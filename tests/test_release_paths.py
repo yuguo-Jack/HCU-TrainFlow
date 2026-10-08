@@ -41,11 +41,17 @@ def test_timeout_is_not_safe_retry(tmp_path):
 
 def test_agent_bridge_does_not_claim_resolution(tmp_path):
     s=task(tmp_path)
-    with s.db() as db:eid=s.event(db,'t','incident-opened',{'kind':'training-stalled'},channel='agent')
+    with s.db() as db:eid=s.event(db,'t','incident-opened',{'kind':'training-stalled','context':s.task('t')['context']},channel='agent')
     card={'schema_version':1,'argv':[sys.executable,'-c','import sys,pathlib; assert pathlib.Path(sys.argv[-1]).is_file()'],'cwd':str(tmp_path),'basis':'local fake bridge','timeout_seconds':10}
     result=dispatch_inbox(s,eid,'consumer',card,s.lease('bridge','controller'))
     assert result['status']=='complete' and result['incident_resolution']=='pending-consumer-ack'
     assert inbox(s)[0]['status']=='claimed'
+
+def test_stale_event_cannot_launch_bridge(tmp_path):
+    s=task(tmp_path)
+    with s.db() as db:eid=s.event(db,'t','incident-opened',{'kind':'training-stalled','context':'previous-context'},channel='agent')
+    with pytest.raises(FlowError):dispatch_inbox(s,eid,'consumer',{},s.lease('bridge','controller'))
+    assert inbox(s)[0]['status']=='pending'
 
 def test_cli_incomplete_exit_and_output(tmp_path,capsys):
     p=tmp_path/'groups.json';write_json(p,{'groups':[{'domain':'tp','ranks':[0,1]}],'available':[0]})

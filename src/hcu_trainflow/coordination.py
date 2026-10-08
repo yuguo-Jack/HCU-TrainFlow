@@ -27,7 +27,7 @@ def finish_assignment(store, aid, owner, report_id):
         if json.loads(row["payload"])["context"] != context:
             raise FlowError("Assignment context became stale; reassess against current task")
         db.execute("UPDATE assignments SET status='returned' WHERE id=?", (aid,))
-        store.event(db, row["task"], "assignment-returned", {"id": aid, "report": report_id, "acceptance": "main-controller-review-required"}, channel="agent")
+        store.event(db, row["task"], "assignment-returned", {"id": aid, "context": context, "report": report_id, "acceptance": "main-controller-review-required"}, channel="agent")
     return {"id": aid, "status": "returned"}
 
 
@@ -60,6 +60,8 @@ def dispatch_inbox(store, event_id, owner, card, lease):
     if not item:
         raise FlowError("Unknown event")
     task = store.task(item["task"])
+    if json.loads(item["payload"]).get("context") != task["context"]:
+        raise FlowError("Event context is stale or missing; inspect before dispatching an agent")
     if "agent-dispatch" not in task["spec"].get("permissions", []) or "execute" not in task["spec"].get("permissions", []):
         raise FlowError("Task must explicitly allow agent-dispatch and execute")
     if card.get("backend", "local") != "local":

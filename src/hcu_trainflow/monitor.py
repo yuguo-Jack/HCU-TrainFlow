@@ -115,6 +115,9 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
                 sample = json.loads(raw)
                 if not isinstance(sample, dict):
                     raise ValueError("observation must be an object")
+                if sample.get("context", task["context"]) != task["context"]:
+                    raise ValueError("observation belongs to another context")
+                sample["context"] = task["context"]
                 if not isinstance(sample.get("attempt_id"), str) or not sample["attempt_id"]:
                     raise ValueError("attempt_id required")
                 if not isinstance(sample.get("step"), int) or isinstance(sample["step"], bool) or sample["step"] < 0:
@@ -152,11 +155,11 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
         if not incident:
             import uuid
             incident = uuid.uuid4().hex
-            store.event(db, tid, "incident-opened", {"incident_id": incident, "attempt_id": samples[-1]["attempt_id"] if samples else None,
+            store.event(db, tid, "incident-opened", {"incident_id": incident, "context": task["context"], "attempt_id": samples[-1]["attempt_id"] if samples else None,
                         "recovery_owner": task["spec"].get("recovery_owner", "unassigned"), **issue}, channel="agent")
         next_active[issue_key] = incident
     for issue_key in active.keys() - next_active.keys():
-        store.event(db, tid, "incident-cleared", {"incident_id": active[issue_key], "kind": issue_key}, channel="agent")
+        store.event(db, tid, "incident-cleared", {"incident_id": active[issue_key], "context": task["context"], "kind": issue_key}, channel="agent")
     heartbeat = {"schema_version": 1, "task_id": tid, "checked_at": time.time() if now is None else now,
                  "status": "attention" if issues else "healthy-observed", "issues": issues,
                  "last_observation": samples[-1] if samples else None, "context": task["context"],
