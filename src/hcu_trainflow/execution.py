@@ -81,6 +81,9 @@ def run_command(store, tid, operation_id, card, lease):
             if prior["status"] in {"complete", "failed"}:
                 return json.loads(prior["result"])
             raise FlowError("Outcome unknown; reconcile original execution before creating another operation")
+        occupied = db.execute("SELECT o.id FROM operations o JOIN events e ON json_extract(e.payload,'$.operation')=o.id WHERE e.kind='operation-started' AND json_extract(e.payload,'$.lease.resource')=? AND o.status IN ('started','unknown')", (lease["resource"],)).fetchone()
+        if occupied:
+            raise FlowError("Resource already has an unresolved execution, including in another task")
         count = db.execute("SELECT count(*) FROM operations WHERE task=?", (tid,)).fetchone()[0]
         if count >= task["spec"].get("budget", {}).get("max_operations", 100):
             raise FlowError("Operation budget exhausted")

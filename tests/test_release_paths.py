@@ -33,6 +33,15 @@ def test_expired_lease_with_running_operation_cannot_transfer(tmp_path):
         db.execute("UPDATE leases SET expires=0")
     with pytest.raises(FlowError):s.lease('gpu','new')
 
+def test_same_lease_cannot_bypass_cross_task_resource_serialization(tmp_path):
+    s=task(tmp_path);lease=s.lease('gpu','controller')
+    s.create({'schema_version':1,'task_id':'other','mode':'analyze','objective':'test','context':{'s':'2'},'permissions':['execute']})
+    with s.db() as db:
+        db.execute("INSERT INTO operations VALUES('in-flight','t','hash','started',NULL,'now')")
+        s.event(db,'t','operation-started',{'operation':'in-flight','lease':lease})
+    card={'schema_version':1,'argv':[sys.executable,'--version'],'cwd':str(tmp_path),'basis':'test','timeout_seconds':5}
+    with pytest.raises(FlowError):run_command(s,'other','bypass',card,lease)
+
 def test_timeout_is_not_safe_retry(tmp_path):
     s=task(tmp_path);lease=s.lease('cpu','owner')
     result=run_command(s,'t','slow',{'schema_version':1,'argv':[sys.executable,'-c','import time;time.sleep(5)'],'cwd':str(tmp_path),'basis':'test','timeout_seconds':0.05},lease)

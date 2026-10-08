@@ -15,3 +15,10 @@
 
 - Final pre-publication local validation: 52 tests passed; 32 Wiki pages (31 topics + index), source/maintenance integrity passed, five Skill validations passed. Source bundle integrity and resource ownership under unresolved execution are covered.
 - Repository relocation now creates a new Wiki index generation so search results cannot retain obsolete absolute paths.
+
+## v0.1.0 release verification
+
+- Final local suite: 55 tests passed. Added stale-event dispatch rejection and cross-task resource serialization checks during release review.
+- Public GitHub repository created under yuguo-Jack; initial Windows/Linux × Python 3.10/3.12 matrix completed successfully. Final release commit is validated by the same workflow.
+- CLI editable install, wheel build/import demo, source locks, five Skills, local Markdown links and public file boundary reviewed.
+- Source/field limitations and the next real HCU pilot are documented in docs/capabilities.md. No real HCU benchmark, training deployment or notification service was claimed or performed.

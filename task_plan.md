@@ -9,7 +9,7 @@ Implement the first usable local-centred workflow release. Preserve the 36 requi
 3. Environment/quality gates, profile analysis, experiments and monitoring — complete
 4. Public upstream Wiki, refresh/impact/search and workflow maintenance — complete
 5. Five Skills, installation, reproducible demo and tests — complete
-6. Integrated review, clean installation, public export, GitHub release — in_progress
+6. Integrated review, clean installation, public export, GitHub release — complete
 
 ## Delivery rules
 - Keep working copies, credentials, site data and original private planning outside the published file set.
