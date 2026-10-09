@@ -26,6 +26,18 @@ def parser():
     cmd("task-show", "task")
     cmd("task-context", "task", "context_file")
     q = cmd("task-transition", "task", "state"); q.add_argument("--reason")
+    cmd('flow-start', 'task', 'file')
+    q = cmd('flow-replan', 'task', 'file'); q.add_argument('--reason', required=True)
+    cmd('flow-next', 'task')
+    cmd('flow-submit', 'task', 'file')
+    cmd('flow-review', 'task', 'file')
+    q = cmd('flow-review-failed', 'task', 'round'); q.add_argument('--reason', required=True)
+    cmd('flow-advance', 'task')
+    cmd('flow-board', 'task')
+    q = cmd('flow-watch', 'task'); q.add_argument('--once', action='store_true')
+    q = cmd('flow-guidance-ack', 'task', 'hash'); q.add_argument('--decision', choices=['applied','queued','needs-human','not-applicable'], required=True); q.add_argument('--note', required=True)
+    cmd('flow-question', 'task', 'file')
+    q = cmd('flow-question-close', 'task', 'question'); q.add_argument('--guidance', required=True); q.add_argument('--note', required=True)
     cmd("artifact-add", "file")
     cmd("artifact-read", "sha", "destination")
     cmd("report-add", "task", "kind", "file")
@@ -63,11 +75,12 @@ def parser():
     q = cmd("wiki-pr", "repository", "number"); q.add_argument("--output")
     cmd("wiki-review", "project", "stage", "decisions")
     cmd("demo", "destination")
+    cmd('collaboration-demo', 'destination')
     return p
 
 
 def execute(a):
-    from . import analysis, coordination, delivery, environment, execution, monitor, quality, wiki
+    from . import analysis, coordination, delivery, environment, execution, flow, monitor, quality, wiki
     store = Store(a.workspace)
     c = a.command
     if c == "init": return {"workspace": str(store.root), "schema_version": 1, "version": __version__}
@@ -75,6 +88,23 @@ def execute(a):
     if c == "task-show": return store.task(a.task)
     if c == "task-context": return store.change_context(a.task, read_json(a.context_file))
     if c == "task-transition": return store.transition(a.task, a.state, a.reason)
+    if c in {'flow-start', 'flow-replan'}: return flow.start(store, a.task, read_json(a.file), getattr(a, 'reason', None))
+    if c == 'flow-next': return flow.next_step(store, a.task)
+    if c == 'flow-submit': return flow.submit(store, a.task, read_json(a.file))
+    if c == 'flow-review': return flow.review(store, a.task, read_json(a.file))
+    if c == 'flow-review-failed': return flow.review_failure(store, a.task, int(a.round), a.reason)
+    if c == 'flow-advance': return flow.advance(store, a.task)
+    if c == 'flow-guidance-ack': return flow.acknowledge(store, a.task, a.hash, a.decision, a.note)
+    if c == 'flow-question': return flow.question(store, a.task, read_json(a.file))
+    if c == 'flow-question-close': return flow.close_question(store, a.task, a.question, a.guidance, a.note)
+    if c in {'flow-board', 'flow-watch'}:
+        while True:
+            change = flow.sync_guidance(store, a.task)
+            result = {**flow.render_board(store, a.task), **change}
+            if c == 'flow-board' or a.once: return result
+            if change['new']: print(json.dumps(result, ensure_ascii=False), flush=True)
+            with store.db() as db: interval = flow.get_flow(db, a.task)['plan']['poll_seconds']
+            time.sleep(interval)
     if c == "artifact-add": return {"artifact": store.put(Path(a.file).read_bytes()), "visibility": "private"}
     if c == "artifact-read":
         from .core import atomic_write
@@ -145,6 +175,9 @@ def execute(a):
         return wiki.review_refresh(store, a.stage, decisions["pages"], a.project, decisions.get("workflows"))
     if c == "demo":
         from .demo import run_demo
+        return run_demo(a.destination)
+    if c == 'collaboration-demo':
+        from .collaboration_demo import run_demo
         return run_demo(a.destination)
     raise FlowError("Unsupported command")
 

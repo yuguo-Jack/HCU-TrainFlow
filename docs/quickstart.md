@@ -10,13 +10,14 @@ python scripts/validate_knowledge.py
 python -m pytest -q
 hcu-trainflow --workspace .work/local init
 hcu-trainflow demo .work/demo-001
+hcu-trainflow collaboration-demo .work/collaboration-001
 ```
 
 查看 demo 返回的 HTML 报告：含 step、loss、梯度与显存合成曲线，以及监测故障记录。合成证据只验证程序逻辑。
 
 ## 创建任务
 
-从 `examples/task.json` 复制到私有目录并修改。先明确只分析、只诊断还是完整推进。
+推荐通过 `$hcu-trainflow` 提供环境、模型和目标，由 Agent 建立内部任务与协作循环。也可从 `examples/task.json` 复制到私有目录并修改，用 CLI 手动操作。先明确只分析、只诊断还是完整推进。
 
 ```bash
 hcu-trainflow --workspace /private/task-a task-create /private/task-a/task.json
@@ -32,6 +33,8 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 目的 | 命令 |
 |---|---|
 | 任务与证据 | task-create/show/context/transition、artifact-add/read、report-add |
+| 协作循环 | flow-start/next/submit/review/review-failed/advance/replan |
+| 看板与指导 | flow-board/watch/question/question-close/guidance-ack |
 | 资源与执行 | lease-acquire/renew/release、command-plan/run、operation-reconcile |
 | 源码传输 | source-snapshot/materialize/bundle/receive |
 | 多 Agent | assignment-add/return、inbox、inbox-dispatch |
@@ -45,12 +48,15 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 
 ## Skill 使用例
 
-- `$hcu-train-prepare`：只检查分配的环境，按实际节点和设备生成缺项表。
+- `$hcu-trainflow`：在给定环境推进模型适配、优化和大规模验证，建立看板并持续复核。
+- `$hcu-train-adapt`：只检查分配的环境，按实际节点和设备生成缺项表。
 - `$hcu-train-optimize`：只分析这些 ranks 的 trace，给热点、效率和下一步实验。
-- `$hcu-train-operate`：诊断卡住，先保存全 rank 现场，不触发重启。
+- `$hcu-train-fault-tolerance`：诊断卡住，先保存全 rank 现场，不触发重启。
 - `$hcu-engine-wiki-search`：查 EP overlap 与重算的版本限制。
 - `$hcu-engine-wiki-update`：复核最新官方/生态源码，并同步受影响的用法。
 
 第三方使用者自行配置私有工作区和资源；不要拷贝另一位用户的凭据或现场目录。
 
 各输入字段和判定边界见 [JSON 契约](contracts.md)。
+
+统一主控的目标、候选、独立复核与文件回复契约见 [协作循环](collaboration.md)。完整自动续接需要宿主 Agent 在线或已部署桥接，安装 Skill 不会自动启动后台模型服务。

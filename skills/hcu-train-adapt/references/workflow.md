@@ -4,6 +4,7 @@
 
 按需阅读项目：
 
+- `docs/collaboration.md`：统一入口、候选复核、人的文件指导与断点接续。
 - `docs/quickstart.md`：安装、任务、证据及 CLI。
 - `docs/workflows.md`：三个工作流与验证门槛。
 - `docs/profiling.md`：时间分母、热点建模和 TraceLens。

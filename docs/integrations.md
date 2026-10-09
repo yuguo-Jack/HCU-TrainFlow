@@ -28,7 +28,7 @@ python -m pip install -e thirdparty/TraceLens
 
 ## 三个算子 Skill
 
-在 PowerShell 中一次安装五个 TrainFlow Skill 和三个 Hygon 算子 Skill：
+在 PowerShell 中一次安装六个 TrainFlow Skill（一个统一入口、三个阶段和两个 Wiki） 和三个 Hygon 算子 Skill：
 
 ```powershell
 python scripts/install_skills.py --with-kernel-skills --target "$HOME/.codex/skills"

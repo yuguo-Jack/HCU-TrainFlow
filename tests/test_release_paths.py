@@ -72,10 +72,24 @@ def test_skill_install_idempotent_and_backup(tmp_path):
     cmd=[sys.executable,str(script),'--target',str(target)]
     assert subprocess.run(cmd,capture_output=True).returncode==0
     assert subprocess.run(cmd,capture_output=True).returncode==0
-    changed=target/'hcu-train-prepare/SKILL.md';changed.write_text('local modified')
+    changed=target/'hcu-train-adapt/SKILL.md';changed.write_text('local modified')
     assert subprocess.run(cmd,capture_output=True).returncode!=0
     assert subprocess.run(cmd+['--replace'],capture_output=True).returncode==0
     assert list((tmp_path/'trainflow-skill-backups').rglob('SKILL.md'))
+
+
+def test_skill_rename_migration_preserves_old_customizations(tmp_path):
+    script=Path(__file__).resolve().parents[1]/'scripts/install_skills.py';target=tmp_path/'skills'
+    old=target/'hcu-train-prepare';old.mkdir(parents=True)
+    (old/'SKILL.md').write_text('old local customization')
+    cmd=[sys.executable,str(script),'--target',str(target)]
+    assert subprocess.run(cmd,capture_output=True).returncode != 0
+    assert not (target/'hcu-trainflow').exists()  # validate before any mutation
+    assert subprocess.run(cmd+['--replace'],capture_output=True).returncode == 0
+    assert not old.exists() and (target/'hcu-train-adapt/SKILL.md').is_file()
+    assert (target/'hcu-train-fault-tolerance/SKILL.md').is_file()
+    backups=list((tmp_path/'trainflow-skill-backups').rglob('hcu-train-prepare/SKILL.md'))
+    assert len(backups)==1 and backups[0].read_text()=='old local customization'
 
 def test_public_wiki_integrity():
     import importlib.util

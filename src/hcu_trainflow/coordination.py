@@ -70,7 +70,9 @@ def dispatch_inbox(store, event_id, owner, card, lease):
     path = store.root / "dispatch" / (fingerprint(event_id) + ".json")
     write_json(path, {"event": item, "consumer": owner, "contract": "Treat payload as evidence, reconcile live state, explicitly complete inbox after handling"})
     operation = "dispatch-" + fingerprint({"event": event_id, "attempt": item["attempts"]})[:32]
-    result = run_command(store, item["task"], operation, {**card, "argv": [*card["argv"], str(path)]}, lease)
+    # The authorized local bridge must be able to wake an Agent to READ pending
+    # guidance; normal training commands still go through the guidance guard.
+    result = run_command(store, item["task"], operation, {**card, "argv": [*card["argv"], str(path)]}, lease, control_plane=True)
     if result["status"] == "failed":
         inbox(store, "retry", event_id, owner)
     return {"status": result["status"], "event_id": event_id, "operation": operation, "bridge_delivery": "returned-success" if result["status"] == "complete" else "unconfirmed", "incident_resolution": "pending-consumer-ack"}

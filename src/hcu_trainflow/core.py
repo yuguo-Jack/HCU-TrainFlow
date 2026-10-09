@@ -114,6 +114,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,task TEXT,request_hash TEXT,status TEXT,result TEXT,created TEXT);
             CREATE TABLE IF NOT EXISTS cursors(peer TEXT PRIMARY KEY,seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS assignments(id TEXT PRIMARY KEY,task TEXT,payload TEXT,status TEXT);
+            CREATE TABLE IF NOT EXISTS flows(task TEXT PRIMARY KEY,plan TEXT,goal TEXT,context TEXT);
+            CREATE TABLE IF NOT EXISTS flow_rounds(task TEXT,number INTEGER,context TEXT,revision INTEGER,goal TEXT,candidate TEXT,review TEXT,status TEXT,failures INTEGER DEFAULT 0,PRIMARY KEY(task,number));
+            CREATE TABLE IF NOT EXISTS flow_guidance(task TEXT,id TEXT,context TEXT,status TEXT,note TEXT,created TEXT,PRIMARY KEY(task,id));
+            CREATE TABLE IF NOT EXISTS flow_guidance_cursor(task TEXT PRIMARY KEY,hash TEXT);
+            CREATE TABLE IF NOT EXISTS flow_questions(task TEXT,id TEXT,payload TEXT,status TEXT,resolution TEXT,PRIMARY KEY(task,id));
             """)
             row = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
             if row and row[0] != "1":
@@ -224,6 +229,8 @@ class Store:
         return self.task(tid)
 
     def transition(self, tid, state, reason=None):
+        from .flow import sync_guidance, guard_transition
+        sync_guidance(self, tid)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
@@ -232,6 +239,7 @@ class Store:
             spec = json.loads(row["spec"])
             if row["state"] in {"completed", "cancelled"}:
                 raise FlowError("Terminal task; create a new task")
+            guard_transition(self, db, dict(row), state)
             if state in {"paused", "blocked", "failed", "cancelled"}:
                 if not reason:
                     raise FlowError("A reason is required")

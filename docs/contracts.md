@@ -6,7 +6,7 @@
 
 `schema_version: 1`；`task_id` 为稳定 ID；`mode` 取 environment/adapt/analyze/optimize/diagnose/operate/full；`objective` 为任务目标；非空 `context` 描述比较范围；`permissions` 缺省为空，可选 execute/sync/notify/agent-dispatch；`recovery_owner` 指既有容错工具；`budget` 支持 max_operations/max_seconds。
 
-context 应共同包含初始 baseline、候选、环境、模型、数据与质量契约身份。baseline 和 candidate 的源码可以不同，但属于同一个已冻结比较上下文。修改候选后显式更新 context；不要用同一个哈希掩盖内容变化。
+context 包含初始 baseline、环境、模型、数据与质量契约身份。baseline 和 candidate 的源码可以不同，但属于同一个已冻结比较上下文。挂接协作循环后，各轮 candidate.snapshot 单独锁具体实现、配置与产物，报告必须绑定对应 candidate_snapshot；不能将旧报告移用到新候选。环境、模型、数据、初始基线或验证契约变化时用 task-context 更新并重新验收。未挂接 flow 的旧式任务没有候选绑定，仍需将候选身份放在 context，改变候选后更新 context。
 
 ## 环境验收
 
@@ -50,6 +50,8 @@ models JSON 按分析输出中的 op key（优先）或 kernel name 映射。GEM
 ## ReportEnvelope
 
 `report-add` 所读 JSON 含 context、status、evidence。pass 要求 executed>0、无 failures/required_missing。evidence 先通过 artifact-add 保留为 SHA256 对象。报告必须由负责的 Agent/人阅读原始证据后形成；存储完整性和声明字段不能防止作者写错结论。
+
+协作循环还要求 candidate_snapshot 与候选清单 artifact 相同。候选、独立 review、目标与人的回复契约见 [协作循环](collaboration.md)；不要只调用 task-transition 跳过已登记的 review。
 
 ## Assignment 与接手
 

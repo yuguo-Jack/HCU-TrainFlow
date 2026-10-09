@@ -62,7 +62,10 @@ def command_plan(card):
     return result
 
 
-def run_command(store, tid, operation_id, card, lease):
+def run_command(store, tid, operation_id, card, lease, *, control_plane=False):
+    if not control_plane:
+        from .flow import guard_execution
+        guard_execution(store, tid)
     task = store.task(tid)
     if "execute" not in task["spec"].get("permissions", []):
         raise FlowError("Task has no execute permission")

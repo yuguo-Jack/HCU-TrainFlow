@@ -46,3 +46,16 @@
 - Migrated this machine's clean upstream dependency checkout using the explicit migration command, preserved the upstream remote, reinstalled the pinned fork and generated 10 single-rank tables plus 5 two-rank collective tables from synthetic fixtures.
 - TrainFlow validation: 77 tests passed, including preservation of dirty/unknown/conflicting migration states; 46 Wiki pages and 24 registered sources have no integrity errors. Both upstream and fork now participate in workflow maintenance.
 - Real HCU graph attribution, custom collective classification, hardware performance models and replay remain deployment-validation work; no full upstream GPU/JAX/Origami suite or real training result is claimed.
+
+## 2026-10-09 collaborative workflow follow-up
+
+Inspected clean local checkout, project rules and current interfaces; read planning-with-files and skill-creator. Work is development-only: no release/tag. Planned names: hcu-trainflow entry, hcu-train-adapt, hcu-train-optimize, hcu-train-fault-tolerance, plus existing Wiki search/update. Reference-only source checkouts stay under ignored .private.
+
+Reference retrieval note: older .private/sources directories are source snapshots, not independent Git checkouts; attempted git -C fetch resolved the TrainFlow root (read-only fetch only). Created explicit ignored .private/reference Git checkouts for current comparison instead. A referenced rlar.py path was a package; corrected inspection to rlar/__init__.py.
+
+
+- Implemented durable goal/candidate/reviewer rounds, explicit correction/blocked decisions, current evidence checks, stage and iteration gates, bounded failures/plateaus, and manual-transition protection. Independent reviewer identity remains a runtime responsibility; no actual second model or GPU result is claimed by the synthetic fixture.
+- Added generated BOARD.md, preserved GUIDANCE.md, revision events and responses, blocking/advisory questions, polling and existing inbox integration. No persistent monitor service was deployed by this task.
+- Added hcu-trainflow and renamed stage Skills to adapt/optimize/fault-tolerance. Installer migrates old names with preserved backups outside Skill discovery; six workflow Skills are installed locally, matching checkout bytes. Existing Hygon kernel Skill installations were not replaced.
+- Updated workflow-first README, architecture/contracts/operations, source-maintenance links, CLI, unreleased changelog and package metadata to 0.3.0.dev0. Local editable installation reports the same version.
+- Validation: 100 full-suite tests passed; 22 focused flow tests passed again after final contract/error-handling review. All six Skills validate; all 46 Wiki pages and 24 source registrations validate; authored local Markdown links resolve. CLI collaboration demonstration completed with explicitly scripted CPU-only evidence and a retained board. Existing real-site/multi-Agent/notification validation gaps remain explicit. No release or new tag was created.

@@ -33,7 +33,7 @@ sources:
 
 本工作流的 HCU 适配顺序是：先读取选定 HCU 分支已有的同模型脚本及其环境/启动依赖，结合现场部署和用户 patch；没有同模型脚本时参考相近模型的 HCU 配方，再与官方模型配置核对训练语义。没有适用 HCU 配方时才据官方示例构建平台适配方案。HCU 旧脚本也须核对当前 DTK/依赖和参数支持，不能仅凭名称相同直接运行。
 
-确认实际入口是 HCU 包装脚本、Bridge recipe 还是 `pretrain_gpt.py`，在已获授权的调度资源内用匹配解释器及该入口支持的帮助/配置输出方式核对参数。`--help` 也可能初始化导入依赖。沿启动链核对最终 argv、cwd、非敏感环境及其覆盖顺序，再写入 command card；保存与原 HCU 脚本的差异及原因。具体核对见 [适配工作流](../../skills/hcu-train-prepare/references/workflow.md#启动配方选择与核对)。
+确认实际入口是 HCU 包装脚本、Bridge recipe 还是 `pretrain_gpt.py`，在已获授权的调度资源内用匹配解释器及该入口支持的帮助/配置输出方式核对参数。`--help` 也可能初始化导入依赖。沿启动链核对最终 argv、cwd、非敏感环境及其覆盖顺序，再写入 command card；保存与原 HCU 脚本的差异及原因。具体核对见 [适配工作流](../../skills/hcu-train-adapt/references/workflow.md#启动配方选择与核对)。
 
 ## 测试阶梯
 

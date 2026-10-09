@@ -48,3 +48,12 @@ Public repository stores reusable integration and public authored knowledge. HCU
 2. Preserve upstream modules and commands; document HCU extension/validation boundaries, and repair only locally reproduced compatibility defects — complete.
 3. Point TrainFlow to the reviewed fork commit; provide explicit safe migration from the upstream checkout and retain the upstream knowledge source — complete.
 4. Validate native command entrypoints, report regressions, dependency migration and repository integrity — complete. Publication is recorded in both Git repositories.
+
+## 2026-10-09: collaborative workflow and review loop (active)
+
+User requests a unified autonomous entry Skill, persistent implement/review/correct cycles, file-based human guidance and progress, renaming prepare to adapt and operate to fault-tolerance, accurate development version/README, and no release. Existing three stage workflows plus two Wiki Skills remain callable; one coordinator entry is now explicitly requested. Real HCU validation is deferred until a site is supplied.
+
+1. Inspect TrainFlow and pinned Humanize/BBuf/Hyperloom reference implementations — complete.
+2. Design and implement evidence-bound iteration/review and human board contracts integrated with existing task/execution/monitor state — complete.
+3. Add unified Skill, rename stage Skills with safe installation migration, and rewrite workflow-first docs — complete.
+4. Exercise interruption/resume, stale reviews, human guidance and numerical/scale gates; review and validate; no release or new tag — complete.
