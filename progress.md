@@ -104,3 +104,9 @@ Implemented scoped PR search, pinned code reading, public PR source pages, compl
 - Added an early parallel-layout/memory-budget assessment to optimize and coordinator Skills; linked the workflow to the Megatron parallelism topic and retained official parallelism, Bridge performance and memory-estimator tutorials.
 - Compare actual HCU topology, TP/PP/DP/CP/EP/SP, microbatch/accumulation, recomputation and state sharding against worst-rank peak/headroom and measured throughput. Preserve model/global-batch/token/precision/optimizer semantics; refresh process groups and shapes after layout changes; stage loss cadence is unchanged.
 - Documentation-only change: knowledge validator passed 485 pages/24 sources; changed links, Skill metadata, numbered flow and whitespace checked. Changed Skills installed with backups. No training or HCU-Knowledge update.
+
+## 2026-10-09: detailed workflow diagrams
+
+- Added docs/workflow-map.md: ten editable Mermaid diagrams covering the overall task, adaptation, parallel-layout/memory tuning, fusion and hotspot bounds, local/stage validation, review, dynamic Agent collaboration, remote execution, long-training recovery and the knowledge lifecycle. Added exact full-mode gate/source mapping and linked from README/architecture.
+- Rendered all ten diagrams with Mermaid 11.12.0 and inspected overview/optimization/monitoring views using Playwright. A local offline HTML preview with embedded SVGs and original-size controls is retained under ignored .work/workflow-map; diagrams remain editable in the tracked Markdown.
+- Verified local links and all seven core.GATES report sets; knowledge validation passed 485 pages/24 sources. No runtime logic or Skill changes, so no additional training/runtime tests. Version remains 0.4.0.dev0; no HCU-Knowledge update, tag or release.

@@ -1,5 +1,7 @@
 # 架构与边界
 
+按训练任务推进顺序阅读 [工作流全景与阶段细图](workflow-map.md)；本页说明系统职责和实现边界。
+
 ```mermaid
 flowchart TD
     U[用户目标与部署授权] --> A[本地主控 Agent]

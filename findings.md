@@ -86,3 +86,7 @@ Confirmed and repaired boundary failures, with reproductions and regression cove
 - Online PR fallback did not propagate partial failure to CLI exit status; combined multi-repository display truncation could appear complete. Both are explicit now.
 
 Readiness boundary: protocol/unit fixtures and public Wiki retrieval are locally testable. Site commands, HCU kernel traces and numerical convergence, native Agent wake-up, site recovery ownership and real multi-node fault injection remain environment integration work. No real training measurements were fabricated. No HCU-Knowledge update or TrainFlow release/tag.
+
+## Detailed workflow mapping
+
+Existing README/architecture/team diagrams were summaries. The new workflow map separates system tuning, shape-bound efficiency assessment and implementation validation; distinguishes local iteration from stage loss; and maps full-mode report gates directly to core.GATES. Agent scheduling, file guidance, remote execution uncertainty, site recovery ownership and knowledge updates have separate views so readers can trace dependencies without assuming a built-in model runtime or validated site deployment.

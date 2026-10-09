@@ -19,7 +19,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 ```mermaid
 flowchart TD
     U[模型、环境与目标] --> A[环境验收与模型适配]
-    A --> O[性能分析与系统 / 算子优化]
+    A --> O[并行切分与显存预算<br/>性能分析与系统 / 算子优化]
     O --> Q[阶段 loss 与性能验收]
     Q --> S[最小 DP 域、筛机与扩容验证]
     S --> T[长训监测、容错与故障诊断]
@@ -32,6 +32,8 @@ flowchart TD
 ```
 
 优化保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，必要时参考官方引擎 Wiki、HCU-Knowledge、底层源码及三个 Hygon 算子 Skill。
+
+完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新的细图见 [工作流全景](docs/workflow-map.md)。
 
 ## 如何与 Agent 协作
 

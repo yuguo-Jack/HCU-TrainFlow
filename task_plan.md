@@ -84,3 +84,9 @@ Real training and site-dependent command validation remain pending until hardwar
 2. Reproduce and repair concrete defects, preserving public/private boundaries and existing workflow scope — complete; independent reproduction and cross-review included.
 3. Run complete local tests, knowledge validation and relevant CLI/demo smoke checks; synchronize changed Skills if needed — complete: 206 tests, 485 pages/24 sources, all six installed Skills matched.
 4. Commit and push reviewed development changes; report readiness and site-dependent validation limits. No tag/release — validated for publication; final publication is recorded in Git remote state and CI.
+
+## 2026-10-09: detailed workflow diagrams
+
+1. Map current stages, code gates, optimization loops, Agent coordination, remote execution, monitoring and knowledge lifecycle — complete.
+2. Add editable diagrams with source links and explicit implementation/site-validation boundaries; connect existing reading entries — complete.
+3. Render and inspect diagrams, verify links and gate mapping, publish documentation without release/tag — locally validated; publication recorded in Git history and remote state.
