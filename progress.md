@@ -97,3 +97,10 @@ Implemented scoped PR search, pinned code reading, public PR source pages, compl
 - Fixed TraceLens and kernel-Skill checkouts are clean and ready. System installed version remains **0.4.0.dev0**; all six installed workflow/Wiki Skills byte-match their repository copies.
 - No live training, remote recovery, external notification or HCU-Knowledge update performed. Public repository has no site data. Real environment onboarding can now validate command adapters, HCU traces/numerics, distributed recovery and Agent wake-up.
 - Commit/push development fixes using yuguo-Jack; retain no new tag/release. Remote publication/CI status is checked after committing.
+
+
+## 2026-10-09: parallel mapping before kernel optimization
+
+- Added an early parallel-layout/memory-budget assessment to optimize and coordinator Skills; linked the workflow to the Megatron parallelism topic and retained official parallelism, Bridge performance and memory-estimator tutorials.
+- Compare actual HCU topology, TP/PP/DP/CP/EP/SP, microbatch/accumulation, recomputation and state sharding against worst-rank peak/headroom and measured throughput. Preserve model/global-batch/token/precision/optimizer semantics; refresh process groups and shapes after layout changes; stage loss cadence is unchanged.
+- Documentation-only change: knowledge validator passed 485 pages/24 sources; changed links, Skill metadata, numbered flow and whitespace checked. Changed Skills installed with backups. No training or HCU-Knowledge update.
