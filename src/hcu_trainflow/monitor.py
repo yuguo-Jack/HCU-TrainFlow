@@ -8,6 +8,48 @@ import time
 from .core import FlowError, fingerprint, read_json, utc, write_json
 
 
+_PHASES = {"startup", "training", "finished", "failed", "unknown"}
+_KINDS = {"iteration", "memory", "heartbeat", "lifecycle"}
+_PROGRESS_VERSION = 3
+
+
+def _finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _modern(sample):
+    return any(key in sample for key in ("phase", "observation_kind", "progress_observed"))
+
+
+def _iteration(sample):
+    # Legacy normalized rows represented iterations. Explicit modern heartbeats
+    # and memory reports must never advance or regress the iteration clock.
+    return not _modern(sample) or (sample.get("observation_kind") == "iteration"
+                                   and sample.get("progress_observed") is True)
+
+
+def _event_time_known(sample):
+    # Legacy normalized input has its own event-time contract. A raw adapter
+    # must explicitly distinguish event time from collector fallback time.
+    return sample.get("timestamp_basis") in {None, "source-log-clock"}
+
+
+def _validate_contract(sample):
+    if _modern(sample):
+        if sample.get("phase") not in _PHASES or sample.get("observation_kind") not in _KINDS:
+            raise ValueError("invalid observation phase/kind")
+        if type(sample.get("progress_observed")) is not bool:
+            raise ValueError("progress_observed boolean required")
+        if sample["progress_observed"] and sample["observation_kind"] != "iteration":
+            raise ValueError("only iteration observations may report progress")
+        started = sample.get("attempt_started_at")
+        if not _finite(started) or started > sample["timestamp"]:
+            raise ValueError("attempt_started_at must be finite and no later than observation")
+    for key in ("adapter_warnings", "fatal_errors"):
+        if key in sample and (not isinstance(sample[key], list) or any(not isinstance(x, str) for x in sample[key])):
+            raise ValueError(key + " must be a list of strings")
+
+
 def check_policy(policy):
     required = {"stall_seconds", "telemetry_seconds", "recovery_seconds", "min_progress_samples"}
     if required - policy.keys():
@@ -19,78 +61,181 @@ def check_policy(policy):
     if not isinstance(policy["min_progress_samples"], int) or policy["min_progress_samples"] < 2:
         raise FlowError("Recovery needs at least two advancing progress observations")
     for key in ("memory_limit_bytes", "required_headroom_bytes", "reference_step_seconds", "slowdown_ratio"):
-        if key in policy and (not isinstance(policy[key], (int, float)) or not math.isfinite(policy[key]) or policy[key] < 0):
+        if key in policy and (not _finite(policy[key]) or policy[key] < 0):
             raise FlowError("Invalid optional threshold: " + key)
-    if not isinstance(policy.get("performance_window", 5), int) or policy.get("performance_window", 5) < 2:
+    if "startup_timeout_seconds" in policy and (not _finite(policy["startup_timeout_seconds"]) or policy["startup_timeout_seconds"] <= 0):
+        raise FlowError("Invalid startup_timeout_seconds")
+    if type(policy.get("performance_window", 5)) is not int or policy.get("performance_window", 5) < 2:
         raise FlowError("performance_window must be an integer >=2")
 
 
 def _record_progress(progress, sample):
     """Keep attempt clocks and monotonic progress independent of sample retention."""
     attempt = progress.get(sample["attempt_id"])
+    iteration = _iteration(sample)
     if attempt is None:
-        progress[sample["attempt_id"]] = {
-            "started_at": sample["timestamp"], "last_progress_at": sample["timestamp"],
-            "max_step": sample["step"], "last_step": sample["step"],
-            "progress_samples": 1, "regressed": False,
+        attempt = progress[sample["attempt_id"]] = {
+            "started_at": sample.get("attempt_started_at", sample["timestamp"]),
+            "last_progress_at": sample.get("attempt_started_at", sample["timestamp"]),
+            "last_observation_at": sample["timestamp"], "max_step": -1, "last_step": None,
+            "progress_samples": 0, "regressed": False, "clock_regressed": False,
+            "clocks": {},
+            "training_seen": False, "modern": _modern(sample), "contract_changed": False,
+            "contract": {key: sample.get(key) for key in ("attempt_started_at", "expected_final_step", "process_identity")},
+            "fatal_errors": [], "nonfinite": [],
+            "last_source_progress_at": None, "clockless_ranges": {}, "clockless_source_invalid": False,
         }
-        return
-    attempt["started_at"] = min(attempt["started_at"], sample["timestamp"])
-    if sample["step"] < attempt["last_step"]:
-        attempt["regressed"] = True
-    if sample["step"] > attempt["max_step"]:
-        attempt["last_progress_at"] = max(attempt["last_progress_at"], sample["timestamp"])
-        attempt["max_step"] = sample["step"]
-        attempt["progress_samples"] += 1
-    attempt["last_step"] = sample["step"]
+    elif attempt["modern"] != _modern(sample) or attempt["contract"] != {
+            key: sample.get(key) for key in ("attempt_started_at", "expected_final_step", "process_identity")}:
+        attempt["contract_changed"] = True
+    # Source-log iterations may arrive after a newer collector heartbeat. They
+    # must be monotonic relative to other iterations, not heartbeat wall time.
+    # Keep source-clock memory records separate from collector lifecycle rows.
+    clock = (("iteration-source" if _event_time_known(sample) else "iteration-collected") if iteration else "source-other"
+             if sample.get("timestamp_basis") == "source-log-clock" else "collector")
+    previous_time = attempt["clocks"].get(clock, sample["timestamp"])
+    time_regressed = sample["timestamp"] < previous_time
+    attempt["clocks"][clock] = max(previous_time, sample["timestamp"])
+    attempt["clock_regressed"] |= time_regressed
+    attempt["last_observation_at"] = max(attempt["last_observation_at"], sample["timestamp"])
+    attempt["training_seen"] |= iteration or sample.get("phase") == "training"
+    if iteration:
+        if attempt["last_step"] is not None and sample["step"] < attempt["last_step"]:
+            attempt["regressed"] = True
+        if sample["step"] > attempt["max_step"]:
+            if not time_regressed:
+                attempt["last_progress_at"] = max(attempt["last_progress_at"], sample["timestamp"])
+                attempt["progress_samples"] += 1
+            attempt["max_step"] = sample["step"]
+            if _event_time_known(sample):
+                attempt["last_source_progress_at"] = sample["timestamp"]
+            else:
+                source = sample.get("source")
+                if (not isinstance(source, dict) or not isinstance(source.get("path"), str)
+                        or type(source.get("offset")) is not int or source["offset"] < 0
+                        or type(source.get("bytes")) is not int or source["bytes"] <= 0):
+                    attempt["clockless_source_invalid"] = True
+                else:
+                    ranges = attempt["clockless_ranges"]
+                    ranges[source["path"]] = max(ranges.get(source["path"], 0), source["offset"] + source["bytes"])
+        attempt["last_step"] = sample["step"]
+    for error in sample.get("fatal_errors", []):
+        if error not in attempt["fatal_errors"]:
+            attempt["fatal_errors"].append(error)
+    for name in ("loss", "grad_norm"):
+        if sample.get(name) is not None and not _finite(sample[name]) and name not in attempt["nonfinite"]:
+            attempt["nonfinite"].append(name)
+
+
+def _completion_verified(sample, attempt, now):
+    """A terminal label is a claim; independently bind it to observed progress."""
+    if sample.get("completed") is not True or sample.get("phase", "finished") != "finished":
+        return False
+    expected = sample.get("expected_final_step")
+    receipt, identity = sample.get("exit_receipt"), sample.get("process_identity")
+    if (type(expected) is not int or expected <= 0 or attempt["max_step"] < expected
+            or attempt["progress_samples"] < 1 or not isinstance(receipt, dict) or not isinstance(identity, dict)):
+        return False
+    if (type(identity.get("pid")) is not int or identity["pid"] <= 0
+            or not isinstance(identity.get("start_ticks"), str) or not identity["start_ticks"].isdecimal()
+            or not isinstance(identity.get("boot_id"), str) or not identity["boot_id"]
+            or not isinstance(identity.get("pid_namespace"), str) or not identity["pid_namespace"]):
+        return False
+    finished = receipt.get("finished_at")
+    if attempt["clockless_source_invalid"]:
+        return False
+    if attempt["clockless_ranges"]:
+        seal = receipt.get("log_evidence")
+        if sample.get("log_seal_verified") is not True or not isinstance(seal, dict) or type(seal.get("bytes")) is not int:
+            return False
+        sha = seal.get("sha256")
+        if not isinstance(sha, str) or len(sha) != 64 or set(sha) - set("0123456789abcdef"):
+            return False
+        for source_path, end in attempt["clockless_ranges"].items():
+            if source_path != seal.get("path") or end > seal["bytes"]:
+                return False
+    last_source = attempt["last_source_progress_at"]
+    return (receipt.get("attempt_id") == sample["attempt_id"]
+            and bool(sample.get("context")) and receipt.get("context") == sample["context"]
+            and receipt.get("process") == identity and type(receipt.get("exit_code")) is int and receipt["exit_code"] == 0
+            and _finite(finished) and attempt["started_at"] <= finished <= min(now, sample["timestamp"])
+            and (last_source is None or last_source <= finished)
+            and not any(attempt[key] for key in ("regressed", "clock_regressed", "contract_changed", "fatal_errors", "nonfinite")))
 
 
 def observation_issues(samples, policy, now=None, *, progress=None):
     check_policy(policy)
     now = time.time() if now is None else now
+    if not _finite(now):
+        raise FlowError("Watcher time must be finite")
     if not samples:
         return [{"kind": "telemetry-missing", "severity": "warning", "detail": "No valid observations"}]
     latest = samples[-1]
-    issues = []
-    age = now - latest["timestamp"]
-    if age < -30:
-        issues.append({"kind": "clock-mismatch", "severity": "warning", "detail": "Observation timestamp is ahead of watcher"})
-    if age > policy["telemetry_seconds"] and not latest.get("completed", False):
-        issues.append({"kind": "telemetry-stale", "severity": "critical", "detail": "Collector/log path may have stopped; training state unknown"})
-    if latest.get("job_alive") is False and not latest.get("completed", False):
-        issues.append({"kind": "job-exited", "severity": "critical", "detail": "Check scheduler and recovery owner"})
+    for sample in samples:
+        _validate_contract(sample)
+    if _modern(latest) and "startup_timeout_seconds" not in policy:
+        raise FlowError("Phase-aware monitoring requires an independent startup_timeout_seconds")
     current = [x for x in samples if x["attempt_id"] == latest["attempt_id"]]
     if progress is None:
         progress = {}
         for sample in current:
             _record_progress(progress, sample)
     attempt = progress[latest["attempt_id"]]
-    advancing = [current[0]]
-    for sample in current[1:]:
-        if sample["step"] > advancing[-1]["step"]:
+    completed = _completion_verified(latest, attempt, now)
+    issues = []
+    age = now - latest["timestamp"]
+    if age < -30:
+        issues.append({"kind": "clock-mismatch", "severity": "warning", "detail": "Observation timestamp is ahead of watcher"})
+    if age > policy["telemetry_seconds"] and not completed:
+        issues.append({"kind": "telemetry-stale", "severity": "critical", "detail": "Collector/log path may have stopped; training state unknown"})
+    if latest.get("job_alive") is False and not completed:
+        issues.append({"kind": "job-exited", "severity": "critical", "detail": "Check scheduler and recovery owner"})
+    advancing = []
+    for sample in current:
+        if _iteration(sample) and (not advancing or sample["step"] > advancing[-1]["step"]):
             advancing.append(sample)
     if attempt["regressed"]:
         issues.append({"kind": "step-regressed", "severity": "critical", "detail": "Step went backwards without a new attempt"})
-    if now - attempt["last_progress_at"] > policy["stall_seconds"] and not latest.get("completed", False):
-        issues.append({"kind": "training-stalled", "severity": "critical", "detail": "Liveness alone does not prove training progress"})
+    if attempt["clock_regressed"]:
+        issues.append({"kind": "observation-time-regressed", "severity": "critical", "detail": "Observation time moved backwards; verify clocks and log ordering"})
+    if attempt["contract_changed"]:
+        issues.append({"kind": "attempt-contract-changed", "severity": "critical", "detail": "Start time, process or expected final step changed without a new attempt"})
+    if not completed:
+        if not attempt["training_seen"] and attempt["modern"]:
+            if now - attempt["started_at"] > policy["startup_timeout_seconds"]:
+                issues.append({"kind": "startup-timeout", "severity": "critical", "detail": "Startup/compilation has not produced a training iteration within the configured startup allowance"})
+        elif now - attempt["last_progress_at"] > policy["stall_seconds"]:
+            issues.append({"kind": "training-stalled", "severity": "critical", "detail": "Liveness alone does not prove training progress"})
+    if (latest.get("completed") or latest.get("phase") == "finished") and not completed:
+        issues.append({"kind": "completion-unverified", "severity": "critical", "detail": "Need matching process exit receipt, successful exit and observed expected final step"})
+    if latest.get("phase") == "failed":
+        issues.append({"kind": "training-failed", "severity": "critical", "detail": "Adapter reports training failure; preserve attempt evidence"})
+    if latest.get("phase") == "unknown":
+        issues.append({"kind": "training-state-unknown", "severity": "warning", "detail": "Training liveness/phase is unverified; reconcile the current attempt"})
+    if latest.get("adapter_warnings"):
+        issues.append({"kind": "adapter-warning", "severity": "warning", "detail": latest["adapter_warnings"]})
+    if attempt["fatal_errors"]:
+        issues.append({"kind": "training-fatal-error", "severity": "critical", "detail": attempt["fatal_errors"]})
     if latest.get("recovery_state") in {"restarting", "recovering", "restored"}:
-        recovered = attempt["progress_samples"] >= policy["min_progress_samples"] and latest.get("checkpoint_verified") is True
+        recovered = (attempt["progress_samples"] >= policy["min_progress_samples"] and latest.get("checkpoint_verified") is True
+                     and not any(attempt[key] for key in ("regressed", "clock_regressed", "contract_changed", "fatal_errors", "nonfinite")))
         if not recovered and now - attempt["started_at"] > policy["recovery_seconds"]:
             issues.append({"kind": "recovery-timeout", "severity": "critical", "detail": "Restart has not produced verified checkpoint and advancing steps"})
-    for name in ("loss", "grad_norm"):
-        value = latest.get(name)
-        if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value)):
-            issues.append({"kind": "nonfinite-" + name, "severity": "critical", "detail": "Preserve numerical evidence before recovery"})
+    for name in attempt["nonfinite"]:
+        issues.append({"kind": "nonfinite-" + name, "severity": "critical", "detail": "Preserve numerical evidence before recovery"})
     limit = policy.get("memory_limit_bytes")
     if limit and latest.get("device_memory_bytes") is not None:
         reserve = policy.get("required_headroom_bytes", 0)
         if limit - latest["device_memory_bytes"] < reserve:
             issues.append({"kind": "memory-headroom", "severity": "warning", "detail": "Device memory leaves less than the stage's configured reserve"})
     reference = policy.get("reference_step_seconds")
-    if reference and len(advancing) >= policy.get("performance_window", 5):
+    if reference and not attempt["clock_regressed"] and len(advancing) >= policy.get("performance_window", 5):
         subset = advancing[-policy.get("performance_window", 5):]
         delta = subset[-1]["step"] - subset[0]["step"]
-        ratio = (subset[-1]["timestamp"] - subset[0]["timestamp"]) / delta / reference if delta else None
+        # Collector scheduling/backlog is not training step latency. Preserve
+        # the adapter warning instead of classifying it as measured slowdown.
+        ratio = ((subset[-1]["timestamp"] - subset[0]["timestamp"]) / delta / reference
+                 if delta and all(_event_time_known(row) for row in subset) else None)
         if ratio and ratio > policy.get("slowdown_ratio", 1.2):
             issues.append({"kind": "sustained-slowdown", "severity": "warning", "detail": {"step_time_ratio": ratio}})
     return issues
@@ -121,7 +266,7 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
     if previous["path"] != str(path):
         raise FlowError("Watcher log path changed; use an explicit new watcher workspace")
     progress = previous.get("progress")
-    if progress is None:
+    if progress is None or previous.get("progress_version") != _PROGRESS_VERSION:
         # Older cursors retained only 1000 samples. Recover their clocks from the
         # transactionally retained observations rather than resetting on upgrade.
         progress = {}
@@ -175,11 +320,14 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
                 timestamp = sample.get("timestamp")
                 if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
                     raise ValueError("finite UTC epoch timestamp required")
+                _validate_contract(sample)
+                if _modern(sample) and "startup_timeout_seconds" not in policy:
+                    raise FlowError("Phase-aware monitoring requires an independent startup_timeout_seconds")
                 # Non-finite numerical samples become incidents, but JSON artifacts remain valid.
                 for name in ("loss", "grad_norm"):
                     if isinstance(sample.get(name), float) and not math.isfinite(sample[name]):
                         sample[name] = str(sample[name])
-                if "device_memory_bytes" in sample and (not isinstance(sample["device_memory_bytes"], (int, float)) or not math.isfinite(sample["device_memory_bytes"])):
+                if "device_memory_bytes" in sample and (not _finite(sample["device_memory_bytes"]) or sample["device_memory_bytes"] < 0):
                     raise ValueError("invalid device memory")
                 for flag in ("job_alive", "completed", "checkpoint_verified"):
                     if flag in sample and not isinstance(sample[flag], bool):
@@ -188,10 +336,10 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
                 existed = db.execute("SELECT 1 FROM events WHERE event_id=?", (event_id,)).fetchone()
                 store.event(db, tid, "observation", sample, event_id)
                 if not existed:
-                    if previous["samples"] and timestamp < previous["samples"][-1]["timestamp"]:
-                        errors.append("observation-time-regressed")
                     previous["samples"].append(sample)
                     _record_progress(progress, sample)
+            except FlowError:
+                raise
             except (ValueError, TypeError, KeyError) as exc:
                 errors.append("invalid-log-record:" + str(exc))
     samples = previous["samples"][-1000:]
@@ -215,9 +363,10 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
                  "status": "attention" if issues else "healthy-observed", "issues": issues,
                  "last_observation": samples[-1] if samples else None, "context": task["context"],
                  "context_epoch": task['context_epoch'],
+                 "completion_verified": bool(samples and _completion_verified(samples[-1], progress[samples[-1]["attempt_id"]], time.time() if now is None else now)),
                  "recovery_action": "none; external owner retains control"}
     db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, json.dumps({"offset": offset, "prefix": prefix_hash,
-               "prefix_length": prefix_length, "file_id": file_id, "progress": progress, "samples": samples,
+               "prefix_length": prefix_length, "file_id": file_id, "progress": progress, "progress_version": _PROGRESS_VERSION, "samples": samples,
                "active_incidents": next_active, "path": str(path), "context": task["context"],
                "context_epoch": task['context_epoch']}, allow_nan=False)))
     return heartbeat

@@ -135,3 +135,15 @@ Confirmed access to the supplied reference repository; read framework and commun
 Validation: full dependency/Python/index/11-Skill setup succeeded against the existing independent HCU-Knowledge checkout, with all 77,358 evidence objects and 32,269 derivatives checked. A second run exercised the current-index reuse path and synchronized the system Skills without rehashing historical data. Knowledge repository tracked files remain clean; no source update or extra clone. Six TrainFlow Skills validated; relative links resolve; all 12 Mermaid diagrams render without parser errors. README image regenerated and visually checked. Public/private files and Git diff reviewed; no release/tag.
 
 Final regression: 218 tests passed; knowledge validator checked 485 pages / 24 sources with no errors. Current-index reuse and installed Skill bindings verified; generated browser artifacts are ignored.
+
+## Real environment integration in progress
+
+Implemented and locally tested occupancy admission, SSH hop contracts, dimensional-proxy authorization, HIP trace attribution, batching/source-link integrity and training log/lifecycle observation. Actual fixed source transfer and bounded device/component diagnostics have run; full environment, model baseline, multi-rank optimization and long-run recovery remain open. Parser/tool issues and model initialization defects are retained with private evidence. No public site data, domain-knowledge update, release or completed-training claim.
+
+## Real-environment workflow qualification checkpoint
+
+- Generalized fresh device/process admission, nested SSH execution, immutable source transfer including nested Git modes, multi-node command receipts and uncertain-execution reconciliation. A dangling child Git marker and Windows path-case ambiguity are rejected before incorrect source metadata can propagate.
+- Added real training-log adapters, scoped observer lifecycles, all-member health aggregation, context handoff, versioned file Q&A, reusable private reference data, conservative cache maintenance and offline training curves with original-byte provenance.
+- TraceLens fork changes were independently reviewed and pinned after processing actual compressed, multi-rank HCU traces. Shape attribution, denominator coverage, missing groups and conditional operator bounds remain explicit.
+- Actual bounded training, optimization and stage-loss records are retained privately; collector pause/recovery demonstrates monitoring behavior, not recovery of a failed training job. Main-branch model integration has separate qualification and a retained checkpoint failure; full numerical/production gates are not marked passed.
+- Final local regression: **844 passed in 85.74 s** using system Python; knowledge validation: **485 pages / 24 sources / no errors**. Independent source-transfer checks passed; new chart tests include extreme finite numbers, missing values and raw-log byte verification. Public changed/new files were checked for private site identifiers and credentials; no matches. Final independent review and publication verification follow.

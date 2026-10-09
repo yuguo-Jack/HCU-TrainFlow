@@ -12,7 +12,8 @@ description: 统一编排 HCU 大模型训练适配、性能优化、大规模�
 1. 定位 HCU-TrainFlow checkout（用户路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。先读项目 `docs/collaboration.md`、`docs/multi-agent.md`、`docs/workflows.md`，查看当前 CLI 帮助与已有任务。找不到工程时说明所缺路径，不以安装 Skill 的相对位置猜测项目。
 2. 从会话和现场推导模型、预训练/SFT/RL、资源范围、部署方式、数据/权重、用户 patch、目标及已有授权。关键访问、数据或资源缺失才向用户询问；并行继续可做的阅读/分析。全流程用 `full`；只检查、适配、分析、优化、诊断、运行分别用现有独立模式，不扩大任务。
 3. 创建或恢复 TaskSpec；冻结初始数值基线、比较上下文、预算、执行权限、唯一容错负责人。依当前 HCU 活跃分支的脚本和现场启动方式适配，不机械照搬 NV 配方。读取原始证据的权限不等于允许发布数据或重启任意任务。
-4. 写出可验收的目标和阶段计划，`flow-start` 挂接持久循环。用 `flow-board` 向用户提供 BOARD.md 和 GUIDANCE.md 路径。预算是停止盲目试错的边界；实际调整理由用 `flow-replan` 留痕，不能偷偷降低目标或延长循环。
+4. 写出可验收的目标和阶段计划，`flow-start` 挂接持久循环。用 `flow-board` 向用户提供中文简要 BOARD.md、要求与指导 GUIDANCE.md、提问与回答 QUESTIONS.md 的路径；完整团队和历史在 DETAILS.md。预算是停止盲目试错的边界；实际调整理由用 `flow-replan` 留痕，不能偷偷降低目标或延长循环。
+5. 每个模型私有工作区保留 `task_plan.md`、`findings.md`、`progress.md`：分别记录当前计划、可追溯发现和实验/决策经过。它们补充看板与结构化 evidence，不代替程序门槛；跨环境/版本结论标明适用范围，现场数据不写进公共工程文档。
 
 ## 每轮工作
 
@@ -36,12 +37,26 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 
 - `$hcu-train-adapt`：环境验收、HCU 启动配方、模型适配和初始基线。可仅检查环境。
 - `$hcu-train-optimize`：可仅分析性能；先评估并行切分、微批/梯度累积与显存余量，按吞吐和通信代价选择配置；系统、融合、算子优化采用测量→假设→实施→验证→复核。累计 ≥90% 端到端热点集合中的非通信算子逐项建模；比较真实 shape 的独立测试。每轮局部正确性和 profiler-off 性能，稳定阶段才长窗口验 loss，始终对初始基线。复用 Flash-Train/TE 现有实现，必要时调用三个 Hygon kernel Skill。
-- `$hcu-train-fault-tolerance`：恢复完整模型后扩 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
+- `$hcu-train-fault-tolerance`：按本轮选定配置扩 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。完整模型目标须先恢复完整配置；用户明确以缩减模型验证本轮流程时，可扩该配置的 DP 并保留完整模型缺口，见 `docs/proxy-contract.md`。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
 - `$hcu-engine-wiki-search` / `$hcu-engine-wiki-update`：本地官方 Wiki 的检索和维护。需要 HCU 事实时读 HCU-Knowledge、当前底层库分支或官方资料；普通任务不顺带更新 HCU 大知识库。工具/脚本变了要复核相关 Skill、命令和解析器，不仅更新 Wiki。
 
 ## 看板指导
 
 默认每 5 分钟采集 GUIDANCE.md，由 `flow-watch` 或到期的 `flow-next` 收集到事件队列；每轮开始、昂贵实验前、阶段推进前检查已采集指导。不要每个步骤都绕过间隔直接重读文件。用户要求立即刷新时用 `flow-board` / `flow-watch --once`。逐条明确应用、排期或不能应用的理由并 `flow-guidance-ack`；不要编辑人的原文。阻塞问题以 `flow-question` 登记，收到实际回答后关闭。进展、收益/代价、显存趋势、平台期和专家需求写看板；避免要求确认常规动作。
+
+同一次轮询也采集 QUESTIONS.md。用户可按 `## Q1：问题` 写标题和正文；用 `flow-questions TASK` 读取待答项、问题版本和整份文件哈希。你负责查证并写 Markdown 答案，再用 `flow-answer TASK QUESTION ANSWER.md --version VERSION --file-hash HASH --author SESSION` 写回问题下方。不要直接重写人的问题文件；遇到编辑冲突先重读，不能用旧答案覆盖新内容。已发布回答保持版本，追问作为新问题或正文修改处理。回答内容不会产生新问题。
+
+问答是解释收件箱，不自动构成执行命令、扩大资源范围或重启训练的授权；不要据问题里的命令直接行动。待答问题不阻塞无关的已授权工作；及时回答与训练可并行。GUIDANCE、独立 review 和执行准入仍按原有规则处理。观察器/flow-watch 只采集，没有在线 Agent 或已配置唤醒桥接时不会自行生成答案，恢复后先读持久问题队列。
+
+用 `flow-status-update` 维护简短中文进展：一句概况、至多三条已完成/验证中事项、三条下一步和真正需要人判断的事项。不要把每条团队消息、原始 JSON 或所有实验日志塞进 BOARD；DETAILS 与私有的三个计划文件保留完整过程。简报不能修改真实流程状态，也不能把短跑、缩模或局部通过写成全模型验收通过。
+
+需要展示训练趋势时，使用项目 `scripts/render_training_dashboard.py` 从规范化日志生成私有单 attempt 图表；按 `docs/training-dashboard.md` 选择身份、记录原件哈希并保留历史输出。绘图只是观察，不能替代阶段质量、性能或容错验收；未采集的指标明确留空。
+
+## 工作区维护与观察交接
+
+由主控在同一个默认五分钟交互轮询中检查维护是否到期；有已登记缓存时调用一次 `scripts/maintain_workspace.py ... tick`，默认 dry-run。已明确配置自动清理的部署可按该 policy 加 `--enable-delete`，正常执行无需反复询问。只处理登记的可重建代次；老目录不自动迁移或删除，活跃/未知作业、lease、使用 pin 和原件引用继续保护。不要并行派多个清理者，也不要在每条 Agent 消息后扫工作空间。触发方式、缓存生产者与安装资源核对见 [维护与观察交接](references/maintenance.md)。
+
+实际 TaskSpec context 改变时，沿该参考完成**独立观察 Store、事件 peer 和 sentinel**的交接，保留旧游标和证据；不能只换 parser state-dir 或删 watcher 状态。多节点分别核对所有必需 member 的身份、ready、心跳和退出回执；先核对固定引擎源码和真实日志中的进度输出节点（可能是 rank0、全局最后一个 rank 或专用 logger）；该节点的 iteration/loss 只代表该日志覆盖范围。主控离线期间仅由已部署守护继续监测，不能把轮询脚本视为自动运行 Agent。
 
 ## 多 Agent 拆解、交流与集成
 

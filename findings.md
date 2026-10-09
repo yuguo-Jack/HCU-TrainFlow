@@ -104,3 +104,19 @@ Inspected the user-supplied hygonpilot-skills at 3b949665dbb74a2340f8a257345bb06
 HCU-Knowledge current local search succeeds; Galaxy results reinforce version-specific queue/stream semantics and preservation of historical API boundaries. Existing full installation did not require the domain KB; this is a real installation gap, not only wording. Reuse the existing checkout without fetching upstream knowledge or duplicating originals.
 
 Installation review also found unnecessary full historical validation on each external-KB reinstall. Setup now probes current index health and snapshot mode before restoring it; first-time, stale and rollback cases still bootstrap. The full local check passed, while future ready-index reuse avoids that repeated cost. HCU-Knowledge source/knowledge content is unchanged.
+
+## Real environment: reusable findings
+
+- Nested SSH execution and ProxyJump have different authentication locations; preserve strict host identity and existing credential boundaries.
+- Runtime/library activation differs between host and container; import-only checks may still access GPU devices. RDMA sysfs naming alone does not determine IB versus RoCE.
+- Source transport needs Windows Git executable and symlink semantics; content snapshots preserve internal-link provenance without assuming writable alias semantics.
+- Modern model-builder paths can bypass legacy audit hooks; validate actual parameter placement through initialization, precision wrappers, DDP and optimizer construction.
+- Real training observation must separate initialization from progress, source clocks from collection clocks, and verified child exit from process disappearance.
+## Real-environment integration lessons
+
+- A successful transfer hash is not enough when nested repositories contain Git symlink placeholders or executable files. Read the owning index, preserve link provenance and reject unavailable child metadata rather than accepting a parent repository fallback.
+- Distributed training may print progress on the last global rank. Verify the engine logger and monitor every required member independently; progress from one rank cannot certify all workers.
+- A paused collector can be detected and recovered without signalling training. This demonstrates collector-health handling only; training restart, notifications and Agent wake-up require their own deployment and evidence.
+- The same source with different audit/profile settings is not one performance cohort. Keep initial state, input sequence, optimizer configuration, parallel layout and measurement mode explicit when comparing optimization and loss.
+- Small native FP32 parameter groups can coexist with mixed-precision optimizer groups. Main-branch checkpoint qualification must preserve their actual optimizer ordering; forward/backward success alone does not demonstrate save or restart correctness.
+- Offline plots must distinguish missing samples, copied heartbeat state and actual fresh metrics. Hashes bind the retained bytes; chart appearance does not establish quality or performance acceptance.

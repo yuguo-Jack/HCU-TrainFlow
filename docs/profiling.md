@@ -31,6 +31,10 @@ GEMM FLOPs = 2×M×N×K×batch。其他 op 由实际算法定义 FLOPs、有效/
 
 `generated` 表示非空报告生成，不表示优化完成。TraceLens 原生百分比的统计窗口/分母不自动等于 TrainFlow 稳态窗口墙钟；Agent 需结合窗口、process groups 和 shape 证据解释，两套结果不能直接相加。缺失 CPU-op 关联、空表、超时与执行失败都会明确保留。
 
+选窗口时以 CPU `user_annotation` 的完整 `ProfilerStep#` 为依据。HIP trace 还可能在多个 GPU stream 输出同名 `gpu_user_annotation`；这些是同一步的设备区间，不能当成额外训练步。inventory 分别记录 CPU/GPU step annotation 数目，同时保留原总数。必须对照实际训练循环调用 `prof.step()` 的位置和 profiler schedule，不能由命令的起止数字直接推断采了几步。
+
+原生分析的 Python warnings 会保留在 worker 摘要及 stderr。若同一 CPU-op 组含不同数量的 kernel，TraceLens 的逐位置 kernel-detail 汇总可能跳过部分列表；此时报告标记 `incomplete`，不把聚合表误称完整样本。原始区间及独立事件归因仍可用于核对覆盖。没有父 CPU-op 的 runtime 项（例如 `hipLaunchKernel`）不能当作已经建立语义的算子；保持 `unlinked`，再按源码或额外采集定位。CPU 输入 shape 也不能直接充当其中每个 kernel 的 FLOPs 或访存量。
+
 默认不加载其他厂商的架构峰值。确有匹配 HCU 的配置才传 `--gpu-arch-json`；复杂算子仍需补充实际算法和访存模型，不能仅凭自动 FLOPs 宣称达到上限。
 
 kernel 瓶颈升级到 Hygon 算子 Skill，按环境分别使用 XProf/XCompute 或 hipprof。测量吞吐时关闭 profiler；对照 NV 融合粒度和内部精度路径后再验端到端收益。

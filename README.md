@@ -6,7 +6,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。每轮以实际证据推进，经过独立复核和修正；人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前源码版本：`0.4.0.dev0`，开发中，尚未发布。** 协作循环、证据检查和文件交互已有本地自动化验证；真实 HCU 训练、Agent 运行时接续及站点容错仍需逐项联调。当前不能视为拿到任意集群就可无人值守运行的成品。见 [能力与验证边界](docs/capabilities.md)。
+**当前源码版本：`0.4.0.dev0`，开发中，尚未发布。** 协作循环、证据检查和文件交互已有本地自动化验证；正在结合真实 HCU 环境验证远程执行、模型适配、性能分析与训练观测。完整训练、Agent 运行时接续及站点容错仍需逐项验收。当前不能视为拿到任意集群就可无人值守运行的成品。见 [能力与验证边界](docs/capabilities.md)。
 
 ## 如何开始
 
@@ -24,7 +24,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，按需使用三个 Hygon 算子 Skill。
 
-同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。资源不足时可缩 layer 跑通或筛机；扩规模前恢复完整模型，再逐级扩 DP 域并复核性能、显存和训练语义。
+同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。资源不足时默认缩 layer 跑通或筛机；用户明确允许缩维时记录授权范围与模型差异。扩规模前先验收选定的完整配置，再逐级扩 DP 域并复核性能、显存和训练语义；缩维代理的结果不能声称为原完整模型验证。
 
 完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新见 [工作流全景](docs/workflow-map.md)，其中列明阶段证据门槛及对应源码。
 
@@ -35,9 +35,14 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 ```text
 collaboration/<task>/BOARD.md       进度、待决问题、轮次复核和证据入口
 collaboration/<task>/GUIDANCE.md    人的评论、回答和优先级调整
+collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 ```
 
 在 `GUIDANCE.md` 写意见，默认每 **5 分钟**采集一次；主控在后续实验与推进前检查已采集的指导并记录处理结果。需要立即生效时可让 Agent 刷新，或运行 `flow-board` / `flow-watch --once`。文件轮询本身不运行模型。会话关闭后的自动接续需要部署 Agent bridge；本机离线时远端守护和原有容错继续运行。详见 [协作循环与文件交互](docs/collaboration.md) 和 [长训守护](docs/operations.md)。
+
+解释性问题可写入 `QUESTIONS.md`，主控按同一周期读取并在原问题下回答，保留问题与回答版本。问题不自动改变资源或重启授权；采集器不会代替离线的 Agent 生成答案。
+
+主控在同一周期检查已登记的可重建缓存，默认只生成清理计划；明确启用的部署策略可自动保留最近3代并清理过期代次，活跃作业与证据继续保护，老目录不会自动删除。模型/实验 context 换代时使用独立观察 Store，重新核对全部成员监测及独立 sentinel。见 [工作区维护与观察交接](docs/workspace-maintenance.md)。
 
 ## 多 Agent 如何协同
 
@@ -98,5 +103,6 @@ python scripts/validate_knowledge.py
 - [工作流全景](docs/workflow-map.md) / [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
 - [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)
 - [性能分析](docs/profiling.md) / [远程执行](docs/remote-execution.md)
+- [真实训练观察](docs/training-observation.md) / [离线训练图表](docs/training-dashboard.md) / [缓存维护与观察换代](docs/workspace-maintenance.md)
 - [官方 Wiki](knowledge/README.md) / [搜索与更新](docs/wiki.md) / [私有训练经验与 Cookbook 记录](docs/experience-knowledge.md)
 - [贡献与公开边界](CONTRIBUTING.md) / [参考工程](THIRD_PARTY_NOTICES.md)

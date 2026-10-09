@@ -4,6 +4,8 @@
 
 Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需 pytest。Git 用于源码与版本管理，SSH/scp、Docker、kubectl、Slurm 客户端只在使用相应执行方式时需要。TraceLens 通过固定 checkout 和本机 Python 的报告 API 集成，完整安装包含三个算子 Skill 及必需 HCU-Knowledge，步骤见 [第三方集成](integrations.md)。HCU 训练依赖由目标环境提供，本包不下载 PyTorch/DTK/模型。
 
+首次接入真实集群，先读 [环境发现与验收](environment-discovery.md)、[远程执行与准入](remote-execution.md) 和 [源码传输](source-transfer.md)。启动训练前按 [训练观测](training-observation.md) 建立真实 attempt、日志与退出回执；部署了观察器不等于已接通跨节点告警或 Agent 唤醒。
+
 ```bash
 python -m pip install -e ".[test]"
 python scripts/validate_knowledge.py
@@ -39,7 +41,7 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 源码传输 | source-snapshot/materialize/bundle/receive |
 | 多 Agent | team-plan/next、assignment-add/claim/bind/return/review/yield/cancel、agent-send/inbox/ack |
 | 事件投递 | inbox、inbox-dispatch |
-| 验收 | environment-check、proxy-check、iteration-check、quality-check |
+| 验收 | occupancy-check、environment-check、proxy-check、iteration-check、quality-check |
 | 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective |
 | 长训 | watch、heartbeat-check、events-export/import、monitor-report |
 | 官方 Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog |

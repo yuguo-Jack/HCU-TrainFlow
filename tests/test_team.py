@@ -89,7 +89,9 @@ def test_dependency_waits_for_acceptance_and_binds_exact_inputs(store):
     assert flow.next_step(store, 't')['action'] == 'work'
     board = flow.render_board(store, 't')
     from pathlib import Path
-    assert 'native-session-a' in Path(board['board']).read_text(encoding='utf8')
+    assert 'native-session-a' in Path(board['details']).read_text(encoding='utf8')
+    assert '(DETAILS.md)' in Path(board['board']).read_text(encoding='utf8')
+    assert Path(board['board']).parent / 'DETAILS.md' == Path(board['details'])
 
 
 @pytest.mark.parametrize('changes', [

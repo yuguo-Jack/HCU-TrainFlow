@@ -131,6 +131,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS flow_guidance_cursor(task TEXT PRIMARY KEY,hash TEXT);
             CREATE TABLE IF NOT EXISTS flow_guidance_scans(task TEXT PRIMARY KEY,checked_at REAL);
             CREATE TABLE IF NOT EXISTS flow_questions(task TEXT,id TEXT,payload TEXT,status TEXT,resolution TEXT,PRIMARY KEY(task,id));
+            CREATE TABLE IF NOT EXISTS file_question_scans(task TEXT PRIMARY KEY,hash TEXT,checked_at REAL,scope TEXT,error TEXT);
+            CREATE TABLE IF NOT EXISTS file_question_versions(task TEXT,id TEXT,version TEXT,scope TEXT,payload TEXT,status TEXT,answer TEXT,created TEXT,PRIMARY KEY(task,id,version,scope));
+            CREATE TABLE IF NOT EXISTS file_question_current(task TEXT,id TEXT,version TEXT,scope TEXT,PRIMARY KEY(task,id));
+            CREATE TABLE IF NOT EXISTS file_question_answers(task TEXT,id TEXT,payload TEXT,status TEXT,created TEXT,PRIMARY KEY(task,id));
+            CREATE TABLE IF NOT EXISTS flow_status(task TEXT PRIMARY KEY,payload TEXT,created TEXT);
             CREATE TABLE IF NOT EXISTS team_plans(task TEXT PRIMARY KEY,artifact TEXT,max_parallel INTEGER);
             CREATE TABLE IF NOT EXISTS assignment_runs(assignment TEXT PRIMARY KEY,token INTEGER,session TEXT,inputs TEXT,report TEXT,updated TEXT,note TEXT);
             CREATE TABLE IF NOT EXISTS assignment_operations(operation TEXT PRIMARY KEY,assignment TEXT,token INTEGER);
@@ -183,31 +188,68 @@ class Store:
         return result
 
     def put(self, data, visibility="private"):
+        return self.put_many([data], visibility)[0]
+
+    def put_many(self, payloads, visibility="private"):
+        """Persist each object, then register the whole batch in one transaction.
+
+        Payloads may be a generator: only hashes/metadata remain in memory.
+        An interrupted write can leave unregistered immutable objects, never a
+        registered partial batch. A retry verifies and reuses those objects.
+        """
         if visibility not in {"private", "public"}:
             raise FlowError("Invalid visibility")
-        sha = digest(data)
-        path = self.root / "objects" / sha[:2] / sha
-        if path.exists():
-            if digest(path.read_bytes()) != sha:
-                raise FlowError("Corrupted existing artifact")
-        else:
-            atomic_write(path, data)
+        hashes, records = [], {}
+        for data in payloads:
+            sha = digest(data)
+            path = self.root / "objects" / sha[:2] / sha
+            if sha not in records:
+                if path.exists():
+                    if digest(path.read_bytes()) != sha:
+                        raise FlowError("Corrupted existing artifact")
+                else:
+                    try:
+                        atomic_write(path, data)
+                    except OSError as publish_error:
+                        # Another writer may have published these exact bytes
+                        # while Windows readers prevent replacing its object.
+                        # Accept only a complete, readable hash match; keep real
+                        # permission/I/O failures and corruption visible.
+                        try:
+                            published = path.read_bytes()
+                        except OSError:
+                            raise publish_error
+                        if digest(published) != sha:
+                            raise FlowError("Corrupted competing artifact")
+                records[sha] = (path.relative_to(self.root).as_posix(), len(data))
+            hashes.append(sha)
+        if not records:
+            return hashes
         with self.db() as db:
-            old = db.execute("SELECT visibility FROM artifacts WHERE id=?", (sha,)).fetchone()
-            # Identical private bytes never silently become public through re-import.
-            effective = "private" if old and old[0] == "private" else visibility
-            db.execute("INSERT INTO artifacts VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET visibility=?", (sha, path.relative_to(self.root).as_posix(), len(data), effective, utc(), effective))
-        return sha
+            db.execute("BEGIN IMMEDIATE")
+            created = utc()
+            # Evaluate visibility inside the write lock: a concurrent private
+            # registration cannot be promoted by a public re-import.
+            db.executemany("INSERT INTO artifacts VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                           "visibility=CASE WHEN artifacts.visibility='private' THEN 'private' ELSE excluded.visibility END",
+                           ((sha, path, size, visibility, created) for sha, (path, size) in records.items()))
+        return hashes
 
     def artifact(self, sha):
+        with contextlib.closing(self.iter_artifacts([sha])) as objects:
+            return next(objects)[1]
+
+    def iter_artifacts(self, hashes):
+        """Stream verified objects while reusing one read connection."""
         with self.db() as db:
-            row = db.execute("SELECT * FROM artifacts WHERE id=?", (sha,)).fetchone()
-        if not row:
-            raise FlowError("Unknown artifact")
-        data = child(self.root, row["path"]).read_bytes()
-        if digest(data) != sha:
-            raise FlowError("Artifact hash mismatch")
-        return data
+            for sha in hashes:
+                row = db.execute("SELECT * FROM artifacts WHERE id=?", (sha,)).fetchone()
+                if not row:
+                    raise FlowError("Unknown artifact")
+                data = child(self.root, row["path"]).read_bytes()
+                if len(data) != row["size"] or digest(data) != sha:
+                    raise FlowError("Artifact hash mismatch")
+                yield sha, data
 
     def report(self, tid, kind, value):
         task = self.task(tid)

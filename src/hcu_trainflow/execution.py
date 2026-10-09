@@ -29,37 +29,45 @@ def operation_budget_seconds(db, operation_id, result, *, reserve=False):
 
 
 def command_plan(card):
-    allowed = {"schema_version", "argv", "cwd", "env", "timeout_seconds", "backend", "ssh_target", "container", "namespace", "pod", "allocation", "activation", "basis"}
-    if set(card) - allowed or card.get("schema_version") != 1:
+    allowed = {"schema_version", "argv", "cwd", "env", "timeout_seconds", "backend", "ssh_target", "ssh_jump", "ssh_known_hosts", "container", "namespace", "pod", "allocation", "activation", "basis"}
+    if not isinstance(card, dict) or set(card) - allowed or type(card.get("schema_version")) is not int or card.get("schema_version") != 1:
         raise FlowError("Unknown command-card fields or version")
     argv = card.get("argv")
     if not isinstance(argv, list) or not argv or any(not isinstance(x, str) or "\x00" in x for x in argv) or not argv[0]:
         raise FlowError("argv must be a nonempty string array")
     env = card.get("env", {})
-    if not isinstance(env, dict) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or not isinstance(v, str) or "\x00" in v for k, v in env.items()):
+    if not isinstance(env, dict) or any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or not isinstance(v, str) or "\x00" in v for k, v in env.items()):
         raise FlowError("Invalid environment mapping")
-    if not card.get("basis") or not card.get("cwd"):
+    if (not isinstance(card.get("basis"), str) or not card["basis"].strip()
+            or not isinstance(card.get("cwd"), str) or not card["cwd"] or "\x00" in card["cwd"]):
         raise FlowError("Commands require a reviewed basis and explicit working directory")
     timeout = card.get("timeout_seconds", 600)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 86400:
         raise FlowError("timeout_seconds must be in (0,86400]")
     backend = card.get("backend", "local")
+    if not isinstance(backend, str):
+        raise FlowError("Unsupported execution backend")
     activation = card.get("activation")
-    inner = "exec " + shlex.join(["env"] + [k + "=" + v for k, v in env.items()] + argv)
-    if activation:
+    # env -- preserves an executable/argument beginning with '-' as data. All
+    # user-provided arguments remain individual words across every shell hop.
+    inner = "exec " + shlex.join(["env", "--"] + [k + "=" + v for k, v in env.items()] + argv)
+    remote_command = "cd -- " + shlex.quote(card["cwd"]) + " && " + inner
+    if activation is not None:
         if not isinstance(activation, str) or not activation.startswith("/") or "\x00" in activation:
             raise FlowError("Activation must be a verified absolute POSIX script path")
-        inner = ". " + shlex.quote(activation) + " && " + inner
-    remote_command = "cd " + shlex.quote(card["cwd"]) + " && " + inner
+        # Activation scripts may themselves change directory. Establish the
+        # requested cwd after activation, then apply the card's explicit env.
+        remote_command = ". " + shlex.quote(activation) + " && " + remote_command
+    ssh_jump = card.get("ssh_jump")
+    if (ssh_jump is not None or card.get("ssh_known_hosts") is not None) and backend not in {"ssh", "ssh-docker", "ssh-slurm"}:
+        raise FlowError("SSH transport settings are only valid for SSH execution backends")
     result = {"backend": backend, "cwd": card["cwd"], "env": env, "timeout_seconds": timeout, "card_hash": fingerprint(card), "basis": card["basis"]}
     if backend == "local":
         if activation:
             raise FlowError("Local activation is not implicit; use an explicit interpreter in argv")
         result["argv"] = argv
     elif backend in {"ssh", "ssh-docker", "ssh-slurm"}:
-        target = card.get("ssh_target", "")
-        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", target):
-            raise FlowError("Use an explicit trusted SSH config alias or user@host")
+        target = _ssh_target(card.get("ssh_target"))
         if backend == "ssh-docker":
             container = card.get("container", "")
             safe_id(container)
@@ -69,7 +77,23 @@ def command_plan(card):
             if not allocation.isdecimal():
                 raise FlowError("Slurm execution requires an existing numeric allocation; this does not submit a new job")
             remote_command = shlex.join(["srun", "--jobid", allocation, "bash", "-lc", remote_command])
-        result.update(argv=["ssh", "-o", "BatchMode=yes", target, remote_command], cwd=None, env={})
+        else:
+            remote_command = shlex.join(["bash", "-lc", remote_command])
+        known_hosts = card.get("ssh_known_hosts")
+        if ssh_jump is not None and known_hosts is not None and (not isinstance(known_hosts, str) or not known_hosts.startswith("/")):
+            raise FlowError("Nested SSH known-hosts file must be an absolute POSIX path on the jump host")
+        transport = _ssh_argv(target, remote_command, known_hosts)
+        if ssh_jump is not None:
+            if (not isinstance(ssh_jump, dict) or set(ssh_jump) - {"mode", "target", "known_hosts"}
+                    or ssh_jump.get("mode") != "exec"):
+                raise FlowError("ssh_jump requires mode='exec', target, and optional known_hosts")
+            jump = _ssh_target(ssh_jump.get("target"))
+            if jump == target:
+                raise FlowError("Jump host and final target must differ")
+            # Unlike ProxyJump, this SSH client runs on the jump host and uses
+            # its existing credentials. Never copy keys or forward an agent.
+            transport = _ssh_argv(jump, "exec " + shlex.join(transport), ssh_jump.get("known_hosts"))
+        result.update(argv=transport, cwd=None, env={})
     elif backend == "k8s":
         for key in ("pod", "namespace", "container"):
             safe_id(card.get(key))
@@ -79,7 +103,43 @@ def command_plan(card):
     return result
 
 
+def _ssh_target(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", value):
+        raise FlowError("Use an explicit trusted SSH config alias or user@host")
+    return value
+
+
+def _ssh_argv(target, command, known_hosts=None):
+    # Known hosts must be enrolled through the site's normal verification
+    # procedure; a command-card execution must never prompt or trust a new key.
+    arguments = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ForwardAgent=no",
+                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15"]
+    if known_hosts is not None:
+        if (not isinstance(known_hosts, str) or not known_hosts
+                or any(ord(x) < 32 for x in known_hosts) or any(x in known_hosts for x in ("%", "$"))
+                or not (known_hosts.startswith("/") or re.match(r"^[A-Za-z]:[/\\]", known_hosts))
+                or known_hosts.lower().replace("\\", "/").rstrip("/") in {"/dev/null", "nul"}):
+            raise FlowError("SSH known-hosts file must be an explicit absolute path, without expansion tokens")
+        if re.match(r"^[A-Za-z]:[/\\]", known_hosts):
+            known_hosts = known_hosts.replace("\\", "/")
+        # OpenSSH parses -o as config syntax after argv parsing. Quote again so
+        # spaces denote one filename, not multiple user-known-hosts files.
+        quoted = '"' + known_hosts.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        arguments += ["-o", "UserKnownHostsFile=" + quoted]
+    return arguments + [target, command]
+
+
 def run_command(store, tid, operation_id, card, lease, *, control_plane=False, assignment=None, owner=None, token=None):
+    # Use the existing group lock domain for every operation ID. Reconciliation
+    # cannot declare "no process" while this controller can still launch one,
+    # and a single/group API race cannot dispatch the same ID twice.
+    from .command_group import _controller_lock
+    with _controller_lock(store, operation_id):
+        return _run_command(store, tid, operation_id, card, lease, control_plane=control_plane,
+                            assignment=assignment, owner=owner, token=token)
+
+
+def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, assignment=None, owner=None, token=None):
     from . import team
     if control_plane and assignment:
         raise FlowError('A local delivery bridge is not an assignment experiment')
@@ -192,61 +252,276 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False, a
     return result
 
 
+def _source_name(name):
+    """Reject path aliases before platform-dependent Path normalization."""
+    from pathlib import PurePosixPath
+    if (not isinstance(name, str) or not name or "\\" in name or ":" in name or "\x00" in name
+            or name.startswith("/") or any(part in {"", ".", ".."} for part in name.split("/"))):
+        raise FlowError("Source paths must be unambiguous relative POSIX paths")
+    if name.split("/", 1)[0].casefold() == "trainflow-snapshot.json":
+        raise FlowError("Source path collides with reserved trainflow-snapshot.json receipt")
+    if os.name == "nt" and any(part.endswith((".", " ")) or PurePosixPath(part).stem.upper() in
+                              {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(1, 10)],
+                               *[f"LPT{i}" for i in range(1, 10)]} for part in name.split("/")):
+        raise FlowError("Source path is not representable safely on Windows")
+    return name
+
+
+def _validate_manifest(manifest, snapshot_id):
+    if not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+        raise FlowError("Invalid snapshot ID")
+    if (not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int
+            or manifest["schema_version"] != 1 or not isinstance(manifest.get("files"), dict) or not manifest["files"]):
+        raise FlowError("Invalid source manifest")
+    if fingerprint(manifest) != snapshot_id:
+        raise FlowError("Snapshot manifest hash mismatch")
+    names = set()
+    for name, info in manifest["files"].items():
+        _source_name(name)
+        normalized = os.path.normcase(name)
+        if normalized in names:
+            raise FlowError("Source paths collide on the target filesystem")
+        names.add(normalized)
+        if (not isinstance(info, dict) or not isinstance(info.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", info["sha256"])
+                or type(info.get("size")) is not int or info["size"] < 0 or type(info.get("executable")) is not bool):
+            raise FlowError("Invalid source file metadata")
+        if "source_path" in info:
+            _source_name(info["source_path"])
+    for name in names:
+        # normcase uses backslashes on Windows; normalize just for this prefix check.
+        parts = name.replace("\\", "/").split("/")
+        if any(os.path.normcase("/".join(parts[:i])) in names for i in range(1, len(parts))):
+            raise FlowError("Source file conflicts with a parent directory")
+    links = manifest.get("resolved_links", {})
+    if not isinstance(links, dict):
+        raise FlowError("Invalid source link evidence")
+    for name, link in links.items():
+        from .core import digest
+        _source_name(name)
+        if not isinstance(link, dict):
+            raise FlowError("Invalid source link evidence")
+        target = link.get("target")
+        if (not isinstance(target, str) or not target or target.startswith("/") or "\\" in target or ":" in target
+                or any(ord(char) < 32 for char in target) or digest(target.encode("utf-8")) != link.get("target_sha256")
+                or link.get("kind") not in {"file", "directory"}
+                or link.get("representation") not in {"filesystem-symlink", "git-index-placeholder"}):
+            raise FlowError("Invalid source link evidence")
+        _source_name(link.get("resolved_source"))
+    return manifest
+
+
+def _git_modes(repo):
+    metadata = Path(repo) / ".git"
+    if metadata.is_symlink() and not metadata.exists():
+        # Git may silently discover an enclosing repository through a dangling
+        # child .git link. Its successful exit does not establish child modes.
+        raise FlowError("Cannot read dangling Git source metadata: " + str(repo))
+    result = subprocess.run(["git", "-C", str(repo), "ls-files", "--stage", "-z"], capture_output=True)
+    if result.returncode:
+        if (Path(repo) / ".git").exists() or (Path(repo) / ".git").is_symlink():
+            raise FlowError("Cannot read Git source modes: " + str(repo))
+        return {}
+    modes = {}
+    for row in result.stdout.split(b"\0"):
+        if not row:
+            continue
+        metadata, name = row.split(b"\t", 1)
+        mode, _, stage = metadata.split(b" ")
+        name = name.decode("utf-8", errors="surrogateescape")
+        modes[name] = mode.decode("ascii") if stage == b"0" else "unmerged"
+    return modes
+
+
+def _executable_metadata(candidate, name, modes, *, windows=None):
+    if modes.get(name) == "120000":
+        raise FlowError("Git symlink source requires explicit external dependency handling")
+    if modes.get(name) == "unmerged":
+        raise FlowError("Unmerged Git source requires conflict resolution before snapshot")
+    windows = os.name == "nt" if windows is None else windows
+    if windows:
+        # Windows stat reports suffix-based execute bits, not the Git mode.
+        # Untracked files have no POSIX execution contract; use bash/python
+        # explicitly or git add/update-index --chmod=+x before snapshotting.
+        return {"executable": modes.get(name) == "100755",
+                "executable_source": "git-index" if name in modes else "windows-untracked-default-nonexecutable"}
+    return {"executable": bool(candidate.stat().st_mode & 0o111), "executable_source": "posix-working-tree"}
+
+
+def _new_transfer_destination(destination):
+    destination = Path(destination).resolve()
+    if destination.exists():
+        raise FlowError("Snapshot destination must be new; never overwrite a running worktree")
+    staging = destination.with_name(destination.name + ".partial")
+    if staging.exists() or staging.is_symlink():
+        raise FlowError("An unfinished transfer exists; inspect it before retry")
+    return destination, staging
+
+
+def _excluded_source(name):
+    parts = name.split("/")
+    return any(part in {".git", ".private", ".work", "__pycache__"} or part.startswith(".env") for part in parts)
+
+
+def _resolve_source(repo, name, modes, links, chain=(), mode_roots=None):
+    """Resolve components in order, including Git's Windows text placeholders.
+
+    Do not normpath before following a link: link/.. is relative to the link's
+    resolved directory, not necessarily the directory containing the link.
+    """
+    from .core import digest
+    mode_roots = {repo} if mode_roots is None else mode_roots
+    parts, todo = [], name.split("/")
+    while todo:
+        part = todo.pop(0)
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise FlowError("Source link escapes repository")
+            parts.pop()
+            continue
+        current = "/".join([*parts, part])
+        candidate = repo.joinpath(*parts, part)
+        physical_link = candidate.is_symlink()
+        if (os.name == "nt" and not physical_link and candidate.exists()
+                and candidate.resolve().name != part):
+            raise FlowError("Select source paths with their exact filesystem spelling")
+        if physical_link or modes.get(current) == "120000":
+            if current in chain or len(chain) >= 64:
+                raise FlowError("Source link cycle or excessive link depth")
+            if physical_link:
+                target = os.readlink(candidate)
+                raw = target.encode("utf-8")
+                representation = "filesystem-symlink"
+            else:
+                if not candidate.is_file():
+                    raise FlowError("Git source link placeholder is missing")
+                raw = candidate.read_bytes()
+                try:
+                    target = raw.decode("utf-8")
+                except UnicodeError as exc:
+                    raise FlowError("Invalid Git source link placeholder") from exc
+                representation = "git-index-placeholder"
+            if (not target or target.startswith("/") or "\\" in target or ":" in target
+                    or any(ord(char) < 32 for char in target)):
+                raise FlowError("Source links must contain a relative POSIX target")
+            resolved = _resolve_source(repo, "/".join([*parts, target]), modes, links, (*chain, current), mode_roots)
+            resolved_name = resolved.relative_to(repo).as_posix()
+            if _excluded_source(resolved_name):
+                raise FlowError("Source link targets an excluded private/generated path")
+            evidence = {"target": target, "target_sha256": digest(raw), "resolved_source": resolved_name,
+                        "kind": "directory" if resolved.is_dir() else "file", "representation": representation}
+            if current in links and links[current] != evidence:
+                raise FlowError("Source link changed during snapshot")
+            links[current] = evidence
+            parts = list(resolved.relative_to(repo).parts)
+            candidate = resolved
+        else:
+            if getattr(candidate, "is_junction", lambda: False)():
+                raise FlowError("Source junctions require explicit external dependency handling")
+            if not candidate.exists():
+                raise FlowError("Source or link target does not exist: " + current)
+            if not candidate.resolve().is_relative_to(repo):
+                raise FlowError("Source escaped repository")
+            parts.append(part)
+        if candidate.is_dir() and candidate not in mode_roots and ((candidate / ".git").exists() or (candidate / ".git").is_symlink()):
+            # The outer index contains only the gitlink for a submodule.
+            # Load its index before interpreting any contained placeholder,
+            # even when the selected path names a file inside that checkout.
+            prefix = candidate.relative_to(repo).as_posix() + "/"
+            modes.update({prefix + child: mode for child, mode in _git_modes(candidate).items()})
+            mode_roots.add(candidate)
+        if todo and not candidate.is_dir():
+            raise FlowError("Source link path traverses a non-directory")
+    resolved = repo.joinpath(*parts)
+    if not resolved.exists():
+        raise FlowError("Source or link target does not exist")
+    return resolved
+
+
 def snapshot(store, repository, paths):
     repo = Path(repository).resolve()
     if not paths:
         raise FlowError("Choose explicit source paths to snapshot")
-    files = {}
+    files, selected_files, links = {}, {}, {}
+    modes = _git_modes(repo)
+    mode_roots = {repo}
+    def select(source_name, output_name, ancestors=()):
+        if _excluded_source(source_name) or _excluded_source(output_name):
+            return
+        _source_name(output_name)
+        candidate = _resolve_source(repo, source_name, modes, links, mode_roots=mode_roots)
+        if candidate.is_dir():
+            if candidate in ancestors:
+                raise FlowError("Source directory link cycle")
+            for entry in sorted(candidate.iterdir()):
+                select(entry.relative_to(repo).as_posix(), output_name + "/" + entry.name, (*ancestors, candidate))
+        elif candidate.is_file():
+            selected_files[output_name] = candidate
+        else:
+            raise FlowError("Unsupported source file type")
     for relative in paths:
-        if (repo / relative).is_symlink():
-            raise FlowError("Selected source is a symlink")
-        path = child(repo, relative)
-        if not path.exists():
-            raise FlowError("Selected source does not exist: " + relative)
-        selected = [path] if path.is_file() else sorted(path.rglob("*"))
-        for candidate in selected:
-            if candidate.is_symlink():
-                raise FlowError("Snapshot symlinks require explicit external dependency handling")
-            if not candidate.is_file():
-                continue
-            name = candidate.relative_to(repo).as_posix()
-            if any(part in {".git", ".private", ".work", "__pycache__"} for part in candidate.relative_to(repo).parts) or candidate.name.startswith(".env"):
-                continue
-            if not candidate.resolve().is_relative_to(repo):
-                raise FlowError("Source escaped repository")
-            content = candidate.read_bytes()
-            files[name] = {"sha256": store.put(content), "size": len(content), "executable": bool(candidate.stat().st_mode & 0o111)}
-    if not files:
+        relative = str(relative).replace("\\", "/") if os.name == "nt" else str(relative)
+        _source_name(relative)
+        select(relative, relative)
+    if not selected_files:
         raise FlowError("Empty source snapshot")
+    def contents():
+        from .core import digest
+        for name, candidate in sorted(selected_files.items()):
+            if candidate.is_symlink() or not candidate.resolve().is_relative_to(repo):
+                raise FlowError("Source changed to a symlink or escaped repository during snapshot")
+            before = candidate.stat()
+            content = candidate.read_bytes()
+            after = candidate.stat()
+            if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+                raise FlowError("Source changed while being read; stop edits before taking a snapshot")
+            original = candidate.relative_to(repo).as_posix()
+            files[name] = {"sha256": digest(content), "size": len(content), **_executable_metadata(candidate, original, modes)}
+            if original != name:
+                files[name]["source_path"] = original
+            yield content
+        # Resolve again before the batch becomes registered. Replacement of a
+        # link with a regular file must not silently retain stale provenance.
+        for link_name, evidence in list(links.items()):
+            if not (repo / link_name).is_symlink() and modes.get(link_name) != "120000":
+                raise FlowError("Source link changed during snapshot")
+            resolved = _resolve_source(repo, link_name, modes, links, mode_roots=mode_roots)
+            if resolved.relative_to(repo).as_posix() != evidence["resolved_source"]:
+                raise FlowError("Source link changed during snapshot")
+    store.put_many(contents())
     head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True)
     manifest = {"schema_version": 1, "files": files, "git_head": head.stdout.strip() if head.returncode == 0 else None,
                 "meaning": "Exact selected working-tree bytes, including uncommitted modifications; repository HEAD alone is insufficient"}
+    if links:
+        manifest["resolved_links"] = links
+        manifest["meaning"] += "; contained relative links dereferenced into immutable ordinary files, with resolution evidence; writable alias semantics are not retained"
     sid = fingerprint(manifest)
+    _validate_manifest(manifest, sid)
     write_json(store.root / "snapshots" / (sid + ".json"), manifest)
     return {"snapshot_id": sid, **manifest}
 
 
 def materialize(store, snapshot_id, destination):
     from .core import read_json, digest
-    if not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+    if not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
         raise FlowError("Invalid snapshot ID")
     manifest = read_json(store.root / "snapshots" / (snapshot_id + ".json"))
-    if fingerprint(manifest) != snapshot_id:
-        raise FlowError("Snapshot manifest hash mismatch")
-    destination = Path(destination).resolve()
-    if destination.exists():
-        raise FlowError("Snapshot destination must be new; never overwrite a running worktree")
-    staging = destination.with_name(destination.name + ".partial")
-    if staging.exists():
-        raise FlowError("An unfinished transfer exists; inspect it before retry")
+    _validate_manifest(manifest, snapshot_id)
+    destination, staging = _new_transfer_destination(destination)
     staging.mkdir(parents=True)
-    for name, info in manifest["files"].items():
-        path = child(staging, name)
-        atomic_write(path, store.artifact(info["sha256"]))
-        if digest(path.read_bytes()) != info["sha256"]:
-            raise FlowError("Materialized snapshot hash mismatch")
-        if info["executable"] and os.name != "nt":
-            path.chmod(0o755)
+    import contextlib
+    with contextlib.closing(store.iter_artifacts(info["sha256"] for info in manifest["files"].values())) as objects:
+        for (name, info), (_, content) in zip(manifest["files"].items(), objects):
+            if len(content) != info["size"]:
+                raise FlowError("Source manifest size mismatch")
+            path = child(staging, name)
+            atomic_write(path, content)
+            if digest(path.read_bytes()) != info["sha256"]:
+                raise FlowError("Materialized snapshot hash mismatch")
+            if info["executable"] and os.name != "nt":
+                path.chmod(0o755)
     write_json(staging / "trainflow-snapshot.json", {"snapshot_id": snapshot_id, **manifest})
     staging.rename(destination)
     return {"snapshot_id": snapshot_id, "destination": str(destination), "verified": True}
@@ -256,36 +531,61 @@ def bundle(store, snapshot_id, destination):
     """Portable exact-byte bundle; copy it with the site's approved SSH/transfer tool."""
     import zipfile
     from .core import read_json
-    if not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+    if not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
         raise FlowError("Invalid snapshot ID")
     manifest = read_json(store.root / "snapshots" / (snapshot_id + ".json"))
-    if fingerprint(manifest) != snapshot_id:
-        raise FlowError("Snapshot manifest changed")
-    with zipfile.ZipFile(destination, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+    _validate_manifest(manifest, snapshot_id)
+    destination, staging = _new_transfer_destination(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    import contextlib
+    with zipfile.ZipFile(staging, "x", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("manifest.json", json.dumps({"snapshot_id": snapshot_id, "manifest": manifest}))
-        for name, record in manifest["files"].items():
-            archive.writestr("files/" + name, store.artifact(record["sha256"]))
-    return {"snapshot_id": snapshot_id, "bundle": str(Path(destination).resolve()), "visibility": "private"}
+        with contextlib.closing(store.iter_artifacts(info["sha256"] for info in manifest["files"].values())) as objects:
+            for (name, record), (_, content) in zip(manifest["files"].items(), objects):
+                if len(content) != record["size"]:
+                    raise FlowError("Source manifest size mismatch")
+                archive.writestr("files/" + name, content)
+    with staging.open("r+b") as stream:
+        os.fsync(stream.fileno())
+    staging.rename(destination)
+    return {"snapshot_id": snapshot_id, "bundle": str(destination), "visibility": "private"}
 
 
 def receive(store, archive_path, destination, max_bytes=4 * 1024**3):
     import zipfile
     from .core import digest
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise FlowError("Transfer maximum bytes must be a positive integer")
+    _new_transfer_destination(destination)
     with zipfile.ZipFile(archive_path) as archive:
         names = archive.namelist()
         if len(names) != len(set(names)) or sum(x.file_size for x in archive.infolist()) > max_bytes:
             raise FlowError("Duplicate archive member or bundle too large")
-        record = json.loads(archive.read("manifest.json"))
+        def unique_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise FlowError("Duplicate manifest JSON key")
+                result[key] = value
+            return result
+        record = json.loads(archive.read("manifest.json"), object_pairs_hook=unique_pairs)
+        if not isinstance(record, dict) or not {"manifest", "snapshot_id"} <= record.keys():
+            raise FlowError("Invalid transferred snapshot record")
         manifest, sid = record["manifest"], record["snapshot_id"]
-        if fingerprint(manifest) != sid:
-            raise FlowError("Transferred manifest failed integrity check")
+        _validate_manifest(manifest, sid)
         if set(names) != {"manifest.json"} | {"files/" + x for x in manifest["files"]}:
             raise FlowError("Bundle file set differs from manifest")
         for name, info in manifest["files"].items():
+            member = archive.getinfo("files/" + name)
+            if member.is_dir() or (member.external_attr >> 16) & 0o170000 == 0o120000 or member.file_size != info["size"]:
+                raise FlowError("Transferred source member type/size mismatch")
             child(destination, name)
-            content = archive.read("files/" + name)
-            if len(content) != info["size"] or digest(content) != info["sha256"]:
-                raise FlowError("Transferred source hash/size mismatch")
-            store.put(content)
+        def contents():
+            for name, info in manifest["files"].items():
+                content = archive.read("files/" + name)
+                if len(content) != info["size"] or digest(content) != info["sha256"]:
+                    raise FlowError("Transferred source hash/size mismatch")
+                yield content
+        store.put_many(contents())
     write_json(store.root / "snapshots" / (sid + ".json"), manifest)
     return materialize(store, sid, destination)

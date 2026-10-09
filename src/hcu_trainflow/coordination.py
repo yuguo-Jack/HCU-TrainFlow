@@ -17,6 +17,14 @@ def finish_assignment(store, aid, owner, report_id, token):
 
 
 def reconcile_operation(store, oid, status, evidence, note):
+    from .command_group import _controller_lock
+    # Same operation lock as both execution APIs. Its process lifetime, not a
+    # sampled PID or lease expiry, determines whether a controller can launch.
+    with _controller_lock(store, oid):
+        return _reconcile_operation(store, oid, status, evidence, note)
+
+
+def _reconcile_operation(store, oid, status, evidence, note):
     from .execution import operation_budget_seconds
     if status not in {"complete", "failed"} or not evidence or not note:
         raise FlowError("Reconciliation needs terminal outcome, retained evidence and explanation")
@@ -24,6 +32,9 @@ def reconcile_operation(store, oid, status, evidence, note):
         store.artifact(sha)
     with store.db() as db:
         db.execute("BEGIN IMMEDIATE")
+        group = db.execute("SELECT 1 FROM events WHERE kind='command-group-intent' AND json_extract(payload,'$.operation')=?", (oid,)).fetchone()
+        if group:
+            raise FlowError("Command groups require command-group-reconcile covering every original member")
         row = db.execute("SELECT * FROM operations WHERE id=?", (oid,)).fetchone()
         if not row or row["status"] not in {"started", "unknown"}:
             raise FlowError("Only unresolved operations can be reconciled")

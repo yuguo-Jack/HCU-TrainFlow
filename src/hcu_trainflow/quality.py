@@ -6,12 +6,54 @@ from .analysis import number
 from .core import FlowError, fingerprint
 
 
-def proxy_contract(full, candidate):
-    changes = {k: {"full": full.get(k), "candidate": candidate.get(k)} for k in full.keys() | candidate.keys() if full.get(k) != candidate.get(k)}
-    allowed = set(changes) <= {"num_layers"}
-    if "num_layers" in changes:
-        allowed = allowed and all(isinstance(x.get("num_layers"), int) and not isinstance(x.get("num_layers"), bool) for x in (full, candidate)) and 0 < candidate["num_layers"] < full["num_layers"]
-    return {"status": "pass" if allowed else "fail", "changes": changes, "is_proxy": bool(changes), "full_model_equivalent": not changes, "runtime_validated": False}
+def _same_json(left, right):
+    """Model semantics include key presence and JSON value types, recursively."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_same_json(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_same_json(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def proxy_contract(full, candidate, authorization=None):
+    """Check an explicit proxy's scope, never claim runtime or full-model validity.
+
+    Layer-only reduction remains the default. Dimension reduction requires a
+    recorded user authorization listing each numeric field; architecture and
+    numerical validity are separate evidence obligations.
+    """
+    if not isinstance(full, dict) or not isinstance(candidate, dict):
+        raise FlowError('Model contracts must be JSON objects')
+    changes = {k: {"full": full.get(k), "candidate": candidate.get(k),
+                   "full_present": k in full, "candidate_present": k in candidate}
+               for k in full.keys() | candidate.keys()
+               if k not in full or k not in candidate or not _same_json(full[k], candidate[k])}
+    dimensions = []
+    if authorization is not None:
+        if not isinstance(authorization, dict) or set(authorization) - {'authority', 'reason', 'allowed_dimension_reductions'}:
+            raise FlowError('Proxy authorization requires authority, reason and explicit dimension fields')
+        for key in ('authority', 'reason'):
+            if not isinstance(authorization.get(key), str) or not authorization[key].strip():
+                raise FlowError('Proxy authorization must record user authority and reason')
+        dimensions = authorization.get('allowed_dimension_reductions')
+        if not isinstance(dimensions, list) or not dimensions or any(not isinstance(k, str) or not k.strip() or k == 'num_layers' for k in dimensions) or len(set(dimensions)) != len(dimensions):
+            raise FlowError('List each authorized dimension field exactly once; layer reduction is already supported')
+    allowed_fields = {'num_layers', *dimensions}
+    reasons = []
+    for key in changes:
+        if key not in allowed_fields:
+            reasons.append(key + ':unauthorized-change')
+        elif not all(type(x.get(key)) is int for x in (full, candidate)) or not 0 < candidate[key] < full[key]:
+            reasons.append(key + ':requires-positive-integer-reduction')
+    return {'status': 'fail' if reasons else 'pass', 'changes': changes,
+            'is_proxy': bool(changes), 'full_model_equivalent': not changes,
+            'runtime_validated': False, 'reasons': reasons,
+            'authorization': authorization,
+            'scope': 'dimension-proxy' if set(changes) - {'num_layers'} else 'layer-proxy' if changes else 'unchanged',
+            'required_followup': ['architecture-constraints', 'numerical-baseline', 'selected-configuration-scaling'] if changes else [],
+            'limits': 'Static scope check only. A reduced model does not validate full-model memory, loss convergence or scaling.'}
 
 
 def validate_measurement(value, context, path_required=True):

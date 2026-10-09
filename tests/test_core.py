@@ -55,6 +55,74 @@ def test_paths_and_artifact_integrity(store,tmp_path):
     (store.root/'objects'/sha[:2]/sha).write_bytes(b'changed')
     with pytest.raises(FlowError):store.artifact(sha)
 
+
+def test_competing_immutable_writers_reuse_verified_object(store, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from hcu_trainflow import core
+    original = core.atomic_write
+    both = threading.Barrier(2)
+    published = threading.Event()
+    guard = threading.Lock()
+    calls = 0
+    def racing_write(path, data):
+        nonlocal calls
+        with guard:
+            slot = calls
+            calls += 1
+        both.wait(timeout=5)
+        if slot == 0:
+            original(path, data)
+            published.set()
+        else:
+            assert published.wait(timeout=5)
+            raise PermissionError('Windows reader prevents replacement')
+    monkeypatch.setattr(core, 'atomic_write', racing_write)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(store.put, b'same complete object', visibility)
+                for visibility in ('private', 'public')]
+        hashes = [job.result(timeout=10) for job in jobs]
+    assert hashes[0] == hashes[1]
+    assert store.artifact(hashes[0]) == b'same complete object'
+    with store.db() as db:
+        assert db.execute('SELECT visibility FROM artifacts WHERE id=?', (hashes[0],)).fetchone()[0] == 'private'
+
+
+@pytest.mark.parametrize('competing', [None, b'corrupted'])
+def test_failed_object_publication_does_not_hide_missing_or_corrupt_target(store, monkeypatch, competing):
+    from hcu_trainflow import core
+    def failed_write(path, data):
+        if competing is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(competing)
+        raise PermissionError('actual publication failure')
+    monkeypatch.setattr(core, 'atomic_write', failed_write)
+    expected = PermissionError if competing is None else FlowError
+    with pytest.raises(expected):
+        store.put(b'expected bytes')
+    with store.db() as db:
+        assert db.execute('SELECT count(*) FROM artifacts').fetchone()[0] == 0
+
+
+def test_unreadable_competing_object_keeps_publication_error(store, monkeypatch):
+    from pathlib import Path
+    from hcu_trainflow import core
+    original = Path.read_bytes
+    error = PermissionError('actual publication failure')
+    def fail(path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        raise error
+    def unreadable(path):
+        if 'objects' in path.parts:
+            raise PermissionError('object cannot be verified')
+        return original(path)
+    monkeypatch.setattr(core, 'atomic_write', fail)
+    monkeypatch.setattr(Path, 'read_bytes', unreadable)
+    with pytest.raises(PermissionError) as caught:
+        store.put(b'expected bytes')
+    assert caught.value is error
+
 @pytest.mark.parametrize('backend',['ssh','ssh-docker','ssh-slurm','k8s'])
 def test_remote_command_quoting(backend):
     card={'schema_version':1,'backend':backend,'argv':['python','file name.py','a; echo bad'], 'cwd':'/work/a b','env':{'X':'x;danger'},'basis':'reviewed','ssh_target':'site','container':'train','allocation':'123','pod':'worker','namespace':'train'}

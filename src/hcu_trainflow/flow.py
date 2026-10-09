@@ -93,11 +93,18 @@ def start(store, tid, plan, reason=None):
             db.execute('INSERT OR REPLACE INTO flow_guidance_cursor VALUES(?,?)', (tid, sha))
     if task['state'] == 'draft':
         store.transition(tid, 'prepared')
-    render_board(store, tid)
-    return {'task': tid, 'goal': goal, 'status': 'started', 'board': str(board), 'guidance': str(guidance)}
+    views = render_board(store, tid)
+    return {'task': tid, 'goal': goal, 'status': 'started', **views}
 
 
 def sync_guidance(store, tid, *, force=False):
+    from . import file_questions
+    guidance = _sync_guidance(store, tid, force=force)
+    questions = file_questions.scan(store, tid, force=force)
+    return {**guidance, 'questions_new': questions['new'], 'question_scan': questions}
+
+
+def _sync_guidance(store, tid, *, force=False):
     with store.db() as db:
         flow = get_flow(db, tid)
         scan = db.execute('SELECT checked_at FROM flow_guidance_scans WHERE task=?', (tid,)).fetchone()
@@ -248,12 +255,15 @@ def last_round(db, tid):
 
 def next_step(store, tid):
     sync_guidance(store, tid)
+    from .file_questions import state as question_state
+    inbox = question_state(store, tid)
     task = store.task(tid)
     with store.db() as db:
         flow = get_flow(db, tid)
         if not flow:
             raise FlowError('Start the collaborative flow first')
-        result = {'task': tid, 'state': task['state'], 'context': task['context'], 'goal': flow['goal']}
+        result = {'task': tid, 'state': task['state'], 'context': task['context'], 'goal': flow['goal'],
+                  'file_questions': {'pending': inbox['pending'], 'path': inbox['path'], 'scan_error': inbox['scan_error'], 'blocking': False}}
         row = last_round(db, tid)
         if row and row['status'] == 'accepted':
             candidate = artifact_json(store, row['candidate'])
@@ -484,6 +494,33 @@ def guard_execution(store, tid, *, allow_parallel=False):
             raise FlowError('Resolve flow decision before more execution: ' + decision['action'] + ' ' + ', '.join(decision.get('reasons', [])))
 
 
+def status_update(store, tid, value):
+    """A concise human-facing summary; does not change any execution gate."""
+    required = {'summary', 'progress', 'next', 'needs_human', 'evidence'}
+    if not isinstance(value, dict) or set(value) != required:
+        raise FlowError('Status requires summary, progress, next, needs_human and evidence')
+    if not isinstance(value['summary'], str) or not value['summary'].strip() or len(value['summary']) > 240 or '\n' in value['summary']:
+        raise FlowError('Status summary must be one concise line up to 240 characters')
+    for key in ('progress', 'next', 'needs_human'):
+        if not isinstance(value[key], list) or len(value[key]) > 3 or any(not isinstance(x, str) or not x.strip() or len(x)>200 or '\n' in x for x in value[key]):
+            raise FlowError('Status lists allow at most three concise single-line items')
+    if not isinstance(value['evidence'], list):
+        raise FlowError('Status evidence must be retained artifact IDs')
+    for sha in value['evidence']:
+        store.artifact(sha)
+    task = store.task(tid)
+    body = {**value, 'context': task['context'], 'context_epoch': task['context_epoch']}
+    artifact = retain(store, body)
+    with store.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = db.execute('SELECT context FROM tasks WHERE id=?', (tid,)).fetchone()
+        if not get_flow(db, tid) or current['context'] != task['context'] or context_epoch(db, tid) != task['context_epoch']:
+            raise FlowError('Start/reconcile the current flow before writing its status')
+        db.execute('INSERT OR REPLACE INTO flow_status VALUES(?,?,?)', (tid, json.dumps(body, ensure_ascii=False), utc()))
+        store.event(db, tid, 'flow-status-updated', {'artifact': artifact, **body})
+    return {**render_board(store, tid), 'status_artifact': artifact}
+
+
 def render_board(store, tid):
     task = store.task(tid)
     with store.db() as db:
@@ -494,8 +531,16 @@ def render_board(store, tid):
         guidance = [dict(x) for x in db.execute("SELECT * FROM flow_guidance WHERE task=? AND status!='template' ORDER BY created", (tid,))]
         questions = [dict(x) for x in db.execute('SELECT * FROM flow_questions WHERE task=?', (tid,))]
         reports = [dict(x) for x in store.current_reports(db, tid, task['context']).values()]
-        events = [dict(x) for x in db.execute('SELECT kind,payload,created FROM events WHERE task=? ORDER BY seq DESC LIMIT 12', (tid,))]
+        events = [dict(x) for x in db.execute('SELECT kind,payload,created FROM events WHERE task=? ORDER BY seq DESC', (tid,))]
+        status = db.execute('SELECT payload,created FROM flow_status WHERE task=?', (tid,)).fetchone()
     directory, board, human = board_paths(store, tid)
+    from . import file_questions
+    try:
+        file_questions.ensure(store, tid)
+    except FlowError:
+        pass  # Missing user content is shown below, never recreated.
+    inbox = file_questions.state(store, tid)
+    details = child(directory, 'DETAILS.md')
     def link(sha):
         return f'[{sha[:12]}](../../objects/{sha[:2]}/{sha})'
     lines = ['# HCU-TrainFlow collaboration board', '', task['spec']['objective'], '',
@@ -533,5 +578,38 @@ def render_board(store, tid):
     for item in messages(store,tid):
         m=item['message']
         lines += [f"- **{item['id']}** · {m['sender']} → {m['recipient']} · {m['kind']} / {item['status']} · stale={item['stale']}: {m['body']}"]
-    atomic_write(board, '\n'.join(lines) + '\n')
-    return {'board': str(board), 'guidance': str(human), 'task': tid}
+    lines += ['', '## User file questions (not execution authorization)', '',
+              f"Pending: {inbox['pending']} · [QUESTIONS.md](QUESTIONS.md) · scan error: {inbox['scan_error'] or 'none'}"]
+    atomic_write(details, '\n'.join(lines) + '\n')
+    labels = {'draft':'任务已登记', 'prepared':'准备阶段', 'environment_checked':'环境已验收',
+              'baseline_validated':'初始基线已验证', 'profiling':'性能分析', 'optimizing':'优化迭代',
+              'scale_ready':'准备扩容', 'training':'持续训练', 'completed':'已完成',
+              'cancelled':'已取消', 'paused':'已暂停', 'blocked':'等待解决阻塞', 'failed':'出现失败'}
+    concise = ['# 训练工作看板', '',
+               f"更新：{utc()} · 流程登记：**{labels.get(task['state'], task['state'])}**", '',
+               '[提问与回答](QUESTIONS.md) · [修改要求与指导](GUIDANCE.md) · [完整协作记录](DETAILS.md)',
+               '[计划](../../task_plan.md) · [发现](../../findings.md) · [过程](../../progress.md)', '',
+               '## 当前进展', '']
+    status_body = json.loads(status['payload']) if status else None
+    fresh = status_body and status_body['context'] == task['context'] and status_body['context_epoch'] == task['context_epoch']
+    if fresh:
+        concise += [status_body['summary'], ''] + ['- ' + x for x in status_body['progress']]
+        concise += ['', '## 接下来', ''] + (['- ' + x for x in status_body['next']] or ['- 按当前计划继续。'])
+    else:
+        concise += ['主控尚未更新当前上下文的简要进展；请查看完整记录。']
+        if rounds:
+            latest = rounds[-1]
+            concise += ['- 最近候选：' + artifact_json(store, latest['candidate'])['summary'][:200]]
+    concise += ['', '## 需要你关注', '']
+    needs = list(status_body['needs_human']) if fresh else []
+    needs += [json.loads(q['payload'])['title'][:200] for q in questions if q['status']=='open' and json.loads(q['payload'])['blocking']]
+    pending_guidance = sum(x['status'] in {'pending','needs-human'} for x in guidance)
+    if pending_guidance:
+        needs.append(f'有 {pending_guidance} 版指导等待主控处理。')
+    if inbox['scan_error']:
+        needs.append('问题文件暂时无法正常采集，请保留原件并查看完整记录中的原因。')
+    concise += ['- ' + x for x in needs[:5]] or ['- 当前没有已登记的人工决策需求。']
+    concise += ['', f"你的问题：{inbox['pending']} 项待回答；默认每 5 分钟采集，在线 Agent 会在原问题下回复。",
+                '此页由程序生成；完整证据、团队消息和历史保存在完整协作记录中。进展摘要不替代训练验收。', '']
+    atomic_write(board, '\n'.join(concise))
+    return {'board': str(board), 'guidance': str(human), 'questions': inbox['path'], 'details': str(details), 'task': tid}

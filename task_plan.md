@@ -97,3 +97,19 @@ Real training and site-dependent command validation remain pending until hardwar
 2. Integrate conditional Torch-native and communication guidance into the existing optimization Skill; clarify restoration and DP scale-out — complete.
 3. Require HCU-Knowledge in full setup, including index and bound Skills; support reuse and explicit permission failures — complete.
 4. Refresh diagrams, review/test setup and Skills, synchronize local installation, commit/push without release — complete locally; publication recorded in Git history.
+
+## Real-environment qualification (active)
+
+1. Discover and qualify authorized transport, container, occupancy, tool provenance and computation/communication capabilities.
+2. Adapt a fixed official model proxy on current HCU software; establish component numerics, real-data baseline and checkpoint restoration.
+3. Exercise measured training traces, dynamic optimization tasks, private experience, independent review, monitoring and scale-out.
+4. Generalize and test each reproduced workflow/TraceLens defect, synchronize Skills and review public-safe changes; no release.
+
+Site inventory, model/data definitions, raw measurements and user guidance are retained only in the external private task workspace. Environment and model gates remain incomplete until their actual coverage passes.
+
+### Qualification checkpoint
+
+- Transport, immutable snapshots, bounded resource admission, training observation, multi-member health, private references and offline plots have reusable implementations and CPU regressions.
+- Actual component numerics, bounded training, multiple-rank profiling, an optimization comparison, stage loss observations and collector failure/recovery have been exercised. These are separate evidence cohorts, not a blanket production pass.
+- Main HCU delivery integration is being qualified separately; a native mixed-precision checkpoint failure is retained and must be repaired and retested. No donor result is relabelled as main-branch acceptance.
+- Final public review, installed Skill synchronization and development commit remain the publication steps. No tag/release; unsupported automatic recovery/notification and full-size model claims stay open.

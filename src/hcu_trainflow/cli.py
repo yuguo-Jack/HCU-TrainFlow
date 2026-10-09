@@ -34,6 +34,9 @@ def parser():
     q = cmd('flow-review-failed', 'task', 'round'); q.add_argument('--reason', required=True)
     cmd('flow-advance', 'task')
     cmd('flow-board', 'task')
+    cmd('flow-status-update', 'task', 'file')
+    q = cmd('flow-questions', 'task'); q.add_argument('--refresh', action='store_true')
+    q = cmd('flow-answer', 'task', 'question', 'file'); q.add_argument('--version', required=True); q.add_argument('--file-hash', required=True); q.add_argument('--author', required=True)
     q = cmd('flow-watch', 'task'); q.add_argument('--once', action='store_true')
     q = cmd('flow-guidance-ack', 'task', 'hash'); q.add_argument('--decision', choices=['applied','queued','needs-human','not-applicable'], required=True); q.add_argument('--note', required=True)
     cmd('flow-question', 'task', 'file')
@@ -46,6 +49,10 @@ def parser():
     cmd("lease-release", "file")
     cmd("command-plan", "card")
     q = cmd("command-run", "task", "operation", "card", "lease_file"); q.add_argument('--assignment'); q.add_argument('--owner'); q.add_argument('--token',type=int)
+    cmd("command-group-plan", "card")
+    q = cmd("command-group-run", "task", "operation", "card", "leases_file"); q.add_argument('--assignment'); q.add_argument('--owner'); q.add_argument('--token',type=int)
+    cmd("command-group-status", "operation")
+    cmd("command-group-reconcile", "operation", "file")
     cmd("operation-reconcile", "operation", "file")
     cmd("assignment-add", "task", "file")
     q = cmd("assignment-return", "assignment", "owner", "report"); q.add_argument('--token',type=int,required=True)
@@ -65,14 +72,16 @@ def parser():
     cmd("source-bundle", "snapshot", "destination")
     cmd("source-receive", "archive", "destination")
     cmd("environment-check", "contract", "observations")
-    cmd("proxy-check", "full", "candidate")
+    cmd("occupancy-check", "contract", "observations")
+    q = cmd("proxy-check", "full", "candidate"); q.add_argument('--authorization', help='Explicit user-authorized numeric dimension reduction contract')
     cmd("quality-check", "contract", "baseline", "candidate")
     cmd("iteration-check", "file")
     cmd("profile-plan", "file")
-    q = cmd("profile-analyze", "trace", "window"); q.add_argument("--models"); q.add_argument("--output"); q.add_argument("--groups")
-    q = cmd('tracelens-report', 'trace'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--rank', type=int); q.add_argument('--gpu-arch-json'); q.add_argument('--timeout', type=int, default=1800)
+    q = cmd("profile-analyze", "trace", "window"); q.add_argument("--models"); q.add_argument("--output"); q.add_argument("--groups"); q.add_argument('--attribution', help='TraceLens export bound to this exact trace and window')
+    q = cmd('tracelens-report', 'trace'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--rank', type=int); q.add_argument('--gpu-arch-json'); q.add_argument('--timeout', type=int, default=1800); q.add_argument('--window', help='Explicit training-step window for CPU/GPU shape attribution')
     q = cmd('tracelens-collective', 'trace_pattern'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--world-size', type=int, required=True); q.add_argument('--timeout', type=int, default=1800)
     q = cmd("watch", "task", "log", "policy"); q.add_argument("--once", action="store_true"); q.add_argument("--interval", type=float, default=10)
+    q = cmd("observe-training", "task", "manifest", "policy"); q.add_argument("--exit-receipt"); q.add_argument("--state-dir")
     q = cmd("heartbeat-check", "file"); q.add_argument("--max-age", type=float, required=True)
     q = cmd("events-export", "destination"); q.add_argument("--after", type=int, default=0)
     cmd("events-import", "peer", "file")
@@ -80,6 +89,9 @@ def parser():
     cmd("monitor-report", "task", "output")
     cmd("public-export", "source", "destination", "manifest")
     cmd('experience-record','task','file')
+    cmd('reference-record', 'file')
+    cmd('reference-query', 'file')
+    cmd('reference-index')
     cmd('experience-index')
     q=cmd('experience-sync'); q.add_argument('task',nargs='?')
     cmd('experience-read','id')
@@ -114,7 +126,7 @@ def parser():
 
 
 def execute(a):
-    from . import analysis, coordination, delivery, environment, execution, flow, monitor, quality, team, wiki, official, experience
+    from . import admission, analysis, coordination, delivery, environment, execution, flow, monitor, quality, team, wiki, official, experience
     store = Store(a.workspace)
     c = a.command
     if c == "init": return {"workspace": str(store.root), "schema_version": 1, "version": __version__}
@@ -131,12 +143,22 @@ def execute(a):
     if c == 'flow-guidance-ack': return flow.acknowledge(store, a.task, a.hash, a.decision, a.note)
     if c == 'flow-question': return flow.question(store, a.task, read_json(a.file))
     if c == 'flow-question-close': return flow.close_question(store, a.task, a.question, a.guidance, a.note)
+    if c == 'flow-status-update': return flow.status_update(store, a.task, read_json(a.file))
+    if c in {'flow-questions', 'flow-answer'}:
+        from . import file_questions
+        if c == 'flow-questions':
+            file_questions.scan(store, a.task, force=a.refresh)
+            return file_questions.state(store, a.task)
+        result = file_questions.answer(store, a.task, a.question, a.version, a.file_hash,
+                                       Path(a.file).read_text(encoding='utf-8-sig'), author=a.author)
+        flow.render_board(store, a.task)
+        return result
     if c in {'flow-board', 'flow-watch'}:
         while True:
             change = flow.sync_guidance(store, a.task, force=c == 'flow-board' or a.once)
             result = {**flow.render_board(store, a.task), **change}
             if c == 'flow-board' or a.once: return result
-            if change['new']: print(json.dumps(result, ensure_ascii=False), flush=True)
+            if change['new'] or change['questions_new'] or change['question_scan'].get('error'): print(json.dumps(result, ensure_ascii=False), flush=True)
             with store.db() as db: interval = flow.get_flow(db, a.task)['plan']['poll_seconds']
             time.sleep(interval)
     if c == "artifact-add": return {"artifact": store.put(Path(a.file).read_bytes()), "visibility": "private"}
@@ -150,6 +172,12 @@ def execute(a):
     if c == "lease-release": return store.release(read_json(a.file))
     if c == "command-plan": return execution.command_plan(read_json(a.card))
     if c == "command-run": return execution.run_command(store, a.task, a.operation, read_json(a.card), read_json(a.lease_file),assignment=a.assignment,owner=a.owner,token=a.token)
+    if c.startswith("command-group-"):
+        from . import command_group
+        if c == "command-group-plan": return command_group.group_plan(read_json(a.card))
+        if c == "command-group-run": return command_group.run_group(store, a.task, a.operation, read_json(a.card), read_json(a.leases_file), assignment=a.assignment, owner=a.owner, token=a.token)
+        if c == "command-group-status": return command_group.group_status(store, a.operation)
+        if c == "command-group-reconcile": return command_group.reconcile_group(store, a.operation, read_json(a.file))
     if c == "operation-reconcile": return coordination.reconcile_operation(store, a.operation, **read_json(a.file))
     if c == "assignment-add": return coordination.assign(store, a.task, read_json(a.file))
     if c == "assignment-return": return coordination.finish_assignment(store, a.assignment, a.owner, a.report, a.token)
@@ -169,7 +197,8 @@ def execute(a):
     if c == "source-bundle": return execution.bundle(store, a.snapshot, a.destination)
     if c == "source-receive": return execution.receive(store, a.archive, a.destination)
     if c == "environment-check": return environment.assess_health(read_json(a.contract), read_json(a.observations))
-    if c == "proxy-check": return quality.proxy_contract(read_json(a.full), read_json(a.candidate))
+    if c == "occupancy-check": return admission.assess_occupancy(read_json(a.contract), read_json(a.observations))
+    if c == "proxy-check": return quality.proxy_contract(read_json(a.full), read_json(a.candidate), read_json(a.authorization) if a.authorization else None)
     if c == "quality-check": return quality.compare_loss(read_json(a.contract), read_json(a.baseline), read_json(a.candidate))
     if c == "iteration-check": return quality.assess_iteration(**read_json(a.file))
     if c == "profile-plan":
@@ -177,10 +206,15 @@ def execute(a):
     if c in {'tracelens-report', 'tracelens-collective'}:
         from .tracelens import run_report
         if c == 'tracelens-report':
-            return run_report(store, a.project, trace=a.trace, rank=a.rank, gpu_arch_json=a.gpu_arch_json, timeout=a.timeout)
+            return run_report(store, a.project, trace=a.trace, rank=a.rank, gpu_arch_json=a.gpu_arch_json, timeout=a.timeout, window=read_json(a.window) if a.window else None)
         return run_report(store, a.project, trace_pattern=a.trace_pattern, world_size=a.world_size, timeout=a.timeout)
     if c == "profile-analyze":
-        result = analysis.analyze_trace(read_json(a.trace), read_json(a.window), read_json(a.models) if a.models else {})
+        from .tracelens import file_hash, read_trace
+        attribution = read_json(a.attribution) if a.attribution else None
+        if attribution:
+            if attribution.get('source', {}).get('sha256') != file_hash(a.trace):
+                raise FlowError('Attribution source bytes differ from the selected trace')
+        result = analysis.analyze_trace(read_trace(a.trace), read_json(a.window), read_json(a.models) if a.models else {}, attribution=attribution)
         if a.groups:
             groups = read_json(a.groups)
             coverage = analysis.profile_plan(groups, [int(x) for x in result["ranks"] if x.isdecimal()])
@@ -191,6 +225,10 @@ def execute(a):
             result["status"] = "incomplete"
         if a.output: write_json(a.output, result)
         return result
+    if c == "observe-training":
+        from .training_logs import observe_once
+        state_dir = a.state_dir or store.root / "training-logs" / a.task
+        return observe_once(store.root, a.task, a.manifest, a.policy, state_dir, a.exit_receipt)
     if c == "watch":
         if not 0.1 <= a.interval <= 3600: raise FlowError("Watch interval must be in [0.1,3600]")
         policy = read_json(a.policy)
@@ -208,6 +246,11 @@ def execute(a):
     if c == "monitor-report": return delivery.monitor_report(store, a.task, a.output)
     if c == "public-export": return delivery.export_public(a.source, a.destination, read_json(a.manifest))
     if c == 'experience-record': return experience.record(store,a.task,read_json(a.file))
+    if c in {'reference-record','reference-query','reference-index'}:
+        from . import reference_data
+        if c == 'reference-record': return reference_data.record(store, read_json(a.file))
+        if c == 'reference-query': return reference_data.query(store, read_json(a.file))
+        return reference_data.rebuild(store)
     if c == 'experience-index': return experience.rebuild(store)
     if c == 'experience-sync': return experience.sync(store,a.task)
     if c == 'experience-read': return experience.get(store,a.id)
@@ -257,6 +300,11 @@ def execute(a):
 
 
 def main(argv=None):
+    # Structured output is UTF-8 on every host, including Windows redirected
+    # streams (native profiler column names can contain non-ASCII symbols).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     args = parser().parse_args(argv)
     try:
         result = execute(args)

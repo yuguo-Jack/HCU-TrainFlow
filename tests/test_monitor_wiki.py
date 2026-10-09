@@ -52,9 +52,10 @@ def test_recovery_requires_progress_and_checkpoint():
     sample={'attempt_id':'b','step':10,'timestamp':100,'recovery_state':'restored','checkpoint_verified':False}
     assert 'recovery-timeout' in [x['kind'] for x in observation_issues([sample],POLICY,now=160)]
 
-def test_confirmed_completion_does_not_become_stall():
+def test_legacy_completion_label_without_receipt_is_unverified():
     sample={'attempt_id':'b','step':100,'timestamp':100,'completed':True,'job_alive':False}
-    assert observation_issues([sample],POLICY,now=10000)==[]
+    assert {'completion-unverified', 'job-exited', 'training-stalled'} <= {
+        issue['kind'] for issue in observation_issues([sample],POLICY,now=10000)}
 
 def test_replay_and_claim(tmp_path):
     remote,path=setup(tmp_path);poll_log(remote,'t',path,POLICY,now=200)

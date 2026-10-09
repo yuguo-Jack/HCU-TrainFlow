@@ -168,6 +168,19 @@ def test_questions_require_human_answer(tmp_path):
     assert flow.next_step(store,'t')['action'] == 'work'
 
 
+def test_user_explanation_question_preserves_accepted_review_and_execution_guards(tmp_path):
+    from hcu_trainflow import file_questions
+    store = setup(tmp_path)
+    flow.submit(store, 't', candidate(store))
+    flow.review(store, 't', verdict(store))
+    file_questions.paths(store, 't')[1].write_text('## Q1：这个结果为什么成立？\n', encoding='utf-8')
+    flow.sync_guidance(store, 't', force=True)
+    decision = flow.next_step(store, 't')
+    assert decision['action'] == 'advance' and decision['file_questions']['pending'] == 1
+    with store.db() as db:
+        assert flow.last_round(db, 't')['status'] == 'accepted'
+
+
 def test_pending_guidance_blocks_work_but_not_authorized_bridge(tmp_path):
     store = setup(tmp_path)
     flow.board_paths(store,'t')[2].write_text('Pause and inspect the metrics.', encoding='utf8')
