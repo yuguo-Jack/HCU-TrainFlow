@@ -115,3 +115,9 @@ Implemented scoped PR search, pinned code reading, public PR source pages, compl
 
 - Gave the README overview its own section; made the failed stage-validation loop, full-model minimum-DP validation and completion/handoff condition explicit. Summarized parallel-layout/memory tradeoffs and linked the ten detailed diagrams.
 - Added concise official/private/HCU knowledge roles, online PR-to-source fallback, local Wiki maintenance and private experience boundaries. Kept the development version and site-validation status unchanged; no runtime or Skill changes.
+
+## 2026-10-09: illustrated README overview
+
+- Used built-in imagegen to create a navy/cyan technical workflow illustration. Refined parallel-task presentation, the separate pass/retry branches and text readability; selected the final shorter-copy image after visual inspection.
+- Stored the PNG and final generation prompt under docs/assets; README links to the full-size image. The editable ten-diagram workflow map remains the detailed technical source. No runtime, Skill, version, release or HCU-Knowledge changes.
+- Verified the 1536×1024 PNG, README/prompt links and Git whitespace; knowledge validation passed 485 pages/24 sources with no errors. Only the selected final image is included in Git.

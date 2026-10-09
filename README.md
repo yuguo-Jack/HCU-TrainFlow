@@ -18,21 +18,9 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ## 工作流总览
 
-```mermaid
-flowchart TD
-    U[模型、环境与目标] --> A[环境验收与模型适配]
-    A --> O[并行切分与显存预算<br/>性能分析与系统 / 算子优化]
-    O --> Q{阶段 loss 与性能通过？}
-    Q -->|未通过，修正或回退| O
-    Q -->|通过| S[完整模型最小 DP 域<br/>筛机与扩容验证]
-    S --> T[长训监测、容错与故障诊断]
-    C[实施 → 测量 → 独立复核 → 修正] --- A
-    C --- O
-    C --- S
-    C --- T
-    H[人类看板指导] <--> C
-    T -->|达到约定的完成或交接条件| D[可复现成果与持续运行记录]
-```
+[![HCU-TrainFlow 工作流总览：环境适配、性能优化与阶段验收、扩容长训；多 Agent、独立复核、远端执行和知识沉淀贯穿全程](docs/assets/workflow-overview.png)](docs/assets/workflow-overview.png)
+
+点击图片可查看原尺寸。
 
 优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，按需使用三个 Hygon 算子 Skill。
 
