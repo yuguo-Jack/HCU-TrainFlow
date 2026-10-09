@@ -26,3 +26,18 @@ Implement the first usable local-centred workflow release. Preserve the 36 requi
 
 - Complete: corrected preparation guidance to reuse applicable HCU scripts and the user's deployment, with official model/training semantics as the reference.
 - Complete: reviewed related workflow, Megatron topics, profiling and maintenance guidance together; Wiki integrity and all three changed Skills validate successfully.
+
+## Active follow-up: training libraries and bundled integrations
+
+1. Inspect current TE, cuDNN Frontend and TraceLens sources/tutorials and dependency repository layout — complete.
+2. Add detailed official library Wiki topics, monitored source/tutorial paths, source locks and workflow impact rules — complete.
+3. Integrate TraceLens execution and reproducible thirdparty acquisition, including optional private HCU-Knowledge and the three Hygon kernel Skills — complete.
+4. Update installation/workflow guidance, validate fresh-environment behavior and real TraceLens fixture execution, review — complete. Publication is recorded in Git history.
+
+Public repository stores reusable integration and public authored knowledge. HCU-Knowledge contents remain in an ignored checkout and access failure cannot block the public workflow installation.
+
+### Follow-up acquisition issues
+
+- cuDNN Frontend shallow clone hit an HTTP/2 early EOF; TraceLens pack transfer stalled. Retry with HTTP/1.1 and sparse acquisition to avoid large non-code payloads.
+- TE's historical user-guide URL returns 404; use the current canonical documentation root and pinned in-repository tutorial sources.
+- The pinned TraceLens CLI imports an unrelated helper that sets csv.field_size_limit(sys.maxsize), overflowing Windows C long. The integration uses its supported report API in an isolated worker, retaining the upstream checkout unmodified.

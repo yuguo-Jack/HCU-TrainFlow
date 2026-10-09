@@ -25,6 +25,12 @@ GEMM FLOPs = 2×M×N×K×batch。其他 op 由实际算法定义 FLOPs、有效/
 
 ## TraceLens
 
-可用其 `TraceLens_generate_perf_report_pytorch --profile_json_path ... --output_csvs_dir ...` 做细节报告，先看已安装 `--help`。multi-rank collective 报告需要真实 rank 及通信上下文。TrainFlow 不内置或重写完整 TraceLens，也不把其内置其他厂商架构表当 HCU 峰值。
+安装与依赖版本见 [第三方集成](integrations.md)。`tracelens-report TRACE --project PROJECT --rank RANK` 调用锁定版本的 PyTorch report API，输出原生 op/kernel、overlap 等 CSV、输入哈希、日志与报告清单。JSON 和 `.json.gz` 均可读取；不是重新实现一套 TraceLens。
+
+`tracelens-collective 'rank*.json' --project PROJECT --world-size N` 要求完整 `0..N-1` 文件和实际通信上下文。并行域只采两个代表 rank 时，仍可逐 rank 分析，但不足以运行要求完整 ranks 的 collective 报告。RCCL 事件能否识别、collective 映射和分组字段须在目标 trace 上核对；合成单 rank 回归不代表真实 HCU 通信已验证。
+
+`generated` 表示非空报告生成，不表示优化完成。TraceLens 原生百分比的统计窗口/分母不自动等于 TrainFlow 稳态窗口墙钟；Agent 需结合窗口、process groups 和 shape 证据解释，两套结果不能直接相加。缺失 CPU-op 关联、空表、超时与执行失败都会明确保留。
+
+默认不加载其他厂商的架构峰值。确有匹配 HCU 的配置才传 `--gpu-arch-json`；复杂算子仍需补充实际算法和访存模型，不能仅凭自动 FLOPs 宣称达到上限。
 
 kernel 瓶颈升级到 Hygon 算子 Skill，按环境分别使用 XProf/XCompute 或 hipprof。测量吞吐时关闭 profiler；对照 NV 融合粒度和内部精度路径后再验端到端收益。

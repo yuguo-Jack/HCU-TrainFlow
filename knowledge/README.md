@@ -8,7 +8,7 @@ visibility: public
 
 本库以公开官方源码为基准，保存固定提交的阅读说明、工程导航和优化机制。HCU 私有补丁、现场材料和训练数据保存在任务工作区，通过可选 HCU-Knowledge 检索补充。
 
-首版深度主要在 Megatron 生态与 AMD/华为/百度的代表性机制；其他引擎提供明确入口和任务检查路线，未宣称完成逐模型 Wiki。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
+重点覆盖 Megatron 生态、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；其他引擎提供明确入口和任务检查路线，未宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
 
 ## 章节
 
@@ -47,3 +47,20 @@ visibility: public
 ## 更新方法
 
 `wiki-refresh` 采集注册文件并生成受影响页面和工作流清单；用 Wiki update Skill 深读差异、PR 顶层 review/评论/代码后修订所有关联结论，最后 `wiki-review` 写复核回执和 `wiki-index` 重建搜索。运行中的任务继续使用原锁定快照，升级需重新建立 context。
+
+## 官方底层训练库
+
+- [Transformer Engine 官方工程：定位、目录与训练调用链](official-transformer-engine-wiki/overview.md)
+- [TE 安装、运行、单测与 HCU 环境接入](official-transformer-engine-wiki/build-run-test.md)
+- [TE 低精度训练：recipe、amax、权重缓存与反向状态](official-transformer-engine-wiki/precision-and-cache.md)
+- [TE Attention：后端选择、cuDNN 调用与训练精度契约](official-transformer-engine-wiki/attention.md)
+- [TE 并行与显存：Userbuffers、CP、Graph 和 Offload](official-transformer-engine-wiki/overlap-and-memory.md)
+- [TE 融合与形状级分析：OperationFuser 和 GEMM 教程](official-transformer-engine-wiki/fusion-and-profiling.md)
+- [TE 官方教程索引与版本更新方法](official-transformer-engine-wiki/tutorials-and-update.md)
+- [cuDNN Frontend 官方工程：Graph、开放 Kernel 与训练调用链](official-cudnn-frontend-wiki/overview.md)
+- [cuDNN Frontend 编译安装、运行示例与测试路线](official-cudnn-frontend-wiki/build-run-test.md)
+- [cuDNN Graph、执行计划、Workspace 与动态形状缓存](official-cudnn-frontend-wiki/graph-and-plans.md)
+- [cuDNN SDPA 训练：Forward、Backward、Stats 与布局](official-cudnn-frontend-wiki/attention.md)
+- [cuDNN 开放 Kernel：MoE 融合、FROST 与稀疏 Attention](official-cudnn-frontend-wiki/open-kernel-fusions.md)
+- [案例：cuDNN Kernel 不慢，模型却被构图和 Host 调度拖慢](official-cudnn-frontend-wiki/cases/host-dispatch-and-cache.md)
+- [cuDNN Frontend 官方教程、源码实例与更新索引](official-cudnn-frontend-wiki/tutorials-and-update.md)

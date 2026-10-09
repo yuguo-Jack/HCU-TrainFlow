@@ -10,13 +10,15 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 ## 更新协议
 
 1. 检查公共 GitHub/文档权限、限流与实际访问，不把 404 当成已删除。读取 knowledge/sources.json 与已有 observed/reviewed 游标。
-2. `wiki-refresh <project> <source-id>` 收集注册路径的最新内容和固定提交。新增主题需把关键源码/测试/配置路径登记进去；不能只抓 README 宣称全仓无变化。检查树/分支和相关 release/roadmap/PR。
+2. `wiki-refresh <project> <source-id>` 收集注册路径的最新内容和固定提交；`kind: web` 收集登记教程并生成内容指纹，不能当成 Git SHA。新增主题需把关键源码/测试/配置/教程路径登记进去；不能只抓 README 宣称全仓无变化。检查树/分支和相关 release/roadmap/PR。TE、cuDNN Frontend 均有独立代码源和 `-docs` 教程源，更新相关主题时两者一起检查，区分官网版本、主干和实际部署版本。
 3. 需要 PR 依据时 `wiki-pr owner/repo number`，采集正文、普通评论、行内评论、独立 review 顶层正文及文件分页。API diff 缺失或超限时补 base/head 源码。记录未完成分页/权限缺口，不能继续标记全部完成。
 4. 比较实际 active ref 与已锁版本，处理 submodule gitlink，不用子仓 HEAD 偷换。发布计划、open PR、merged main、released 和运行可用分开。
 5. 对每个 affected overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
 6. 按 knowledge/maintenance.json 同时检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤。HCU 命令可以依托大知识库当前内容或自主看最新工程源码；任务所用 HCU 模型脚本、其引入的环境配置、launcher 或依赖变化时，一并复核 prepare/optimize 的用法和任务配方。公共仓只保留可公开的规则与来源，现场配置留在私有工作区；不能只更新官方 Wiki 文本。
 7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 全部通过后记录 receipt，再 `wiki-index`。采集完成不是内容复核完成，更不是硬件实测通过。
 8. 运行本工程测试和真实问题检索，保存本次缺口及下次入口。公共材料提交与 push 沿用任务授权，私有数据禁止进入公共仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
+
+实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。
 
 ## 组织标准
 

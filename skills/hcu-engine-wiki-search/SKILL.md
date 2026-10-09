@@ -13,6 +13,10 @@ description: 检索官方训练引擎与生态优化机制，核对固定提交�
 4. 跨主题问题按依赖连接：并行 schedule→通信/TE→显存→数值→恢复，或 RL→rollout→weight sync→训练。需要时拉当前实际底层分支到独立参考/开发目录。
 5. 官方 Wiki 不含 HCU 私有材料；必要时调用 HCU knowledge search 和在线飞书检索补上下文，权限不足及时反馈。不要因为查询顺手更新大知识库。
 
+底层库可用 `--engine transformer-engine` 或 `--engine cudnn-frontend` 定向搜索。TE 独立 Wiki 覆盖精度/权重缓存、attention、overlap/显存、融合与教程；cuDNN Frontend 覆盖 graph/plan、SDPA、open kernels、host 缓存与教程。跨 TE→cuDNN→HCU TE/Flash-Train 的问题分别检索并核对调用条件，不能把官方 NV 示例命令直接当成 HCU 配方。
+
+本机缺 HCU knowledge search 时按项目 docs/integrations.md 复用已有知识库或启用可选 thirdparty/HCU-Knowledge；需要仓库权限就提示用户。不可因未获权而把“未检索”写成“没有相关知识”。
+
 ## 回答要求
 
 给结论、适用条件、固定来源、实现位置、反例/约束与待验证项。找不到源码或本页只是入口导航时明确说明。遇到版本漂移可建议/执行本项目官方 Wiki 更新（符合当前任务范围），运行中任务的源锁保持不变。

@@ -28,3 +28,13 @@
 - Updated prepare to prefer applicable HCU model scripts and the actual deployment, preserve user patches, trace sourced configuration and launch wrappers, and compare official model/training semantics.
 - Aligned project instructions, general workflow, three Megatron pages, profiling guidance and workflow maintenance; recorded launch source/version, effective configuration and adjustment rationale as adaptation evidence.
 - Validation passed: 32 Wiki pages / 20 sources with no integrity errors; all three changed Skills passed the Skill validator; Git whitespace review passed. This is a guidance change, without new runtime behavior or HCU execution claims.
+
+## v0.2.0 training libraries and integrations
+
+- Authored 14 independent TE/cuDNN Frontend pages with source maps, build/run/test guidance, numerical and storage contracts, attention, fusion cases, tutorials and update routes. Wiki totals: 46 pages, 21 Git sources and 2 website groups.
+- Read selected pinned source and repository tutorials; acquired all 16 registered official HTML pages. Code and website fingerprints remain distinct; no NVIDIA tutorial or model loss was executed on HCU.
+- Integrated TraceLens report APIs with private tables/logs and pinned provenance. Real local tool invocation produced 10 tables from the compressed single-rank synthetic fixture and 5 tables from synthetic two-rank collectives. No hardware/throughput claim follows from these fixtures.
+- Verified a fresh checkout of both public dependencies using the bootstrap implementation; TraceLens uses sparse acquisition. Verified optional private repository Git access without copying its materials into this project.
+- Verified full eight-Skill installation into a temporary directory and protection of modified existing Skills. Five workflow Skills pass schema validation; real questions find the intended new Wiki pages and all local Markdown links resolve.
+- Built wheel and source distribution with system Python; archive inspection confirms private workspaces and thirdparty checkout contents are absent. Public manifest and installation scripts are included in the source distribution.
+- Final local validation: 72 tests passed, 46 Wiki pages / 23 sources have no integrity errors, public file scan and Git whitespace review passed. Package metadata and documentation now declare 0.2.0.

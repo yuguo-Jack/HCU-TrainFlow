@@ -2,7 +2,7 @@
 
 ## 依赖
 
-Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需 pytest。Git 用于源码与版本管理，SSH/scp、Docker、kubectl、Slurm 客户端只在使用相应执行方式时需要。TraceLens 可在独立分析环境安装，先核对其版本和 CLI。HCU 训练依赖由目标环境提供，本包不下载 PyTorch/DTK/模型。
+Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需 pytest。Git 用于源码与版本管理，SSH/scp、Docker、kubectl、Slurm 客户端只在使用相应执行方式时需要。TraceLens 通过固定 checkout 和本机 Python 的报告 API 集成，安装三个算子 Skill 及可选 HCU-Knowledge 的步骤见 [第三方集成](integrations.md)。HCU 训练依赖由目标环境提供，本包不下载 PyTorch/DTK/模型。
 
 ```bash
 python -m pip install -e ".[test]"
@@ -36,7 +36,7 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 源码传输 | source-snapshot/materialize/bundle/receive |
 | 多 Agent | assignment-add/return、inbox、inbox-dispatch |
 | 验收 | environment-check、proxy-check、iteration-check、quality-check |
-| 分析 | profile-plan、profile-analyze |
+| 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective |
 | 长训 | watch、heartbeat-check、events-export/import、monitor-report |
 | Wiki | wiki-index/search/refresh/pr/review |
 | 公开交付 | public-export |

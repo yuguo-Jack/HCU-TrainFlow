@@ -48,6 +48,8 @@ def parser():
     cmd("iteration-check", "file")
     cmd("profile-plan", "file")
     q = cmd("profile-analyze", "trace", "window"); q.add_argument("--models"); q.add_argument("--output"); q.add_argument("--groups")
+    q = cmd('tracelens-report', 'trace'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--rank', type=int); q.add_argument('--gpu-arch-json'); q.add_argument('--timeout', type=int, default=1800)
+    q = cmd('tracelens-collective', 'trace_pattern'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--world-size', type=int, required=True); q.add_argument('--timeout', type=int, default=1800)
     q = cmd("watch", "task", "log", "policy"); q.add_argument("--once", action="store_true"); q.add_argument("--interval", type=float, default=10)
     q = cmd("heartbeat-check", "file"); q.add_argument("--max-age", type=float, required=True)
     q = cmd("events-export", "destination"); q.add_argument("--after", type=int, default=0)
@@ -98,6 +100,11 @@ def execute(a):
     if c == "iteration-check": return quality.assess_iteration(**read_json(a.file))
     if c == "profile-plan":
         value = read_json(a.file); return analysis.profile_plan(value["groups"], value["available"])
+    if c in {'tracelens-report', 'tracelens-collective'}:
+        from .tracelens import run_report
+        if c == 'tracelens-report':
+            return run_report(store, a.project, trace=a.trace, rank=a.rank, gpu_arch_json=a.gpu_arch_json, timeout=a.timeout)
+        return run_report(store, a.project, trace_pattern=a.trace_pattern, world_size=a.world_size, timeout=a.timeout)
     if c == "profile-analyze":
         result = analysis.analyze_trace(read_json(a.trace), read_json(a.window), read_json(a.models) if a.models else {})
         if a.groups:

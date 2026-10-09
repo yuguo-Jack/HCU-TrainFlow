@@ -5,6 +5,7 @@ task's source lock. Failed pagination is visible, and review is per affected pag
 """
 import hashlib
 import contextlib
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
@@ -146,7 +147,17 @@ def refresh_source(store, project, source_id, token=None):
     source = next((x for x in registry if x["id"] == source_id), None)
     if not source:
         raise FlowError("Source is not registered")
-    repo = source["repository"]
+    if source.get('kind') == 'web':
+        sha, files, failures = collect_web_documents(store, source)
+        ref = 'registered-official-pages'
+    else:
+        sha, files, failures = collect_git_files(store, source, token)
+        ref = source['ref']
+    return stage_source_refresh(store, project, source, sha, files, failures, ref)
+
+
+def collect_git_files(store, source, token=None):
+    repo = source['repository']
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise FlowError("Invalid public repository identity")
     ref = source["ref"]
@@ -154,8 +165,6 @@ def refresh_source(store, project, source_id, token=None):
     sha = commit["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise FlowError("Unexpected commit SHA")
-    cursor_path = store.root / "wiki/sources" / (source_id + ".json")
-    previous = read_json(cursor_path) if cursor_path.exists() else {"files": {}}
     files, failures = {}, []
     for name in source["paths"]:
         if name.startswith("/") or ".." in Path(name).parts:
@@ -169,9 +178,65 @@ def refresh_source(store, project, source_id, token=None):
             files[name] = {"sha256": store.put(data, "public"), "url": f"https://github.com/{repo}/blob/{sha}/{name}"}
         except (OSError, FlowError):
             failures.append({"path": name, "status": "unavailable"})
+    return sha, files, failures
+
+
+class DocumentText(HTMLParser):
+    """Readable tutorial text; raw HTML remains separately available as evidence."""
+    def __init__(self):
+        super().__init__()
+        self.skip = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {'script', 'style', 'nav', 'footer', 'header'}:
+            self.skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in {'script', 'style', 'nav', 'footer', 'header'} and self.skip:
+            self.skip -= 1
+
+    def handle_data(self, data):
+        if not self.skip and data.strip():
+            self.parts.append(' '.join(data.split()))
+
+
+def collect_web_documents(store, source):
+    files, failures = {}, []
+    for name in source['paths']:
+        url = source['documents'][name]
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != 'https' or parsed.hostname != 'docs.nvidia.com' or parsed.username or parsed.password or parsed.port not in (None, 443):
+            raise FlowError('Official document adapter requires canonical docs.nvidia.com HTTPS URLs')
+        try:
+            # No token and no redirects: a moved document must be explicitly re-registered.
+            opener = urllib.request.build_opener(NoRedirect)
+            request = urllib.request.Request(url, headers={'User-Agent': 'HCU-TrainFlow'})
+            with opener.open(request, timeout=60) as response:
+                data = response.read(8 * 1024 * 1024 + 1)
+                mime = response.headers.get('Content-Type', '')
+            if len(data) > 8 * 1024 * 1024 or 'text/html' not in mime.lower():
+                raise FlowError('Expected bounded HTML document')
+            parser = DocumentText(); parser.feed(data.decode('utf-8'))
+            text = '\n'.join(parser.parts).encode('utf-8')
+            if len(text) < 200:
+                raise FlowError('Document body is empty or incomplete')
+            files[name] = {'sha256': store.put(text, 'public'), 'raw_sha256': store.put(data, 'public'), 'url': url}
+        except (OSError, ValueError, FlowError):
+            failures.append({'path': name, 'status': 'unavailable', 'url': url})
+    # A web revision is a content fingerprint, never a fabricated Git SHA.
+    revision = fingerprint({name: {'sha256': row['sha256'], 'url': row['url']} for name, row in files.items()})
+    return revision, files, failures
+
+
+def stage_source_refresh(store, project, source, sha, files, failures, ref):
+    source_id, repo = source['id'], source['repository']
+    cursor_path = store.root / 'wiki/sources' / (source_id + '.json')
     reviewed_path = store.root / "wiki/reviewed-sources" / (source_id + ".json")
     reviewed = read_json(reviewed_path) if reviewed_path.exists() else {"files": source.get("baseline_files", {})}
-    changes = sorted(name for name in files.keys() | reviewed["files"].keys() if files.get(name, {}).get("sha256") != reviewed["files"].get(name, {}).get("sha256"))
+    changes = sorted(name for name in files.keys() | reviewed["files"].keys()
+                     if files.get(name, {}).get("sha256") != reviewed["files"].get(name, {}).get("sha256")
+                     or (source.get('kind') == 'web' and files.get(name, {}).get('url') != reviewed['files'].get(name, {}).get('url')))
     affected = []
     for path in (Path(project) / "knowledge").rglob("*.md"):
         meta, _ = parse_page(path)
@@ -186,6 +251,7 @@ def refresh_source(store, project, source_id, token=None):
                 maintenance.extend(rule["targets"])
     result = {"source": source_id, "repository": repo, "ref": ref, "commit": sha, "files": files, "changed_paths": changes,
               "affected_pages": affected, "affected_workflows": sorted(set(maintenance)), "failures": failures, "observed_at": utc(), "status": "partial" if failures else "collected-not-reviewed"}
+    result['revision_kind'] = 'web-content-fingerprint' if source.get('kind') == 'web' else 'git-commit'
     stage_id = fingerprint(result)
     write_json(store.root / "wiki/staging" / (stage_id + ".json"), result)
     if not failures:

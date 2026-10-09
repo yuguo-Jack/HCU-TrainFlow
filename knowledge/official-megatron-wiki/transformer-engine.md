@@ -13,19 +13,19 @@ reviewed_on: '2026-10-09'
 sources:
 - source: nvidia-transformerengine
   path: README.rst
-  commit: 14be43fb924af0431d99e3fcc9043574b3afbefd
+  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
   sha256: 7ec335c82227680e55c8047d90db0e99a87d0c10d3d6d43d7b54d54e2d5f9e0a
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/fp8.py
-  commit: 14be43fb924af0431d99e3fcc9043574b3afbefd
+  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
   sha256: 54a2967ad103ddcffcaf7a1d10e7d9fcfa3a290772d9239c416fff391349f3a1
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/quantization.py
-  commit: 14be43fb924af0431d99e3fcc9043574b3afbefd
+  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
   sha256: d8f2cd4fa72d8343eaca912cad0d89c4f39ff5828849cda3904c640aa587a943
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/module/linear.py
-  commit: 14be43fb924af0431d99e3fcc9043574b3afbefd
+  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
   sha256: a7b63f31f9607c71f71c0a93e3e90239194d63601b72aab7875dd5b57c75617e
 ---
 
@@ -33,7 +33,9 @@ sources:
 
 ## 阅读层次
 
-从 PyTorch module/linear 的 forward/backward/autograd 状态开始，进入 quantization 和 fp8 管理，再定位 C++/CUDA 底层实现。记录模块接口、训练/推理分支、参数 dtype、累积 dtype、scale 与缓存所有权。低精度参数格式不能用输出 tensor dtype 单独概括。
+TE 的独立详细知识库已建立：[工程总览与源码导航](../official-transformer-engine-wiki/overview.md)、[低精度和权重缓存](../official-transformer-engine-wiki/precision-and-cache.md)、[attention 后端](../official-transformer-engine-wiki/attention.md)、[官方教程](../official-transformer-engine-wiki/tutorials-and-update.md)。本页保留 Megatron 与 HCU 承接关系的入口。
+
+从 PyTorch module/linear 的 forward/backward/autograd 状态开始，进入 quantization 管理，再定位 C++/CUDA 底层实现；当前官方 `pytorch/fp8.py` 已标注为弃用的兼容入口，新机制以 `quantization.py` 为准。记录模块接口、训练/推理分支、参数 dtype、累积 dtype、scale 与缓存所有权。低精度参数格式不能用输出 tensor dtype 单独概括。
 
 ## 融合对齐契约
 
@@ -47,9 +49,9 @@ NV 的一条融合调用在 HCU 侧可由多个 kernel 暂时实现，但需要�
 
 ## 固定源码与更新范围
 
-- [README.rst](https://github.com/NVIDIA/TransformerEngine/blob/14be43fb924af0431d99e3fcc9043574b3afbefd/README.rst)
-- [transformer_engine/pytorch/fp8.py](https://github.com/NVIDIA/TransformerEngine/blob/14be43fb924af0431d99e3fcc9043574b3afbefd/transformer_engine/pytorch/fp8.py)
-- [transformer_engine/pytorch/quantization.py](https://github.com/NVIDIA/TransformerEngine/blob/14be43fb924af0431d99e3fcc9043574b3afbefd/transformer_engine/pytorch/quantization.py)
-- [transformer_engine/pytorch/module/linear.py](https://github.com/NVIDIA/TransformerEngine/blob/14be43fb924af0431d99e3fcc9043574b3afbefd/transformer_engine/pytorch/module/linear.py)
+- [README.rst](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/README.rst)
+- [transformer_engine/pytorch/fp8.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/fp8.py)
+- [transformer_engine/pytorch/quantization.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/quantization.py)
+- [transformer_engine/pytorch/module/linear.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/module/linear.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。
