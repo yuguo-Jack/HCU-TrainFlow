@@ -20,7 +20,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 [![HCU-TrainFlow 工作流总览：环境适配、性能优化与阶段验收、扩容长训；多 Agent、独立复核、远端执行和知识沉淀贯穿全程](docs/assets/workflow-overview.png)](docs/assets/workflow-overview.png)
 
-点击图片可查看原尺寸。
+[原尺寸图片](docs/assets/workflow-overview.png) · [可编辑流程图与验收规则](docs/workflow-map.md)
 
 优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，按需使用三个 Hygon 算子 Skill。
 

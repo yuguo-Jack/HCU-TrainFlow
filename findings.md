@@ -90,3 +90,9 @@ Readiness boundary: protocol/unit fixtures and public Wiki retrieval are locally
 ## Detailed workflow mapping
 
 Existing README/architecture/team diagrams were summaries. The new workflow map separates system tuning, shape-bound efficiency assessment and implementation validation; distinguishes local iteration from stage loss; and maps full-mode report gates directly to core.GATES. Agent scheduling, file guidance, remote execution uncertainty, site recovery ownership and knowledge updates have separate views so readers can trace dependencies without assuming a built-in model runtime or validated site deployment.
+
+## User-supplied end-side workflow comparison
+
+- Comparison scope is the supplied hygonpilot-skills illustration, not an audit of its repository or actual execution. Its visible strengths are explicit framework/communication/Triton/kernel routing by expected end-to-end benefit, startup-versus-steady-state benchmarking, rollback/best-known records and a dedicated regression-bisect entry.
+- TrainFlow already has the environment/baseline/profile/optimize/regression cycle, system-first analysis, lower-level kernel Skills, profiler-off repetitions and retained candidates. Its additional explicit scope is training parallelism/memory, gradients/optimizer/stage loss, actual process groups, dynamic multi-Agent dependencies/reviews, remote execution uncertainty, scaling/long-run recovery and official/private knowledge lifecycle. Features absent from the supplied drawing cannot be assumed absent from that project.
+- In TrainFlow, prioritization and best-candidate selection currently depend on the coordinator and evidence; there is no standalone expected-benefit ranking model or regression-bisect command. Graph-break/AOTI-specific triage and separate cold-start cost accounting could be made more explicit. These are potential follow-ups, not implemented features of this illustration change. Real HCU integration remains pending.

@@ -121,3 +121,9 @@ Implemented scoped PR search, pinned code reading, public PR source pages, compl
 - Used built-in imagegen to create a navy/cyan technical workflow illustration. Refined parallel-task presentation, the separate pass/retry branches and text readability; selected the final shorter-copy image after visual inspection.
 - Stored the PNG and final generation prompt under docs/assets; README links to the full-size image. The editable ten-diagram workflow map remains the detailed technical source. No runtime, Skill, version, release or HCU-Knowledge changes.
 - Verified the 1536×1024 PNG, README/prompt links and Git whitespace; knowledge validation passed 485 pages/24 sources with no errors. Only the selected final image is included in Git.
+
+## 2026-10-09: white overview and workflow comparison
+
+- Restyled the README overview with built-in imagegen using the supplied picture only for white/pastel/line-art appearance. Preserved TrainFlow's own stages and wording; refined the continuous quality-pass connector into scaling. Replaced the asset and updated its prompt and README reading links; the dark version remains in Git history.
+- Compared visible reference-flow capabilities with current TrainFlow Skills/source and recorded the evidence limits and concrete gaps in findings.md. No capabilities from the reference diagram were silently added or claimed implemented; no private reference image was added to the repository.
+- Validation: final PNG decoded successfully, README/prompt links and whitespace passed, knowledge validator passed 485 pages/24 sources. Version remains 0.4.0.dev0; no runtime/Skill changes or release/tag.
