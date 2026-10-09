@@ -712,4 +712,3 @@ Use `wiki-code hiyouga/LlamaFactory ce9dc9e072f80fa3abe0989d4ab90da25f083438 PAT
 - [tests_v1/trainers/test_dpo_loss_precision.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/tests_v1/trainers/test_dpo_loss_precision.py) · blob `96cbf100b533663741e0497691a531b82fce68fd`
 - [tests_v1/trainers/test_fsdp2_dpo_trainer.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/tests_v1/trainers/test_fsdp2_dpo_trainer.py) · blob `0d242e91a54d8fe0a532d0abbbe30f485b69ae33`
 - [tests_v1/trainers/test_fsdp2_sft_trainer.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/tests_v1/trainers/test_fsdp2_sft_trainer.py) · blob `30e14e05b5f30498c9667d88d8945f99bcd83172`
-

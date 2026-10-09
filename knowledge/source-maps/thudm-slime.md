@@ -755,4 +755,3 @@ Use `wiki-code THUDM/slime 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e PATH` to ins
 ## train.py
 
 - [train.py](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/train.py) · blob `c13a9832516e9ae8327a5cb21074d75543adfa26`
-

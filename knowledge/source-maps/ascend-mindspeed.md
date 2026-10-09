@@ -1745,4 +1745,3 @@ Use `wiki-code Ascend/MindSpeed 485d1077017a39963de83944230cfab26a6ec467 PATH` t
 - [tools/data_handler.py](https://github.com/Ascend/MindSpeed/blob/485d1077017a39963de83944230cfab26a6ec467/tools/data_handler.py) · blob `88b59a1b8f6ccda92f94dda68f16ca626e190b4e`
 - [tools/preprocess_data.py](https://github.com/Ascend/MindSpeed/blob/485d1077017a39963de83944230cfab26a6ec467/tools/preprocess_data.py) · blob `22a6d9858887d8f456cc390ab047cac7bf72a2cb`
 - [tools/replace_ascend_path.py](https://github.com/Ascend/MindSpeed/blob/485d1077017a39963de83944230cfab26a6ec467/tools/replace_ascend_path.py) · blob `8e629cbec1ff8486ffc139036717d403f2fbbdff`
-

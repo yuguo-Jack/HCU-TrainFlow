@@ -74,6 +74,6 @@ User requests a unified autonomous entry Skill, persistent implement/review/corr
 2. Implement official Wiki PR discovery/read/source tracing, persistent public PR pages, full source-tree navigation and resumable source/PR update coverage — complete.
 3. Expand official engine documentation and source navigation with versioned evidence, deepen Megatron ecosystem; distinguish automatic source maps from authored analysis — complete.
 4. Add private task experience knowledge: environment/model/version identity, performance/loss evidence, successful and failed optimization milestones, retrieval and cookbook delivery provenance; integrate flow milestones — complete.
-5. Test offline and real public retrieval; review privacy, pagination, stale evidence and restart behavior; install Skills — complete. Commit/push development changes next; no TrainFlow release/tag.
+5. Test offline and real public retrieval; review privacy, pagination, stale evidence and restart behavior; install Skills — complete. Development changes committed; push verification is recorded in Git remote state. No TrainFlow release/tag.
 
 Real training and site-dependent command validation remain pending until hardware is supplied. This does not defer source-based Wiki work. HCU-Knowledge is not updated as a side effect of TrainFlow operation.

@@ -2681,4 +2681,3 @@ Use `wiki-code AMD-AGI/Primus 9b0ce906466cdf4d795597317a79cb368725ff1c PATH` to 
 - [tools/visualization/pp_vis/pp_data_example/gpu8_layer64_gbs16/pp8_vpp2/pp_rank_7.json](https://github.com/AMD-AGI/Primus/blob/9b0ce906466cdf4d795597317a79cb368725ff1c/tools/visualization/pp_vis/pp_data_example/gpu8_layer64_gbs16/pp8_vpp2/pp_rank_7.json) · blob `ed949232b9e586c8e5532d8ac736c071d323117c`
 - [tools/visualization/pp_vis/requirements.txt](https://github.com/AMD-AGI/Primus/blob/9b0ce906466cdf4d795597317a79cb368725ff1c/tools/visualization/pp_vis/requirements.txt) · blob `0a54286c55f5e61a2620a4628c4ad174f0e1ee82`
 - [tools/visualization/pp_vis/vis.py](https://github.com/AMD-AGI/Primus/blob/9b0ce906466cdf4d795597317a79cb368725ff1c/tools/visualization/pp_vis/vis.py) · blob `d50448669e9e416a5af572f0778d30761bd80ef6`
-

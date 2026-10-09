@@ -161,7 +161,7 @@ def markdown(meta, body):
 def generated_page(path, meta, body):
     # GitHub descriptions and upstream documents may contain mixed CRLF/CR.
     # parse_page uses universal newlines; hash the same canonical representation.
-    body=body.replace('\r\n','\n').replace('\r','\n')
+    body=body.replace('\r\n','\n').replace('\r','\n').strip()+'\n'
     if path.exists():
         previous, previous_body=wiki.parse_page(path)
         if previous.get('generated_body_sha256') != digest(previous_body.encode()):

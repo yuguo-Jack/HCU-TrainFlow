@@ -1599,4 +1599,3 @@ Use `wiki-code modelscope/ms-swift 22249748429ce7e8516640e35cbe997e572a233a PATH
 - [tests/utils/test_tool_response_name.py](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/tests/utils/test_tool_response_name.py) · blob `7d634639f10cb6defd58bda62dff27b0cc56f591`
 - [tests/utils/test_toolbench_reward.py](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/tests/utils/test_toolbench_reward.py) · blob `f783a0983cfb974e770c9a0375e401616131cc84`
 - [tests/utils/test_url_utils.py](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/tests/utils/test_url_utils.py) · blob `7de441de4ffad2ab4bb04aaf3511581854ad9490`
-

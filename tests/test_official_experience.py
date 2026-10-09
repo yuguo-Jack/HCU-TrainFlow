@@ -164,6 +164,7 @@ def test_generated_pages_normalize_upstream_newlines(tmp_path):
     official.generated_page(p,{'id':'p'},'# Title\r\n\rText\n')
     meta,body=wiki.parse_page(p)
     assert meta['generated_body_sha256']==digest(body.encode())
+    assert not p.read_bytes().endswith(b'\n\n')
     official.generated_page(p,{'id':'p'},'# Title\r\n\rText\n')
 
 

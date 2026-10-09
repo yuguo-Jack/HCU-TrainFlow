@@ -1985,4 +1985,3 @@ Use `wiki-code Ascend/MindSpeed-LLM bc4e91cc6d344937df4d2f36f6ac26828051482c PAT
 ## train_fsdp2.py
 
 - [train_fsdp2.py](https://github.com/Ascend/MindSpeed-LLM/blob/bc4e91cc6d344937df4d2f36f6ac26828051482c/train_fsdp2.py) · blob `c9c82cdaf6fa84dbd79558b902746211c034b5f8`
-

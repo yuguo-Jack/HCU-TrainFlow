@@ -1240,4 +1240,3 @@ Use `wiki-code NVIDIA/TransformerEngine 39c30c577f5dd4f9fba921ee011b5cd797ae667e
 - [transformer_engine/pytorch/triton/pad.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/triton/pad.py) · blob `547bc277603c45518f145635189da870cfc3ea38`
 - [transformer_engine/pytorch/triton/permutation.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/triton/permutation.py) · blob `c155d73e1e37e616b97b15851324c64585a7128d`
 - [transformer_engine/pytorch/utils.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/utils.py) · blob `aa21ed06e05bca121124417c6bd080646786ecb0`
-
