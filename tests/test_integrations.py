@@ -72,6 +72,26 @@ def test_dependency_paths_cannot_escape(tmp_path):
     with pytest.raises(FlowError): dependencies.load_manifest(root)
 
 
+@pytest.mark.parametrize('condition', ['clean', 'dirty', 'unknown-head', 'upstream-conflict', 'status-only'])
+def test_fork_origin_migration_preserves_unrecognized_state(tmp_path,condition):
+    root,items=manifest(tmp_path)
+    path,sha=create_checkout(root,items[0])
+    old_url=items[0]['url'];new_url='https://github.com/example/fork.git'
+    items[0].update(url=new_url,commit=sha,upstream_url=old_url,upstream_commit=sha)
+    if condition=='dirty':(path/'file.txt').write_text('local edits')
+    if condition=='unknown-head':items[0]['upstream_commit']='b'*40
+    if condition=='upstream-conflict':subprocess.check_call(['git','-C',str(path),'remote','add','upstream','https://github.com/other/repo.git'])
+    write_json(root/'thirdparty/manifest.json',{'schema_version':1,'dependencies':items})
+    assert dependencies.sync_dependencies(root,only=['public-tool'])['status']=='incomplete'
+    result=dependencies.sync_dependencies(root,only=['public-tool'],migrate_origin=True,status_only=condition=='status-only')
+    origin=subprocess.check_output(['git','-C',str(path),'remote','get-url','origin'],text=True).strip()
+    assert origin==(new_url if condition=='clean' else old_url)
+    assert result['status']==('ready' if condition=='clean' else 'incomplete')
+    if condition=='clean':
+        assert subprocess.check_output(['git','-C',str(path),'remote','get-url','upstream'],text=True).strip()==old_url
+    if condition=='dirty':assert (path/'file.txt').read_text()=='local edits'
+
+
 def setup_trace(tmp_path, monkeypatch, cpu=True):
     root=tmp_path/'dependency'; root.mkdir()
     monkeypatch.setattr(tracelens,'require_checkout',lambda *a:(root,{'commit':'a'*40}))

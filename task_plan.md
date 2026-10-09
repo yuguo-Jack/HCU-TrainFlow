@@ -41,3 +41,10 @@ Public repository stores reusable integration and public authored knowledge. HCU
 - cuDNN Frontend shallow clone hit an HTTP/2 early EOF; TraceLens pack transfer stalled. Retry with HTTP/1.1 and sparse acquisition to avoid large non-code payloads.
 - TE's historical user-guide URL returns 404; use the current canonical documentation root and pinned in-repository tutorial sources.
 - The pinned TraceLens CLI imports an unrelated helper that sets csv.field_size_limit(sys.maxsize), overflowing Windows C long. The integration uses its supported report API in an isolated worker, retaining the upstream checkout unmodified.
+
+## Active follow-up: reusable HCU TraceLens fork
+
+1. Verify account and create/reuse the public yuguo-Jack fork with upstream history — complete.
+2. Preserve upstream modules and commands; document HCU extension/validation boundaries, and repair only locally reproduced compatibility defects — complete.
+3. Point TrainFlow to the reviewed fork commit; provide explicit safe migration from the upstream checkout and retain the upstream knowledge source — complete.
+4. Validate native command entrypoints, report regressions, dependency migration and repository integrity — complete. Publication is recorded in both Git repositories.

@@ -21,6 +21,8 @@ description: 分析 HCU 大模型训练瓶颈，或推进系统与算子优化�
 
 ## 重要参考
 
+TraceLens 使用 thirdparty 清单锁定的 HCU fork，保留上游完整模块和原生 CLI。两个 TrainFlow 报告入口之外，按任务需要复用 TraceDiff、graph 报告、trace 分段/索引、源码定位及 EventReplay，具体依赖和入口见 docs/integrations.md。原生命令仍要遵循任务执行权限并记录私有输入/产物；缺少架构模型或事件映射时先标注缺口，优先用现有扩展点，必要的核心修改在独立 fork 开发 checkout 中完成并补回归。
+
 TE 精度、权重缓存、attention backend、userbuffers 和融合查 `knowledge/official-transformer-engine-wiki/`；cuDNN graph/plan、SDPA fwd/bwd、open-kernel 融合和 host 缓存查 `knowledge/official-cudnn-frontend-wiki/`。先读 Wiki 再定位目标版本源码与教程，保留 NV/HCU 实现边界和实际 dispatch 证据。
 
 AMD Primus、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 与官方开发分支都是一级机制参考。先比较补丁基线/gitlink、触发条件、测试和回退；官方能力真正进入当前 HCU 分支且回归等价后再退役旧 patch。

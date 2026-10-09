@@ -20,6 +20,8 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。
 
+TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查看 fork 的上游基准、补丁记录及 HCU 验证状态；保留可复用模块和全部原生能力，优先扩展现有解析/模型。上游已有等价修复时经回归后退役本地补丁，不能只改 Wiki 就自动推进训练依赖。
+
 ## 组织标准
 
 按工程定位→目录→编译安装→运行/测试→调用链→优化机制→问题诊断→版本/依赖→证据组织。案例按问题/瓶颈→为什么改→实现符号→适用条件→正确性/性能证据→失败条件/回退。尚未逐模型覆盖的入口页保持 coverage 标记，不以页数代替深度。

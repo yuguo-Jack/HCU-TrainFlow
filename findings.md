@@ -32,3 +32,10 @@
 - TraceLens report APIs work on Windows without the unrelated CLI helper that overflows C long via csv.field_size_limit(sys.maxsize). Keep upstream unmodified and invoke report APIs in an isolated process.
 - Report generation is not training validation: preserve native statistical denominators, complete rank requirements and explicit HCU architecture input. Truncated tables must still produce a failed report receipt.
 - Native report, gzip and complete two-rank synthetic collective paths are locally verified. Fresh bootstrap also verified the sparse clone path, avoiding unnecessary example trace downloads.
+
+## HCU TraceLens fork
+
+- Created the public yuguo-Jack/TraceLens fork; `hcu` is the default integration branch and `main` retains the initial AMD upstream baseline. Development uses a separate checkout from the installed thirdparty dependency.
+- Preserved all 13 native command entrypoints and upstream modules/dependency declarations. Base installation supports CLI help without the optional JAX/Origami runtime; that does not validate those execution paths on HCU.
+- A narrow CSV OverflowError fix restores native CLI imports on affected Windows Python builds. Existing graph-under-recording tests continue to pass; upstream private-repository notification is guarded to the upstream repository identity.
+- Prefer existing hardware JSON, architecture extension and op-model/collective interfaces. Actual HCU trace formats and measurements are required before adding hardware predictions or new kernel-specific rules.

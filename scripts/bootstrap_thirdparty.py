@@ -15,9 +15,10 @@ def main():
     p.add_argument('--only', nargs='+', help='Dependency IDs; default: all public dependencies')
     p.add_argument('--include-knowledge', action='store_true', help='Also fetch the optional HCU-Knowledge repository using your own Git access')
     p.add_argument('--status', action='store_true', help='Inspect only; no fetch or checkout')
+    p.add_argument('--migrate-origin', action='store_true', help='Explicitly migrate a clean registered upstream baseline to its fork, preserving an upstream remote')
     args = p.parse_args()
     try:
-        result = sync_dependencies(ROOT, args.only, args.include_knowledge, args.status)
+        result = sync_dependencies(ROOT, args.only, args.include_knowledge, args.status, args.migrate_origin)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result['status'] == 'ready' else 2
     except (FlowError, OSError, ValueError, KeyError) as exc:

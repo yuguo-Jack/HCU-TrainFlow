@@ -38,3 +38,11 @@
 - Verified full eight-Skill installation into a temporary directory and protection of modified existing Skills. Five workflow Skills pass schema validation; real questions find the intended new Wiki pages and all local Markdown links resolve.
 - Built wheel and source distribution with system Python; archive inspection confirms private workspaces and thirdparty checkout contents are absent. Public manifest and installation scripts are included in the source distribution.
 - Final local validation: 72 tests passed, 46 Wiki pages / 23 sources have no integrity errors, public file scan and Git whitespace review passed. Package metadata and documentation now declare 0.2.0.
+
+## v0.2.1 TraceLens fork integration
+
+- Published public fork commit e4e891de60d3ac3cff3046a58e5852d0814b3dc6 on `hcu`, based on AMD upstream c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3. All upstream analysis modules and native entrypoints remain available.
+- Locally passed 15 portability tests covering all 13 native CLI help entrypoints and two CSV integer-bound cases, 41 existing deterministic report tests, and 7 existing architecture-resolution tests. The same selected tests pass on Windows/Linux with Python 3.10/3.12 in fork CI.
+- Migrated this machine's clean upstream dependency checkout using the explicit migration command, preserved the upstream remote, reinstalled the pinned fork and generated 10 single-rank tables plus 5 two-rank collective tables from synthetic fixtures.
+- TrainFlow validation: 77 tests passed, including preservation of dirty/unknown/conflicting migration states; 46 Wiki pages and 24 registered sources have no integrity errors. Both upstream and fork now participate in workflow maintenance.
+- Real HCU graph attribution, custom collective classification, hardware performance models and replay remain deployment-validation work; no full upstream GPU/JAX/Origami suite or real training result is claimed.

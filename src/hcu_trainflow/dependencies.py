@@ -25,8 +25,11 @@ def load_manifest(project):
             raise FlowError('Dependency checkout cannot escape thirdparty')
         if path in paths or not re.fullmatch(r'[0-9a-f]{40}', item['commit']):
             raise FlowError('Duplicate checkout or unpinned dependency')
-        if not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git', item['url']):
-            raise FlowError('Expected credential-free GitHub HTTPS URL')
+        for url in [item['url']] + ([item['upstream_url']] if item.get('upstream_url') else []):
+            if not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git', url):
+                raise FlowError('Expected credential-free GitHub HTTPS URL')
+        if item.get('upstream_url') and not re.fullmatch(r'[0-9a-f]{40}', item.get('upstream_commit', '')):
+            raise FlowError('Fork needs a pinned upstream baseline')
         for value in item.get('sparse_paths', []):
             if not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', value) or any(p in {'.', '..'} for p in value.split('/')):
                 raise FlowError('Invalid sparse checkout directory')
@@ -65,7 +68,27 @@ def inspect_checkout(root, item):
             'status': 'dirty' if dirty else 'ready' if revision == item['commit'] else 'revision-mismatch'}
 
 
-def sync_dependencies(project, only=None, include_optional=False, status_only=False):
+def migrate_upstream_origin(root, item, state):
+    """Explicitly migrate a clean, known upstream baseline to its registered fork."""
+    path = root / item['path']
+    origin = git(path, 'remote', 'get-url', 'origin').stdout.strip().removesuffix('.git')
+    if not item.get('upstream_url') or origin != item['upstream_url'].removesuffix('.git'):
+        return {**state, 'action': 'Only the manifest upstream origin can migrate; inspect this checkout manually'}
+    if git(path, 'status', '--porcelain', '--untracked-files=normal').stdout.strip():
+        return {**state, 'status': 'dirty', 'action': 'Preserve local changes before changing repository origin'}
+    head = git(path, 'rev-parse', '--verify', 'HEAD', check=False)
+    if head.returncode or head.stdout.strip() != item['upstream_commit']:
+        return {**state, 'action': 'Unrecognized upstream revision; preserve local commits and migrate manually'}
+    upstream = git(path, 'remote', 'get-url', 'upstream', check=False)
+    if not upstream.returncode and upstream.stdout.strip().removesuffix('.git') != item['upstream_url'].removesuffix('.git'):
+        return {**state, 'action': 'Existing upstream remote differs; preserve it and inspect manually'}
+    if upstream.returncode:
+        git(path, 'remote', 'add', 'upstream', item['upstream_url'])
+    git(path, 'remote', 'set-url', 'origin', item['url'])
+    return inspect_checkout(root, item)
+
+
+def sync_dependencies(project, only=None, include_optional=False, status_only=False, migrate_origin=False):
     root, entries = load_manifest(project)
     requested = set(only or [])
     if requested - {x['id'] for x in entries}:
@@ -75,6 +98,8 @@ def sync_dependencies(project, only=None, include_optional=False, status_only=Fa
     for item in selected:
         try:
             state = inspect_checkout(root, item)
+            if not status_only and migrate_origin and state['status'] == 'origin-mismatch':
+                state = migrate_upstream_origin(root, item, state)
             if not status_only and state['status'] in {'missing', 'revision-mismatch'}:
                 path = root / item['path']
                 if state['status'] == 'missing':
@@ -90,6 +115,8 @@ def sync_dependencies(project, only=None, include_optional=False, status_only=Fa
                 state = inspect_checkout(root, item)
             if state['status'] == 'dirty':
                 state['action'] = 'Preserve local edits; use a separate development checkout or resolve them before sync'
+            if state['status'] == 'origin-mismatch' and 'action' not in state:
+                state['action'] = 'Inspect origin; use --migrate-origin only for the registered upstream baseline'
             if state['status'] == 'ready' and item.get('lfs'):
                 state['materials'] = 'LFS payloads are not fetched; follow the dependency installation guide when originals are needed'
             results.append(state)

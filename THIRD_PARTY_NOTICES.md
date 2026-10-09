@@ -4,7 +4,7 @@
 
 - [Hyperloom](https://github.com/yuguo-Jack/Hyperloom)：参考多 Agent 编排、证据和性能流程的组织。
 - [BBuf AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS)：参考先重现后升级工具的故障分析方法和 profiler 工作流；未复制 Skill/脚本。
-- [TraceLens](https://github.com/AMD-AGI/TraceLens)：通过 thirdparty 固定 checkout 集成本地报告 API，主仓不重复发布其源码。
+- [TraceLens 上游](https://github.com/AMD-AGI/TraceLens) 与 [HCU fork](https://github.com/yuguo-Jack/TraceLens)：通过 thirdparty 锁定 fork 的提交并记录上游基准，复用完整分析模块与报告 API；主仓不重复发布其源码。
 - [Megatron-LM](https://github.com/NVIDIA/Megatron-LM)、[Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)、[Transformer Engine](https://github.com/NVIDIA/TransformerEngine)、[Energon](https://github.com/NVIDIA/Megatron-Energon)：官方训练基准与阅读来源。
 - [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)：官方 Graph、SDPA、开放融合 kernel 与教程的阅读来源；注意该仓 LICENSING.md 中不同组件的许可。
 - [cuda-optimized-skill](https://github.com/yuguo-Jack/cuda-optimized-skill)：三个 Hygon 算子 Skill 的固定安装源，完整副本只在用户本机的忽略目录或指定安装目录。

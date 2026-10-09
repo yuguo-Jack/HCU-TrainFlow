@@ -4,7 +4,7 @@
 
 | ID | 目录 | 用途 |
 | --- | --- | --- |
-| `tracelens` | `TraceLens/` | 已接入 TrainFlow 的 PyTorch trace 与全 rank collective 报告。 |
+| `tracelens` | `TraceLens/` | HCU fork，保留完整上游能力；TrainFlow 封装 PyTorch 与全 rank collective 报告。 |
 | `cuda-optimized-skill` | `cuda-optimized-skill/` | 三个 Hygon HIP/Triton 算子 Skill 的完整源码、脚本与参考文件。 |
 | `hcu-knowledge` | `HCU-Knowledge/` | 可选大领域知识库；当前需仓库读取权限。 |
 
@@ -18,7 +18,9 @@ python scripts/bootstrap_thirdparty.py --status
 
 默认只拉前两个公开工程，不自动执行其安装脚本或安装模型/训练环境。目录已有修改或来源不匹配时保留现场并报告，绝不 reset/clean。同步的是清单中的提交，不是每次擅自升级 HEAD。网络或权限失败返回非零；解决 Git 认证后可用 `--only ID` 重试。
 
-TraceLens 默认稀疏检出运行代码、how-to 和仓库根文件，避免下载其大量示例 trace。需要阅读更多上游目录可在该 checkout 中 `git sparse-checkout add <目录>`；不会改变锁定提交。
+TraceLens 默认稀疏检出完整运行代码、文档和仓库根文件，避免下载其大量示例 trace。需要更多目录可在该 checkout 中 `git sparse-checkout add <目录>`；不会改变锁定提交。
+
+已安装旧 AMD 上游 checkout 时，按集成指南执行 `--only tracelens --migrate-origin`。只迁移干净且与登记基准一致的 checkout；其他来源或本地修改不覆盖。fork 的开发工作应使用独立 checkout，主仓在 `manifest.json` 同时保留运行提交与 AMD 上游基准。
 
 HCU-Knowledge 明确启用：
 

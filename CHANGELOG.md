@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-10-09
+
+- Pin the public HCU TraceLens fork while preserving upstream APIs and all native command entrypoints; document capability requirements and HCU validation boundaries.
+- Add explicit, guarded upstream-to-fork origin migration and retain upstream provenance in report receipts.
+- Monitor both TraceLens upstream and the HCU fork in Wiki/workflow maintenance. Verified the fork's Windows portability fix, native command help and local report paths.
+
 ## 0.2.0 — 2026-10-09
 
 - Add independent Transformer Engine and cuDNN Frontend Wikis: source maps, build/test guidance, training call chains, precision/cache, attention, fusion and official tutorials.

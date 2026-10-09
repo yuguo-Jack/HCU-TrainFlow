@@ -104,7 +104,8 @@ def run_report(store, project, trace=None, trace_pattern=None, world_size=None,
     if not all(x['cpu_ops'] for x in inventories): gaps.append('CPU-op attribution unavailable in one or more traces')
     if not any(x['rows'] for x in tables): gaps.append('No nonempty report tables')
     result = {'status': 'failed' if failure else 'incomplete' if gaps else 'generated',
-              'tool': 'TraceLens', 'source_commit': dependency['commit'], 'created_at': utc(),
+              'tool': 'TraceLens', 'source_commit': dependency['commit'],
+              'source_repository': dependency.get('url'), 'upstream_commit': dependency.get('upstream_commit'), 'created_at': utc(),
               'mode': 'collective' if trace_pattern else 'pytorch', 'inputs': inventories,
               'argv': argv, 'output_directory': str(output), 'returncode': returncode,
               'tables': tables, 'gaps': gaps, 'failure': failure,
