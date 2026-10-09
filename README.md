@@ -16,24 +16,27 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 主控会建立任务、确认缺失的关键条件，然后按阶段推进。已知环境和授权可以复用；正常步骤持续执行，遇到权限缺口、数值异常、收益平台期或需要专家判断时再提出具体问题。内部任务文件和命令由 Agent 管理。
 
+## 工作流总览
+
 ```mermaid
 flowchart TD
     U[模型、环境与目标] --> A[环境验收与模型适配]
     A --> O[并行切分与显存预算<br/>性能分析与系统 / 算子优化]
-    O --> Q[阶段 loss 与性能验收]
-    Q --> S[最小 DP 域、筛机与扩容验证]
+    O --> Q{阶段 loss 与性能通过？}
+    Q -->|未通过，修正或回退| O
+    Q -->|通过| S[完整模型最小 DP 域<br/>筛机与扩容验证]
     S --> T[长训监测、容错与故障诊断]
     C[实施 → 测量 → 独立复核 → 修正] --- A
     C --- O
     C --- S
     C --- T
     H[人类看板指导] <--> C
-    T --> D[可复现成果与持续运行记录]
+    T -->|达到约定的完成或交接条件| D[可复现成果与持续运行记录]
 ```
 
-优化保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，必要时参考官方引擎 Wiki、HCU-Knowledge、底层源码及三个 Hygon 算子 Skill。
+优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，按需使用三个 Hygon 算子 Skill。
 
-完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新的细图见 [工作流全景](docs/workflow-map.md)。
+完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新见 [工作流全景：总览与九张细图](docs/workflow-map.md)，其中列明阶段证据门槛及对应源码。
 
 ## 如何与 Agent 协作
 
@@ -51,6 +54,12 @@ collaboration/<task>/GUIDANCE.md    人的评论、回答和优先级调整
 主控根据模型与实测热点动态生成任务和 Agent 分工，不预设固定算子名单。环境与启动配方核对、系统分析，以及不同算子的详细分析和优化均可并行；某个算子具备实施条件后即可优化，无需等待其他算子的分析全部完成。相关 Agent 可提问、答复、共享发现和报告阻塞，消息与处理回执保存在同一任务中。
 
 下游只消费已验收的结果；共享 GPU 的测量、耦合代码修改、集成和阶段 loss 验证由主控安排。任务领取、真实 Agent 会话、返回报告和验收分别记录，避免重复派发或把“已经返回”误当成“已经完成”。详见 [任务拆解与 Agent 协同](docs/multi-agent.md)。
+
+## 知识如何参与工作流
+
+遇到问题时先查相关环境与模型的私有训练经验，再查官方引擎 Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。HCU-Knowledge 按需提供硬件、工具、适配与优化参考。
+
+局部官方 Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。实际性能、loss、故障和里程碑持续沉淀到私有经验 Wiki；公开 Cookbook 交付与验证记录关联，现场数据留在私有工作区。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
 
 ## 安装
 
@@ -97,7 +106,7 @@ python scripts/validate_knowledge.py
 
 任务源码、现场数据、日志、看板与凭据保存在独立私有工作区；默认 `.work/` 同样忽略提交。公共仓仅包含可复用流程、工具、公开知识及合成示例。
 
-- [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
+- [工作流全景](docs/workflow-map.md) / [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
 - [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)
 - [性能分析](docs/profiling.md) / [远程执行](docs/remote-execution.md)
 - [官方 Wiki](knowledge/README.md) / [搜索与更新](docs/wiki.md) / [私有训练经验与 Cookbook 记录](docs/experience-knowledge.md)
