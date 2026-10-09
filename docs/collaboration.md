@@ -23,6 +23,7 @@
 | [humanfia/humanize](https://github.com/humanfia/humanize) | 独立 flow runtime，内置 RLAR 的 actor/reviewer、结构化判断和可接续轮次 | 实施者与 reviewer 分离、明确 accept/revise/blocked；未打包其完整 runtime，不能称两个 Humanize 是同一个插件 |
 | [BBuf SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS) | 可复现分析、当前源码契约、从真实 review 提炼检查问题 | 检查真实 dispatch、数值和证据；其 humanize-review Skill 不等同于 RLCR 调度器 |
 | [Hyperloom](https://github.com/yuguo-Jack/Hyperloom) | 持久运行状态、计划批判、候选和停滞/预算控制 | 保留候选证据和有界迭代；训练额外检查梯度、阶段 loss、实际并行组和扩容 |
+| [Multica](https://github.com/multica-ai/multica) | 负责人分工、成员结果回流、运行中消息和投递状态 | 本地依赖图、会话映射、定向消息与处理回执；已发送不等于已处理，已返回不等于验收 |
 
 本项目实现自己的轻量协议，没有调用上面几个工程的完整循环运行时。代码 review 接受不代表 GPU 测试、模型 loss 或扩容验收通过。当前没有全局 Stop hook 强制宿主永不结束；持续执行依赖入口 Skill 和部署的 Agent，关闭会话后的唤醒依赖本地桥接。
 
@@ -33,14 +34,14 @@
 | 命令 | 作用 |
 | --- | --- |
 | `flow-start TASK PLAN` | 固定验收目标和循环预算，初始化人的文件与看板 |
-| `flow-next TASK` | 返回 work/repair/review/advance/reconcile/human/completed/cancelled |
+| `flow-next TASK` | 返回 work/repair/coordinate/review/advance/reconcile/human/completed/cancelled |
 | `flow-submit TASK CANDIDATE` | 留存不可变候选并请求独立复核 |
 | `flow-review TASK REVIEW` | 校验结构、上下文、身份区分、目标覆盖及发现 |
 | `flow-review-failed TASK ROUND --reason TEXT` | 记录 reviewer 超时、无法解析或未输出等失败 |
 | `flow-advance TASK` | 复核与证据均符合当前阶段才推进 |
 | `flow-replan TASK PLAN --reason TEXT` | 记录上下文/目标/预算调整原因，保留旧轮次并使旧复核失效 |
 | `flow-board TASK` | 同步人的修改，重新生成看板，返回两个文件路径 |
-| `flow-watch TASK [--once]` | 默认每 30 秒扫描指导，产生事件；不自行调用模型 |
+| `flow-watch TASK [--once]` | 默认每 5 分钟扫描指导；--once 立即采集，不自行调用模型 |
 | `flow-question TASK QUESTION` | 增加稳定问题 ID，注明是否阻塞 |
 | `flow-guidance-ack TASK HASH --decision DECISION --note TEXT` | 对一版人的原文逐项回应；决定可为 applied/queued/needs-human/not-applicable |
 | `flow-question-close TASK ID --guidance HASH --note TEXT` | 依据已读的实际回答关闭问题 |
@@ -61,11 +62,15 @@
   "max_stalled_rounds": 3,
   "full_review_every": 4,
   "max_review_failures": 3,
-  "poll_seconds": 30
+  "poll_seconds": 300
 }
 ```
 
 验收条件按任务具体化，独立分析模式不要套全训练条件。轮数和 reviewer 失败数防止无界循环；计算时长、操作数仍受 TaskSpec budget 限制。连续停滞由 reviewer 基于实际收益/阻塞证据判断，不能通过每轮自报“有进步”来绕过。达到边界后提出具体建议；有新假设和授权才记录重规划。不要自动上调 budget 或降低数值门槛。
+
+`coordinate` 要求主控处理团队可派发工作、结果验收和定向消息，具体见 [多 Agent 协同](multi-agent.md)。团队工作验收完成后，仍要提交整体候选、独立复核并推进阶段。
+
+新任务默认 poll_seconds=300。已有任务保留登记时的配置；需要改为 300 时使用完整原计划 `flow-replan`，只调整采集间隔并说明原因，保留验收目标和预算。自动 `flow-next`/执行/推进检查共享上次扫描时间，间隔内不重复读文件；显式 `flow-board` 或 `flow-watch --once` 立即刷新。采集间隔不是紧急停机信号，紧急操作使用当前会话或站点控制渠道。
 
 ### 候选契约
 
@@ -123,15 +128,15 @@ BOARD.md 由程序生成，展示目标、当前阶段、问题、处理回执�
 
 阻塞问题只在得到真正的答复后关闭。一般建议可以回应后继续其他工作；外部权限、资源决定、反复数值异常和无法解释的性能问题需要人介入时，给出具体证据、备选项和代价，避免泛泛问“是否继续”。没有用户回复不算授权。
 
-`flow-watch` 单独运行时只是文件事件采集器。活动中的主控在每轮、昂贵实验前、阶段推进前读指导，等待时按计划查看；配置好的 bridge 可以消费 agent 事件唤醒本地 Agent。bridge 送达不等于已读，更不等于问题解决，主控仍要回执并完成 inbox。无需在远端部署模型 Agent。
+`flow-watch` 单独运行时只是文件事件采集器。默认每 5 分钟读一次交互文件，活动主控在每轮、昂贵实验前和阶段推进前检查已采集指导；用户明确要求立即刷新时可即时采集。Agent 之间的消息走自己的持久收件箱与宿主投递，不受五分钟文件间隔限制。配置好的 bridge 可以消费事件唤醒本地 Agent；送达不等于已读或已解决，主控仍要回执并完成 inbox。无需在远端部署模型 Agent。
 
 queued 的意见需在最终交付前改为实际应用或有理由的不适用，不能一直排队却声称完成。任务完成后的新目标另建任务；完成记录保持原验收范围。
 
 ## 中断、并发和长训
 
 - 任务/轮次/事件在 SQLite 持久保存，代码与证据按内容保存。重新打开相同 workspace 后先 flow-next；旧 context、旧目标或被替换报告不能凭旧 review 推进。
-- 一个主控拥有阶段推进权；专家通过 assignment 领取独立 scope。多个控制者提交同一待审轮会被拒绝，硬件执行仍需资源租约。协议不是 OS 沙箱，不能约束绕过它的任意命令。
-- 执行状态 unknown/started 先核对原作业，flow 不会以“再试一次”启动重复训练。
+- 一个主控拥有阶段推进权；专家通过带依赖、范围与 token 的 assignment 工作，结果验收后下游才能消费。多个控制者提交同一待审轮会被拒绝，硬件执行仍需资源租约。协议不是 OS 沙箱，不能约束绕过它的任意命令。
+- 未明归属的 started 或任何 unknown 执行先核对原作业；已绑定到不同当前 assignment 的独立执行可按资源约束并行，不能以“再试一次”启动重复训练。所有执行结束后才可推进阶段。
 - 长训主控按实际进展记录实验和问题，不逐 step 触发代码 review。检测到异常先诊断再形成需复核的修复；不能每次 loss 抖动就改实现。
 - 本机离线，远端 watcher 和既有容错继续；本机恢复按 seq 接收事件并核对 attempt、checkpoint、节点池。独立 heartbeat observer 检测 watcher 自身失活。
 - 本版本提供通用 bridge 契约，没有验证你的实际 Codex launcher、飞书投递或集群恢复。真实环境提供后，要测试 Agent 中断、主机休眠、故障无人恢复、事件重放及人类指导生效。
@@ -142,4 +147,4 @@ queued 的意见需在最终交付前改为实际应用或有理由的不适用�
 hcu-trainflow collaboration-demo .work/collaboration-demo-001
 ```
 
-示例有“提交→要求修改→人的评论→恢复工作区→修正→接受→完成”，输出看板路径。review 和人的回复都是明确标记的合成 fixture，未调用真实 reviewer，也没有 GPU 训练。用于检查协议和阅读体验，不能冒充完整自主运行验收。
+示例有“双 lane 领取→问答与回执→结果验收→提交→要求修改→人的评论→恢复工作区→修正→接受→完成”，输出看板路径。Agent、review 和人的回复都是明确标记的合成 fixture，未调用真实模型，也没有 GPU 训练。用于检查协议和阅读体验，不能冒充完整自主运行验收。

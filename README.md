@@ -1,6 +1,8 @@
 # HCU-TrainFlow
 
-## 面向 HCU 大模型训练适配与优化的人机协作工作流
+## 面向 HCU 大模型训练的全流程智能体协同工作流
+
+An agentic workflow for end-to-end large-model training adaptation, optimization, and resilient scaling on HCU.
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。每轮以实际证据推进，经过独立复核和修正；人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT 和 RL，也支持只检查环境、只分析性能或只诊断故障。
 
@@ -40,7 +42,13 @@ collaboration/<task>/BOARD.md       进度、待决问题、轮次复核和证�
 collaboration/<task>/GUIDANCE.md    人的评论、回答和优先级调整
 ```
 
-人在 `GUIDANCE.md` 写意见，Agent 记录处理结果并在后续实验与推进前读取。默认轮询间隔 30 秒，可由 `flow-watch` 收集新意见；文件轮询本身不运行模型。会话关闭后的自动接续需要部署 Agent bridge；本机离线时远端守护和原有容错继续运行。详见 [协作循环与文件交互](docs/collaboration.md) 和 [长训守护](docs/operations.md)。
+在 `GUIDANCE.md` 写意见，默认每 **5 分钟**采集一次；主控在后续实验与推进前检查已采集的指导并记录处理结果。需要立即生效时可让 Agent 刷新，或运行 `flow-board` / `flow-watch --once`。文件轮询本身不运行模型。会话关闭后的自动接续需要部署 Agent bridge；本机离线时远端守护和原有容错继续运行。详见 [协作循环与文件交互](docs/collaboration.md) 和 [长训守护](docs/operations.md)。
+
+## 多 Agent 如何协同
+
+主控根据证据、依赖和可用资源拆分任务：环境与启动配方核对、计算/通信/显存分析可并行；attention、GEMM、MoE 等不同算子的优化也可独立并行推进。相关 Agent 可提问、答复、共享发现和报告阻塞，消息与处理回执保存在同一任务中。
+
+下游只消费已验收的结果；共享 GPU 的测量、耦合代码修改、集成和阶段 loss 验证由主控安排。任务领取、真实 Agent 会话、返回报告和验收分别记录，避免重复派发或把“已经返回”误当成“已经完成”。详见 [任务拆解与 Agent 协同](docs/multi-agent.md)。
 
 ## 安装
 
@@ -87,7 +95,7 @@ python scripts/validate_knowledge.py
 
 任务源码、现场数据、日志、看板与凭据保存在独立私有工作区；默认 `.work/` 同样忽略提交。公共仓仅包含可复用流程、工具、公开知识及合成示例。
 
-- [协作循环](docs/collaboration.md) / [三个阶段工作流](docs/workflows.md)
+- [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
 - [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)
 - [性能分析](docs/profiling.md) / [远程执行](docs/remote-execution.md)
 - [官方 Wiki](knowledge/README.md) / [更新协议](docs/wiki.md)

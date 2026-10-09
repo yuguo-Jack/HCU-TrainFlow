@@ -1,6 +1,6 @@
 ---
 name: hcu-trainflow
-description: 统一推进 HCU 大模型训练适配、性能优化、大规模验证与持续容错协作；从环境和模型目标启动可接续的实施、独立复核、修正循环，读取人类看板指导。也可只检查环境、分析性能或诊断故障。
+description: 统一编排 HCU 大模型训练适配、性能优化、大规模验证与持续容错；拆解并行 Agent 任务，协调依赖、消息与证据验收，持续实施、独立复核和修正，并处理看板指导。也可只检查环境、分析性能或诊断故障。
 ---
 
 # HCU-TrainFlow 协作主控
@@ -9,7 +9,7 @@ description: 统一推进 HCU 大模型训练适配、性能优化、大规模�
 
 ## 定位与任务契约
 
-1. 定位 HCU-TrainFlow checkout（用户路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。先读项目 `docs/collaboration.md`、`docs/workflows.md`，查看当前 CLI 帮助与已有任务。找不到工程时说明所缺路径，不以安装 Skill 的相对位置猜测项目。
+1. 定位 HCU-TrainFlow checkout（用户路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。先读项目 `docs/collaboration.md`、`docs/multi-agent.md`、`docs/workflows.md`，查看当前 CLI 帮助与已有任务。找不到工程时说明所缺路径，不以安装 Skill 的相对位置猜测项目。
 2. 从会话和现场推导模型、预训练/SFT/RL、资源范围、部署方式、数据/权重、用户 patch、目标及已有授权。关键访问、数据或资源缺失才向用户询问；并行继续可做的阅读/分析。全流程用 `full`；只检查、适配、分析、优化、诊断、运行分别用现有独立模式，不扩大任务。
 3. 创建或恢复 TaskSpec；冻结初始数值基线、比较上下文、预算、执行权限、唯一容错负责人。依当前 HCU 活跃分支的脚本和现场启动方式适配，不机械照搬 NV 配方。读取原始证据的权限不等于允许发布数据或重启任意任务。
 4. 写出可验收的目标和阶段计划，`flow-start` 挂接持久循环。用 `flow-board` 向用户提供 BOARD.md 和 GUIDANCE.md 路径。预算是停止盲目试错的边界；实际调整理由用 `flow-replan` 留痕，不能偷偷降低目标或延长循环。
@@ -21,6 +21,7 @@ description: 统一推进 HCU 大模型训练适配、性能优化、大规模�
 | action | 主控责任 |
 | --- | --- |
 | `work` / `repair` | 调用对应阶段 Skill，读取上一轮问题，选一个有证据支持的改动/实验。准备代码快照、报告和完整候选契约，`flow-submit`。不能只改总结以规避未通过的测试。 |
+| `coordinate` | 按 `team-next` 处理可派发任务、活跃成员和返回结果；转送/回复消息，验收解锁依赖。不能把等待成员当任务完成，也不能绕过团队验收直接提交候选。 |
 | `review` | 让独立 reviewer 从目标、候选快照、原始测试/trace、代码差异和历史发现重新检查。具备委派授权时用独立 Agent/会话；否则使用已配置 reviewer 或人类复核，不把实施者换个名字冒充独立审核。按契约 `flow-review`；超时、空回复或解析失败记 `flow-review-failed`。 |
 | `advance` | `flow-advance` 检查当前证据并进入下一阶段或下一轮。review 接受不能代替程序验收。 |
 | `reconcile` | 先确认原作业/attempt/执行是否仍在运行，再凭证据核销不确定操作；不得盲目重跑。 |
@@ -36,11 +37,20 @@ review 按 `docs/collaboration.md` 使用完整字段；不以单词“完成”
 - `$hcu-train-fault-tolerance`：完整模型最小 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
 - `$hcu-engine-wiki-search` / `$hcu-engine-wiki-update`：本地官方 Wiki 的检索和维护。需要 HCU 事实时读 HCU-Knowledge、当前底层库分支或官方资料；普通任务不顺带更新 HCU 大知识库。工具/脚本变了要复核相关 Skill、命令和解析器，不仅更新 Wiki。
 
-## 人机协作与多 Agent
+## 看板指导
 
-每轮开始、昂贵实验前、阶段推进前读取 GUIDANCE.md；有等待中的任务时按计划轮询（默认 30 秒），可运行 `flow-watch` 收集修改到事件队列。逐条明确应用、排期或不能应用的理由并 `flow-guidance-ack`；不要编辑人的原文。阻塞问题以 `flow-question` 登记，收到实际回答后关闭。一般进展、候选收益/代价、资源与显存趋势、平台期和专家需求写看板；避免频繁向人要求确认常规动作。
+默认每 5 分钟采集 GUIDANCE.md，由 `flow-watch` 或到期的 `flow-next` 收集到事件队列；每轮开始、昂贵实验前、阶段推进前检查已采集指导。不要每个步骤都绕过间隔直接重读文件。用户要求立即刷新时用 `flow-board` / `flow-watch --once`。逐条明确应用、排期或不能应用的理由并 `flow-guidance-ack`；不要编辑人的原文。阻塞问题以 `flow-question` 登记，收到实际回答后关闭。进展、收益/代价、显存趋势、平台期和专家需求写看板；避免要求确认常规动作。
 
-主控将专家 scope、允许修改路径、预算和验收记录为 assignment；独立源码分析可以并行，同一 GPU 资源上的基准实验要串行或明确隔离。共享 context 和候选哈希，不共享未经复核的“已完成”结论。reviewer 回应交由主控归并。
+## 多 Agent 拆解、交流与集成
+
+1. 每个阶段判断是否有值得并行的工作，写出输入/输出与依赖图。环境/软件核对、HCU 配方与官方语义可并行；固定 trace 的计算/通信/显存分析可并行。attention、GEMM、MoE 等不同算子可各由 Agent 完整推进局部优化迭代。实施按互不重叠的文件/函数/机制划分，单个算子耦合的 kernel body 与 launch 配置由同一人负责。并发上限不是人数配额。
+2. `team-plan` 登记 owner、scope、allowed_paths、checkout、mode、resources、depends_on、peers、预算和验收。共享 context 和固定证据，依赖报告须先验收。真正独立的 checkout/设备才用不同 ID；同一 GPU/网络测量域串行或确认隔离。完整算子优化任务宜用 `resource_scope: operation`，仅在实际测量时领取/释放资源租约；也可拆开发与测试任务。其他算子继续开发，有独立设备时可并行测量，不把所有算子优化强制串行。
+3. 依据 `team-next` 逐个 `assignment-claim`，再在宿主允许的范围内用原生多 Agent 工具派发，并 `assignment-bind` 实际 session ID。交给成员当前 token、输入哈希、允许范围、输出契约与收件规则。没有可用/获授权委派能力就顺序处理并说明，不能伪造会话或把领取叫作启动。
+4. 主动发现接口问题、相互影响或新瓶颈就 `agent-send` 留存，再用宿主消息工具提示已绑定会话。被动方每次恢复、实验/提交前读 `agent-inbox`，先 seen、处理后 handled；回答由提问方确认。相关成员可直接交流，重要阻塞和跨范围变更交主控。运行中投递依赖宿主能力，不能假定写入收件箱就会唤醒 Agent，也不要为每条消息重启会话。
+5. 等回答占着并发名额时，先确认执行结束和停止修改，`assignment-yield` 释放占用，恢复重新领取。不能向依赖自己完成的下游提出阻塞问题。成员失败保留其他结果；旧 context/token、未知远端作业先核对，不能自动超时重发。
+6. `assignment-return --token` 给出准确输入哈希、结论、原始证据、限制和跨域影响；主控/另一 reviewer 通过 `assignment-review` 验收才解锁下游。统一计算/通信的分母、内存生命周期和数值约束，挑选兼容方案。主控集成后再做局部回归、profiler-off 测量、阶段 loss 及独立整体复核；不能将几个分别有效的改动视为组合后必然有效。
+
+命令与 JSON 以 `docs/multi-agent.md` 为准。团队消息事件及时处理，不受人的五分钟文件采集周期限制。成果由所属阶段交付，无需再增加细碎的独立 Skill。
 
 本地会话在线才有主控推理。`flow-watch` 只记文件变化，不会凭空启动 Agent；离线唤醒需已配置的本地 bridge/宿主服务。远端 watcher 和既有容错独立运行，本机恢复后重放事件、核对现场再续接。没有配置时如实说明接续方式，不能承诺全天自动接管。
 

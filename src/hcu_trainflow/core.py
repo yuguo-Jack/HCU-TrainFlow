@@ -118,7 +118,12 @@ class Store:
             CREATE TABLE IF NOT EXISTS flow_rounds(task TEXT,number INTEGER,context TEXT,revision INTEGER,goal TEXT,candidate TEXT,review TEXT,status TEXT,failures INTEGER DEFAULT 0,PRIMARY KEY(task,number));
             CREATE TABLE IF NOT EXISTS flow_guidance(task TEXT,id TEXT,context TEXT,status TEXT,note TEXT,created TEXT,PRIMARY KEY(task,id));
             CREATE TABLE IF NOT EXISTS flow_guidance_cursor(task TEXT PRIMARY KEY,hash TEXT);
+            CREATE TABLE IF NOT EXISTS flow_guidance_scans(task TEXT PRIMARY KEY,checked_at REAL);
             CREATE TABLE IF NOT EXISTS flow_questions(task TEXT,id TEXT,payload TEXT,status TEXT,resolution TEXT,PRIMARY KEY(task,id));
+            CREATE TABLE IF NOT EXISTS team_plans(task TEXT PRIMARY KEY,artifact TEXT,max_parallel INTEGER);
+            CREATE TABLE IF NOT EXISTS assignment_runs(assignment TEXT PRIMARY KEY,token INTEGER,session TEXT,inputs TEXT,report TEXT,updated TEXT,note TEXT);
+            CREATE TABLE IF NOT EXISTS assignment_operations(operation TEXT PRIMARY KEY,assignment TEXT,token INTEGER);
+            CREATE TABLE IF NOT EXISTS agent_messages(id TEXT PRIMARY KEY,task TEXT,payload TEXT,status TEXT,created TEXT,receipt TEXT);
             """)
             row = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
             if row and row[0] != "1":

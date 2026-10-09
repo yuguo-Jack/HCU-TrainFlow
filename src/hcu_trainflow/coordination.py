@@ -1,34 +1,19 @@
 """Harness-neutral work assignments; no hidden model runtime or GUI wake-up."""
 import json
 
-from .core import FlowError, safe_id
+from .core import FlowError
 
 
 def assign(store, tid, spec):
-    task = store.task(tid)
-    required = {"id", "owner", "goal", "scope", "allowed_paths", "acceptance", "budget", "context"}
-    if required - spec.keys() or any(not spec[x] for x in required) or spec["context"] != task["context"]:
-        raise FlowError("Assignment needs bounded scope, owner, acceptance, budget and current context")
-    safe_id(spec["id"])
+    from .team import plan
     with store.db() as db:
-        db.execute("INSERT INTO assignments VALUES(?,?,?,'pending')", (spec["id"], tid, json.dumps(spec)))
-        store.event(db, tid, "assignment-ready", spec, channel="agent")
-    return {"id": spec["id"], "status": "pending", "dispatch": "Controller must claim and launch using its installed agent harness"}
+        previous=db.execute('SELECT max_parallel FROM team_plans WHERE task=?',(tid,)).fetchone()
+    return plan(store,tid,{'rationale':'Single bounded work item added by controller','max_parallel':previous['max_parallel'] if previous else 3,'assignments':[spec]})
 
 
-def finish_assignment(store, aid, owner, report_id):
-    store.artifact(report_id)
-    with store.db() as db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute("SELECT * FROM assignments WHERE id=?", (aid,)).fetchone()
-        if not row or json.loads(row["payload"])["owner"] != owner or row["status"] != "pending":
-            raise FlowError("Assignment is unavailable or belongs to another owner")
-        context = db.execute("SELECT context FROM tasks WHERE id=?", (row["task"],)).fetchone()[0]
-        if json.loads(row["payload"])["context"] != context:
-            raise FlowError("Assignment context became stale; reassess against current task")
-        db.execute("UPDATE assignments SET status='returned' WHERE id=?", (aid,))
-        store.event(db, row["task"], "assignment-returned", {"id": aid, "context": context, "report": report_id, "acceptance": "main-controller-review-required"}, channel="agent")
-    return {"id": aid, "status": "returned"}
+def finish_assignment(store, aid, owner, report_id, token):
+    from .team import finish
+    return finish(store,aid,owner,report_id,token)
 
 
 def reconcile_operation(store, oid, status, evidence, note):

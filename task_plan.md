@@ -57,3 +57,11 @@ User requests a unified autonomous entry Skill, persistent implement/review/corr
 2. Design and implement evidence-bound iteration/review and human board contracts integrated with existing task/execution/monitor state — complete.
 3. Add unified Skill, rename stage Skills with safe installation migration, and rewrite workflow-first docs — complete.
 4. Exercise interruption/resume, stale reviews, human guidance and numerical/scale gates; review and validate; no release or new tag — complete.
+
+
+## Agent coordination follow-up
+
+1. Inspect existing assignment, review and execution contracts; identify safe parallel stages — complete.
+2. Implement dependency-aware assignment lifecycle, bounded dispatch selection and related-agent message receipts; preserve execution uncertainty and quality gates — complete.
+3. Use the agreed agentic project description, five-minute guidance collection, stage/coordinator Skills and concrete parallelization guidance — complete.
+4. Test dependency/race/stale-result/message/resource cases, review and install Skills, push development changes without release/tag — complete locally; publication is recorded in Git history and CI.

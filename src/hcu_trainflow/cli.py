@@ -45,10 +45,20 @@ def parser():
     q = cmd("lease-renew", "file"); q.add_argument("--ttl", type=float, default=300)
     cmd("lease-release", "file")
     cmd("command-plan", "card")
-    cmd("command-run", "task", "operation", "card", "lease_file")
+    q = cmd("command-run", "task", "operation", "card", "lease_file"); q.add_argument('--assignment'); q.add_argument('--owner'); q.add_argument('--token',type=int)
     cmd("operation-reconcile", "operation", "file")
     cmd("assignment-add", "task", "file")
-    cmd("assignment-return", "assignment", "owner", "report")
+    q = cmd("assignment-return", "assignment", "owner", "report"); q.add_argument('--token',type=int,required=True)
+    cmd('team-plan', 'task', 'file')
+    cmd('team-next', 'task')
+    cmd('assignment-claim', 'assignment', 'owner')
+    q = cmd('assignment-bind', 'assignment', 'owner', 'session'); q.add_argument('--token',type=int,required=True)
+    cmd('assignment-review', 'assignment', 'file')
+    cmd('assignment-cancel', 'assignment', 'file')
+    q = cmd('assignment-yield', 'assignment', 'owner', 'file'); q.add_argument('--token',type=int,required=True)
+    cmd('agent-send', 'task', 'file')
+    q = cmd('agent-inbox', 'task'); q.add_argument('--recipient')
+    cmd('agent-ack', 'message', 'owner', 'file')
     cmd("inbox-dispatch", "event", "owner", "card", "lease_file")
     q = cmd("source-snapshot", "repository"); q.add_argument("paths", nargs="+")
     cmd("source-materialize", "snapshot", "destination")
@@ -80,7 +90,7 @@ def parser():
 
 
 def execute(a):
-    from . import analysis, coordination, delivery, environment, execution, flow, monitor, quality, wiki
+    from . import analysis, coordination, delivery, environment, execution, flow, monitor, quality, team, wiki
     store = Store(a.workspace)
     c = a.command
     if c == "init": return {"workspace": str(store.root), "schema_version": 1, "version": __version__}
@@ -99,7 +109,7 @@ def execute(a):
     if c == 'flow-question-close': return flow.close_question(store, a.task, a.question, a.guidance, a.note)
     if c in {'flow-board', 'flow-watch'}:
         while True:
-            change = flow.sync_guidance(store, a.task)
+            change = flow.sync_guidance(store, a.task, force=c == 'flow-board' or a.once)
             result = {**flow.render_board(store, a.task), **change}
             if c == 'flow-board' or a.once: return result
             if change['new']: print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -115,10 +125,20 @@ def execute(a):
     if c == "lease-renew": return store.renew(read_json(a.file), a.ttl)
     if c == "lease-release": return store.release(read_json(a.file))
     if c == "command-plan": return execution.command_plan(read_json(a.card))
-    if c == "command-run": return execution.run_command(store, a.task, a.operation, read_json(a.card), read_json(a.lease_file))
+    if c == "command-run": return execution.run_command(store, a.task, a.operation, read_json(a.card), read_json(a.lease_file),assignment=a.assignment,owner=a.owner,token=a.token)
     if c == "operation-reconcile": return coordination.reconcile_operation(store, a.operation, **read_json(a.file))
     if c == "assignment-add": return coordination.assign(store, a.task, read_json(a.file))
-    if c == "assignment-return": return coordination.finish_assignment(store, a.assignment, a.owner, a.report)
+    if c == "assignment-return": return coordination.finish_assignment(store, a.assignment, a.owner, a.report, a.token)
+    if c == 'team-plan': return team.plan(store,a.task,read_json(a.file))
+    if c == 'team-next': return team.schedule(store,a.task)
+    if c == 'assignment-claim': return team.claim(store,a.assignment,a.owner)
+    if c == 'assignment-bind': return team.bind(store,a.assignment,a.owner,a.token,a.session)
+    if c == 'assignment-review': return team.review(store,a.assignment,read_json(a.file))
+    if c == 'assignment-cancel': return team.cancel(store,a.assignment,read_json(a.file))
+    if c == 'assignment-yield': return team.yield_assignment(store,a.assignment,a.owner,a.token,read_json(a.file))
+    if c == 'agent-send': return team.send(store,a.task,read_json(a.file))
+    if c == 'agent-inbox': return {'messages':team.messages(store,a.task,a.recipient)}
+    if c == 'agent-ack': return team.acknowledge(store,a.message,a.owner,read_json(a.file))
     if c == "inbox-dispatch": return coordination.dispatch_inbox(store, a.event, a.owner, read_json(a.card), read_json(a.lease_file))
     if c == "source-snapshot": return execution.snapshot(store, a.repository, a.paths)
     if c == "source-materialize": return execution.materialize(store, a.snapshot, a.destination)

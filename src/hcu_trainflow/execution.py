@@ -62,10 +62,15 @@ def command_plan(card):
     return result
 
 
-def run_command(store, tid, operation_id, card, lease, *, control_plane=False):
+def run_command(store, tid, operation_id, card, lease, *, control_plane=False, assignment=None, owner=None, token=None):
+    from . import team
+    if control_plane and assignment:
+        raise FlowError('A local delivery bridge is not an assignment experiment')
+    if not assignment and (owner is not None or token is not None):
+        raise FlowError('Owner/token require an assignment')
     if not control_plane:
         from .flow import guard_execution
-        guard_execution(store, tid)
+        guard_execution(store, tid, allow_parallel=assignment is not None)
     task = store.task(tid)
     if "execute" not in task["spec"].get("permissions", []):
         raise FlowError("Task has no execute permission")
@@ -73,10 +78,21 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False):
         raise FlowError("Task is not active")
     safe_id(operation_id)
     plan = command_plan(card)
-    request = fingerprint({"plan": plan, "context": task["context"]})
+    identity = {"plan": plan, "context": task["context"]}
+    if assignment:
+        identity.update(assignment=assignment, owner=owner, token=token)
+    request = fingerprint(identity)
     with store.db() as db:
         db.execute("BEGIN IMMEDIATE")
         store.check_lease(db, **lease)
+        current = db.execute('SELECT context,state FROM tasks WHERE id=?', (tid,)).fetchone()
+        if current['context'] != task['context'] or current['state'] in {'completed', 'cancelled', 'paused', 'blocked', 'failed'}:
+            raise FlowError('Task context/state changed before execution')
+        if not control_plane:
+            from .flow import get_flow, blockers
+            current_flow = get_flow(db, tid)
+            if current_flow and blockers(db, tid, task, current_flow):
+                raise FlowError('New guidance/context needs attention before execution')
         prior = db.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
         if prior:
             if prior["task"] != tid or prior["request_hash"] != request:
@@ -84,6 +100,7 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False):
             if prior["status"] in {"complete", "failed"}:
                 return json.loads(prior["result"])
             raise FlowError("Outcome unknown; reconcile original execution before creating another operation")
+        assigned=team.check_execution(db,tid,assignment,owner,token,lease['resource']) if assignment else None
         occupied = db.execute("SELECT o.id FROM operations o JOIN events e ON json_extract(e.payload,'$.operation')=o.id WHERE e.kind='operation-started' AND json_extract(e.payload,'$.lease.resource')=? AND o.status IN ('started','unknown')", (lease["resource"],)).fetchone()
         if occupied:
             raise FlowError("Resource already has an unresolved execution, including in another task")
@@ -91,14 +108,32 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False):
         if count >= task["spec"].get("budget", {}).get("max_operations", 100):
             raise FlowError("Operation budget exhausted")
         spent = sum(json.loads(x[0]).get("seconds", 0) for x in db.execute("SELECT result FROM operations WHERE task=? AND result IS NOT NULL", (tid,)))
-        remaining = task["spec"].get("budget", {}).get("max_seconds", float("inf")) - spent
+        reserved = sum(json.loads(r[0]).get('timeout_seconds', 0) for r in db.execute(
+            "SELECT e.payload FROM events e JOIN operations o ON json_extract(e.payload,'$.operation')=o.id "
+            "WHERE e.kind='operation-started' AND o.task=? AND o.status IN ('started','unknown')", (tid,)))
+        remaining = task["spec"].get("budget", {}).get("max_seconds", float("inf")) - spent - reserved
         if plan["timeout_seconds"] > remaining:
             raise FlowError("Command timeout exceeds remaining execution budget")
-        uncertain = db.execute("SELECT id FROM operations WHERE task=? AND status IN ('started','unknown')", (tid,)).fetchall()
-        if uncertain:
-            raise FlowError("Prior execution outcome is unresolved; reconcile before another command")
+        uncertain = db.execute("SELECT id,status FROM operations WHERE task=? AND status IN ('started','unknown')", (tid,)).fetchall()
+        for other in uncertain:
+            # The authorized short local bridge must deliver questions/incidents
+            # while workers run, including to wake reconciliation of an unknown job.
+            # It still needs its own lease/budget and cannot reuse an occupied resource.
+            if control_plane:
+                continue
+            linked=db.execute('SELECT assignment FROM assignment_operations WHERE operation=?',(other['id'],)).fetchone()
+            if not assigned or other['status']=='unknown' or not team.active_operation(db,other['id'],tid) or linked['assignment']==assignment:
+                raise FlowError("Prior execution outcome is unresolved; reconcile before another command")
+        if assigned:
+            history=db.execute('SELECT o.result FROM operations o JOIN assignment_operations a ON o.id=a.operation WHERE a.assignment=?',(assignment,)).fetchall()
+            budget=assigned['spec']['budget']
+            seconds=sum(json.loads(r['result']).get('seconds',0) for r in history if r['result'])
+            if len(history)>=budget.get('max_operations',100) or plan['timeout_seconds']>budget.get('max_seconds',float('inf'))-seconds:
+                raise FlowError('Assignment execution budget exhausted')
         db.execute("INSERT INTO operations VALUES(?,?,?,'started',NULL,?)", (operation_id, tid, request, utc()))
-        store.event(db, tid, "operation-started", {"operation": operation_id, "request": request, "lease": lease})
+        if assigned:db.execute('INSERT INTO assignment_operations VALUES(?,?,?)',(operation_id,assignment,token))
+        store.event(db, tid, "operation-started", {"operation": operation_id, "request": request, "lease": lease,
+                                                "timeout_seconds": plan['timeout_seconds']})
     output = store.root / "runs" / tid / operation_id
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "plan.json", plan)

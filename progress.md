@@ -59,3 +59,16 @@ Reference retrieval note: older .private/sources directories are source snapshot
 - Added hcu-trainflow and renamed stage Skills to adapt/optimize/fault-tolerance. Installer migrates old names with preserved backups outside Skill discovery; six workflow Skills are installed locally, matching checkout bytes. Existing Hygon kernel Skill installations were not replaced.
 - Updated workflow-first README, architecture/contracts/operations, source-maintenance links, CLI, unreleased changelog and package metadata to 0.3.0.dev0. Local editable installation reports the same version.
 - Validation: 100 full-suite tests passed; 22 focused flow tests passed again after final contract/error-handling review. All six Skills validate; all 46 Wiki pages and 24 source registrations validate; authored local Markdown links resolve. CLI collaboration demonstration completed with explicitly scripted CPU-only evidence and a retained board. Existing real-site/multi-Agent/notification validation gaps remain explicit. No release or new tag was created.
+
+
+Started the approved project-description/five-minute guidance/multi-Agent coordination follow-up. No real training environment or background service is being deployed. Using the existing planning-with-files and skill-creator workflow; prior checkout is clean.
+
+## Agent coordination and five-minute guidance follow-up
+
+- Applied the agreed agentic workflow description to README, package metadata and GitHub About (authenticated account verified as yuguo-Jack). Version remains 0.3.0.dev0; no release/tag requested or created.
+- Implemented DAG work plans, atomic bounded claims, actual session mapping, immutable accepted-input hashes, result review, quiescent yield/cancel and durable peer messages with explicit receipts. Integrated incomplete-team gates and stale-candidate invalidation with the existing flow loop.
+- Enabled independent assignment command execution while preserving task/assignment budgets and uncertainty checks. Shared GPU measurement remains fenced; operation-scoped resources let different operator Agents continue development concurrently without reserving GPU for their whole task.
+- Guidance collection defaults to 300 seconds; normal flow operations share the collection timestamp, and explicit refresh remains immediate. Task board includes assignments, dependencies, sessions, results and peer exchanges.
+- Updated coordinator/three stage Skills with concrete parallelization, direct peer interaction and operator optimization guidance. Reviewed Multica alongside the prior Hyperloom/Humanize/BBuf evidence. The local protocol demo now includes two scripted lanes, question/answer/acknowledgement and result acceptance before the full review loop.
+- Validation: 127 tests passed, including 26 team/parallel/message/resource tests; 46 Wiki pages and 24 sources validate; six Skills validate and installed copies match repository bytes; local Markdown links and Git whitespace pass. Private/cache paths remain excluded from candidate tracked files. System Python editable metadata remains 0.3.0.dev0.
+- Real model-provider launch, native runtime message delivery and HCU hardware behavior remain deployment validation work. Only the synthetic protocol was executed; no background watcher, production training, release or tag was started.

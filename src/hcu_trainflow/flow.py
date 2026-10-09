@@ -4,10 +4,11 @@ The Agent executes the decisions. This module never silently launches a model,
 claims to authenticate reviewer identity, or treats a code review as a GPU test.
 """
 import json
+import time
 from .core import FlowError, GATES, atomic_write, child, safe_id, utc
 
 DEFAULTS = {'max_rounds': 20, 'max_stalled_rounds': 3, 'full_review_every': 4,
-            'max_review_failures': 3, 'poll_seconds': 30}
+            'max_review_failures': 3, 'poll_seconds': 300}
 DELIVERABLES = {'environment': 'environment', 'adapt': 'baseline', 'analyze': 'analysis',
                 'optimize': 'stage-quality', 'diagnose': 'diagnosis', 'operate': 'operations'}
 NEXT = {'prepared': 'environment_checked', 'environment_checked': 'baseline_validated',
@@ -49,8 +50,8 @@ def start(store, tid, plan, reason=None):
     for key in DEFAULTS:
         if type(plan[key]) is not int or plan[key] <= 0:
             raise FlowError('Flow limits must be positive integers')
-    if not 1 <= plan['poll_seconds'] <= 60:
-        raise FlowError('Guidance polling interval must be 1..60 seconds')
+    if not 1 <= plan['poll_seconds'] <= 3600:
+        raise FlowError('Guidance polling interval must be 1..3600 seconds')
     acceptance = plan.get('acceptance')
     if not isinstance(acceptance, dict) or not acceptance or any(not isinstance(v, str) or not v.strip() for v in acceptance.values()):
         raise FlowError('Plan requires named, concrete acceptance criteria')
@@ -88,11 +89,15 @@ def start(store, tid, plan, reason=None):
     return {'task': tid, 'goal': goal, 'status': 'started', 'board': str(board), 'guidance': str(guidance)}
 
 
-def sync_guidance(store, tid):
+def sync_guidance(store, tid, *, force=False):
     with store.db() as db:
         flow = get_flow(db, tid)
+        scan = db.execute('SELECT checked_at FROM flow_guidance_scans WHERE task=?', (tid,)).fetchone()
     if not flow:
         return {'new': 0}
+    now = time.time()
+    if not force and scan and 0 <= now - scan['checked_at'] < flow['plan']['poll_seconds']:
+        return {'new': 0, 'scan': 'not-due'}
     _, _, path = board_paths(store, tid)
     if not path.is_file():
         raise FlowError('Human guidance file is missing; restore it rather than silently resetting the inbox')
@@ -104,6 +109,7 @@ def sync_guidance(store, tid):
     task = store.task(tid)
     with store.db() as db:
         db.execute('BEGIN IMMEDIATE')
+        db.execute('INSERT OR REPLACE INTO flow_guidance_scans VALUES(?,?)', (tid, now))
         previous = db.execute('SELECT hash FROM flow_guidance_cursor WHERE task=?', (tid,)).fetchone()
         if previous and previous['hash'] == sha:
             return {'new': 0, 'guidance': sha}
@@ -189,7 +195,8 @@ def required_reports(task, destination):
 
 def gate(store, db, task, candidate):
     """Reports are current and belong to this exact candidate; LLM verdict cannot waive them."""
-    reasons = []
+    from .team import completion_blockers
+    reasons = completion_blockers(db,task['id'])
     if candidate['target'] == 'completed' and db.execute("SELECT 1 FROM flow_guidance WHERE task=? AND status='queued'", (task['id'],)).fetchone():
         reasons.append('queued-human-guidance-needs-final-disposition')
     for kind in required_reports(task, candidate['target']):
@@ -247,7 +254,9 @@ def next_step(store, tid):
                 row = last_round(db, tid)
         if task['state'] in {'completed', 'cancelled'}:
             return {**result, 'action': task['state']}
-        uncertain = [r['id'] for r in db.execute("SELECT id FROM operations WHERE task=? AND status IN ('started','unknown')", (tid,))]
+        from .team import active_operation, completion_blockers, schedule
+        uncertain = [r['id'] for r in db.execute("SELECT id,status FROM operations WHERE task=? AND status IN ('started','unknown')", (tid,))
+                     if r['status']=='unknown' or not active_operation(db,r['id'],tid)]
         if uncertain:
             return {**result, 'action': 'reconcile', 'operations': uncertain}
         reasons = blockers(db, tid, task, flow)
@@ -268,6 +277,9 @@ def next_step(store, tid):
                 if row['failures'] >= flow['plan']['max_review_failures']:
                     return {**result, 'action': 'human', 'reasons': ['review-failures'], 'round': row['number']}
                 problems = gate(store, db, task, candidate) if row['status'] == 'accepted' else []
+                team_reasons = completion_blockers(db, tid)
+                if team_reasons:
+                    return {**result, 'action': 'coordinate', 'reasons': team_reasons, 'team': schedule(store, tid)}
                 return {**result, 'action': 'repair' if problems else 'advance' if row['status'] == 'accepted' else 'review',
                         'round': row['number'], 'candidate': row['candidate'], 'review': row['review'], 'reasons': problems,
                         'full_alignment_required': row['number'] % flow['plan']['full_review_every'] == 0 or candidate['target'] in {'scale_ready', 'training', 'completed'}}
@@ -285,6 +297,9 @@ def next_step(store, tid):
         mode = task['spec']['mode']
         stage = STAGES.get(task['state'], 'adapt') if mode == 'full' else 'adapt' if mode in {'environment', 'adapt'} else 'optimize' if mode in {'analyze', 'optimize'} else 'fault-tolerance'
         action = 'repair' if row and row['status'] in {'revise', 'superseded'} else 'work'
+        team_reasons=completion_blockers(db,tid)
+        if team_reasons:
+            return {**result,'action':'coordinate','reasons':team_reasons,'team':schedule(store,tid)}
         return {**result, 'action': action, 'skill': 'hcu-train-' + stage, 'target': target(task),
                 'required_reports': required_reports(task, target(task)), 'last_review': row['review'] if row else None,
                 'poll_seconds': flow['plan']['poll_seconds']}
@@ -442,12 +457,14 @@ def advance(store, tid):
     return next_step(store, tid)
 
 
-def guard_execution(store, tid):
+def guard_execution(store, tid, *, allow_parallel=False):
     with store.db() as db:
         flow = get_flow(db, tid)
     if flow:
         decision = next_step(store, tid)
-        if decision['action'] in {'human','reconcile','completed','cancelled'}:
+        task=store.task(tid)
+        with store.db() as db: reasons=blockers(db,tid,task,flow)
+        if reasons or decision['action'] in {'human','completed','cancelled'} or decision['action']=='reconcile' and not allow_parallel:
             raise FlowError('Resolve flow decision before more execution: ' + decision['action'] + ' ' + ', '.join(decision.get('reasons', [])))
 
 
@@ -489,5 +506,16 @@ def render_board(store, tid):
             lines += [review['summary'], ''] + [f"- {f['severity']}: {f['detail']}" for f in review['findings']]
     lines += ['', '## Current evidence', ''] + [f"- {r['kind']}: {r['result']} · {link(r['artifact'])}" for r in reports]
     lines += ['', '## Recent progress and incidents', ''] + [f"- {e['created']} · {e['kind']} · `{e['payload']}`" for e in reversed(events)]
+    from .team import schedule, messages
+    team=schedule(store,tid)
+    lines += ['', '## Agent work and dependencies', '', f"Parallel slots: {team['max_parallel']} · Ready: {', '.join(team['dispatchable']) or 'none'}", '']
+    for item in team['assignments']:
+        lines += [f"- **{item['id']}** · {item['owner']} · {item['status']} · stale={item['stale']} · depends on {', '.join(item['depends_on']) or 'none'}: {item['goal']}"]
+        run=item['run']
+        if run:lines += [f"  - Session: {run['session'] or 'not bound'} · token {run['token']} · result {link(run['report']) if run['report'] else 'pending'}"]
+    lines += ['', '## Agent questions and findings', '']
+    for item in messages(store,tid):
+        m=item['message']
+        lines += [f"- **{item['id']}** · {m['sender']} → {m['recipient']} · {m['kind']} / {item['status']} · stale={item['stale']}: {m['body']}"]
     atomic_write(board, '\n'.join(lines) + '\n')
     return {'board': str(board), 'guidance': str(human), 'task': tid}

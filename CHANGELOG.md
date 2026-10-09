@@ -2,6 +2,8 @@
 
 ## 0.3.0.dev0 — Unreleased
 
+- Add dependency-aware parallel assignments, atomic scope/resource reservations, native session bindings, accepted-result handoffs and durable peer questions/answers/blockers. Known independent executions can coexist; uncertain remote outcomes still require reconciliation.
+- Collect guidance every five minutes by default, with explicit immediate refresh; expose team progress and message receipts on the task board. Reference Multica routing/receipts and Hyperloom implementation ownership without adding their runtimes.
 - Add the unified collaborative workflow Skill, with persistent implementation/review/correction rounds, evidence-bound stage advancement, full-goal checks and bounded review failures.
 - Add private Markdown boards, preserved human guidance, explicit responses/questions and durable wake-up events; an actual Agent runtime/bridge is still required.
 - Rename preparation to `hcu-train-adapt` and operations to `hcu-train-fault-tolerance`, with backed-up installation migration and unchanged independent task modes.

@@ -3,6 +3,7 @@
 本项目原始代码与原创说明使用 MIT。公开源码 Wiki 是自主组织的阅读说明和固定链接，未将第三方完整源码、文档或 Skill 原文打包进本仓。第三方项目保留自己的许可；安装/复用时检查所用提交的 LICENSE 及附加条款。
 
 - [Hyperloom](https://github.com/yuguo-Jack/Hyperloom)：参考多 Agent 编排、证据和性能流程的组织。
+- [Multica](https://github.com/multica-ai/multica)：参考负责人拆解派发、运行中消息、结果回流及投递回执的区分；未复制其代码或引入运行时依赖。其 LICENSE 含附加条件，不能视为无附加条件的 Apache-2.0。
 - [BBuf AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS)：参考先重现后升级工具的故障分析方法和 profiler 工作流；未复制 Skill/脚本。
 - [PolyArch/humanize](https://github.com/PolyArch/humanize)：参考 RLCR 的实施/独立复核、全目标对齐和失败处理；未复制其 hook 或安装全局运行时。
 - [humanfia/humanize](https://github.com/humanfia/humanize)：参考独立 flow runtime 中 actor/reviewer 的结构化循环与持久状态；未把该运行时作为 TrainFlow 依赖。

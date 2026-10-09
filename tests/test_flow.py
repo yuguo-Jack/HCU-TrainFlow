@@ -141,8 +141,8 @@ def test_guidance_supersedes_review_and_is_never_overwritten(tmp_path):
     path = flow.board_paths(store, 't')[2]
     text = '# Expert guidance\nDo not use the previous timing denominator.\n'
     path.write_text(text, encoding='utf8')
-    first = flow.sync_guidance(store, 't')
-    assert first['new'] == 1 and flow.sync_guidance(store, 't')['new'] == 0
+    first = flow.sync_guidance(store, 't', force=True)
+    assert first['new'] == 1 and flow.sync_guidance(store, 't', force=True)['new'] == 0
     assert flow.next_step(store, 't')['action'] == 'human'
     flow.render_board(store, 't')
     assert path.read_text(encoding='utf8') == text
@@ -150,10 +150,10 @@ def test_guidance_supersedes_review_and_is_never_overwritten(tmp_path):
     assert flow.next_step(store, 't')['action'] == 'repair'
     with pytest.raises(FlowError): flow.advance(store, 't')
     path.write_text(text + 'Second comment', encoding='utf8')
-    second = flow.sync_guidance(store, 't')
+    second = flow.sync_guidance(store, 't', force=True)
     flow.acknowledge(store, 't', second['guidance'], 'applied', 'Addressed')
     path.write_text(text, encoding='utf8')
-    assert flow.sync_guidance(store, 't')['new'] == 1
+    assert flow.sync_guidance(store, 't', force=True)['new'] == 1
 
 
 def test_questions_require_human_answer(tmp_path):
@@ -162,7 +162,7 @@ def test_questions_require_human_answer(tmp_path):
     assert flow.next_step(store,'t')['action'] == 'human'
     with pytest.raises(FlowError): flow.close_question(store,'t','q1','missing','Guessed a pool')
     flow.board_paths(store, 't')[2].write_text('q1: Use the previously allocated pool.', encoding='utf8')
-    answer = flow.sync_guidance(store,'t')['guidance']
+    answer = flow.sync_guidance(store,'t', force=True)['guidance']
     flow.acknowledge(store,'t',answer,'applied','Using existing allocation')
     flow.close_question(store,'t','q1',answer,'Confirmed scope')
     assert flow.next_step(store,'t')['action'] == 'work'
@@ -171,7 +171,7 @@ def test_questions_require_human_answer(tmp_path):
 def test_pending_guidance_blocks_work_but_not_authorized_bridge(tmp_path):
     store = setup(tmp_path)
     flow.board_paths(store,'t')[2].write_text('Pause and inspect the metrics.', encoding='utf8')
-    event = flow.sync_guidance(store,'t')['event_id']
+    event = flow.sync_guidance(store,'t', force=True)['event_id']
     card = {'schema_version':1, 'argv':[sys.executable,'-c','print("synthetic bridge")'],
             'cwd':str(tmp_path), 'basis':'fixture', 'timeout_seconds':10}
     lease = store.lease('local-cpu','controller')
@@ -225,12 +225,14 @@ def test_cli_collaboration_fixture(tmp_path, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result['action'] == 'completed'
     assert result['validation'] == 'scripted-protocol-fixture-only'
+    assert len(result['team']['assignments']) == 2
+    assert all(x['status'] == 'accepted' for x in result['team']['assignments'])
 
 
 def test_queued_guidance_must_be_resolved_before_completion(tmp_path):
     store = setup(tmp_path)
     flow.board_paths(store,'t')[2].write_text('Please also explain the memory peak.', encoding='utf8')
-    sha = flow.sync_guidance(store,'t')['guidance']
+    sha = flow.sync_guidance(store,'t', force=True)['guidance']
     flow.acknowledge(store,'t',sha,'queued','Will include memory peak in the final analysis')
     flow.submit(store,'t',candidate(store))
     flow.review(store,'t',verdict(store))
@@ -277,3 +279,28 @@ def test_guidance_watch_cli_does_not_act_on_user_content(tmp_path,capsys):
     assert json.loads(capsys.readouterr().out)['new'] == 0
     with store.db() as db:
         assert db.execute('SELECT count(*) FROM operations').fetchone()[0] == 0
+
+
+def test_new_required_assignment_supersedes_accepted_candidate(tmp_path):
+    from hcu_trainflow import team
+    store = setup(tmp_path)
+    flow.submit(store, 't', candidate(store))
+    flow.review(store, 't', verdict(store))
+    evidence = store.put(b'Additional fixture verification')
+    team.plan(store, 't', {'rationale': 'Additional scope needs its own candidate review', 'max_parallel': 1,
+        'assignments': [{'id': 'a', 'owner': 'worker', 'goal': 'Additional check', 'scope': 'Fixture',
+            'mode': 'read', 'allowed_paths': ['.'], 'budget': {'max_operations': 1},
+            'acceptance': 'Fixture evidence retained', 'context': store.task('t')['context']}]})
+    assert flow.next_step(store, 't')['action'] == 'coordinate'
+    with pytest.raises(FlowError): flow.advance(store, 't')
+    run = team.claim(store, 'a', 'worker')
+    report = flow.retain(store, {'summary': 'Additional findings', 'context': run['context'],
+                                 'inputs': run['inputs'], 'evidence': [evidence]})
+    team.finish(store, 'a', 'worker', report, run['token'])
+    team.review(store, 'a', {'report': report, 'reviewer': 'controller', 'verdict': 'accept',
+                             'note': 'Evidence verified', 'evidence': [report]})
+    assert flow.next_step(store, 't')['action'] == 'repair'
+    with pytest.raises(FlowError): flow.advance(store, 't')
+    flow.submit(store, 't', candidate(store, label='updated-candidate'))
+    flow.review(store, 't', verdict(store))
+    assert flow.advance(store, 't')['action'] == 'completed'

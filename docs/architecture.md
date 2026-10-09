@@ -6,7 +6,10 @@ flowchart TD
     A --> F[统一入口与实施 / 复核 / 修正循环]
     F --> S[三个阶段 Skill]
     HN[BOARD.md / GUIDANCE.md] <--> F
-    A --> E[有范围和预算的本地专家]
+    A --> DAG[依赖图、可派发任务与范围预约]
+    DAG --> E[有范围和预算的本地专家]
+    E <--> MSG[定向消息、问题与处理回执]
+    MSG --> A
     S --> W[任务上下文与证据工作区]
     E --> W
     W --> C[不可变代码快照与显式命令卡]
@@ -43,6 +46,8 @@ SQLite 保存任务、报告、事件、租约、操作和游标；大对象按 
 
 ## Agent 与长训
 
-主控通过 assignment 划分分析/实现范围并验收，不在库内绑定某家模型 API。远端只需 Python watcher 和原有容错工具。Agent bridge 在本机运行，可接站点/用户自己的 Codex CLI launcher；bridge 退出成功仅表示交付返回，事件仍需消费者完成回执。
+主控通过带依赖的 assignment 划分分析/实现范围并验收，具体见 [多 Agent 协同](multi-agent.md)。SQLite 原子领取避免名额、资源或修改范围的重复占用；领取 token 和实际 session 分开保存。依赖绑定已验收的报告哈希，消息区分问题/答案/发现/阻塞/交接以及 seen/handled。主控用宿主原生工具派发，库不绑定模型 API。
+
+远端只需 Python watcher 和原有容错工具。Agent bridge 在本机运行，可接站点/用户自己的 Codex CLI launcher；bridge 退出成功仅表示交付返回，事件仍需消费者完成回执。已登记且资源独立的成员操作可以并行，未明结局的操作不能盲目重试；集成和训练阶段推进检查全任务未完成工作。
 
 人的文件指导与告警共用持久事件队列。文件轮询和 watcher 都不进行模型推理，具体运行时必须提供 Agent 会话/桥接；本地合成闭环不能证明真实多 Agent 调度、离线唤醒或集群容错已验收。三个阶段 Skill 可独立调用，统一入口不改变 environment/analyze/diagnose 的范围。

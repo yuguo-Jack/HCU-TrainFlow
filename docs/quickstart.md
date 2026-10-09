@@ -37,7 +37,8 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 看板与指导 | flow-board/watch/question/question-close/guidance-ack |
 | 资源与执行 | lease-acquire/renew/release、command-plan/run、operation-reconcile |
 | 源码传输 | source-snapshot/materialize/bundle/receive |
-| 多 Agent | assignment-add/return、inbox、inbox-dispatch |
+| 多 Agent | team-plan/next、assignment-add/claim/bind/return/review/yield/cancel、agent-send/inbox/ack |
+| 事件投递 | inbox、inbox-dispatch |
 | 验收 | environment-check、proxy-check、iteration-check、quality-check |
 | 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective |
 | 长训 | watch、heartbeat-check、events-export/import、monitor-report |
@@ -60,3 +61,5 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 各输入字段和判定边界见 [JSON 契约](contracts.md)。
 
 统一主控的目标、候选、独立复核与文件回复契约见 [协作循环](collaboration.md)。完整自动续接需要宿主 Agent 在线或已部署桥接，安装 Skill 不会自动启动后台模型服务。
+
+默认每 5 分钟采集交互文件，`flow-board TASK` 或 `flow-watch TASK --once` 可立即采集。运行期间用 `team-next TASK` 查看可派发任务、活跃会话、依赖与冲突，用 `agent-inbox TASK --recipient ASSIGNMENT` 查看定向消息。完整契约和运行时接入见 [多 Agent 协同](multi-agent.md)。

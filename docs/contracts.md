@@ -55,7 +55,11 @@ models JSON 按分析输出中的 op key（优先）或 kernel name 映射。GEM
 
 ## Assignment 与接手
 
-assignment-add 接收 id、owner、goal、scope、allowed_paths、acceptance、budget、context。assignment-return 引用已保留的报告对象；主控仍需验收。inbox 的 pending→claimed→completed 与工作结果验收分开。
+`team-plan TASK FILE` 记录 rationale、max_parallel 和 assignments。每项有 id、owner、goal、scope、allowed_paths、acceptance、budget、context，并可声明 depends_on、peers、mode、checkout、resources、resource_scope、required。resource_scope 默认 assignment（整项预约），operation 用于不同算子并行开发、仅在实际测试时按资源租约互斥。`assignment-add` 保留为单项追加入口。
+
+`assignment-claim` 返回 token 和已验收依赖报告的 inputs 哈希；`assignment-bind` 绑定真实运行时 session。`assignment-return ... --token N` 引用 JSON 报告（context、精确 inputs、summary、evidence）；`assignment-review` 的 accept 才解锁下游。`assignment-yield` 要求证实工作已静止，恢复必须重新领取；cancel 不等于完成。旧的未领取 assignment 不能直接 return。
+
+`agent-send` 保存有方向的 question/answer/finding/blocker/handoff；`agent-ack` 区分 seen 与 handled，回答由提问方确认。消息不自动启动模型。事件 inbox 的投递状态与消息处理、工作验收是三套不同状态。字段示例、并行条件和过期处理见 [多 Agent 契约](multi-agent.md)。
 
 ## WikiReview
 
