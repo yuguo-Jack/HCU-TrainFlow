@@ -15,6 +15,7 @@
 
 - 连续组从固定初始状态运行到总目标 N，在中间 K 保存。
 - 恢复组从连续组同一份 K 的不可变 checkpoint 恢复，目标仍为总步数 N。确认引擎的参数含义是总步数还是新增步数。
+- 区分本次停止步数与优化器调度长度。延长 `train_iters` 可能同时改变 LR decay / weight decay 的总长度并在加载时冲突；若目标是原样续训，应采用该版本支持的 checkpoint scheduler 恢复策略，核对恢复的 num_steps、LR/WD 全部参数。不要用跳过优化器/RNG、覆盖断言或重新初始化来换取退出码 0。确需改变调度配方则单独记录并验证，不作为原样恢复。
 - 不能修改原运行目录中的 latest 指针。为读取旧迭代建立任务自己的只读选择目录或使用引擎原生迭代选择参数；确保所有分片、metadata 和版本一致。
 - 核对加载日志、模型 key 覆盖、优化器/调度器、RNG、数据游标/consumed samples、并行布局以及后续更新。某些实现会在 strict 加载失败后重试非 strict；退出码 0 不能证明没有 missing/unexpected keys。
 - 比较 K+1…N 的 loss、grad、学习率、样本数和最终模型/优化器状态。打印的小数相同不代表原始 tensor 相同；需要时按 checkpoint storage chunk 分批在 CPU 比较，避免一次加载整个大模型。
