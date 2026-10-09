@@ -1,60 +1,61 @@
 # 第三方依赖与安装
 
-## 统一目录与可复现版本
+## 完整安装
 
-`thirdparty/manifest.json` 是本版本测试的依赖清单。执行 bootstrap 后建立 TraceLens、cuda-optimized-skill 的 Git checkout，HCU-Knowledge 可单独启用。主仓不会递归提交其源码、数据、凭据或运行缓存；Git clone 本仓后还需执行下面的安装步骤。
+系统 Python 3.10+、Git、Git LFS 和 HCU-Knowledge 读取权限是基础条件。`thirdparty/manifest.json` 锁定 TraceLens HCU fork、三个 Hygon 算子 Skill 的源仓以及必需的 HCU-Knowledge。公共仓只提交清单，不提交依赖源码、知识库资料、凭据或现场数据。
 
-```bash
-python -m pip install -e ".[test]"
-python scripts/bootstrap_thirdparty.py
-python -m pip install -e thirdparty/TraceLens
-python scripts/bootstrap_thirdparty.py --status
+在工程根目录执行（PowerShell）：
+
+```powershell
+git lfs install
+python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills"
 ```
 
-使用当前系统 Python。TraceLens 的分析依赖（pandas、openpyxl 等）由其包声明安装；不需要在本地主控安装 CUDA、DTK、PyTorch 训练环境、TE 或 cuDNN。其可选 LLM/联网分析 extra 未启用，集成只调用本地报告 API。
+完整安装依次检查/获取三个依赖，用当前系统 Python 安装 TrainFlow、TraceLens、HCU-Knowledge 包，获取受管知识 checkout 的 LFS 原件，知识库本机索引未就绪时调用其自身 bootstrap 恢复缓存/索引，doctor 验收后安装 **11 个 Skill**：六个 TrainFlow、三个 Hygon kernel、HCU knowledge search/update。安装脚本不安装 CUDA/DTK、训练 PyTorch、TE、cuDNN 或模型；这些由实际训练环境提供。
 
-TraceLens checkout 默认展开完整运行代码、文档和根目录文件，减少示例 trace 的下载；源码提交仍固定，需要时可扩展稀疏目录。核心包和局部 Wiki 可先独立使用，TraceLens 子命令需要完成上面的 bootstrap 与依赖安装。
+失败返回非零，`.work/setup/status.json` 记录已完成阶段与失败阶段；修复后重跑会复用依赖和当前索引。缺私有仓权限、原件、Python 依赖或可用索引时不能声称完整安装通过。仅有 checkout 不等于知识搜索就绪。Git 使用本人已保存凭据；权限需本人获得，安装器不复制其他人的账号或自动提交访问申请。
 
-### 从原上游 checkout 迁到 HCU fork
+### 复用已有知识库
 
-现在锁定 [yuguo-Jack/TraceLens](https://github.com/yuguo-Jack/TraceLens) 的 `hcu` 分支提交，并记录 AMD 上游基准。已经用 v0.2.0 拉过依赖的用户执行：
+```powershell
+python scripts/setup_trainflow.py --knowledge-root "D:/my-knowledge/HCU-Knowledge" --skills-dir "$HOME/.codex/skills" --replace
+```
+
+本机路径记录在忽略提交的 `thirdparty.local.json`。检查 Git 来源与工程入口，保留该独立知识库的当前提交、配置和内容；不 pull、不重置、不降级到 TrainFlow 清单版本、不复制原件。先由 doctor 检查可用性、index_current 与快照状态；当前外部索引就绪则直接复用，不重复 hash 全部历史原件。缺失、过期或处于 rollback 的索引才调用 bootstrap，后者仅恢复/校验当前 checkout 的本地证据与索引，不更新飞书、链接或源码知识。缺 LFS 原件时先在该知识库按其安装说明恢复，再重跑。
+
+全新机器没有外部绑定时，知识 checkout 默认位于 `thirdparty/HCU-Knowledge`，使用清单中的固定提交。外部绑定的实际提交会出现在依赖状态与本机安装记录中，兼容性由实际 bootstrap/doctor/Skill 安装检查，不冒称与清单提交相同。搬家后重新指定真实路径。需要改回受管目录时，检查并删除自己的 `thirdparty.local.json` 绑定文件，再运行完整安装；不会替用户删除独立知识库。
+
+HCU-Knowledge 贯穿环境适配、性能优化和扩 DP/容错，按问题查询；必需安装不意味着每一步都要重复搜索。安装两个知识库 Skill 不授予自动更新大知识库的权限，普通训练/检索/局部 Wiki 更新均不附带更新它。
+
+### Skills、账号与升级
+
+`--replace` 会把不同的旧 Skill 备份到扫描目录之外，核对全部目标后再替换；旧 prepare/operate 名称迁为 adapt/fault-tolerance。两个 HCU 知识 Skill 生成与其自身安装器相同格式的 `workspace.json`，绑定实际知识 checkout；完整复制脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
+
+飞书在线检索另外安装/配置 `lark-cli` 并用本人身份授权；浏览器辅助访问按需配置 `playwright-cli`。离线索引就绪不表示在线权限就绪，任务启动和使用在线来源时检查实际请求状态。Git、飞书和浏览器的身份分别管理。详细知识安装与权限规则见实际知识库的 `docs/installation.md`。
+
+依赖目录有修改、来源不符或受管提交不符时，保留现场并报告，禁止 reset/clean。依赖升级须先评估、更新锁并回归；普通安装不会擅自追最新分支。外部知识库由其独立维护流程管理。
+
+## 定向维护命令
+
+```powershell
+# 仅检查依赖 checkout 身份；不是完整安装验收
+python scripts/bootstrap_thirdparty.py --status
+# 只修复选定依赖
+python scripts/bootstrap_thirdparty.py --only tracelens
+# 完整环境已就绪后，更新 11 个 Skill
+python scripts/install_skills.py --target "$HOME/.codex/skills" --replace
+```
+
+bootstrap 默认包含 HCU-Knowledge，但只负责 Git checkout；完整初始化用 setup_trainflow。维护者的 `install_skills.py --workflow-only` 仅刷新六个本仓 Skill，供隔离开发使用，不代表完整安装。旧 `--with-kernel-skills` 和 `--include-knowledge` 保留解析兼容，默认已经包含这些必需项。
+
+TraceLens 默认稀疏检出完整运行代码、文档和根文件，减少示例 trace 下载；按需可扩展目录。旧 AMD 上游 checkout 迁移到 HCU fork 使用：
 
 ```bash
 python scripts/bootstrap_thirdparty.py --only tracelens --migrate-origin
 python -m pip install -e thirdparty/TraceLens
 ```
 
-迁移仅接受清单中登记的原上游 URL 与基准提交，且工作树必须干净；保留 `upstream` remote 后将 `origin` 改为 fork，再检出锁定提交。来源、HEAD、已有 upstream 不匹配或存在修改时会停止该依赖的迁移，保留现场。`--status` 始终只读；默认 bootstrap 不擅自修改 origin。新安装直接拉 fork，无需迁移参数。
-
-## 三个算子 Skill
-
-在 PowerShell 中一次安装六个 TrainFlow Skill（一个统一入口、三个阶段和两个 Wiki） 和三个 Hygon 算子 Skill：
-
-```powershell
-python scripts/install_skills.py --with-kernel-skills --target "$HOME/.codex/skills"
-$env:TRAINFLOW_PROJECT = (Get-Location).Path
-$env:TRAINFLOW_WORKSPACE = "D:/trainflow-work/my-task"
-```
-
-Linux 可将目标改为 `~/.codex/skills`。安装器检查完整源目录，连同脚本、指令资料和 references 一起复制，仅选择 Hygon 的三个 Skill，不安装 CUDA 优化 Skill。已有不同版本默认报错；确认替换时加 `--replace`，原目录备份在 Skill 扫描目录之外。
-
-未安装到 Agent 系统目录时，也可按明确路径读取 `thirdparty/cuda-optimized-skill/skills/<name>/SKILL.md`，但自动发现通常需要安装。优化 Skill 会先检查安装状态，缺失时给出本指南入口，不假定别人机器上已有这些能力。
-
-## 可选 HCU-Knowledge
-
-仓库当前需要读取权限。公共工作流和局部官方 Wiki 可独立运行；认证缺口不伪装成“知识库为空”。启用时：
-
-```bash
-python scripts/bootstrap_thirdparty.py --only hcu-knowledge
-```
-
-随后阅读 `thirdparty/HCU-Knowledge/INSTALL.md` 与 `docs/installation.md`，按该版本要求配置本机依赖、Git LFS 原件、workspace 和 bootstrap。知识库自身安装命令会生成机器绑定文件；不要用普通目录复制取代它。例如已完成知识库配置后：
-
-```powershell
-python -X utf8 thirdparty/HCU-Knowledge/tools/setup_workspace.py install-skills --skills-dir "$HOME/.codex/skills"
-```
-
-已有可用 HCU-Knowledge 时保留其绑定即可，不执行上面的替换安装。知识库本地索引重建只处理当前 checkout，不表示已更新飞书、原始链接和上游仓库。训练查询不触发大知识库更新，也不会因本工程刷新官方 Wiki 而自动更新大知识库。
+仅允许来源和基准提交均与清单匹配、工作树干净的迁移；保留 upstream remote。不同来源/提交或本地修改需先人工核对。TraceLens 可选 LLM/联网 extra 不会默认安装。
 
 ## TraceLens 的实际集成
 

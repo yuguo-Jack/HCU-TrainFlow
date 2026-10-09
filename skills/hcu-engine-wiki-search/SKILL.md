@@ -17,7 +17,7 @@ description: 检索官方训练引擎与生态优化机制，核对固定提交�
 
 底层库可用 `--engine transformer-engine` 或 `--engine cudnn-frontend` 定向搜索。TE 独立 Wiki 覆盖精度/权重缓存、attention、overlap/显存、融合与教程；cuDNN Frontend 覆盖 graph/plan、SDPA、open kernels、host 缓存与教程。跨 TE→cuDNN→HCU TE/Flash-Train 的问题分别检索并核对调用条件，不能把官方 NV 示例命令直接当成 HCU 配方。
 
-本机缺 HCU knowledge search 时按项目 docs/integrations.md 复用已有知识库或启用可选 thirdparty/HCU-Knowledge；需要仓库权限就提示用户。不可因未获权而把“未检索”写成“没有相关知识”。
+HCU-Knowledge 是完整安装的必需项；缺少 search 或绑定不可用时，按项目 docs/integrations.md 修复或复用已有知识库，需要仓库权限就提示用户，不把局部 Wiki 可用当作完整安装通过。不可因未获权而把“未检索”写成“没有相关知识”。
 
 对外线上检索仅使用可公开的机制、符号或经概括的问题词；不要发送内部路径、完整私有日志、数据样本或凭据。
 
@@ -31,6 +31,6 @@ description: 检索官方训练引擎与生态优化机制，核对固定提交�
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 
-需要 HCU 事实、历史案例或底层实现时使用可用的 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流只维护自己的局部官方 Wiki；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
+HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP/容错；需要 HCU 事实、历史案例或底层实现时使用 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流只维护自己的局部官方 Wiki；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
 
 产物归属本 Skill：按目标仓规范准备集中、通用的改动、测试、PR 说明和回退方式。公开 PR/Cookbook 只含脱敏的可公开方法与必要代码，不上传任务数据。遵循当前会话已给出的提交/发布授权。

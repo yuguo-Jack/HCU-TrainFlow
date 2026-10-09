@@ -90,3 +90,10 @@ Real training and site-dependent command validation remain pending until hardwar
 1. Map current stages, code gates, optimization loops, Agent coordination, remote execution, monitoring and knowledge lifecycle — complete.
 2. Add editable diagrams with source links and explicit implementation/site-validation boundaries; connect existing reading entries — complete.
 3. Render and inspect diagrams, verify links and gate mapping, publish documentation without release/tag — locally validated; publication recorded in Git history and remote state.
+
+## 2026-10-09: Torch training and required knowledge integration
+
+1. Read the supplied reference implementation and current HCU knowledge — complete.
+2. Integrate conditional Torch-native and communication guidance into the existing optimization Skill; clarify restoration and DP scale-out — complete.
+3. Require HCU-Knowledge in full setup, including index and bound Skills; support reuse and explicit permission failures — complete.
+4. Refresh diagrams, review/test setup and Skills, synchronize local installation, commit/push without release — complete locally; publication recorded in Git history.

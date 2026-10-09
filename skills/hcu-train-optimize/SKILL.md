@@ -1,18 +1,20 @@
 ---
 name: hcu-train-optimize
-description: 分析 HCU 大模型训练瓶颈，或推进系统与算子优化、局部回归及阶段 loss 验证；支持仅模型性能分析。
+description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统、通信与算子优化、局部回归及阶段 loss 验证；支持仅模型性能分析。
 ---
 
 # HCU 训练性能分析与优化
 
 支持 `analyze` 只交付性能分析，也支持 `optimize/full` 迭代。分析任务不自动改实现或长时验 loss。
 
+先识别实际训练执行路径：大型引擎按既有并行与融合路线；Torch 原生训练（包括视频生成、VLA、世界模型）按 [Torch 训练专项](references/torch-native-training.md) 补查输入流水、eager/compile、断图/重编译、autograd、DDP/FSDP 和实际 backend。引擎内部模块也可采用该专项，不另建一套流程。环境适配和扩 DP/容错继续复用另外两个阶段。
+
 ## 优化闭环
 
 1. **固定比较对象。** 初始基线不可覆盖；锁定源码、数据、环境、shape、拓扑、precision、sample/token 聚合和预算。未完成环境验收须标明对性能解释的限制。
 2. **先评估并行切分与显存预算。** 结合模型、卡数、机内/机间拓扑和实际 HCU 配方，参考局部 Wiki 的 `official-megatron-wiki/parallelism.md` 及官方并行/性能教程，比较 TP/PP/DP/CP/EP、SP、微批/梯度累积、重算与状态分片。先估最吃紧 rank 的峰值和必要余量，再以短跑实测吞吐、通信、PP 空泡和显存校准；不把显存填满作为目标。保持模型、有效全局 batch/token、精度与优化器语义可比；记录候选矩阵，选定布局后更新 rank 分组与算子 shape，再深入优化。只分析模式给建议，不擅自试跑。详见项目 `docs/workflows.md`。
 3. **抓训练端到端剖面。** 优先使用实际 HCU 启动链已有的 torch profiler 支持，必要时对照官方实现接入；保留已验收的环境与 launcher，并记录采集所需改动。每个实际非单例并行组至少两个有代表性的 rank。保留完整稳态步和 phase，区分 fwd/bwd/optimizer/通信/数据/checkpoint；跨 rank 先校时。warmup、编译和 profiling 开销不能混进性能对照。
-4. **先系统分析。** 空泡分数据、CPU launch、同步、PP 调度；通信分真实消息量、拓扑、wait、overlap 和最慢 rank。关注显存 reserved/allocated、图池、临时/通信 buffer，以及保存恢复峰值。`GPU_MAX_HW_QUEUES` 按目标 runtime 和对照实测调节，没有通用最佳值。
+4. **先系统分析。** 空泡分数据、CPU launch、同步、PP 调度；通信按 [通信优化专项](references/communication-optimization.md) 分 process group、消息量、拓扑、依赖、暴露尾部、overlap 与最慢 rank。联合分析计算被并发拖慢、bucket/chunk/prefetch、通算融合及其同步协议；不能只凭 stream 重叠判定有效。关注显存 reserved/allocated、图池、临时/通信 buffer，以及保存恢复峰值。`GPU_MAX_HW_QUEUES` 按目标 runtime 和对照实测调节，没有通用最佳值。
 5. **复用 TraceLens。** 按项目 docs/integrations.md 安装锁定依赖，用 `tracelens-report TRACE --project PROJECT --rank RANK` 做 op/kernel、overlap 分析；完整 ranks 才用 `tracelens-collective`。检查日志、非空表、单位、统计分母及 unsupported 情形。原生表保留在私有 workspace，`generated` 不代表训练评估通过。TrainFlow 补充稳态窗口、实际 rank 分组、shape 与热点建模；不默认套用 AMD/NV 峰值，轻量归因不冒充跨 rank 关键路径。
 6. **融合粒度与数值对齐。** 对照 NV 实际调用、接口、fwd/bwd、saved tensors、cast/accumulation。先查最新 Flash-Train 已支持算子；TE 能力提交 HCU TE，通用编译/cuDNN frontend 训练融合优先 Flash-Train。优先复用，不重复开发。
 7. **评估累计 ≥90% 端到端占比的热点集合。** 墙钟为分母，重叠不能重复累计，CPU/等待缺口不能删掉。其中每个非通信 op 按 shape/dtype/布局/phase 建立 FLOPs、HBM/其他有效流量或延迟模型，给理论/可达上限、当前效率、独立实测与优化决策。混合通算 kernel 仍评估计算部分；纯通信单列消息/拓扑/等待。缺模型或覆盖不足须明确补证据，不能报全覆盖。
@@ -40,6 +42,8 @@ Agent 分工由实际模型调用和 profile 决定，不预设固定名称、�
 
 ## 阶段产物
 
+按预期整步收益范围、证据置信度、显存/编译成本、数值风险和依赖排序候选，允许独立方向并行；估计收益不得重复相加。沿用当前 flow/experience 保存已验收最佳版本、保留/拒绝原因和回退；不用最后一次尝试替代最好结果，不新建一套独立总账。
+
 分析模式交付可复查的瓶颈报告、覆盖缺口、shape/效率表、优先级和建议实验。优化模式另交付候选源快照、成对实验、阶段 quality、回退和目标仓 PR。证据不足、收益平台期、反复数值异常或底层库缺能力时向用户报告最小证据包，方便专家介入。
 
 ## 与统一主控衔接
@@ -52,7 +56,7 @@ Agent 分工由实际模型调用和 profile 决定，不预设固定名称、�
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 
-需要 HCU 事实、历史案例或底层实现时使用可用的 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流只维护自己的局部官方 Wiki；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
+HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP/容错；需要 HCU 事实、历史案例或底层实现时使用 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流只维护自己的局部官方 Wiki；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
 
 产物归属本 Skill：按目标仓规范准备集中、通用的改动、测试、PR 说明和回退方式。公开 PR/Cookbook 只含脱敏的可公开方法与必要代码，不上传任务数据。遵循当前会话已给出的提交/发布授权。
 

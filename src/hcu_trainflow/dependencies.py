@@ -4,7 +4,36 @@ from pathlib import Path
 import re
 import subprocess
 
-from .core import FlowError, read_json
+from .core import FlowError, read_json, write_json
+
+
+def dependency_path(root, item):
+    binding = root / 'thirdparty.local.json'
+    if item['id'] == 'hcu-knowledge' and binding.is_file():
+        value = read_json(binding).get('hcu_knowledge_root')
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise FlowError('HCU-Knowledge binding must be an absolute checkout path')
+        return Path(value).resolve(), True
+    return root / item['path'], False
+
+
+def bind_knowledge(project, path):
+    """Reuse an explicitly selected independent KB; never pull or reset it."""
+    root, entries = load_manifest(project)
+    item = next(x for x in entries if x['id'] == 'hcu-knowledge')
+    path = Path(path).expanduser().resolve()
+    if path == (root / item['path']).resolve():
+        raise FlowError('Managed knowledge checkout needs no external binding')
+    for name in ('kb.py', 'tools/setup_workspace.py', 'knowledge/INDEX.md',
+                 'skills/hcu-knowledge-search/SKILL.md', 'skills/hcu-knowledge-update/SKILL.md'):
+        if not (path / name).is_file():
+            raise FlowError('Incomplete HCU-Knowledge checkout: ' + name)
+    top = git(path, 'rev-parse', '--show-toplevel').stdout.strip()
+    origin = git(path, 'remote', 'get-url', 'origin').stdout.strip()
+    if Path(top).resolve() != path or origin.removesuffix('.git') != item['url'].removesuffix('.git'):
+        raise FlowError('HCU-Knowledge checkout identity differs from the registered source')
+    write_json(root / 'thirdparty.local.json', {'hcu_knowledge_root': str(path)})
+    return path
 
 
 def load_manifest(project):
@@ -51,8 +80,8 @@ def git(path, *args, check=True):
 
 
 def inspect_checkout(root, item):
-    path = root / item['path']
-    result = {'id': item['id'], 'path': str(path), 'expected_commit': item['commit'], 'optional': item.get('optional', False)}
+    path, external = dependency_path(root, item)
+    result = {'id': item['id'], 'path': str(path), 'expected_commit': item['commit'], 'optional': item.get('optional', False), 'external': external}
     if not path.exists():
         return {**result, 'status': 'missing'}
     top = git(path, 'rev-parse', '--show-toplevel', check=False)
@@ -64,6 +93,10 @@ def inspect_checkout(root, item):
     head = git(path, 'rev-parse', '--verify', 'HEAD', check=False)
     dirty = git(path, 'status', '--porcelain', '--untracked-files=normal').stdout.strip()
     revision = head.stdout.strip() if not head.returncode else None
+    if external:
+        return {**result, 'commit': revision, 'dirty': bool(dirty),
+                'status': 'ready' if revision else 'invalid-checkout',
+                'note': 'Independent knowledge revision preserved; setup must verify its local index and Skills'}
     return {**result, 'commit': revision, 'dirty': bool(dirty),
             'status': 'dirty' if dirty else 'ready' if revision == item['commit'] else 'revision-mismatch'}
 
@@ -98,9 +131,9 @@ def sync_dependencies(project, only=None, include_optional=False, status_only=Fa
     for item in selected:
         try:
             state = inspect_checkout(root, item)
-            if not status_only and migrate_origin and state['status'] == 'origin-mismatch':
+            if not status_only and migrate_origin and not state.get('external') and state['status'] == 'origin-mismatch':
                 state = migrate_upstream_origin(root, item, state)
-            if not status_only and state['status'] in {'missing', 'revision-mismatch'}:
+            if not status_only and not state.get('external') and state['status'] in {'missing', 'revision-mismatch'}:
                 path = root / item['path']
                 if state['status'] == 'missing':
                     path.mkdir(parents=True)
@@ -118,7 +151,7 @@ def sync_dependencies(project, only=None, include_optional=False, status_only=Fa
             if state['status'] == 'origin-mismatch' and 'action' not in state:
                 state['action'] = 'Inspect origin; use --migrate-origin only for the registered upstream baseline'
             if state['status'] == 'ready' and item.get('lfs'):
-                state['materials'] = 'LFS payloads are not fetched; follow the dependency installation guide when originals are needed'
+                state['materials'] = 'Checkout inspection does not verify LFS payloads or the search index; full setup runs knowledge bootstrap/doctor'
             results.append(state)
         except (FlowError, OSError) as exc:
             results.append({'id': item['id'], 'status': 'unavailable', 'message': str(exc),
@@ -134,4 +167,4 @@ def require_checkout(project, dependency):
     state = inspect_checkout(root, item)
     if state['status'] != 'ready':
         raise FlowError(f'{dependency}: {state["status"]}; run scripts/bootstrap_thirdparty.py --only {dependency}, preserving local changes')
-    return root / item['path'], item
+    return dependency_path(root, item)[0], item

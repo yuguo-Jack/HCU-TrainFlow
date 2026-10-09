@@ -17,7 +17,7 @@ def manifest(tmp_path):
     return root, items
 
 
-def test_default_bootstrap_skips_private_and_status_does_not_fetch(tmp_path, monkeypatch):
+def test_manifest_optional_entries_are_skipped_and_status_does_not_fetch(tmp_path, monkeypatch):
     root, _ = manifest(tmp_path)
     monkeypatch.setattr(dependencies, 'git', lambda *a, **kw: pytest.fail('Unexpected Git network/mutation'))
     result = dependencies.sync_dependencies(root, status_only=True)
@@ -211,15 +211,12 @@ def test_web_moved_source_requires_provenance_review(tmp_path):
     assert result['changed_paths']==['guide'] and result['affected_pages']
 
 
-def test_three_kernel_skills_install_when_checked_out(tmp_path):
+def test_workflow_only_install_is_explicit_and_preserves_edits(tmp_path):
     root=Path(__file__).resolve().parents[1]
-    if not (root/'thirdparty/cuda-optimized-skill/skills').is_dir():
-        pytest.skip('Live dependency checkout is optional in offline unit-test jobs')
     target=tmp_path/'skills'
-    result=subprocess.run([sys.executable,str(root/'scripts/install_skills.py'),'--with-kernel-skills','--target',str(target)],capture_output=True,text=True)
+    result=subprocess.run([sys.executable,str(root/'scripts/install_skills.py'),'--workflow-only','--target',str(target)],capture_output=True,text=True)
     assert result.returncode==0,result.stderr
-    assert len(list(target.glob('*/SKILL.md')))==9
-    assert (target/'hygon-hip-kernel-optimizer/scripts/orchestrate.py').is_file()
+    assert len(list(target.glob('*/SKILL.md')))==6
     (target/'hcu-train-adapt/SKILL.md').write_text('local edits')
-    result=subprocess.run([sys.executable,str(root/'scripts/install_skills.py'),'--with-kernel-skills','--target',str(target)],capture_output=True,text=True)
+    result=subprocess.run([sys.executable,str(root/'scripts/install_skills.py'),'--workflow-only','--target',str(target)],capture_output=True,text=True)
     assert result.returncode!=0 and (target/'hcu-train-adapt/SKILL.md').read_text()=='local edits'

@@ -32,9 +32,11 @@ review 按 `docs/collaboration.md` 使用完整字段；不以单词“完成”
 
 ## 阶段分工
 
+Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize 按需加载 Torch 与通信专项，不增加独立 Skill。全流程先检查 HCU-Knowledge 的搜索 Skill、workspace 绑定及当前索引可用性；缺失按 docs/integrations.md 完成必需安装。三个阶段按实际 HCU 问题联查它，普通训练不触发大知识库更新。
+
 - `$hcu-train-adapt`：环境验收、HCU 启动配方、模型适配和初始基线。可仅检查环境。
 - `$hcu-train-optimize`：可仅分析性能；先评估并行切分、微批/梯度累积与显存余量，按吞吐和通信代价选择配置；系统、融合、算子优化采用测量→假设→实施→验证→复核。累计 ≥90% 端到端热点集合中的非通信算子逐项建模；比较真实 shape 的独立测试。每轮局部正确性和 profiler-off 性能，稳定阶段才长窗口验 loss，始终对初始基线。复用 Flash-Train/TE 现有实现，必要时调用三个 Hygon kernel Skill。
-- `$hcu-train-fault-tolerance`：完整模型最小 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
+- `$hcu-train-fault-tolerance`：恢复完整模型后扩 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
 - `$hcu-engine-wiki-search` / `$hcu-engine-wiki-update`：本地官方 Wiki 的检索和维护。需要 HCU 事实时读 HCU-Knowledge、当前底层库分支或官方资料；普通任务不顺带更新 HCU 大知识库。工具/脚本变了要复核相关 Skill、命令和解析器，不仅更新 Wiki。
 
 ## 看板指导

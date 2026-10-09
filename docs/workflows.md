@@ -12,6 +12,10 @@
 
 ## 性能优化
 
+优化阶段按实际调用选择大型引擎或 [Torch 原生训练专项](../skills/hcu-train-optimize/references/torch-native-training.md)，可以混用，不新增阶段。视频生成/VLA/世界模型侧重输入与时空 shape、autograd、compile/断图/重编译、DDP/FSDP 及编译后的实际后端；共同保留初始数值基线、≥90% 非通信热点建模和阶段 loss。AOTI 不默认用于训练。
+
+[通信优化专项](../skills/hcu-train-optimize/references/communication-optimization.md) 覆盖真实 process groups、消息与依赖、DP bucket/FSDP 预取、TP/EP/PP/CP 调度、chunk-ready、AG-GEMM/GEMM-RS 和设备侧通算融合。对照纯通信、纯计算、模型内并发与整步表现，量化暴露时间、计算退化和额外显存，不以时间线相交宣称加速。
+
 先评估并行切分与显存预算，建立可行候选布局，再端到端采样并迭代系统调参/overlap/内存和融合粒度，然后形状级上限与实现优化。并行度、微批/梯度累积、重算与状态分片共同影响显存、通信、PP 空泡和算子 shape；按最吃紧 rank 的峰值及必要余量筛选，再用 profiler-off 吞吐实测选择，不能只追求“能装下”或“占满显存”。具体对照项和已有官方教程见 [并行切分与显存调参](../knowledge/official-megatron-wiki/parallelism.md#调参推理)。
 
 不要要求先完成全部融合才能分析剩余热点。Flash-Train 先复用现有能力，算子实现交由已有 Hygon HIP/Triton 技能。子 Agent 可并行读取独立证据，但同资源实验串行，修改范围不重叠。
@@ -20,7 +24,7 @@
 
 ## 扩容、容错和诊断
 
-先完整模型最小 DP 域，再筛机、扩大规模和单一恢复负责人接管。节点池随故障和重新验收变化。监测 loss、吞吐、显存、checkpoint、step/token 进展及恢复超时；独立监测 watcher 的心跳。容错动作权限在部署具体任务时确定。
+资源不足时可仅缩 layer 做适配或筛机；扩规模前恢复完整模型，在能够容纳它的模型并行布局上先跑通并复核，再逐级扩 DP 域并接入单一恢复负责人。每一级重新验收节点池、吞吐效率、通信、显存与保存恢复。扩 DP 时明确固定有效全局 batch 还是获准改变训练配方，并据此调整累积/学习率等，不能把弱扩展与强扩展结果混比。节点池随故障和重新验收变化。监测 loss、吞吐、显存、checkpoint、step/token 进展及恢复超时；独立监测 watcher 的心跳。容错动作权限在部署具体任务时确定。
 
 故障按第一异常分层：环境/网络、调度/进程组、数据、Python/C++、设备 kernel、保存恢复。先采现场再重现和选择工具，错误或性能停滞时适时给人类专家最小证据包。
 

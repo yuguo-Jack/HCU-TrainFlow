@@ -1,33 +1,15 @@
 # 第三方工程与版本
 
-`manifest.json` 登记来源、固定提交和本地位置。bootstrap 在本目录建立独立 Git checkout；源码本身被主仓忽略，公共提交仅含清单和集成代码。这样不会把私有知识库内容发布到本仓，也不会重复维护第三方源码副本。
+`manifest.json` 登记必需依赖、固定提交及 checkout 位置；源码、材料和本机状态被主仓忽略，避免把私有资料提交到公共 TrainFlow。
 
-| ID | 目录 | 用途 |
+| ID | 默认目录 | 用途 |
 | --- | --- | --- |
-| `tracelens` | `TraceLens/` | HCU fork，保留完整上游能力；TrainFlow 封装 PyTorch 与全 rank collective 报告。 |
-| `cuda-optimized-skill` | `cuda-optimized-skill/` | 三个 Hygon HIP/Triton 算子 Skill 的完整源码、脚本与参考文件。 |
-| `hcu-knowledge` | `HCU-Knowledge/` | 可选大领域知识库；当前需仓库读取权限。 |
+| `tracelens` | `TraceLens/` | HCU fork，保留上游模块与原生 CLI，TrainFlow 复用报告 API |
+| `cuda-optimized-skill` | `cuda-optimized-skill/` | 三个 Hygon HIP/Triton Skill、脚本和参考资料 |
+| `hcu-knowledge` | `HCU-Knowledge/` | 必需 HCU 大领域知识库，贯穿三个阶段；当前需读取权限 |
 
-从工程根执行：
+从工程根执行 `python scripts/setup_trainflow.py --skills-dir <Agent技能目录>` 完成 Python 依赖、知识库 LFS/本机索引和 11 个 Skill 的安装。已有独立知识库可加 `--knowledge-root <实际目录>`，通过忽略提交的 `thirdparty.local.json` 复用，不重复复制、不拉取其新资料。
 
-```bash
-python scripts/bootstrap_thirdparty.py
-python -m pip install -e thirdparty/TraceLens
-python scripts/bootstrap_thirdparty.py --status
-```
+`bootstrap_thirdparty.py` 默认拉全部必需 checkout，`--only ID` 仅用于定向维护，`--status` 仅检查 Git 身份。Git 就绪不等于可查询；完整安装还需知识 bootstrap/doctor。没有权限或索引失败时报告未完成。任何依赖本地修改和来源差异都保留，不 reset/clean。
 
-默认只拉前两个公开工程，不自动执行其安装脚本或安装模型/训练环境。目录已有修改或来源不匹配时保留现场并报告，绝不 reset/clean。同步的是清单中的提交，不是每次擅自升级 HEAD。网络或权限失败返回非零；解决 Git 认证后可用 `--only ID` 重试。
-
-TraceLens 默认稀疏检出完整运行代码、文档和仓库根文件，避免下载其大量示例 trace。需要更多目录可在该 checkout 中 `git sparse-checkout add <目录>`；不会改变锁定提交。
-
-已安装旧 AMD 上游 checkout 时，按集成指南执行 `--only tracelens --migrate-origin`。只迁移干净且与登记基准一致的 checkout；其他来源或本地修改不覆盖。fork 的开发工作应使用独立 checkout，主仓在 `manifest.json` 同时保留运行提交与 AMD 上游基准。
-
-HCU-Knowledge 明确启用：
-
-```bash
-python scripts/bootstrap_thirdparty.py --only hcu-knowledge
-```
-
-使用自己的 Git 凭据；无需在本仓保存 token。拉取时跳过 Git LFS 原件下载，正文、索引构建和原件恢复按其安装说明执行。已有独立 HCU-Knowledge 可以继续使用，无须额外复制。仓库以后公开只改变访问权限，不需更换目录或 URL。
-
-Skill 安装、知识库绑定、升级与 TraceLens 验证见 [依赖集成指南](../docs/integrations.md)。这些 checkout 用于工具/知识依赖；训练引擎 fork、PR 开发与运行快照仍放任务私有工作区。
+受管目录固定清单提交；独立知识库保留实际提交并做本机可用性验收。TraceLens 稀疏检出完整代码/文档，按需扩展；旧上游迁移到 fork、Skills 替换备份、飞书权限和升级步骤见 [安装指南](../docs/integrations.md)。训练引擎 fork/PR 开发继续使用任务独立 checkout，不能借用知识库源码缓存。

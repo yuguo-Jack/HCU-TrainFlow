@@ -127,3 +127,11 @@ Implemented scoped PR search, pinned code reading, public PR source pages, compl
 - Restyled the README overview with built-in imagegen using the supplied picture only for white/pastel/line-art appearance. Preserved TrainFlow's own stages and wording; refined the continuous quality-pass connector into scaling. Replaced the asset and updated its prompt and README reading links; the dark version remains in Git history.
 - Compared visible reference-flow capabilities with current TrainFlow Skills/source and recorded the evidence limits and concrete gaps in findings.md. No capabilities from the reference diagram were silently added or claimed implemented; no private reference image was added to the repository.
 - Validation: final PNG decoded successfully, README/prompt links and whitespace passed, knowledge validator passed 485 pages/24 sources. Version remains 0.4.0.dev0; no runtime/Skill changes or release/tag.
+
+## Torch training / communication / installation follow-up
+
+Confirmed access to the supplied reference repository; read framework and communication workflows. Added training-specific conditional references and started full installation changes. Full HCU-Knowledge setup must include local index readiness and workspace-bound search/update Skills. No source refresh of the domain KB is authorized as a side effect.
+
+Validation: full dependency/Python/index/11-Skill setup succeeded against the existing independent HCU-Knowledge checkout, with all 77,358 evidence objects and 32,269 derivatives checked. A second run exercised the current-index reuse path and synchronized the system Skills without rehashing historical data. Knowledge repository tracked files remain clean; no source update or extra clone. Six TrainFlow Skills validated; relative links resolve; all 12 Mermaid diagrams render without parser errors. README image regenerated and visually checked. Public/private files and Git diff reviewed; no release/tag.
+
+Final regression: 218 tests passed; knowledge validator checked 485 pages / 24 sources with no errors. Current-index reuse and installed Skill bindings verified; generated browser artifacts are ignored.

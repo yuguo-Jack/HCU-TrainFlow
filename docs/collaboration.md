@@ -56,7 +56,7 @@
     "environment": "所有分配设备和相关互联有可比预期与验收证据",
     "quality": "阶段候选相对初始冻结基线通过约定的 loss 与梯度验证",
     "performance": "给出热点覆盖、非通信上限模型及 profiler-off 性能",
-    "scale": "完整模型最小 DP 域、扩容验证及约定时长稳定运行"
+    "scale": "恢复完整模型、逐级扩 DP 域验证及约定时长稳定运行"
   },
   "max_rounds": 20,
   "max_stalled_rounds": 3,

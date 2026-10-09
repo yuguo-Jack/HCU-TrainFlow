@@ -4,7 +4,7 @@
 
 An agentic workflow for end-to-end large-model training adaptation, optimization, and resilient scaling on HCU.
 
-给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。每轮以实际证据推进，经过独立复核和修正；人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT 和 RL，也支持只检查环境、只分析性能或只诊断故障。
+给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。每轮以实际证据推进，经过独立复核和修正；人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
 **当前源码版本：`0.4.0.dev0`，开发中，尚未发布。** 协作循环、证据检查和文件交互已有本地自动化验证；真实 HCU 训练、Agent 运行时接续及站点容错仍需逐项联调。当前不能视为拿到任意集群就可无人值守运行的成品。见 [能力与验证边界](docs/capabilities.md)。
 
@@ -24,7 +24,9 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，按需使用三个 Hygon 算子 Skill。
 
-完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新见 [工作流全景：总览与九张细图](docs/workflow-map.md)，其中列明阶段证据门槛及对应源码。
+同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。资源不足时可缩 layer 跑通或筛机；扩规模前恢复完整模型，再逐级扩 DP 域并复核性能、显存和训练语义。
+
+完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新见 [工作流全景](docs/workflow-map.md)，其中列明阶段证据门槛及对应源码。
 
 ## 如何与 Agent 协作
 
@@ -45,36 +47,35 @@ collaboration/<task>/GUIDANCE.md    人的评论、回答和优先级调整
 
 ## 知识如何参与工作流
 
-遇到问题时先查相关环境与模型的私有训练经验，再查官方引擎 Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。HCU-Knowledge 按需提供硬件、工具、适配与优化参考。
+**HCU-Knowledge 是完整安装的必需组成，贯穿三个阶段。** 按问题检索硬件、工具、HCU 工程、配方、优化与故障案例，并联查私有训练经验和官方引擎 Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。必需安装不表示每个命令都强制查询。
 
 局部官方 Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。实际性能、loss、故障和里程碑持续沉淀到私有经验 Wiki；公开 Cookbook 交付与验证记录关联，现场数据留在私有工作区。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
 
 ## 安装
 
-Python 3.10+、Git；使用 SSH/Docker/Slurm/K8s 时需对应客户端与资源权限。HCU 训练软件由实际环境提供。
+Python 3.10+、Git、Git LFS，以及 HCU-Knowledge 仓库读取权限。使用 SSH/Docker/Slurm/K8s 时需对应客户端与资源权限；HCU 训练软件由实际环境提供。
 
 ```bash
 git clone https://github.com/yuguo-Jack/HCU-TrainFlow.git
 cd HCU-TrainFlow
-python -m pip install -e ".[test]"
-python scripts/bootstrap_thirdparty.py
-python -m pip install -e thirdparty/TraceLens
+git lfs install
 ```
 
-PowerShell 中安装一个统一入口、三个阶段 Skill、两个 Wiki Skill，以及三个 Hygon 算子 Skill：
+PowerShell 中完成依赖、知识库本机索引和 **11 个 Skill** 的安装（六个 TrainFlow、三个算子、两个 HCU 知识库）：
 
 ```powershell
-python scripts/install_skills.py --with-kernel-skills --target "$HOME/.codex/skills"
+python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills"
 $env:TRAINFLOW_PROJECT = (Get-Location).Path
 $env:TRAINFLOW_WORKSPACE = "D:/trainflow-work/my-task"
 ```
 
-升级使用 `--replace`，旧版本先备份到 Skill 扫描目录之外；旧名 `hcu-train-prepare`、`hcu-train-operate` 会迁移为 `hcu-train-adapt`、`hcu-train-fault-tolerance`。省略 `--with-kernel-skills` 只安装六个 TrainFlow Skill。TraceLens 使用固定版本的 HCU fork；HCU-Knowledge 按权限单独启用或复用已有安装，默认不会拉取私有知识。见 [依赖与安装说明](docs/integrations.md)。
+已有独立知识库时加 `--knowledge-root /path/to/HCU-Knowledge`，复用原件、索引与配置，不重复克隆、不拉取其上游更新。升级 Skill 使用 `--replace`，旧版本先备份到扫描目录之外；旧 prepare/operate 名称自动迁移。缺少私有仓权限、LFS 原件或索引不可用时安装会报告未完成；不会静默跳过。飞书等在线能力另用本人账号授权。详见 [依赖与安装说明](docs/integrations.md)。
 
 ## 本地验证与阅读入口
 
 ```bash
 hcu-trainflow --version
+python -m pip install -e ".[test]"
 hcu-trainflow collaboration-demo .work/collaboration-first
 hcu-trainflow demo .work/analysis-first
 python -m pytest -q

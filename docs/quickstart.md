@@ -2,7 +2,7 @@
 
 ## 依赖
 
-Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需 pytest。Git 用于源码与版本管理，SSH/scp、Docker、kubectl、Slurm 客户端只在使用相应执行方式时需要。TraceLens 通过固定 checkout 和本机 Python 的报告 API 集成，安装三个算子 Skill 及可选 HCU-Knowledge 的步骤见 [第三方集成](integrations.md)。HCU 训练依赖由目标环境提供，本包不下载 PyTorch/DTK/模型。
+Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需 pytest。Git 用于源码与版本管理，SSH/scp、Docker、kubectl、Slurm 客户端只在使用相应执行方式时需要。TraceLens 通过固定 checkout 和本机 Python 的报告 API 集成，完整安装包含三个算子 Skill 及必需 HCU-Knowledge，步骤见 [第三方集成](integrations.md)。HCU 训练依赖由目标环境提供，本包不下载 PyTorch/DTK/模型。
 
 ```bash
 python -m pip install -e ".[test]"

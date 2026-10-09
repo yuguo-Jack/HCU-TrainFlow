@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart TD
-    U["模型、环境、数据与目标<br/>预训练 / SFT / RL"] --> C["本地主控 hcu-trainflow<br/>明确范围、预算、验收与现场权限"]
+    U["模型、环境、数据与目标<br/>预训练 / SFT / RL / Torch 原生训练"] --> C["本地主控 hcu-trainflow<br/>明确范围、预算、验收与现场权限"]
     C --> A["① 环境验收与模型适配<br/>hcu-train-adapt · 详见图 2"]
     A --> AG{"环境与初始数值基线通过？"}
     AG -->|缺失或失败| AR["补证据 / 修环境 / 修适配"]
@@ -20,7 +20,7 @@ flowchart TD
     Q --> QG{"达到约定目标且数值通过？"}
     QG -->|未达到| OR["定位问题、修正或回退<br/>无新证据 / 达到预算边界时请专家介入"]
     OR --> O
-    QG -->|通过| S["③ 完整模型最小 DP 域<br/>筛机、健康池与扩容验证"]
+    QG -->|通过| S["③ 恢复完整模型 → 扩 DP 域<br/>筛机、健康池与逐级扩容验证"]
     S --> SG{"环境、质量与扩容验收通过？"}
     SG -->|失败| SR["按原因回到环境、适配或优化<br/>修复后重新验收受影响证据"]
     SR --> C
@@ -30,7 +30,7 @@ flowchart TD
     TG -->|是| Z["完成复核与交付<br/>代码 / 配方 / 证据 / 经验 / 运行交接"]
     LOOP["所有阶段共用<br/>实施 → 测量 → 独立复核 → 修正 / 推进<br/>详见图 4"] -.-> C
     H["BOARD.md 进展与问题<br/>GUIDANCE.md 指导 · 默认每 5 分钟采集"] -.-> C
-    K[("官方 Wiki + 私有训练经验<br/>按需 HCU-Knowledge / PR / 底层源码<br/>详见图 7")] -.-> C
+    K[("必装 HCU-Knowledge 贯穿三个阶段<br/>联查官方 Wiki / 私有经验 / PR / 底层源码<br/>详见图 7")] -.-> C
     C -.-> TEAM["按依赖动态拆解多 Agent 任务<br/>独立工作并行，集成与共享测量协调<br/>详见图 5"]
 ```
 
@@ -58,16 +58,18 @@ flowchart TD
     TYPE -->|预训练| P["输出、梯度、优化器步与 checkpoint"]
     TYPE -->|SFT| F["另核模板、packing、loss mask"]
     TYPE -->|RL| RL["另核 actor / critic / ref / reward / rollout<br/>权重同步、policy version、logprob 和异步语义"]
+    TYPE -->|Torch 原生训练| N["视频 / VLA / 世界模型等<br/>数据与时空 shape、mask、autograd、EMA"]
     P --> B["冻结初始正确性 / 数值基线<br/>有 NV 环境时补跨平台对照"]
     F --> B
     RL --> B
+    N --> B
     B --> BG{"基线可用且验证通过？"}
     BG -->|否| BF["追到当前引擎和底层库源码<br/>修正适配，重跑受影响验证"]
     BF --> R
     BG -->|是| OUT["进入性能分析或按适配任务范围交付"]
 ```
 
-启动配方优先级是：**当前 HCU 分支同模型配方 → 同引擎相近模型的 HCU 配方 → 结合官方语义与 HCU 实现构建配方**。每一种都要核对实际生效参数，不能直接照搬 NV 的环境变量或旧 HCU 脚本。缩 layer 是适配/分析代理，不证明完整模型的显存和扩容能力。
+启动配方优先级是：**当前 HCU 分支同模型配方 → 同引擎相近模型的 HCU 配方 → 结合官方语义与 HCU 实现构建配方**。每一种都要核对实际生效参数，不能直接照搬 NV 的环境变量或旧 HCU 脚本。缩 layer 可用于适配/分析和筛机代理，不证明完整模型的显存、收敛和扩容能力。图中任务分支可组合，例如 Torch 原生 SFT；按实际语义核查，不是互斥类别。
 
 工具发现和预期查证由 Agent 按现场完成；当前工程没有为所有 HCU 型号内置一套恒定验收命令和阈值。仅环境检查也可交付明确的失败或不充分报告，这不等于通过训练准入。详见 [适配 Skill](../skills/hcu-train-adapt/SKILL.md)。
 
@@ -82,14 +84,17 @@ flowchart TD
     M --> T["稳态端到端采样：torchprof<br/>覆盖各实际非单例并行组至少 2 个代表 rank"]
     T --> TL["TraceLens + TrainFlow 窗口分析<br/>补 CPU-op 对应的 shape / dtype / layout / phase"]
     TL --> A["按证据并行分析<br/>CPU / 数据 / launch 空泡"]
-    TL --> C["通信、等待、overlap<br/>PP / EP 负载、慢 rank 与拓扑"]
+    TL --> C["通信依赖、暴露时间与 overlap<br/>bucket / chunk / 预取 / 通算融合<br/>慢 rank、拓扑及计算竞争 · 详见图 3.5"]
     TL --> V["显存生命周期与峰值<br/>激活 / 状态 / workspace / 通信 / graph"]
     TL --> O["真实算子调用与热点表<br/>前后向、融合粒度与时间归因"]
+    TL --> TORCH["Torch 原生 / 引擎局部模块<br/>输入、断图、重编译、前后向、DDP/FSDP<br/>详见图 3.4"]
     A --> H["主控合并证据和瓶颈优先级<br/>区分系统问题与实现差距"]
     C --> H
     V --> H
     O --> H
-    H --> MODE{"是否仅性能分析？"}
+    TORCH --> H
+    H --> RANK["候选排序：预计整步收益、置信度<br/>显存 / 编译成本、数值风险、依赖与回退"]
+    RANK --> MODE{"是否仅性能分析？"}
     MODE -->|是| REPORT["交付瓶颈、上限评估、证据缺口与实验建议<br/>不擅自修改配置或启动优化实验"]
     MODE -->|否| SYS["系统调参候选<br/>并行布局 / overlap / GPU_MAX_HW_QUEUES<br/>必要位置 compile / 显存与重算权衡"]
     MODE -->|否| K["融合对齐与热点实现优化<br/>进入图 3.2，可与独立系统分析并行"]
@@ -158,6 +163,51 @@ flowchart TD
 - **工具与归属：**XProf/XCompute 与 hipprof 按实际环境分别使用；必要时查底层库对应分支，不能用不匹配的软件栈解释现场行为。hipBLASLt/groupGEMM 当前不承诺自动 tune，记录可复现 size 和需求。
 
 详细约束见 [性能分析](profiling.md)、[优化 Skill](../skills/hcu-train-optimize/SKILL.md) 与 [三个阶段工作流](workflows.md)。
+
+### 3.4 Torch 原生训练专项（沿用同一优化闭环）
+
+```mermaid
+flowchart TD
+    IN["适配已建立基线 / 优化采样证据"] --> PATH["识别 eager / compile / 混合路径<br/>视频生成、VLA、世界模型或引擎局部模块"]
+    PATH --> CONTRACT["固定数据、时空 shape、mask 和 loss<br/>autograd、optimizer、EMA、随机性与有效 batch"]
+    CONTRACT --> TIME["分开启动 / 编译 / 稳态整步<br/>forward + backward + optimizer + 数据与通信"]
+    TIME --> DATA["输入 / host / 同步<br/>解码、预取、H2D、日志与隐式等待"]
+    TIME --> GRAPH["图与运行时<br/>断图、guard、重编译、动态 shape、capture"]
+    TIME --> TRAIN["训练状态与分布式<br/>saved tensors、重算、DDP / FSDP"]
+    DATA --> SELECT["按整步收益与代价排序<br/>明确证据缺口与候选实验"]
+    GRAPH --> SELECT
+    TRAIN --> SELECT
+    SELECT --> MODE{"是否仅分析？"}
+    MODE -->|是| REPORT["交付分析报告与建议<br/>不启动优化实验或修改实现"]
+    MODE -->|否| IMPL["选定模块 / 调度 / layout / 库实现<br/>编译生成 kernel 按需交 Hygon Triton Skill"]
+    IMPL --> VERIFY["输出 / 梯度 / 参数更新 / 多 shape 回归<br/>profiler-off 整步性能 + 显存"]
+    VERIFY -->|改进保留，失败回退与重定位| TIME
+    VERIFY -->|候选稳定| LOSS["回共同阶段 loss / 质量验收<br/>沿用 flow 复核与私有经验"]
+```
+
+它补充 PyTorch 路径特有分析，不重复环境验收、热点上限建模、算子实现、扩 DP 和容错。AOTI/export 仅在真实使用该路径且训练/子模块契约明确时评估，不能默认替代训练编译。详见 [Torch 原生训练指引](../skills/hcu-train-optimize/references/torch-native-training.md)。
+
+### 3.5 通信调度、overlap 与通算融合
+
+```mermaid
+flowchart TD
+    IN["实际 groups / 消息 / 拓扑 / stream / buffer"] --> BASE["同条件测纯通信、纯计算、训练并发窗口<br/>校时，定位最慢 rank 与关键依赖"]
+    BASE --> WHY{"暴露时间来自哪里？"}
+    WHY -->|触发或等待不当| SCHED["bucket / chunk / prefetch / 早发晚等<br/>DP、FSDP、TP、PP、CP、EP 对应调度"]
+    WHY -->|资源竞争| RESOURCE["计算退化、SM / HBM / NIC / 队列<br/>GPU_MAX_HW_QUEUES 按当前 runtime 对照"]
+    WHY -->|计算通信边界可优化| REUSE["先查 HCU Flux / TE / MORI / rocSHMEM<br/>AG-GEMM、GEMM-RS、dispatch-combine"]
+    REUSE --> PROTOCOL["定义 chunk ready / 可见性 / progress<br/>buffer 复用、尾块、反向与梯度同步"]
+    SCHED --> TEST["多 rank 局部正确性与并发压力<br/>消息 / shape / 空块 / 累积 / 保存恢复"]
+    RESOURCE --> TEST
+    PROTOCOL --> TEST
+    TEST --> E2E["整步对照：暴露时间、吞吐、计算退化<br/>显存峰值与最差 rank / 尾延迟"]
+    E2E --> PASS{"净收益成立且数值通过？"}
+    PASS -->|否| BACK["回退或调整，重新归因"]
+    BACK --> BASE
+    PASS -->|是| OUT["纳入共同候选与阶段 loss<br/>混合通算 kernel 仍建计算效率模型"]
+```
+
+时间线相交只是观察；不等于通信已隐藏，也不保证训练更快。不同 Agent 共享同一 process-group/协议版本；耦合的同步与 buffer 生命周期由同一 owner 负责，设备/网络测量按资源协调。详见 [通信优化指引](../skills/hcu-train-optimize/references/communication-optimization.md)。
 
 ## 4. 每阶段共用：实施、独立复核、修正
 
@@ -257,10 +307,17 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Q["优化阶段质量 / 性能通过"] --> MIN["完整模型最小 DP 域验证<br/>不能用缩 layer 结果替代"]
-    MIN --> POOL["Cluster Manager 为主筛机<br/>适用时结合 Primus Safe<br/>动态维护健康节点池"]
-    POOL --> SCALE["扩容验收<br/>当前环境 + 阶段质量 + scale 证据"]
-    SCALE --> START["按部署授权启动长训<br/>明确唯一 recovery_owner、阈值和监测范围"]
+    Q["优化阶段质量 / 性能通过"] --> FULL["恢复完整模型，在可行模型并行规模验证<br/>复核数值、显存和保存恢复"]
+    PROXY["资源不足时仅缩 layer 跑通或提前筛机<br/>保留代理范围，不替代完整模型证据"] -.-> FULL
+    FULL --> POOL["Cluster Manager 为主筛机<br/>适用时结合 Primus Safe<br/>动态维护健康节点池"]
+    POOL --> DP["逐级扩 DP 域<br/>明确强 / 弱扩展与有效全局 batch 策略"]
+    DP --> SCALE["每级扩容验收<br/>吞吐效率 / 通信尾部 / 显存 / checkpoint<br/>当前环境 + 阶段质量 + scale 证据"]
+    SCALE --> SG{"当前级验收通过？"}
+    SG -->|否| FIXS["按问题返回环境 / 适配 / 优化<br/>修复后重新验收当前上下文"]
+    FIXS --> FULL
+    SG -->|是| MORE{"还需继续扩 DP？"}
+    MORE -->|是| POOL
+    MORE -->|否| START["按部署授权启动长训<br/>明确唯一 recovery_owner、阈值和监测范围"]
     START --> JOB["训练与 checkpoint 持续运行"]
     JOB --> LOG["现场归一化器<br/>全局进展 JSONL：attempt / step / 时间<br/>loss / grad / 显存 / 恢复状态等"]
     LOG --> WATCH["远端 watcher 持久采集<br/>游标、真实推进时钟、incident 与 outbox"]
@@ -289,6 +346,8 @@ flowchart TD
 
 本机休眠时远端不临时启动 LLM Agent；继续工作的是 watcher、站点告警和既有容错。通知送达、bridge 返回成功、Agent 接手、故障解决是四种不同状态，不能互相代替。
 
+恢复完整模型或扩 DP 改变比较上下文时，通过 `task-context` 更新并重新规划，取得当前环境/模型对应的基线与质量证据；缩层旧报告不能直接放行完整模型。全参新瓶颈回到适配/优化阶段处理。上图概括推进关系，不绕过 context 重置后的程序门槛。
+
 TrainFlow 提供 watcher、事件重放、inbox、bridge 接口和报告能力；日志归一化、常驻托管、飞书实际通道、宿主接续及站点恢复规则仍要在部署时接好并实测。故障修复不建立第二套抢着重启的控制者。仅诊断任务可直接进入诊断分支，不需要启动训练或取得重启权限。详见 [长训守护](operations.md)。
 
 ## 7. 知识检索、更新与成果沉淀
@@ -302,7 +361,7 @@ flowchart TD
     ANSWER -->|否| PR["按问题在线搜已收录 / 未收录 PR<br/>描述、普通评论、行内评论、顶层 review"]
     PR --> CODE["追到固定 head / base 源码<br/>完整函数、调用者、对应底层依赖和测试"]
     CODE --> USE
-    PROB -.-> HCU["按需 HCU-Knowledge 与飞书检索<br/>HCU 硬件、工具、patch、配方和案例"]
+    PROB -.-> HCU["必装 HCU-Knowledge，三个阶段按问题检索<br/>硬件、工具、patch、配方、优化与故障案例<br/>飞书在线访问另行授权"]
     HCU -.-> USE
     USE --> RESULT["实际里程碑结果<br/>基线、候选、阶段 loss、扩容、异常与恢复"]
     RESULT --> PRIVATE[("私有经验 Wiki<br/>自动保留报告 / 阶段事件<br/>Agent 补充解释、指标口径、失败条件和回退")]
@@ -318,7 +377,7 @@ flowchart TD
 ```
 
 - **两个局部 Wiki Skill：**`hcu-engine-wiki-search` 负责检索、PR 和源码追查；`hcu-engine-wiki-update` 负责增量采集、知识复核及关联用法检查。普通查询写私有缓存，正式收录才进入公共知识目录。
-- **大知识库边界：**HCU-Knowledge 是按需查询的领域参考，普通 TrainFlow 工作不附带更新它；更新走单独明确的维护任务。
+- **大知识库边界：**HCU-Knowledge 是完整安装的必需组件，可复用独立 checkout，三个阶段按问题查询；普通 TrainFlow 工作不附带更新它，更新走单独明确的维护任务。本地索引恢复不等于刷新上游内容。
 - **版本边界：**局部官方 Wiki 更新不会自动替换当前训练任务的依赖或运行源码。采用新实现要形成新候选并重新验证；官方已吸收的功能应复核本地 patch 是否可以退场。
 - **经验边界：**性能、loss、环境和事故的实际数据留在私有工作区；失败和不充分结果也记录。公开 Cookbook 的方法与其私有验证记录建立关联，记录交付不等于自动发送 PR。
 

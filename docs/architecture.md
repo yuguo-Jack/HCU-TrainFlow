@@ -23,7 +23,7 @@ flowchart TD
     W --> EK[私有环境与模型经验 Wiki]
     EK --> A
     EK --> CB[经脱敏审核的 Cookbook 方法交付]
-    H[可选 HCU 知识检索] --> A
+    H[必装 HCU 知识库贯穿三个阶段] --> A
     R --> D[远端 watcher 与既有容错]
     D --> O[持久事件与通知通道]
     O --> I[本地 inbox / 运行时桥接]

@@ -16,6 +16,7 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 5. 对每个 affected overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
    PR 描述、review 或 diff 更新即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
 6. 按 knowledge/maintenance.json 同时检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤。HCU 命令可以依托大知识库当前内容或自主看最新工程源码；任务所用 HCU 模型脚本、其引入的环境配置、launcher 或依赖变化时，一并复核 adapt/optimize 的用法和任务配方。公共仓只保留可公开的规则与来源，现场配置留在私有工作区；不能只更新官方 Wiki 文本。
+   PyTorch/编译器/DDP/FSDP 或通信库版本变化时，同步复核 optimize 的 `references/torch-native-training.md` 和 `references/communication-optimization.md`；核实日志接口、编译/通信触发、同步与 buffer 生命周期。未登记的依赖变化也要按任务版本主动查源码，不能因为不在维护清单就跳过。
 7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
    复核后又改正文/工作流或新增同来源专题时，重新检查并留下新回执；即使上游没有新变化也不能沿用过期复核。PR 重采后同样处理由作者页变动引起的待办。
 8. wiki-catalog 刷新来源/文档/PR 导航（wiki-update 已在收尾调用），wiki-index 更新搜索。运行本工程测试和真实问题检索，保存本次缺口及下次入口。公共材料提交与 push 沿用任务授权，私有数据禁止进入公共仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
@@ -38,6 +39,6 @@ TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查�
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 
-需要 HCU 事实、历史案例或底层实现时使用可用的 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流只维护自己的局部官方 Wiki；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
+HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP/容错；需要 HCU 事实、历史案例或底层实现时使用 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流只维护自己的局部官方 Wiki；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
 
 产物归属本 Skill：按目标仓规范准备集中、通用的改动、测试、PR 说明和回退方式。公开 PR/Cookbook 只含脱敏的可公开方法与必要代码，不上传任务数据。遵循当前会话已给出的提交/发布授权。
