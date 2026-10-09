@@ -69,7 +69,9 @@ def test_cli_incomplete_exit_and_output(tmp_path,capsys):
 
 def test_skill_install_idempotent_and_backup(tmp_path):
     script=Path(__file__).resolve().parents[1]/'scripts/install_skills.py';target=tmp_path/'skills'
-    cmd=[sys.executable,str(script),'--target',str(target)]
+    # These tests exercise workflow replacement, independent of local private
+    # dependency checkouts. Full required installation has separate fixtures.
+    cmd=[sys.executable,str(script),'--target',str(target),'--workflow-only']
     assert subprocess.run(cmd,capture_output=True).returncode==0
     assert subprocess.run(cmd,capture_output=True).returncode==0
     changed=target/'hcu-train-adapt/SKILL.md';changed.write_text('local modified')
@@ -82,7 +84,7 @@ def test_skill_rename_migration_preserves_old_customizations(tmp_path):
     script=Path(__file__).resolve().parents[1]/'scripts/install_skills.py';target=tmp_path/'skills'
     old=target/'hcu-train-prepare';old.mkdir(parents=True)
     (old/'SKILL.md').write_text('old local customization')
-    cmd=[sys.executable,str(script),'--target',str(target)]
+    cmd=[sys.executable,str(script),'--target',str(target),'--workflow-only']
     assert subprocess.run(cmd,capture_output=True).returncode != 0
     assert not (target/'hcu-trainflow').exists()  # validate before any mutation
     assert subprocess.run(cmd+['--replace'],capture_output=True).returncode == 0

@@ -86,7 +86,7 @@ def test_observer_does_not_stop_on_adapter_only_completion(monkeypatch, tmp_path
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "sys", SimpleNamespace(platform="linux", stderr=sys.stderr))
-    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=lambda *args: None))
+    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(LOCK_EX=1, LOCK_NB=2, LOCK_UN=8, flock=lambda *args: None))
     monkeypatch.setattr(sys, "argv", [str(path), "--workspace", str(tmp_path), "--task", "fixture",
                                       "--manifest", str(tmp_path / "attempt.json"), "--policy", str(tmp_path / "policy.json")])
     replies = iter([
@@ -105,7 +105,7 @@ def test_once_observer_exits_nonzero_for_attention(monkeypatch, tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "sys", SimpleNamespace(platform="linux", stderr=sys.stderr))
-    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=lambda *args: None))
+    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(LOCK_EX=1, LOCK_NB=2, LOCK_UN=8, flock=lambda *args: None))
     monkeypatch.setattr(sys, "argv", [str(path), "--workspace", str(tmp_path), "--task", "fixture", "--once",
                                       "--manifest", str(tmp_path / "attempt.json"), "--policy", str(tmp_path / "policy.json")])
     monkeypatch.setattr(module, "observe_once", lambda *args: {"adapter": {"last_observation": {"completed": False}},
