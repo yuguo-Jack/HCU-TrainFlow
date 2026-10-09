@@ -65,3 +65,5 @@ User requests a unified autonomous entry Skill, persistent implement/review/corr
 2. Implement dependency-aware assignment lifecycle, bounded dispatch selection and related-agent message receipts; preserve execution uncertainty and quality gates — complete.
 3. Use the agreed agentic project description, five-minute guidance collection, stage/coordinator Skills and concrete parallelization guidance — complete.
 4. Test dependency/race/stale-result/message/resource cases, review and install Skills, push development changes without release/tag — complete locally; publication is recorded in Git history and CI.
+
+- Dynamic operator decomposition clarification: use real model/profile operator identity and implementation scope; independent analysis and optimization proceed concurrently without an all-operator analysis barrier — complete.

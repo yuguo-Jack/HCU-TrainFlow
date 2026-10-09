@@ -31,7 +31,11 @@ AMD Primus、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 与官方开发�
 
 固定 trace 后，可并行分析 CPU/空泡、计算/shape/上限、通信/并行域、显存/生命周期，各自保留原始证据并及时交流互相影响（如 overlap 下的 GEMM 变慢、重算与峰值显存）。所有 lane 使用同一窗口、rank 映射和墙钟分母；不能分别删去各自不擅长的时间再相加。
 
-不同算子（如 attention、GEMM、MoE）可由不同 Agent 并行推进完整局部优化，按不重叠代码区域或独立候选 checkout 分工。接口、数值契约与保存状态先约定；单个算子的 kernel body 和 launch 参数等耦合修改由同一 owner 负责。独立 GPU 可并行测量，共享 GPU 只将实际占用设备的验证排队，开发/编译仍可继续；完整优化任务可选 `resource_scope: operation`，仅在命令执行时领取/释放资源租约，避免长期占住 GPU。按 `docs/multi-agent.md` 登记依赖、peer、资源和验收。单个 kernel 内部沿用原 Hygon Skill 的实测迭代，不强制再拆多 Agent 讨论。返回结论有疑问就定向提问/共享证据；主控选择兼容组合，统一集成后重新做局部正确性、隔离性能和阶段 loss 验证。
+Agent 分工由实际模型调用和 profile 决定，不预设固定名称、算子类别或人数。先得到足以派发的热点清单，再按真实算子/源码位置、shape、dtype、前后向和实现路径动态拆分或合并任务；对应 `profile-analyze` 的 operator key 与原始 trace，补足其未覆盖的调用与 shape 信息。逐项覆盖应建模的非通信热点，不局限于少数常见算子。
+
+**不同算子的详细分析与优化均可并行推进。** 本算子的分析有依据后即可进入局部优化，其他算子可仍在分析或优化，不设置全体分析结束的统一等待点。按不重叠代码区域或独立候选 checkout 分工，接口、数值契约与保存状态先约定；耦合的 kernel body 和 launch 参数由同一 owner 负责。独立 GPU 可并行测量，共享 GPU 只将实际占用设备的验证排队，开发/编译仍可继续；完整优化任务可选 `resource_scope: operation`，仅在命令执行时领取/释放租约。按 `docs/multi-agent.md` 登记实际依赖、peer、资源和验收。
+
+单个 kernel 内部沿用原 Hygon Skill 的实测迭代，不强制再拆多 Agent 讨论。结论有疑问就定向提问/共享证据；主控选择兼容组合，集成后重新做局部正确性、隔离性能和阶段 loss 验证。新 profile 出现新热点时动态调整分工，不能沿用过时任务名单。
 
 ## 阶段产物
 
