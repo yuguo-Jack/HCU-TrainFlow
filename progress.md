@@ -22,3 +22,9 @@
 - Public GitHub repository created under yuguo-Jack; initial Windows/Linux × Python 3.10/3.12 matrix completed successfully. Final release commit is validated by the same workflow.
 - CLI editable install, wheel build/import demo, source locks, five Skills, local Markdown links and public file boundary reviewed.
 - Source/field limitations and the next real HCU pilot are documented in docs/capabilities.md. No real HCU benchmark, training deployment or notification service was claimed or performed.
+
+## HCU launch recipe guidance correction
+
+- Updated prepare to prefer applicable HCU model scripts and the actual deployment, preserve user patches, trace sourced configuration and launch wrappers, and compare official model/training semantics.
+- Aligned project instructions, general workflow, three Megatron pages, profiling guidance and workflow maintenance; recorded launch source/version, effective configuration and adjustment rationale as adaptation evidence.
+- Validation passed: 32 Wiki pages / 20 sources with no integrity errors; all three changed Skills passed the Skill validator; Git whitespace review passed. This is a guidance change, without new runtime behavior or HCU execution claims.

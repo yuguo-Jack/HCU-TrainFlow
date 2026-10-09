@@ -21,3 +21,8 @@ Implement the first usable local-centred workflow release. Preserve the 36 requi
 
 ## Errors and decisions
 - Original planning documents are preserved under ignored .private/planning-original; public documentation will be curated separately.
+
+## Follow-up: HCU launch recipe priority
+
+- Complete: corrected preparation guidance to reuse applicable HCU scripts and the user's deployment, with official model/training semantics as the reference.
+- Complete: reviewed related workflow, Megatron topics, profiling and maintenance guidance together; Wiki integrity and all three changed Skills validate successfully.

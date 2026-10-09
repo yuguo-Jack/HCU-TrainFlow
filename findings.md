@@ -14,3 +14,8 @@
 - Python sqlite3 context managers commit/rollback but do not close connections; explicit close is required before renaming index files on Windows.
 
 - Initial Git whitespace review detected CRLF text as trailing whitespace under this host configuration. Added a repository LF policy and normalized only the intended tracked text files; cached source bytes remain unchanged.
+
+## HCU model adaptation clarification
+
+- The prepare Skill and several Megatron pages said to start from official recipes, which could mislead agents into copying NVIDIA platform setup and launch commands.
+- Applicable HCU scripts, their sourced environment/configuration and the user's deployment form the launch reference. Official recipes remain the model/training semantic reference; both old HCU scripts and new task changes require compatibility and correctness checks.

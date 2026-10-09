@@ -49,7 +49,7 @@ Bridge 的 CommOverlapConfig 与 model 配置共同决定 TP/DP/PP/CP/EP 路径�
 
 ## 安装和运行
 
-读取本提交 pyproject 及 recipe 依赖，采用与 Core/TE 匹配的环境。先构造并打印解析后的配置，再在任务分配资源内运行官方对应模型示例。运行命令应由当前 recipe 生成并锁定，而不是用一个覆盖所有模型的固定命令。
+读取任务选定提交的 pyproject 及 recipe 依赖，采用与 Core/TE 匹配的环境。HCU 适配优先参考 HCU Bridge/训练工程已有的对应模型 recipe、环境与启动脚本，结合用户部署和 patch，用官方 recipe 核对模型与训练语义。先构造并检查解析后的非敏感配置，再在任务分配资源内执行匹配的 HCU 启动链；缺少适用脚本时记录平台适配项。运行命令依据实际 recipe、环境和 launcher 生成并锁定，保存来源与差异。
 
 ## 更新
 

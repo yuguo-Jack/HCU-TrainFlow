@@ -10,7 +10,7 @@ description: 分析 HCU 大模型训练瓶颈，或推进系统与算子优化�
 ## 优化闭环
 
 1. **固定比较对象。** 初始基线不可覆盖；锁定源码、数据、环境、shape、拓扑、precision、sample/token 聚合和预算。未完成环境验收须标明对性能解释的限制。
-2. **抓训练端到端剖面。** 采用当前官方/HCU 入口的 torch profiler；每个实际非单例并行组至少两个有代表性的 rank。保留完整稳态步和 phase，区分 fwd/bwd/optimizer/通信/数据/checkpoint；跨 rank 先校时。warmup、编译和 profiling 开销不能混进性能对照。
+2. **抓训练端到端剖面。** 优先使用实际 HCU 启动链已有的 torch profiler 支持，必要时对照官方实现接入；保留已验收的环境与 launcher，并记录采集所需改动。每个实际非单例并行组至少两个有代表性的 rank。保留完整稳态步和 phase，区分 fwd/bwd/optimizer/通信/数据/checkpoint；跨 rank 先校时。warmup、编译和 profiling 开销不能混进性能对照。
 3. **先系统分析。** 空泡分数据、CPU launch、同步、PP 调度；通信分真实消息量、拓扑、wait、overlap 和最慢 rank。关注显存 reserved/allocated、图池、临时/通信 buffer，以及保存恢复峰值。`GPU_MAX_HW_QUEUES` 按目标 runtime 和对照实测调节，没有通用最佳值。
 4. **复用 TraceLens。** 先用其已安装 CLI/API 做 op/kernel、overlap、collective 分析，核对输出单位/字段与 unsupported 情形。TrainFlow 补充训练契约、rank 覆盖和热点建模；轻量归因不冒充跨 rank 关键路径。
 5. **融合粒度与数值对齐。** 对照 NV 实际调用、接口、fwd/bwd、saved tensors、cast/accumulation。先查最新 Flash-Train 已支持算子；TE 能力提交 HCU TE，通用编译/cuDNN frontend 训练融合优先 Flash-Train。优先复用，不重复开发。
