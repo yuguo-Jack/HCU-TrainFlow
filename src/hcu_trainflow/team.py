@@ -6,7 +6,7 @@ actual Agents after claiming work; accepted results, not delivery receipts, unlo
 import json
 from pathlib import PurePosixPath
 
-from .core import FlowError, safe_id, utc
+from .core import FlowError, context_epoch, safe_id, utc
 
 
 def goal(db, tid):
@@ -28,7 +28,9 @@ def get(db, aid):
 
 def stale(db, row):
     task = db.execute('SELECT context FROM tasks WHERE id=?', (row['task'],)).fetchone()
-    return row['spec']['context'] != task['context'] or row['spec'].get('flow_goal') != goal(db, row['task'])
+    registered = db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE task=? AND kind='assignment-registered' AND json_extract(payload,'$.id')=?", (row['task'], row['id'])).fetchone()[0]
+    return (row['spec']['context'] != task['context'] or row['spec'].get('flow_goal') != goal(db, row['task'])
+            or context_epoch(db, row['task']) > registered)
 
 
 def proof(store, values):
@@ -108,7 +110,7 @@ def plan(store, tid, value):
     with store.db() as db:
         db.execute('BEGIN IMMEDIATE')
         current=db.execute('SELECT context,state FROM tasks WHERE id=?',(tid,)).fetchone()
-        if current['state'] in {'completed','cancelled'} or current['context'] != task['context'] or goal(db,tid) != fg:
+        if current['state'] in {'completed','cancelled'} or current['context'] != task['context'] or context_epoch(db,tid) != task['context_epoch'] or goal(db,tid) != fg:
             raise FlowError('Context changed during planning')
         old=records(db,tid)
         for spec in normalized:
@@ -117,7 +119,7 @@ def plan(store, tid, value):
         specs={**{k:r['spec'] for k,r in old.items()}, **{s['id']:s for s in normalized}}
         for spec in normalized:
             for dep in spec['depends_on'] + spec['peers']:
-                if dep not in specs or specs[dep]['context'] != task['context'] or specs[dep].get('flow_goal') != fg:
+                if dep not in specs or specs[dep]['context'] != task['context'] or specs[dep].get('flow_goal') != fg or dep in old and stale(db,old[dep]):
                     raise FlowError('Dependency/peer must be registered in the same current task/goal')
         visited=set(); visiting=set()
         def visit(aid):
@@ -137,19 +139,31 @@ def plan(store, tid, value):
     return schedule(store,tid)
 
 
-def conflict(left, right):
+def conflict(left, right, *, shared_checkout=True):
     if set(left['resources']) & set(right['resources']) and (
             left.get('resource_scope','assignment')=='assignment' or right.get('resource_scope','assignment')=='assignment'):
         return 'shared-resource'
     # Readers of a mutable checkout also conflict with a writer. Give readers an
     # immutable snapshot with another checkout ID to safely run beside writes.
     writes=lambda s:s['mode'] in {'write','experiment'}
-    if left['checkout'] == right['checkout'] and (writes(left) or writes(right)):
+    if shared_checkout and left['checkout'] == right['checkout'] and (writes(left) or writes(right)):
         for a in left['allowed_paths']:
             for b in right['allowed_paths']:
                 if a == '.' or b == '.' or a.casefold() == b.casefold() or a.casefold().startswith(b.casefold()+'/') or b.casefold().startswith(a.casefold()+'/'):
                     return 'shared-checkout-path'
     return None
+
+
+def active_reservations(db):
+    return [{**dict(row), 'spec': json.loads(row['payload'])}
+            for row in db.execute("SELECT * FROM assignments WHERE status='claimed'")]
+
+
+def reservation_conflict(left, right):
+    # The default checkout is local to its task; explicitly named checkouts and
+    # hardware resources identify shared scopes throughout the workspace.
+    shared = left['task'] == right['task'] or all(row['spec']['checkout'] != 'task' for row in (left, right))
+    return conflict(left['spec'], right['spec'], shared_checkout=shared)
 
 
 def message_blockers(db, tid, endpoint):
@@ -164,12 +178,24 @@ def message_blockers(db, tid, endpoint):
     return reasons
 
 
-def readiness(db,row,all_rows):
+def dependency_blockers(db, row, visited=None):
+    """An accepted intermediate result cannot hide invalidated upstream inputs."""
+    visited=set() if visited is None else visited
     reasons=[]
-    if stale(db,row): reasons.append('stale-context-or-goal')
     for dep in row['spec'].get('depends_on',[]):
-        if all_rows[dep]['status'] != 'accepted': reasons.append('dependency-not-accepted:'+dep)
+        if dep in visited: continue
+        visited.add(dep)
+        parent=get(db,dep)
+        if parent['status'] != 'accepted': reasons.append('dependency-not-accepted:'+dep)
+        if stale(db,parent): reasons.append('dependency-stale:'+dep)
         if message_blockers(db,row['task'],dep):reasons.append('dependency-has-peer-blocker:'+dep)
+        reasons += dependency_blockers(db,parent,visited)
+    return reasons
+
+
+def readiness(db,row,all_rows):
+    reasons=dependency_blockers(db,row)
+    if stale(db,row): reasons.append('stale-context-or-goal')
     # Incoming questions must not prevent their recipient from running to answer.
     # A voluntarily yielded worker can resume after its blocking exchange resolves.
     if row['status']=='waiting':reasons += message_blockers(db,row['task'],row['id'])
@@ -182,17 +208,18 @@ def schedule(store, tid):
         rows=records(db,tid)
         cfg=db.execute('SELECT max_parallel FROM team_plans WHERE task=?',(tid,)).fetchone()
         limit=cfg['max_parallel'] if cfg else 1
-        active=[r for r in rows.values() if r['status']=='claimed']
+        occupied_rows=active_reservations(db)
+        active=[r for r in occupied_rows if r['task']==tid]
         selected=[];waiting={};returned=[]
         for aid,row in rows.items():
             if row['status']=='returned' and not stale(db,row): returned.append(aid)
             if row['status'] not in {'pending','needs-revision','waiting'}: continue
             reasons=readiness(db,row,rows)
             if len(active)+len(selected)>=limit: reasons.append('parallel-slot-limit')
-            for occupied in active+selected:
-                why=conflict(row['spec'],occupied['spec'])
+            for occupied in occupied_rows+selected:
+                why=reservation_conflict(row,occupied)
                 if why: reasons.append(why+':'+occupied['id'])
-                if row['spec']['owner']==occupied['spec']['owner']: reasons.append('owner-busy:'+occupied['id'])
+                if row['task']==occupied['task'] and row['spec']['owner']==occupied['spec']['owner']: reasons.append('owner-busy:'+occupied['id'])
             if reasons: waiting[aid]=reasons
             else:selected.append(row)
         items=[]
@@ -205,6 +232,9 @@ def schedule(store, tid):
                 'run':dict(run) if run else None})
         return {'task':tid,'max_parallel':limit,'dispatchable':[r['id'] for r in selected],
                 'active':[r['id'] for r in active],'awaiting_acceptance':returned,'waiting':waiting,'assignments':items,
+                'replan_required':[{'assignment':r['id'],'action':'flow-replan',
+                    'reason':'Required work was cancelled. Replan the flow with an explicit replacement reason, then register current assignments; adding a new assignment alone does not replace the cancelled obligation.'}
+                    for r in rows.values() if r['status']=='cancelled' and r['spec'].get('required',True) and not stale(db,r)],
                 'dispatch':'Claim, launch through the installed harness, then bind the actual session ID'}
 
 
@@ -214,12 +244,18 @@ def claimed(db,aid,owner,token):
     if row['status']!='claimed' or row['spec']['owner']!=owner or not run or run['token']!=token:
         raise FlowError('Assignment is not claimed by this owner/token')
     if stale(db,row):raise FlowError('Assignment context/goal is stale')
+    validate_inputs(db,row,run)
+    return row,dict(run)
+
+
+def validate_inputs(db,row,run):
+    if dependency_blockers(db,row):
+        raise FlowError('Accepted dependency evidence changed')
     for dep,sha in json.loads(run['inputs']).items():
         parent=get(db,dep)
         parent_run=db.execute('SELECT report FROM assignment_runs WHERE assignment=?',(dep,)).fetchone()
         if parent['status']!='accepted' or not parent_run or parent_run['report']!=sha or message_blockers(db,row['task'],dep):
             raise FlowError('Accepted dependency evidence changed')
-    return row,dict(run)
 
 
 def claim(store,aid,owner):
@@ -233,12 +269,13 @@ def claim(store,aid,owner):
         if task['state'] in {'paused','blocked','failed','completed','cancelled'}:raise FlowError('Task is not active')
         if row['spec']['owner']!=owner or row['status'] not in {'pending','needs-revision','waiting'}:raise FlowError('Assignment cannot be claimed')
         all_rows=records(db,row['task']);reasons=readiness(db,row,all_rows)
-        active=[r for r in all_rows.values() if r['status']=='claimed']
+        occupied_rows=active_reservations(db)
+        active=[r for r in occupied_rows if r['task']==row['task']]
         limit=db.execute('SELECT max_parallel FROM team_plans WHERE task=?',(row['task'],)).fetchone()
         if len(active)>=(limit['max_parallel'] if limit else 1):reasons.append('parallel-slot-limit')
-        for other in active:
-            why=conflict(row['spec'],other['spec'])
-            if why or other['spec']['owner']==owner:reasons.append(why or 'owner-busy')
+        for other in occupied_rows:
+            why=reservation_conflict(row,other)
+            if why or other['task']==row['task'] and other['spec']['owner']==owner:reasons.append(why or 'owner-busy')
         if reasons:raise FlowError('Claim blocked: '+', '.join(reasons))
         old=db.execute('SELECT token FROM assignment_runs WHERE assignment=?',(aid,)).fetchone()
         token=old['token']+1 if old else 1
@@ -284,6 +321,7 @@ def review(store,aid,value):
         db.execute('BEGIN IMMEDIATE');row=get(db,aid)
         run=db.execute('SELECT * FROM assignment_runs WHERE assignment=?',(aid,)).fetchone()
         if row['status']!='returned' or stale(db,row) or not run or run['report']!=value['report']:raise FlowError('No matching current returned result')
+        if value['verdict']=='accept':validate_inputs(db,row,run)
         if row['spec']['owner']==value['reviewer']:raise FlowError('Owner cannot accept their own result')
         if message_blockers(db,row['task'],aid):raise FlowError('Resolve peer blockers before accepting result')
         state='accepted' if value['verdict']=='accept' else 'needs-revision'

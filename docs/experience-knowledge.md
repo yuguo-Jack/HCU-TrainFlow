@@ -35,6 +35,8 @@ hcu-trainflow experience-index
 
 model/environment 是 context 对应值的精确过滤；复杂对象按规范 JSON 保存，也可先用问题词检索，再用 `--context` 判断是否同上下文并读全文。索引可重建，原始记录和证据必须保留。
 
+同一事件或同一手工输入的并发重试复用一条记录；SQLite 事务协调事件身份和导航发布，避免互相覆盖索引。新记录保留 source_event，experience-index 可恢复事件映射；重建先验证全部记录、上下文与证据，再替换索引。页面或导航写入中断时，原始记录仍保留，可用 experience-sync / experience-index 恢复。备份时仍须保留整个私有工作区的数据库、records 和 objects。
+
 ## 解释记录契约
 
 `experience-record TASK file.json` 的最小字段模板如下。hash 和说明必须替换为真实任务证据，不是演示测量：

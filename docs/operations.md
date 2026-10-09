@@ -21,6 +21,8 @@ hcu-trainflow --workspace /private/remote watch TASK /private/normalized.jsonl /
 
 日志游标、观测、incident 和 outbox 同事务提交。部分行不消费、重复观测不重复告警；轮转/坏行明确告警。心跳文件是派生产物，独立 observer 用 heartbeat-check 检查 watcher 失活。watcher 自己不能证明自己一直在线。
 
+每个 attempt 的开始时间、最高 step 和上次真实推进时间独立持久化，不随最近 1000 条观测窗口滑动；高频心跳不能掩盖停滞或恢复超时。旧游标首次升级时从已保留事件恢复这些时钟。日志轮转同时检查文件身份及已读前缀，小文件也参与检查，正常追加不会被误判为轮转。
+
 ## 本机恢复
 
 远端 `events-export` 按 seq 导出；本机 `events-import` 使用稳定 peer ID 重放并去重，遇到缺号拒绝越过。之后查询 inbox，结合当前 attempt/job/checkpoint 决定处理。不要只依据旧告警重启已经恢复的任务。

@@ -24,7 +24,9 @@ hcu-trainflow wiki-read official-megatron-wiki/cases/paged-stash-launch
 hcu-trainflow wiki-search "weight transfer" --engine vllm --kind source-document
 ```
 
-索引使用 SQLite FTS5、英文符号/中文 bigram、标题与类型权重，不下载 embedding 模型。`--kind` 支持 authored、source-document、source-pr、source-map。目录清单降权；搜索结果相关不等于结论适用。`wiki-read` 返回索引中的完整正文，文件变化时提示重新索引。
+索引使用 SQLite FTS5、英文符号/中文 bigram、标题与类型权重，不下载 embedding 模型。`--kind` 支持 authored、source-document、source-pr、source-map。`wiki-search` 按 `--project`（或 `TRAINFLOW_PROJECT`）核对当前本地文件，复用或重建对应内容指纹的索引；切换 checkout 或补充页面后不会沿用另一工程的旧结果。这一步只读本地知识，不刷新上游。并发索引使用独立临时文件，搜索绑定自己选定的代次。目录清单降权；搜索结果相关不等于结论适用。`wiki-read` 返回最近索引中的完整正文，文件变化时提示重新索引。
+
+多 Agent 或多个 checkout 共用私有工作区时，后续全文读取使用 `wiki-read PAGE_ID --generation SEARCH_RETURNED_GENERATION`，保证读取刚才命中的同一快照；也可 `--project PROJECT` 明确读取该工程当前本地版本。省略两者只兼容使用最近的 active 索引，不适合并发跨工程读取。
 
 **本地无候选**时，`wiki-search` 默认 `--online-pr auto` 按 engine/source/repo 范围搜索线上 PR；无范围时要求先确定仓。**有结果但不能回答问题**时，由 Agent 判断并主动 `wiki-search-pr` 或 `--online-pr always`，不能因有命中就停止。纯离线用 `--online-pr off`。
 
@@ -91,6 +93,8 @@ python scripts/validate_knowledge.py
 ```
 
 decisions 结构为 `{"pages":{PATH:DECISION},"workflows":{PATH:DECISION}}`。apply 再核对页哈希和最新采集版本，才写公共锁/基线，历史固定证据继续保留。PR 初始描述和最终代码不同必须明确记录。
+
+复核同时绑定同来源页面和已复核工作流的当前哈希。复核后修改正文、新增关联专题或修改工作流，会重新产生待复核项；上游内容不变也不会清掉这些项。删除来源标注而保留正文也需要明确复核。无变化的再次复核保留原哈希绑定，不能用空 decisions 绕过后来发生的编辑。PR 重采也检查关联作者页是否变化。staging 之后新增关联页需重新 staging，apply 之前再次改动则拒绝沿用旧回执。
 
 涉及现场 HCU 命令/工具且暂时无法验证时，允许 `wiki-review ... --defer-workflows "具体现场缺口"` 完成知识内容复核。未完工作流项单独保存，下次仍会出现；不称 Skill 已现场通过。第三方工具运行版本与任务快照独立管理。
 

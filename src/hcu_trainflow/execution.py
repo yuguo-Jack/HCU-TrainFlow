@@ -1,5 +1,6 @@
 """Explicit command plans and replay-safe execution intents; no implicit shell."""
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -8,7 +9,23 @@ import shutil
 import subprocess
 import time
 
-from .core import FlowError, atomic_write, child, fingerprint, safe_id, utc, write_json
+from .core import FlowError, atomic_write, child, context_epoch, fingerprint, safe_id, utc, write_json
+
+
+def operation_budget_seconds(db, operation_id, result, *, reserve=False):
+    """Count interrupted runs conservatively without inventing measured runtime."""
+    values = [result[key] for key in ("seconds", "budget_seconds")
+              if isinstance(result.get(key), (int, float)) and not isinstance(result[key], bool)
+              and math.isfinite(result[key]) and result[key] >= 0]
+    if reserve or not values:
+        event = db.execute("SELECT payload FROM events WHERE kind='operation-started' "
+                           "AND json_extract(payload,'$.operation')=? ORDER BY seq LIMIT 1", (operation_id,)).fetchone()
+        timeout = json.loads(event["payload"]).get("timeout_seconds") if event else None
+        # Legacy incomplete records may have no start receipt. Charge the maximum
+        # permitted command duration until their accounting is explicitly repaired.
+        values.append(timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+                      and math.isfinite(timeout) and timeout > 0 else 86400)
+    return max(values)
 
 
 def command_plan(card):
@@ -79,6 +96,9 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False, a
     safe_id(operation_id)
     plan = command_plan(card)
     identity = {"plan": plan, "context": task["context"]}
+    if task['context_epoch']:
+        # Preserve IDs from the initial context while distinguishing A -> B -> A.
+        identity['context_epoch'] = task['context_epoch']
     if assignment:
         identity.update(assignment=assignment, owner=owner, token=token)
     request = fingerprint(identity)
@@ -86,7 +106,8 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False, a
         db.execute("BEGIN IMMEDIATE")
         store.check_lease(db, **lease)
         current = db.execute('SELECT context,state FROM tasks WHERE id=?', (tid,)).fetchone()
-        if current['context'] != task['context'] or current['state'] in {'completed', 'cancelled', 'paused', 'blocked', 'failed'}:
+        if (current['context'] != task['context'] or context_epoch(db, tid) != task['context_epoch']
+                or current['state'] in {'completed', 'cancelled', 'paused', 'blocked', 'failed'}):
             raise FlowError('Task context/state changed before execution')
         if not control_plane:
             from .flow import get_flow, blockers
@@ -101,17 +122,20 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False, a
                 return json.loads(prior["result"])
             raise FlowError("Outcome unknown; reconcile original execution before creating another operation")
         assigned=team.check_execution(db,tid,assignment,owner,token,lease['resource']) if assignment else None
+        for reservation in team.active_reservations(db):
+            if (reservation['id'] != assignment and reservation['spec'].get('resource_scope', 'assignment') == 'assignment'
+                    and lease['resource'] in reservation['spec']['resources']):
+                raise FlowError('Resource is reserved by a claimed assignment; execute with its owner/token or release its scope')
         occupied = db.execute("SELECT o.id FROM operations o JOIN events e ON json_extract(e.payload,'$.operation')=o.id WHERE e.kind='operation-started' AND json_extract(e.payload,'$.lease.resource')=? AND o.status IN ('started','unknown')", (lease["resource"],)).fetchone()
         if occupied:
             raise FlowError("Resource already has an unresolved execution, including in another task")
         count = db.execute("SELECT count(*) FROM operations WHERE task=?", (tid,)).fetchone()[0]
         if count >= task["spec"].get("budget", {}).get("max_operations", 100):
             raise FlowError("Operation budget exhausted")
-        spent = sum(json.loads(x[0]).get("seconds", 0) for x in db.execute("SELECT result FROM operations WHERE task=? AND result IS NOT NULL", (tid,)))
-        reserved = sum(json.loads(r[0]).get('timeout_seconds', 0) for r in db.execute(
-            "SELECT e.payload FROM events e JOIN operations o ON json_extract(e.payload,'$.operation')=o.id "
-            "WHERE e.kind='operation-started' AND o.task=? AND o.status IN ('started','unknown')", (tid,)))
-        remaining = task["spec"].get("budget", {}).get("max_seconds", float("inf")) - spent - reserved
+        spent = sum(operation_budget_seconds(db, row["id"], json.loads(row["result"] or "{}"),
+                                            reserve=row["status"] in {"started", "unknown"})
+                    for row in db.execute("SELECT id,status,result FROM operations WHERE task=?", (tid,)))
+        remaining = task["spec"].get("budget", {}).get("max_seconds", float("inf")) - spent
         if plan["timeout_seconds"] > remaining:
             raise FlowError("Command timeout exceeds remaining execution budget")
         uncertain = db.execute("SELECT id,status FROM operations WHERE task=? AND status IN ('started','unknown')", (tid,)).fetchall()
@@ -125,9 +149,10 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False, a
             if not assigned or other['status']=='unknown' or not team.active_operation(db,other['id'],tid) or linked['assignment']==assignment:
                 raise FlowError("Prior execution outcome is unresolved; reconcile before another command")
         if assigned:
-            history=db.execute('SELECT o.result FROM operations o JOIN assignment_operations a ON o.id=a.operation WHERE a.assignment=?',(assignment,)).fetchall()
+            history=db.execute('SELECT o.id,o.status,o.result FROM operations o JOIN assignment_operations a ON o.id=a.operation WHERE a.assignment=?',(assignment,)).fetchall()
             budget=assigned['spec']['budget']
-            seconds=sum(json.loads(r['result']).get('seconds',0) for r in history if r['result'])
+            seconds=sum(operation_budget_seconds(db, r['id'], json.loads(r['result'] or '{}'),
+                                                 reserve=r['status'] in {'started', 'unknown'}) for r in history)
             if len(history)>=budget.get('max_operations',100) or plan['timeout_seconds']>budget.get('max_seconds',float('inf'))-seconds:
                 raise FlowError('Assignment execution budget exhausted')
         db.execute("INSERT INTO operations VALUES(?,?,?,'started',NULL,?)", (operation_id, tid, request, utc()))
@@ -155,7 +180,7 @@ def run_command(store, tid, operation_id, card, lease, *, control_plane=False, a
             stderr.write(str(exc).encode("utf-8"))
     artifacts = [store.put((output / x).read_bytes()) for x in ("stdout.log", "stderr.log", "plan.json")]
     result = {"operation": operation_id, "returncode": code, "timed_out": timed_out, "seconds": time.monotonic() - started,
-              "context": task["context"], "evidence": artifacts,
+              "context": task["context"], "context_epoch": task['context_epoch'], "evidence": artifacts,
               "status": "unknown" if timed_out or (plan["backend"] != "local" and code != 0) else ("complete" if code == 0 else "failed"),
               "validation": "unassessed; exit zero does not establish numerical or performance correctness",
               "remote_outcome": "reconcile-required" if plan["backend"] != "local" and (timed_out or code != 0) else "command-returned"}

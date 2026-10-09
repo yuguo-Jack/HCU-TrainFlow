@@ -60,8 +60,23 @@ def test_iteration_not_production_acceptance():
     result=assess_iteration(r,[10,11,10],[9,10,9],'ctx')
     assert result['status']=='iteration-kept' and result['production_default'] is False
 
+def test_missing_required_coverage_blocks_loss_and_iteration():
+    c,r=loss_fixture()
+    r.update(required_missing=['backward'],profiler_off=True,measurement_protocol='paired warm runs')
+    assert compare_loss(c,r,r)['status']=='incomplete'
+    assert assess_iteration(r,[10,11,10],[9,10,9],'ctx')['status']=='incomplete'
+    with pytest.raises(FlowError,match='min_steps'):
+        compare_loss({**c,'min_steps':True},r,r)
+
 def test_environment_requires_every_device():
     required=[{'node':'n','device':x,'check':'gemm','kind':'performance','conditions':{'dtype':'bf16'},'minimum':100,'basis':'matching peak'} for x in ('0','1')]
     m={'node':'n','device':'0','check':'gemm','conditions':{'dtype':'bf16'},'context':'c','value':120,'status':'pass','executed':1,'evidence':['raw']}
     assert assess_health({'context':'c','required':required},[m])['status']=='incomplete'
     assert assess_health({'context':'c','required':required},[m,{**m,'device':'1','value':80}])['status']=='fail'
+
+@pytest.mark.parametrize('invalid',[{'executed':True},{'executed':1.5},{'executed':'1'},
+    {'skipped_required':1},{'required_missing':['peer test']},{'failures':1}])
+def test_environment_pass_requires_valid_executed_coverage(invalid):
+    contract={'context':'c','required':[{'node':'n','device':'0','check':'health','conditions':{}}]}
+    measurement={'context':'c','node':'n','device':'0','check':'health','conditions':{},'status':'pass','executed':1,'evidence':['raw']}
+    assert assess_health(contract,[{**measurement,**invalid}])['status']=='incomplete'

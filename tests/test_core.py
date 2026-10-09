@@ -65,3 +65,112 @@ def test_event_id_collision(store):
     with store.db() as db:store.event(db,'t','observation',{'x':1},'unique')
     with pytest.raises(FlowError):
         with store.db() as db:store.event(db,'t','observation',{'x':2},'unique')
+
+
+@pytest.mark.parametrize('result', [None, {'seconds':1, 'status':'unknown'}, {'seconds':15, 'status':'unknown'}])
+def test_reconciliation_preserves_timeout_budget(store, tmp_path, result):
+    lease = store.lease('cpu', 'audit')
+    with store.db() as db:
+        spec = store.task('t')['spec']
+        spec['budget'] = {'max_seconds':10}
+        db.execute("UPDATE tasks SET spec=? WHERE id='t'", (json.dumps(spec),))
+        db.execute("INSERT INTO operations VALUES('lost','t','hash','started',?,'now')",
+                   (json.dumps(result) if result else None,))
+        store.event(db, 't', 'operation-started', {'operation':'lost', 'lease':lease, 'timeout_seconds':10})
+    reconciled = reconcile_operation(store, 'lost', 'complete', [store.put(b'Original operation confirmed ended')],
+                                    'Controller lost its result; verified terminal outcome')
+    assert reconciled['budget_seconds'] == max(10, result['seconds'] if result else 0)
+    assert reconciled.get('seconds') == (result['seconds'] if result else None)
+    card = {'schema_version':1, 'argv':[sys.executable, '--version'], 'cwd':str(tmp_path),
+            'timeout_seconds':1, 'basis':'Local budget fixture'}
+    with pytest.raises(FlowError, match='remaining execution budget'):
+        run_command(store, 't', 'overspend', card, lease)
+
+
+def test_legacy_reconciled_result_cannot_erase_timeout_budget(store, tmp_path):
+    lease = store.lease('cpu', 'audit')
+    with store.db() as db:
+        spec = store.task('t')['spec']
+        spec['budget'] = {'max_seconds':10}
+        db.execute("UPDATE tasks SET spec=? WHERE id='t'", (json.dumps(spec),))
+        db.execute("INSERT INTO operations VALUES('legacy','t','hash','complete',?,'now')",
+                   (json.dumps({'status':'complete', 'reconciliation':{'note':'Old terminal receipt'}}),))
+        store.event(db, 't', 'operation-started', {'operation':'legacy', 'lease':lease, 'timeout_seconds':10})
+    card = {'schema_version':1, 'argv':[sys.executable, '--version'], 'cwd':str(tmp_path),
+            'timeout_seconds':1, 'basis':'Local budget fixture'}
+    with pytest.raises(FlowError, match='remaining execution budget'):
+        run_command(store, 't', 'overspend', card, lease)
+
+
+def _reserve_assignment(store, scope='assignment'):
+    from hcu_trainflow import team
+    spec = {'id':'worker', 'owner':'worker-owner', 'goal':'Check fixture', 'scope':'Local execution fixture',
+            'allowed_paths':['.'], 'acceptance':'Retain result', 'mode':'read', 'resources':['cpu'],
+            'resource_scope':scope, 'budget':{'max_seconds':10}, 'context':store.task('t')['context']}
+    team.plan(store, 't', {'rationale':'Local reservation fixture', 'max_parallel':1, 'assignments':[spec]})
+    return team.claim(store, 'worker', 'worker-owner')
+
+
+def test_assignment_budget_retains_reconciled_runtime(store, tmp_path):
+    claim = _reserve_assignment(store)
+    lease = store.lease('cpu', 'worker-owner')
+    with store.db() as db:
+        db.execute("INSERT INTO operations VALUES('lost','t','hash','started',NULL,'now')")
+        db.execute("INSERT INTO assignment_operations VALUES('lost','worker',?)", (claim['token'],))
+        store.event(db, 't', 'operation-started', {'operation':'lost', 'lease':lease, 'timeout_seconds':10})
+    reconcile_operation(store, 'lost', 'complete', [store.put(b'Ended')], 'Verified terminal fixture')
+    card = {'schema_version':1, 'argv':[sys.executable, '--version'], 'cwd':str(tmp_path),
+            'timeout_seconds':1, 'basis':'Local assignment budget fixture'}
+    with pytest.raises(FlowError, match='Assignment execution budget exhausted'):
+        run_command(store, 't', 'overspend', card, lease,
+                    assignment='worker', owner='worker-owner', token=claim['token'])
+
+
+@pytest.mark.parametrize('target', ['t', 'other'])
+def test_unassigned_execution_cannot_bypass_claimed_resource(store, tmp_path, target):
+    claim = _reserve_assignment(store)
+    if target == 'other':
+        store.create({'schema_version':1, 'task_id':target, 'mode':'analyze', 'objective':'Other local fixture',
+                      'context':{'fixture':'other'}, 'permissions':['execute']})
+    lease = store.lease('cpu', 'worker-owner')
+    card = {'schema_version':1, 'argv':[sys.executable, '--version'], 'cwd':str(tmp_path),
+            'timeout_seconds':1, 'basis':'Local resource fixture'}
+    with pytest.raises(FlowError, match='reserved by a claimed assignment'):
+        run_command(store, target, 'unassigned', card, lease)
+    assert run_command(store, 't', 'assigned', card, lease, assignment='worker',
+                       owner='worker-owner', token=claim['token'])['status'] == 'complete'
+
+
+def test_operation_scope_resource_remains_available_between_commands(store, tmp_path):
+    _reserve_assignment(store, scope='operation')
+    lease = store.lease('cpu', 'controller')
+    card = {'schema_version':1, 'argv':[sys.executable, '--version'], 'cwd':str(tmp_path),
+            'timeout_seconds':1, 'basis':'Local resource sharing fixture'}
+    assert run_command(store, 't', 'shared', card, lease)['status'] == 'complete'
+
+
+def test_execution_identity_does_not_reuse_result_after_context_returns(store, tmp_path):
+    lease = store.lease('cpu', 'controller')
+    card = {'schema_version':1, 'argv':[sys.executable, '--version'], 'cwd':str(tmp_path),
+            'timeout_seconds':1, 'basis':'Local context fixture'}
+    run_command(store, 't', 'original', card, lease)
+    store.change_context('t', {'source':'b'})
+    store.change_context('t', {'source':'a'})
+    with pytest.raises(FlowError, match='different request'):
+        run_command(store, 't', 'original', card, lease)
+    assert run_command(store, 't', 'current', card, lease)['status'] == 'complete'
+
+
+def test_execution_admission_detects_context_reset_race(store, tmp_path, monkeypatch):
+    from hcu_trainflow import execution
+    original = execution.command_plan
+    def reset_context(card):
+        plan = original(card)
+        store.change_context('t', {'source':'b'})
+        store.change_context('t', {'source':'a'})
+        return plan
+    monkeypatch.setattr(execution, 'command_plan', reset_context)
+    card = {'schema_version':1, 'argv':[sys.executable, '--version'], 'cwd':str(tmp_path),
+            'timeout_seconds':1, 'basis':'Local context fixture'}
+    with pytest.raises(FlowError, match='context/state changed'):
+        run_command(store, 't', 'raced', card, store.lease('cpu', 'controller'))

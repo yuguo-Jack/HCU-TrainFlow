@@ -1,6 +1,7 @@
 """Environment admission compares compatible checks, never arbitrary peak tables."""
 from .analysis import number
 from .core import FlowError
+from .quality import validate_measurement
 
 
 def assess_health(contract, measurements):
@@ -24,11 +25,11 @@ def assess_health(contract, measurements):
             result, reasons = "incomplete", ["not-collected"]
         elif item.get("context") != contract.get("context") or item.get("conditions") != expectation.get("conditions"):
             result, reasons = "incomplete", ["environment-or-workload-mismatch"]
-        elif not item.get("evidence") or item.get("executed", 0) <= 0:
-            result, reasons = "incomplete", ["missing-evidence-or-no-tests"]
         elif item.get("status") != "pass":
             result = "fail" if item.get("status") == "fail" else "incomplete"
             reasons = [item.get("reason", "check-not-passed")]
+        elif validate_measurement(item, contract.get('context'), path_required=False):
+            result, reasons = "incomplete", validate_measurement(item, contract.get('context'), path_required=False)
         elif expectation.get("kind") == "performance":
             if not expectation.get("basis") or expectation.get("minimum") is None:
                 result, reasons = "incomplete", ["missing-matched-expectation"]
@@ -37,6 +38,7 @@ def assess_health(contract, measurements):
         rows.append({"node": key[0], "device": key[1], "check": key[2], "status": result, "reasons": reasons})
     status = "fail" if any(x["status"] == "fail" for x in rows) else "incomplete" if any(x["status"] == "incomplete" for x in rows) else "pass"
     return {"schema_version": 1, "context": contract["context"], "status": status, "checks": rows,
-            "executed": sum(x.get("executed", 0) for x in measurements), "failures": sum(x["status"] == "fail" for x in rows),
+            "executed": sum(x['executed'] for x in measurements if isinstance(x.get('executed'), int)
+                            and not isinstance(x['executed'], bool) and x['executed'] > 0), "failures": sum(x["status"] == "fail" for x in rows),
             "required_missing": [x for x in rows if x["status"] == "incomplete"],
             "evidence": sorted({s for x in measurements for s in x.get("evidence", [])})}

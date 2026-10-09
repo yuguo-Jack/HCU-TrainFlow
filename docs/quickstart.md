@@ -26,7 +26,7 @@ hcu-trainflow --workspace /private/task-a task-show example-analysis
 
 CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incomplete/partial/attention 等需要处理的结果；1 为输入/运行错误；130 为中断。source collected、bridge returned、脚本 exit0 不表示模型质量通过，必须看具体状态字段。
 
-报告 envelope 必须包含当前 task-show 返回的 context 哈希、status、evidence 数组；pass 还要求 executed>0、没有 failures/required_missing。evidence 是 `artifact-add` 返回的对象 ID。报告由负责 Agent/人根据原始证据撰写；程序验证完整性，不声称能证明任意手填结论真实。
+报告 envelope 必须包含当前 task-show 返回的 context 哈希、status、evidence 数组；pass 还要求 executed 为正整数（不是布尔值）、没有 failures/required_missing/skipped_required。环境、局部测量和阶段 loss 使用相同的必测覆盖原则。evidence 是 `artifact-add` 返回的对象 ID。报告由负责 Agent/人根据原始证据撰写；程序验证完整性，不声称能证明任意手填结论真实。
 
 ## 常用命令组
 
@@ -42,7 +42,8 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 验收 | environment-check、proxy-check、iteration-check、quality-check |
 | 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective |
 | 长训 | watch、heartbeat-check、events-export/import、monitor-report |
-| Wiki | wiki-index/search/refresh/pr/review |
+| 官方 Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog |
+| 私有训练经验 | experience-record/sync/index/search/read/compare |
 | 公开交付 | public-export |
 
 参数以子命令 `--help` 为准。JSON 文件用 UTF-8；PowerShell 重定向可能带 BOM，读取器已兼容。远端命令避免把凭据放 argv/env 明文卡中，使用站点管理的认证设施。

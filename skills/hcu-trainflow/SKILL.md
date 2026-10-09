@@ -50,6 +50,8 @@ review 按 `docs/collaboration.md` 使用完整字段；不以单词“完成”
 5. 等回答占着并发名额时，先确认执行结束和停止修改，`assignment-yield` 释放占用，恢复重新领取。不能向依赖自己完成的下游提出阻塞问题。成员失败保留其他结果；旧 context/token、未知远端作业先核对，不能自动超时重发。
 6. `assignment-return --token` 给出准确输入哈希、结论、原始证据、限制和跨域影响；主控/另一 reviewer 通过 `assignment-review` 验收才解锁下游。统一计算/通信的分母、内存生命周期和数值约束，挑选兼容方案。主控集成后再做局部回归、profiler-off 测量、阶段 loss 及独立整体复核；不能将几个分别有效的改动视为组合后必然有效。
 
+同一私有工作区内，显式 checkout/resource ID 跨任务共享预约；无 assignment 的主控命令也不能绕过已领取的资源范围。context 重置后即使切回原配置，仍需 flow-replan 和新验收。晚到的上游阻塞要重新检查整条依赖链。必做任务取消按 team-next 的 replan_required 明确重规划替代，不能仅追加新任务便把旧义务算完成。
+
 命令与 JSON 以 `docs/multi-agent.md` 为准。团队消息事件及时处理，不受人的五分钟文件采集周期限制。成果由所属阶段交付，无需再增加细碎的独立 Skill。
 
 本地会话在线才有主控推理。`flow-watch` 只记文件变化，不会凭空启动 Agent；离线唤醒需已配置的本地 bridge/宿主服务。远端 watcher 和既有容错独立运行，本机恢复后重放事件、核对现场再续接。没有配置时如实说明接续方式，不能承诺全天自动接管。

@@ -30,6 +30,17 @@ def fingerprint(value):
     return digest(json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode())
 
 
+def context_epoch(db, tid):
+    """A reset invalidates earlier validation even when the context bytes return."""
+    return db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE task=? AND kind='context-changed'", (tid,)).fetchone()[0]
+
+
+def valid_pass(value):
+    return (type(value.get("executed")) is int and value["executed"] > 0
+            and not value.get("failures") and not value.get("required_missing")
+            and not value.get("skipped_required"))
+
+
 def read_json(path):
     with open(path, encoding="utf-8-sig") as stream:
         return json.load(stream, parse_constant=lambda value: (_ for _ in ()).throw(FlowError("Non-finite JSON: " + value)))
@@ -164,7 +175,7 @@ class Store:
 
     def task(self, tid):
         with self.db() as db:
-            row = db.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+            row = db.execute("SELECT tasks.*, (SELECT COALESCE(MAX(seq),0) FROM events WHERE task=tasks.id AND kind='context-changed') AS context_epoch FROM tasks WHERE id=?", (tid,)).fetchone()
         if not row:
             raise FlowError("Unknown task: " + tid)
         result = dict(row)
@@ -208,11 +219,15 @@ class Store:
             raise FlowError("Report requires retained evidence IDs")
         for sha in value["evidence"]:
             self.artifact(sha)
-        if value["status"] == "pass" and (value.get("executed", 0) <= 0 or value.get("failures", 0) or value.get("required_missing")):
+        if value["status"] == "pass" and not valid_pass(value):
             raise FlowError("PASS requires actual execution, no failures and required coverage")
         data = json.dumps(value, ensure_ascii=False, allow_nan=False).encode()
         sha = self.put(data)
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT context FROM tasks WHERE id=?", (tid,)).fetchone()
+            if current["context"] != task["context"] or context_epoch(db, tid) != task["context_epoch"]:
+                raise FlowError("Task context changed while recording report; revalidate before retrying")
             db.execute("INSERT OR REPLACE INTO reports VALUES(?,?,?,?,?,?)", (tid, kind, task["context"], sha, value["status"], utc()))
             self.event(db, tid, "report-recorded", {"kind": kind, "artifact": sha, "status": value["status"],
                                                    "context_spec": task['spec']['context']})
@@ -222,6 +237,16 @@ class Store:
         except (OSError,ValueError,sqlite3.Error) as exc:
             knowledge={'status':'pending','reason':type(exc).__name__,'resume':'experience-sync '+tid}
         return {"artifact": sha, "status": value["status"], 'knowledge':knowledge}
+
+    def current_reports(self, db, tid, context):
+        """Keep historical reports, but only expose evidence recorded since the last reset."""
+        rows = db.execute("""SELECT r.* FROM reports r WHERE r.task=? AND r.context=? AND EXISTS (
+            SELECT 1 FROM events e WHERE e.task=r.task AND e.kind='report-recorded'
+            AND json_extract(e.payload,'$.kind')=r.kind
+            AND json_extract(e.payload,'$.artifact')=r.artifact AND e.seq>?)""",
+            (tid, context, context_epoch(db, tid)))
+        return {row["kind"]: row for row in rows
+                if row["result"] != "pass" or valid_pass(json.loads(self.artifact(row["artifact"])))}
 
     def change_context(self, tid, context):
         if not isinstance(context, dict) or not context:
@@ -256,7 +281,7 @@ class Store:
                     raise FlowError("A reason is required")
             else:
                 modes = {"environment": "environment", "adapt": "baseline", "analyze": "analysis", "diagnose": "diagnosis", "optimize": "stage-quality", "operate": "operations"}
-                reports = {x["kind"]: x for x in db.execute("SELECT * FROM reports WHERE task=? AND context=?", (tid, row["context"]))}
+                reports = self.current_reports(db, tid, row["context"])
                 if state == "completed" and spec["mode"] in modes:
                     kind = modes[spec["mode"]]
                     if kind not in reports:

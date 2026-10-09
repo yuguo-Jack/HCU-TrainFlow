@@ -77,3 +77,10 @@ User requests a unified autonomous entry Skill, persistent implement/review/corr
 5. Test offline and real public retrieval; review privacy, pagination, stale evidence and restart behavior; install Skills — complete. Development changes committed; push verification is recorded in Git remote state. No TrainFlow release/tag.
 
 Real training and site-dependent command validation remain pending until hardware is supplied. This does not defer source-based Wiki work. HCU-Knowledge is not updated as a side effect of TrainFlow operation.
+
+## 2026-10-09: overall pre-environment review
+
+1. Review execution/monitoring, flow/team state, numerical/performance gates, Wiki and experience persistence against actual source and regression tests — complete.
+2. Reproduce and repair concrete defects, preserving public/private boundaries and existing workflow scope — complete; independent reproduction and cross-review included.
+3. Run complete local tests, knowledge validation and relevant CLI/demo smoke checks; synchronize changed Skills if needed — complete: 206 tests, 485 pages/24 sources, all six installed Skills matched.
+4. Commit and push reviewed development changes; report readiness and site-dependent validation limits. No tag/release — validated for publication; final publication is recorded in Git remote state and CI.

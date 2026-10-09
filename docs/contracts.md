@@ -8,6 +8,8 @@
 
 context 包含初始 baseline、环境、模型、数据与质量契约身份。baseline 和 candidate 的源码可以不同，但属于同一个已冻结比较上下文。挂接协作循环后，各轮 candidate.snapshot 单独锁具体实现、配置与产物，报告必须绑定对应 candidate_snapshot；不能将旧报告移用到新候选。环境、模型、数据、初始基线或验证契约变化时用 task-context 更新并重新验收。未挂接 flow 的旧式任务没有候选绑定，仍需将候选身份放在 context，改变候选后更新 context。
 
+task-context 的每次实际重置还记录 context_epoch。切换 A→B→A 不会重新启用 A 的旧验收、旧 assignment 或旧 flow；历史证据保留用于查阅，重新规划并登记新验收后才可推进。普通阶段转换不会重置已验证的上下文。
+
 ## 环境验收
 
 ```json

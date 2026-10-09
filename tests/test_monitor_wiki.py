@@ -127,3 +127,124 @@ def test_end_to_end_demo(tmp_path):
     result=run_demo(tmp_path/'demo')
     assert result['command']=='complete' and result['analysis']=='complete' and result['loss_fixture']=='pass'
     assert result['stalled_watch']=='attention' and Path(result['report']).is_file()
+
+
+def test_progress_clocks_survive_retention_restart_and_new_attempt(tmp_path):
+    store, path = setup(tmp_path)
+    policy = {**POLICY, 'stall_seconds':300, 'recovery_seconds':900}
+    samples = [{'attempt_id':'a', 'step':0, 'timestamp':i / 10,
+                'recovery_state':'recovering', 'checkpoint_verified':False} for i in range(10001)]
+    path.write_text(''.join(json.dumps(sample) + '\n' for sample in samples))
+    result = poll_log(store, 't', path, policy, now=1000)
+    assert {'training-stalled', 'recovery-timeout'} <= {issue['kind'] for issue in result['issues']}
+    with store.db() as db:
+        cursor = json.loads(db.execute("SELECT value FROM meta WHERE key='watch:t'").fetchone()[0])
+    assert len(cursor['samples']) == 1000
+    assert cursor['progress']['a']['started_at'] == cursor['progress']['a']['last_progress_at'] == 0
+    reopened = Store(store.root)
+    assert poll_log(reopened, 't', path, policy, now=1001)['issues'] == result['issues']
+    assert len([event for event in reopened.events() if event['kind'] == 'incident-opened']) == 2
+    with path.open('a') as stream:
+        stream.write(json.dumps({**samples[-1], 'step':1, 'timestamp':1002, 'checkpoint_verified':True}) + '\n')
+    assert poll_log(reopened, 't', path, policy, now=1002)['status'] == 'healthy-observed'
+    with path.open('a') as stream:
+        stream.write(json.dumps({**samples[-1], 'attempt_id':'b', 'timestamp':1003}) + '\n')
+    assert poll_log(reopened, 't', path, policy, now=1003)['status'] == 'healthy-observed'
+
+
+def test_legacy_watcher_rebuilds_progress_from_events_beyond_cached_samples(tmp_path):
+    store, path = setup(tmp_path)
+    samples = [{'attempt_id':'a', 'step':int(i > 0), 'timestamp':i / 10,
+                'recovery_state':'restored', 'checkpoint_verified':True} for i in range(1501)]
+    path.write_text(''.join(json.dumps(sample) + '\n' for sample in samples))
+    poll_log(store, 't', path, POLICY, now=150)
+    with store.db() as db:
+        cursor = json.loads(db.execute("SELECT value FROM meta WHERE key='watch:t'").fetchone()[0])
+        assert all(sample['step'] == 1 for sample in cursor['samples'])
+        for field in ('progress', 'prefix_length', 'file_id', 'context_epoch'):
+            cursor.pop(field)
+        db.execute("UPDATE meta SET value=? WHERE key='watch:t'", (json.dumps(cursor),))
+    result = poll_log(Store(store.root), 't', path, POLICY, now=150)
+    assert [issue['kind'] for issue in result['issues']] == ['training-stalled']
+    with store.db() as db:
+        rebuilt = json.loads(db.execute("SELECT value FROM meta WHERE key='watch:t'").fetchone()[0])['progress']['a']
+    assert rebuilt['started_at'] == 0 and rebuilt['last_progress_at'] == 0.1
+    assert rebuilt['progress_samples'] == 2
+
+
+def test_step_regression_cannot_restart_stall_clock():
+    samples = [{'attempt_id':'a', 'step':step, 'timestamp':timestamp}
+               for step, timestamp in [(10, 0), (5, 10), (10, 20)]]
+    kinds = {issue['kind'] for issue in observation_issues(samples, POLICY, now=40)}
+    assert {'training-stalled', 'step-regressed'} <= kinds
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_short_log_replacement_replays_new_attempt(tmp_path, legacy):
+    store, path = setup(tmp_path)
+    poll_log(store, 't', path, POLICY, now=100)
+    assert path.stat().st_size < 128
+    if legacy:
+        with store.db() as db:
+            cursor = json.loads(db.execute("SELECT value FROM meta WHERE key='watch:t'").fetchone()[0])
+            cursor['prefix'] = None
+            for field in ('progress', 'prefix_length', 'file_id', 'context_epoch'):
+                cursor.pop(field)
+            db.execute("UPDATE meta SET value=? WHERE key='watch:t'", (json.dumps(cursor),))
+    size = path.stat().st_size
+    path.write_text(json.dumps({'attempt_id':'b', 'step':1, 'timestamp':101}) + '\n')
+    assert path.stat().st_size == size
+    result = poll_log(Store(store.root), 't', path, POLICY, now=101)
+    assert result['last_observation']['attempt_id'] == 'b'
+    assert any(issue['kind'] == 'collector-input-warning' for issue in result['issues'])
+    assert len([event for event in store.events() if event['kind'] == 'observation']) == 2
+
+
+def test_short_log_append_extends_prefix_without_false_rotation(tmp_path):
+    store, path = setup(tmp_path)
+    poll_log(store, 't', path, POLICY, now=100)
+    for step in range(1, 4):
+        with path.open('a') as stream:
+            stream.write(json.dumps({'attempt_id':'a', 'step':step, 'timestamp':100 + step}) + '\n')
+        result = poll_log(Store(store.root), 't', path, POLICY, now=100 + step)
+        assert result['issues'] == [] and result['last_observation']['step'] == step
+    assert path.stat().st_size > 128
+
+
+def test_replaced_file_with_same_prefix_does_not_skip_changed_tail(tmp_path):
+    store, path = setup(tmp_path)
+    first = json.dumps({'attempt_id':'a', 'step':0, 'timestamp':100, 'padding':'x' * 128}) + '\n'
+    path.write_text(first + json.dumps({'attempt_id':'a', 'step':1, 'timestamp':101}) + '\n')
+    poll_log(store, 't', path, POLICY, now=101)
+    replacement = tmp_path / 'replacement.jsonl'
+    replacement.write_text(first + json.dumps({'attempt_id':'b', 'step':2, 'timestamp':102}) + '\n')
+    replacement.replace(path)
+    result = poll_log(store, 't', path, POLICY, now=102)
+    assert result['last_observation']['attempt_id'] == 'b'
+    assert any(issue['kind'] == 'collector-input-warning' for issue in result['issues'])
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_watcher_rejects_context_that_returns_to_previous_hash(tmp_path, legacy):
+    store, path = setup(tmp_path)
+    poll_log(store, 't', path, POLICY, now=100)
+    if legacy:
+        with store.db() as db:
+            cursor = json.loads(db.execute("SELECT value FROM meta WHERE key='watch:t'").fetchone()[0])
+            cursor.pop('context_epoch')
+            db.execute("UPDATE meta SET value=? WHERE key='watch:t'", (json.dumps(cursor),))
+    store.change_context('t', {'s':'new'})
+    store.change_context('t', {'s':'1'})
+    with pytest.raises(FlowError, match='epoch changed or legacy scope is ambiguous'):
+        poll_log(Store(store.root), 't', path, POLICY, now=101)
+    assert len([event for event in store.events() if event['kind'] == 'observation']) == 1
+
+
+def test_new_watcher_records_current_context_epoch(tmp_path):
+    store, path = setup(tmp_path)
+    store.change_context('t', {'s':'new'})
+    store.change_context('t', {'s':'1'})
+    result = poll_log(store, 't', path, POLICY, now=100)
+    assert result['status'] == 'healthy-observed'
+    assert result['context_epoch'] == store.task('t')['context_epoch'] > 0
+    assert poll_log(Store(store.root), 't', path, POLICY, now=101)['status'] == 'healthy-observed'

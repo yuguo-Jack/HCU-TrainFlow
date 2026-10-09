@@ -5,7 +5,7 @@ claims to authenticate reviewer identity, or treats a code review as a GPU test.
 """
 import json
 import time
-from .core import FlowError, GATES, atomic_write, child, safe_id, utc
+from .core import FlowError, GATES, atomic_write, child, context_epoch, safe_id, utc
 
 DEFAULTS = {'max_rounds': 20, 'max_stalled_rounds': 3, 'full_review_every': 4,
             'max_review_failures': 3, 'poll_seconds': 300}
@@ -33,6 +33,11 @@ def retain(store, value):
 def get_flow(db, tid):
     row = db.execute('SELECT * FROM flows WHERE task=?', (tid,)).fetchone()
     return {**dict(row), 'plan': json.loads(row['plan'])} if row else None
+
+
+def needs_context_replan(db, tid):
+    started = db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE task=? AND kind IN ('flow-started','flow-replanned')", (tid,)).fetchone()[0]
+    return context_epoch(db, tid) > started
 
 
 def board_paths(store, tid):
@@ -65,8 +70,11 @@ def start(store, tid, plan, reason=None):
     goal = retain(store, goal_record)
     with store.db() as db:
         db.execute('BEGIN IMMEDIATE')
+        current = db.execute('SELECT context,state FROM tasks WHERE id=?', (tid,)).fetchone()
+        if current['state'] in {'completed', 'cancelled'} or current['context'] != task['context'] or context_epoch(db, tid) != task['context_epoch']:
+            raise FlowError('Task context/state changed while planning')
         old = get_flow(db, tid)
-        if old and old['goal'] != goal and not reason:
+        if old and (old['goal'] != goal or needs_context_replan(db, tid)) and not reason:
             raise FlowError('Plan/context changed; use flow-replan with a concrete reason')
         if old and old['goal'] == goal:
             return {'task': tid, 'goal': goal, 'status': 'unchanged'}
@@ -169,7 +177,7 @@ def close_question(store, tid, qid, guidance, note):
 
 def blockers(db, tid, task, flow):
     reasons = []
-    if flow['context'] != task['context']:
+    if flow['context'] != task['context'] or needs_context_replan(db, tid):
         reasons.append('context-changed: replan and revalidate')
     if db.execute("SELECT 1 FROM flow_guidance WHERE task=? AND status IN ('pending','needs-human')", (tid,)).fetchone():
         reasons.append('human-guidance-needs-response')
@@ -199,9 +207,10 @@ def gate(store, db, task, candidate):
     reasons = completion_blockers(db,task['id'])
     if candidate['target'] == 'completed' and db.execute("SELECT 1 FROM flow_guidance WHERE task=? AND status='queued'", (task['id'],)).fetchone():
         reasons.append('queued-human-guidance-needs-final-disposition')
+    reports = store.current_reports(db, task['id'], task['context'])
     for kind in required_reports(task, candidate['target']):
         sha = candidate['reports'].get(kind)
-        row = db.execute('SELECT * FROM reports WHERE task=? AND kind=? AND context=?', (task['id'], kind, task['context'])).fetchone()
+        row = reports.get(kind)
         if not row or row['artifact'] != sha:
             reasons.append('missing-or-replaced-report:' + kind)
             continue
@@ -484,7 +493,7 @@ def render_board(store, tid):
         rounds = [dict(x) for x in db.execute('SELECT * FROM flow_rounds WHERE task=? ORDER BY number', (tid,))]
         guidance = [dict(x) for x in db.execute("SELECT * FROM flow_guidance WHERE task=? AND status!='template' ORDER BY created", (tid,))]
         questions = [dict(x) for x in db.execute('SELECT * FROM flow_questions WHERE task=?', (tid,))]
-        reports = [dict(x) for x in db.execute('SELECT kind,result,artifact,created FROM reports WHERE task=? AND context=?', (tid, task['context']))]
+        reports = [dict(x) for x in store.current_reports(db, tid, task['context']).values()]
         events = [dict(x) for x in db.execute('SELECT kind,payload,created FROM events WHERE task=? ORDER BY seq DESC LIMIT 12', (tid,))]
     directory, board, human = board_paths(store, tid)
     def link(sha):

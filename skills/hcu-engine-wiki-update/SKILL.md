@@ -17,6 +17,7 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
    PR 描述、review 或 diff 更新即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
 6. 按 knowledge/maintenance.json 同时检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤。HCU 命令可以依托大知识库当前内容或自主看最新工程源码；任务所用 HCU 模型脚本、其引入的环境配置、launcher 或依赖变化时，一并复核 adapt/optimize 的用法和任务配方。公共仓只保留可公开的规则与来源，现场配置留在私有工作区；不能只更新官方 Wiki 文本。
 7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
+   复核后又改正文/工作流或新增同来源专题时，重新检查并留下新回执；即使上游没有新变化也不能沿用过期复核。PR 重采后同样处理由作者页变动引起的待办。
 8. wiki-catalog 刷新来源/文档/PR 导航（wiki-update 已在收尾调用），wiki-index 更新搜索。运行本工程测试和真实问题检索，保存本次缺口及下次入口。公共材料提交与 push 沿用任务授权，私有数据禁止进入公共仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。

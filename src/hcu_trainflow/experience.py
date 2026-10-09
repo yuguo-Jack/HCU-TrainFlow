@@ -1,12 +1,9 @@
 """Private, evidence-bound training experience Wiki, replayable from milestones."""
-import contextlib
 import json
 import math
-from pathlib import Path
-import sqlite3
 from urllib.parse import urlsplit
 
-from .core import FlowError, atomic_write, digest, fingerprint, safe_id, utc, write_json, read_json
+from .core import FlowError, atomic_write, fingerprint, safe_id, utc, write_json, read_json
 from .wiki import terms
 
 
@@ -24,25 +21,15 @@ def label(value):
     return value if isinstance(value,str) else json.dumps(value,ensure_ascii=False,sort_keys=True)
 
 
-def save(store, document, event=None):
-    schema(store)
-    ident=fingerprint(document)
+def _prepare(document):
     if fingerprint(document['context_spec'])!=document['context']:
         raise FlowError('Experience context fingerprint mismatch')
     raw=json.dumps(document,ensure_ascii=False,sort_keys=True,allow_nan=False).encode()
-    sha=store.put(raw) # Always private; public visibility is never inferred from a result.
-    write_json(store.root/'experience/records'/f'{ident}.json',document)
+    sha=fingerprint(document)
     context=document['context_spec']
     model=label(context.get('model','unknown'))
     environment=label(context.get('environment','unknown'))
-    with store.db() as db:
-        db.execute('BEGIN IMMEDIATE')
-        exists=db.execute('SELECT id FROM experiences WHERE id=?',(ident,)).fetchone()
-        if not exists:
-            db.execute('INSERT INTO experiences VALUES(?,?,?,?,?,?,?,?,?)',
-                       (ident,document['task'],document['context'],model,environment,document['kind'],document['outcome'],sha,document['created_at']))
-            db.execute('INSERT INTO experience_fts(id,body) VALUES(?,?)',(ident,' '.join(terms(raw.decode()))))
-        if event:db.execute('INSERT OR IGNORE INTO experience_events VALUES(?,?)',(event,ident))
+    row=(sha,document['task'],document['context'],model,environment,document['kind'],document['outcome'],sha,document['created_at'])
     body='# '+document['summary']+'\n\n'
     body+=f'Private training experience · {document["kind"]} · {document["outcome"]}\n\n'
     body+='## Environment, model and source identity\n\n```json\n'+json.dumps(context,indent=2,ensure_ascii=False)+'\n```\n\n'
@@ -51,14 +38,54 @@ def save(store, document, event=None):
     body+='## Evidence\n\n'+'\n'.join(f'- [{e}](../../objects/{e[:2]}/{e})' for e in document['evidence'])+'\n\n'
     body+='## Complete record\n\n'+f'[Immutable record](../../objects/{sha[:2]}/{sha})\n\n'
     body+='Cross-environment retrieval is a reference, not proof of portability. Revalidate on the actual model, data, precision and topology. Missing loss data is not a pass.\n'
+    return raw, row, body
+
+
+def _register(store, db, document, prepared):
+    raw,row,_=prepared
+    ident=row[0]
+    if not db.execute('SELECT id FROM experiences WHERE id=?',(ident,)).fetchone():
+        db.execute('INSERT INTO experiences VALUES(?,?,?,?,?,?,?,?,?)',row)
+        db.execute('INSERT INTO experience_fts(id,body) VALUES(?,?)',(ident,' '.join(terms(raw.decode()))))
+    write_json(store.root/'experience/records'/f'{ident}.json',document)
+
+
+def _publish(store, prepared):
+    _,row,body=prepared
+    ident=row[0]
     page=store.root/'experience/pages'/f'{ident}.md'
     atomic_write(page,body)
-    with store.db() as db:
-        rows=db.execute('SELECT id,task,model,environment,kind,outcome,created FROM experiences ORDER BY created DESC').fetchall()
+    return {'id':ident,'artifact':ident,'page':str(page),'visibility':'private','status':'recorded'}
+
+
+def _write_index(store, db):
+    rows=db.execute('SELECT id,task,model,environment,kind,outcome,created FROM experiences ORDER BY created DESC,id').fetchall()
     index='# Private training experience Wiki\n\nReports, interpreted milestones and Cookbook delivery records are separate evidence types.\n\n'
     index+='\n'.join(f'- [{r["task"]} / {r["kind"]} / {r["outcome"]}](pages/{r["id"]}.md) · model `{r["model"]}` · environment `{r["environment"]}`' for r in rows)+'\n'
     atomic_write(store.root/'experience/INDEX.md',index)
-    return {'id':ident,'artifact':sha,'page':str(page),'visibility':'private','status':'recorded'}
+
+
+def save(store, document, event=None):
+    schema(store)
+    if event:document={**document,'source_event':event}
+    prepared=_prepare(document)
+    # Artifact registration owns a separate write connection, so retain before taking the lock.
+    store.put(prepared[0])
+    with store.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        prior=db.execute('SELECT experience FROM experience_events WHERE event=?',(event,)).fetchone() if event else None
+        if prior:
+            document=json.loads(store.artifact(prior[0]))
+            prepared=_prepare(document)
+        _register(store,db,document,prepared)
+        if event:db.execute('INSERT OR IGNORE INTO experience_events VALUES(?,?)',(event,prepared[1][0]))
+    # Commit the canonical event first, so a failed page write can safely be retried.
+    with store.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        result=_publish(store,prepared)
+        # Serialize the snapshot and publication with all saves and rebuilds.
+        _write_index(store,db)
+    return result
 
 
 def sync(store, tid=None):
@@ -92,21 +119,42 @@ def sync(store, tid=None):
             if value.get('kind')=='stage-quality':
                 document['loss']={'status':report['status'],'report':value['artifact'],'scope':'stage-quality'}
         recorded.append(save(store,document,event['event_id']))
+    # A previous save may have published its page before the shared index failed.
+    with store.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        _write_index(store,db)
     return {'status':'complete','records':len(recorded),'skipped':skipped,'visibility':'private'}
 
 
 def rebuild(store):
     schema(store)
-    documents=[]
-    for path in (store.root/'experience/records').glob('*.json'):
-        record=read_json(path)
-        if fingerprint(record)!=path.stem:raise FlowError('Experience record changed: '+path.name)
-        for sha in record['evidence']:store.artifact(sha)
-        documents.append(record)
-    # Validate everything before replacing the rebuildable index.
     with store.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        documents={}
+        for path in sorted((store.root/'experience/records').glob('*.json')):
+            record=read_json(path)
+            if fingerprint(record)!=path.stem:raise FlowError('Experience record changed: '+path.name)
+            for sha in record['evidence']:store.artifact(sha)
+            prepared=_prepare(record)
+            store.artifact(path.stem)
+            documents[path.stem]=(record,prepared)
+        # Preserve older records' mappings, and recover new mappings from immutable records.
+        events={row['event']:row['experience'] for row in db.execute('SELECT * FROM experience_events')
+                if row['experience'] in documents}
+        for ident,(record,_) in documents.items():
+            event=record.get('source_event') or (record.get('milestone') if record.get('automatic') else None)
+            if event:
+                if event in events and events[event]!=ident:
+                    raise FlowError('Conflicting experience records for event: '+event)
+                events[event]=ident
+        # Validate all records and artifacts before replacing any rebuildable index.
         db.execute('DELETE FROM experience_fts');db.execute('DELETE FROM experiences')
-    for record in documents:save(store,record)
+        db.execute('DELETE FROM experience_events')
+        for record,prepared in documents.values():
+            _register(store,db,record,prepared)
+            _publish(store,prepared)
+        db.executemany('INSERT INTO experience_events VALUES(?,?)',events.items())
+        _write_index(store,db)
     return {'status':'complete','records':len(documents),'visibility':'private'}
 
 
@@ -163,12 +211,7 @@ def record(store, tid, value):
             raise FlowError('Public cookbook needs an explicit redaction review; record does not publish data')
     document={**value,'schema_version':1,'task':tid,'context_spec':task['spec']['context'],
               'loss':loss,'metrics':metrics,'created_at':utc(),'automatic':False}
-    schema(store)
     event='manual:'+fingerprint([tid,value])
-    with store.db() as db:prior=db.execute('SELECT experience FROM experience_events WHERE event=?',(event,)).fetchone()
-    if prior:
-        old=get(store,prior[0])
-        return save(store,old['record'],event)
     return save(store,document,event)
 
 

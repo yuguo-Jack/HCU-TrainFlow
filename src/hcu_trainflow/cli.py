@@ -87,7 +87,8 @@ def parser():
     q=cmd('experience-search','query'); q.add_argument('--limit',type=int,default=10)
     q.add_argument('--model'); q.add_argument('--environment'); q.add_argument('--kind'); q.add_argument('--context')
     cmd("wiki-index", "project")
-    cmd('wiki-read','id')
+    q=cmd('wiki-read','id'); select=q.add_mutually_exclusive_group()
+    select.add_argument('--generation'); select.add_argument('--project')
     cmd('wiki-catalog','project')
     q = cmd("wiki-search", "query"); q.add_argument("--limit", type=int, default=10); q.add_argument("--engine"); q.add_argument("--stage")
     q.add_argument('--kind',choices=['authored','source-pr','source-map','source-document'])
@@ -213,7 +214,9 @@ def execute(a):
     if c == 'experience-compare': return experience.compare(store,a.left,a.right)
     if c == 'experience-search': return experience.search(store,a.query,a.limit,a.model,a.environment,a.kind,a.context)
     if c == "wiki-index": return wiki.index_wiki(store, a.project)
-    if c == 'wiki-read': return wiki.read_page(store,a.id)
+    if c == 'wiki-read':
+        generation=wiki.index_wiki(store,a.project)['generation'] if a.project else a.generation
+        return wiki.read_page(store,a.id,generation)
     if c == 'wiki-catalog': return official.catalog(a.project)
     if c == 'wiki-search-pr':
         return official.annotate_prs(a.project,official.search_prs(store,a.query,official.engine_repos(a.project,a.engine,a.source,a.repo),
@@ -226,10 +229,12 @@ def execute(a):
     if c == 'wiki-update': return official.update_source(store,a.project,a.source,max_prs=a.max_prs,max_documents=a.max_documents,since=a.since)
     if c == 'wiki-apply': return official.apply_refresh(store,a.project,a.stage)
     if c == "wiki-search":
-        if not (store.root/'wiki/active.json').exists(): wiki.index_wiki(store,a.project)
-        result=wiki.search_wiki(store,a.query,a.limit,a.engine,a.stage,a.kind)
+        index=wiki.index_wiki(store,a.project)
+        result=wiki.search_wiki(store,a.query,a.limit,a.engine,a.stage,a.kind,index=index)
         if a.online_pr == 'always' or a.online_pr=='auto' and not result['results']:
             result['online_pr']=official.annotate_prs(a.project,official.search_prs(store,a.pr_query or a.query,official.engine_repos(a.project,a.engine,a.source,a.repo),limit=a.limit))
+            if result['online_pr'].get('status') == 'partial':
+                result['status']='partial'
         result['followup']='If local candidates are insufficient, wiki-search-pr -> wiki-pr -> wiki-code at exact head/base; no HCU-Knowledge update.'
         return result
     if c == "wiki-refresh": return wiki.refresh_source(store, a.project, a.source, os.environ.get("GITHUB_TOKEN"))

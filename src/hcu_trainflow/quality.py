@@ -24,6 +24,8 @@ def validate_measurement(value, context, path_required=True):
         missing.append("reported-test-failures")
     if value.get("skipped_required", 0):
         missing.append("required-tests-skipped")
+    if value.get("required_missing"):
+        missing.append("required-coverage-missing")
     if path_required and value.get("candidate_path_exercised") is not True:
         missing.append("candidate-dispatch-not-confirmed")
     if not value.get("evidence"):
@@ -35,7 +37,7 @@ def compare_loss(contract, baseline, candidate):
     required = {"context", "sample_fingerprint", "aggregation", "min_steps", "atol", "rtol", "tolerance_basis"}
     if required - contract.keys() or any(not contract[x] for x in ("context", "sample_fingerprint", "aggregation", "tolerance_basis")):
         raise FlowError("QualityContract must freeze samples, aggregation, window and justified tolerances")
-    if not isinstance(contract["min_steps"], int) or contract["min_steps"] < 1:
+    if not isinstance(contract["min_steps"], int) or isinstance(contract["min_steps"], bool) or contract["min_steps"] < 1:
         raise FlowError("min_steps must be positive")
     atol, rtol = number(contract["atol"], "atol"), number(contract["rtol"], "rtol")
     if atol < 0 or rtol < 0:

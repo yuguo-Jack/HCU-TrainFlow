@@ -269,3 +269,127 @@ def test_failed_inventory_skips_document_refresh_and_preserves_run(tmp_path,monk
     assert {e['stage'] for e in result['errors']}=={'inventory','documents'}
     assert list((store.root/'wiki/update-runs').glob('*.json'))
     assert (root/'knowledge/catalog/README.md').is_file()
+
+
+def test_local_edits_cannot_bypass_source_review_via_unchanged_refresh(tmp_path):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    page=root/'knowledge/topic.md'
+    page.write_text(official.markdown({'id':'topic','sources':[{'source':'engine','path':'a.py'}]},'# First conclusion'))
+    source=official.source_for(root,'engine');files={'a.py':{'sha256':'b'*64}}
+    stage=wiki.stage_source_refresh(store,root,source,'a'*40,files,[],'main')
+    def decisions():
+        return {'knowledge/topic.md':{'decision':'updated','note':'Read source and reconciled conclusion',
+            'page_sha256':digest(page.read_bytes()),'source_commit':'a'*40}}
+    wiki.review_refresh(store,stage['stage_id'],decisions(),root)
+    page.write_text(page.read_text()+'\nChanged conclusion')
+    with pytest.raises(FlowError,match='stale'):official.apply_refresh(store,root,stage['stage_id'])
+    repeat=wiki.stage_source_refresh(store,root,source,'a'*40,files,[],'main')
+    assert not repeat['changed_paths'] and repeat['affected_pages']
+    with pytest.raises(FlowError,match='Every'):wiki.review_refresh(store,repeat['stage_id'],{},root)
+    wiki.review_refresh(store,repeat['stage_id'],decisions(),root)
+    unchanged=wiki.stage_source_refresh(store,root,source,'a'*40,files,[],'main')
+    assert not unchanged['affected_pages']
+    wiki.review_refresh(store,unchanged['stage_id'],{},root)
+    # A no-op review must retain page bindings for later edits, across restarts.
+    page.write_text(page.read_text()+'\nAnother change')
+    assert wiki.stage_source_refresh(Store(store.root),root,source,'a'*40,files,[],'main')['affected_pages']
+
+
+def test_new_topic_after_staging_requires_review(tmp_path):
+    root=project(tmp_path);store=Store(tmp_path/'s');source=official.source_for(root,'engine')
+    stage=wiki.stage_source_refresh(store,root,source,'a'*40,{'a.py':{'sha256':'b'*64}},[],'main')
+    (root/'knowledge/new.md').write_text(official.markdown({'id':'new','sources':[{'source':'engine','path':'a.py'}]},'# New claim'))
+    with pytest.raises(FlowError,match='after staging'):wiki.review_refresh(store,stage['stage_id'],{},root)
+
+
+def test_unchanged_pr_reopens_review_for_changed_related_topic(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    page=root/'knowledge/topic.md';page.write_text(official.markdown({'id':'topic','sources':[{'source':'engine','path':'a.py'}]},'# Gradient'))
+    monkeypatch.setattr(wiki,'_get_json',pr_api)
+    pr=official.read_pr(store,'org/engine',1);saved=official.retain_pr(store,root,pr,'engine')
+    decisions={'artifact_sha256':saved['artifact'],'note':'Inspected discussion','pages':{'knowledge/topic.md':{
+        'decision':'still-applicable','note':'Inspected final source','page_sha256':digest(page.read_bytes())}}}
+    official.review_pr(store,root,saved['id'],decisions)
+    page.write_text(page.read_text()+'\nAltered interpretation')
+    official.retain_pr(store,root,pr,'engine')
+    assert read_json(store.root/'wiki/pr-review'/f'{saved["id"]}.json')['status']=='pending-content-review'
+
+
+def test_cli_search_refreshes_local_index_and_binds_requested_project(tmp_path):
+    from hcu_trainflow.cli import execute, parser
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    page=root/'knowledge/topic.md';page.write_text(official.markdown({'id':'first'},'# Original'))
+    wiki.index_wiki(store,root)
+    second=tmp_path/'other';(second/'knowledge').mkdir(parents=True)
+    (second/'knowledge/topic.md').write_text(official.markdown({'id':'second'},'# Fresh claim'))
+    def search(project):
+        return execute(parser().parse_args(['--workspace',str(store.root),'wiki-search','fresh','--project',str(project),'--online-pr','off']))
+    assert [r['id'] for r in search(second)['results']]==['second']
+    page.write_text(official.markdown({'id':'first'},'# Fresh original project'))
+    assert [r['id'] for r in search(root)['results']]==['first']
+
+
+def test_concurrent_local_index_builds_are_independent(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    root=project(tmp_path);store=Store(tmp_path/'s');barrier=Barrier(2)
+    (root/'knowledge/topic.md').write_text(official.markdown({'id':'topic'},'# Parallel search'))
+    def build(_):
+        barrier.wait()
+        index=wiki.index_wiki(store,root)
+        return wiki.search_wiki(store,'parallel',index=index)['results'][0]['id']
+    with ThreadPoolExecutor(max_workers=2) as pool:assert list(pool.map(build,range(2)))==['topic','topic']
+    assert not list((store.root/'wiki').glob('*.building'))
+
+
+def test_cli_online_search_failure_is_partial_not_empty_success(tmp_path,monkeypatch,capsys):
+    from hcu_trainflow.cli import main
+    root=project(tmp_path)
+    monkeypatch.setattr(official,'search_prs',lambda *a,**kw:{'status':'partial','results':[],
+        'coverage':[{'repository':'org/engine','complete':False,'error':'rate limit'}]})
+    code=main(['--workspace',str(tmp_path/'s'),'wiki-search','missing answer','--project',str(root),'--engine','engine'])
+    result=json.loads(capsys.readouterr().out)
+    assert code==2 and result['status']=='partial' and result['online_pr']['coverage'][0]['error']=='rate limit'
+
+
+def test_multi_repository_search_exposes_combined_truncation(tmp_path,monkeypatch):
+    def results(*a,**kw):
+        return {'total_count':1,'items':[{'number':1,'title':'overlap','html_url':'https://github.com/org/repo/pull/1',
+            'state':'open','updated_at':'2026-10-09T00:00:00Z'}]},''
+    monkeypatch.setattr(wiki,'_get_json',results)
+    result=official.search_prs(Store(tmp_path/'s'),'overlap',['org/one','org/two'],limit=1)
+    assert all(c['complete'] for c in result['coverage'])
+    assert result['display_truncated'] and result['status']=='partial' and len(result['results'])==1
+
+
+def test_removing_source_binding_requires_review_of_surviving_prose(tmp_path):
+    root=project(tmp_path);store=Store(tmp_path/'s');source=official.source_for(root,'engine')
+    page=root/'knowledge/topic.md'
+    page.write_text(official.markdown({'id':'topic','sources':[{'source':'engine','path':'a.py'}]},'# Claim'))
+    files={'a.py':{'sha256':'b'*64}}
+    def refresh():return wiki.stage_source_refresh(store,root,source,'a'*40,files,[],'main')
+    def decisions():return {'knowledge/topic.md':{'decision':'updated','note':'Verified the surviving claim and its attribution',
+        'page_sha256':digest(page.read_bytes()),'source_commit':'a'*40}}
+    stage=refresh();wiki.review_refresh(store,stage['stage_id'],decisions(),root)
+    noop=refresh();assert not noop['affected_pages']
+    page.write_text(official.markdown({'id':'topic'},'# Changed claim without citation'))
+    with pytest.raises(FlowError,match='after staging'):wiki.review_refresh(store,noop['stage_id'],{},root)
+    stage=refresh();assert stage['affected_pages']
+    with pytest.raises(FlowError,match='Every'):wiki.review_refresh(store,stage['stage_id'],{},root)
+    wiki.review_refresh(store,stage['stage_id'],decisions(),root)
+    assert official.apply_refresh(store,root,stage['stage_id'])['status']=='content-applied'
+    assert not refresh()['affected_pages']
+
+
+def test_read_binds_search_generation_even_after_other_project_index(tmp_path):
+    from hcu_trainflow.cli import execute, parser
+    store=Store(tmp_path/'s')
+    for name in ['first','second']:
+        root=tmp_path/name;(root/'knowledge').mkdir(parents=True)
+        (root/'knowledge/topic.md').write_text(official.markdown({'id':'same'},'# '+name))
+    first=wiki.index_wiki(store,tmp_path/'first')
+    wiki.index_wiki(store,tmp_path/'second')
+    args=['--workspace',str(store.root),'wiki-read','same','--generation',first['generation']]
+    assert execute(parser().parse_args(args))['body']=='# first'
+    args=['--workspace',str(store.root),'wiki-read','same','--project',str(tmp_path/'second')]
+    assert execute(parser().parse_args(args))['body']=='# second'

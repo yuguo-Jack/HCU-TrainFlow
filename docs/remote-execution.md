@@ -38,3 +38,5 @@ Conda/裸机可直接给绝对解释器；需要 activation 时仅用已核实�
 ## 中断与重试
 
 operation ID 不重复执行已完成请求。超时、SSH 断线或 started 状态残留需核对远端进程、job 和输出，上传证据后 `operation-reconcile`。不能只换一个 operation ID 就重发训练。Python fencing 防止本工作区的过期拥有者发新动作；跨机器的真实运行隔离还依赖站点调度器。
+
+核销未知操作后仍保留其超时预算占用，记为 `budget_seconds`；不会因为缺少本地主控的耗时结果就按零计费。这是保守预算核算，不是伪造的远程实测耗时。任务总预算和 assignment 预算都遵循此规则。资源被领取中的 assignment 整体预约时，无 assignment 身份的主控命令也不能绕过预约。

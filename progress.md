@@ -87,3 +87,13 @@ Implemented scoped PR search, pinned code reading, public PR source pages, compl
 - Final extensions: automatic source catalog, explicit historical/pending document state, PR discussion-to-author-page review receipts, and inventory failure dependency handling. Full regression 145 tests passed; 485 pages / 24 sources validate. Installed all six Skills, confirmed source and installed package version 0.4.0.dev0. Public-source corpus ~30 MiB; no task data, private workspace or credentials staged.
 
 - Commit 844f791 contains the reviewed Wiki/experience work. A final whitespace pass normalized generated directory-page endings without changing content hashes. Authenticated GitHub account verified as yuguo-Jack; origin was up to date before commit. Publication uses main only, with no TrainFlow tag/release.
+
+
+## 2026-10-09: overall review before real HCU integration
+
+- Reproduced and fixed monitoring retention/rotation, execution reconciliation budgets, global assignment reservations, context reset/late dependency evidence, false PASS coverage, stale Wiki review/index scope and concurrent experience persistence. Cross-review additionally caught source-citation removal and full-page read generation binding.
+- Final system Python regression: **206 passed in 22.49 s**; validator **485 pages / 24 sources / no errors**. Both synthetic workflow demos run through regression tests.
+- Authored documentation/Skill relative links and Python syntax checks passed; tracked private/cache paths absent; git diff whitespace check passed.
+- Fixed TraceLens and kernel-Skill checkouts are clean and ready. System installed version remains **0.4.0.dev0**; all six installed workflow/Wiki Skills byte-match their repository copies.
+- No live training, remote recovery, external notification or HCU-Knowledge update performed. Public repository has no site data. Real environment onboarding can now validate command adapters, HCU traces/numerics, distributed recovery and Agent wake-up.
+- Commit/push development fixes using yuguo-Jack; retain no new tag/release. Remote publication/CI status is checked after committing.

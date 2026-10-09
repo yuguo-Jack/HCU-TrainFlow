@@ -17,6 +17,7 @@ def finish_assignment(store, aid, owner, report_id, token):
 
 
 def reconcile_operation(store, oid, status, evidence, note):
+    from .execution import operation_budget_seconds
     if status not in {"complete", "failed"} or not evidence or not note:
         raise FlowError("Reconciliation needs terminal outcome, retained evidence and explanation")
     for sha in evidence:
@@ -27,6 +28,8 @@ def reconcile_operation(store, oid, status, evidence, note):
         if not row or row["status"] not in {"started", "unknown"}:
             raise FlowError("Only unresolved operations can be reconciled")
         value = json.loads(row["result"] or "{}")
+        value["budget_seconds"] = operation_budget_seconds(db, oid, value, reserve=True)
+        value["budget_basis"] = "Conservative reservation retained; exact elapsed execution time remains unassessed"
         value.update(status=status, reconciliation={"evidence": evidence, "note": note})
         db.execute("UPDATE operations SET status=?,result=? WHERE id=?", (status, json.dumps(value), oid))
         store.event(db, row["task"], "operation-reconciled", {"operation": oid, **value})

@@ -1,6 +1,7 @@
 """Durable normalized-log watcher, incidents and reconnectable agent inbox."""
 import json
 import math
+import os
 from pathlib import Path
 import time
 
@@ -24,7 +25,27 @@ def check_policy(policy):
         raise FlowError("performance_window must be an integer >=2")
 
 
-def observation_issues(samples, policy, now=None):
+def _record_progress(progress, sample):
+    """Keep attempt clocks and monotonic progress independent of sample retention."""
+    attempt = progress.get(sample["attempt_id"])
+    if attempt is None:
+        progress[sample["attempt_id"]] = {
+            "started_at": sample["timestamp"], "last_progress_at": sample["timestamp"],
+            "max_step": sample["step"], "last_step": sample["step"],
+            "progress_samples": 1, "regressed": False,
+        }
+        return
+    attempt["started_at"] = min(attempt["started_at"], sample["timestamp"])
+    if sample["step"] < attempt["last_step"]:
+        attempt["regressed"] = True
+    if sample["step"] > attempt["max_step"]:
+        attempt["last_progress_at"] = max(attempt["last_progress_at"], sample["timestamp"])
+        attempt["max_step"] = sample["step"]
+        attempt["progress_samples"] += 1
+    attempt["last_step"] = sample["step"]
+
+
+def observation_issues(samples, policy, now=None, *, progress=None):
     check_policy(policy)
     now = time.time() if now is None else now
     if not samples:
@@ -39,20 +60,22 @@ def observation_issues(samples, policy, now=None):
     if latest.get("job_alive") is False and not latest.get("completed", False):
         issues.append({"kind": "job-exited", "severity": "critical", "detail": "Check scheduler and recovery owner"})
     current = [x for x in samples if x["attempt_id"] == latest["attempt_id"]]
+    if progress is None:
+        progress = {}
+        for sample in current:
+            _record_progress(progress, sample)
+    attempt = progress[latest["attempt_id"]]
     advancing = [current[0]]
-    regressions = []
-    for previous, sample in zip(current, current[1:]):
-        if sample["step"] > previous["step"]:
+    for sample in current[1:]:
+        if sample["step"] > advancing[-1]["step"]:
             advancing.append(sample)
-        elif sample["step"] < previous["step"]:
-            regressions.append(sample["step"])
-    if regressions:
+    if attempt["regressed"]:
         issues.append({"kind": "step-regressed", "severity": "critical", "detail": "Step went backwards without a new attempt"})
-    if now - advancing[-1]["timestamp"] > policy["stall_seconds"] and not latest.get("completed", False):
+    if now - attempt["last_progress_at"] > policy["stall_seconds"] and not latest.get("completed", False):
         issues.append({"kind": "training-stalled", "severity": "critical", "detail": "Liveness alone does not prove training progress"})
     if latest.get("recovery_state") in {"restarting", "recovering", "restored"}:
-        recovered = len(advancing) >= policy["min_progress_samples"] and latest.get("checkpoint_verified") is True
-        if not recovered and now - current[0]["timestamp"] > policy["recovery_seconds"]:
+        recovered = attempt["progress_samples"] >= policy["min_progress_samples"] and latest.get("checkpoint_verified") is True
+        if not recovered and now - attempt["started_at"] > policy["recovery_seconds"]:
             issues.append({"kind": "recovery-timeout", "severity": "critical", "detail": "Restart has not produced verified checkpoint and advancing steps"})
     for name in ("loss", "grad_norm"):
         value = latest.get(name)
@@ -89,23 +112,50 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
     path = Path(logfile).resolve()
     key = "watch:" + tid
     row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    previous = json.loads(row[0]) if row else {"offset": 0, "samples": [], "active_incidents": {}, "path": str(path)}
+    previous = json.loads(row[0]) if row else {"offset": 0, "samples": [], "active_incidents": {}, "path": str(path),
+                                             "context_epoch": task['context_epoch']}
     if previous.get("context", task["context"]) != task["context"]:
         raise FlowError("Watcher context changed; establish a new task/watch scope")
+    if previous.get('context_epoch', 0) != task['context_epoch']:
+        raise FlowError("Watcher context epoch changed or legacy scope is ambiguous; establish a new task/watch scope")
     if previous["path"] != str(path):
         raise FlowError("Watcher log path changed; use an explicit new watcher workspace")
+    progress = previous.get("progress")
+    if progress is None:
+        # Older cursors retained only 1000 samples. Recover their clocks from the
+        # transactionally retained observations rather than resetting on upgrade.
+        progress = {}
+        for event in db.execute("SELECT payload FROM events WHERE task=? AND kind='observation' "
+                                "AND json_extract(payload,'$.context')=? AND seq>? ORDER BY seq",
+                                (tid, task["context"], task['context_epoch'])):
+            _record_progress(progress, json.loads(event["payload"]))
+        if not progress:
+            for sample in previous["samples"]:
+                _record_progress(progress, sample)
     errors, offset = [], previous["offset"]
     import io
-    size = path.stat().st_size if path.exists() else 0
-    if not path.exists():
+    available = path.exists()
+    if not available:
         errors.append("log-unavailable")
-    with (path.open("rb") if path.exists() else io.BytesIO()) as stream:
+    with (path.open("rb") if available else io.BytesIO()) as stream:
+        stat = os.fstat(stream.fileno()) if available else None
+        size = stat.st_size if stat else 0
+        file_id = [stat.st_dev, stat.st_ino] if stat and stat.st_ino else None
         prefix = stream.read(min(size, 128))
-        prefix_hash = fingerprint(list(prefix)) if size >= 128 else None
-        rotated = size < offset or (previous.get("prefix") and prefix_hash and previous["prefix"] != prefix_hash)
+        prefix_length = len(prefix)
+        prefix_hash = fingerprint(list(prefix))
+        old_length = previous.get("prefix_length", 128 if previous.get("prefix") else 0)
+        rotated = (size < offset
+                   or (previous.get("file_id") and file_id and previous["file_id"] != file_id)
+                   or (previous.get("prefix") and previous["prefix"] != fingerprint(list(prefix[:old_length]))))
         if rotated:
             offset = 0
             errors.append("log-rotated-or-truncated; prior observations retained")
+        elif offset and "prefix_length" not in previous and not previous.get("prefix"):
+            # Legacy short-file cursors had no prefix proof. Re-read once;
+            # observation IDs prevent replay from counting as fresh progress.
+            offset = 0
+            errors.append("watch-cursor-upgraded; replaying unverified short-file prefix")
         stream.seek(offset)
         for raw in stream:
             if not raw.endswith(b"\n"):
@@ -141,10 +191,11 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
                     if previous["samples"] and timestamp < previous["samples"][-1]["timestamp"]:
                         errors.append("observation-time-regressed")
                     previous["samples"].append(sample)
+                    _record_progress(progress, sample)
             except (ValueError, TypeError, KeyError) as exc:
                 errors.append("invalid-log-record:" + str(exc))
     samples = previous["samples"][-1000:]
-    issues = observation_issues(samples, policy, now)
+    issues = observation_issues(samples, policy, now, progress=progress)
     if errors:
         issues.append({"kind": "collector-input-warning", "severity": "warning", "detail": errors})
     active = previous["active_incidents"]
@@ -163,8 +214,12 @@ def _poll_transaction(store, db, tid, logfile, policy, now):
     heartbeat = {"schema_version": 1, "task_id": tid, "checked_at": time.time() if now is None else now,
                  "status": "attention" if issues else "healthy-observed", "issues": issues,
                  "last_observation": samples[-1] if samples else None, "context": task["context"],
+                 "context_epoch": task['context_epoch'],
                  "recovery_action": "none; external owner retains control"}
-    db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, json.dumps({"offset": offset, "prefix": prefix_hash, "samples": samples, "active_incidents": next_active, "path": str(path), "context": task["context"]}, allow_nan=False)))
+    db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, json.dumps({"offset": offset, "prefix": prefix_hash,
+               "prefix_length": prefix_length, "file_id": file_id, "progress": progress, "samples": samples,
+               "active_incidents": next_active, "path": str(path), "context": task["context"],
+               "context_epoch": task['context_epoch']}, allow_nan=False)))
     return heartbeat
 
 

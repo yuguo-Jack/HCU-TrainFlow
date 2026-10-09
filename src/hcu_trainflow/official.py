@@ -75,8 +75,11 @@ def search_prs(store, query, repos, token=None, limit=10, state='all', branch=No
                     'next':['wiki-pr',repo,str(row['number'])]})
         except (FlowError, OSError, ValueError) as exc:
             report['error'] = str(exc)[:240]
+    result['display_truncated'] = len(result['results']) > limit
     result['results'] = sorted(result['results'],key=lambda r:r['rank'])[:limit]
-    result['status'] = 'ok' if all(c['complete'] for c in result['coverage']) else 'partial'
+    result['status'] = 'ok' if all(c['complete'] for c in result['coverage']) and not result['display_truncated'] else 'partial'
+    if result['display_truncated']:
+        result['instruction']='Combined result limit reached; query individual repositories to inspect omitted candidates.'
     result['artifact'] = store.put(json.dumps(result,ensure_ascii=False).encode())
     return result
 
@@ -214,16 +217,20 @@ def retain_pr(store, project, result, engine, token=None):
           'repository':repo,'pr_number':number,'updated_at':d['updated_at'],'artifact_sha256':raw_sha,
           'artifact_path':raw.relative_to(project).as_posix(),'sources':[]}
     generated_page(path,meta,body)
-    if old_meta.get('artifact_sha256')!=raw_sha:
-        source_ids={s['id'] for s in read_json(Path(project)/'knowledge/sources.json') if s.get('repository','').lower()==repo.lower()}
-        affected=[]
-        for page in (Path(project)/'knowledge').rglob('*.md'):
-            pm,_=wiki.parse_page(page)
-            if pm.get('kind') in {'source-pr','source-map','source-document'}:continue
-            if pid in pm.get('pr_sources',[]) or any(r['source'] in source_ids for r in pm.get('sources',[])):
-                affected.append(page.relative_to(project).as_posix())
-        write_json(store.root/'wiki/pr-review'/f'{pid}.json',{'id':pid,'artifact_sha256':raw_sha,'affected_pages':affected,
-                   'status':'pending-content-review','reason':'PR description, review, diff or metadata changed'})
+    source_ids={s['id'] for s in read_json(Path(project)/'knowledge/sources.json') if s.get('repository','').lower()==repo.lower()}
+    affected={}
+    for page in (Path(project)/'knowledge').rglob('*.md'):
+        pm,_=wiki.parse_page(page)
+        if pm.get('kind') in {'source-pr','source-map','source-document'}:continue
+        if pid in pm.get('pr_sources',[]) or any(r['source'] in source_ids for r in pm.get('sources',[])):
+            affected[page.relative_to(project).as_posix()]=digest(page.read_bytes())
+    pointer=store.root/'wiki/pr-review'/f'{pid}.json'
+    prior=read_json(pointer) if pointer.exists() else {}
+    reviewed={p:d['page_sha256'] for p,d in prior.get('decisions',{}).get('pages',{}).items()}
+    invalidated=prior.get('status')=='content-reviewed' and reviewed!=affected
+    if old_meta.get('artifact_sha256')!=raw_sha or not prior or invalidated or set(prior.get('affected_pages',[]))!=set(affected):
+        write_json(pointer,{'id':pid,'artifact_sha256':raw_sha,'affected_pages':sorted(affected),
+                   'status':'pending-content-review','reason':'PR evidence or related authored pages changed'})
     return {'id':pid,'page':path.relative_to(project).as_posix(),'artifact':raw_sha,'updated_at':d['updated_at']}
 
 
@@ -370,6 +377,15 @@ def apply_refresh(store, project, stage_id):
     safe_id(stage_id)
     stage=read_json(store.root/'wiki/staging'/f'{stage_id}.json')
     receipt=read_json(store.root/'wiki/reviews'/f'{stage_id}.json')
+    reviewed_pages = receipt.get('page_hashes', {p: d['page_sha256'] for p, d in receipt['decisions'].items()})
+    if wiki.source_page_hashes(project, stage['source']) != reviewed_pages:
+        raise FlowError('Review stale; related pages changed or were added before applying source lock')
+    for path, sha in receipt.get('content_hashes', reviewed_pages).items():
+        if not child(project,path).is_file() or digest(child(project,path).read_bytes()) != sha:
+            raise FlowError('Review stale; reviewed content changed before applying source lock')
+    for path, sha in receipt.get('workflow_hashes', {}).items():
+        if not child(project,path).is_file() or digest(child(project,path).read_bytes()) != sha:
+            raise FlowError('Review stale; workflow changed before applying source lock')
     for path,decision in {**receipt['decisions'],**receipt['workflow_decisions']}.items():
         if digest(child(project,path).read_bytes())!=decision['page_sha256']:
             raise FlowError('Review stale; content changed before applying source lock')

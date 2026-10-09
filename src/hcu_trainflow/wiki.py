@@ -13,6 +13,7 @@ import sqlite3
 import functools
 import os
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +30,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def parse_page(path):
     text = Path(path).read_text(encoding="utf-8-sig")
+    return parse_text(text)
+
+
+def parse_text(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
     if text.startswith("---\n"):
         _, front, body = text.split("---", 2)
         meta = yaml.safe_load(front) or {}
@@ -53,40 +59,49 @@ def index_wiki(store, project):
         raise FlowError("Project knowledge directory not found")
     records = []
     for path in sorted(root.rglob("*.md")):
-        meta, body = parse_page(path)
+        raw = path.read_bytes()
+        meta, body = parse_text(raw.decode('utf-8-sig'))
         if meta.get("visibility", "public") != "public":
             continue
-        records.append((path, meta, body))
-    identities = [m.get("id", p.relative_to(root).as_posix()) for p, m, _ in records]
+        records.append((path, meta, body, digest(raw)))
+    identities = [m.get("id", p.relative_to(root).as_posix()) for p, m, _, _ in records]
     if len(identities) != len(set(identities)):
         raise FlowError("Duplicate Wiki page ID")
-    generation = fingerprint({"root": str(root), "pages": {p.relative_to(root).as_posix(): digest(p.read_bytes()) for p, _, _ in records}})
+    generation = fingerprint({"root": str(root), "pages": {p.relative_to(root).as_posix(): sha for p, _, _, sha in records}})
     destination = store.root / "wiki" / (generation + ".sqlite3")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.exists():
-        temp = destination.with_suffix(".building")
-        if temp.exists():
-            raise FlowError("Interrupted Wiki build exists; inspect it before retry")
-        with contextlib.closing(sqlite3.connect(temp)) as db, db:
-            db.execute("CREATE TABLE pages(id TEXT PRIMARY KEY,title TEXT,path TEXT,body TEXT,metadata TEXT,sha256 TEXT)")
-            db.execute("CREATE VIRTUAL TABLE fts USING fts5(title,body)")
-            for path, meta, body in records:
-                pid = meta.get("id", path.relative_to(root).as_posix())
-                title = meta.get("title", next((x[2:] for x in body.splitlines() if x.startswith("# ")), path.stem))
-                cursor = db.execute("INSERT INTO pages VALUES(?,?,?,?,?,?)", (pid, title, str(path), body, json.dumps(meta, ensure_ascii=False), digest(path.read_bytes())))
-                db.execute("INSERT INTO fts(rowid,title,body) VALUES(?,?,?)", (cursor.lastrowid, " ".join(terms(title)), " ".join(terms(body))))
-        temp.rename(destination)
-    write_json(store.root / "wiki/active.json", {"generation": generation, "path": str(destination), "root": str(root), "pages": len(records), "created_at": utc()})
-    return {"generation": generation, "pages": len(records)}
+        fd, name = tempfile.mkstemp(prefix=generation+'-', suffix='.building', dir=destination.parent)
+        os.close(fd)
+        temp = Path(name)
+        try:
+            with contextlib.closing(sqlite3.connect(temp)) as db, db:
+                db.execute("CREATE TABLE pages(id TEXT PRIMARY KEY,title TEXT,path TEXT,body TEXT,metadata TEXT,sha256 TEXT)")
+                db.execute("CREATE VIRTUAL TABLE fts USING fts5(title,body)")
+                for path, meta, body, sha in records:
+                    pid = meta.get("id", path.relative_to(root).as_posix())
+                    title = meta.get("title", next((x[2:] for x in body.splitlines() if x.startswith("# ")), path.stem))
+                    cursor = db.execute("INSERT INTO pages VALUES(?,?,?,?,?,?)", (pid, title, str(path), body, json.dumps(meta, ensure_ascii=False), sha))
+                    db.execute("INSERT INTO fts(rowid,title,body) VALUES(?,?,?)", (cursor.lastrowid, " ".join(terms(title)), " ".join(terms(body))))
+            if not destination.exists():
+                try:
+                    temp.rename(destination)
+                except FileExistsError:
+                    pass  # A concurrent reader built the same immutable generation.
+        finally:
+            temp.unlink(missing_ok=True)
+    state = {"generation": generation, "path": str(destination), "root": str(root), "pages": len(records), "created_at": utc()}
+    write_json(store.root / "wiki/active.json", state)
+    return state
 
 
-def search_wiki(store, query, limit=10, engine=None, stage=None, kind=None):
+def search_wiki(store, query, limit=10, engine=None, stage=None, kind=None, index=None):
     if not isinstance(limit, int) or not 1 <= limit <= 100:
         raise FlowError("Search limit must be in [1,100]")
     active = store.root / "wiki/active.json"
-    if not active.exists():
+    if index is None and not active.exists():
         raise FlowError("Run wiki index first; no upstream refresh is needed for local indexing")
-    state = read_json(active)
+    state = index or read_json(active)
     tokens = terms(query)
     if not tokens:
         return {"results": [], "generation": state["generation"]}
@@ -115,13 +130,19 @@ def search_wiki(store, query, limit=10, engine=None, stage=None, kind=None):
     return {"results": results, "generation": state["generation"], "instruction": "Read full page and pinned source before relying on a conclusion; retrieval does not refresh sources."}
 
 
-def read_page(store, identity):
-    state=read_json(store.root/'wiki/active.json')
+def read_page(store, identity, generation=None):
+    if generation is not None:
+        if not re.fullmatch(r'[0-9a-f]{64}', generation):
+            raise FlowError('Invalid Wiki generation')
+        state={'generation':generation, 'path':str(store.root/'wiki'/f'{generation}.sqlite3')}
+    else:
+        state=read_json(store.root/'wiki/active.json')
     with contextlib.closing(sqlite3.connect(Path(state['path']).as_uri()+'?mode=ro',uri=True)) as db:
         db.row_factory=sqlite3.Row
         row=db.execute('SELECT * FROM pages WHERE id=?',(identity,)).fetchone()
     if not row:raise FlowError('Unknown Wiki page ID; index the current project first')
     value=dict(row);value['metadata']=json.loads(value['metadata'])
+    value['generation']=state['generation']
     path=Path(value['path'])
     value['review_state']='indexed-snapshot' if path.is_file() and digest(path.read_bytes())==value['sha256'] else 'local-page-changed; reindex'
     return value
@@ -279,6 +300,15 @@ def collect_web_documents(store, source):
     return revision, files, failures
 
 
+def source_page_hashes(project, source_id):
+    result = {}
+    for path in (Path(project) / 'knowledge').rglob('*.md'):
+        meta, _ = parse_page(path)
+        if any(ref.get('source') == source_id for ref in meta.get('sources', [])):
+            result[path.relative_to(project).as_posix()] = digest(path.read_bytes())
+    return result
+
+
 def stage_source_refresh(store, project, source, sha, files, failures, ref):
     source_id, repo = source['id'], source['repository']
     cursor_path = store.root / 'wiki/sources' / (source_id + '.json')
@@ -287,13 +317,17 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
     changes = sorted(name for name in files.keys() | reviewed["files"].keys()
                      if files.get(name, {}).get("sha256") != reviewed["files"].get(name, {}).get("sha256")
                      or (source.get('kind') == 'web' and files.get(name, {}).get('url') != reviewed['files'].get(name, {}).get('url')))
-    affected = []
-    for path in (Path(project) / "knowledge").rglob("*.md"):
-        meta, _ = parse_page(path)
-        refs = [x for x in meta.get("sources", []) if x.get("source") == source_id]
-        # Same-repository claims can depend on each other without sharing a literal file citation.
-        if refs and changes:
-            affected.append({"page": path.relative_to(project).as_posix(), "page_sha256": digest(path.read_bytes()), "status": "pending-content-review"})
+    page_hashes = source_page_hashes(project, source_id)
+    reviewed_hashes = reviewed.get('page_hashes', {p['page']: p['page_sha256'] for p in reviewed.get('affected_pages', [])})
+    # Removing a citation does not by itself review the surviving prose.
+    for name in reviewed_hashes.keys() - page_hashes.keys():
+        path = child(project, name)
+        if path.is_file():
+            page_hashes[name] = digest(path.read_bytes())
+    # An unchanged upstream must not erase a review invalidated by local edits/new topics.
+    affected = [{'page': name, 'page_sha256': sha256, 'status': 'pending-content-review'}
+                for name, sha256 in page_hashes.items()
+                if changes or (reviewed_path.exists() and reviewed_hashes.get(name) != sha256)]
     maintenance = []
     maintenance_path = Path(project) / "knowledge/maintenance.json"
     if maintenance_path.exists():
@@ -303,8 +337,15 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
     pending_path=store.root/'wiki/workflow-pending'/(source_id+'.json')
     if pending_path.exists():
         maintenance.extend(read_json(pending_path).get('targets',[]))
+    reviewed_workflows = reviewed.get('workflow_hashes', {})
+    for name, sha256 in reviewed_workflows.items():
+        path = child(project, name)
+        if not path.is_file() or digest(path.read_bytes()) != sha256:
+            maintenance.append(name)
     result = {"source": source_id, "repository": repo, "ref": ref, "commit": sha, "files": files, "changed_paths": changes,
               "affected_pages": affected, "affected_workflows": sorted(set(maintenance)), "failures": failures, "observed_at": utc(), "status": "partial" if failures else "collected-not-reviewed"}
+    result['page_inventory'] = page_hashes
+    result['workflow_hashes'] = reviewed_workflows
     result['revision_kind'] = 'web-content-fingerprint' if source.get('kind') == 'web' else 'git-commit'
     stage_id = fingerprint(result)
     write_json(store.root / "wiki/staging" / (stage_id + ".json"), result)
@@ -353,6 +394,14 @@ def review_refresh(store, stage_id, decisions, project, workflow_decisions=None,
             raise FlowError("Reviewed page changed; renew its review")
         if decision.get("source_commit") != stage["commit"]:
             raise FlowError("Review must address the newly observed source commit")
+    current_hashes = source_page_hashes(project, stage['source'])
+    staged_hashes = stage.get('page_inventory', {p['page']: p['page_sha256'] for p in stage['affected_pages']})
+    bound_hashes = dict(current_hashes)
+    for path in staged_hashes.keys() - bound_hashes.keys():
+        current = child(project, path)
+        bound_hashes[path] = digest(current.read_bytes()) if current.is_file() else None
+    if any(path not in decisions and staged_hashes.get(path) != sha for path, sha in bound_hashes.items()):
+        raise FlowError('Related pages changed or were added after staging; refresh and review again')
     latest_path = store.root / "wiki/sources" / (stage["source"] + ".json")
     if latest_path.exists() and read_json(latest_path)["commit"] != stage["commit"]:
         raise FlowError("A newer source was observed; review that stage instead")
@@ -360,7 +409,13 @@ def review_refresh(store, stage_id, decisions, project, workflow_decisions=None,
     deferred = sorted(required_workflows-set(workflow_decisions))
     receipt.update(workflow_deferred=deferred, workflow_deferral_reason=defer_workflows,
                    workflow_status='pending-site-review' if deferred else 'reviewed')
+    receipt['page_hashes'] = current_hashes
+    receipt['content_hashes'] = bound_hashes
+    receipt['workflow_hashes'] = {**stage.get('workflow_hashes', {}), **{p: d['page_sha256'] for p, d in workflow_decisions.items()}}
+    for path in deferred:
+        receipt['workflow_hashes'].pop(path, None)
     write_json(store.root/'wiki/workflow-pending'/(stage['source']+'.json'), {'targets':deferred,'reason':defer_workflows,'stage_id':stage_id})
     write_json(store.root / "wiki/reviews" / (stage_id + ".json"), receipt)
-    write_json(store.root / "wiki/reviewed-sources" / (stage["source"] + ".json"), stage)
+    write_json(store.root / "wiki/reviewed-sources" / (stage["source"] + ".json"),
+               {**stage, 'page_hashes': current_hashes, 'workflow_hashes': receipt['workflow_hashes']})
     return receipt

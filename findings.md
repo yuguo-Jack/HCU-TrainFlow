@@ -73,3 +73,16 @@ HCU-Knowledge v0.5.3 published first (80da7cefc). Its online GitHub and internal
 
 - Megatron PR #7897 demonstrates description drift: initial description proposed config switches, final diff uses device-selected fixed launch settings. Authored case distinguishes source claims from final implementation and from HCU validation.
 - Public Wiki and private experiment Wiki are separate durable assets. Report/flow milestone capture does not manufacture metric units or numerical validation; cookbook delivery records link back to immutable experiences and preserve publication status without exporting raw data.
+
+## 2026-10-09: pre-environment correctness review
+
+Confirmed and repaired boundary failures, with reproductions and regression coverage:
+- Watcher stall/recovery clocks incorrectly moved with the last-1000 sample window; short-file rotation could go undetected. Preserve per-attempt progress and file identity/prefix state, migrate existing observations.
+- Report/health/quality paths differed on positive integer execution and required coverage; legacy malformed PASS and context A→B→A could revive stale evidence. Apply consistent admission and reset-generation eligibility.
+- Claimed checkout/resources were task-local; unassigned commands could bypass reservations. Coordinate explicit scopes across the workspace, and recheck late/transitive input blockers at acceptance/use.
+- Reconciliation of an interrupted operation could drop its budget reservation. Retain labelled conservative budget accounting separately from measured duration.
+- Unchanged Wiki refresh could clear review after local edits; search could use another checkout's/stale index. Bind page/workflow hashes, propagate edited/new topics, and select an immutable local generation per query.
+- Concurrent experience retries could create duplicate records and overwrite navigation; interrupted publication/rebuild could lose event mappings. Serialize canonical identity/publication and recover from retained records.
+- Online PR fallback did not propagate partial failure to CLI exit status; combined multi-repository display truncation could appear complete. Both are explicit now.
+
+Readiness boundary: protocol/unit fixtures and public Wiki retrieval are locally testable. Site commands, HCU kernel traces and numerical convergence, native Agent wake-up, site recovery ownership and real multi-node fault injection remain environment integration work. No real training measurements were fabricated. No HCU-Knowledge update or TrainFlow release/tag.
