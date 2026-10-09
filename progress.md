@@ -149,3 +149,9 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - Final local regression: **844 passed in 85.74 s** using system Python; knowledge validation: **485 pages / 24 sources / no errors**. Independent source-transfer checks passed; new chart tests include extreme finite numbers, missing values and raw-log byte verification. Public changed/new files were checked for private site identifiers and credentials; no matches. Final independent review and publication verification follow.
 
 - Clean GitHub CI exposed fixture assumptions hidden by the development machine: workflow-only replacement tests were invoking full installation with local thirdparty dependencies, and Linux observer mocks omitted the unlock constant. Scoped the lifecycle tests to explicit workflow refresh and completed the lock mock; full required-dependency setup remains covered separately and unchanged. Local success and CI success are recorded separately.
+
+## Checkpoint IPC and concurrent evidence follow-up
+
+- Replaced CAS overwrite publication with atomic no-clobber publication and verified-content reuse; bounded only Windows sharing conflicts. Added deterministic racing writers/readers, corrupt object, fsync/I/O and unsupported-filesystem regression cases. Mutable file publication remains separate.
+- Added explicit Linux checkpoint TMPDIR preflight with actual AF_UNIX and spawn Manager queue roundtrips, exact-path evidence and bounded own-process cleanup. Actual target-container short/oversized path tests succeeded/failed as expected without fallback; platform limitations remain explicit.
+- Local full regression: **875 passed, 4 Linux-specific tests skipped on Windows**, 58.74 seconds. Knowledge validator: **485 pages / 24 sources / no errors**. Cross-platform CI remains a separate result; matrix now completes all combinations even if one fails.

@@ -134,3 +134,7 @@ observation-contexts/TASK_ID/CONTEXT_HASH-eSOURCE_CONTEXT_EPOCH/
 统一 Skill 的 `references/maintenance.md` 在既有五分钟交互循环触发维护，adapt/optimize/fault-tolerance 的 `references/workflow.md` 分别规定缓存生产、候选保留和长训交接责任。没有新增独立 Skill，也不把 `flow-watch` 的文件采集误称为已经运行维护命令。
 
 标准 `setup_trainflow.py` 以 checkout 做 editable 安装，`install_skills.py` 复制 Skill 自带 references；项目 `scripts/`、`docs/` 继续从 `TRAINFLOW_PROJECT` 定位。`retention.py` 是 wheel 中的 Python 模块，但 wheel 不包含整个项目脚本/文档/Wiki。远端只装 wheel 时，另同步同版本 `observe_training.py`、`manage_training_observer.py`，需要维护时同步 `maintain_workspace.py`，核对模块/脚本版本及哈希。本机 Skill 升级不代表远端脚本已更新。
+
+### 不可变证据的并发写入
+
+证据对象按内容哈希保存；并发登记相同内容只复用并核验，不替换已有对象。Windows 使用不覆盖目标的原子重命名，POSIX 的对象目录须支持同目录硬链接。临时读取共享冲突有界重试；损坏哈希、权限或文件系统错误继续返回失败，不退回部分写入或覆盖。重建缓存清理规则不适用于这些原始证据。

@@ -63,6 +63,60 @@ def atomic_write(path, data):
             os.unlink(name)
 
 
+_WINDOWS_OBJECT_CONFLICTS = {5, 32, 33}
+_OBJECT_READ_DELAYS = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32)
+
+
+def _read_object(path):
+    """Retry only bounded Windows access/sharing conflicts, never bad bytes."""
+    for delay in (*_OBJECT_READ_DELAYS, None):
+        try:
+            return path.read_bytes()
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in _WINDOWS_OBJECT_CONFLICTS or delay is None:
+                raise
+            time.sleep(delay)
+
+
+def _publish_object(path, data):
+    """Atomically create an immutable object without replacing a competitor.
+
+    POSIX filesystems must support same-directory hard links; unsupported links
+    and genuine I/O failures propagate, with no unsafe overwrite fallback.
+    Windows rename already refuses an existing destination. The staged inode
+    is complete and fsynced before either publication operation exposes it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".write-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            if os.name == "nt":
+                os.rename(name, path)
+            else:
+                os.link(name, path)
+        except FileExistsError:
+            if digest(_read_object(path)) != digest(data):
+                raise FlowError("Corrupted competing artifact")
+        except PermissionError as publish_error:
+            if getattr(publish_error, "winerror", None) not in _WINDOWS_OBJECT_CONFLICTS:
+                raise
+            # Windows may report access denied rather than already-exists for
+            # an occupied destination. Accept only verified competing bytes.
+            try:
+                published = _read_object(path)
+            except OSError:
+                raise publish_error
+            if digest(published) != digest(data):
+                raise FlowError("Corrupted competing artifact")
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
 def write_json(path, value):
     atomic_write(path, json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
 
@@ -204,23 +258,13 @@ class Store:
             sha = digest(data)
             path = self.root / "objects" / sha[:2] / sha
             if sha not in records:
-                if path.exists():
-                    if digest(path.read_bytes()) != sha:
-                        raise FlowError("Corrupted existing artifact")
+                try:
+                    published = _read_object(path)
+                except FileNotFoundError:
+                    _publish_object(path, data)
                 else:
-                    try:
-                        atomic_write(path, data)
-                    except OSError as publish_error:
-                        # Another writer may have published these exact bytes
-                        # while Windows readers prevent replacing its object.
-                        # Accept only a complete, readable hash match; keep real
-                        # permission/I/O failures and corruption visible.
-                        try:
-                            published = path.read_bytes()
-                        except OSError:
-                            raise publish_error
-                        if digest(published) != sha:
-                            raise FlowError("Corrupted competing artifact")
+                    if digest(published) != sha:
+                        raise FlowError("Corrupted existing artifact")
                 records[sha] = (path.relative_to(self.root).as_posix(), len(data))
             hashes.append(sha)
         if not records:
@@ -246,7 +290,7 @@ class Store:
                 row = db.execute("SELECT * FROM artifacts WHERE id=?", (sha,)).fetchone()
                 if not row:
                     raise FlowError("Unknown artifact")
-                data = child(self.root, row["path"]).read_bytes()
+                data = _read_object(child(self.root, row["path"]))
                 if len(data) != row["size"] or digest(data) != sha:
                     raise FlowError("Artifact hash mismatch")
                 yield sha, data

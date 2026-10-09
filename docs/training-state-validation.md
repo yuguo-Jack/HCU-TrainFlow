@@ -22,6 +22,24 @@
 
 没有覆盖的异步保存、跨拓扑 reshard、故障中断、不同优化器和持久化后端继续列为待验证。短窗口恢复通过不代表长时 loss/收敛验收通过。
 
+## Checkpoint 临时目录与进程通信预检
+
+部分 checkpoint writer 会启动 Python `spawn` / `SyncManager`，即使训练采用同步保存，也可能通过 AF_UNIX socket 交换状态。源快照或 attempt 名很长时，直接把同样长的 scratch 路径用作 `TMPDIR`，可能在训练结束后的首次保存才出现 `AF_UNIX path too long`。它限制的是**完整 socket 路径的字节数**，还包括 Python 自动添加的 `pymp-*` / `listener-*` 后缀；仅检查目录存在或能写普通文件不够。
+
+先在真实 Linux 容器或训练环境中，显式准备一个本任务已有授权范围内、由当前 UID 拥有的短临时目录。编译缓存可以继续使用独立的较长目录，不必跟随 IPC 临时目录改名。在训练之前执行 stdlib 检查，示例变量应替换为本任务的真实路径：
+
+```bash
+python -B scripts/probe_training_tempdir.py \
+  --task-root "$TASK_ROOT" --tempdir "$TASK_ROOT/tmp/$SHORT_RUN_ID" \
+  --timeout-seconds 15 > "$TASK_ROOT/evidence/tempdir-probe.json"
+```
+
+父目录、临时目录和 evidence 目录应由任务部署步骤预先建立；探针不会自动选择系统 `/tmp`，不会创建缺失的用户路径。目录必须位于 `--task-root` 下，且具有当前所有者的写入/搜索权限。它实际执行 AF_UNIX Listener 双向通信、`spawn` Manager Queue 往返和正常退出，记录实际路径、字节数、子进程身份与清理结果。成功返回0；失败返回2；非 Linux 返回3和 `unsupported`，不能用 Windows 单测代替现场 Linux 验证。
+
+探针固定本次进程的 `tempfile.tempdir`，因此不可写或缺失目录不会触发 Python 默认目录搜索的静默回退。超时只终止本次独立进程组；清理仅移除自己的随机 `pymp-*` 目录及遗留 listener socket，发现身份变化或未知文件则保留并报错。测试期间不应有其他清理者修改该目录。探针不保存模型 checkpoint，也不能代替真实保存/加载验证。
+
+通过后，训练命令应明确使用**同一 Linux 环境和选定目录**的 `TMPDIR`（必要时同时设置 `TEMP`、`TMP`），不要把探针自己的临时 `pymp-*` 子目录作为训练配置。长训期间目录可能被删除、权限或挂载变化，仍须保留真实 writer 的原始日志。训练中出现 `EOFError` 时，向前追溯 Manager 子进程的第一条错误：socket 路径、权限、spawn import、资源耗尽等都可能使父进程只看到 EOF；不要直接按数据损坏或 GPU OOM 处理。
+
 ## 保存或优化器阶段的资源错误
 
 报错中的 “GPU out of memory” 或 “probable leak” 是线索，不是根因。先定位实际失败调用及资源域：
@@ -32,6 +50,7 @@
 | 原生 multi-tensor 优化器 | tensor 数量、每组列表、dtype、descriptor/元数据池限制、失败前更新范围 | 相同原生算子的有界批次对照；核对 step/scalar 与所有状态，不能静默替换优化器 |
 | 混合精度 checkpoint 映射 | 实际 optimizer 参数组顺序、原生 FP32 参数、FP16/BF16 master 参数、分片 key/shape/offset | 按真实参数 ID 核对 moment 与 master 的归属；同形状也可能错配，不能只验 shape。保留形状断言，覆盖混合及单一 dtype、保存/加载和恢复后的下一次更新 |
 | GPU→CPU checkpoint staging | CPU RSS/可用内存、锁页限额、进程 VMA 数/上限、pinned tensor 数、逐步分配轨迹 | 用匹配 dtype/layout 的最小复现比较当前搬运路径；保留最后成功样本 |
+| checkpoint worker / Manager IPC | 第一条子进程异常、实际 TMPDIR、完整 socket 路径字节数、spawn 启动与退出 | 在相同 Linux 环境先做有界 IPC 预检；父进程 EOFError 可能只是后续症状，禁止默默回退到任务范围外的目录 |
 | checkpoint 写盘 | 实际保存格式/分片数、metadata、共享盘延迟、可用容量、结束标记 | 核对全部 rank 完成、回执和实际加载；不能只看到保存开始日志 |
 
 大量很小的张量可能先耗尽描述符或主机映射额度，而非 GPU 容量。失败时错误记录自身也可能无法再分配内存，应提前流式保留关键指标。不要把提高系统限额当作默认修复；先查对应 HCU/上游版本已有实现及同步要求，局部修复需保留原生数值和格式契约。
