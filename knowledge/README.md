@@ -8,7 +8,16 @@ visibility: public
 
 本库以公开官方源码为基准，保存固定提交的阅读说明、工程导航和优化机制。HCU 私有补丁、现场材料和训练数据保存在任务工作区，通过可选 HCU-Knowledge 检索补充。
 
-重点覆盖 Megatron 生态、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；其他引擎提供明确入口和任务检查路线，未宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
+重点覆盖 Megatron 生态、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；主要 SFT/RL 引擎按目录、调用链、安装运行测试、优化和故障诊断组织，仍不宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
+
+## 搜索与来源层
+
+- [PR 描述、review、diff 与固定源码索引](PR-INDEX.md)
+- [全仓源码路径](source-maps/) / [官方教程原文](upstream-docs/) / [来源游标与文档清单](catalog/)
+- [搜索与持续更新](../docs/wiki.md) / [私有训练经验与 Cookbook 记录](../docs/experience-knowledge.md)
+- [Megatron LM/Core 工程地图](official-megatron-wiki/engineering-guide.md)
+- [Paged Stash launch 与 PR 描述漂移案例](official-megatron-wiki/cases/paged-stash-launch.md)
+- [DeepSpeed offload 梯度生命周期案例](engines/deepspeed-offload-lifetime.md)
 
 ## 章节
 
@@ -46,7 +55,7 @@ visibility: public
 
 ## 更新方法
 
-`wiki-refresh` 采集注册文件并生成受影响页面和工作流清单；用 Wiki update Skill 深读差异、PR 顶层 review/评论/代码后修订所有关联结论，最后 `wiki-review` 写复核回执和 `wiki-index` 重建搜索。运行中的任务继续使用原锁定快照，升级需重新建立 context。
+`wiki-update` 检查全仓目录、文档与 PR 增量、登记源码，生成受影响页面和工作流清单；用 Wiki update Skill 深读差异、PR 顶层 review/评论/代码后修订所有关联结论，最后 `wiki-review` 写复核回执、`wiki-apply` 写来源锁、`wiki-index` 重建搜索。运行中的任务继续使用原锁定快照，升级需重新建立 context。
 
 ## 官方底层训练库
 

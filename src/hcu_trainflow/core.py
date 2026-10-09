@@ -214,8 +214,14 @@ class Store:
         sha = self.put(data)
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO reports VALUES(?,?,?,?,?,?)", (tid, kind, task["context"], sha, value["status"], utc()))
-            self.event(db, tid, "report-recorded", {"kind": kind, "artifact": sha, "status": value["status"]})
-        return {"artifact": sha, "status": value["status"]}
+            self.event(db, tid, "report-recorded", {"kind": kind, "artifact": sha, "status": value["status"],
+                                                   "context_spec": task['spec']['context']})
+        from .experience import sync
+        try:
+            knowledge=sync(self,tid)
+        except (OSError,ValueError,sqlite3.Error) as exc:
+            knowledge={'status':'pending','reason':type(exc).__name__,'resume':'experience-sync '+tid}
+        return {"artifact": sha, "status": value["status"], 'knowledge':knowledge}
 
     def change_context(self, tid, context):
         if not isinstance(context, dict) or not context:

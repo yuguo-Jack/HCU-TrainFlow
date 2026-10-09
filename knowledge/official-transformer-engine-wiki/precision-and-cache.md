@@ -3,9 +3,9 @@ id: official-transformer-engine-wiki/precision-and-cache
 title: TE 低精度训练：recipe、amax、权重缓存与反向状态
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

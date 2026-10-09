@@ -18,7 +18,7 @@ def export_public(source, destination, manifest):
         path = child(source, entry["path"])
         if (source / entry["path"]).is_symlink() or path.suffix.lower() not in {".md", ".json", ".yaml", ".yml", ".py", ".toml", ".txt", ".svg"}:
             raise FlowError("Export accepts reviewed text files only")
-        if any(x in {".private", ".work", ".git", "objects", "runs", "materials"} for x in (*Path(entry["path"]).parts, *path.relative_to(source).parts)):
+        if any(x in {".private", ".work", ".git", "objects", "runs", "materials", "experience"} for x in (*Path(entry["path"]).parts, *path.relative_to(source).parts)):
             raise FlowError("Private evidence/cache cannot be exported")
         data = path.read_bytes()
         if digest(data) != entry.get("sha256"):

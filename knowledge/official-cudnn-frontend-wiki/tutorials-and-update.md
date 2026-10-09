@@ -3,9 +3,9 @@ id: official-cudnn-frontend-wiki/tutorials-and-update
 title: cuDNN Frontend 官方教程、源码实例与更新索引
 engine: cudnn-frontend
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

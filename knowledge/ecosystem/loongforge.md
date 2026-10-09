@@ -3,9 +3,9 @@ id: ecosystem/loongforge
 title: 百度 LoongForge：调度、offload 和模型适配参考
 engine: loongforge
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

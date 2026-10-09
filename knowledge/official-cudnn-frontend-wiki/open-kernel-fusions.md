@@ -3,9 +3,9 @@ id: official-cudnn-frontend-wiki/open-kernel-fusions
 title: cuDNN 开放 Kernel：MoE 融合、FROST 与稀疏 Attention
 engine: cudnn-frontend
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

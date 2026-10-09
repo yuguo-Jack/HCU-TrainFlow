@@ -3,9 +3,9 @@ id: official-transformer-engine-wiki/tutorials-and-update
 title: TE 官方教程索引与版本更新方法
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

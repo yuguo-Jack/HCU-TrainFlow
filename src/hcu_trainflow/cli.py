@@ -79,18 +79,41 @@ def parser():
     q = cmd("inbox"); q.add_argument("--action", choices=["list", "claim", "complete", "retry"], default="list"); q.add_argument("--event"); q.add_argument("--owner")
     cmd("monitor-report", "task", "output")
     cmd("public-export", "source", "destination", "manifest")
+    cmd('experience-record','task','file')
+    cmd('experience-index')
+    q=cmd('experience-sync'); q.add_argument('task',nargs='?')
+    cmd('experience-read','id')
+    cmd('experience-compare','left','right')
+    q=cmd('experience-search','query'); q.add_argument('--limit',type=int,default=10)
+    q.add_argument('--model'); q.add_argument('--environment'); q.add_argument('--kind'); q.add_argument('--context')
     cmd("wiki-index", "project")
+    cmd('wiki-read','id')
+    cmd('wiki-catalog','project')
     q = cmd("wiki-search", "query"); q.add_argument("--limit", type=int, default=10); q.add_argument("--engine"); q.add_argument("--stage")
+    q.add_argument('--kind',choices=['authored','source-pr','source-map','source-document'])
+    q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT','.')); q.add_argument('--online-pr',choices=['auto','always','off'],default='auto')
+    q.add_argument('--pr-query'); q.add_argument('--repo',action='append',default=[]); q.add_argument('--source')
+    q = cmd('wiki-search-pr', 'query'); q.add_argument('--project',default=os.environ.get('TRAINFLOW_PROJECT','.'))
+    q.add_argument('--engine'); q.add_argument('--source'); q.add_argument('--repo',action='append',default=[])
+    q.add_argument('--limit',type=int,default=10); q.add_argument('--state',choices=['all','open','closed','merged'],default='all'); q.add_argument('--branch'); q.add_argument('--page',type=int,default=1)
+    q = cmd('wiki-code','repository','commit','path'); q.add_argument('--max-chars',type=int,default=24000)
+    q = cmd('wiki-inventory','project','source'); q.add_argument('--retain',action='store_true')
+    cmd('wiki-triage','project','source','decisions')
+    q = cmd('wiki-sync-prs','project','source'); q.add_argument('--max-prs',type=int,default=10); q.add_argument('--since')
+    q = cmd('wiki-sync-docs','project','source'); q.add_argument('--max-documents',type=int,default=40)
+    q = cmd('wiki-update','project','source'); q.add_argument('--max-prs',type=int,default=10); q.add_argument('--max-documents',type=int,default=40); q.add_argument('--since')
+    cmd('wiki-apply','project','stage')
     cmd("wiki-refresh", "project", "source")
-    q = cmd("wiki-pr", "repository", "number"); q.add_argument("--output")
-    cmd("wiki-review", "project", "stage", "decisions")
+    q = cmd("wiki-pr", "repository", "number"); q.add_argument("--output"); q.add_argument('--retain-project'); q.add_argument('--engine',default='unspecified'); q.add_argument('--max-pages',type=int,default=20)
+    cmd('wiki-review-pr','project','id','decisions')
+    q = cmd("wiki-review", "project", "stage", "decisions"); q.add_argument('--defer-workflows',metavar='REASON')
     cmd("demo", "destination")
     cmd('collaboration-demo', 'destination')
     return p
 
 
 def execute(a):
-    from . import analysis, coordination, delivery, environment, execution, flow, monitor, quality, team, wiki
+    from . import analysis, coordination, delivery, environment, execution, flow, monitor, quality, team, wiki, official, experience
     store = Store(a.workspace)
     c = a.command
     if c == "init": return {"workspace": str(store.root), "schema_version": 1, "version": __version__}
@@ -183,16 +206,42 @@ def execute(a):
     if c == "inbox": return monitor.inbox(store, a.action, a.event, a.owner)
     if c == "monitor-report": return delivery.monitor_report(store, a.task, a.output)
     if c == "public-export": return delivery.export_public(a.source, a.destination, read_json(a.manifest))
+    if c == 'experience-record': return experience.record(store,a.task,read_json(a.file))
+    if c == 'experience-index': return experience.rebuild(store)
+    if c == 'experience-sync': return experience.sync(store,a.task)
+    if c == 'experience-read': return experience.get(store,a.id)
+    if c == 'experience-compare': return experience.compare(store,a.left,a.right)
+    if c == 'experience-search': return experience.search(store,a.query,a.limit,a.model,a.environment,a.kind,a.context)
     if c == "wiki-index": return wiki.index_wiki(store, a.project)
-    if c == "wiki-search": return wiki.search_wiki(store, a.query, a.limit, a.engine, a.stage)
+    if c == 'wiki-read': return wiki.read_page(store,a.id)
+    if c == 'wiki-catalog': return official.catalog(a.project)
+    if c == 'wiki-search-pr':
+        return official.annotate_prs(a.project,official.search_prs(store,a.query,official.engine_repos(a.project,a.engine,a.source,a.repo),
+                                   limit=a.limit,state=a.state,branch=a.branch,page=a.page))
+    if c == 'wiki-code': return official.read_code(store,a.repository,a.commit,a.path,max_chars=a.max_chars)
+    if c == 'wiki-inventory': return official.inventory(store,a.project,a.source,retain=a.retain)
+    if c == 'wiki-triage': return official.triage_inventory(store,a.project,a.source,read_json(a.decisions))
+    if c == 'wiki-sync-prs': return official.sync_prs(store,a.project,a.source,max_prs=a.max_prs,since=a.since)
+    if c == 'wiki-sync-docs': return official.sync_documents(store,a.project,a.source,max_documents=a.max_documents)
+    if c == 'wiki-update': return official.update_source(store,a.project,a.source,max_prs=a.max_prs,max_documents=a.max_documents,since=a.since)
+    if c == 'wiki-apply': return official.apply_refresh(store,a.project,a.stage)
+    if c == "wiki-search":
+        if not (store.root/'wiki/active.json').exists(): wiki.index_wiki(store,a.project)
+        result=wiki.search_wiki(store,a.query,a.limit,a.engine,a.stage,a.kind)
+        if a.online_pr == 'always' or a.online_pr=='auto' and not result['results']:
+            result['online_pr']=official.annotate_prs(a.project,official.search_prs(store,a.pr_query or a.query,official.engine_repos(a.project,a.engine,a.source,a.repo),limit=a.limit))
+        result['followup']='If local candidates are insufficient, wiki-search-pr -> wiki-pr -> wiki-code at exact head/base; no HCU-Knowledge update.'
+        return result
     if c == "wiki-refresh": return wiki.refresh_source(store, a.project, a.source, os.environ.get("GITHUB_TOKEN"))
     if c == "wiki-pr":
-        result = wiki.collect_pr(store, a.repository, int(a.number), os.environ.get("GITHUB_TOKEN"))
+        result = official.read_pr(store, a.repository, int(a.number), max_pages=a.max_pages)
+        if a.retain_project: result['retained']=official.retain_pr(store,a.retain_project,result,a.engine)
         if a.output: write_json(a.output, result)
         return result
     if c == "wiki-review":
         decisions = read_json(a.decisions)
-        return wiki.review_refresh(store, a.stage, decisions["pages"], a.project, decisions.get("workflows"))
+        return wiki.review_refresh(store, a.stage, decisions["pages"], a.project, decisions.get("workflows"),a.defer_workflows)
+    if c == 'wiki-review-pr': return official.review_pr(store,a.project,a.id,read_json(a.decisions))
     if c == "demo":
         from .demo import run_demo
         return run_demo(a.destination)

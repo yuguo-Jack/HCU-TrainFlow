@@ -3,9 +3,9 @@ id: official-megatron-wiki/profiling
 title: 训练 profiler 采样与 TraceLens 联动
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

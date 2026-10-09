@@ -3,9 +3,9 @@ id: official-transformer-engine-wiki/overlap-and-memory
 title: TE 并行与显存：Userbuffers、CP、Graph 和 Offload
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

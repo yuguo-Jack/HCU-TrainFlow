@@ -3,9 +3,9 @@ id: ecosystem/mindspeed
 title: 华为 MindSpeed / MindSpeed-LLM：机制级参考
 engine: mindspeed
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

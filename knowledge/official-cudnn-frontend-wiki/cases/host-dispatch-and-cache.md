@@ -3,9 +3,9 @@ id: official-cudnn-frontend-wiki/cases/host-dispatch-and-cache
 title: 案例：cuDNN Kernel 不慢，模型却被构图和 Host 调度拖慢
 engine: cudnn-frontend
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

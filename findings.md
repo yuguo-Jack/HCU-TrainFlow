@@ -66,3 +66,10 @@ The current assignment API only registers pending work and accepts an owner's re
 - Five-minute collection is enforced on automatic guidance reads, not only watcher sleep. Explicit refresh remains immediate. Real Agent launch, runtime delivery, filesystem isolation and HCU training still need site-level validation; session/owner strings are attribution, not authentication.
 
 - Operator parallelism clarification: independent attention/GEMM/MoE implementations can run complete local optimization loops concurrently. Added operation-scoped resource ownership so a long-lived operator Agent takes the shared GPU lease only during actual measurement; assignment-scoped exclusivity remains available for experiments requiring continuous ownership. Shared interface edits and integrated numerical/performance regression remain coordinated.
+
+## Official and experience Wiki audit
+
+HCU-Knowledge v0.5.3 published first (80da7cefc). Its online GitHub and internal GitLab chain verified. Hyperloom experience_sink/reader/integration separate implementation identity, measured correctness and warm-start revalidation; TrainFlow adopts evidence-bound environment/model contexts, durable milestones and negative results, without importing its kernel-specific runtime. New Wiki source inventories revealed upstream canonical repository migrations: hiyouga/LlamaFactory, areal-project/AReaL, verl-project/verl. Old source IDs and fixed evidence remain; canonical registry names updated.
+
+- Megatron PR #7897 demonstrates description drift: initial description proposed config switches, final diff uses device-selected fixed launch settings. Authored case distinguishes source claims from final implementation and from HCU validation.
+- Public Wiki and private experiment Wiki are separate durable assets. Report/flow milestone capture does not manufacture metric units or numerical validation; cookbook delivery records link back to immutable experiences and preserve publication status without exporting raw data.

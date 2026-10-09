@@ -3,9 +3,9 @@ id: official-cudnn-frontend-wiki/build-run-test
 title: cuDNN Frontend 编译安装、运行示例与测试路线
 engine: cudnn-frontend
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

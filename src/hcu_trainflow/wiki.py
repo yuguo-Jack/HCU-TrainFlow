@@ -10,6 +10,9 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import functools
+import os
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,7 +80,7 @@ def index_wiki(store, project):
     return {"generation": generation, "pages": len(records)}
 
 
-def search_wiki(store, query, limit=10, engine=None, stage=None):
+def search_wiki(store, query, limit=10, engine=None, stage=None, kind=None):
     if not isinstance(limit, int) or not 1 <= limit <= 100:
         raise FlowError("Search limit must be in [1,100]")
     active = store.root / "wiki/active.json"
@@ -95,9 +98,12 @@ def search_wiki(store, query, limit=10, engine=None, stage=None):
     if stage:
         conditions.append("EXISTS(SELECT 1 FROM json_each(json_extract(metadata,'$.stages')) WHERE value=?)")
         args.append(stage)
+    if kind:
+        conditions.append("coalesce(json_extract(metadata,'$.kind'),'authored')=?")
+        args.append(kind)
     with contextlib.closing(sqlite3.connect(Path(state["path"]).as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT pages.*,bm25(fts,4,1) score FROM fts JOIN pages ON pages.rowid=fts.rowid WHERE " + " AND ".join(conditions) + " ORDER BY score LIMIT ?", args + [limit]).fetchall()
+        rows = db.execute("SELECT pages.*,bm25(fts,4,1) * CASE json_extract(metadata,'$.kind') WHEN 'source-map' THEN 0.05 WHEN 'source-document' THEN 0.6 WHEN 'source-pr' THEN 0.8 ELSE 1 END score FROM fts JOIN pages ON pages.rowid=fts.rowid WHERE " + " AND ".join(conditions) + " ORDER BY score LIMIT ?", args + [limit]).fetchall()
     results = []
     for row in rows:
         value = dict(row)
@@ -109,11 +115,39 @@ def search_wiki(store, query, limit=10, engine=None, stage=None):
     return {"results": results, "generation": state["generation"], "instruction": "Read full page and pinned source before relying on a conclusion; retrieval does not refresh sources."}
 
 
+def read_page(store, identity):
+    state=read_json(store.root/'wiki/active.json')
+    with contextlib.closing(sqlite3.connect(Path(state['path']).as_uri()+'?mode=ro',uri=True)) as db:
+        db.row_factory=sqlite3.Row
+        row=db.execute('SELECT * FROM pages WHERE id=?',(identity,)).fetchone()
+    if not row:raise FlowError('Unknown Wiki page ID; index the current project first')
+    value=dict(row);value['metadata']=json.loads(value['metadata'])
+    path=Path(value['path'])
+    value['review_state']='indexed-snapshot' if path.is_file() and digest(path.read_bytes())==value['sha256'] else 'local-page-changed; reindex'
+    return value
+
+
+@functools.lru_cache(maxsize=1)
+def github_token():
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if token:
+        return token
+    try:
+        proc = subprocess.run(['git', '-c', 'credential.interactive=false', 'credential', 'fill'],
+                              input=b'protocol=https\nhost=github.com\n\n', capture_output=True, timeout=10,
+                              env={**os.environ,'GIT_TERMINAL_PROMPT':'0','GCM_INTERACTIVE':'Never'})
+        fields = dict(line.split('=',1) for line in proc.stdout.decode().splitlines() if '=' in line)
+        return fields.get('password')
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return None
+
+
 def _get_json(url, token=None):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname != "api.github.com" or parsed.username or parsed.password:
         raise FlowError("Public GitHub adapter only accepts api.github.com HTTPS URLs")
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "HCU-TrainFlow"}
+    token = token or github_token()
     if token:
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(url, headers=headers)
@@ -123,7 +157,8 @@ def _get_json(url, token=None):
                 raise FlowError("Unexpected API redirect")
             return json.load(response), response.headers.get("Link", "")
     except urllib.error.HTTPError as exc:
-        raise FlowError(f"GitHub HTTP {exc.code}; check permission/rate limit separately") from None
+        reason = 'authentication' if exc.code == 401 else 'permission or rate limit' if exc.code in {403,429} else 'resource unavailable or permission' if exc.code == 404 else 'request failed'
+        raise FlowError(f"GitHub HTTP {exc.code}: {reason}; no empty-result inference") from None
 
 
 def pages(url, token=None, max_pages=100):
@@ -166,9 +201,17 @@ def collect_git_files(store, source, token=None):
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise FlowError("Unexpected commit SHA")
     files, failures = {}, []
+    inventory_path=store.root/'wiki/inventory'/(source['id']+'.json')
+    known_tree=None
+    if inventory_path.exists():
+        inventory=read_json(inventory_path)
+        if inventory['commit']==sha:
+            known_tree=json.loads(store.artifact(inventory['artifact']))['entries']
     for name in source["paths"]:
         if name.startswith("/") or ".." in Path(name).parts:
             raise FlowError("Invalid registered source path")
+        if known_tree is not None and name not in known_tree:
+            continue  # Complete tree at this exact SHA proves removal; stage diff requires review.
         url = f"https://raw.githubusercontent.com/{repo}/{sha}/" + urllib.parse.quote(name)
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "HCU-TrainFlow"}), timeout=60) as response:
@@ -176,8 +219,15 @@ def collect_git_files(store, source, token=None):
             if len(data) > 16 * 1024 * 1024:
                 raise FlowError("Source exceeds acquisition size limit")
             files[name] = {"sha256": store.put(data, "public"), "url": f"https://github.com/{repo}/blob/{sha}/{name}"}
-        except (OSError, FlowError):
-            failures.append({"path": name, "status": "unavailable"})
+        except (OSError, FlowError) as exc:
+            # The raw host can fail independently of the GitHub content API.
+            # Both paths stay pinned to the same full SHA; never substitute HEAD.
+            try:
+                from .official import read_code
+                code=read_code(store,repo,sha,name,token,max_chars=1)
+                files[name]={'sha256':code['artifact'],'url':code['url']}
+            except (OSError,ValueError) as fallback:
+                failures.append({"path":name,"status":"unavailable","error":str(fallback)[:240],"raw_error":type(exc).__name__})
     return sha, files, failures
 
 
@@ -241,7 +291,8 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
     for path in (Path(project) / "knowledge").rglob("*.md"):
         meta, _ = parse_page(path)
         refs = [x for x in meta.get("sources", []) if x.get("source") == source_id]
-        if refs and any(x.get("path") in changes for x in refs):
+        # Same-repository claims can depend on each other without sharing a literal file citation.
+        if refs and changes:
             affected.append({"page": path.relative_to(project).as_posix(), "page_sha256": digest(path.read_bytes()), "status": "pending-content-review"})
     maintenance = []
     maintenance_path = Path(project) / "knowledge/maintenance.json"
@@ -249,6 +300,9 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
         for rule in read_json(maintenance_path):
             if rule["source"] == source_id and any(name in changes for name in rule["paths"]):
                 maintenance.extend(rule["targets"])
+    pending_path=store.root/'wiki/workflow-pending'/(source_id+'.json')
+    if pending_path.exists():
+        maintenance.extend(read_json(pending_path).get('targets',[]))
     result = {"source": source_id, "repository": repo, "ref": ref, "commit": sha, "files": files, "changed_paths": changes,
               "affected_pages": affected, "affected_workflows": sorted(set(maintenance)), "failures": failures, "observed_at": utc(), "status": "partial" if failures else "collected-not-reviewed"}
     result['revision_kind'] = 'web-content-fingerprint' if source.get('kind') == 'web' else 'git-commit'
@@ -276,7 +330,7 @@ def collect_pr(store, repository, number, token=None):
     return {"artifact": sha, "coverage": data["coverage"], "reviews": len(data["reviews"]), "status": "collected-not-reviewed"}
 
 
-def review_refresh(store, stage_id, decisions, project, workflow_decisions=None):
+def review_refresh(store, stage_id, decisions, project, workflow_decisions=None, defer_workflows=None):
     if not re.fullmatch(r"[0-9a-f]{64}", stage_id):
         raise FlowError("Invalid stage ID")
     stage = read_json(store.root / "wiki/staging" / (stage_id + ".json"))
@@ -286,8 +340,11 @@ def review_refresh(store, stage_id, decisions, project, workflow_decisions=None)
     if set(decisions) != expected:
         raise FlowError("Every affected overview/topic/case needs an explicit content decision")
     workflow_decisions = workflow_decisions or {}
-    if set(workflow_decisions) != set(stage.get("affected_workflows", [])):
+    required_workflows = set(stage.get("affected_workflows", []))
+    if set(workflow_decisions) - required_workflows or (not defer_workflows and set(workflow_decisions) != required_workflows):
         raise FlowError("Affected Skills/adapters need review as well as Wiki pages")
+    if defer_workflows is not None and not str(defer_workflows).strip():
+        raise FlowError('Deferred workflow review requires a reason and remains pending')
     for path, decision in {**decisions, **workflow_decisions}.items():
         if decision.get("decision") not in {"updated", "still-applicable", "historical"} or not decision.get("note"):
             raise FlowError("Review requires a substantive per-page conclusion")
@@ -300,6 +357,10 @@ def review_refresh(store, stage_id, decisions, project, workflow_decisions=None)
     if latest_path.exists() and read_json(latest_path)["commit"] != stage["commit"]:
         raise FlowError("A newer source was observed; review that stage instead")
     receipt = {"stage_id": stage_id, "decisions": decisions, "workflow_decisions": workflow_decisions, "reviewed_at": utc(), "status": "content-reviewed", "runtime_validated": False}
+    deferred = sorted(required_workflows-set(workflow_decisions))
+    receipt.update(workflow_deferred=deferred, workflow_deferral_reason=defer_workflows,
+                   workflow_status='pending-site-review' if deferred else 'reviewed')
+    write_json(store.root/'wiki/workflow-pending'/(stage['source']+'.json'), {'targets':deferred,'reason':defer_workflows,'stage_id':stage_id})
     write_json(store.root / "wiki/reviews" / (stage_id + ".json"), receipt)
     write_json(store.root / "wiki/reviewed-sources" / (stage["source"] + ".json"), stage)
     return receipt

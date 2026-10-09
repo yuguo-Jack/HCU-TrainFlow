@@ -3,9 +3,9 @@ id: official-transformer-engine-wiki/attention
 title: TE Attention：后端选择、cuDNN 调用与训练精度契约
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

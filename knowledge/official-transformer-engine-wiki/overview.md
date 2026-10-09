@@ -3,9 +3,9 @@ id: official-transformer-engine-wiki/overview
 title: Transformer Engine 官方工程：定位、目录与训练调用链
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

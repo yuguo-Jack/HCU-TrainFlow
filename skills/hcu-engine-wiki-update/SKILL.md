@@ -10,13 +10,14 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 ## 更新协议
 
 1. 检查公共 GitHub/文档权限、限流与实际访问，不把 404 当成已删除。读取 knowledge/sources.json 与已有 observed/reviewed 游标。
-2. `wiki-refresh <project> <source-id>` 收集注册路径的最新内容和固定提交；`kind: web` 收集登记教程并生成内容指纹，不能当成 Git SHA。新增主题需把关键源码/测试/配置/教程路径登记进去；不能只抓 README 宣称全仓无变化。检查树/分支和相关 release/roadmap/PR。TE、cuDNN Frontend 均有独立代码源和 `-docs` 教程源，更新相关主题时两者一起检查，区分官网版本、主干和实际部署版本。
-3. 需要 PR 依据时 `wiki-pr owner/repo number`，采集正文、普通评论、行内评论、独立 review 顶层正文及文件分页。API diff 缺失或超限时补 base/head 源码。记录未完成分页/权限缺口，不能继续标记全部完成。
+2. 先读项目 `docs/wiki.md`。`wiki-update PROJECT SOURCE` 依次检查完整树、document_globs 新文档、PR/讨论与登记源码；也可单独使用 wiki-inventory / wiki-sync-docs / wiki-sync-prs / wiki-refresh。重复运行续完 pending，检查所有阶段错误。未监测的新文件从完整树发现，按最新 commit 用 wiki-triage 记录 knowledge-added/not-relevant/deferred，不能只抓 README 宣称全仓无变化。web 来源生成内容指纹，不能当 Git SHA；TE/cuDNN 同时检查代码与官方教程。
+3. PR 来源页保存描述、普通评论、行内评论、独立 review 顶层状态/正文、文件列表及原始 JSON。首次增量发现默认最近 30 天，已保留历史 PR 每七天重新查讨论；需要扩大范围用 --since，不能称已覆盖全部历史。主动按问题 wiki-search-pr 补重要未收录 PR，再 wiki-pr 和 wiki-code 追最终代码；可显式 --retain-project 纳入公共来源页。缺 patch/分页/权限时保留失败并补证据，不将标题或初始描述直接编成案例。
 4. 比较实际 active ref 与已锁版本，处理 submodule gitlink，不用子仓 HEAD 偷换。发布计划、open PR、merged main、released 和运行可用分开。
 5. 对每个 affected overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
-6. 按 knowledge/maintenance.json 同时检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤。HCU 命令可以依托大知识库当前内容或自主看最新工程源码；任务所用 HCU 模型脚本、其引入的环境配置、launcher 或依赖变化时，一并复核 prepare/optimize 的用法和任务配方。公共仓只保留可公开的规则与来源，现场配置留在私有工作区；不能只更新官方 Wiki 文本。
-7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 全部通过后记录 receipt，再 `wiki-index`。采集完成不是内容复核完成，更不是硬件实测通过。
-8. 运行本工程测试和真实问题检索，保存本次缺口及下次入口。公共材料提交与 push 沿用任务授权，私有数据禁止进入公共仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
+   PR 描述、review 或 diff 更新即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
+6. 按 knowledge/maintenance.json 同时检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤。HCU 命令可以依托大知识库当前内容或自主看最新工程源码；任务所用 HCU 模型脚本、其引入的环境配置、launcher 或依赖变化时，一并复核 adapt/optimize 的用法和任务配方。公共仓只保留可公开的规则与来源，现场配置留在私有工作区；不能只更新官方 Wiki 文本。
+7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
+8. wiki-catalog 刷新来源/文档/PR 导航（wiki-update 已在收尾调用），wiki-index 更新搜索。运行本工程测试和真实问题检索，保存本次缺口及下次入口。公共材料提交与 push 沿用任务授权，私有数据禁止进入公共仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。
 
@@ -25,6 +26,10 @@ TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查�
 ## 组织标准
 
 按工程定位→目录→编译安装→运行/测试→调用链→优化机制→问题诊断→版本/依赖→证据组织。案例按问题/瓶颈→为什么改→实现符号→适用条件→正确性/性能证据→失败条件/回退。尚未逐模型覆盖的入口页保持 coverage 标记，不以页数代替深度。
+
+## 私有训练经验的维护
+
+参照 `docs/experience-knowledge.md`。任务 report 和 flow-advance 自动沉淀原 context 与证据；里程碑后确认自动写入成功，必要时 experience-sync 续接。关键环境验收、基线、性能/显存优化、阶段 loss、扩容、故障及 Cookbook 交付由对应阶段补 experience-record 解释；失败尝试也保存。不能猜指标单位或补造 loss。Cookbook 记录关联原经验 ID、脱敏审核和 draft/submitted/merged 等状态及 PR 链接，原数据不进入 public。局部经验和官方 Wiki 可自主按需更新，不调用 HCU 大知识库更新。
 
 ## 运行约定
 

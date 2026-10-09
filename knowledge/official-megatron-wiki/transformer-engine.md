@@ -3,9 +3,9 @@ id: official-megatron-wiki/transformer-engine
 title: Transformer Engine：精度、融合与 HCU 承接边界
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

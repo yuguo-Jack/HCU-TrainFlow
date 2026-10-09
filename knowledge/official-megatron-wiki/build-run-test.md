@@ -3,9 +3,9 @@ id: official-megatron-wiki/build-run-test
 title: Megatron 安装、启动、测试与 HCU 接入
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

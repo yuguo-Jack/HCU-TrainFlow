@@ -3,9 +3,9 @@ id: official-megatron-wiki/memory
 title: 显存生命周期、重算、offload 与 checkpoint 峰值
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

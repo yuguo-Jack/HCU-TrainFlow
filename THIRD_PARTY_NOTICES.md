@@ -16,3 +16,7 @@
 - 其他来源及固定提交列于 knowledge/sources.json 和 source-lock.json。
 
 HCU/其他产品名称属于各自所有者；本项目不表示上述组织背书。
+
+## Retained upstream knowledge
+
+Original document and PR attribution remains with upstream authors. See [knowledge notices and license copies](thirdparty/KNOWLEDGE-NOTICES.md). These materials are not relicensed under TrainFlow’s MIT license.

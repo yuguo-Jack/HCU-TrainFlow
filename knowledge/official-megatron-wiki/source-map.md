@@ -3,9 +3,9 @@ id: official-megatron-wiki/source-map
 title: Megatron 代码目录与问题定位地图
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

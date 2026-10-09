@@ -452,9 +452,16 @@ def advance(store, tid):
             guard_transition(store, db, task, 'iterate')
         changed = db.execute("UPDATE flow_rounds SET status='advanced' WHERE task=? AND number=? AND status='accepted'", (tid, decision['round'])).rowcount
         if changed:
-            store.event(db, tid, 'flow-advanced', {'round': decision['round'], 'target': candidate['target']})
+            current = store.task(tid)
+            store.event(db, tid, 'flow-advanced', {'round': decision['round'], 'target': candidate['target'],
+                'context_spec':current['spec']['context'],'evidence':[decision['candidate']]})
+    from .experience import sync
+    try:
+        knowledge=sync(store,tid)
+    except (OSError,ValueError) as exc:
+        knowledge={'status':'pending','reason':type(exc).__name__,'resume':'experience-sync '+tid}
     render_board(store, tid)
-    return next_step(store, tid)
+    return {**next_step(store, tid),'knowledge':knowledge}
 
 
 def guard_execution(store, tid, *, allow_parallel=False):

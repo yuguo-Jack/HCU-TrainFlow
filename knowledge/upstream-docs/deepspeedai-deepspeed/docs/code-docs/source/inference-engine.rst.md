@@ -1,0 +1,172 @@
+---
+id: doc-deepspeedai-deepspeed-a3e2170174d2c0a7b02f
+title: deepspeedai/DeepSpeed / docs/code-docs/source/inference-engine.rst
+engine: deepspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: deepspeedai/DeepSpeed
+commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+path: docs/code-docs/source/inference-engine.rst
+raw_sha256: d149e9d5484fdf2c4804b820a49b4c8b1a2a92c8df2e2726903b220d8582c4bf
+sources: []
+generated_body_sha256: 1f98ee7cfaf1e962f07bbc736b6b1be78f892548e0b0932657a1299f0861a82d
+source_state: current-scan
+---
+
+# deepspeedai/DeepSpeed / docs/code-docs/source/inference-engine.rst
+
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/code-docs/source/inference-engine.rst)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+Inference API
+=============
+
+:func:`deepspeed.init_inference` returns an *inference engine*
+of type :class:`InferenceEngine`.
+
+.. code-block:: python
+
+    for step, batch in enumerate(data_loader):
+        #forward() method
+        loss = engine(batch)
+
+Forward Propagation
+-------------------
+.. autofunction:: deepspeed.InferenceEngine.forward
+
+HybridEngine Rollout Profiling
+------------------------------
+
+``HybridEngineRollout`` can record synchronized stage timings for a rollout.
+Profiling is disabled by default because synchronization changes execution
+behavior and adds overhead. Enable it through ``HybridEngineRolloutConfig``::
+
+    from deepspeed.runtime.rollout.hybrid_engine_rollout import (
+        HybridEngineRollout,
+        HybridEngineRolloutConfig,
+    )
+
+    rollout = HybridEngineRollout(
+        engine,
+        tokenizer,
+        cfg=HybridEngineRolloutConfig(enable_profiling=True),
+    )
+    output = rollout.generate(request, sampling)
+    profile = rollout.get_last_profile()
+
+The profile contains synchronized times for prompt expansion, generation,
+post-processing, and the complete rollout. Generation is further divided into
+the first model forward (``prefill_forward_ms``), all later model forwards
+(``decode_forward_ms``), and residual generation work
+(``generation_overhead_ms``). The residual includes sampling, generation-loop
+bookkeeping, shared-cache expansion, and other work outside the top-level model
+forwards. ``num_decode_forwards`` reports how many forwards contributed to the
+decode time.
+
+Forward timings use accelerator events where supported and synchronize once at
+the end of generation instead of after every generated token. Synchronous
+accelerators without events, such as CPU, use wall-clock timings. The forward
+breakdown is unavailable when an asynchronous accelerator lacks event timing,
+such as MPS, and for the CUDA graph path because graph replays bypass model
+forward hooks. In both cases its forward fields are ``None`` and its complete
+generation time is reported as generation overhead.
+
+Times are reported in milliseconds. ``num_generated_tokens`` counts all
+returned response positions across the expanded batch, including padding
+positions. ``tokens_per_second`` divides that count by the end-to-end rollout
+time. The profile also records the input batch size, samples per prompt, prompt
+length, and returned response length.
+For benchmark matrices, cases execute from the largest effective batch to the
+smallest because HybridEngine sizes its inference workspace on the first
+forward. Results remain in the user-requested matrix order.
+
+Shared Prompt Prefill
+---------------------
+
+When one prompt branches into multiple response samples,
+``HybridEngineRolloutConfig(use_shared_prefill=True)`` computes the prompt
+forward once and repeats its KV cache before decoding the independent response
+branches. The option is disabled by default.
+
+Shared prefill currently requires HybridEngine kernel injection, ZeRO stage 0,
+inference tensor-parallel size 1, an internal KV cache, and a prompt longer than
+one token. It cannot be combined with CUDA graph capture,
+``release_inference_cache``, or continuous batching
+(``SamplingConfig.continuous_batch_size``). Sampling still happens independently
+for every response branch after the shared prompt forward.
+
+Continuous batching (experimental)
+-----------------------------------
+
+Continuous batching is enabled through ``SamplingConfig.continuous_batch_size``
+on the regular ``HybridEngineRollout.generate(request, sampling)`` entry point.
+When unset, generation keeps its existing behavior. When set to a positive
+value, at most that many prompt rows are active at once; completed rows retire
+and pending rows are prefetched into the released slots. The returned
+``RolloutBatch`` remains in the original ``RolloutRequest`` row order.
+When ``HybridEngineRolloutConfig(enable_cache_trimming=True)`` is enabled, the
+experimental path periodically trims unused cache columns from the left to
+keep long-running staggered-EOS workloads within the allocated cache span.
+
+When ``HybridEngineRolloutConfig(enable_profiling=True)`` is enabled, this path
+also records a snapshot in ``get_last_profile()``. In addition to the common
+rollout fields, the snapshot reports ``scheduler_overhead_ms`` for scheduler
+transitions, ``cache_management_overhead_ms`` for cache compaction, trimming,
+reset, and admitted-row copies, and separate ``prefill_forward_ms`` and
+``decode_forward_ms`` totals. ``num_prefill_forwards`` counts each admitted
+prompt batch, while ``num_decode_forwards`` counts decode steps that had
+surviving rows. ``num_generated_tokens`` counts tokens actually produced by
+all requests (padding is excluded), and ``active_batch_size`` is the maximum
+number of simultaneously active rows; ``continuous_batch_size`` is the
+configured capacity.
+
+The experimental path intentionally does not implement paged attention or change the
+default generation semantics. It currently requires one padded prompt width for
+all rows, a model with cache-class support, greedy decoding, and one sample per
+prompt. CUDA Graph capture and shared prompt prefill are rejected until the scheduling semantics are
+validated on real workloads. Models that explicitly declare no cache-class
+support are rejected; models with unknown support should be validated against
+the default ``generate()`` path before use.
+``align_decode_fronts=False`` is the default equal-width padded-prompt baseline:
+all requests use the same padded prompt width. Different effective lengths
+encoded by the attention masks retain the legacy staggered logical decode
+positions; physical decode-front alignment is enabled only when
+``align_decode_fronts=True``. Cache trimming is independently controlled by
+``enable_cache_trimming`` and is disabled by default. When disabled, the
+rollout does not trim periodically, but it reclaims a dead prefix when that is
+necessary to avoid exhausting the configured cache capacity.
+
+Set ``HybridEngineRolloutConfig(align_decode_fronts=True)`` to enable the
+follow-up alignment path. It derives each request's effective prompt width from
+its attention mask, orders requests from longest to shortest internally, and
+restores the original row order in the returned batch. Retired rows are refilled
+from that pre-sorted pending queue. Cache trimming remains disabled unless
+``enable_cache_trimming=True`` is also set. You can override the derived cache
+span with ``continuous_cache_capacity``; if the span is exhausted, the rollout
+raises an error that names both remedies.
+
+The most recent cache statistics are available from
+``rollout.get_last_continuous_stats()``. They include ``cache_capacity``,
+``peak_cache_length``, ``cache_memory_bytes``, ``trim_count``,
+``trimmed_columns``, ``trim_frequency``, and ``trim_bytes_moved``.
+``cache_memory_bytes`` covers
+the preallocated KV tensors and active cache metadata. With profiling enabled,
+``trim_latency_ms``, ``end_to_end_ms``, and ``tokens_per_second`` are also
+measured with accelerator synchronization; otherwise those timing fields are
+``None`` or zero.
+``trim_frequency`` is the number of trims divided by decode steps. Trimming
+statistics remain zero when ``enable_cache_trimming`` is false unless a
+capacity-exhaustion fallback reclaims a dead prefix.
+
+``DeepSpeedStaticCache`` accepts one write position per row and can compact
+active rows while preserving its static tensor addresses. This mirrors the
+scheduler/cache separation used by systems such as vLLM and SGLang without
+copying their backend-specific kernels.

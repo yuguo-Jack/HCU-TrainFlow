@@ -67,3 +67,13 @@ User requests a unified autonomous entry Skill, persistent implement/review/corr
 4. Test dependency/race/stale-result/message/resource cases, review and install Skills, push development changes without release/tag — complete locally; publication is recorded in Git history and CI.
 
 - Dynamic operator decomposition clarification: use real model/profile operator identity and implementation scope; independent analysis and optimization proceed concurrently without an all-operator analysis barrier — complete.
+
+## 2026-10-09: official and task knowledge completion
+
+1. Complete HCU-Knowledge online PR/MR fallback and pinned source reading, test/review and publish v0.5.3 first — complete, pushed and tagged.
+2. Implement official Wiki PR discovery/read/source tracing, persistent public PR pages, full source-tree navigation and resumable source/PR update coverage — complete.
+3. Expand official engine documentation and source navigation with versioned evidence, deepen Megatron ecosystem; distinguish automatic source maps from authored analysis — complete.
+4. Add private task experience knowledge: environment/model/version identity, performance/loss evidence, successful and failed optimization milestones, retrieval and cookbook delivery provenance; integrate flow milestones — complete.
+5. Test offline and real public retrieval; review privacy, pagination, stale evidence and restart behavior; install Skills — complete. Commit/push development changes next; no TrainFlow release/tag.
+
+Real training and site-dependent command validation remain pending until hardware is supplied. This does not defer source-based Wiki work. HCU-Knowledge is not updated as a side effect of TrainFlow operation.

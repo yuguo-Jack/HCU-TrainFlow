@@ -3,9 +3,9 @@ id: official-transformer-engine-wiki/fusion-and-profiling
 title: TE 融合与形状级分析：OperationFuser 和 GEMM 教程
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

@@ -1,0 +1,213 @@
+---
+id: doc-nvidia-cudnn-frontend-03a78e5109c004153efe
+title: NVIDIA/cudnn-frontend / samples/README.md
+engine: cudnn-frontend
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: NVIDIA/cudnn-frontend
+commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+path: samples/README.md
+raw_sha256: 475c7814047e5d2691fa34986a6368e42934a30d8660f79cc2345ec004dfbf9d
+sources: []
+generated_body_sha256: 540b4feae8edff348aa19c8b20d2bce706fb81f813dc6f4cd78f27b9128ce6b3
+source_state: current-scan
+---
+
+# NVIDIA/cudnn-frontend / samples/README.md
+
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/samples/README.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# FE - Programming Samples
+
+## Python Interface Samples
+Samples leveraging FE's Python interface are located in [samples/python](python/).
+* [23_layer_norm](python/23_layernorm_with_pointwise_add_fusion.ipynb)
+    Shows how to run pointwise add and layer norm fusion with intermediate bfloat16 output.
+
+* [26_layer_norm](python/26_layernorm_forward_training_and_backward_with_relu_bitmask.ipynb)
+    Shows how to use layer norm with fusion pattern for relu using a bitmask.
+
+* [50_sdpa](python/50_sdpa_forward.ipynb)
+    Shows how to run causal self attention with dropout in forward pass.
+
+* [51_sdpa](python/51_sdpa_backward.ipynb)
+    Shows how to run causal self attention in bprop.
+
+* [52_sdpa](python/52_sdpa_with_paged_caches.ipynb)
+    Shows how to run scaled dot product attention (prefill phase) where the K and V caches are stored in non contiguous memory.
+
+* [53_sdpa](python/53_sdpa_decode_with_paged_caches.ipynb)
+    Shows how to run scaled dot product attention (decode phase) where the K and V caches are stored in non contiguous memory.
+
+## FROST Python Samples
+Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python API, each checked against a torch or fp64 reference:
+* [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul.
+* [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2 and GDP prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
+* [frost/gated_attention_block](frost/gated_attention_block/): the gated attention block's training forward (`save_for_backward=True`) -- the caller-owned `SavedForBackward` record and the zero-copy `saved_slab_views` of its projection slab, checked against torch (Rubin only).
+
+```
+python samples/frost/linear_attention/01_gdn_prefill.py
+```
+
+## C++ Interface Samples
+Samples leveraging FE's C++ interface are located in [samples/cpp](cpp/).
+
+### Building the samples
+
+```
+mkdir build
+cd build
+cmake -DCUDNN_PATH=/path/to/cudnn -DCUDAToolkit_ROOT=/path/to/cuda  ../
+cmake --build . -j16
+bin/samples
+```
+
+To run a single sample, for eg. `TEST_CASE("Cached sdpa", "[graph][sdpa][flash]")`
+
+```
+./bin/samples "Cached sdpa"
+```
+
+### Scaled dot product attention SDPA examples
+
+##### [samples/cpp/sdpa](cpp/sdpa) shows how to use cudnn's sdpa operation.
+
+- [Cached SDPA](cpp/sdpa/fp16_cached.cpp)
+
+Users are expected to build a graph once and then execute it multiple times. This example shows how to cache cudnn sdpa graph building. 
+
+- [Fwd SDPA](cpp/sdpa/fp16_fwd.cpp) and [Bwd SDPA](cpp/sdpa/fp16_bwd.cpp)
+
+cudnn's sdpa operation enables various customizations on itself. These examples show how to build a graph with sdpa operation for your own custom sdpa needs.
+
+- [Fwd SDPA with paged caches](cpp/sdpa/fp16_fwd_with_paged_caches.cpp)
+
+Similar to [Fwd SDPA](cpp/sdpa/fp16_fwd.cpp), but here with the ability to use non contiguous K and V caches in combination with page tables, as described in the [PagedAttention paper](https://arxiv.org/abs/2309.06180).
+
+- [Fwd FP8 SDPA](cpp/sdpa/fp8_fwd.cpp) and [Bwd SDPA](cpp/sdpa/fp8_bwd.cpp)
+
+Extends the sdpa sample to fp8 precision.
+
+- [Fwd SDPA with CUDA graph](cpp/sdpa/fp16_fwd_with_cudagraphs.cpp)
+
+Demonstrates the building and execution of a CUDA graph representing the SDPA operation, followed by the update (and another execution) of the CUDA graph with new variant pointers.
+
+### Convolution fusion examples
+
+##### [samples/cpp/convolution](cpp/convolution/) shows how to use cudnn fprop, dgrad, wgrad operation and some fusions with them.
+
+- [Fprop](cpp/convolution/fprop.cpp)
+
+Showcases a simple fprop, fprop with pointwise fusion of scale bias and relu, fprop with bias and relu for channels first layout and fusions before convolution in the form of scale bias relu conv and stats.  Also epilogue fusion of concatenate.
+
+- [Fp8 fprop](cpp/convolution/fp8_fprop.cpp)
+
+Showcases fp8 convolution with scaling and amax reduction.
+
+- [Int8 fprop](cpp/convolution/int8_fprop.cpp)
+
+Showcases Int8 convolution.
+
+- [Dgrad](cpp/convolution/dgrads.cpp)
+
+Has samples for simple dgrad, fusion for dgrad + drelu and Dgrad + Drelu + DBNweight fused operation.
+
+- [Wgrad](cpp/convolution/wgrads.cpp)
+
+Similar to dgrad was simple wgrad and scale+bias+relu+wgrad fused operation.
+
+### Matmul fusion examples
+
+##### [Matmul](cpp/matmul/) showcases different matmul samples.
+
+- [Matmul fusion](cpp/matmul/matmuls.cpp) 
+
+Has samples for simple Matmul, matmul fusions like matmul+abs, matmul+bias and matmul+scale+bias+relu operation.
+
+- [Fp8 Matmul](cpp/matmul/fp8_matmul.cpp)
+
+Showcases fp8 matmul with scaling and amax reduction.
+
+- [Int8 Matmul](cpp/matmul/int8_matmul.cpp)
+
+Showcases Int8 mamtul.
+
+- [Mixed precision matmul](cpp/matmul/mixed_matmul.cpp)
+
+Mixed precision multiplication between int8 and bf16 data-type with int8 operand being upcasted to bf16
+
+### Normaliization examples
+
+##### [Norm](cpp/norm/) showcases different matmul samples.
+
+- [LayerNorm](cpp/norm/layernorm.cpp)
+
+Eg for layernorm training, inference and back propagation
+
+- [AdaLayerNorm](cpp/norm/adaptive_layernorm.cpp)
+
+Eg for adaptive layernorm training, inference and back propagation
+
+- [RMSNorm](cpp/norm/layernorm.cpp)
+
+Eg for rmsnorm training, inference and back propagation
+
+- [BatchNorm](cpp/norm/batchnorm.cpp)
+
+Shows different fusions in batch norm fprop and bprop. And split batch norm fusions.
+
+- [Block scale quantize](cpp/norm/norm_block_scale.cpp)
+
+Showcases normalization with block scale quantize epilogue fusion.
+
+- [Norm zero centered gamma](cpp/norm/norm_zero_centered_gamma.cpp)
+
+Showcases layer normalization with zero centered gamma usage.
+
+- [Layer norm with bitmask relu](cpp/norm/layernorm_bitmask_relu.cpp)
+
+Showcases layer normalization and relu with bitmask.
+
+### Miscellaneous examples
+
+##### [Misc](cpp/misc/) Miscellaneous samples
+
+- [Pointwise fusions](cpp/misc/pointwise.cpp)
+
+pointwise fusions with scalar are shown in this sample.
+
+- [Resample](cpp/misc/resample.cpp)
+
+resample fprop operation with different resampling modes.
+
+- [Serialization](cpp/misc/serialization.cpp)
+
+How to serialize a graph into a file and read it back on another thread/process. 
+
+- [Autotuning](cpp/misc/autotuning.cpp)
+
+How to choose the best performing plan among multiple plans suggested by the heuristics.
+
+- [Cuda Graphs](cpp/misc/cudagraphs.cpp)
+
+Shows how to use the native cuda graph API. The samples show how to create cudnn's cuda graph, and how to repeatedly update it with new device buffers for multiple execution.
+
+- [SM Carveout](cpp/misc/sm_carveout.cpp)
+
+Showcases a Batch norm example, where only a partial number of SMs participate in executing the kernel.
+
+- [Deviceless ahead-of-time compilation](cpp/misc/deviceless_aot_compilation.cpp)
+
+Showcases how to do deviceless ahead-of-time compilation with the device property descriptor (instead of a cuDNN handle).
+
+## [Deprecated] C++ v0.x Interface Samples
+Samples leveraging FE's C++ 0.x interface are located in [samples/legacy_samples](legacy_samples/).

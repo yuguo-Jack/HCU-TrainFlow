@@ -3,9 +3,9 @@ id: official-cudnn-frontend-wiki/graph-and-plans
 title: cuDNN Graph、执行计划、Workspace 与动态形状缓存
 engine: cudnn-frontend
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

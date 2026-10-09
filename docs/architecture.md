@@ -17,6 +17,10 @@ flowchart TD
     R --> P[模型与系统证据]
     P --> A
     K[官方 Wiki与生态案例] --> A
+    K <--> PR[线上 PR / 固定源码 / 增量来源]
+    W --> EK[私有环境与模型经验 Wiki]
+    EK --> A
+    EK --> CB[经脱敏审核的 Cookbook 方法交付]
     H[可选 HCU 知识检索] --> A
     R --> D[远端 watcher 与既有容错]
     D --> O[持久事件与通知通道]

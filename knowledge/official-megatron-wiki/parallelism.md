@@ -3,9 +3,9 @@ id: official-megatron-wiki/parallelism
 title: 并行域、微批与 rank 采样
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

@@ -3,9 +3,9 @@ id: official-megatron-wiki/checkpoint
 title: 分布式 checkpoint、数据游标与恢复验收
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

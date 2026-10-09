@@ -3,9 +3,9 @@ id: official-megatron-wiki/moe
 title: MoE：路由、负载、通信与 grouped GEMM
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

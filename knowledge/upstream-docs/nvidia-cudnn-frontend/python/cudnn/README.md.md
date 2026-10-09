@@ -1,0 +1,128 @@
+---
+id: doc-nvidia-cudnn-frontend-9a9690530882dcff3e44
+title: NVIDIA/cudnn-frontend / python/cudnn/README.md
+engine: cudnn-frontend
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: NVIDIA/cudnn-frontend
+commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+path: python/cudnn/README.md
+raw_sha256: 2b391282946f06e0294a8a80df541f13218a14765d0a35027f0c3892a5a58d0d
+sources: []
+generated_body_sha256: 10055e941e088c03d0c5eecaddbad1f98b78a914375deb7fbde88013648e0b55
+source_state: current-scan
+---
+
+# NVIDIA/cudnn-frontend / python/cudnn/README.md
+
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/python/cudnn/README.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# cuDNN Python Frontend
+
+This folder exposes the Python Frontend Graph APIs and the high-level Graph wrapper, along with several frontend-only, ready-to-use APIs.
+
+- **Graph API**: Low-level primitives for building, compiling, and executing cuDNN operation graphs in Python.
+- **Graph Wrapper (`Graph`)**: A convenience layer that reduces boilerplate, manages workspace and tensor mapping, and makes execution ergonomic.
+- **Frontend-only APIs**: Individual turnkey kernels with Python-first APIs
+
+## Directory Structure
+
+A simplified view of package structure:
+
+```
+pyproject.toml                       # Project metadata and dependencies. Optional dependencies for frontend-only APIs are registered here.
+python/cudnn/
+├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
+├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
+├── wrapper.py                      # High-level Graph wrapper class
+├── datatypes.py                    # Data type conversions and helpers
+├── api_base.py                     # Abstract API base class for frontend-only APIs
+├── gemm/                           # GEMM operation family (operation-first layout)
+│   ├── ops/                        # Backend-independent contracts (torch custom ops)
+│   ├── frost/                      # FROST GEMM engine (graph analysis, codegen, JIT)
+│   ├── reference/                  # Pure-PyTorch correctness engine
+│   └── cutedsl/                    # Direct CuTe DSL kernels
+│       ├── dense/{operation}/      # __init__.py + api.py + {kernel_name}.py
+│       ├── grouped/{operation}/
+│       └── discrete_grouped/{operation}/
+├── {frontend-only-api-name}/       # Families not yet migrated (attention etc.)
+│   ├── __init__.py                 # Frontend-only API class
+│   └── api.py                      # High-level API implementation
+│   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
+├── gemm/                           # The GEMM operation family (see below)
+test/python/                        # Test files
+└── {operation}/cutedsl/           # Tests for frontend-only APIs
+```
+
+All GEMM fusions live under `gemm/`, grouped by operand layout:
+
+```
+python/cudnn/gemm/
+├── cutedsl/
+│   ├── dense/{amax,dsrelu,proj_rope_mxfp8,srelu,swiglu}/
+│   ├── grouped/{dglu,dsrelu,dswiglu,glu,glu_hadamard,quant,srelu,swiglu,unfused,wgrad}/
+│   └── discrete_grouped/{dswiglu,swiglu}/        # per-expert discrete weight pointers
+├── ops/                                          # backend-independent torch custom-op contracts
+└── reference/                                    # pure-PyTorch correctness engine
+```
+
+Every public GEMM symbol is re-exported at the top level (`cudnn.<symbol>`), which
+is the supported entry point — the directory layout is an implementation detail.
+
+## 
+
+## Adding new frontend-only APIs
+
+To add a new frontend-only API, follow these steps:
+1. Choose the operation family first. GEMM-family kernels go under `python/cudnn/gemm/cutedsl/{dense,grouped,discrete_grouped}/{api-name}/`; only non-GEMM families still use a top-level directory.
+2. Add your kernel implementation and implement the high level API implementation in `api.py`, extending the `APIBase` class in `api_base.py`.
+3. Expose the API import in `python/cudnn/__init__.py` and register the folder in `pyproject.toml`. Register any optional dependences if required.
+4. Add a sample usage/test file in `test/python/{operation}/cutedsl/`.
+
+**Currently implemented frontend-only APIs**:
+- `cudnn.ops.causal_conv1d` (full-sequence forward/backward) and `cudnn.ops.causal_conv1d_update` (one-token mutable update)
+- `GEMM + Amax`
+- `RMSNorm + RHT + Amax`
+- `GEMM + SwiGLU`
+- `GEMM + sReLU`
+- `GEMM + dsReLU`
+- `Grouped Gemm + GLU (Unified)`
+- `Grouped Gemm + GLU + Hadamard`
+- `Grouped Gemm + dGLU (Unified)`
+- `Grouped Gemm + SwiGLU (Legacy, Contiguous-only)`
+- `Grouped Gemm + dSwiglu (Legacy, Contiguous-only)`
+- `Grouped Gemm + sReLU (Contiguous-only)`
+- `Grouped Gemm + dsReLU (Contiguous-only)`
+- `Discrete Grouped Gemm + SwiGLU`
+- `Discrete Grouped Gemm + dSwiglu`
+- `Grouped Gemm + Quant (Legacy, Dense-only)`
+- `Grouped Gemm + Quant (Unified)`
+- `Grouped Gemm + Wgrad`
+- `Block Sparse Attention (BSA)`
+- `Flex Attention`
+- `HSTU Attention (Blackwell SM100/SM103)`
+- `SDPA Forward (SM100, D=256)`
+- `SDPA Backward (SM100, D=256)`
+- `NVFP4 Attention QAT Backward (Triton, D=128)`
+
+**In progress frontend-only APIs**:
+- GEMM + Dswiglu
+- GEMM + RoPE
+- Native Sparse Attention (NSA)
+
+## Discrete grouped API notes
+
+The discrete grouped APIs (`DiscreteGroupedGemmSwigluSm100` and `DiscreteGroupedGemmDswigluSm100`) use per-expert pointer arrays instead of a packed `B` tensor:
+
+- Runtime pointer inputs are CUDA `torch.int64` tensors (`b_ptrs`, `sfb_ptrs`) with shape `(num_experts,)`.
+- `compile()` is no-arg and compiles from descriptors captured in the constructor.
+- For CUDA graph capture, call `compile()` before capture and capture only `execute()` with preallocated tensors.

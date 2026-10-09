@@ -3,9 +3,9 @@ id: official-cudnn-frontend-wiki/overview
 title: cuDNN Frontend 官方工程：Graph、开放 Kernel 与训练调用链
 engine: cudnn-frontend
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

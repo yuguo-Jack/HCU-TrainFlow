@@ -63,3 +63,7 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 统一主控的目标、候选、独立复核与文件回复契约见 [协作循环](collaboration.md)。完整自动续接需要宿主 Agent 在线或已部署桥接，安装 Skill 不会自动启动后台模型服务。
 
 默认每 5 分钟采集交互文件，`flow-board TASK` 或 `flow-watch TASK --once` 可立即采集。运行期间用 `team-next TASK` 查看可派发任务、活跃会话、依赖与冲突，用 `agent-inbox TASK --recipient ASSIGNMENT` 查看定向消息。完整契约和运行时接入见 [多 Agent 协同](multi-agent.md)。
+
+## 官方 Wiki 与私有训练经验
+
+见 [搜索、在线 PR 和增量更新](wiki.md)，以及 [环境/模型经验和 Cookbook 记录](experience-knowledge.md)。官方 Wiki 可无需 GPU 独立使用。报告及阶段推进自动沉淀私有经验，重要里程碑再由 Agent 补解释；知识检索不触发 HCU 大知识库更新。

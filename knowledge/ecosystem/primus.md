@@ -3,9 +3,9 @@ id: ecosystem/primus
 title: AMD Primus：后端组织、版本锁与迁移路线
 engine: primus
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

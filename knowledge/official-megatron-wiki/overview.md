@@ -3,9 +3,9 @@ id: official-megatron-wiki/overview
 title: Megatron 官方生态：责任边界与阅读路线
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

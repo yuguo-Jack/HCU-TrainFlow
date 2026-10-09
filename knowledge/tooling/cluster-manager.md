@@ -3,8 +3,8 @@ id: tooling/cluster-manager
 title: HCU Cluster Manager：环境检查与单一恢复负责人
 engine: tooling
 stages:
-- prepare
-- operate
+- adapt
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

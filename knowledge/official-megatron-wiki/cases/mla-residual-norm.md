@@ -17,6 +17,8 @@ sources:
   path: tests/unit_tests/transformer/test_multi_latent_attention.py
   commit: a07014bbd47988608a05df23639c03441570e37b
   sha256: 744af8ccef91748b2d0117ba43219c5084d0a93dd1e13d0bee8a839a3a858d58
+pr_sources:
+- pr-nvidia--megatron-lm-7942
 ---
 
 # 案例：MLA 融合分支遗漏 residual 声明，导致反向少一层融合
@@ -55,3 +57,5 @@ PR head 为 `0e98321a9ddacc11141177202769712415d9f4bd`，merge 为 `91655aa78007
 - [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/a07014bbd47988608a05df23639c03441570e37b/tests/unit_tests/transformer/test_multi_latent_attention.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。
+
+[PR 原文、review 与 diff](../../prs/NVIDIA--Megatron-LM/PR-7942.md)

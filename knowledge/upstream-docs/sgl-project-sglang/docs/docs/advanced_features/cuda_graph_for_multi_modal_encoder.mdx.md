@@ -1,0 +1,107 @@
+---
+id: doc-sgl-project-sglang-a06ba0563dc5ceb32b88
+title: sgl-project/sglang / docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx
+engine: sglang
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: sgl-project/sglang
+commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+path: docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx
+raw_sha256: 06a4185f2919ccec23ecc914036acd745ba6d5f201bc575cefb37e366c461dc1
+sources: []
+generated_body_sha256: eef602691121cf429e00833bc162f725488fa8b674bdcb1ba748e21be341b095
+source_state: current-scan
+---
+
+# sgl-project/sglang / docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx
+
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+---
+title: "Cuda Graph for Multi-Modal Encoder in SGLang"
+metatags:
+    description: "CUDA Graph optimization for ViT in SGLang: reduce kernel launch overhead, dynamic input handling, support for Qwen2.5-VL and Qwen3-VL models."
+---
+## Motivation
+
+In multimodal reasoning services, the visual encoder (ViT / Vision Transformer) typically has a few characteristic traits:
+
+Many layers, fragmented operators: Each layer includes LN, QKV projections, attention, MLP, residual connections, etc., resulting in extremely frequent kernel launches.
+
+Server-side “small batch / low latency” is common: The batch size is very small (sometimes it looks like 1 after “flattening” the batch), so kernel launch overhead accounts for a large portion of end-to-end latency.
+
+Input token count (number of patches) varies frequently: Different image/video resolutions and different batch composition lead to different sequence lengths
+S — and this is precisely the biggest obstacle for CUDA Graph (unstable shapes).
+
+The value of CUDA Graph: It captures a long sequence of GPU kernels with fixed shapes and fixed memory addresses into a graph; later, for the same shapes, it can replay the graph directly, dramatically reducing launch overhead and making GPU scheduling more compact.
+
+This led us to seek a CUDA Graph enabled feature for ViT in order to improve ViT performance.
+
+## Design and Restrictions
+
+The new CUDA Graph enabled ViT logic is built on ViTCudaGraphRunner. This runner captures the "blocks + merger + deepstack merger (optional)" part of a vision transformer into a CUDA graph and replays it for identical shapes. See the following design consideration and restrictions for more details.
+
+### Dynamic inputs to fit static constraints of CUDA Graph
+
+Variable sequence length S is very common in ViT. While CUDA Graph requires fixed shapes. The solution is to build a graph cache by S(e.g., graph_key = S). The first time create a new S, and then capture a graph; afterwards, replay it.
+
+If there are many distinct S values, we need to increase VRAM usage which is graph-private memory pools for many graphs.
+
+### Stable addresses
+
+Everything "parameter-like" becomes a static buffer:
+
+- block_input / block_ws / block_output
+- cu_full_len / cu_window_len and their kk variants
+- sin_cos_ws
+
+In this way to solve the underlying requirement: during replay, not allowed to swap tensors, can only modify tensor contents.
+
+### Attention backend arguments
+Attention backend arguments are fixed inside the graph:
+
+TritonAttn expects [cu_seqlens, cu_seqlens_kk, max_len]
+FA3 expects [cu_seqlens, max_len]
+
+max_len is frozen as an int constant.
+cu_seqlens is cached into a dict during create_graph(), and its contents are not updated during subsequent replays.
+
+For the same graph_key = S, you not only require the input shape to match, but also require the segmentation pattern in cu_seqlens (and window seqlens) to be identical. Otherwise, attention will segment the sequence incorrectly.
+
+### Rotary buffer management
+The feature reallocates a larger sin_cos_ws when seq_len increases.
+The max_content_len is used to make sure the maximum size of the allocated rotary buffer.
+
+
+## Command Example
+You can enable CUDA Graph for ViT by setting env variable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1`, for example:
+```shell Command
+SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
+python3 -m sglang.launch_server \
+  --model Qwen/Qwen3-VL-8B-Instruct
+```
+To run the ViT graph together with Piecewise CUDA Graph over the decoder's
+prefill, ask for the prefill backend explicitly. Qwen3-VL is on neither
+multimodal allowlist, so the default backend resolves prefill to `disabled` for
+it; naming a backend locks the choice and skips that rule:
+```shell Command
+SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
+python3 -m sglang.launch_server \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --cuda-graph-backend-prefill tc_piecewise \
+  --cuda-graph-max-bs-prefill 4096 \
+  --cuda-graph-tc-compiler eager
+```
+
+## Known supported models
+- Qwen2.5-VL (https://github.com/sgl-project/sglang/pull/14422)
+- Qwen3-VL (https://github.com/sgl-project/sglang/pull/15320)

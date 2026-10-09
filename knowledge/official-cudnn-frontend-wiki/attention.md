@@ -3,9 +3,9 @@ id: official-cudnn-frontend-wiki/attention
 title: cuDNN SDPA 训练：Forward、Backward、Stats 与布局
 engine: cudnn-frontend
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

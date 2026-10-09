@@ -3,9 +3,9 @@ id: official-transformer-engine-wiki/build-run-test
 title: TE 安装、运行、单测与 HCU 环境接入
 engine: transformer-engine
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false

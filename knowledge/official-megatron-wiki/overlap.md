@@ -3,9 +3,9 @@ id: official-megatron-wiki/overlap
 title: TP、DP、PP、EP overlap 的适用条件
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false

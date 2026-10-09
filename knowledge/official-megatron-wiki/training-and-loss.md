@@ -3,9 +3,9 @@ id: official-megatron-wiki/training-and-loss
 title: 训练循环、loss 和优化器更新的证据链
 engine: megatron
 stages:
-- prepare
+- adapt
 - optimize
-- operate
+- fault-tolerance
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
