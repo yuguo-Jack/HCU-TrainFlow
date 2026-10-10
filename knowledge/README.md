@@ -1,14 +1,20 @@
 ---
 id: knowledge-index
-title: 训练引擎官方 Wiki 与生态机制索引
+title: TrainFlow 官方引擎、实践与站点知识索引
 visibility: public
 ---
 
-# 训练引擎官方 Wiki 与生态机制索引
+# TrainFlow 官方引擎、实践与站点知识索引
 
-本库以公开官方源码为基准，保存固定提交的阅读说明、工程导航和优化机制。HCU 私有补丁、现场材料和训练数据保存在任务工作区，通过可选 HCU-Knowledge 检索补充。
+本库保存固定官方源码的阅读说明、工程导航和优化机制，也保存跨任务通用实践、实际站点配置/配方/实测及模型案例。可复用知识与精选原件随工程提交；完整任务档案在 workspace。HCU-Knowledge 是完整安装的必需依赖，按问题联查，普通任务不更新它。
 
 重点覆盖 Megatron 生态、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；主要 SFT/RL 引擎按目录、调用链、安装运行测试、优化和故障诊断组织，仍不宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
+
+## 跨任务实践和站点
+
+- [通用工程实践](practices/README.md)：通信配方、执行基线与验证/交付顺序。
+- [站点环境、配方与实测](sites/README.md)：含真实配置和结果，可脱离旧 workspace 使用。
+- [知识归属与维护](../docs/knowledge-architecture.md)：官方、实践、站点/模型案例和任务档案的关系。
 
 ## 搜索与来源层
 

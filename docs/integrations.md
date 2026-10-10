@@ -2,7 +2,7 @@
 
 ## 完整安装
 
-系统 Python 3.10+、Git、Git LFS 和 HCU-Knowledge 读取权限是基础条件。`thirdparty/manifest.json` 锁定 TraceLens HCU fork、三个 Hygon 算子 Skill 的源仓以及必需的 HCU-Knowledge。公共仓只提交清单，不提交依赖源码、知识库资料、凭据或现场数据。
+系统 Python 3.10+、Git、Git LFS 和 HCU-Knowledge 读取权限是基础条件。`thirdparty/manifest.json` 锁定 TraceLens HCU fork、三个 Hygon 算子 Skill 的源仓以及必需的 HCU-Knowledge。第三方依赖本身只登记来源清单，不把完整 checkout 或 HCU-Knowledge 全量复制到本仓。本工程自带 Wiki 则提交实际站点知识、配方、测量及精选证据，见 [知识归属](knowledge-architecture.md)；凭据永不入仓。
 
 在工程根目录执行（PowerShell）：
 

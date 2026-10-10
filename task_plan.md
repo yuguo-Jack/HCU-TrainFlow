@@ -120,3 +120,23 @@ Site inventory, model/data definitions, raw measurements and user guidance are r
 2. Preserve unresolved evidence-backed gaps through environment-check even when execution succeeds or an older floor is reached; distinguish failure from missing comparison evidence — implemented with regressions.
 3. Exercise the sequence on a private collective diagnosis and retain per-rank configuration, correctness, physical-port counters and rollback evidence — initial A/B/A executed with per-rank numerical/exit checks; counter/source review and any additional candidate stay in private evidence.
 4. Review, run the complete test suite and knowledge validator, synchronize managed Skills and publish development changes without release/tag — local review, complete regression and managed Skill synchronization passed; publication is recorded in Git history and remote CI.
+
+## 2026-10-10: substantive workflow qualification and technical board
+
+User requires engineering detail and real scientific optimization, not ceremony. Prioritize a single coordinator; delegate only an independent substantial task with clear expected benefit or one necessary review.
+
+1. Audit actual environment, model/parallelism/profile/operator, recovery/monitor and RLCR evidence; publish a complete private capability/validation matrix with commands, dependencies and gaps. In progress.
+2. Extend the generated board with evidence-backed technical sections and update rules: environment/results vs expected, model/memory/parallelism, bottleneck conclusions, per-op bounds/headroom, experiments and decisions, scale/recovery/training health, RLCR findings. Pending.
+3. Execute focused real-model profiling/shape-bound analysis, justified parameter and operator optimization trials on fresh idle resources; quantify numerical/performance outcomes and limitations. Pending.
+4. Establish actual fault-tool command/dependency ownership; exercise task-local controlled failure, diagnosis, screening where supported, checkpoint relaunch and observation; clearly separate full site capabilities from partial tests. Pending.
+5. Validate RLCR revise→repair→independent-review on a meaningful candidate, integrate lessons into the existing six Skills, regression/review/sync and push public-safe changes. Pending.
+
+No automatic big knowledge-base update. No new public release. No artificial Agent roster or per-command review. Site traffic/host modification and destructive fault injection remain outside scope; controlled failure of our own test process only. User latest request authorizes onward model/workflow qualification; historical partial communication reference remains an explicit limitation, not a reason to silently stall all independent work.
+
+
+### 当前持续推进（2026-10-10）
+
+- [x] 跨任务站点知识与必要原件进入本仓 Wiki；检索、哈希、相对链接、Skill 规则及独立 review。
+- [ ] donor 原执行分支完成微批 ABBA、系统/算子优化与阶段 loss，维持主仓交付延后。
+- [ ] Cluster Manager 实际故障触发、任务身份停止、checkpoint 自动恢复和持续监测；CPU控制协议验证不代替此项。
+- [ ] 将后续可复用调参、loss、故障结果继续沉淀到同仓站点/模型案例。

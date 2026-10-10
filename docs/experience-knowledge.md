@@ -1,6 +1,6 @@
-# 私有训练经验 Wiki
+# 任务经验档案与工程 Wiki
 
-官方 Wiki 解释通用实现；私有经验 Wiki 保存某个环境、模型、源码和数据条件下的实际结果。参考 Hyperloom 将策略、实现身份和测量证据分开的做法，TrainFlow 增加训练上下文、阶段 loss、失败候选和 Cookbook 交付关系。
+官方 Wiki 解释通用实现；任务经验保存某个环境、模型、源码和数据条件下的完整实际结果。跨任务共享的站点、配方和模型经验整理到随工程提交的 `knowledge/`，见 [知识归属](knowledge-architecture.md)。本页 CLI 针对所选任务 Store，不代替工程 Wiki。参考 Hyperloom 将策略、实现身份和测量证据分开的做法，TrainFlow 增加训练上下文、阶段 loss、失败候选和 Cookbook 交付关系。
 
 ## 保存位置
 
@@ -18,7 +18,7 @@ experience/
     pages/<id>.md         可重建的可读参考页
 ```
 
-检索表和任务事件保存在 Store 的 SQLite 数据库。备份整个私有工作区；objects 和 records 是长期资产，不能当普通源码缓存删除。公共 Git 仓不包含这些现场数据。
+检索表和任务事件保存在 Store 的 SQLite 数据库。备份整个私有工作区；objects 和 records 是长期资产，不能当普通源码缓存删除。完整 Store 不复制进 Git；有复用价值的现场配置、关键数值和精选证据按知识架构整理入仓。
 
 每条记录绑定原始 context 指纹与 context_spec。任务上下文应包含环境/设备/gfx、DTK/PyTorch/runtime/库版本、源码 SHA/patch、模型结构/checkpoint、数据/分词/样本指纹、精度、并行拓扑及启动配方。缺失字段需要补证据，不能推测。跨环境可检索，复用前仍需验证。
 
@@ -84,6 +84,16 @@ loss 独立于性能结论：not-run/pass/fail/incomplete。非 not-run 需要�
 
 ## 主控与阶段 Skill
 
+### 有效现场配方必须形成可检索经验
+
+环境检查、通信排障或调参得到有复用价值的结果后，由所属阶段主动整理；不等用户再次提醒，不只在临时 research 报告里保存。仍使用现有 `experience-record` 和有精确适用条件的 `reference-record`，不新增平行知识库。
+
+- **身份与拓扑：** 站点/节点和设备、产品/gfx、实际镜像 digest、驱动/runtime/通信库构建与哈希、网卡/链路/NUMA、容器和调度方式。未知项明确保留；镜像标签不能代替构建身份。
+- **可复现配方：** 原命令、实际执行命令及差异、环境脚本的加载顺序与固定原件；显式列出有用的非敏感环境变量、默认或未设置值、每个 rank 的实际生效验证和动态库路径。凭据与完整未经筛选的环境转储不入页。
+- **效果与因果边界：** 测试 shape/dtype、消息量、rank/节点、计时与字节定义、预热/重复层级、各轮结果/正确性，与预期及原配方比较。多变量配方收益不能归给单个开关；带宽、延迟和不同统计列分别保留。
+- **复用与回退：** 适用/不适用条件、复用前检查、过期触发、实际故障与回退。参考成功不代表新任务自动健康通过；更换硬件、镜像、库、网络策略、节点规模或脚本需重新判断适用范围。
+- **入库验收：** 经验正文写入实际检索词/别名与命令变量名，链接固定原件、实验和参考记录；用新任务可能提出的问题做 `experience-search`，并对可量化参考做一次同条件 `reference-query`，确认能查到正文和原始证据。任务记录之后，将可复用站点/模型知识和必要原件整理进工程 Wiki，再从新 Store 验证 wiki-search 与相对链接。
+
 任务开始或遇到问题时，先检索相同模型/环境/机制的历史经验，再查官方 Wiki、线上 PR、底层源码和必要的 HCU 大知识库。里程碑后确认自动记录成功，补充重要解释。长训按阶段保存统计、异常和恢复结果，无需把每行 log 做成知识页。
 
 HCU-Knowledge 与两项知识库 Skill 属于完整安装的必需依赖，贯穿适配、优化和容错。按问题查阅不等于每一步强制查询；本项目的搜索、局部记录和官方 Wiki 维护也不会顺便更新 HCU 大知识库。
@@ -102,7 +112,7 @@ hcu-trainflow --workspace PRIVATE reference-query target.json
 hcu-trainflow --workspace PRIVATE reference-index
 ```
 
-`reference-query` 直接返回完整记录、来源、原始证据 ID 和私有页面。它只读本地资料，不联网、不重新运行单测，也不更新 HCU-Knowledge；需要刷新时由当前 Agent 在已授权范围内查证或安排实测。可在一个共用的私有 Store 积累跨模型参考，任务自己的实验 Store 保持独立；用 `--workspace` 明确选择，不能猜测或混用知识库源码缓存。
+`reference-query` 直接返回完整记录、来源、原始证据 ID 和私有页面。它只读本地资料，不联网、不重新运行单测，也不更新 HCU-Knowledge；需要刷新时由当前 Agent 在已授权范围内查证或安排实测。跨任务共享采用本仓 `knowledge/sites/` 或 `knowledge/experiments/`；此查询不会自动导入仓内 JSON。用 `--workspace` 明确选择任务 Store，不能把切换/复制旧任务目录作为工程知识的唯一复用方式。
 
 ### 记录的含义
 
@@ -171,4 +181,4 @@ hcu-trainflow --workspace PRIVATE artifact-read SOURCE_ARTIFACT PRIVATE_SOURCE_F
 
 可信差距还要按[环境性能排查闭环](environment-discovery.md#6-性能不及预期时的排查顺序)继续查配置/链路/库实现及尝试可逆对照。参考查询的 compatible 不是当前性能通过，mismatched/missing 也不是停止排查的理由。沿用 diagnosis 经验记录保留原件、假设、尝试、正确性/作用证据、保留或回退及未解项；未解决的环境观测附 `performance_discrepancy`，不只更新参考页面就宣告处理完成。
 
-`reference-index` 先校验所有固定记录和 evidence，再重建 Markdown，不覆盖原件；页面生成失败可重试。记录原件被改写或证据丢失会报错，不能以重新建索引洗掉问题。整个 references 仍在原有私有 experience 导出边界内，不能直接上传公共仓。
+`reference-index` 先校验所有固定记录和 evidence，再重建 Markdown，不覆盖原件；页面生成失败可重试。记录原件被改写或证据丢失会报错，不能以重新建索引洗掉问题。完整 references 属于任务档案；精选测量、适用条件和必要原件按知识架构整理到本仓 Wiki。外部 Cookbook 导出边界单独遵守。

@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import hashlib
 from hcu_trainflow.wiki import parse_page
+from hcu_trainflow.knowledge_evidence import validate_manifests
 
 def validate(root):
     errors=[];ids=set();pr_refs=[]
@@ -33,6 +34,7 @@ def validate(root):
         if rule['source'] not in sources:errors.append('Unknown maintenance source')
         for target in rule['targets']:
             if not (root/target).is_file():errors.append('Missing maintenance target '+target)
+    errors.extend(validate_manifests(root))
     return {'pages':len(ids),'sources':len(sources),'errors':errors}
 
 if __name__=='__main__':

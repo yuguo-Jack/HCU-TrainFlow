@@ -162,3 +162,12 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - Independent root review and full local regression: **905 passed, 4 platform-specific skips**, 59.03 seconds. Knowledge validator: **485 pages / 24 sources / no errors**. Private hardware experiments and publication are recorded separately; no site measurements or identifiers are included here.
 
 - Root reviewed the complete public diff and synced the four changed managed Skills (the two Wiki Skills were already current). The private A/B/A executed with native correctness and per-rank shutdown evidence; reference comparability and shared-network uncertainty remain explicit. Further site analysis stays in the private workspace.
+
+
+## 2026-10-10：跨任务站点知识归属修正
+
+- 按用户明确要求将真实站点配置、通信配方、三轮测量和关键证据放入 knowledge/sites，随本仓提交；不建独立共享私有 Store，不沿用外部 Cookbook 的无数据限制。
+- 新增通用 practices、知识归属说明；六个 Skill、README、贡献/安装文档同步，已安装到本机 Skill 目录。
+- 新任务 Store 实测4条跨引擎查询均能找到站点，读取正文无需原任务。62份声明证据、491页/24来源校验通过。
+- 独立 reviewer 找到并已复核关闭旧发布规则、站点目录/相对路径符号链接漏检、源码机制依据仅在旧workspace三项问题。
+- 全套本地961通过/4平台跳过；之后新增符号链接回归并单独9通过。硬件实测与本地协议测试范围分别保留，整体训练与真实自动恢复仍未完成，不发布release。

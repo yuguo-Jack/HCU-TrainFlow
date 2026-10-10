@@ -54,7 +54,7 @@ collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 
 **HCU-Knowledge 是完整安装的必需组成，贯穿三个阶段。** 按问题检索硬件、工具、HCU 工程、配方、优化与故障案例，并联查私有训练经验和官方引擎 Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。必需安装不表示每个命令都强制查询。
 
-局部官方 Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。实际性能、loss、故障和里程碑持续沉淀到私有经验 Wiki；公开 Cookbook 交付与验证记录关联，现场数据留在私有工作区。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
+局部官方 Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。可复用的站点配置、实测基准、性能/loss 和故障经验沉淀到本仓 `knowledge/sites/`、`knowledge/experiments/`，精选证据随仓提交，跨任务直接检索。完整任务档案留在 workspace；外部 Cookbook 的发布要求单独处理。参见 [知识归属与跨任务复用](docs/knowledge-architecture.md)。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
 
 ## 安装
 
@@ -98,7 +98,7 @@ python scripts/validate_knowledge.py
 | `examples/`、`tests/` | 合成示例与本地回归 |
 | `thirdparty/` | 依赖清单和忽略提交的工具 checkout |
 
-任务源码、现场数据、日志、看板与凭据保存在独立私有工作区；默认 `.work/` 同样忽略提交。公共仓仅包含可复用流程、工具、公开知识及合成示例。
+任务源码、完整日志/trace/checkpoint、数据与看板保存在独立 workspace；默认 `.work/` 忽略提交。工程 Wiki 同时包含官方知识、通用实践、实际站点和模型案例及精选证据；凭据、私钥和 token 不入仓。
 
 - [工作流全景](docs/workflow-map.md) / [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
 - [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)

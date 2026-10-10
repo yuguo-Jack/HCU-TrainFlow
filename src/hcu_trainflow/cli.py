@@ -35,6 +35,7 @@ def parser():
     cmd('flow-advance', 'task')
     cmd('flow-board', 'task')
     cmd('flow-status-update', 'task', 'file')
+    cmd('flow-guidance-record', 'task', 'file')
     q = cmd('flow-questions', 'task'); q.add_argument('--refresh', action='store_true')
     q = cmd('flow-answer', 'task', 'question', 'file'); q.add_argument('--version', required=True); q.add_argument('--file-hash', required=True); q.add_argument('--author', required=True)
     q = cmd('flow-watch', 'task'); q.add_argument('--once', action='store_true')
@@ -103,7 +104,7 @@ def parser():
     select.add_argument('--generation'); select.add_argument('--project')
     cmd('wiki-catalog','project')
     q = cmd("wiki-search", "query"); q.add_argument("--limit", type=int, default=10); q.add_argument("--engine"); q.add_argument("--stage")
-    q.add_argument('--kind',choices=['authored','source-pr','source-map','source-document'])
+    q.add_argument('--kind',choices=['authored','source-pr','source-map','source-document','site-knowledge','experiment-knowledge'])
     q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT','.')); q.add_argument('--online-pr',choices=['auto','always','off'],default='auto')
     q.add_argument('--pr-query'); q.add_argument('--repo',action='append',default=[]); q.add_argument('--source')
     q = cmd('wiki-search-pr', 'query'); q.add_argument('--project',default=os.environ.get('TRAINFLOW_PROJECT','.'))
@@ -144,6 +145,11 @@ def execute(a):
     if c == 'flow-question': return flow.question(store, a.task, read_json(a.file))
     if c == 'flow-question-close': return flow.close_question(store, a.task, a.question, a.guidance, a.note)
     if c == 'flow-status-update': return flow.status_update(store, a.task, read_json(a.file))
+    if c == 'flow-guidance-record':
+        from . import chat_guidance
+        result = chat_guidance.record(store, a.task, read_json(a.file))
+        flow.render_board(store, a.task)
+        return result
     if c in {'flow-questions', 'flow-answer'}:
         from . import file_questions
         if c == 'flow-questions':

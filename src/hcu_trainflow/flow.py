@@ -495,27 +495,43 @@ def guard_execution(store, tid, *, allow_parallel=False):
 
 
 def status_update(store, tid, value):
-    """A concise human-facing summary; does not change any execution gate."""
+    """A scoped human-facing summary and technical patch; never execution gates."""
+    from . import technical_board
     required = {'summary', 'progress', 'next', 'needs_human', 'evidence'}
-    if not isinstance(value, dict) or set(value) != required:
-        raise FlowError('Status requires summary, progress, next, needs_human and evidence')
-    if not isinstance(value['summary'], str) or not value['summary'].strip() or len(value['summary']) > 240 or '\n' in value['summary']:
-        raise FlowError('Status summary must be one concise line up to 240 characters')
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {'technical', 'context', 'context_epoch'}:
+        raise FlowError('Status requires summary, progress, next, needs_human and evidence; optional technical and context/context_epoch')
+    technical_board.text(value['summary'], 'Status summary', 240, single_line=True)
     for key in ('progress', 'next', 'needs_human'):
-        if not isinstance(value[key], list) or len(value[key]) > 3 or any(not isinstance(x, str) or not x.strip() or len(x)>200 or '\n' in x for x in value[key]):
+        if not isinstance(value[key], list) or len(value[key]) > 3:
             raise FlowError('Status lists allow at most three concise single-line items')
-    if not isinstance(value['evidence'], list):
-        raise FlowError('Status evidence must be retained artifact IDs')
-    for sha in value['evidence']:
-        store.artifact(sha)
+        for item in value[key]:
+            technical_board.text(item, 'Status item', 200, single_line=True)
+    technical_board.evidence(store, value['evidence'])
     task = store.task(tid)
+    supplied_scope = set(value) & {'context', 'context_epoch'}
+    if supplied_scope and (supplied_scope != {'context', 'context_epoch'}
+            or not isinstance(value['context'], str) or type(value['context_epoch']) is not int
+            or not technical_board.fresh(value, task)):
+        raise FlowError('Status context/context_epoch must both match the current task')
+    patch = value.get('technical', {})
+    technical_board.validate(store, patch, patch=True)
+    with store.db() as db:
+        previous = db.execute('SELECT payload FROM flow_status WHERE task=?', (tid,)).fetchone()
+    previous_payload = previous['payload'] if previous else None
+    sections = technical_board.merge(json.loads(previous_payload) if previous_payload else None, patch, task)
+    technical_board.validate(store, sections)
     body = {**value, 'context': task['context'], 'context_epoch': task['context_epoch']}
+    if sections or 'technical' in value:
+        body['technical'] = sections
     artifact = retain(store, body)
     with store.db() as db:
         db.execute('BEGIN IMMEDIATE')
         current = db.execute('SELECT context FROM tasks WHERE id=?', (tid,)).fetchone()
         if not get_flow(db, tid) or current['context'] != task['context'] or context_epoch(db, tid) != task['context_epoch']:
             raise FlowError('Start/reconcile the current flow before writing its status')
+        latest = db.execute('SELECT payload FROM flow_status WHERE task=?', (tid,)).fetchone()
+        if (latest['payload'] if latest else None) != previous_payload:
+            raise FlowError('Status changed while merging technical sections; reread and retry')
         db.execute('INSERT OR REPLACE INTO flow_status VALUES(?,?,?)', (tid, json.dumps(body, ensure_ascii=False), utc()))
         store.event(db, tid, 'flow-status-updated', {'artifact': artifact, **body})
     return {**render_board(store, tid), 'status_artifact': artifact}
@@ -590,16 +606,20 @@ def render_board(store, tid):
                '[提问与回答](QUESTIONS.md) · [修改要求与指导](GUIDANCE.md) · [完整协作记录](DETAILS.md)',
                '[计划](../../task_plan.md) · [发现](../../findings.md) · [过程](../../progress.md)', '',
                '## 当前进展', '']
+    from . import technical_board
+    safe = technical_board.plain
     status_body = json.loads(status['payload']) if status else None
-    fresh = status_body and status_body['context'] == task['context'] and status_body['context_epoch'] == task['context_epoch']
+    fresh = technical_board.fresh(status_body, task)
     if fresh:
-        concise += [status_body['summary'], ''] + ['- ' + x for x in status_body['progress']]
-        concise += ['', '## 接下来', ''] + (['- ' + x for x in status_body['next']] or ['- 按当前计划继续。'])
+        concise += [safe(status_body['summary']), ''] + ['- ' + safe(x) for x in status_body['progress']]
+        if status_body['evidence']:
+            concise += ['', '进展证据：' + ' · '.join(link(sha) for sha in status_body['evidence'])]
+        concise += ['', '## 接下来', ''] + (['- ' + safe(x) for x in status_body['next']] or ['- 按当前计划继续。'])
     else:
         concise += ['主控尚未更新当前上下文的简要进展；请查看完整记录。']
         if rounds:
             latest = rounds[-1]
-            concise += ['- 最近候选：' + artifact_json(store, latest['candidate'])['summary'][:200]]
+            concise += ['- 最近候选（历史记录）：' + safe(artifact_json(store, latest['candidate'])['summary'][:200])]
     concise += ['', '## 需要你关注', '']
     needs = list(status_body['needs_human']) if fresh else []
     needs += [json.loads(q['payload'])['title'][:200] for q in questions if q['status']=='open' and json.loads(q['payload'])['blocking']]
@@ -608,8 +628,10 @@ def render_board(store, tid):
         needs.append(f'有 {pending_guidance} 版指导等待主控处理。')
     if inbox['scan_error']:
         needs.append('问题文件暂时无法正常采集，请保留原件并查看完整记录中的原因。')
-    concise += ['- ' + x for x in needs[:5]] or ['- 当前没有已登记的人工决策需求。']
+    concise += ['- ' + safe(x) for x in needs[:5]] or ['- 当前没有已登记的人工决策需求。']
+    if fresh:
+        concise += technical_board.render(status_body.get('technical', {}), link)
     concise += ['', f"你的问题：{inbox['pending']} 项待回答；默认每 5 分钟采集，在线 Agent 会在原问题下回复。",
-                '此页由程序生成；完整证据、团队消息和历史保存在完整协作记录中。进展摘要不替代训练验收。', '']
+                '此页由程序生成；原始证据、团队消息和历史保存在完整协作记录中。看板内容不替代训练验收。', '']
     atomic_write(board, '\n'.join(concise))
     return {'board': str(board), 'guidance': str(human), 'questions': inbox['path'], 'details': str(details), 'task': tid}

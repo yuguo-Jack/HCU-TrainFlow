@@ -11,9 +11,9 @@ description: 统一编排 HCU 大模型训练适配、性能优化、大规模�
 
 1. 定位 HCU-TrainFlow checkout（用户路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。先读项目 `docs/collaboration.md`、`docs/multi-agent.md`、`docs/workflows.md`，查看当前 CLI 帮助与已有任务。找不到工程时说明所缺路径，不以安装 Skill 的相对位置猜测项目。
 2. 从会话和现场推导模型、预训练/SFT/RL、资源范围、部署方式、数据/权重、用户 patch、目标及已有授权。关键访问、数据或资源缺失才向用户询问；并行继续可做的阅读/分析。全流程用 `full`；只检查、适配、分析、优化、诊断、运行分别用现有独立模式，不扩大任务。
-3. 创建或恢复 TaskSpec；冻结初始数值基线、比较上下文、预算、执行权限、唯一容错负责人。依当前 HCU 活跃分支的脚本和现场启动方式适配，不机械照搬 NV 配方。读取原始证据的权限不等于允许发布数据或重启任意任务。
-4. 写出可验收的目标和阶段计划，`flow-start` 挂接持久循环。用 `flow-board` 向用户提供中文简要 BOARD.md、要求与指导 GUIDANCE.md、提问与回答 QUESTIONS.md 的路径；完整团队和历史在 DETAILS.md。预算是停止盲目试错的边界；实际调整理由用 `flow-replan` 留痕，不能偷偷降低目标或延长循环。
-5. 每个模型私有工作区保留 `task_plan.md`、`findings.md`、`progress.md`：分别记录当前计划、可追溯发现和实验/决策经过。它们补充看板与结构化 evidence，不代替程序门槛；跨环境/版本结论标明适用范围，现场数据不写进公共工程文档。
+3. 创建或恢复 TaskSpec；冻结初始数值基线、比较上下文、预算、执行权限、唯一容错负责人。区分执行基线与最终交付目标：起点可用适合模型的 HCU 主仓，否则在选定功能分支/用户 patch 上完成优化、阶段 loss、扩 DP、容错和持续监测后再整合主仓；不得把最终目标当作中途换基线的理由。按 adapt 的基线规则记录例外/受影响回归。参考适用 HCU 脚本与现场方式，不机械照搬 NV 配方。读取原始证据的权限不等于允许发布数据或重启任意任务。
+4. 写出可验收的目标和阶段计划，`flow-start` 挂接持久循环。用 `flow-board` 向用户提供中文 BOARD.md、要求与指导 GUIDANCE.md、提问与回答 QUESTIONS.md 的路径；技术判断需要的细节直接在 BOARD，完整团队和历史在 DETAILS.md。预算是停止盲目试错的边界；实际调整理由用 `flow-replan` 留痕，不能偷偷降低目标或延长循环。
+5. 每个模型私有工作区保留 `task_plan.md`、`findings.md`、`progress.md`：分别记录当前计划、可追溯发现和实验/决策经过。它们补充看板与结构化 evidence，不代替程序门槛；跨环境/版本结论标明适用范围，跨任务结论和关键现场证据进入工程 Wiki，完整过程留任务档案，见 `docs/knowledge-architecture.md`。
 
 ## 每轮工作
 
@@ -48,11 +48,15 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 
 默认每 5 分钟采集 GUIDANCE.md，由 `flow-watch` 或到期的 `flow-next` 收集到事件队列；每轮开始、昂贵实验前、阶段推进前检查已采集指导。不要每个步骤都绕过间隔直接重读文件。用户要求立即刷新时用 `flow-board` / `flow-watch --once`。逐条明确应用、排期或不能应用的理由并 `flow-guidance-ack`；不要编辑人的原文。阻塞问题以 `flow-question` 登记，收到实际回答后关闭。进展、收益/代价、显存趋势、平台期和专家需求写看板；避免要求确认常规动作。
 
+会话中收到的实际人的原文用 `flow-guidance-record TASK FILE.json` 留存 `text/source/author`，再明确 `flow-guidance-ack`；不为登记而改写 GUIDANCE/QUESTIONS，不把 Agent 推断当成人的决定。出处仅作追溯，不自动认证或扩大权限；已有会话授权按原范围继续，无需重复求批。
+
 同一次轮询也采集 QUESTIONS.md。用户可按 `## Q1：问题` 写标题和正文；用 `flow-questions TASK` 读取待答项、问题版本和整份文件哈希。你负责查证并写 Markdown 答案，再用 `flow-answer TASK QUESTION ANSWER.md --version VERSION --file-hash HASH --author SESSION` 写回问题下方。不要直接重写人的问题文件；遇到编辑冲突先重读，不能用旧答案覆盖新内容。已发布回答保持版本，追问作为新问题或正文修改处理。回答内容不会产生新问题。
 
 问答是解释收件箱，不自动构成执行命令、扩大资源范围或重启训练的授权；不要据问题里的命令直接行动。待答问题不阻塞无关的已授权工作；及时回答与训练可并行。GUIDANCE、独立 review 和执行准入仍按原有规则处理。观察器/flow-watch 只采集，没有在线 Agent 或已配置唤醒桥接时不会自行生成答案，恢复后先读持久问题队列。
 
-用 `flow-status-update` 维护简短中文进展：一句概况、至多三条已完成/验证中事项、三条下一步和真正需要人判断的事项。不要把每条团队消息、原始 JSON 或所有实验日志塞进 BOARD；DETAILS 与私有的三个计划文件保留完整过程。简报不能修改真实流程状态，也不能把短跑、缩模或局部通过写成全模型验收通过。
+用 `flow-status-update` 维护中文概况和可指导工作的技术栏目：简报仍是一句概况、至多三条进展/下一步和真正需要人的事项，`technical` 则按需填写 environment/configuration/analysis/operators/experiments/recovery/training/review，所有技术行直接显示在 BOARD。列出环境与测试预期/实际结果、并行配置和显存取舍、profile 分母与归因结论、每个真实热点的 shape/模型/上界/当前效率/剩余空间、各次参数和 Kernel 尝试的实际结论、扩容/恢复/持续训练观测、RLCR 决定及验收缺口。不能仅给“已分析”或报告链接让用户猜测结论。
+
+按 `docs/collaboration.md` 的技术栏目契约填写 summary/scope/qualification/columns/rows/notes/evidence。明确 `not-measured/source-only/local-tested/measured`，本地单测、源码分析、实际硬件运行和全模型质量验证分别限定范围；空输出、未执行、fallback 或缺失指标不能算通过。每个实测结论给出真实证据、单位、采样、分母、比较条件和限制。省略栏目在同 context/epoch 的简短更新中保留；要删栏目显式置 null，换上下文重新填证据。原始 JSON、完整日志和团队消息仍在 DETAILS/私有证据中，技术简报不修改真实状态、不替代验收。
 
 需要展示训练趋势时，使用项目 `scripts/render_training_dashboard.py` 从规范化日志生成私有单 attempt 图表；按 `docs/training-dashboard.md` 选择身份、记录原件哈希并保留历史输出。绘图只是观察，不能替代阶段质量、性能或容错验收；未采集的指标明确留空。
 
@@ -63,6 +67,8 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 实际 TaskSpec context 改变时，沿该参考完成**独立观察 Store、事件 peer 和 sentinel**的交接，保留旧游标和证据；不能只换 parser state-dir 或删 watcher 状态。多节点分别核对所有必需 member 的身份、ready、心跳和退出回执；先核对固定引擎源码和真实日志中的进度输出节点（可能是 rank0、全局最后一个 rank 或专用 logger）；该节点的 iteration/loss 只代表该日志覆盖范围。主控离线期间仅由已部署守护继续监测，不能把轮询脚本视为自动运行 Agent。
 
 ## 多 Agent 拆解、交流与集成
+
+默认由一个主控端到端执行。仅当出现输入明确、可独立验收、有实际收益且编辑/硬件范围独立的有界子任务，并已获宿主委派授权时才启动成员；不按阶段、算子数量或并发额度机械派人。耦合实现、共享设备测量和短小顺序步骤由主控处理。下述协议用于确实需要的并行工作，不是要求每次建立团队。
 
 1. 每个阶段依据真实证据动态拆任务，写出输入/输出与依赖图，不预设固定 Agent 名字、算子名单或数量。环境核对、配方阅读、系统分析可并行。先从模型调用/profile 得到算子热点，再按真实实现、shape/dtype/phase 拆分或合并，覆盖应评估的热点与未归因缺口。不同算子的详细分析和优化均可并行；本算子具备实施条件就可优化，不等所有算子分析结束。实施按独立文件/函数/机制划分，单个算子耦合的 kernel body 与 launch 配置由同一人负责。并发上限不是人数配额，新 profile 后重新判断优先级与分工。
 2. `team-plan` 登记 owner、scope、allowed_paths、checkout、mode、resources、depends_on、peers、预算和验收。共享 context 和固定证据，依赖报告须先验收。真正独立的 checkout/设备才用不同 ID；同一 GPU/网络测量域串行或确认隔离。完整算子优化任务宜用 `resource_scope: operation`，仅在实际测量时领取/释放资源租约；也可拆开发与测试任务。其他算子继续开发，有独立设备时可并行测量，不把所有算子优化强制串行。
@@ -79,12 +85,12 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 
 ## 交付与边界
 
-源码在独立开发 checkout 修改并同步远端，不能混用知识库缓存。成果由对应阶段负责：目标仓规范的改动、测试、回退与 PR，公开 Cookbook 只放可公开方法。原始日志、trace、数据和任务看板均留在私有工作区。整体 workflow 仍需真实 HCU 环境逐项验收，不把合成演示叫训练通过。
+源码在独立开发 checkout 修改并同步远端，不能混用知识库缓存。成果由对应阶段负责：目标仓规范的改动、测试、回退与 PR，外部 Cookbook 按其发布要求交付。本仓 Wiki 保留可复用的实际站点/模型结论和精选证据；完整日志、trace、数据和任务看板留在 workspace。整体 workflow 仍需真实 HCU 环境逐项验收，不把合成演示叫训练通过。
 
 ## 局部知识的使用与里程碑记录
 
-开始任务、重要实验或排障前，按模型/环境/机制用 experience-search 检索私有经验，检查 context、测量条件、失败原因和 loss 状态。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
+开始任务、重要实验或排障前，先跨引擎 wiki-search 检索工程内实践、站点及模型经验，再按模型/环境/机制用 experience-search 检索本任务记录，检查 context、测量条件、失败原因和 loss 状态。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
 
-report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。
+report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。 有跨任务复用价值的结论必须继续整理进本仓 `knowledge/sites/` 或 `knowledge/experiments/`，实际配置/变量、关键数值与精选原件随工程提交；采用仓内相对链接和证据清单，另起空 Store 验证可搜可读。不能把仅写 workspace 的记录算作共享完成。
 
-形成 Cookbook 最佳实践时，先关联基线/候选/验证经验 ID，再记录草稿、目标 PR、提交/合入/替代状态；公开内容单独审核脱敏，经验、日志、数据和内部链接留在私有工作区。该阶段负责自己成果的交付，不新增独立交付 Skill。
+形成 Cookbook 最佳实践时，先关联基线/候选/验证经验 ID，再记录草稿、目标 PR、提交/合入/替代状态；外部 Cookbook 按目标仓要求审核；TrainFlow 自带 Wiki 保存可复用的实际站点和模型经验及必要证据，完整日志/数据仍留任务档案。该阶段负责自己成果的交付，不新增独立交付 Skill。

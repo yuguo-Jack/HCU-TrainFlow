@@ -1,6 +1,6 @@
 # Project instructions
 
-- Keep this repository public-safe. Put site configuration, source checkouts, task data, logs, credentials and original materials in an ignored private workspace.
+- Keep reusable knowledge in this repository's `knowledge/`: official implementation, practices, real site configuration/recipes/measurements and selected evidence belong here and are shared across tasks. Keep complete task archives, datasets, checkpoints, source checkouts and execution state in the workspace. Never commit credentials, private keys or access tokens. External Cookbook publication rules are separate from this repository's Wiki policy; see `docs/knowledge-architecture.md`.
 - Preserve one coordinator entry plus three stage Skills and two Wiki Skills. Analysis-only, environment-only and diagnosis-only are valid independent requests.
 - For model adaptation, inspect applicable scripts/configs in the selected HCU repository and the user's actual deployment first. Reuse compatible HCU launch recipes; use NVIDIA upstream to check model/training semantics. Verify branch, dependencies and effective environment instead of copying NVIDIA launch commands or platform-specific variables.
 - Do not refresh HCU-Knowledge as a side effect of this project's search or maintenance.
