@@ -21,7 +21,7 @@ description: 扩容 HCU 训练并衔接现有容错，持续观测进展、诊�
    watcher 保留每次 attempt 的开始及上次真实推进时间，不用高频心跳代替 step 推进；升级后核对游标迁移和轮转告警。未知命令核销后仍保留保守超时预算，不能借核销继续无限重试。上下文重置要建立新的监测范围，历史日志与恢复证据继续保留。
 3. 远端独立运行 watcher/日志归一化器。监测 step/token 进展、loss/grad、吞吐、显存、checkpoint、进程和恢复阶段；进程活着不等于训练正常，重新启动不等于恢复成功。
 4. 将事件写入持久化 outbox。飞书通知可复用现有容错渠道；Agent 唤醒使用部署时明确配置的运行时桥接，不能把 webhook 送达或 inbox 文件出现叫作 Agent 已接手。领取、处理和完成分别回执。
-5. 本机休眠不停止远端监测和既有容错。恢复后按 sequence 重放并去重，先核对当前 attempt/checkpoint/控制权，再采取动作。另部署独立 heartbeat observer，防止 watcher 自己挂掉无人发现。
+5. 本机休眠不停止远端监测和既有容错。恢复后按 sequence 重放并去重，先核对当前 attempt/checkpoint/控制权，再采取动作。另部署独立 heartbeat observer，防止 watcher 自己挂掉无人发现。 按 `docs/remote-execution.md` 的远端接管要求，实际关闭发起连接，验证故障检测、恢复决策、START/STOP执行均不依赖本机消费队列；分别预检控制端和训练端运行时。后台派发回执保持未决，核销唯一owner及全部成员后再交还控制权。
 
 ## 观察交接与工作区维护
 
