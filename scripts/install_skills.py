@@ -13,8 +13,8 @@ sys.path.insert(0, str(ROOT / 'src'))
 from hcu_trainflow.dependencies import require_checkout
 from hcu_trainflow.core import FlowError
 
-NAMES = ('hcu-trainflow','hcu-train-adapt','hcu-train-optimize','hcu-train-fault-tolerance','hcu-engine-wiki-search','hcu-engine-wiki-update')
-RENAMED = {'hcu-train-prepare': 'hcu-train-adapt', 'hcu-train-operate': 'hcu-train-fault-tolerance'}
+NAMES = ('hcu-trainflow','hcu-train-adapt','hcu-train-optimize','hcu-train-fault-tolerance','hcu-engine-wiki-search','hcu-engine-wiki-skill-update')
+RENAMED = {'hcu-train-prepare': 'hcu-train-adapt', 'hcu-train-operate': 'hcu-train-fault-tolerance', 'hcu-engine-wiki-update': 'hcu-engine-wiki-skill-update'}
 KERNEL_NAMES = ('hygon-hip-baseline-generator', 'hygon-hip-kernel-optimizer', 'hygon-triton-kernel-optimizer')
 KNOWLEDGE_NAMES = ('hcu-knowledge-search', 'hcu-knowledge-update')
 

@@ -15,14 +15,18 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 
 **先复用已有验证。** 开始候选前检查已有数值、dispatch、性能和阶段 loss 证据，记录源码/库/配置差异究竟影响哪层。固定实现、ABI、shape/dtype 和数值契约未变的独立算子测试直接引用；换训练分支通常先补集成与端到端对照，不重跑整套底层资格测试。确有调用/梯度生命周期、依赖版本或覆盖缺口时只补受影响用例，写明重测原因。稳定候选再做一次阶段 loss 验收；不要以反复资格测试代替推进新优化。
 
+**并行组织热点工作。** 获取固定模型 profile 和真实调用契约后，“同 shape 独立实测与模型内对照”和“上限评估、融合挖掘与实现优化”是可并行的两条工作线，不以全部单测完成作为启动分析的前提。按实际热点把不同算子或实现独立的算子族分给不同成员；上限初估可先基于源码、FLOPs/字节量和匹配硬件参考，实测返回后修正效率、剩余空间及优先级。分析发现新的 shape/数值/dispatch 条件，应反向补充重放契约。模型内外差距指向竞争或等待时，与系统/通信负责人共享证据，避免只重写 kernel。共享 GPU/NIC/带宽上的性能测量串行，有可核验隔离资源才并行测；开发与 CPU 分析不必等待测量资源。每个可用候选独立验收并及时交流，最终在同一固定模型实例验证组合收益与数值，稳定阶段统一验 loss。任务依赖、编辑范围和结果验收遵循主控 Skill 的团队协议，不能为满足并行形式机械增加 Agent。
+
 1. **固定比较对象。** 初始基线不可覆盖；锁定源码、数据、环境、shape、拓扑、precision、sample/token 聚合和预算。未完成环境验收须标明对性能解释的限制。
 2. **先评估并行切分与显存预算。** 延续适配阶段容量判断，资源足够时优先完整参数配置，必要时参考 HCU Train Sim 并以实际短跑校准，不能习惯性缩层。 结合模型、卡数、机内/机间拓扑和实际 HCU 配方，参考局部 Wiki 的 `official-megatron-wiki/parallelism.md` 及官方并行/性能教程，比较 TP/PP/DP/CP/EP、SP、微批/梯度累积、重算与状态分片。先估最吃紧 rank 的峰值和必要余量，再以短跑实测吞吐、通信、PP 空泡和显存校准；不把显存填满作为目标。保持模型、有效全局 batch/token、精度与优化器语义可比；记录候选矩阵，选定布局后更新 rank 分组与算子 shape，再深入优化。只分析模式给建议，不擅自试跑。详见项目 `docs/workflows.md`。
 3. **抓训练端到端剖面。** 优先使用实际 HCU 启动链已有的 torch profiler 支持，必要时对照官方实现接入；保留已验收的环境与 launcher，并记录采集所需改动。每个实际非单例并行组至少两个有代表性的 rank。保留完整稳态步和 phase，区分 fwd/bwd/optimizer/通信/数据/checkpoint；跨 rank 先校时。warmup、编译和 profiling 开销不能混进性能对照。
 4. **先系统分析。** 空泡分数据、CPU launch、同步、PP 调度；通信按 [通信优化专项](references/communication-optimization.md) 分 process group、消息量、拓扑、依赖、暴露尾部、overlap 与最慢 rank。联合分析计算被并发拖慢、bucket/chunk/prefetch、通算融合及其同步协议；不能只凭 stream 重叠判定有效。关注显存 reserved/allocated、图池、临时/通信 buffer，以及保存恢复峰值。`GPU_MAX_HW_QUEUES` 按目标 runtime 和对照实测调节，没有通用最佳值。
+
+   解释profile前先明确实际完整CPU步标记、步数、窗口总长、单步分布和profiler开关；排除同名GPU重复标记，不能把多步总GPU时间与关profiler的单步中位数直接比较。CPU op时长可含设备等待，通信驻留可含等peer；仅见GPU空白不能直接归因为CPU计算。非通信热点90%不等于端到端墙钟90%，分母与缺口必须同时报告。形状/模型范围改变后重建热点模型，不继承旧效率结论。
 5. **复用 TraceLens。** 按项目 docs/integrations.md 安装锁定依赖，用 `tracelens-report TRACE --project PROJECT --rank RANK` 做 op/kernel、overlap 分析；完整 ranks 才用 `tracelens-collective`。检查日志、非空表、单位、统计分母及 unsupported 情形。原生表保留在私有 workspace，`generated` 不代表训练评估通过。TrainFlow 补充稳态窗口、实际 rank 分组、shape 与热点建模；不默认套用 AMD/NV 峰值，轻量归因不冒充跨 rank 关键路径。
 6. **融合粒度与数值对齐。** 对照 NV 实际调用、接口、fwd/bwd、saved tensors、cast/accumulation。先查当前 HCU TE、Flash-Train、HCU Primus Turbo 已支持实现，核对与 AMD Primus/Primus-LM patch 的调用关系。TE 能力交 HCU TE，通用编译/cuDNN frontend 训练融合优先 Flash-Train，Primus Turbo 后端/模块问题交其 HCU 分支；依实际归属复用或修复。优先复用，不重复开发。
 7. **评估累计 ≥90% 端到端占比的热点集合。** 墙钟为分母，重叠不能重复累计，CPU/等待缺口不能删掉。其中每个非通信 op 按 shape/dtype/布局/phase 建立 FLOPs、HBM/其他有效流量或延迟模型，给理论/可达上限、当前效率、独立实测与优化决策。混合通算 kernel 仍评估计算部分；纯通信单列消息/拓扑/等待。缺模型或覆盖不足须明确补证据，不能报全覆盖。
-8. **分发实施。** shape 相同的 attention/GEMM/通信独立测量与模型内比较，先解决干扰。rocBLAS 可按匹配教程 tune，hipBLASLt/grouped GEMM 提完整 size 工单给人。必要时看编译器/runtime/数学库/通信库对应分支源码；rocSHMEM 通算融合按瓶颈证据决定。
+8. **分发实施。** 提取真实热点中的计算、通信及 copy，按 [模型内外同条件对照](references/operator-comparison.md) 保留 shape/dtype/stride、实际实现、前后向/累积语义、通信各 rank 收发量及 copy 方向，再独立实测与模型内比较。先区分实现效率、提交等待和并发干扰；不以总耗时相近代替逐项检查。rocBLAS 可按匹配教程 tune，hipBLASLt/grouped GEMM 提完整 size 工单给人。必要时看编译器/runtime/数学库/通信库对应分支源码；rocSHMEM 通算融合按瓶颈证据决定。
 HCU 算子/通信候选和底层构建按 [工程联动](references/hcu-library-integration.md)：联查 HCU Primus Turbo、UCCL、UltraEP、MoonEP，以及现有 RCCL/rocSHMEM/DeepEP/MORI/Flux；按瓶颈和真实能力选用，不默认同名接口可替换。必要时在独立开发树改库、远端隔离重编，证明实际加载新制品并完成分层回归后按目标仓规范PR。
 
 9. **算子流程。** 需要时调用 `$hygon-hip-baseline-generator`、`$hygon-hip-kernel-optimizer`、`$hygon-triton-kernel-optimizer`。先确认可用；缺失时按 docs/integrations.md 获取 thirdparty/cuda-optimized-skill 并安装，也可读取其 skills/<name>/SKILL.md 及配套资源。kernel 遇到优化瓶颈必须做性能分析；hipprof 与 XProf/XCompute 的命令和产物分别使用，不混写。指令/反汇编问题按目标 ISA 和技能中的编译产物方法处理。
@@ -42,7 +46,7 @@ AMD Primus、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 与官方开发�
 
 ## 可并行的分析与实施
 
-卡数充足且有独立优化假设时，可在互不争用的多个完整模型最小可行 DP 实例上并行开展模型级优化。每个实例分配独立 checkout/快照、端口、输出、checkpoint、设备租约和观察身份，共用冻结基线与质量契约；核对 EP/状态分片等约束，不强制 DP=1。按实际收益分工，及时用 agent-send/inbox 交流新结果、接口影响和失败边界；不在运行中静默合并他人的代码。共享 NIC/CFS/功率域可能污染测量，必要时串行；主控在共同参考实例配对复验兼容组合，稳定后统一阶段 loss。详细方法见项目 `knowledge/practices/capacity-and-parallel-experiments.md`。
+卡数充足且有独立优化假设时，可在互不争用的多个完整模型最小可行 DP 实例上并行开展模型级优化。每个实例分配独立 checkout/快照、端口、输出、checkpoint、设备租约和观察身份，共用冻结基线与质量契约；核对 EP/状态分片等约束，不强制 DP=1。按实际收益分工，及时用 agent-send/inbox 交流新结果、接口影响和失败边界；不在运行中静默合并他人的代码。共享 NIC/CFS/功率域可能污染测量，必要时串行；主控在共同参考实例配对复验兼容组合，稳定后统一阶段 loss。详细方法见项目 `docs/practices/capacity-and-parallel-experiments.md`。
 
 固定 trace 后，可并行分析 CPU/空泡、计算/shape/上限、通信/并行域、显存/生命周期，各自保留原始证据并及时交流互相影响（如 overlap 下的 GEMM 变慢、重算与峰值显存）。所有 lane 使用同一窗口、rank 映射和墙钟分母；不能分别删去各自不擅长的时间再相加。
 
@@ -70,18 +74,18 @@ Agent 分工由实际模型调用和 profile 决定，不预设固定名称、�
 
 ## 运行约定
 
-先定位 HCU-TrainFlow checkout（用户给定路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。跨任务站点配置、有效配方、关键性能/loss和精选证据写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
+先定位 HCU-TrainFlow checkout（用户给定路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 
-HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP/容错；需要 HCU 事实、历史案例或底层实现时使用 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流维护自己的官方 Wiki、实践及站点/模型经验；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
+HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP/容错；需要 HCU 事实、历史案例或底层实现时使用 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流维护官方资料、可复用环境经验和模型最终优化总结，工作流方法在 docs/skills；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
 
-产物归属本 Skill：按目标仓规范准备集中、通用的改动、测试、PR 说明和回退方式。外部目标仓 PR/Cookbook 按目标发布要求处理；TrainFlow 自带 Wiki 按本仓知识归属规则保留实际站点/模型经验与精选证据，二者不要混同。遵循当前会话已给出的提交/发布授权。
+产物归属本 Skill：按目标仓规范准备集中、通用的改动、测试、PR 说明和回退方式。外部目标仓 PR/Cookbook 按目标发布要求处理；TrainFlow 自带 Wiki 按本仓知识归属规则保留通用环境经验、模型最终优化总结与必要证据，二者不要混同。遵循当前会话已给出的提交/发布授权。
 
 ## 局部知识的使用与里程碑记录
 
-开始任务、重要实验或排障前，先跨引擎 wiki-search 检索工程内实践、站点及模型经验，再按模型/环境/机制用 experience-search 检索本任务记录，检查 context、测量条件、失败原因和 loss 状态。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
+开始任务、重要实验或排障前，先跨引擎 wiki-search 检索官方资料、可复用环境经验及模型最终总结；工作流方法按需读 docs/practices，再按模型/环境/机制用 experience-search 检索本任务记录，检查 context、测量条件、失败原因和 loss 状态。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
 
-report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。 有跨任务复用价值的结论必须继续整理进本仓 `knowledge/sites/` 或 `knowledge/experiments/`，实际配置/变量、关键数值与精选原件随工程提交；采用仓内相对链接和证据清单，另起空 Store 验证可搜可读。不能把仅写 workspace 的记录算作共享完成。
+report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。 工程 Wiki 仅收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。按 docs/knowledge-architecture.md 筛选：环境经验进入 `knowledge/sites/`；完成当前优化阶段且数值验收清楚的最终总结才进入 `knowledge/experiments/`。临时排查、单次调参、逐算子中间报告和未定候选只留 workspace/看板，不因已测量就入库。必要证据采用仓内相对链接和清单，入库后从新 Store 验证可读可搜。
 
-形成 Cookbook 最佳实践时，先关联基线/候选/验证经验 ID，再记录草稿、目标 PR、提交/合入/替代状态；外部 Cookbook 按目标仓要求审核；TrainFlow 自带 Wiki 保存可复用的实际站点和模型经验及必要证据，完整日志/数据仍留任务档案。该阶段负责自己成果的交付，不新增独立交付 Skill。
+形成 Cookbook 最佳实践时，先关联基线/候选/验证经验 ID，再记录草稿、目标 PR、提交/合入/替代状态；外部 Cookbook 按目标仓要求审核；TrainFlow 自带 Wiki 保存符合收录规则的环境经验与模型最终总结；草稿、候选及完整过程留任务档案。该阶段负责自己成果的交付，不新增独立交付 Skill。

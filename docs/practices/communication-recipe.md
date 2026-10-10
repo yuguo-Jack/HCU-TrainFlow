@@ -1,18 +1,8 @@
----
-id: practices/communication-recipe
-title: HCU RCCL RoCE 通信配方复用与性能差距排查
-engine: cross-engine
-stages: [adapt, optimize, fault-tolerance]
-visibility: public
-review_level: engineering-methodology
-runtime_validated: false
----
-
 # 通信配方是完整执行条件
 
 容器里只加载 DTK，不一定得到站点实际用于训练的配置。环境脚本可能进一步选择 NIC/GID、QP、RoCE 端口、GDR、算法或拓扑文件；同一测试二进制也可能动态加载不同通信库。缺少其中一层，测到的低带宽不能直接解释成硬件上限或 RCCL 缺陷。
 
-本页给出可复用的方法；实际站点地址、版本、变量值和测量曲线见同仓 [BW1000_H / DTK26.10 两节点案例](../sites/cfs-roce-bw1000/communication.md)。`runtime_validated: false` 表示本公开通用模板不是所有环境的运行验收证明，不否定对应站点记录中明确限定范围的实测。
+本页给出可复用的方法；实际站点地址、版本、变量值和测量曲线见同仓 [BW1000_H / DTK26.10 两节点案例](../../knowledge/sites/cfs-roce-bw1000/communication.md)。通用方法不代表所有环境已经验收；现场实测按站点记录限定范围。
 
 ## 1. 还原启动链
 
@@ -60,6 +50,6 @@ GPU空闲要结合新鲜PID/设备FD、利用率、显存和调度预约。共�
 
 ## 5. 形成可跨任务使用的知识
 
-将机制、排查方法和模板整理到本页/同目录；把**完整实际环境、脚本、变量值、结果、失败配置和复用边界**放入同仓 `knowledge/sites/<site-id>/`，关键原件复制入仓并登记哈希。完整实验仍在任务档案，跨任务知识不能依赖旧 workspace 在线。
+将机制、排查方法和模板整理到本页/同目录；筛选**可跨项目复用的环境配方、已验证条件、关键结果及失效/回退边界**进入 `knowledge/sites/<site-id>/`，仅复制支撑结论的必要原件并登记哈希。一次性节点状态、试错流水和未定方案不入库。完整实验仍在任务档案，跨任务知识不能依赖旧 workspace 在线。
 
 新任务先 `wiki-search "RCCL RoCE alltoall" --project TRAINFLOW_PROJECT --online-pr off`，读匹配站点记录，核对硬件/软件/拓扑/shape/dtype及方法。任务内结构化测量可另用 `reference-query`；该命令不会自动导入仓内站点 JSON。配置改变或过期时补查/测量，不重做已经满足相同条件的所有来源搜索。有效现场配方还应回填训练启动配方；通信单测通过不自动代表模型端到端收益或 loss 通过。

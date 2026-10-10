@@ -1,21 +1,21 @@
 ---
 id: knowledge-index
-title: TrainFlow 官方引擎、实践与站点知识索引
+title: TrainFlow 官方资料、环境经验与模型里程碑
 visibility: public
 ---
 
-# TrainFlow 官方引擎、实践与站点知识索引
+# TrainFlow 官方资料、环境经验与模型里程碑
 
-本库保存固定官方源码的阅读说明、工程导航和优化机制，也保存跨任务通用实践、实际站点配置/配方/实测及模型案例。可复用知识与精选原件随工程提交；完整任务档案在 workspace。HCU-Knowledge 是完整安装的必需依赖，按问题联查，普通任务不更新它。
+本库只收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。临时排查、未定候选和逐次实验留在 workspace/看板，不纳入共享检索。HCU-Knowledge 是完整安装的必需依赖，按问题联查，普通任务不更新它。
 
 重点覆盖 Megatron 生态、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；主要 SFT/RL 引擎按目录、调用链、安装运行测试、优化和故障诊断组织，仍不宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
 
-## 跨任务实践和站点
+## 共享知识与工作流文档
 
-- [通用工程实践](practices/README.md)：通信配方、执行基线与验证/交付顺序。
+- [工作流方法说明](../docs/practices/README.md)：通信配方、执行基线与验证/交付顺序。
 - [站点环境、配方与实测](sites/README.md)：含真实配置和结果，可脱离旧 workspace 使用。
-- [模型实验与优化记录](experiments/README.md)：配置、调参/算子候选、精度边界及可校验的关键实测原件。
-- [知识归属与维护](../docs/knowledge-architecture.md)：官方、实践、站点/模型案例和任务档案的关系。
+- [模型最终优化里程碑](experiments/README.md)：最终选择、性能/显存/loss 和适用边界；中间候选留在任务档案。
+- [知识归属与维护](../docs/knowledge-architecture.md)：共享 Wiki 收录条件、工作流文档和任务档案的关系。
 
 ## 搜索与来源层
 

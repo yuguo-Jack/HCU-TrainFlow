@@ -15,8 +15,10 @@ description: 检查 HCU 训练环境或将预训练、SFT、RL 模型适配跑�
 2. **发现真实环境。** 读取已有镜像/脚本、当前工具源码与 `--help`。优先 Cluster Manager 对应子工程、run_nhc/check 脚本和 DTK 工具；按裸机/Conda、SSH+Docker、Slurm、K8s 区分。工具不存在或权限不足登记缺口，不能假定通过。共享集群先检查设备进程、显存、利用率及调度/预约；使用多次新鲜观测与 occupancy-check，未知状态不算空闲。空闲观测不是独占预约，启动前复查并监测其他使用者；不得停止他人任务。
 3. **建立验收矩阵。** 覆盖全部分配节点/设备的健康、GEMM、HBM、机内互联，以及适用 NIC/拓扑的机间通信与 RCCL 正确性。预期必须有硬件/同环境测量/用户资料依据，dtype、shape、单位和消息量可比。被动检查和主动压测分开；主动操作只在任务授权资源内执行。
 4. **选择并固定执行基线。** 公开 HYGON 与内部仓等价时优先公开；公开明显落后则参考真实活跃内部实现。比较模型支持、关键功能与依赖，不仅看默认分支或最新提交时间。起点可直接选适用的 HCU 主仓；否则采用可用的模型功能分支/用户 patch。将实际执行仓、基点、工作分支与最终交付仓、目标分支分别记录。完整任务先在同一执行基线上做完适配、优化、阶段 loss、扩 DP 和容错验证，再整合交付；不能因主仓更新或交付目标不同而中途迁移。保留用户 patch；开发 checkout 不得借用 HCU-Knowledge 缓存。锁官方、HCU、底层库和 submodule 提交；例外和回归范围见 [执行基线与交付顺序](references/workflow.md#适配工作树与最终交付)。
-5. **结合现场环境，优先复用 HCU 启动配方。** 先读所选 HCU 仓当前适用分支中的模型脚本、配置及其调用的环境/启动脚本，结合用户现有 patch 和部署方式使用。已有同模型配方优先；没有则参考同引擎相近模型的 HCU 配方，明确差异后适配。NV 官方配方与 official-megatron-wiki 用于核对模型、数据和训练语义；缺少 HCU 配方时才据此构建适合实际 HCU 环境的启动方案。逐项核对环境变量、依赖和 launcher，不能直接照搬 NV 命令，也不能默认旧 HCU 脚本仍有效。具体检查见 [启动配方选择与核对](references/workflow.md#启动配方选择与核对)。先核对完整模型容量：参考 HCU Train Sim 的匹配 adapter/源码、真实可用卡数和显存余量，模拟可行后短跑校准，能放下就直接全参适配和优化（可先一个最小可行 DP 实例）。卡确实不够才优先缩 num_layers；模拟不支持模型不等于容量不足，不能直接据此缩模。详见项目 `knowledge/practices/capacity-and-parallel-experiments.md`。用户明确允许维度缩减时，`proxy-check --authorization` 记录范围，另核对 head/分片/残差边界等约束。区分 decoder 层数和引擎子层 entry 数，完整模型仍需后续验收。
+5. **结合现场环境，优先复用 HCU 启动配方。** 先读所选 HCU 仓当前适用分支中的模型脚本、配置及其调用的环境/启动脚本，结合用户现有 patch 和部署方式使用。已有同模型配方优先；没有则参考同引擎相近模型的 HCU 配方，明确差异后适配。NV 官方配方与 official-megatron-wiki 用于核对模型、数据和训练语义；缺少 HCU 配方时才据此构建适合实际 HCU 环境的启动方案。逐项核对环境变量、依赖和 launcher，不能直接照搬 NV 命令，也不能默认旧 HCU 脚本仍有效。具体检查见 [启动配方选择与核对](references/workflow.md#启动配方选择与核对)。先核对完整模型容量：参考 HCU Train Sim 的匹配 adapter/源码、真实可用卡数和显存余量，模拟可行后短跑校准，能放下就直接全参适配和优化（可先一个最小可行 DP 实例）。卡确实不够才优先缩 num_layers；模拟不支持模型不等于容量不足，不能直接据此缩模。详见项目 `docs/practices/capacity-and-parallel-experiments.md`。用户明确允许维度缩减时，`proxy-check --authorization` 记录范围，另核对 head/分片/残差边界等约束。区分 decoder 层数和引擎子层 entry 数，完整模型仍需后续验收。
 若配方依赖 Primus Turbo 或专用通信后端，按项目 `skills/hcu-train-optimize/references/hcu-library-integration.md` 核对 HCU 分支、ABI、目标架构和实际加载；不要先全量安装候选库。
+
+模型范围变更时，按用户当前约束显式核对结构参数及辅助模块，记录实际层映射与配置差异；“只缩层”不能夹带宽度、专家数、跨层状态分组或辅助训练目标变化。重新评估并行分片和初始化峰值，创建新比较上下文；旧性能、热点与 loss 仍保留为历史证据。容量不足先重规划，不自行扩大缩模范围；已运行任务按部署约定安全收尾。
 
 6. **建立基线。** 对齐 tokenizer/数据顺序/mask/精度/参数更新。预处理和实际训练镜像需验证 token ID 一致；随机 token 只验证链路。存在 NV 环境则做匹配对照；没有也要保守参考与局部正确性，不阻塞所有后续探索。按项目 `docs/training-state-validation.md` 做短窗口保存/恢复对照，检查实际模型 key、优化器/RNG/数据位置，不能以加载退出码代替恢复完整性。空跑、required skip、fallback 或候选未分发不能通过。
 
@@ -46,18 +48,18 @@ description: 检查 HCU 训练环境或将预训练、SFT、RL 模型适配跑�
 
 ## 运行约定
 
-先定位 HCU-TrainFlow checkout（用户给定路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。跨任务站点配置、有效配方、关键性能/loss和精选证据写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
+先定位 HCU-TrainFlow checkout（用户给定路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 
-HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP/容错；需要 HCU 事实、历史案例或底层实现时使用 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流维护自己的官方 Wiki、实践及站点/模型经验；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
+HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP/容错；需要 HCU 事实、历史案例或底层实现时使用 `$hcu-knowledge-search`；也可以读当前对应分支源码和公开官方文档。知识检索不自动更新 HCU 大知识库。本工作流维护官方资料、可复用环境经验和模型最终优化总结，工作流方法在 docs/skills；具体依赖命令升级时同步复核 Skill/适配器，不能仅改 Wiki。
 
-产物归属本 Skill：按目标仓规范准备集中、通用的改动、测试、PR 说明和回退方式。外部目标仓 PR/Cookbook 按目标发布要求处理；TrainFlow 自带 Wiki 按本仓知识归属规则保留实际站点/模型经验与精选证据，二者不要混同。遵循当前会话已给出的提交/发布授权。
+产物归属本 Skill：按目标仓规范准备集中、通用的改动、测试、PR 说明和回退方式。外部目标仓 PR/Cookbook 按目标发布要求处理；TrainFlow 自带 Wiki 按本仓知识归属规则保留通用环境经验、模型最终优化总结与必要证据，二者不要混同。遵循当前会话已给出的提交/发布授权。
 
 ## 局部知识的使用与里程碑记录
 
-开始任务、重要实验或排障前，先跨引擎 wiki-search 检索工程内实践、站点及模型经验，再按模型/环境/机制用 experience-search 检索本任务记录，检查 context、测量条件、失败原因和 loss 状态。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
+开始任务、重要实验或排障前，先跨引擎 wiki-search 检索官方资料、可复用环境经验及模型最终总结；工作流方法按需读 docs/practices，再按模型/环境/机制用 experience-search 检索本任务记录，检查 context、测量条件、失败原因和 loss 状态。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
 
-report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。 有跨任务复用价值的结论必须继续整理进本仓 `knowledge/sites/` 或 `knowledge/experiments/`，实际配置/变量、关键数值与精选原件随工程提交；采用仓内相对链接和证据清单，另起空 Store 验证可搜可读。不能把仅写 workspace 的记录算作共享完成。
+report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。 工程 Wiki 仅收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。按 docs/knowledge-architecture.md 筛选：环境经验进入 `knowledge/sites/`；完成当前优化阶段且数值验收清楚的最终总结才进入 `knowledge/experiments/`。临时排查、单次调参、逐算子中间报告和未定候选只留 workspace/看板，不因已测量就入库。必要证据采用仓内相对链接和清单，入库后从新 Store 验证可读可搜。
 
-形成 Cookbook 最佳实践时，先关联基线/候选/验证经验 ID，再记录草稿、目标 PR、提交/合入/替代状态；外部 Cookbook 按目标仓要求审核；TrainFlow 自带 Wiki 保存可复用的实际站点和模型经验及必要证据，完整日志/数据仍留任务档案。该阶段负责自己成果的交付，不新增独立交付 Skill。
+形成 Cookbook 最佳实践时，先关联基线/候选/验证经验 ID，再记录草稿、目标 PR、提交/合入/替代状态；外部 Cookbook 按目标仓要求审核；TrainFlow 自带 Wiki 保存符合收录规则的环境经验与模型最终总结；草稿、候选及完整过程留任务档案。该阶段负责自己成果的交付，不新增独立交付 Skill。

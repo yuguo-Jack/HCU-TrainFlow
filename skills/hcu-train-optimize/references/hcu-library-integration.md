@@ -42,6 +42,6 @@
 
 ## 4. 知识与维护闭环
 
-把选库依据、接口/分支、构建制品、实际dispatch、模型收益/回退与失败条件写入本仓 Wiki；站点配置和关键实测可随工程提交，完整trace/数据/执行状态留workspace。外部目标PR/Cookbook遵循各自发布规范，与本仓知识归属分开。
+选库、构建、dispatch、候选收益/回退和失败过程先写任务 experience/看板。仅可跨项目复用的环境经验或模型最终优化里程碑，按 docs/knowledge-architecture.md 筛选必要结论与证据进入共享 Wiki。通用选库和验证方法留本指南，不写入单项目参数、地址或临时补丁。外部目标PR/Cookbook遵循各自发布规范，与本仓知识归属分开。
 
 HCU-Knowledge、官方Wiki或实际工程发现分支/ABI/脚本/后端能力变化时，同步复核本页、通信专项、adapt/optimize/fault-tolerance与相关命令卡。只更新文档不代表活动镜像已升级，也不自动触发大知识库更新。

@@ -12,7 +12,7 @@
 
 启动方案优先参考所选 HCU 工程适用分支已有的同模型脚本、环境变量和配置，并结合现场 Docker/Conda/Slurm/K8s 方式及用户 patch 调整。没有同模型脚本时参考同引擎相近模型的 HCU 配方；缺少适用配方时，才结合官方模型定义与当前 HCU 实现构建启动方案。NV 官方资料用于核对模型与训练语义，平台环境和启动命令须在实际 HCU 分支验证。沿包装脚本追踪最终入口及生效参数，保存脚本来源、版本、调整理由和与官方语义的差异；旧 HCU 脚本也需要兼容性检查。详见 [启动配方核对](../skills/hcu-train-adapt/references/workflow.md#启动配方选择与核对)。
 
-适配前先按[全参容量预估与多实例优化](../knowledge/practices/capacity-and-parallel-experiments.md)，参考 HCU Train Sim、模型结构和现场可用卡数，核对最重 rank 显存及余量并短跑校准。能容纳完整模型时直接全参适配/优化，可先一套最小可行 DP 实例；卡不足才缩 layer。工具落到 generic 或模型支持缺失时保留预测缺口，不把它当作缩模依据。
+适配前先按[全参容量预估与多实例优化](practices/capacity-and-parallel-experiments.md)，参考 HCU Train Sim、模型结构和现场可用卡数，核对最重 rank 显存及余量并短跑校准。能容纳完整模型时直接全参适配/优化，可先一套最小可行 DP 实例；卡不足才缩 layer。工具落到 generic 或模型支持缺失时保留预测缺口，不把它当作缩模依据。
 
 预训练与 SFT 使用相同的基本环境/数值流程，但 SFT 必须额外确认模板、packing 和 loss mask。RL 另外建立 actor/critic/ref/reward/rollout/weight sync 的资源与版本图，保留样本 policy version 和异步语义。
 
@@ -42,4 +42,4 @@
 
 ## 交付
 
-改动归属训练引擎、TE、Flash-Train、编译/运行时或容错工程相应责任边界。PR 描述问题与最终行为、适用条件、验证和回退，遵循该仓规范。外部 Cookbook 按其要求输出最佳实践。本仓 Wiki 保存跨任务站点配置、关键测量和模型经验及精选证据，见 [知识架构](knowledge-architecture.md)；不提交凭据与完整任务档案。
+改动归属训练引擎、TE、Flash-Train、编译/运行时或容错工程相应责任边界。PR 描述问题与最终行为、适用条件、验证和回退，遵循该仓规范。外部 Cookbook 按其要求输出最佳实践。本仓 Wiki 只保存官方资料、可跨项目复用的环境经验，以及模型最终优化里程碑总结和关键数据，见 [知识架构](knowledge-architecture.md)；不提交凭据与完整任务档案。

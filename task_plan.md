@@ -150,3 +150,12 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 ## 2026-10-10：HCU底层工程联动
 
 按用户要求将HCU Primus Turbo、UCCL、UltraEP、MoonEP纳入按瓶颈选择/复用/修改重编/分层验证/目标PR的链路。已检索HCU-Knowledge保留报告，明确通用与专项分支和接口边界；HCU问题先查询大知识库，同问题已取回证据可复用，不触发大库更新。训练引擎与容错项目不扩名单。
+
+
+## 当前收尾：共享知识筛选与通用工作流（2026-10-10）
+
+- [x] 共享 Wiki 收紧为官方资料、可跨项目复用环境经验、模型最终优化里程碑；中间候选完整归回任务档案。
+- [x] 工作流方法迁入 docs/practices，统一所有引用、维护目标及 Skill 的收录/搜索边界。
+- [x] 更新 Skill 更名 hcu-engine-wiki-skill-update；保留旧安装的可恢复迁移，本机六个入口同步。
+- [x] 方法只保留通用触发/输入/判断/验证/回退；项目参数与临时绕过留 workspace。
+- [ ] 完成独立复核修正和提交推送。真实算子及训练质量验证在任务工作区继续；不发布 release。

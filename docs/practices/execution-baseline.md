@@ -1,13 +1,3 @@
----
-id: practices/execution-baseline
-title: 执行基线稳定、验证复用与最终主仓交付
-engine: cross-engine
-stages: [adapt, optimize, fault-tolerance]
-visibility: public
-review_level: engineering-methodology
-runtime_validated: false
----
-
 # 执行基线与最终交付目标
 
 开始时记录执行仓/基点/工作分支/补丁/依赖，以及独立的最终目标仓/分支。HCU主仓已经支持模型时可以直接从它起步；否则选适合当前模型的功能分支或用户patch。固定基线仍允许侵入式优化，但每个候选有不可变快照、实际运行配置和回退。
@@ -29,4 +19,4 @@ runtime_validated: false
 
 说明阻塞、局部修复备选、迁移收益/成本、受影响机制与回归范围。既有授权范围内处理；超出既定范围先给用户具体选择。保留旧最好候选和未解决问题，正式切换更新比较上下文、观察器与任务计划，不让旧证据自动为新实现放行。
 
-执行与交付的具体步骤见 [工作流](../../docs/workflows.md) 和 adapt Skill 的 [基线规则](../../skills/hcu-train-adapt/references/workflow.md#适配工作树与最终交付)。
+执行与交付的具体步骤见 [工作流](../workflows.md) 和 adapt Skill 的 [基线规则](../../skills/hcu-train-adapt/references/workflow.md#适配工作树与最终交付)。

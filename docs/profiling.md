@@ -23,6 +23,12 @@ GEMM FLOPs = 2×M×N×K×batch。其他 op 由实际算法定义 FLOPs、有效/
 
 纯通信项单列 message/topology/wait/overlap；有计算工作的混合 kernel 用 mixed_compute，仍评估计算部分。attention 的 score/softmax/IO/recompute 与 backward 不能简单视作一个 GEMM。
 
+## 模型内外对照
+
+实际热点中的计算、通信、copy 都应检查；完整调用条件、元数据采集扰动、计时口径及差距归因见 [优化 Skill 的对照方法](../skills/hcu-train-optimize/references/operator-comparison.md)。同 shape 并不自动代表同算法、同布局或同字节量。独立通信保留各 rank 的实际 splits；copy 保留方向、dtype/stride 与 pinned/async 语义；模型内的等待与资源竞争需通过对照定位。
+
+端到端吞吐来自 profiler-off 稳态运行。干净 profile 与额外包装采集分别记录；诊断运行用于定位与建立可重放输入，不把其 CPU wrapper 耗时当 GPU kernel 延迟。先核对实际分发和数值，再比较模型内外耗时分布与匹配的上限，最后回到端到端验证收益。
+
 ## TraceLens
 
 安装与依赖版本见 [第三方集成](integrations.md)。`tracelens-report TRACE --project PROJECT --rank RANK` 调用锁定版本的 PyTorch report API，输出原生 op/kernel、overlap 等 CSV、输入哈希、日志与报告清单。JSON 和 `.json.gz` 均可读取；不是重新实现一套 TraceLens。

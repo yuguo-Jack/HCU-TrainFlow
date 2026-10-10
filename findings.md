@@ -136,3 +136,8 @@ The validator checks declarations and retained evidence references, not the trut
 ## 2026-10-10：HCU底层工程联动
 
 按用户要求将HCU Primus Turbo、UCCL、UltraEP、MoonEP纳入按瓶颈选择/复用/修改重编/分层验证/目标PR的链路。已检索HCU-Knowledge保留报告，明确通用与专项分支和接口边界；HCU问题先查询大知识库，同问题已取回证据可复用，不触发大库更新。训练引擎与容错项目不扩名单。
+
+
+## 共享检索与工作流泛化边界（2026-10-10）
+
+wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验证仍会影响后续检索，应在入库前筛选。通用操作方法属于 docs/Skill，执行细节属于任务配置；共享模型页需最终优化结论与关键数据，不能把每个候选当里程碑。已有通信环境知识保留。旧 Skill 名通过安装器备份迁移，不保留重复发现入口；底层 CLI wiki-update 的采集语义没有改名。

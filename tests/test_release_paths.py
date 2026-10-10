@@ -80,17 +80,22 @@ def test_skill_install_idempotent_and_backup(tmp_path):
     assert list((tmp_path/'trainflow-skill-backups').rglob('SKILL.md'))
 
 
-def test_skill_rename_migration_preserves_old_customizations(tmp_path):
+@pytest.mark.parametrize('old_name,new_name', [
+    ('hcu-train-prepare','hcu-train-adapt'),
+    ('hcu-engine-wiki-update','hcu-engine-wiki-skill-update'),
+])
+def test_skill_rename_migration_preserves_old_customizations(tmp_path,old_name,new_name):
     script=Path(__file__).resolve().parents[1]/'scripts/install_skills.py';target=tmp_path/'skills'
-    old=target/'hcu-train-prepare';old.mkdir(parents=True)
+    old=target/old_name;old.mkdir(parents=True)
     (old/'SKILL.md').write_text('old local customization')
     cmd=[sys.executable,str(script),'--target',str(target),'--workflow-only']
     assert subprocess.run(cmd,capture_output=True).returncode != 0
     assert not (target/'hcu-trainflow').exists()  # validate before any mutation
     assert subprocess.run(cmd+['--replace'],capture_output=True).returncode == 0
-    assert not old.exists() and (target/'hcu-train-adapt/SKILL.md').is_file()
+    assert not old.exists() and (target/new_name/'SKILL.md').is_file()
+    assert f'name: {new_name}' in (target/new_name/'SKILL.md').read_text(encoding='utf8')
     assert (target/'hcu-train-fault-tolerance/SKILL.md').is_file()
-    backups=list((tmp_path/'trainflow-skill-backups').rglob('hcu-train-prepare/SKILL.md'))
+    backups=list((tmp_path/'trainflow-skill-backups').rglob(old_name+'/SKILL.md'))
     assert len(backups)==1 and backups[0].read_text()=='old local customization'
 
 def test_public_wiki_integrity():

@@ -1,16 +1,6 @@
----
-id: practices/hcu-library-routing
-title: HCU Primus Turbo、UCCL、UltraEP、MoonEP 与底层库优化入口
-engine: cross-engine
-stages: [adapt, optimize, fault-tolerance]
-visibility: public
-review_level: source-guided-methodology
-runtime_validated: false
----
-
 # 从训练瓶颈追到 HCU 底层库
 
-这是跨任务搜索入口，具体分支和能力结论来自 HCU-Knowledge 保留报告，尚不代表当前环境已安装或通过训练。完整的选库、源码路径、构建与回归步骤统一维护在 [优化 Skill 的依赖联动指南](../../skills/hcu-train-optimize/references/hcu-library-integration.md)。该指南变更时复核本页，避免知识与执行流程各写一套互相矛盾的规则。
+这是工作流方法导航（不进入 Wiki 检索），具体分支和能力结论来自 HCU-Knowledge 保留报告，尚不代表当前环境已安装或通过训练。完整的选库、源码路径、构建与回归步骤统一维护在 [优化 Skill 的依赖联动指南](../../skills/hcu-train-optimize/references/hcu-library-integration.md)。该指南变更时复核本页，避免知识与执行流程各写一套互相矛盾的规则。
 
 | 实际问题 | 查询入口 | 关键边界 |
 | --- | --- | --- |
