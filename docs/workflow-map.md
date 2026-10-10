@@ -20,7 +20,7 @@ flowchart TD
     Q --> QG{"达到约定目标且数值通过？"}
     QG -->|未达到| OR["定位问题、修正或回退<br/>无新证据 / 达到预算边界时请专家介入"]
     OR --> O
-    QG -->|通过| S["③ 恢复完整模型 → 扩 DP 域<br/>筛机、健康池与逐级扩容验证"]
+    QG -->|通过| S["③ 选定完整配置 → 扩 DP 域<br/>筛机、健康池与逐级扩容验证"]
     S --> SG{"环境、质量与扩容验收通过？"}
     SG -->|失败| SR["按原因回到环境、适配或优化<br/>修复后重新验收受影响证据"]
     SR --> C
@@ -53,7 +53,14 @@ flowchart TD
     ONLY -->|否| R["选择当前 HCU 工程适用分支及启动配方<br/>核对已有脚本、环境变量、依赖和用户 patch"]
     W["官方引擎 Wiki + 对应依赖源码<br/>核对模型、精度及训练语义"] -.-> R
     R --> L["本地独立开发 checkout<br/>固定源码与配置 → 同步远端 → 编译运行"]
-    L --> M["最小可运行任务<br/>资源不足时可仅缩 layer，保留其他模型参数"]
+    L --> CAP["全参数容量预估：HCU Train Sim / 当前模型源码<br/>实际可用卡数、最重 rank 显存与余量；核对模型覆盖"]
+    CAP --> FIT{"完整配置估算可行？"}
+    FIT -->|可行| FULL["直接全参最小可行训练实例<br/>实际短跑校准峰值、布局和前后向"]
+    FIT -->|证据不足| CHECK["补结构/公式/现场证据<br/>generic 近似不等于不能运行"]
+    CHECK --> CAP
+    FIT -->|卡确实不足| SMALL["优先缩 layer；其他维度须授权<br/>固定代理范围及未覆盖项"]
+    FULL --> M["冻结选定模型配置与容量判断"]
+    SMALL --> M
     M --> TYPE{"任务类型"}
     TYPE -->|预训练| P["输出、梯度、优化器步与 checkpoint"]
     TYPE -->|SFT| F["另核模板、packing、loss mask"]
@@ -81,7 +88,11 @@ flowchart TD
 flowchart TD
     B["固定比较条件与初始数值基线<br/>模型 / 数据 / 精度 / 有效 batch-token / 版本"] --> P["优先评估并行切分与显存预算<br/>TP / PP / DP / CP / EP / SP<br/>微批、累积、重算、状态分片与 offload"]
     P --> M["筛选布局候选<br/>最吃紧 rank 峰值 + 必要余量<br/>短跑校准吞吐、通信与流水空泡"]
-    M --> T["稳态端到端采样：torchprof<br/>覆盖各实际非单例并行组至少 2 个代表 rank"]
+    M --> RES{"有额外隔离资源和独立优化假设？"}
+    RES -->|是| INST["多个完整模型可行实例并行优化<br/>公共基线、分工/资源独立、及时交换结果<br/>主控在共同实例复验组合"]
+    RES -->|否| T
+    INST --> T
+    T["稳态端到端采样：torchprof<br/>覆盖各实际非单例并行组至少 2 个代表 rank"]
     T --> TL["TraceLens + TrainFlow 窗口分析<br/>补 CPU-op 对应的 shape / dtype / layout / phase"]
     TL --> A["按证据并行分析<br/>CPU / 数据 / launch 空泡"]
     TL --> C["通信依赖、暴露时间与 overlap<br/>bucket / chunk / 预取 / 通算融合<br/>慢 rank、拓扑及计算竞争 · 详见图 3.5"]
@@ -114,7 +125,7 @@ TraceLens 的逐 rank 分析可用代表样本；其完整 collective 报告要�
 flowchart TD
     H["来自同一稳态窗口的热点和调用证据"] --> F["对照 NV 融合粒度与数值契约<br/>接口、前后向、保存值、累加和 cast"]
     H --> C["累计至少 90% 端到端墙钟热点覆盖<br/>重叠不重复累计；空泡与未归因缺口仍保留"]
-    F --> R{"当前 HCU TE / Flash-Train 已支持？"}
+    F --> R{"当前 HCU TE / Flash-Train / Primus Turbo 已支持？"}
     R -->|是| USE["优先复用<br/>进入图 3.3 验证实际 dispatch"]
     R -->|否| NEW["补融合实现<br/>TE 能力归 HCU TE<br/>编译 / cuDNN Frontend 等融合归 Flash-Train"]
     C --> TYPE{"热点类型"}
@@ -130,7 +141,7 @@ flowchart TD
     NEW --> TASK
     COMM -->|系统调参 / overlap 问题| SYS
     COMM -->|已满足目标| KEEP
-    COMM -->|需要通算融合时| SH["核对 rocSHMEM 等当前能力<br/>明确同步、生命周期和正确性"]
+    COMM -->|需要通算融合时| SH["核对 rocSHMEM / DeepEP / UCCL 等当前能力<br/>明确同步、生命周期和正确性"]
     SH --> TASK
 ```
 

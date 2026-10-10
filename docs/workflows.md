@@ -12,6 +12,8 @@
 
 启动方案优先参考所选 HCU 工程适用分支已有的同模型脚本、环境变量和配置，并结合现场 Docker/Conda/Slurm/K8s 方式及用户 patch 调整。没有同模型脚本时参考同引擎相近模型的 HCU 配方；缺少适用配方时，才结合官方模型定义与当前 HCU 实现构建启动方案。NV 官方资料用于核对模型与训练语义，平台环境和启动命令须在实际 HCU 分支验证。沿包装脚本追踪最终入口及生效参数，保存脚本来源、版本、调整理由和与官方语义的差异；旧 HCU 脚本也需要兼容性检查。详见 [启动配方核对](../skills/hcu-train-adapt/references/workflow.md#启动配方选择与核对)。
 
+适配前先按[全参容量预估与多实例优化](../knowledge/practices/capacity-and-parallel-experiments.md)，参考 HCU Train Sim、模型结构和现场可用卡数，核对最重 rank 显存及余量并短跑校准。能容纳完整模型时直接全参适配/优化，可先一套最小可行 DP 实例；卡不足才缩 layer。工具落到 generic 或模型支持缺失时保留预测缺口，不把它当作缩模依据。
+
 预训练与 SFT 使用相同的基本环境/数值流程，但 SFT 必须额外确认模板、packing 和 loss mask。RL 另外建立 actor/critic/ref/reward/rollout/weight sync 的资源与版本图，保留样本 policy version 和异步语义。
 
 ## 性能优化
@@ -22,7 +24,9 @@
 
 先评估并行切分与显存预算，建立可行候选布局，再端到端采样并迭代系统调参/overlap/内存和融合粒度，然后形状级上限与实现优化。并行度、微批/梯度累积、重算与状态分片共同影响显存、通信、PP 空泡和算子 shape；按最吃紧 rank 的峰值及必要余量筛选，再用 profiler-off 吞吐实测选择，不能只追求“能装下”或“占满显存”。具体对照项和已有官方教程见 [并行切分与显存调参](../knowledge/official-megatron-wiki/parallelism.md#调参推理)。
 
-不要要求先完成全部融合才能分析剩余热点。Flash-Train 先复用现有能力，算子实现交由已有 Hygon HIP/Triton 技能。子 Agent 可并行读取独立证据，但同资源实验串行，修改范围不重叠。
+资源富余时可在多个相互隔离的完整模型实例上并行探索不同优化假设，保持相同基线/质量契约并及时共享进展；实例身份、资源、代码和 checkpoint 独立。主控在共同参考实例复验和集成，稳定后阶段验 loss，详见上述容量实践与[多 Agent 协同](multi-agent.md)。
+
+不要要求先完成全部融合才能分析剩余热点。[HCU 工程联动](../skills/hcu-train-optimize/references/hcu-library-integration.md)将 TE、Flash-Train、Primus Turbo 与实际通信后端串联；遇到HCU问题先检索大知识库，再追当前分支。RCCL/rocSHMEM/DeepEP/UCCL/UltraEP/MoonEP各有能力和接口边界，按瓶颈复用，必要时独立修改、隔离重编和集成验证后按规范PR。算子实现交由已有 Hygon HIP/Triton 技能。子 Agent 可并行读取独立证据，但同资源实验串行，修改范围不重叠。
 
 比较实验保存 warmup、profiler-off 重复次数、配对次序、设备状态及方差。每轮局部正确性与实际 candidate 分发必须通过；阶段候选冻结后验 loss。初始基线和回退方案保持不变，不能一路与上一次误差更大的候选比较。
 

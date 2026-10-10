@@ -126,3 +126,13 @@ Installation review also found unnecessary full historical validation on each ex
 A test can execute correctly and meet an old floor while a credible reference gap remains unexplained. Environment assessment now accepts a typed, evidence-linked unresolved discrepancy and preserves incomplete status; failed matched thresholds remain failures. The Agent must inspect original units/conditions, actual transport/library implementation and authorized bounded alternatives. Logical HCA/bond counts do not establish physical-port bandwidth; count actual active members and collect their traffic/error/congestion deltas. A/B/A is bounded diagnosis, not a replacement for repeated optimization comparisons, production network acceptance or model-level loss checks.
 
 The validator checks declarations and retained evidence references, not the truth of engineering reasoning. Removing a discrepancy field cannot by itself close an investigation: original reports, trial evidence and independent review remain required through the existing flow and private experience mechanisms. No new workflow state machine or automatic site-setting mutation was introduced.
+
+
+## 2026-10-10：全参容量预估与多实例优化
+
+用户补充：先用 HCU Train Sim 等判断完整模型可行性，卡足优先全参，卡不足才缩 layer；资源富余时独立完整模型实例并行优化，明确分工和及时交流。已核对公开模拟器 b7d8e6f3（CLI/adapter/模板），并修正 proxy/adapt 的旧“优先缩层”措辞；协同协议沿用现有 team/lease/inbox，新增实践、更新阶段 Skill 和可编辑流程图。预测不作为硬件或全模型验证，当前 Kimi K3 模拟覆盖仍需核实，实际实验继续。
+
+
+## 2026-10-10：HCU底层工程联动
+
+按用户要求将HCU Primus Turbo、UCCL、UltraEP、MoonEP纳入按瓶颈选择/复用/修改重编/分层验证/目标PR的链路。已检索HCU-Knowledge保留报告，明确通用与专项分支和接口边界；HCU问题先查询大知识库，同问题已取回证据可复用，不触发大库更新。训练引擎与容错项目不扩名单。

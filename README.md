@@ -22,9 +22,9 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 [原尺寸图片](docs/assets/workflow-overview.png) · [可编辑流程图与验收规则](docs/workflow-map.md)
 
-优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和已有融合实现，按需使用三个 Hygon 算子 Skill。
+优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和 TE、Flash-Train、Primus Turbo 等已有实现，按瓶颈联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等通信能力，按需使用三个 Hygon 算子 Skill。
 
-同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。资源不足时默认缩 layer 跑通或筛机；用户明确允许缩维时记录授权范围与模型差异。扩规模前先验收选定的完整配置，再逐级扩 DP 域并复核性能、显存和训练语义；缩维代理的结果不能声称为原完整模型验证。
+同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。适配前参考 HCU Train Sim、模型结构和实际可用卡数做容量预估，短跑校准后能放下就直接全参适配优化；资源不足才缩 layer 跑通或筛机；用户明确允许缩维时记录授权范围与模型差异。扩规模前先验收选定的完整配置，再逐级扩 DP 域并复核性能、显存和训练语义；缩维代理的结果不能声称为原完整模型验证。
 
 完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新见 [工作流全景](docs/workflow-map.md)，其中列明阶段证据门槛及对应源码。
 
@@ -47,6 +47,8 @@ collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 ## 多 Agent 如何协同
 
 主控根据模型与实测热点动态生成任务和 Agent 分工，不预设固定算子名单。环境与启动配方核对、系统分析，以及不同算子的详细分析和优化均可并行；某个算子具备实施条件后即可优化，无需等待其他算子的分析全部完成。相关 Agent 可提问、答复、共享发现和报告阻塞，消息与处理回执保存在同一任务中。
+
+卡数充足时，也可用多个隔离的完整模型最小可行 DP 实例并行验证不同优化方向，公共基线与质量契约保持一致，Agent 及时互通进展，由主控复验并集成兼容结果。见[容量预估与并行实验](knowledge/practices/capacity-and-parallel-experiments.md)。
 
 下游只消费已验收的结果；共享 GPU 的测量、耦合代码修改、集成和阶段 loss 验证由主控安排。任务领取、真实 Agent 会话、返回报告和验收分别记录，避免重复派发或把“已经返回”误当成“已经完成”。详见 [任务拆解与 Agent 协同](docs/multi-agent.md)。
 

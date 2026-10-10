@@ -1,6 +1,8 @@
 # 训练通信：暴露时间、overlap 与通算融合
 
-本指引属于现有 optimize 阶段，适用于训练引擎及 Torch DDP/FSDP。先保证通信正确性与环境带宽验收；按问题检索 HCU-Knowledge 的 RCCL、Galaxy、rocSHMEM、MORI、Flux 和引擎案例，再看当前部署分支源码。名称相同不代表接口、异步语义或架构支持相同。
+本指引属于现有 optimize 阶段，适用于训练引擎及 Torch DDP/FSDP。先保证通信正确性与环境带宽验收；按问题检索 HCU-Knowledge 的 RCCL、Galaxy、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP、MORI、Flux 和引擎案例，再看当前部署分支源码。名称相同不代表接口、异步语义或架构支持相同。
+
+候选后端的作用、HCU 分支与可修改/重编的验证顺序见[工程联动](hcu-library-integration.md)。UCCL 的collective/P2P/EP、UltraEP的副本/梯度生命周期、MoonEP的节点内事务接口分别评估，不能当作同一层可互换的开关。
 
 ## 1. 建立边界和基线
 
@@ -38,4 +40,4 @@
 
 通信分析和各计算算子的实现可并行，但共同 owner 管理相交的接口、buffer 生命周期和同步协议；改变协议前给消费者发消息，集成前核对版本。共享 GPU/网络的性能实验串行或确保真实隔离。融合后的 kernel 必须重新建计算/流量模型，并计入非通信热点覆盖，不能整个划到“通信”而跳过 ≥90% 集合的效率评估。
 
-每个候选保存：旧/新依赖图、process groups、消息/shape、单测与整步对照、计算退化、额外显存、数值结果、支持范围、回退、目标源码提交。预期收益排序以可减少的关键路径为依据；若 overlap 图更满但整步更慢，回退或重调。引擎调度改动交引擎，库机制交其 HCU 主仓；底层实现沿用已有 HIP/Triton Skills，公开交付不能包含现场数据。
+每个候选保存：旧/新依赖图、process groups、消息/shape、单测与整步对照、计算退化、额外显存、数值结果、支持范围、回退、目标源码提交。预期收益排序以可减少的关键路径为依据；若 overlap 图更满但整步更慢，回退或重调。引擎调度改动交引擎，库机制交其 HCU 主仓；底层实现沿用已有 HIP/Triton Skills，外部目标PR按其发布规范；本仓Wiki保留可复用站点配置、关键实测与证据，完整档案留workspace。

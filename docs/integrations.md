@@ -95,3 +95,7 @@ fork 保留原有模块、API 和全部 13 个 console 命令。TrainFlow 的两
 5. 提交清单、相关用法和验证记录；回退到旧清单后重新同步/安装。正在运行的训练任务继续保留原来的源码和环境快照。
 
 网络不稳定可在诊断 Git 网络后重试，必要时使用 Git 的 HTTP/1.1 配置；不要为方便把第三方 checkout 改为不明来源或把认证写进 URL。
+
+## 训练环境中的 HCU 库
+
+TE、Flash-Train、HCU Primus Turbo、RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP等按实际模型和瓶颈选择；它们不是本地主控安装时统一替换的依赖。先查HCU大知识库，再核对活动分支与镜像ABI，必要时在任务隔离前缀/容器构建候选，保留旧制品。接口、验证与PR归属见[工程联动](../skills/hcu-train-optimize/references/hcu-library-integration.md)。

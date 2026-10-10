@@ -16,13 +16,15 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 **先复用已有验证。** 开始候选前检查已有数值、dispatch、性能和阶段 loss 证据，记录源码/库/配置差异究竟影响哪层。固定实现、ABI、shape/dtype 和数值契约未变的独立算子测试直接引用；换训练分支通常先补集成与端到端对照，不重跑整套底层资格测试。确有调用/梯度生命周期、依赖版本或覆盖缺口时只补受影响用例，写明重测原因。稳定候选再做一次阶段 loss 验收；不要以反复资格测试代替推进新优化。
 
 1. **固定比较对象。** 初始基线不可覆盖；锁定源码、数据、环境、shape、拓扑、precision、sample/token 聚合和预算。未完成环境验收须标明对性能解释的限制。
-2. **先评估并行切分与显存预算。** 结合模型、卡数、机内/机间拓扑和实际 HCU 配方，参考局部 Wiki 的 `official-megatron-wiki/parallelism.md` 及官方并行/性能教程，比较 TP/PP/DP/CP/EP、SP、微批/梯度累积、重算与状态分片。先估最吃紧 rank 的峰值和必要余量，再以短跑实测吞吐、通信、PP 空泡和显存校准；不把显存填满作为目标。保持模型、有效全局 batch/token、精度与优化器语义可比；记录候选矩阵，选定布局后更新 rank 分组与算子 shape，再深入优化。只分析模式给建议，不擅自试跑。详见项目 `docs/workflows.md`。
+2. **先评估并行切分与显存预算。** 延续适配阶段容量判断，资源足够时优先完整参数配置，必要时参考 HCU Train Sim 并以实际短跑校准，不能习惯性缩层。 结合模型、卡数、机内/机间拓扑和实际 HCU 配方，参考局部 Wiki 的 `official-megatron-wiki/parallelism.md` 及官方并行/性能教程，比较 TP/PP/DP/CP/EP、SP、微批/梯度累积、重算与状态分片。先估最吃紧 rank 的峰值和必要余量，再以短跑实测吞吐、通信、PP 空泡和显存校准；不把显存填满作为目标。保持模型、有效全局 batch/token、精度与优化器语义可比；记录候选矩阵，选定布局后更新 rank 分组与算子 shape，再深入优化。只分析模式给建议，不擅自试跑。详见项目 `docs/workflows.md`。
 3. **抓训练端到端剖面。** 优先使用实际 HCU 启动链已有的 torch profiler 支持，必要时对照官方实现接入；保留已验收的环境与 launcher，并记录采集所需改动。每个实际非单例并行组至少两个有代表性的 rank。保留完整稳态步和 phase，区分 fwd/bwd/optimizer/通信/数据/checkpoint；跨 rank 先校时。warmup、编译和 profiling 开销不能混进性能对照。
 4. **先系统分析。** 空泡分数据、CPU launch、同步、PP 调度；通信按 [通信优化专项](references/communication-optimization.md) 分 process group、消息量、拓扑、依赖、暴露尾部、overlap 与最慢 rank。联合分析计算被并发拖慢、bucket/chunk/prefetch、通算融合及其同步协议；不能只凭 stream 重叠判定有效。关注显存 reserved/allocated、图池、临时/通信 buffer，以及保存恢复峰值。`GPU_MAX_HW_QUEUES` 按目标 runtime 和对照实测调节，没有通用最佳值。
 5. **复用 TraceLens。** 按项目 docs/integrations.md 安装锁定依赖，用 `tracelens-report TRACE --project PROJECT --rank RANK` 做 op/kernel、overlap 分析；完整 ranks 才用 `tracelens-collective`。检查日志、非空表、单位、统计分母及 unsupported 情形。原生表保留在私有 workspace，`generated` 不代表训练评估通过。TrainFlow 补充稳态窗口、实际 rank 分组、shape 与热点建模；不默认套用 AMD/NV 峰值，轻量归因不冒充跨 rank 关键路径。
-6. **融合粒度与数值对齐。** 对照 NV 实际调用、接口、fwd/bwd、saved tensors、cast/accumulation。先查最新 Flash-Train 已支持算子；TE 能力提交 HCU TE，通用编译/cuDNN frontend 训练融合优先 Flash-Train。优先复用，不重复开发。
+6. **融合粒度与数值对齐。** 对照 NV 实际调用、接口、fwd/bwd、saved tensors、cast/accumulation。先查当前 HCU TE、Flash-Train、HCU Primus Turbo 已支持实现，核对与 AMD Primus/Primus-LM patch 的调用关系。TE 能力交 HCU TE，通用编译/cuDNN frontend 训练融合优先 Flash-Train，Primus Turbo 后端/模块问题交其 HCU 分支；依实际归属复用或修复。优先复用，不重复开发。
 7. **评估累计 ≥90% 端到端占比的热点集合。** 墙钟为分母，重叠不能重复累计，CPU/等待缺口不能删掉。其中每个非通信 op 按 shape/dtype/布局/phase 建立 FLOPs、HBM/其他有效流量或延迟模型，给理论/可达上限、当前效率、独立实测与优化决策。混合通算 kernel 仍评估计算部分；纯通信单列消息/拓扑/等待。缺模型或覆盖不足须明确补证据，不能报全覆盖。
 8. **分发实施。** shape 相同的 attention/GEMM/通信独立测量与模型内比较，先解决干扰。rocBLAS 可按匹配教程 tune，hipBLASLt/grouped GEMM 提完整 size 工单给人。必要时看编译器/runtime/数学库/通信库对应分支源码；rocSHMEM 通算融合按瓶颈证据决定。
+HCU 算子/通信候选和底层构建按 [工程联动](references/hcu-library-integration.md)：联查 HCU Primus Turbo、UCCL、UltraEP、MoonEP，以及现有 RCCL/rocSHMEM/DeepEP/MORI/Flux；按瓶颈和真实能力选用，不默认同名接口可替换。必要时在独立开发树改库、远端隔离重编，证明实际加载新制品并完成分层回归后按目标仓规范PR。
+
 9. **算子流程。** 需要时调用 `$hygon-hip-baseline-generator`、`$hygon-hip-kernel-optimizer`、`$hygon-triton-kernel-optimizer`。先确认可用；缺失时按 docs/integrations.md 获取 thirdparty/cuda-optimized-skill 并安装，也可读取其 skills/<name>/SKILL.md 及配套资源。kernel 遇到优化瓶颈必须做性能分析；hipprof 与 XProf/XCompute 的命令和产物分别使用，不混写。指令/反汇编问题按目标 ISA 和技能中的编译产物方法处理。
 10. **验证。** 每轮候选做实际 dispatch、局部输出/梯度/参数更新与多 shape 回归，随后 profiler-off 重复测量。阶段候选稳定后再做冻结样本和容差的较长 loss 验收；不频繁长训，也不省略阶段验收。RL 加查 policy version、logprob、reward 和数据年龄。
 
@@ -39,6 +41,8 @@ TE 精度、权重缓存、attention backend、userbuffers 和融合查 `knowled
 AMD Primus、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 与官方开发分支都是一级机制参考。先比较补丁基线/gitlink、触发条件、测试和回退；官方能力真正进入当前 HCU 分支且回归等价后再退役旧 patch。
 
 ## 可并行的分析与实施
+
+卡数充足且有独立优化假设时，可在互不争用的多个完整模型最小可行 DP 实例上并行开展模型级优化。每个实例分配独立 checkout/快照、端口、输出、checkpoint、设备租约和观察身份，共用冻结基线与质量契约；核对 EP/状态分片等约束，不强制 DP=1。按实际收益分工，及时用 agent-send/inbox 交流新结果、接口影响和失败边界；不在运行中静默合并他人的代码。共享 NIC/CFS/功率域可能污染测量，必要时串行；主控在共同参考实例配对复验兼容组合，稳定后统一阶段 loss。详细方法见项目 `knowledge/practices/capacity-and-parallel-experiments.md`。
 
 固定 trace 后，可并行分析 CPU/空泡、计算/shape/上限、通信/并行域、显存/生命周期，各自保留原始证据并及时交流互相影响（如 overlap 下的 GEMM 变慢、重算与峰值显存）。所有 lane 使用同一窗口、rank 映射和墙钟分母；不能分别删去各自不擅长的时间再相加。
 
@@ -61,6 +65,8 @@ Agent 分工由实际模型调用和 profile 决定，不预设固定名称、�
 ## 与统一主控衔接
 
 由 `$hcu-trainflow` 调用时，沿用当前任务、目标和私有工作区；本阶段负责实际领域工作，主控负责 `flow-next`、独立复核和推进。交付候选源/配置清单、原始证据和绑定 candidate_snapshot 的报告；不要另起无关联任务，也不要绕开复核直接推进状态。人的 GUIDANCE.md 默认每 5 分钟由主控采集，成员检查已采集指导并回应，不各自频繁读文件；明确记录收益、数值/显存代价、未完成项和需要专家判断的问题。完整契约见项目 `docs/collaboration.md`。本 Skill 仍可按用户指定独立使用，不强制开展全流程。
+
+遇到 HCU 相关适配、性能或故障问题，先用 `$hcu-knowledge-search` 搜索大知识库（按工程、错误/符号、shape、gfx/DTK 和机制组合），再核对当前分支源码。已有适用证据可复用；不是每条命令重复搜，也不自动更新大知识库。
 
 ## 运行约定
 

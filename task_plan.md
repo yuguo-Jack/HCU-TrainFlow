@@ -140,3 +140,13 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [ ] donor 原执行分支完成微批 ABBA、系统/算子优化与阶段 loss，维持主仓交付延后。
 - [ ] Cluster Manager 实际故障触发、任务身份停止、checkpoint 自动恢复和持续监测；CPU控制协议验证不代替此项。
 - [ ] 将后续可复用调参、loss、故障结果继续沉淀到同仓站点/模型案例。
+
+
+## 2026-10-10：全参容量预估与多实例优化
+
+用户补充：先用 HCU Train Sim 等判断完整模型可行性，卡足优先全参，卡不足才缩 layer；资源富余时独立完整模型实例并行优化，明确分工和及时交流。已核对公开模拟器 b7d8e6f3（CLI/adapter/模板），并修正 proxy/adapt 的旧“优先缩层”措辞；协同协议沿用现有 team/lease/inbox，新增实践、更新阶段 Skill 和可编辑流程图。预测不作为硬件或全模型验证，当前 Kimi K3 模拟覆盖仍需核实，实际实验继续。
+
+
+## 2026-10-10：HCU底层工程联动
+
+按用户要求将HCU Primus Turbo、UCCL、UltraEP、MoonEP纳入按瓶颈选择/复用/修改重编/分层验证/目标PR的链路。已检索HCU-Knowledge保留报告，明确通用与专项分支和接口边界；HCU问题先查询大知识库，同问题已取回证据可复用，不触发大库更新。训练引擎与容错项目不扩名单。

@@ -14,6 +14,7 @@ visibility: public
 
 - [通用工程实践](practices/README.md)：通信配方、执行基线与验证/交付顺序。
 - [站点环境、配方与实测](sites/README.md)：含真实配置和结果，可脱离旧 workspace 使用。
+- [模型实验与优化记录](experiments/README.md)：配置、调参/算子候选、精度边界及可校验的关键实测原件。
 - [知识归属与维护](../docs/knowledge-architecture.md)：官方、实践、站点/模型案例和任务档案的关系。
 
 ## 搜索与来源层
