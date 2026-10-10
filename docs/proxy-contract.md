@@ -20,6 +20,7 @@
 - 区分模型配置的 decoder 层数和引擎的 attention/MLP entry 数；不能仅比较两个同名 `num_layers`。保存从模型定义到 launcher 参数的映射。
 - 检查 head/hidden/group 的整除、head dimension、latent projection、TP/EP/CP 分片、专家容量和序列长度限制。显式保留或说明被缩减的维度。
 - 新模型不能用架构相似的已支持模型替代。逐项区分源码存在、可以 import、forward、backward、训练循环及扩容已验证状态。
+- 缩层/缩维不授权替换优化器、参数分组或更新精度；对照目标训练配方与实际构造器，不能静默沿用示例默认值。仅为流程验证采用替代配方时明确范围，其容量、热点与 loss 不代表目标配方；恢复目标更新算法须重新评估状态显存/通信/checkpoint 并建立数值与性能基线。详见[配方核对](../skills/hcu-train-adapt/references/workflow.md#优化器和参数分组属于模型训练配方)。
 - 初始数值基线按实际选定配置冻结，不能拿不同模型的 loss 做候选精度比较。已挂接 flow 且仍在同一比较范围内的源码或优化参数候选，用新 `candidate.snapshot` 固定实现并重新取得受影响证据；不为每次优化重置整个任务。环境、模型、数据、初始基线或验证契约改变时才按 [上下文契约](contracts.md) 更新 `task-context` 并重新验收。未挂接 flow 的旧式任务仍按该文档的旧式候选规则处理。
 
 ## 扩容和交付

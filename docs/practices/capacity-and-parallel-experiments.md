@@ -13,6 +13,8 @@
 
 不要求每个任务先运行一个完整网格搜索，也不把模拟器作为不可替代的硬依赖。已有同版本、同结构的可靠实测可复用，并复核本次差异。
 
+优化器容量按实际参数组、精度和分片方式估算；矩阵算法可能需要完整矩阵聚合、正交化中间量和流水通信 buffer，不能套用另一优化器的每参数字节数或默认沿 DP 均分。先核对当前实现是否支持所选状态分片，再计入最重 rank 的峰值。算法/分组变化后的容量和短跑基线要求见[配方核对](../../skills/hcu-train-adapt/references/workflow.md#优化器和参数分组属于模型训练配方)。
+
 ## 2. HCU Train Simulator 的实际入口与限制
 
 已核对公开仓 [HYGON-AI/hcu-train-simulator](https://github.com/HYGON-AI/hcu-train-simulator)，固定提交 `b7d8e6f3becebf5d09121bb1c582436a371c6710`。以下是该提交的入口；以后依实际 checkout 的 `--help` 和源码核对，不保证未来命令不变。
