@@ -33,6 +33,8 @@ review 按 `docs/collaboration.md` 使用完整字段；不以单词“完成”
 
 环境/模型/扩容出现可信性能差距时，主控按项目 `docs/environment-discovery.md` 第 6 节派发基本排查与有界尝试，不能接受只有差距表的“完成”报告。复核原件口径、链路/库版本和 HCU 知识/源码后，在已有授权与资源准入范围内自主推进可逆对照；核验正确性、生效路径、回归与回退。`environment-check` 的 `follow_up_required` 或 `performance_discrepancy` 进入当前 flow/经验记录；条件未知不是忽略理由，未解决保持 fail/incomplete。分析-only 或实际权限不足时保留待执行项，报告已排除项与具体所需权限，不能虚构实验或扩大站点改动范围。
 
+自主调参前先确认现场已有启动命令和环境脚本，按原顺序核对 DTK 激活与现场配置在各 rank 的实际生效情况；用户提供完整配方时优先复现并列出与先前测试的差异。基本排查/有界尝试后仍有可信显著差距，按 `docs/collaboration.md` 的“问题升级与用户决定”形成简报，创建阻塞 `flow-question`、更新看板并向用户提出具体推荐和选择。等待答复时停止扩展同一调查及受影响的验收，不以“后续再查”交付了事；无关只读分析可继续。用户已经给出下一步决定时按该范围执行，不重复询问。
+
 ## 阶段分工
 
 Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize 按需加载 Torch 与通信专项，不增加独立 Skill。全流程先检查 HCU-Knowledge 的搜索 Skill、workspace 绑定及当前索引可用性；缺失按 docs/integrations.md 完成必需安装。三个阶段按实际 HCU 问题联查它，普通训练不触发大知识库更新。
