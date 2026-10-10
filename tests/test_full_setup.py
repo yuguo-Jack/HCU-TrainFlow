@@ -138,7 +138,7 @@ def test_workflow_binding_from_other_directory_preserves_environment(tmp_path, m
     assert os.environ['TRAINFLOW_WORKSPACE'] == str(tmp_path/'explicit-workspace')
 
 
-def test_workflow_relocation_requires_explicit_rebind_and_preserves_old_installation(tmp_path, monkeypatch):
+def test_workflow_relocation_requires_explicit_rebind_and_cleans_verified_backup(tmp_path, monkeypatch):
     import shutil
     module = script('install_skills')
     original, moved = tmp_path/'original', tmp_path/'moved'
@@ -161,9 +161,71 @@ def test_workflow_relocation_requires_explicit_rebind_and_preserves_old_installa
     for name in module.NAMES:
         assert json.loads((target/name/'workspace.json').read_text())['project_root'] == str(moved.resolve())
         backups = list((tmp_path/'trainflow-skill-backups').glob('*/'+name+'/workspace.json'))
-        assert len(backups) == 1
-        assert json.loads(backups[0].read_text())['project_root'] == str(original.resolve())
+        assert not backups
         assert not (moved/'skills'/name/'workspace.json').exists()
+
+
+@pytest.mark.parametrize('failure', ['copy', 'verify'])
+def test_failed_skill_replacement_keeps_originals_and_obsolete_entry_backup(tmp_path, monkeypatch, failure):
+    module = script('install_skills')
+    module.ROOT = tmp_path/'project'
+    target = tmp_path/'installed'
+    for name in module.NAMES:
+        source = module.ROOT/'skills'/name
+        source.mkdir(parents=True)
+        (source/'SKILL.md').write_text('new '+name)
+    old_names = [module.NAMES[0], module.NAMES[1], 'hcu-train-operate']
+    for name in old_names:
+        dest = target/name
+        dest.mkdir(parents=True)
+        (dest/'SKILL.md').write_text('original '+name)
+    real_copy = module.shutil.copytree
+    def faulty_copy(source, dest, **kwargs):
+        result = real_copy(source, dest, **kwargs)
+        if failure == 'copy' and dest.name == module.NAMES[1]:
+            raise OSError('synthetic copy failure')
+        if failure == 'verify' and dest.name == module.NAMES[0]:
+            (dest/'SKILL.md').write_text('corrupt installed content')
+        return result
+    monkeypatch.setattr(module.shutil, 'copytree', faulty_copy)
+    monkeypatch.setattr(sys, 'argv', ['install_skills.py', '--target', str(target), '--workflow-only', '--replace'])
+    with pytest.raises((OSError, FlowError)):
+        module.main()
+    for name in old_names:
+        backups = list((tmp_path/'trainflow-skill-backups').glob('*/'+name+'/SKILL.md'))
+        assert len(backups) == 1
+        assert backups[0].read_text() == 'original '+name
+
+
+def test_successful_install_only_cleans_its_own_backups(tmp_path, monkeypatch):
+    module = script('install_skills')
+    module.ROOT = tmp_path/'project'
+    target = tmp_path/'installed'
+    for name in module.NAMES:
+        source = module.ROOT/'skills'/name
+        source.mkdir(parents=True)
+        (source/'SKILL.md').write_text('current '+name)
+    old = target/module.NAMES[0]
+    old.mkdir(parents=True)
+    (old/'SKILL.md').write_text('old installed')
+    history = tmp_path/'trainflow-skill-backups/previous-failed'/module.NAMES[0]/'SKILL.md'
+    history.parent.mkdir(parents=True)
+    history.write_text('unresolved previous backup')
+    monkeypatch.setattr(sys, 'argv', ['install_skills.py', '--target', str(target), '--workflow-only', '--replace'])
+    module.main()
+    assert history.read_text() == 'unresolved previous backup'
+    assert list((tmp_path/'trainflow-skill-backups').rglob('SKILL.md')) == [history]
+    assert (old/'SKILL.md').read_text() == 'current '+module.NAMES[0]
+
+
+def test_skill_cleanup_rejects_paths_outside_managed_root(tmp_path):
+    module = script('install_skills')
+    outside = tmp_path/'outside'/module.NAMES[0]
+    outside.mkdir(parents=True)
+    (outside/'SKILL.md').write_text('must remain')
+    with pytest.raises(FlowError, match='unsafe backup cleanup'):
+        module.cleanup_backups(tmp_path/'installed', [outside])
+    assert (outside/'SKILL.md').read_text() == 'must remain'
 
 
 def test_external_binding_never_fetches_or_resets(tmp_path, monkeypatch):

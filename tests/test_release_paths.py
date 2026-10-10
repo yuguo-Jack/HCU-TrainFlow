@@ -67,7 +67,7 @@ def test_cli_incomplete_exit_and_output(tmp_path,capsys):
     assert main(['--workspace',str(tmp_path/'w'),'profile-plan',str(p)])==2
     assert json.loads(capsys.readouterr().out)['status']=='incomplete'
 
-def test_skill_install_idempotent_and_backup(tmp_path):
+def test_skill_install_idempotent_and_cleans_successful_backup(tmp_path):
     script=Path(__file__).resolve().parents[1]/'scripts/install_skills.py';target=tmp_path/'skills'
     # These tests exercise workflow replacement, independent of local private
     # dependency checkouts. Full required installation has separate fixtures.
@@ -77,14 +77,16 @@ def test_skill_install_idempotent_and_backup(tmp_path):
     changed=target/'hcu-train-adapt/SKILL.md';changed.write_text('local modified')
     assert subprocess.run(cmd,capture_output=True).returncode!=0
     assert subprocess.run(cmd+['--replace'],capture_output=True).returncode==0
-    assert list((tmp_path/'trainflow-skill-backups').rglob('SKILL.md'))
+    assert not list((tmp_path/'trainflow-skill-backups').rglob('SKILL.md'))
+    assert changed.read_bytes() == (script.parent.parent/'skills/hcu-train-adapt/SKILL.md').read_bytes()
 
 
 @pytest.mark.parametrize('old_name,new_name', [
     ('hcu-train-prepare','hcu-train-adapt'),
+    ('hcu-train-operate','hcu-train-fault-tolerance'),
     ('hcu-engine-wiki-update','hcu-engine-wiki-skill-update'),
 ])
-def test_skill_rename_migration_preserves_old_customizations(tmp_path,old_name,new_name):
+def test_skill_rename_removes_obsolete_entry_after_verified_replacement(tmp_path,old_name,new_name):
     script=Path(__file__).resolve().parents[1]/'scripts/install_skills.py';target=tmp_path/'skills'
     old=target/old_name;old.mkdir(parents=True)
     (old/'SKILL.md').write_text('old local customization')
@@ -96,7 +98,7 @@ def test_skill_rename_migration_preserves_old_customizations(tmp_path,old_name,n
     assert f'name: {new_name}' in (target/new_name/'SKILL.md').read_text(encoding='utf8')
     assert (target/'hcu-train-fault-tolerance/SKILL.md').is_file()
     backups=list((tmp_path/'trainflow-skill-backups').rglob(old_name+'/SKILL.md'))
-    assert len(backups)==1 and backups[0].read_text()=='old local customization'
+    assert not backups
 
 def test_public_wiki_integrity():
     import importlib.util

@@ -193,3 +193,12 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [x] 完成本地套件、Wiki、链接、实际 Mermaid 渲染及真实源码包检查。
 
 发布目标：本轮变更提交至 main，推送 origin，并创建 annotated `v0.5.0` tag；最终发布回执以 Git 远端 ref 核对为准。本轮不创建 GitHub Release，不执行远端训练或更新大知识库。
+
+## 2026-10-10：README 总览与 Skill 更新收尾
+
+- [x] 主页按环境适配、性能优化、扩 DP/持续容错三阶段展开，补齐现场检查、准确模型语义、容量、初始基线及交付。
+- [x] 说明 Wiki/Skill 内容维护与本机安装同步的分工；主页移除历史名称迁移叙述。
+- [x] 安装器全部内容和绑定验证后清理本次临时备份，失败保留；更新 Skill 明确同步收尾。
+- [x] 针对性测试、知识与链接校验，本机同步及再次幂等安装均通过。
+
+本轮提交至 main，不移动已有 v0.5.0 tag；行为变化记入 Unreleased。

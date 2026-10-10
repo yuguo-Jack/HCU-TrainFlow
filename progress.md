@@ -219,3 +219,7 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 实际构建 0.5.0 sdist，确认新增介绍、流程图、PNG、提示文件逐字节保留；68/68 声明原件哈希一致，私有 workspace 和第三方 checkout 未入包。检查脚本兼容 Windows PKG-INFO 的 CRLF。
 - 源码版本、CLI 与本机 editable-package metadata 均为 0.5.0。远端 origin/main 没有新增提交，v0.5.0 tag 尚不存在；待本轮提交后推送并核对 main/tag refs。不创建 GitHub Release。
 - 没有运行新的硬件实验、更新 HCU-Knowledge 或修改其他任务的运行现场。
+
+## 2026-10-10：README 与升级同步验收
+
+完成 README、集成说明、安装器和更新 Skill 的对应修订。安装/重命名/绑定/依赖相关 60 项测试通过；新增覆盖复制失败、校验失败保留原件、成功仅清理本次备份、拒绝目录外清理。Wiki 校验 490 页/25 来源/0错误。更新 Skill 源文件及已安装副本通过 quick_validate；实际同步六个工作流入口后，本次临时备份已清理，再次安装全部 already current，历史备份文件数仍为87，本机无旧名称入口。没有执行知识刷新、远端任务或其他依赖升级。

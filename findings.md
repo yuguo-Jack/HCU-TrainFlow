@@ -171,3 +171,7 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 - 代表 rank 采样与 TraceLens 完整 collective 报告分开；后者需要全部 0..N-1 rank 文件及实际进程组上下文。
 - 算子同形状独立实测与上限建模可并行，优化按实际占比和剩余空间推进；完整数学库 bench 命令、baseline/HIP/Triton 衔接及阶段质量重算进入详图。
 - 主图由 built-in imagegen 更新并人工检查，复现提示保存于 docs/assets/workflow-overview.prompt.md；精确分支以可编辑 Mermaid 和文档契约为准。
+
+## 2026-10-10：更新 Skill 与安装器分工
+
+原 README 的总览主要展开优化，环境适配及扩容持续容错缺少同等清晰的入口，现已按三阶段重写。--replace 是将已核对的源 Skill 同步到安装目录，不承担上游查证或内容更新；更新 Skill 此前未明确同步本机收尾，现已补齐。旧 prepare/operate 入口已不存在，安装器仅保留识别历史目录的兼容。新替换先保留旧内容，全部哈希/绑定验收后清理本次备份；历史备份不自动扫除，避免删除之前失败安装的恢复材料。

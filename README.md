@@ -26,13 +26,34 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 [工程介绍](docs/project-overview.md) · [详细流程图与验收规则](docs/workflow-map.md)
 
-优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。抽离模型中关键算子同shape单测判断算子在模型中是否被通信、访存竞争或调度等因素显著拖慢。优先复用当前 HCU 工程配方和 TE、Flash-Train、Primus Turbo 等已有实现，按瓶颈联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等通信能力，按需使用三个 Hygon 算子 Skill。
+### 1. 环境验收与模型适配
 
-按主要占比选择优化对象：空泡、通信或计算谁占主导，先处理谁。计算算子按实际占比逐项分析和迭代；初步融合后仍有显著空间就继续优化，必要时转 HIP，停止时给出依据。详见[热点排序与算子迭代](skills/hcu-train-optimize/references/operator-ceiling-iteration.md)。
+- **发现并验收现场**：确认节点与卡的授权、占用、拓扑、镜像、DTK 和关键库版本，复用当前 Cluster Manager、run_nhc、检查脚本及 DTK 工具。检查健康、GEMM、HBM、机内互联和机间通信，逐项对照有来源的预期；缺项、性能差距和排查结果明确记录，需要时请专家介入。
+- **准确适配模型**：选择适用且活跃的 HCU 仓库/分支，优先核对已有启动脚本、环境变量和现场激活链；结合官方实现确认模型结构、数据、精度、优化器与训练语义，保留用户 patch 和执行基线。预训练、SFT、RL 与 Torch 原生训练分别补查其数据和执行语义。
+- **先评估完整模型容量**：参考 HCU Train Sim、当前模型源码、实际可用卡数和硬件参数，预算最重 rank 的显存与余量并短跑校准。能放下就直接全参适配；资源不足才优先缩 layer，其他维度变化须明确授权并记录代理范围。
+- **建立可信基线**：验证前向、反向、参数更新和 checkpoint，冻结源码、配置、初始数值及比较条件。有 NVIDIA 环境时补充跨平台对照；未覆盖范围保留到后续验收。
 
-同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。适配前参考 HCU Train Sim、模型结构和实际可用卡数做容量预估，短跑校准后能放下就直接全参适配优化；资源不足才缩 layer 跑通或筛机；用户明确允许缩维时记录授权范围与模型差异。完整模型目标在扩规模前恢复并验收完整配置，再逐级扩 DP 域；已获授权的代理任务可以扩选定代理配置的 DP，复核性能、显存和训练语义，同时保留原完整模型的验证缺口。
+### 2. 性能分析、优化与质量验证
 
-完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新见 [工作流全景](docs/workflow-map.md)，其中列明阶段证据门槛及对应源码。
+- **并行切分与显存取舍**：先评估 TP/PP/DP/CP/EP、微批、累积、重算、状态切分及 overlap，在显存峰值、必要余量、通信和实际吞吐之间选择配置。调参保持训练语义可比，GPU_MAX_HW_QUEUES 等按当前 runtime 与实测核验。
+- **按主要瓶颈推进**：采集稳态端到端 profile，每个实际非单例并行组至少覆盖两个代表 rank，结合 TraceLens 分析空泡、通信、负载不均、计算和显存。谁占主要时间就先处理谁；通信达到单测预期仍大量暴露时，再考虑 overlap、调度或通算融合。
+- **重点算子持续迭代**：对累计 ≥90% 端到端热点中的非通信算子，按实际贡献排序，评估瓶颈、可达上限、当前效率和剩余空间。同 shape 独立实测与上限建模可以并行，用于区分实现差距和模型内资源竞争；保留空泡、重叠和未归因时间的正确口径。
+- **复用与深入实现**：优先复用 HCU TE、Flash-Train、Primus Turbo 等能力，对齐融合粒度和数值契约；缺 HIP 基线时先调用 baseline Skill，再进入 HIP 优化，已有 Triton 实现调用 Triton 优化 Skill。融合后仍有显著空间就继续迭代，瓶颈时使用实际性能工具；数学库有性能缺口时提取原生日志中的完整 bench 命令用于 tune。通信按需联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等。
+- **稳定阶段验 loss**：每轮做局部正确性、多形状和无 profiler 性能回归，集成后重测整步净收益；稳定阶段从同一冻结初态与配方比较 loss、性能和显存。达到目标、接近可达上限、无稳定收益或受阻，都须给出证据与停止依据。
+
+同一阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。机制选择联查官方教程与 PR、AMD Primus、MindSpeed 系列、LoongForge 和 HCU 底层源码。详见[热点排序与算子迭代](skills/hcu-train-optimize/references/operator-ceiling-iteration.md)。
+
+### 3. 扩 DP 域、容错与持续训练
+
+- **逐级扩容**：完整模型目标必要时先恢复并验收完整配置；获准的代理任务可以扩选定代理配置的 DP，并保留完整模型验证缺口。以 Cluster Manager 为主筛机、交叉检查疑似节点并维护健康池，逐级核对吞吐、扩展效率、通信、显存和训练语义；新瓶颈返回优化。
+- **验证恢复链路**：接入现场既有容错并明确唯一恢复负责人，按部署授权诊断卡住、core dump、OOM、泄露等问题。验证旧进程处理、checkpoint 完整性、重新拉起及训练状态恢复，观察 step 是否真实持续推进。
+- **长时观察与接续**：持续记录 loss、吞吐、显存、全部必需成员、checkpoint 和恢复状态，生成曲线并检查观察器自身健康。本机离线时由已部署并验收的远端守护和既有容错继续工作；恢复后核对现场、重放事件并接续 Agent，告警和自动唤醒分别验收。
+
+### 贯穿全程的协同与交付
+
+本地主控按依赖和收益拆解任务，独立方向并行，共享资源测量与耦合修改协调执行；代码以固定快照同步远端，超时或断线先核查原作业。HCU-Knowledge、局部官方 Wiki、PR 与源码查证贯穿三个阶段，看板持续展示技术结论并采集指导。各阶段按范围交付代码、配方、验证和回退方法；完整任务在执行基线上完成约定验证后再整合目标主仓，精选通用经验和最终里程碑进入共享 Wiki。
+
+完整分支、优化回路、独立任务与验收条件见 [工作流全景](docs/workflow-map.md)。
 
 ## 如何与 Agent 协作
 
@@ -82,7 +103,13 @@ $env:TRAINFLOW_PROJECT = (Get-Location).Path
 $env:TRAINFLOW_WORKSPACE = "D:/trainflow-work/my-task"
 ```
 
-已有独立知识库时加 `--knowledge-root /path/to/HCU-Knowledge`，复用原件、索引与配置，不重复克隆、不拉取其上游更新。升级 Skill 使用 `--replace`，旧版本先备份到扫描目录之外；旧 prepare/operate 名称自动迁移。缺少私有仓权限、LFS 原件或索引不可用时安装会报告未完成；不会静默跳过。飞书等在线能力另用本人账号授权。详见 [依赖与安装说明](docs/integrations.md)。
+已有独立知识库时加 `--knowledge-root /path/to/HCU-Knowledge`，复用原件、索引与配置，不重复克隆、不拉取其上游更新。缺少私有仓权限、LFS 原件或索引不可用时安装会报告未完成；不会静默跳过。飞书等在线能力另用本人账号授权。详见 [依赖与安装说明](docs/integrations.md)。
+
+### 后续更新
+
+日常维护使用 `$hcu-engine-wiki-skill-update`，由 Agent 检查官方与相关 HCU 工程变化，更新局部 Wiki、受影响的流程和 Skill，验证后同步本机安装。普通维护不更新 HCU-Knowledge，也不自动替换正在运行的训练依赖。
+
+手动拉取 TrainFlow 新版本后，可重新运行安装命令并加 `--replace`。这个参数只允许用已经核对的仓库内容替换本机已安装 Skill；内容查证与修订由更新 Skill 完成。安装器在全部内容及目录绑定校验成功后清理本次临时旧版本备份，失败时保留备份供恢复。完成后重新打开 Agent 会话。具体步骤见[维护与本机同步](docs/integrations.md#skills账号与升级)。
 
 ## 本地验证与阅读入口
 

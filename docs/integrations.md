@@ -29,9 +29,23 @@ HCU-Knowledge 贯穿环境适配、性能优化和扩 DP/容错，按问题查�
 
 ### Skills、账号与升级
 
-`--replace` 会把不同的旧 Skill 备份到扫描目录之外，核对全部目标后再替换；旧 prepare/operate 名称迁为 adapt/fault-tolerance。两个 HCU 知识 Skill 生成与其自身安装器相同格式的 `workspace.json`，绑定实际知识 checkout；完整复制脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
+更新分为内容维护和本机同步，由更新 Skill 衔接完成：
 
-六个 TrainFlow Skill 的安装目录各有 `workspace.json`，其中 `project_root` 指向本次安装使用的工程绝对路径；个人路径只写入安装目录，不写入仓库源文件。新会话从其他工作目录使用 Skill 时，先采用用户明确指定的项目或 `TRAINFLOW_PROJECT`，未指定时读取该绑定。绑定只用于定位项目，不设置或覆盖任务的 `TRAINFLOW_WORKSPACE`。工程搬家后从新位置运行安装器并加 `--replace`，保留旧安装备份后重绑；两个 HCU 知识 Skill 的 `root` 继续独立指向知识 checkout。
+1. **内容维护**：`$hcu-engine-wiki-skill-update` 检查官方/相关 HCU 工程变化，修订本仓 Wiki、受影响的 Skill、命令和解析器，完成对应复核与测试。
+2. **本机同步**：仓库内容验证后，安装器将 Skill 及 references 复制到实际 Agent 的 Skills 目录，并写入目录绑定。`--replace` 允许替换已有的不同内容，本身不搜索上游、不修订知识，也不决定依赖升级。
+3. **安装验收与清理**：替换期间暂存本次旧内容；全部目标的文件哈希和绑定匹配后，自动清理本次临时备份。复制或校验失败则保留备份和错误，修复后再同步。未确认状态的历史备份不由本次安装自动扫除。
+
+完整安装已就绪、仅更新本仓六个 Skill 时，由 Agent 执行：
+
+```powershell
+python scripts/install_skills.py --target "$HOME/.codex/skills" --workflow-only --replace
+```
+
+首次安装用 setup_trainflow；手动拉取 TrainFlow 新版本后，重新运行 setup_trainflow 并加 `--replace`，以核对包、依赖和全部 11 个入口。算子或知识库 Skill 的源版本确有变化时按对应维护范围同步，不因本仓文档变化而升级其他项目。HCU-Knowledge 的内容更新仍需单独授权。
+
+当前阶段入口是 `hcu-train-adapt`、`hcu-train-optimize` 和 `hcu-train-fault-tolerance`。安装器只为较早安装保留过时目录的清理兼容，不安装旧名称或旧别名。两个 HCU 知识 Skill 的 `workspace.json` 绑定实际知识 checkout；完整复制其脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
+
+六个 TrainFlow Skill 的安装目录各有 `workspace.json`，其中 `project_root` 指向本次安装使用的工程绝对路径；个人路径只写入安装目录，不写入仓库源文件。新会话从其他工作目录使用 Skill 时，先采用用户明确指定的项目或 `TRAINFLOW_PROJECT`，未指定时读取该绑定。绑定只用于定位项目，不设置或覆盖任务的 `TRAINFLOW_WORKSPACE`。工程搬家后从新位置运行安装器并加 `--replace`，校验新绑定成功后清理本次旧备份；两个 HCU 知识 Skill 的 `root` 继续独立指向知识 checkout。
 
 飞书在线检索另外安装/配置 `lark-cli` 并用本人身份授权；浏览器辅助访问按需配置 `playwright-cli`。离线索引就绪不表示在线权限就绪，任务启动和使用在线来源时检查实际请求状态。Git、飞书和浏览器的身份分别管理。详细知识安装与权限规则见实际知识库的 `docs/installation.md`。
 

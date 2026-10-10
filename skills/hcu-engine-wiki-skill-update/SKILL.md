@@ -22,6 +22,7 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
    复核后又改正文/工作流或新增同来源专题时，重新检查并留下新回执；即使上游没有新变化也不能沿用过期复核。PR 重采后同样处理由作者页变动引起的待办。
 8. wiki-catalog 刷新来源/文档/PR 导航（wiki-update 已在收尾调用），wiki-index 更新搜索。运行本工程测试和真实问题检索，保存本次缺口及下次入口。Wiki 提交与 push 沿用任务授权；站点知识按本仓归属规则提交，凭据不入仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
+9. 若本仓 Skill 或 references 有变化，验证后在本次维护范围内同步实际 Agent 的安装目录：完整安装已就绪时运行 `scripts/install_skills.py --target <实际Skills目录> --workflow-only --replace`，核对六个入口和 `workspace.json` 绑定。安装器全部校验成功后清理本次临时旧备份，失败保留备份供恢复；报告同步结果并提醒新会话加载。仅 Wiki 内容变化无需重装 Skill；其他依赖 Skill 变更按 `docs/integrations.md` 的对应范围同步，不自动更新 HCU-Knowledge。
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。
 

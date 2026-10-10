@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Expand the README overview into environment/model adaptation, performance and quality iteration, and DP scaling with sustained recovery/observation. Explain content maintenance through the Wiki/Skill update entry and installation synchronization separately.
+- Verify all installed Skill files and directory bindings before cleaning backups created by a successful replacement. Preserve originals on failure and leave historical backups untouched; obsolete entry names remain cleanup compatibility only. The Wiki/Skill update workflow now explicitly synchronizes changed local workflow Skills after validation.
+
 ## 0.5.0 — 2026-10-10
 
 - Add a complete project introduction covering task takeover, environment acceptance, faithful model adaptation, capacity planning, bottleneck-driven optimization, numerical validation, DP scaling and sustained recovery/observation.

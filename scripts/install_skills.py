@@ -29,23 +29,52 @@ def checked_destination(target, name):
         raise FlowError('Skill destination is not a directory: '+str(path))
     return path
 
+def managed_backup_root(target):
+    backup_root=target.parent/'trainflow-skill-backups'
+    if backup_root.is_symlink() or backup_root.resolve()!=backup_root or backup_root.is_relative_to(target):
+        raise FlowError('Backup directory must be unredirected and outside scanned Skills')
+    return backup_root
+
+
 def backup_directory(target, path):
     # Recheck resolved boundaries immediately before moving a whole directory.
     path=checked_destination(target,path.name)
-    backup_root=(target.parent/'trainflow-skill-backups').resolve()
-    if backup_root.is_relative_to(target):
-        raise FlowError('Backup directory must be outside scanned Skills')
+    backup_root=managed_backup_root(target)
     backup=backup_root/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')/path.name
     if not backup.resolve().is_relative_to(backup_root):
         raise FlowError('Backup must remain under its managed root')
     backup.parent.mkdir(parents=True,exist_ok=True)
     path.rename(backup)
     print(path.name+': backed up to '+str(backup))
+    return backup
+
+
+def cleanup_backups(target, backups):
+    """Remove only this successful invocation's backups, never sweep history."""
+    def check(backup):
+        root=managed_backup_root(target)
+        if (not backup.is_absolute() or backup.parent.parent!=root
+                or backup.name not in {*NAMES, *KERNEL_NAMES, *KNOWLEDGE_NAMES, *RENAMED}
+                or backup.is_symlink() or backup.resolve()!=backup or not backup.is_dir()):
+            raise FlowError('Refusing unsafe backup cleanup: '+str(backup))
+        for child in backup.rglob('*'):
+            if child.is_symlink() or child.resolve()!=child:
+                raise FlowError('Retaining backup with redirected content: '+str(backup))
+
+    # Validate the whole set, then recheck each path immediately before deletion.
+    for backup in backups:
+        check(backup)
+    for backup in backups:
+        check(backup)
+        shutil.rmtree(backup)
+        if not any(backup.parent.iterdir()):
+            backup.parent.rmdir()
+        print(backup.name+': verified replacement; temporary backup removed')
 
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--target',type=Path,required=True,help='Agent skills directory; installation is explicit')
-    parser.add_argument('--replace',action='store_true',help='Back up an existing different skill before replacement')
+    parser.add_argument('--replace',action='store_true',help='Replace installed Skills; clean temporary backups only after all copies and bindings verify')
     parser.add_argument('--with-kernel-skills',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--workflow-only',action='store_true',help='Developer-only six-Skill refresh; not a complete TrainFlow installation')
     args=parser.parse_args()
@@ -84,19 +113,26 @@ def main():
     for old in RENAMED:
         dest=checked_destination(target,old)
         if dest.exists() and not args.replace:
-            parser.error('Renamed Skill found; --replace preserves it outside discovery before migration: '+old)
+            parser.error('Obsolete Skill entry found; inspect it then use --replace to install current names: '+old)
+    backups=[]
     for old in RENAMED:
         dest=checked_destination(target,old)
-        if dest.exists():backup_directory(target,dest)
+        if dest.exists():backups.append(backup_directory(target,dest))
     for name, source in sources.items():
-        dest=target/name
+        dest=checked_destination(target,name)
         if dest.exists():
             if tree_hash(dest)==expected[name]:print(name+': already current');continue
-            # Backups outside the scanned skills directory avoid duplicate discovery.
-            backup_directory(target,dest)
+            # Retain originals on any install/verification failure.
+            backups.append(backup_directory(target,dest))
         shutil.copytree(source,dest,ignore=shutil.ignore_patterns('__pycache__'))
         if name in bindings:
             (dest/'workspace.json').write_bytes(bindings[name])
         print(name+': installed')
+    for name in sources:
+        dest=checked_destination(target,name)
+        if tree_hash(dest)!=expected[name]:
+            raise FlowError('Installed Skill verification failed; backups retained: '+name)
+    print(f'Verified {len(sources)} installed Skills and their bindings')
+    cleanup_backups(target,backups)
 
 if __name__=='__main__':main()

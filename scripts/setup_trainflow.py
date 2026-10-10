@@ -79,7 +79,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--skills-dir', type=Path, required=True)
     parser.add_argument('--knowledge-root', type=Path, help='Reuse an existing KB without source updates; missing LFS objects must be restored there first')
-    parser.add_argument('--replace', action='store_true', help='Back up different installed Skills before replacement')
+    parser.add_argument('--replace', action='store_true', help='Replace installed Skills; clean temporary backups after successful verification')
     args = parser.parse_args()
     try:
         setup(ROOT, args.skills_dir, args.knowledge_root, args.replace)
