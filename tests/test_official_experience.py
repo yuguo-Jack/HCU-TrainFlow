@@ -315,6 +315,64 @@ def test_unchanged_pr_reopens_review_for_changed_related_topic(tmp_path,monkeypa
     assert read_json(store.root/'wiki/pr-review'/f'{saved["id"]}.json')['status']=='pending-content-review'
 
 
+@pytest.mark.parametrize('association',['source','pr'])
+def test_pr_review_discovers_new_related_page_after_capture(tmp_path,monkeypatch,association):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    old=root/'knowledge/topic.md'
+    old.write_text(official.markdown({'id':'topic','sources':[{'source':'engine'}]},'# Existing topic'))
+    monkeypatch.setattr(wiki,'_get_json',pr_api)
+    saved=official.retain_pr(store,root,official.read_pr(store,'org/engine',1),'engine')
+    added=root/'knowledge/new-topic.md'
+    meta={'id':'new-topic','sources':[{'source':'engine'}]} if association=='source' else {'id':'new-topic','pr_sources':[saved['id']]}
+    added.write_text(official.markdown(meta,'# New related conclusion'))
+    decisions={'artifact_sha256':saved['artifact'],'note':'Reviewed API','pages':{'knowledge/topic.md':{
+        'decision':'still-applicable','note':'Read final source','page_sha256':digest(old.read_bytes())}}}
+    with pytest.raises(FlowError,match='every'):official.review_pr(store,root,saved['id'],decisions)
+    pending=read_json(store.root/'wiki/pr-review'/f'{saved["id"]}.json')
+    assert pending['status']=='pending-content-review'
+    assert pending['affected_pages']==['knowledge/new-topic.md','knowledge/topic.md']
+    decisions['pages']['knowledge/new-topic.md']={'decision':'updated','note':'Reconciled new topic','page_sha256':digest(added.read_bytes())}
+    assert official.review_pr(store,root,saved['id'],decisions)['status']=='content-reviewed'
+
+
+def test_pr_citation_removal_keeps_surviving_prose_pending(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    page=root/'knowledge/topic.md'
+    page.write_text(official.markdown({'id':'topic','sources':[{'source':'engine'}]},'# Claim'))
+    monkeypatch.setattr(wiki,'_get_json',pr_api)
+    pr=official.read_pr(store,'org/engine',1);saved=official.retain_pr(store,root,pr,'engine')
+    page.write_text(official.markdown({'id':'topic','sources':[]},'# Claim still present'))
+    official.retain_pr(store,root,pr,'engine')
+    pending=read_json(store.root/'wiki/pr-review'/f'{saved["id"]}.json')
+    assert pending['affected_pages']==['knowledge/topic.md']
+    with pytest.raises(FlowError,match='every'):
+        official.review_pr(store,root,saved['id'],{'artifact_sha256':saved['artifact'],'note':'Checked','pages':{}})
+
+
+def test_pr_review_rejects_artifact_updated_by_another_store(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    monkeypatch.setattr(wiki,'_get_json',pr_api)
+    saved=official.retain_pr(store,root,official.read_pr(store,'org/engine',1),'engine')
+    def changed(url,token=None):
+        data,links=pr_api(url,token)
+        if '/reviews?' in url:data[0]['body']='New API boundary'
+        return data,links
+    monkeypatch.setattr(wiki,'_get_json',changed)
+    other=Store(tmp_path/'other-store')
+    official.retain_pr(other,root,official.read_pr(other,'org/engine',1),'engine')
+    with pytest.raises(FlowError,match='artifact changed'):
+        official.review_pr(store,root,saved['id'],{'artifact_sha256':saved['artifact'],'note':'Old interpretation','pages':{}})
+
+
+def test_pr_review_reads_legacy_pointer_without_page_binding(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    monkeypatch.setattr(wiki,'_get_json',pr_api)
+    saved=official.retain_pr(store,root,official.read_pr(store,'org/engine',1),'engine')
+    pointer=store.root/'wiki/pr-review'/f'{saved["id"]}.json'
+    pending=read_json(pointer);pending.pop('page');write_json(pointer,pending)
+    assert official.review_pr(store,root,saved['id'],{'artifact_sha256':saved['artifact'],'note':'No authored topic affected','pages':{}})['status']=='content-reviewed'
+
+
 def test_cli_search_refreshes_local_index_and_binds_requested_project(tmp_path):
     from hcu_trainflow.cli import execute, parser
     root=project(tmp_path);store=Store(tmp_path/'s')

@@ -1,6 +1,5 @@
 """Complete local TrainFlow setup using system Python and the user's Git access."""
 import argparse
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -8,7 +7,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from hcu_trainflow.core import FlowError, write_json
-from hcu_trainflow.dependencies import bind_knowledge, require_checkout, sync_dependencies
+from hcu_trainflow.dependencies import bind_knowledge, knowledge_ready, require_checkout, sync_dependencies
 
 
 def setup(project, skills_dir, knowledge_root=None, replace=False, run=subprocess.run):
@@ -55,11 +54,7 @@ def setup(project, skills_dir, knowledge_root=None, replace=False, run=subproces
             state['current_stage'] = stage
             write_json(record, state)
             probe = run(doctor, cwd=knowledge, capture_output=True, text=True, encoding='utf-8', errors='replace')
-            try:
-                health = json.loads(probe.stdout)
-                reusable = probe.returncode == 0 and health.get('local_ready') is True and health.get('index_current') is True and health.get('snapshot_mode') != 'rollback'
-            except (AttributeError, ValueError):
-                pass
+            reusable = knowledge_ready(probe)
         if reusable:
             state['completed_stages'].append('knowledge-bootstrap-reused')
             print('Setup: reusing current external knowledge index (no historical rehash)', flush=True)

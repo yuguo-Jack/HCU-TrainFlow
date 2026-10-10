@@ -122,6 +122,11 @@ def test_all_leases_are_validated_before_any_launch(store, tmp_path, monkeypatch
 
 
 def test_remote_failure_holds_all_resources_until_whole_group_reconciliation(store, tmp_path, monkeypatch):
+    # An authorized local bridge must still respect the group's resource locks.
+    with store.db() as db:
+        task = store.task("t")["spec"]
+        task["permissions"].append("agent-dispatch")
+        db.execute("UPDATE tasks SET spec=? WHERE id='t'", (json.dumps(task),))
     spec = card(tmp_path, ["raise SystemExit(7)", "print('peer exited')"])
     for member in spec["members"]:
         member["card"].update(backend="ssh", ssh_target=member["node"])

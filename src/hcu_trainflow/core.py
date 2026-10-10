@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,20 @@ import uuid
 
 class FlowError(ValueError):
     pass
+
+
+def _check_lease_ttl(ttl):
+    if (isinstance(ttl, bool) or not isinstance(ttl, (int, float))
+            or not 0 < ttl <= 86400 or not math.isfinite(ttl)):
+        raise FlowError("Lease TTL must be finite and in (0,86400]")
+
+
+def _check_lease_expiry(row):
+    expiry = row["expires"]
+    if (isinstance(expiry, bool) or not isinstance(expiry, (int, float))
+            or not math.isfinite(expiry)):
+        raise FlowError("Invalid persisted lease expiry; inspect and reconcile before reuse")
+    return expiry
 
 
 def utc():
@@ -307,6 +322,9 @@ class Store:
             self.artifact(sha)
         if value["status"] == "pass" and not valid_pass(value):
             raise FlowError("PASS requires actual execution, no failures and required coverage")
+        if kind == "stage-quality" and value["status"] == "pass":
+            from .quality import validate_stage_report
+            validate_stage_report(self, value)
         data = json.dumps(value, ensure_ascii=False, allow_nan=False).encode()
         sha = self.put(data)
         with self.db() as db:
@@ -331,8 +349,22 @@ class Store:
             AND json_extract(e.payload,'$.kind')=r.kind
             AND json_extract(e.payload,'$.artifact')=r.artifact AND e.seq>?)""",
             (tid, context, context_epoch(db, tid)))
-        return {row["kind"]: row for row in rows
-                if row["result"] != "pass" or valid_pass(json.loads(self.artifact(row["artifact"])))}
+        result = {}
+        for row in rows:
+            if row["result"] == "pass":
+                value = json.loads(self.artifact(row["artifact"]))
+                if not valid_pass(value):
+                    continue
+                if row["kind"] == "stage-quality":
+                    from .quality import validate_stage_report
+                    try:
+                        validate_stage_report(self, value)
+                    except FlowError:
+                        # Historical artifacts remain readable but cannot grant
+                        # a new transition using an incomplete old contract.
+                        continue
+            result[row["kind"]] = row
+        return result
 
     def change_context(self, tid, context):
         if not isinstance(context, dict) or not context:
@@ -389,15 +421,14 @@ class Store:
         return self.task(tid)
 
     def lease(self, resource, owner, ttl=300):
-        if ttl <= 0 or ttl > 86400:
-            raise FlowError("Lease TTL must be in (0,86400]")
+        _check_lease_ttl(ttl)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             running = db.execute("SELECT o.id FROM operations o JOIN events e ON json_extract(e.payload,'$.operation')=o.id WHERE e.kind='operation-started' AND json_extract(e.payload,'$.lease.resource')=? AND o.status IN ('started','unknown')", (resource,)).fetchone()
             if running:
                 raise FlowError("Resource has an unresolved execution; reconcile before acquiring it")
             row = db.execute("SELECT * FROM leases WHERE resource=?", (resource,)).fetchone()
-            if row and row["expires"] > time.time():
+            if row and _check_lease_expiry(row) > time.time():
                 raise FlowError("Resource is already leased; renew with its fencing token")
             token = row["token"] + 1 if row else 1
             db.execute("INSERT OR REPLACE INTO leases VALUES(?,?,?,?)", (resource, owner, token, time.time() + ttl))
@@ -405,12 +436,13 @@ class Store:
 
     def check_lease(self, db, resource, owner, token):
         row = db.execute("SELECT * FROM leases WHERE resource=?", (resource,)).fetchone()
-        if not row or row["owner"] != owner or row["token"] != token or row["expires"] <= time.time():
+        if not row or row["owner"] != owner or row["token"] != token:
+            raise FlowError("Expired lease or stale fencing token")
+        if _check_lease_expiry(row) <= time.time():
             raise FlowError("Expired lease or stale fencing token")
 
     def renew(self, lease, ttl=300):
-        if not 0 < ttl <= 86400:
-            raise FlowError("Invalid lease duration")
+        _check_lease_ttl(ttl)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             self.check_lease(db, **lease)

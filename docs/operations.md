@@ -86,6 +86,8 @@ CFS故障时，本地Store仍有机会记录读超时；但共享CFS上的源数
 
 远端 `events-export` 按 seq 导出；本机 `events-import` 使用稳定 peer ID 重放并去重，遇到缺号拒绝越过。之后查询 inbox，结合当前 attempt/job/checkpoint 决定处理。不要只依据旧告警重启已经恢复的任务。
 
+派发本地事件时，程序拒绝早于当前 context epoch 的记录，并把领取时的 context/epoch 绑定到执行事务；配置改成 B 后再改回 A，也不能复用原 A 事件启动新的处理。远端事件的本地 seq 是导入顺序，不能证明远端产生时的 epoch：迟到事件仍须核对实际 attempt、进程/作业、checkpoint 和最新观测，必要时只保留为历史。bridge 被唤醒是处理证据的入口，不授予按旧事件直接重启训练的权限。
+
 `inbox --action claim --event ID --owner NAME` 领取，处理后 complete；失败用 retry。agent bridge 可用 `inbox-dispatch ID OWNER CARD LEASE` 执行本地已配置的 launcher，事件文件路径作为最后参数传入。TaskSpec 必须有 execute 和 agent-dispatch。bridge 返回成功仅记录交付，实际 Agent 的接手/完成由 inbox 回执确认。没有已配置且在线的 Agent launcher 就无法自动唤醒它。
 
 飞书优先使用既有容错告警通道；本版本不内置飞书凭据或自动群发。通知成功不等于恢复成功。新增修复上线、重启或隔离权限在具体任务部署时确定，既有容错保持唯一恢复负责人。

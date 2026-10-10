@@ -49,6 +49,8 @@ task-context 的每次实际重置还记录 context_epoch。切换 A→B→A 不
 {
   "context": "TASK_CONTEXT_HASH",
   "sample_fingerprint": "FROZEN_SAMPLE_AND_MASK_HASH",
+  "initial_state_fingerprint": "FROZEN_MODEL_OPTIMIZER_RNG_DATA_STATE_HASH",
+  "training_recipe_fingerprint": "COMPARABLE_TRAINING_RECIPE_HASH",
   "aggregation": "global-valid-token-mean",
   "min_steps": 100,
   "atol": 0.001,
@@ -59,7 +61,24 @@ task-context 的每次实际重置还记录 context_epoch。切换 A→B→A 不
 
 baseline/candidate 各含 context、sample_fingerprint、aggregation、executed、evidence、steps 数组、loss 数组。candidate 还必须 `candidate_path_exercised: true`。`skipped_required`、`failures` 或失败 status 阻止通过。steps 必须严格递增且完全对齐，loss 必须有限。程序比较固定窗口，不自动证明数据指纹的真实性或长期收敛。
 
+新阶段 A/B 同时在契约及两组记录中声明非空 `initial_state_fingerprint`、`training_recipe_fingerprint`；声明后缺失/不匹配会阻止通过。它们是初始模型/优化器/RNG/数据状态清单及可比训练配方的内容身份，与实现的 `candidate_snapshot` 分开。旧契约可读，输出的 `matched_identity_fields` 明确实际比较了哪些身份；缺少初态/配方声明时，即使窗口数值 `status=pass`，也返回 `stage_eligible=false` 和 `stage_missing`，不能用于新阶段晋级。记录中已出现的身份不能借旧契约忽略，契约未冻结它们时返回 incomplete。准备与证据要求见[阶段 A/B loss](training-state-validation.md#优化里程碑的阶段-ab-loss)。
+
+登记通过的 `stage-quality` 报告前，将实际 QualityContract 和两组记录合为 `{"contract": {...}, "baseline": {...}, "candidate": {...}}` 文件，经 `artifact-add` 留存。报告的 `quality_inputs` 填返回的 SHA256，同时放入报告 `evidence`；candidate 记录还需包含与报告相同的 `candidate_snapshot`，该快照及两组记录的原始 evidence 都必须已注册。例如报告增补：
+
+```json
+{
+  "quality_inputs": "REGISTERED_COMPARISON_INPUTS_SHA256",
+  "evidence": ["REGISTERED_COMPARISON_INPUTS_SHA256", "REGISTERED_RAW_TEST_SHA256"]
+}
+```
+
+程序在登记和后续阶段推进时重新计算对照，要求 `status=pass`、`stage_eligible=true`、当前 context 和候选快照匹配。只填报告的 pass 或自行声明 stage_eligible 不能代替输入。历史报告原件仍可读，但未包含这些证据的旧通过记录不再授予新的阶段晋级；只能根据原始资料补全可追溯证据或补验，不能捏造身份。程序检查身份一致性和证据完整性，原始清单是否真实仍由负责 Agent 与独立 reviewer 核实。
+
 `iteration-check` 输入 correctness、baseline_times、candidate_times、context、可选 max_regression。correctness 另要求 profiler_off=true 和 measurement_protocol。至少三次匹配性能重复，输出 iteration-kept 仍是 pending-stage-validation，不是生产默认。
+
+数值记录的显式 `status` 只能为 `pass`；blocked/rejected/unknown 等均不能作为通过的证据。历史记录可省略 status，但仍须具备实际执行、候选 dispatch、非空证据 ID 数组和完整覆盖。baseline/candidate 的 steps 均独立验证为严格递增整数，布尔值或浮点数不等同于训练步数。冻结 context 应包含初始模型/优化器/RNG 状态及有效 batch 等比较身份，仅 loss 数字相近不能证明这些条件匹配。
+
+`measurement_protocol` 可用非空说明字符串，或结构化对象（例如 `{"description":"交错配对稳态采样，注明单位和资源条件", "max_relative_mad":0.1}`）。阈值是任务在采样前确定的示例，不是默认标准。配置 `max_relative_mad` 时，基线和候选的 `median(abs(time - median(time))) / median(time)` 都不得超过它，否则返回 incomplete；未配置则输出 `timing.stability=not-specified`，不声称稳定性已验收。输出中保留各自中位数、相对 MAD 及配对比值，供进一步检查漂移和离群值；MAD 不代替置信区间或物理隔离，单靠中位数不能证明收益显著。
 
 ## OperatorModel
 

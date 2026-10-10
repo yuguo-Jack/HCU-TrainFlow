@@ -1,4 +1,17 @@
-# HCU-TrainFlow v0.1.0 implementation plan
+# HCU-TrainFlow development plan
+
+## Current: integrated workflow review and handoff (2026-10-10)
+
+The physical qualification round is sufficient for this review. Consolidate reusable decisions and evidence contracts so a fresh Agent can take over a new environment/model through the single coordinator Skill. Do not resume proxy tuning or present bounded drills as full-model convergence. Historical sections below record earlier decisions; current AGENTS.md and published workflow docs take precedence over superseded optional-dependency/naming/release notes.
+
+1. Audit requirements against the entry Skills, phase transitions, runtime, installation, Wiki and observation/delivery contracts — complete.
+2. Repair demonstrated gaps and simplify discovery/handoffs; preserve three independent stage modes, scientific prioritization and evidence limitations — complete.
+3. Run focused regressions, full CPU suite, knowledge validation, fresh-workspace/install checks and independent behavioral review — complete (1054 passed, 4 platform skips; 490 Wiki pages valid; 68/68 packaged evidence files).
+4. Update version/changelog and qualification boundaries, synchronize installed Skills — complete. Publish this reviewed tree to main with the explicitly requested v0.4.0-dev.1 development milestone tag; matching remote branch and tag refs are the publication receipt.
+
+Parallel reviews covered workflow/Skill decision quality, runtime/operation state and installation/Wiki; the main Agent owned integration and final acceptance. Independent code review and a fresh-context entry exercise checked the integrated result. No new live GPU experiments were performed. Process notes remain in these three planning files; transferable operating instructions belong in docs/Skills.
+
+## Historical implementation record
 
 ## Scope
 Implement the first usable local-centred workflow release. Preserve the 36 requirements and staged roadmap from the approved design. Five Skills: prepare, optimize, operate, wiki search, wiki update. Real HCU/site validation remains explicit and separate from local fixture tests.

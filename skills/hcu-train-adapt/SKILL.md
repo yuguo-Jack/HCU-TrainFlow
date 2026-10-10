@@ -11,7 +11,9 @@ description: 检查 HCU 训练环境或将预训练、SFT、RL 模型适配跑�
 
 ## 工作步骤
 
-1. **接受任务与权限。** 记录模型、训练类型、资源、运行方式、数据/权重位置、已有 patch、预算、预期和可执行范围；缺失关键项及时询问，其他阅读与命令发现可继续。
+`environment` 只执行步骤 1–3 及其差距排查，然后交付环境报告；不进入模型容量/短跑、源码适配和训练基线步骤，也不部署训练观察器。步骤 4 以后用于 adapt/full。环境检查所需测试仓源码仍可按问题读取。
+
+1. **接受任务与权限。** 先按模式记录资源、运行方式、预算、预期和可执行范围；adapt/full 再记录模型、训练类型、数据/权重、已有 patch。environment 不要求尚未提供的模型或训练数据。缺失当前工作所需的关键项才询问，其他阅读与命令发现可继续。
 2. **发现真实环境。** 读取已有镜像/脚本、当前工具源码与 `--help`。优先 Cluster Manager 对应子工程、run_nhc/check 脚本和 DTK 工具；按裸机/Conda、SSH+Docker、Slurm、K8s 区分。工具不存在或权限不足登记缺口，不能假定通过。共享集群先检查设备进程、显存、利用率及调度/预约；使用多次新鲜观测与 occupancy-check，未知状态不算空闲。空闲观测不是独占预约，启动前复查并监测其他使用者；不得停止他人任务。
 3. **建立验收矩阵。** 覆盖全部分配节点/设备的健康、GEMM、HBM、机内互联，以及适用 NIC/拓扑的机间通信与 RCCL 正确性。预期必须有硬件/同环境测量/用户资料依据，dtype、shape、单位和消息量可比。按项目 `docs/environment-discovery.md` 第 5 节归并硬件基线：型号/gfx、有效计算资源、存储容量/层级、频率/功耗，以及分精度/指令路径的算力和带宽参考；明确标称、现场实测、历史参考与未知项，绑定原件，交给后续算子建模。被动检查和主动压测分开；主动操作只在任务授权资源内执行。
 4. **选择并固定执行基线。** 公开 HYGON 与内部仓等价时优先公开；公开明显落后则参考真实活跃内部实现。比较模型支持、关键功能与依赖，不仅看默认分支或最新提交时间。起点可直接选适用的 HCU 主仓；否则采用可用的模型功能分支/用户 patch。将实际执行仓、基点、工作分支与最终交付仓、目标分支分别记录。完整任务先在同一执行基线上做完适配、优化、阶段 loss、扩 DP 和容错验证，再整合交付；不能因主仓更新或交付目标不同而中途迁移。保留用户 patch；开发 checkout 不得借用 HCU-Knowledge 缓存。锁官方、HCU、底层库和 submodule 提交；例外和回归范围见 [执行基线与交付顺序](references/workflow.md#适配工作树与最终交付)。
@@ -38,7 +40,9 @@ description: 检查 HCU 训练环境或将预训练、SFT、RL 模型适配跑�
 
 ## 阶段产物
 
-输出全参容量判断（模型覆盖、模拟工具/版本、布局、各 stage 峰值/余量、可用卡数、短跑校准、缩模依据）和环境覆盖表（pass/fail/incomplete）、差异与缺权限项、源/依赖锁、可重复启动和单测命令、基线快照、数值契约及已知风险。适配任务还记录采用的 HCU 脚本路径/提交、现场调整及理由、实际生效的非敏感环境/参数，并说明与官方模型语义的核对结果。用 `environment-check` 评估契约；留存证据后 `report-add`。纯环境模式允许交付不通过的诊断结果，但必须明确其不允许训练放行。
+所有模式输出当前检查范围的环境覆盖表（pass/fail/incomplete）、预期依据、实际条件、差异/缺权限项、工具/依赖身份、可重复检查命令和原件。用 `environment-check` 评估契约，留存证据后 `report-add`。纯环境模式在此交付，允许给出不通过的诊断结果，明确不构成训练放行。
+
+adapt/full 另交全参容量判断（模型覆盖、模拟工具/版本、布局、各 stage 峰值/余量、可用卡数、短跑校准、缩模依据）、模型源/依赖锁、可重复训练命令、基线快照与数值契约。记录采用的 HCU 脚本路径/提交、现场调整及理由、实际生效的非敏感环境/参数，以及官方模型语义核对结果。
 
 详见 references/workflow.md 和项目 docs/environment-discovery.md。优先限定范围发现镜像 `/opt` 下已有工具，分别核对宿主与容器的实际安装；复用当前容错/环境检查工程的具体脚本。失败先区分入口、动态库、协议选择、解析误判与真实故障，保留原始证据。工具 import 也可能访问 GPU，仍须按副作用准入。安装/命令变化时复核当前工程，禁止把示例节点或旧参数变成默认值。
 
@@ -50,7 +54,7 @@ description: 检查 HCU 训练环境或将预训练、SFT、RL 模型适配跑�
 
 ## 运行约定
 
-先定位 HCU-TrainFlow checkout（用户给定路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
+先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 

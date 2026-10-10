@@ -1,10 +1,22 @@
 """Selective, pinned thirdparty checkouts. Never publishes or resets their content."""
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
 
 from .core import FlowError, read_json, write_json
+
+
+def knowledge_ready(result):
+    """Accept the current checkout's usable index, never a rollback snapshot."""
+    try:
+        health=json.loads(result.stdout)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (result.returncode==0 and isinstance(health,dict)
+            and health.get('local_ready') is True and health.get('index_current') is True
+            and health.get('snapshot_mode')=='current')
 
 
 def dependency_path(root, item):

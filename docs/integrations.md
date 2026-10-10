@@ -31,6 +31,8 @@ HCU-Knowledge 贯穿环境适配、性能优化和扩 DP/容错，按问题查�
 
 `--replace` 会把不同的旧 Skill 备份到扫描目录之外，核对全部目标后再替换；旧 prepare/operate 名称迁为 adapt/fault-tolerance。两个 HCU 知识 Skill 生成与其自身安装器相同格式的 `workspace.json`，绑定实际知识 checkout；完整复制脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
 
+六个 TrainFlow Skill 的安装目录各有 `workspace.json`，其中 `project_root` 指向本次安装使用的工程绝对路径；个人路径只写入安装目录，不写入仓库源文件。新会话从其他工作目录使用 Skill 时，先采用用户明确指定的项目或 `TRAINFLOW_PROJECT`，未指定时读取该绑定。绑定只用于定位项目，不设置或覆盖任务的 `TRAINFLOW_WORKSPACE`。工程搬家后从新位置运行安装器并加 `--replace`，保留旧安装备份后重绑；两个 HCU 知识 Skill 的 `root` 继续独立指向知识 checkout。
+
 飞书在线检索另外安装/配置 `lark-cli` 并用本人身份授权；浏览器辅助访问按需配置 `playwright-cli`。离线索引就绪不表示在线权限就绪，任务启动和使用在线来源时检查实际请求状态。Git、飞书和浏览器的身份分别管理。详细知识安装与权限规则见实际知识库的 `docs/installation.md`。
 
 依赖目录有修改、来源不符或受管提交不符时，保留现场并报告，禁止 reset/clean。依赖升级须先评估、更新锁并回归；普通安装不会擅自追最新分支。外部知识库由其独立维护流程管理。
@@ -47,6 +49,8 @@ python scripts/install_skills.py --target "$HOME/.codex/skills" --replace
 ```
 
 bootstrap 默认包含 HCU-Knowledge，但只负责 Git checkout；完整初始化用 setup_trainflow。维护者的 `install_skills.py --workflow-only` 仅刷新六个本仓 Skill，供隔离开发使用，不代表完整安装。旧 `--with-kernel-skills` 和 `--include-knowledge` 保留解析兼容，默认已经包含这些必需项。
+
+完整 Skill 安装与 setup 复用外部索引使用相同验收：doctor 的 `local_ready`、`index_current` 均为 true，`snapshot_mode` 为 current。rollback 快照或不完整的 doctor 输出会阻止安装；先完成知识库自身的本机 bootstrap，再重试，不以可读旧索引冒称当前知识就绪。
 
 TraceLens 默认稀疏检出完整运行代码、文档和根文件，减少示例 trace 下载；按需可扩展目录。旧 AMD 上游 checkout 迁移到 HCU fork 使用：
 

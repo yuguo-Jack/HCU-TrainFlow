@@ -271,13 +271,14 @@ def next_step(store, tid):
             if row['context'] == task['context'] and row['goal'] == flow['goal'] and task['state'] == candidate['target'] and task['revision'] == row['revision'] + 1:
                 db.execute("UPDATE flow_rounds SET status='advanced' WHERE task=? AND number=?", (tid, row['number']))
                 row = last_round(db, tid)
-        if task['state'] in {'completed', 'cancelled'}:
-            return {**result, 'action': task['state']}
         from .team import active_operation, completion_blockers, schedule
+        terminal = task['state'] in {'completed', 'cancelled'}
         uncertain = [r['id'] for r in db.execute("SELECT id,status FROM operations WHERE task=? AND status IN ('started','unknown')", (tid,))
-                     if r['status']=='unknown' or not active_operation(db,r['id'],tid)]
+                     if terminal or r['status']=='unknown' or not active_operation(db,r['id'],tid)]
         if uncertain:
             return {**result, 'action': 'reconcile', 'operations': uncertain}
+        if terminal:
+            return {**result, 'action': task['state']}
         reasons = blockers(db, tid, task, flow)
         if task['state'] in {'paused', 'blocked', 'failed'}:
             reasons.append('task-' + task['state'])

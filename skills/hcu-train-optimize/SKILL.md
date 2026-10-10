@@ -11,7 +11,7 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 
 ## 优化闭环
 
-沿适配阶段固定的执行工作分支推进。本轮优化完成不等于完整训练工作流完成；扩 DP、容错和持续监测尚未验证时，保持最终主仓整合 deferred。可参考最新主仓/第三方源码并移植必要修复，不为交付目标提前替换执行基线。执行基线与交付目标的顺序见 adapt Skill 的 `references/workflow.md`。
+沿适配阶段固定的执行工作分支推进。`full` 任务中，本轮优化完成不等于完整训练工作流完成；扩 DP、容错和持续监测尚未验证时，保持最终主仓整合 deferred。独立 optimize/adapt/diagnose 任务按其已授权目标完成验证后交付，不增加扩容/长训义务；仅 analyze 不擅自修改或提交实现。可参考最新主仓/第三方源码并移植必要修复，不为交付目标提前替换执行基线。执行基线与交付目标的顺序见 adapt Skill 的 `references/workflow.md`。
 
 **先复用已有验证。** 开始候选前检查已有数值、dispatch、性能和阶段 loss 证据，记录源码/库/配置差异究竟影响哪层。固定实现、ABI、shape/dtype 和数值契约未变的独立算子测试直接引用；换训练分支通常先补集成与端到端对照，不重跑整套底层资格测试。确有调用/梯度生命周期、依赖版本或覆盖缺口时只补受影响用例，写明重测原因。稳定候选再做一次阶段 loss 验收；不要以反复资格测试代替推进新优化。
 
@@ -30,7 +30,7 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 HCU 算子/通信候选和底层构建按 [工程联动](references/hcu-library-integration.md)：联查 HCU Primus Turbo、UCCL、UltraEP、MoonEP，以及现有 RCCL/rocSHMEM/DeepEP/MORI/Flux；按瓶颈和真实能力选用，不默认同名接口可替换。必要时在独立开发树改库、远端隔离重编，证明实际加载新制品并完成分层回归后按目标仓规范PR。
 
 9. **按优先级持续迭代算子实现。** 计算占主导时，以计算热点为主线；其他情况下按其端到端影响安排独立计算分析；先按真实逻辑 op 聚合占比，再拆 phase/shape，完成高占比项初查、上限/未知和选择裁决后派发。高占比但上限不清的先补分析，不能因易写或已有 benchmark 随便选较小项。初步融合不是结束：重新评估融合后的工作量、瓶颈与可达上限，仍有显著空间就继续实施和测量。必要时将受编译/布局/指令限制的实现转 HIP：缺正确基线调用 `$hygon-hip-baseline-generator`，再用 `$hygon-hip-kernel-optimizer`；适合 Triton 的调用 `$hygon-triton-kernel-optimizer`。先确认可用；缺失时按 docs/integrations.md 获取 thirdparty/cuda-optimized-skill 并安装，也可读取其 skills/<name>/SKILL.md 及配套资源。kernel 遇到优化瓶颈必须做性能分析；hipprof 与 XProf/XCompute 的命令和产物分别使用，不混写。指令/反汇编问题按目标 ISA 和技能中的编译产物方法处理。达到目标、近可达上限、多轮无收益或受阻均需逐项给出证据和原因；显著空间未解决要汇报并保留缺口，不能以“已有融合”或预算耗尽视为达标。
-10. **验证。** 每轮候选做实际 dispatch、局部输出/梯度/参数更新与多 shape 回归，随后 profiler-off 重复测量。阶段候选稳定后再做冻结样本和容差的较长 loss 验收；不频繁长训，也不省略阶段验收。RL 加查 policy version、logprob、reward 和数据年龄。
+10. **验证。** 每轮候选做实际 dispatch、局部输出/梯度/参数更新与多 shape 回归，随后 profiler-off 重复测量，按预先确定的稳定性标准处理噪声。阶段候选稳定后按项目 `docs/training-state-validation.md` 的阶段 A/B 段，从同一初始模型/优化器/RNG/数据状态对照，固定配方、样本与容差并登记状态/配方指纹；不频繁长训，也不省略阶段验收。RL 加查 policy version、logprob、reward 和数据年龄。
 
 独立 GEMM/HBM/通信实测不及近期适用参考，或模型内性能异常时，沿项目 `docs/environment-discovery.md` 第 6 节推进差距闭环：查原件口径、配置/链路、所加载库与对应源码，按需搜 HCU-Knowledge，做授权内的单变量有界 A/B/A，核对正确性和实际作用路径，再回归保留或回退。不能把现场低值直接当可达上限，也不能因参考条件不全就停止排查；未解决用 `performance_discrepancy` / 当前 flow 问题保留，带已尝试证据升级专家。`analyze` 仅分析时不扩大执行权限，明确待执行步骤。
 
@@ -74,7 +74,7 @@ Agent 分工由实际模型调用和 profile 决定，不预设固定名称、�
 
 ## 运行约定
 
-先定位 HCU-TrainFlow checkout（用户给定路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
+先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 

@@ -7,6 +7,7 @@ from hcu_trainflow import flow
 from hcu_trainflow.core import FlowError, Store
 from hcu_trainflow.execution import run_command
 from hcu_trainflow.coordination import dispatch_inbox
+from quality_fixtures import stage_report
 
 
 def setup(tmp_path, mode='analyze', **limits):
@@ -25,8 +26,9 @@ def candidate(store, target=None, experiment=False, label='candidate-1'):
     destination = target or flow.target(task)
     reports = {}
     for kind in flow.required_reports(task, destination):
-        reports[kind] = store.report('t', kind, {'context':task['context'], 'candidate_snapshot':snap,
-             'status':'pass', 'executed':3, 'evidence':[proof]})['artifact']
+        body = stage_report(store, task['context'], snap, proof) if kind == 'stage-quality' else {
+            'context':task['context'], 'candidate_snapshot':snap, 'status':'pass', 'executed':3, 'evidence':[proof]}
+        reports[kind] = store.report('t', kind, body)['artifact']
     value = {'author':'actor', 'context':task['context'], 'goal':decision['goal'], 'snapshot':snap,
              'summary':label, 'reports':reports, 'target':destination, 'evidence':[proof]}
     if experiment:
@@ -121,6 +123,28 @@ def test_iteration_is_not_stage_loss_validation(tmp_path):
     assert 'missing-or-replaced-report:stage-quality' in flow.next_step(store, 't')['reasons']
     with pytest.raises(FlowError):
         flow.advance(store, 't')
+
+
+def test_legacy_stage_pass_cannot_be_waived_by_an_accepting_reviewer(tmp_path):
+    store = setup(tmp_path, mode='optimize')
+    final = candidate(store, experiment=True)
+    body = flow.artifact_json(store, final['reports']['stage-quality'])
+    body.pop('quality_inputs')
+    body['stage_eligible'] = True
+    legacy = flow.retain(store, body)
+    # Simulate an existing Store from before retained comparison gates.
+    with store.db() as db:
+        db.execute('UPDATE reports SET artifact=? WHERE task=? AND kind=?', (legacy, 't', 'stage-quality'))
+        store.event(db, 't', 'report-recorded', {'kind': 'stage-quality', 'artifact': legacy})
+    final['reports']['stage-quality'] = legacy
+    flow.submit(store, 't', final)
+    flow.review(store, 't', verdict(store))
+    decision = flow.next_step(store, 't')
+    assert decision['action'] == 'repair'
+    assert 'missing-or-replaced-report:stage-quality' in decision['reasons']
+    with pytest.raises(FlowError):
+        flow.advance(store, 't')
+    assert flow.artifact_json(store, legacy)['status'] == 'pass'
 
 
 def test_rejected_measurement_cannot_advance_iteration(tmp_path):

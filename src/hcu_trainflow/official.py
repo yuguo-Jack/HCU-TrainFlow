@@ -173,6 +173,22 @@ def generated_page(path, meta, body):
     atomic_write(path,markdown(meta,body))
 
 
+def pr_page_hashes(project, identity, repository, previous=()):
+    source_ids={s['id'] for s in read_json(Path(project)/'knowledge/sources.json')
+                if s.get('repository','').lower()==repository.lower()}
+    affected={}
+    for page in (Path(project)/'knowledge').rglob('*.md'):
+        meta,_=wiki.parse_page(page)
+        if meta.get('kind') in {'source-pr','source-map','source-document'}:continue
+        if identity in meta.get('pr_sources',[]) or any(r['source'] in source_ids for r in meta.get('sources',[])):
+            affected[page.relative_to(project).as_posix()]=digest(page.read_bytes())
+    # Removing a citation cannot silently approve the surviving prose.
+    for name in previous:
+        page=child(project,name)
+        if page.is_file():affected.setdefault(name,digest(page.read_bytes()))
+    return affected
+
+
 def retain_pr(store, project, result, engine, token=None):
     """Explicitly publish public source material, never arbitrary private artifacts."""
     data=json.loads(store.artifact(result['artifact']))
@@ -217,20 +233,15 @@ def retain_pr(store, project, result, engine, token=None):
           'repository':repo,'pr_number':number,'updated_at':d['updated_at'],'artifact_sha256':raw_sha,
           'artifact_path':raw.relative_to(project).as_posix(),'sources':[]}
     generated_page(path,meta,body)
-    source_ids={s['id'] for s in read_json(Path(project)/'knowledge/sources.json') if s.get('repository','').lower()==repo.lower()}
-    affected={}
-    for page in (Path(project)/'knowledge').rglob('*.md'):
-        pm,_=wiki.parse_page(page)
-        if pm.get('kind') in {'source-pr','source-map','source-document'}:continue
-        if pid in pm.get('pr_sources',[]) or any(r['source'] in source_ids for r in pm.get('sources',[])):
-            affected[page.relative_to(project).as_posix()]=digest(page.read_bytes())
     pointer=store.root/'wiki/pr-review'/f'{pid}.json'
     prior=read_json(pointer) if pointer.exists() else {}
+    affected=pr_page_hashes(project,pid,repo,prior.get('affected_pages',[]))
     reviewed={p:d['page_sha256'] for p,d in prior.get('decisions',{}).get('pages',{}).items()}
     invalidated=prior.get('status')=='content-reviewed' and reviewed!=affected
     if old_meta.get('artifact_sha256')!=raw_sha or not prior or invalidated or set(prior.get('affected_pages',[]))!=set(affected):
         write_json(pointer,{'id':pid,'artifact_sha256':raw_sha,'affected_pages':sorted(affected),
-                   'status':'pending-content-review','reason':'PR evidence or related authored pages changed'})
+                    'page':path.relative_to(project).as_posix(),
+                    'status':'pending-content-review','reason':'PR evidence or related authored pages changed'})
     return {'id':pid,'page':path.relative_to(project).as_posix(),'artifact':raw_sha,'updated_at':d['updated_at']}
 
 
@@ -239,6 +250,22 @@ def review_pr(store, project, identity, decisions):
     pointer=store.root/'wiki/pr-review'/f'{identity}.json'
     pending=read_json(pointer)
     if pending['artifact_sha256']!=decisions.get('artifact_sha256'):raise FlowError('Review must address current retained PR artifact')
+    if pending.get('page'):
+        source_page=child(project,pending['page'])
+        meta,_=wiki.parse_page(source_page)
+    else:
+        # Receipts created before project page bindings remain reviewable.
+        matches=[(page,meta) for page in (Path(project)/'knowledge/prs').rglob('*.md')
+                 if (meta:=wiki.parse_page(page)[0]).get('id')==identity]
+        if len(matches)!=1:raise FlowError('Current retained PR source page is missing or ambiguous')
+        source_page,meta=matches[0]
+    if meta.get('id')!=identity or meta.get('artifact_sha256')!=pending['artifact_sha256']:
+        raise FlowError('Current retained PR artifact changed; collect it again before review')
+    affected=pr_page_hashes(project,identity,meta['repository'],pending['affected_pages'])
+    if set(affected)!=set(pending['affected_pages']):
+        pending={**pending,'affected_pages':sorted(affected),'status':'pending-content-review',
+                 'reason':'Related authored pages changed after PR capture'}
+        write_json(pointer,pending)
     rows=decisions.get('pages',{})
     if set(rows)!=set(pending['affected_pages']):raise FlowError('Review every affected PR overview/topic/case')
     if not decisions.get('note'):raise FlowError('PR review requires an overall interpretation, including when no page is affected')

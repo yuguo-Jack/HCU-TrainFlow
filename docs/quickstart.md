@@ -21,6 +21,8 @@ hcu-trainflow collaboration-demo .work/collaboration-001
 
 推荐通过 `$hcu-trainflow` 提供环境、模型和目标，由 Agent 建立内部任务与协作循环。也可从 `examples/task.json` 复制到私有目录并修改，用 CLI 手动操作。先明确只分析、只诊断还是完整推进。
 
+首次接手或换 Agent 先读[主控接手与阶段交接](agent-playbook.md)：恢复现场与原任务，按当前最大瓶颈选择工作，区分探索、局部通过和阶段验收，避免重跑已有效的实验。
+
 ```bash
 hcu-trainflow --workspace /private/task-a task-create /private/task-a/task.json
 hcu-trainflow --workspace /private/task-a task-show example-analysis

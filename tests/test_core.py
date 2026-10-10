@@ -4,6 +4,7 @@ import pytest
 from hcu_trainflow.core import Store, FlowError, fingerprint
 from hcu_trainflow.execution import command_plan, run_command, snapshot, materialize
 from hcu_trainflow.coordination import reconcile_operation
+from quality_fixtures import stage_report
 
 @pytest.fixture
 def store(tmp_path):
@@ -12,8 +13,7 @@ def store(tmp_path):
     return s
 
 def test_context_invalidates_report(store):
-    sha=store.put(b'proof')
-    store.report('t','stage-quality',{'context':store.task('t')['context'],'status':'pass','executed':1,'evidence':[sha]})
+    store.report('t','stage-quality',stage_report(store, store.task('t')['context']))
     store.change_context('t',{'source':'b'})
     with pytest.raises(FlowError):store.transition('t','completed')
 

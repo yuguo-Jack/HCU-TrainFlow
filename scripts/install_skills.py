@@ -10,7 +10,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
-from hcu_trainflow.dependencies import require_checkout
+from hcu_trainflow.dependencies import knowledge_ready, require_checkout
 from hcu_trainflow.core import FlowError
 
 NAMES = ('hcu-trainflow','hcu-train-adapt','hcu-train-optimize','hcu-train-fault-tolerance','hcu-engine-wiki-search','hcu-engine-wiki-skill-update')
@@ -61,18 +61,19 @@ def main():
         sources.update({name: knowledge/'skills'/name for name in KNOWLEDGE_NAMES})
         result = subprocess.run([sys.executable, '-X', 'utf8', str(knowledge/'tools/setup_workspace.py'), 'doctor'],
                                 cwd=knowledge, capture_output=True, text=True, encoding='utf-8', errors='replace')
-        try:
-            ready = json.loads(result.stdout)['local_ready']
-        except (ValueError, KeyError):
-            ready = False
-        if result.returncode or not ready:
+        if not knowledge_ready(result):
             parser.error('HCU-Knowledge is not locally ready; run scripts/setup_trainflow.py first')
     target=args.target.expanduser().resolve()
     expected = {name: tree_hash(source) for name, source in sources.items()}
+    # Runtime bindings belong to installed Skills, never their portable source.
+    bindings = {name: (json.dumps({'project_root':str(ROOT.resolve())},ensure_ascii=False,indent=2)+'\n').encode()
+                for name in NAMES}
     if knowledge:
         binding=(json.dumps({'root':str(knowledge)},ensure_ascii=False,indent=2)+'\n').encode()
         for name in KNOWLEDGE_NAMES:
-            expected[name]['workspace.json']=hashlib.sha256(binding).hexdigest()
+            bindings[name]=binding
+    for name, binding in bindings.items():
+        expected[name]['workspace.json']=hashlib.sha256(binding).hexdigest()
     # Validate all destinations before any mutation.
     for name, source in sources.items():
         if not (source/'SKILL.md').is_file():parser.error('Missing source Skill: '+str(source))
@@ -94,8 +95,8 @@ def main():
             # Backups outside the scanned skills directory avoid duplicate discovery.
             backup_directory(target,dest)
         shutil.copytree(source,dest,ignore=shutil.ignore_patterns('__pycache__'))
-        if name in KNOWLEDGE_NAMES:
-            (dest/'workspace.json').write_bytes(binding)
+        if name in bindings:
+            (dest/'workspace.json').write_bytes(bindings[name])
         print(name+': installed')
 
 if __name__=='__main__':main()

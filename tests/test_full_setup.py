@@ -93,11 +93,14 @@ def test_default_installer_copies_eleven_and_binds_knowledge(tmp_path, monkeypat
             (path/'SKILL.md').write_text(name)
             (path/'helper.py').write_text('# source\n')
     monkeypatch.setattr(module, 'require_checkout', lambda p, name: (kb if name == 'hcu-knowledge' else kernel, {}))
-    monkeypatch.setattr(module.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0, stdout='{"local_ready": true}'))
+    monkeypatch.setattr(module.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0, stdout='{"local_ready": true, "index_current": true, "snapshot_mode": "current"}'))
     target = tmp_path/'installed'
     monkeypatch.setattr(sys, 'argv', ['install_skills.py', '--target', str(target)])
     module.main()
     assert len(list(target.glob('*/SKILL.md'))) == 11
+    for name in module.NAMES:
+        assert json.loads((target/name/'workspace.json').read_text()) == {'project_root':str(tmp_path.resolve())}
+        assert not (tmp_path/'skills'/name/'workspace.json').exists()
     for name in module.KNOWLEDGE_NAMES:
         assert json.loads((target/name/'workspace.json').read_text())['root'] == str(kb)
         assert (target/name/'helper.py').is_file()
@@ -105,6 +108,62 @@ def test_default_installer_copies_eleven_and_binds_knowledge(tmp_path, monkeypat
     (target/module.NAMES[0]/'SKILL.md').write_text('user edits')
     with pytest.raises(SystemExit): module.main()
     assert (target/module.NAMES[0]/'SKILL.md').read_text() == 'user edits'
+
+
+def test_workflow_binding_from_other_directory_preserves_environment(tmp_path, monkeypatch):
+    from hcu_trainflow.cli import execute, parser
+    module = script('install_skills')
+    project = tmp_path/'project'
+    for name in module.NAMES:
+        source = project/'skills'/name
+        source.mkdir(parents=True)
+        (source/'SKILL.md').write_text(name)
+    (project/'knowledge').mkdir()
+    (project/'knowledge/topic.md').write_text('---\nid: installation-binding\n---\n# Installed project discovery\n',encoding='utf-8')
+    module.ROOT = project
+    elsewhere = tmp_path/'elsewhere'; elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv('TRAINFLOW_PROJECT', str(tmp_path/'explicit-project'))
+    monkeypatch.setenv('TRAINFLOW_WORKSPACE', str(tmp_path/'explicit-workspace'))
+    target = tmp_path/'installed'
+    monkeypatch.setattr(sys, 'argv', ['install_skills.py', '--workflow-only', '--target', str(target)])
+    module.main()
+    binding = json.loads((target/'hcu-trainflow/workspace.json').read_text())
+    assert Path(binding['project_root']).is_absolute()
+    result = execute(parser().parse_args(['--workspace',str(tmp_path/'search-state'),'wiki-search','discovery',
+                                         '--project',binding['project_root'],'--online-pr','off']))
+    assert result['results'][0]['id'] == 'installation-binding'
+    import os
+    assert os.environ['TRAINFLOW_PROJECT'] == str(tmp_path/'explicit-project')
+    assert os.environ['TRAINFLOW_WORKSPACE'] == str(tmp_path/'explicit-workspace')
+
+
+def test_workflow_relocation_requires_explicit_rebind_and_preserves_old_installation(tmp_path, monkeypatch):
+    import shutil
+    module = script('install_skills')
+    original, moved = tmp_path/'original', tmp_path/'moved'
+    for name in module.NAMES:
+        source = original/'skills'/name
+        source.mkdir(parents=True)
+        (source/'SKILL.md').write_text(name)
+    target = tmp_path/'installed'
+    module.ROOT = original
+    argv = ['install_skills.py', '--workflow-only', '--target', str(target)]
+    monkeypatch.setattr(sys, 'argv', argv)
+    module.main()
+    module.main()  # Generated bindings participate in idempotence.
+    shutil.copytree(original, moved)
+    module.ROOT = moved
+    with pytest.raises(SystemExit): module.main()
+    assert json.loads((target/'hcu-trainflow/workspace.json').read_text())['project_root'] == str(original.resolve())
+    monkeypatch.setattr(sys, 'argv', [*argv,'--replace'])
+    module.main()
+    for name in module.NAMES:
+        assert json.loads((target/name/'workspace.json').read_text())['project_root'] == str(moved.resolve())
+        backups = list((tmp_path/'trainflow-skill-backups').glob('*/'+name+'/workspace.json'))
+        assert len(backups) == 1
+        assert json.loads(backups[0].read_text())['project_root'] == str(original.resolve())
+        assert not (moved/'skills'/name/'workspace.json').exists()
 
 
 def test_external_binding_never_fetches_or_resets(tmp_path, monkeypatch):
@@ -130,6 +189,25 @@ def test_unready_knowledge_cannot_install_any_skills(tmp_path, monkeypatch):
     target = tmp_path/'skills'
     monkeypatch.setattr(sys, 'argv', ['install_skills.py', '--target', str(target)])
     with pytest.raises(SystemExit): module.main()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize('stdout',[
+    '{"local_ready": true, "index_current": false, "snapshot_mode": "current"}',
+    '{"local_ready": true, "index_current": true, "snapshot_mode": "rollback"}',
+    '{"local_ready": true, "index_current": true, "snapshot_mode": "unknown"}',
+    '{"local_ready": true}',
+    '{"local_ready": "false", "index_current": true, "snapshot_mode": "current"}',
+    '[]',
+    'not JSON',
+])
+def test_incomplete_or_rollback_knowledge_cannot_install_skills(tmp_path,monkeypatch,stdout):
+    module=script('install_skills')
+    monkeypatch.setattr(module,'require_checkout',lambda *a:(tmp_path/'kb',{}))
+    monkeypatch.setattr(module.subprocess,'run',lambda *a,**kw:SimpleNamespace(returncode=0,stdout=stdout))
+    target=tmp_path/'installed'
+    monkeypatch.setattr(sys,'argv',['install_skills.py','--target',str(target)])
+    with pytest.raises(SystemExit):module.main()
     assert not target.exists()
 
 

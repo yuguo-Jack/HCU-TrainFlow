@@ -7,6 +7,8 @@ description: 扩容 HCU 训练并衔接现有容错，持续观测进展、诊�
 
 支持 `diagnose` 只做诊断或 `operate/full` 扩容与长训。故障处置权限、通知渠道、资源范围在部署具体任务时确定。
 
+`diagnose` 先进入下文“故障诊断步骤”，保存当前作业现场、给出原因/证据/下一步；不因存在扩容章节就安排筛机压测、故障注入或重启。`operate` 接管既有任务时先核对其实际配置、基线和恢复责任，复用仍适用的证据，不自动重走适配/优化；缺少与运行安全相关的证据则保留缺口并按授权补查。
+
 ## 扩容和接管
 
 沿适配/优化阶段已经验证的执行工作分支继续扩 DP、故障和恢复演练，不在此之前为了最终 PR 切换训练引擎主仓。完整流程跑通后再整理主仓交付；若整合改变 checkpoint、launcher、进程组或错误处理，再针对这些差异补恢复回归。
@@ -57,7 +59,7 @@ description: 扩容 HCU 训练并衔接现有容错，持续观测进展、诊�
 
 ## 运行约定
 
-先定位 HCU-TrainFlow checkout（用户给定路径或 `TRAINFLOW_PROJECT`）和私有 `TRAINFLOW_WORKSPACE`。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
+先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 

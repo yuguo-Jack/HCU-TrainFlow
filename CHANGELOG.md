@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0.dev1 — 2026-10-10 development milestone
+
+- Consolidate entry, stage handoffs, bounded diagnostics, evidence reuse and stopping decisions in the agent playbook. Keep environment-only, analysis-only, standalone optimization and diagnosis within the requested scope; preserve the full-task integration order.
+- Bind installed TrainFlow Skills to their project checkout without binding another task's private workspace. Complete installation still includes HCU-Knowledge and the three Hygon operator Skills; querying or maintaining TrainFlow does not refresh the large knowledge base.
+- Harden numerical acceptance against non-pass outcomes, malformed evidence and invalid candidate steps. Require retained comparison inputs, frozen initial-state/recipe identities and candidate binding for stage-quality advancement; preserve legacy window comparisons as explicitly ineligible for a new stage. Add a predeclared timing-dispersion gate; keep local correctness, stage loss and long-run convergence distinct.
+- Preserve unresolved execution during cancellation and handoff, validate lease lifetimes, and harden execution/Agent event delivery failure paths with CPU regressions.
+- Recompute PR review impact when authored pages or source associations change. Include curated raw evidence and overview assets in source distributions, and verify knowledge readiness before complete Skill installation.
+- Document the qualified SSH + Docker scope: multi-rank profiling, representative operator validation/modeling, proxy training and a bounded cross-node checkpoint recovery with the launching SSH session disconnected. This does not qualify arbitrary sites, full-model convergence, physical controller shutdown, production notifications or autonomous Agent wake-up.
+
+This tag records a reviewed development checkpoint. It is not a production release or a claim that all planned site integrations have been exercised.
+
 ## 0.3.0.dev0 — Unreleased
 
 - Add dependency-aware parallel assignments, atomic scope/resource reservations, native session bindings, accepted-result handoffs and durable peer questions/answers/blockers. Known independent executions can coexist; uncertain remote outcomes still require reconciliation.

@@ -197,3 +197,16 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - baseline初版→HIP优化、现有Triton→Triton优化的交接与负责人验收已写通用Skill；本机三项变更Skill已同步。
 - 真实CM恢复密封日志经现有解析/绘图得到3张图、9步记录，历史离线视图不进入实时监控。
 - 站点硬件知识及精选6原件随公共工程；全新Store可搜读；独立review唯一来源过度断言已修正。72项相关测试和490页/25来源校验通过，无release。
+# Integrated review, 2026-10-10
+
+- Final integrated acceptance: **1054 passed, 4 platform-specific skips**, 68.69 seconds with system Python. Wiki: **490 pages / 25 sources / zero errors**; 50 README/docs/Skill Markdown files have no missing local file links. Both synthetic demos complete within their stated CPU-only scope. Actual 0.4.0.dev1 sdist retains **68/68** declared originals, workflow image, knowledge notices and source licenses; extracted knowledge validation passes.
+- Independent integrated reviewer reproduced then verified fixes for legacy quality advancement and dispatch context/epoch races; no remaining reproduced blockers. Retained-input numerical gate has direct Store and full flow-review/advance regression coverage, including historical evidence compatibility. No further real-environment tuning was performed.
+- Refreshed system editable metadata to **0.4.0.dev1**, synchronized all six workflow/Wiki Skills with backups and project bindings, and verified a second installation is unchanged. All six Skills pass validation. Existing kernel/knowledge Skills and the large knowledge repository were preserved; their dependency readiness was checked earlier.
+- Publication target: main plus annotated **v0.4.0-dev.1**, explicitly requested by the user; no GitHub Release. Commit/tag refs provide the final publication receipt after local verification.
+
+- All six revised Skills pass skill-creator validation with system Python UTF-8 mode (the external validator's default Windows GBK decoding failed; no skill content was changed to work around it). Fresh temporary Skill install carries project bindings. Fresh Store Wiki search resolves GPU_MAX_HW_QUEUES with official and site context; dependency status confirms all three pinned/external checkouts are ready and clean. No HCU-Knowledge update, live training or remote mutations were performed.
+- Origin fetch succeeded; no upstream commits beyond the starting HEAD. Selected 0.4.0.dev1 / v0.4.0-dev.1 as an explicitly requested development milestone, without a GitHub Release. Installed editable-package metadata will be refreshed together with managed Skills after final validation.
+
+- Added the common takeover/phase/evidence-reuse playbook and connected it to coordinator and docs. Clarified standalone environment/diagnose/optimize scope, stage A/B initial-state and recipe contracts, installation binding discovery, and existing physical qualification limits. Focused numerical/flow/proxy regressions: 90 passed before the additional identity checks; full validation follows integration.
+
+- Read current project instructions, coordinator Skill, skill-creator and file-planning instructions; session catchup reported no additional context. Inventoried source, docs, tests and six Skills. Started independent workflow and runtime audits without remote execution.

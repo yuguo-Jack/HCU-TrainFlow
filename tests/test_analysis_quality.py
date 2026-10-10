@@ -60,6 +60,56 @@ def test_iteration_not_production_acceptance():
     result=assess_iteration(r,[10,11,10],[9,10,9],'ctx')
     assert result['status']=='iteration-kept' and result['production_default'] is False
 
+
+@pytest.mark.parametrize('status', ['blocked', 'rejected', 'error', 'skipped', 'unknown', 'complete', None, False, ['pass']])
+def test_nonpass_outcome_cannot_pass_numerical_or_iteration_gate(status):
+    contract, record = loss_fixture()
+    changed = {**record, 'status': status, 'profiler_off': True, 'measurement_protocol': 'paired warm runs'}
+    assert compare_loss(contract, record, changed)['status'] == 'incomplete'
+    assert compare_loss(contract, changed, record)['status'] == 'incomplete'
+    assert assess_iteration(changed, [10, 11, 10], [9, 10, 9], 'ctx')['status'] == 'incomplete'
+
+
+@pytest.mark.parametrize('evidence', ['raw', {'raw': True}, [None], [''], []])
+def test_numerical_evidence_must_be_a_nonempty_id_array(evidence):
+    contract, record = loss_fixture()
+    assert compare_loss(contract, record, {**record, 'evidence': evidence})['status'] == 'incomplete'
+
+
+@pytest.mark.parametrize('steps', [[True, 2, 3], [1., 2., 3.], [1, 2, 2], None, '123'])
+def test_candidate_steps_checked_independently_of_python_numeric_equality(steps):
+    contract, record = loss_fixture()
+    assert compare_loss(contract, record, {**record, 'steps': steps})['status'] == 'incomplete'
+
+
+def test_predeclared_timing_stability_blocks_a_faster_but_noisy_candidate():
+    _, record = loss_fixture()
+    record.update(profiler_off=True, measurement_protocol={'description': 'interleaved warm runs', 'max_relative_mad': .1})
+    result = assess_iteration(record, [10, 10.1, 10, 10.1, 10], [1, 5, 9, 5, 1], 'ctx')
+    assert result['status'] == 'incomplete'
+    assert result['timing']['candidate_median'] == 5
+    assert result['timing']['candidate_relative_mad'] == .8
+    result = assess_iteration(record, [10, 10.1, 10, 10.1, 10], [9, 9.1, 9, 9.1, 9], 'ctx')
+    assert result['status'] == 'iteration-kept'
+    assert result['timing']['stability'] == 'pass'
+
+
+def test_legacy_protocol_does_not_claim_stability_was_checked():
+    _, record = loss_fixture()
+    record.update(profiler_off=True, measurement_protocol='paired warm runs')
+    assert assess_iteration(record, [10, 10, 10], [9, 9, 9], 'ctx')['timing']['stability'] == 'not-specified'
+
+
+@pytest.mark.parametrize('key', ['initial_state_fingerprint', 'training_recipe_fingerprint'])
+def test_frozen_stage_comparison_rejects_equal_loss_from_different_inputs(key):
+    contract, record = loss_fixture()
+    contract[key] = 'frozen-identity'
+    bound = {**record, key: 'frozen-identity'}
+    assert compare_loss(contract, bound, record)['status'] == 'incomplete'
+    assert compare_loss(contract, bound, {**bound, key: 'different'})['status'] == 'incomplete'
+    assert compare_loss(contract, {**bound, key: 'different'}, bound)['status'] == 'incomplete'
+    assert key in compare_loss(contract, bound, bound)['matched_identity_fields']
+
 def test_missing_required_coverage_blocks_loss_and_iteration():
     c,r=loss_fixture()
     r.update(required_missing=['backward'],profiler_off=True,measurement_protocol='paired warm runs')

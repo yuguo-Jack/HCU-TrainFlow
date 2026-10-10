@@ -129,18 +129,25 @@ def _ssh_argv(target, command, known_hosts=None):
     return arguments + [target, command]
 
 
-def run_command(store, tid, operation_id, card, lease, *, control_plane=False, assignment=None, owner=None, token=None):
+def run_command(store, tid, operation_id, card, lease, *, control_plane=False, assignment=None, owner=None, token=None,
+                expected_context=None, expected_context_epoch=None):
     # Use the existing group lock domain for every operation ID. Reconciliation
     # cannot declare "no process" while this controller can still launch one,
     # and a single/group API race cannot dispatch the same ID twice.
     from .command_group import _controller_lock
     with _controller_lock(store, operation_id):
         return _run_command(store, tid, operation_id, card, lease, control_plane=control_plane,
-                            assignment=assignment, owner=owner, token=token)
+                            assignment=assignment, owner=owner, token=token,
+                            expected_context=expected_context, expected_context_epoch=expected_context_epoch)
 
 
-def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, assignment=None, owner=None, token=None):
+def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, assignment=None, owner=None, token=None,
+                 expected_context=None, expected_context_epoch=None):
     from . import team
+    bound_context = expected_context is not None or expected_context_epoch is not None
+    if bound_context and (not isinstance(expected_context, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_context)
+                          or type(expected_context_epoch) is not int or expected_context_epoch < 0):
+        raise FlowError("Execution context binding requires a context hash and nonnegative epoch")
     if control_plane and assignment:
         raise FlowError('A local delivery bridge is not an assignment experiment')
     if not assignment and (owner is not None or token is not None):
@@ -151,10 +158,14 @@ def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, 
     task = store.task(tid)
     if "execute" not in task["spec"].get("permissions", []):
         raise FlowError("Task has no execute permission")
+    if control_plane and "agent-dispatch" not in task["spec"].get("permissions", []):
+        raise FlowError("A control-plane bridge requires explicit agent-dispatch permission")
     if task["state"] in {"completed", "cancelled", "paused", "blocked", "failed"}:
         raise FlowError("Task is not active")
     safe_id(operation_id)
     plan = command_plan(card)
+    if control_plane and plan["backend"] != "local":
+        raise FlowError("A control-plane bridge must use the local controller backend")
     identity = {"plan": plan, "context": task["context"]}
     if task['context_epoch']:
         # Preserve IDs from the initial context while distinguishing A -> B -> A.
@@ -166,7 +177,10 @@ def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, 
         db.execute("BEGIN IMMEDIATE")
         store.check_lease(db, **lease)
         current = db.execute('SELECT context,state FROM tasks WHERE id=?', (tid,)).fetchone()
-        if (current['context'] != task['context'] or context_epoch(db, tid) != task['context_epoch']
+        current_epoch = context_epoch(db, tid)
+        if bound_context and (current['context'] != expected_context or current_epoch != expected_context_epoch):
+            raise FlowError('Bound execution context/epoch changed before admission; inspect the original event')
+        if (current['context'] != task['context'] or current_epoch != task['context_epoch']
                 or current['state'] in {'completed', 'cancelled', 'paused', 'blocked', 'failed'}):
             raise FlowError('Task context/state changed before execution')
         if not control_plane:
@@ -181,6 +195,8 @@ def _run_command(store, tid, operation_id, card, lease, *, control_plane=False, 
             if prior["status"] in {"complete", "failed"}:
                 return json.loads(prior["result"])
             raise FlowError("Outcome unknown; reconcile original execution before creating another operation")
+        if db.execute("SELECT 1 FROM operations WHERE lower(id)=lower(?)", (operation_id,)).fetchone():
+            raise FlowError("Operation ID collides with an existing identifier on case-insensitive filesystems")
         assigned=team.check_execution(db,tid,assignment,owner,token,lease['resource']) if assignment else None
         for reservation in team.active_reservations(db):
             if (reservation['id'] != assignment and reservation['spec'].get('resource_scope', 'assignment') == 'assignment'
