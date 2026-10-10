@@ -232,3 +232,15 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 独立前向复核完成：通信超时/主机OOM/旧观察身份、显存增长/动态输入/空报告两组模拟场景均能形成正确的有界下一行动，没有发现误导或断链；不构成真实故障验证。
 - 本机六个 Skill 同步完成，目录绑定与逐文件哈希核对一致；旧 adapt/fault-tolerance 入口已清理，本次临时备份验证后清理，历史备份未动。
 - 提交目标 main，沿用 0.5.0 版本和既有 tag；推送回执在会话中核对，不发布新 tag。
+
+
+## 2026-10-10 — 0.5.1 方法复核与验证
+
+- 完成参考工程源码、HCU知识及现有三个阶段对照，已落地通用决策方法、诊断与维护入口；无实际训练、GPU采集、故障注入和HCU大库更新。
+- Python全套测试：1081 passed, 4 skipped（70.07s）；本地平台受限用例继续保留skip。上限/归因定向回归80 passed。
+- Wiki校验490页/25来源/0错误；六项Skill UTF-8 quick_validate通过；本地Markdown链接检查357条无失效（新增最终导航在发布前再检查）；新方法Mermaid语法通过。
+- 初次Skill验证受Windows默认GBK影响失败，显式python -X utf8重验通过；没有修改系统验证器。
+- 独立场景检验完成，无新增可行动问题；旧安装Skill与HEAD归一换行比对无独立修改，已通过仓内安装器更新六项工作流Skill，三个算子和两个大库Skill保留原绑定。
+- 版本统一0.5.1；准备提交main及annotated v0.5.1，不创建GitHub Release。现场能力声明保持原验证范围。
+
+- 发布前最终核对：359条本地链接无失效；六项已安装Skill内容/绑定一致；系统Python包与源码均0.5.1；HCU-Knowledge工作树干净；origin/main无外部新增提交，v0.5.1尚不存在。四项skip为Linux专用AF_UNIX/spawn现场测试。本轮发布目标为main与annotated v0.5.1，实际远端以Git回执为准。

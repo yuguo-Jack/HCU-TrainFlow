@@ -96,6 +96,8 @@ flowchart TD
 
 ## 3. 性能分析、优化与验证
 
+图中每轮采集、分流和验证遵循 [证据驱动闭环](../skills/hcu-train-optimize/references/evidence-driven-loop.md)：根据实际结构变化刷新 profile，以热点源码、依赖重叠和融合契约共同决定下一轮；只分析模式交付证据和建议。参考方法的采用范围见 [性能方法](practices/performance-methods.md)。
+
 ### 3.1 系统调参与瓶颈定位
 
 ```mermaid

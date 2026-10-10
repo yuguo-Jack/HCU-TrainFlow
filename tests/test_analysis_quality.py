@@ -23,6 +23,42 @@ def test_bound_and_interference():
     assert result['lower_bound_us']==2 and result['decision']=='investigate-system-interference'
     assert model_operator(model,1)['status']=='inconsistent'
 
+def test_bound_reports_assumptions_without_claiming_measured_bottleneck():
+    result = model_operator({'flops': 2000, 'peak_flops_s': 1e9,
+                             'bytes': 1000, 'bandwidth_bytes_s': 5e8,
+                             'latency_floor_us': 1, 'basis': 'synthetic matched units'}, 5)
+    assert result['bound_terms_us'] == {'compute': 2, 'memory': 2, 'latency': 1}
+    assert result['limiting_terms'] == ['compute', 'memory']
+    assert result['arithmetic_intensity_flops_per_byte'] == 2
+    assert result['decision'] == 'compare-reachable-reference'
+    assert result['eta_bound'] == .4
+
+@pytest.mark.parametrize('key,value', [
+    ('slowdown_threshold', float('nan')), ('slowdown_threshold', float('inf')),
+    ('slowdown_threshold', True), ('slowdown_threshold', .5),
+    ('efficiency_target', float('nan')), ('efficiency_target', 1.5),
+    ('efficiency_target', True),
+])
+@pytest.mark.parametrize('actual_us', [1, 10])
+def test_invalid_decision_thresholds_never_hide_behind_another_branch(key, value, actual_us):
+    with pytest.raises(FlowError):
+        model_operator({'latency_floor_us': 2, 'isolated_us': 1, 'basis': 'fixture', key: value}, actual_us)
+
+def test_copy_can_have_zero_flops_but_empty_work_is_not_a_bound():
+    result = model_operator({'flops': 0, 'bytes': 1000, 'bandwidth_bytes_s': 1e9, 'basis': 'copy fixture'}, 2)
+    assert result['lower_bound_us'] == 1 and result['limiting_terms'] == ['memory']
+    assert result['arithmetic_intensity_flops_per_byte'] == 0
+    assert model_operator({'flops': 0, 'peak_flops_s': 1e9, 'basis': 'empty'}, 2)['status'] == 'incomplete'
+
+@pytest.mark.parametrize('change', [
+    {'kind': 'gemm', 'm': 1e200, 'n': 1e200, 'k': 10},
+    {'flops': 1e308, 'peak_flops_s': 1e-300},
+    {'flops': -1}, {'bytes': float('nan')},
+])
+def test_invalid_or_overflowed_work_cannot_form_a_valid_model(change):
+    with pytest.raises(FlowError):
+        model_operator({'latency_floor_us': 2, 'basis': 'fixture', **change}, 10)
+
 def test_no_trace_no_success():
     assert analyze_trace([],{'start_us':0,'end_us':100})['status']=='incomplete'
     assert profile_plan([{'domain':'tp','ranks':[0,2]}],[0,1])['status']=='incomplete'

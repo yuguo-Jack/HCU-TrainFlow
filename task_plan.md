@@ -212,3 +212,13 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [x] 同步本机 Skill，提交推送 main；不移动既有 v0.5.0。
 
 本轮只维护 TrainFlow，不刷新 HCU 大知识库、不操作远端训练或执行故障注入。
+
+## 2026-10-10：全阶段复核与参考工程性能方法补强（0.5.1）
+
+- [x] 固定 Hyperloom/GEAK/BBuf 可读版本，深入对照性能方法、代码与当前实现，记录采用/不采用依据。
+- [x] 结合 HCU 大库复核诊断、环境适配、性能与长稳薄弱点，完善通用方法和衔接。
+- [x] 对影响决策的程序缺口做必要修正及有意义的回归，补齐维护与使用说明。
+- [x] 独立审查、项目整体测试与 Wiki/Skill/链接验证，明确未实测边界。
+- [x] 版本统一 0.5.1，同步本机 Skill；全部检查完成，按本轮发布操作提交并 push main 和 annotated v0.5.1；不创建 GitHub Release。
+
+仅维护 TrainFlow；不刷新 HCU 大知识库、不启动实际训练或自动升级运行依赖。用户所说 hyperloop 按本会话已明确参考的 Hyperloom 解读。

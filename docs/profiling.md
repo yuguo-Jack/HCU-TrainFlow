@@ -48,3 +48,9 @@ kernel 瓶颈升级到 Hygon 算子 Skill，按环境分别使用 XProf/XCompute
 ## 从分析到优化队列
 
 计算占主导时，按真实逻辑算子的端到端贡献优先分析，再结合上限空间和证据选择实现任务。高占比项的模型未知是待解决问题，不能跳过去优先做容易实现的小项。按[热点上限、融合与实现迭代](../skills/hcu-train-optimize/references/operator-ceiling-iteration.md)维护两层排序、融合后复评、HIP迭代和逐项退出依据；保持不同 trace、rank、阶段的分母独立。已有融合仅是新的基线，仍需证明当前效率和继续优化或停止的原因。
+
+## 证据刷新与模型解释
+
+按 [证据驱动闭环](../skills/hcu-train-optimize/references/evidence-driven-loop.md) 区分映射运行、正式稳态 trace、计数器与无 profiler 计时。并行/微批/重算、graph/compile、融合/backend 或布局变化时重建受影响的 rank/shape/源码映射和热点；不能把旧窗口归因用于新候选。方法出处与采用边界见 [性能方法](practices/performance-methods.md)。
+
+`profile-analyze` 的算子评估增加 `bound_terms_us`（compute/memory/latency）、`limiting_terms`（最大模型项，可并列）和 `arithmetic_intensity_flops_per_byte`。流量层级由输入 `basis` 解释；这是模型分解，不是计数器确认的瓶颈。零 FLOPs 的 copy 可用带宽模型；无正值下界仍为 incomplete。工作量、派生值和决策阈值须为有限合法数，`slowdown_threshold >= 1`，`0 < efficiency_target <= 1`，无效输入报错，不静默跳过干扰检查。不同精度/资源、共享带宽和串行依赖须由调用者建立适用模型，简单 max 不能替代依赖分析。

@@ -65,6 +65,8 @@ prepared --environment--> environment_checked --baseline--> baseline_validated
 
 ## 4. 证据怎样复用，什么变化需要重验
 
+性能决策的具体方法见 [证据驱动闭环](../skills/hcu-train-optimize/references/evidence-driven-loop.md)：区分映射/稳态/计数器/正式计时，以热点源码、重叠和融合三表安排实验；刷新旧归因，组合复验，无进展时有据换方向。异常共用规模长稳 Skill 的 [诊断指南](../skills/hcu-train-scale-and-stability/references/diagnosis.md)，维护假设及反证、可重放失败条件和下一项区分检查，不反复堆采集命令。
+
 | 变化 | 处理 |
 | --- | --- |
 | 仅改说明或读取相同原件 | 复用已核验结论，不重复占卡 |

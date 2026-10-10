@@ -19,6 +19,8 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
    新增或升级 HCU Primus Turbo、UCCL、UltraEP、MoonEP 等库时，复核 optimize 的 `references/hcu-library-integration.md`、通信专项及 adapt/规模长稳 Skill 调用；分别核对 HCU 主线/专项线、ABI/编译器、provider、同步/异步/精度边界与消费者。知识检索不足时读实际源码，不自动刷新大知识库。
    HCU Train Simulator 或训练引擎的模型 adapter、显存/求解公式、Profile、并行约束变化时，复核 `docs/practices/capacity-and-parallel-experiments.md` 和 adapt/optimize/coordinator；检查全参判断、余量与多实例资源隔离，保留旧预测/实测版本，不自动切换活动训练依赖。
    PyTorch/编译器/DDP/FSDP 或通信库版本变化时，同步复核 optimize 的 `references/torch-native-training.md` 和 `references/communication-optimization.md`；核实日志接口、编译/通信触发、同步与 buffer 生命周期。未登记的依赖变化也要按任务版本主动查源码，不能因为不在维护清单就跳过。
+   性能方法同步查项目 `docs/practices/performance-methods.md` 的固定来源与路径（Hyperloom/GEAK/BBuf）：核对新版本的证据刷新、dispatch/oracle、重叠归因、测量与停止规则，并复核 optimize 的 `references/evidence-driven-loop.md`、`references/operator-ceiling-iteration.md` 及实际分析/质量评估代码。参考仓不是必装运行时，不能把其推理门槛或 AMD/NV 工具默认搬到 HCU 训练；方法源暂未注册的按该页有界查证并记录，不能伪称 Wiki 已全量更新。
+
    故障诊断与适配/优化异常指南也属于维护目标：同时复核规模长稳 Skill 的 `references/diagnosis.md`、`references/evidence-sources.md`、环境检查与模型适配的 `references/troubleshooting.md` 和 optimize 的 `references/validation-diagnostics.md`。检查 DTK hipgdb/hipprof 接口、runtime 信号/转储、RCCL/PyTorch 日志及内存 API、hcuprobe 与 Cluster Manager 的部署分支/恢复语义；按当前大库或源码查证，缺现场测试明确保留待验证，不能只换工具名字或年份。
 7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
    复核后又改正文/工作流或新增同来源专题时，重新检查并留下新回执；即使上游没有新变化也不能沿用过期复核。PR 重采后同样处理由作者页变动引起的待办。

@@ -183,3 +183,14 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 - 官方交叉核对：PyTorch distributed（Gloo monitored_barrier）、memory snapshot（allocator 可见范围）、Linux cgroup v2（memory.events 层级/增量）。具体来源已写入 Skill references/evidence-sources.md。
 - 本轮新指南属于文档/源码查证，不表示真实 hang/core/leak/数值/存储等故障已在当前集群复现。适配和优化增加异常分流，通用方法留 Skill，事件原件继续留 workspace。
 - 批量编辑曾因主控 Skill 无“运行约定”标题中止；检查实际标题后继续，前面成功的改动未重复插入。
+
+
+## 2026-10-10 — 0.5.1 全阶段方法与性能闭环复核
+
+- 固定读取 AMD-AGI/Hyperloom@880c1672a84cb718e48f640def0bd79e24294d44、AMD-AGI/GEAK@ba509ef31d416350269266b626ec455e9d9475d1、BBuf/AI-Infra-Auto-Driven-SKILLS@6dc9c66a008daded66f214022919ff88b2186252；参考克隆只在忽略提交的 .work/references，未覆盖用户 Hyperloom fork。逐项采用矩阵与可追溯源码在 docs/practices/performance-methods.md。
+- 采用：初始/最佳/候选分离，按源码/shape/执行结构刷新 profile，映射/正式/计数器/计时分离，热点源码/重叠/融合三表，dispatch 先验，完整 API 成本，条件性整步上限，组合验证和有界策略转向。已有动态并行、热点90%、三项算子 Skill、数学库 tune 和阶段 loss 沿用。
+- 不照搬：TP=1 推理限定、固定0.5%/5%门槛、AMD峰值/计数器、推理移除autograd、每轮清缓存、把区间重叠等同因果隐藏、无差别重试/固定Agent人数。低GPU占比不自动定性CPU瓶颈。
+- HCU大库只读核对：xprof-xcompute-workflow、hipprof-2610-metrics、infra-resource-critical-path、rocblas-kme-padding-contract、pytorch-memory-stream-graph-lifecycle、torchcomms-async-functional-watchdog、verl-ppo-grpo-worker-chain、verl-weight-sync-checkpoint-lifecycle，并沿用上一轮 runtime/RCCL/Cluster Manager/转储内存资料。
+- 故障方法补充：假设及反证、可重放条件、采集缺失的降级、有界版本二分、节点/绑定交叉矩阵、四种异步完成、RL worker/同步/峰值/恢复边界。适配补能力分层修复、graph/backward初始化，性能异常与统一主控互通。
+- 发现并修复 analysis.model_operator 中 slowdown_threshold 不做有限性校验、其他阈值在早分支下未验证的问题；增加可复算 bound_terms_us/limiting_terms/算术强度，允许copy的零FLOPs，拒绝派生溢出。标签保持条件模型而非物理瓶颈。
+- 独立只读前向检验：graph/eager与过期shape、噪声小收益候选、OOM累计值/异步wait/混合attempt场景均正确保留证据缺口；20步合成trace计算并集74%、未解释26%、覆盖目标未达。未发现可行动的新问题。不是新HCU现场验收。

@@ -35,40 +35,60 @@ def profile_plan(groups, available):
 
 def model_operator(model, actual_us):
     actual = number(actual_us, "actual_us", True)
+    if model is not None and not isinstance(model, dict):
+        raise FlowError("Operator model must be an object")
     if not model or not model.get("basis"):
         return {"status": "incomplete", "reason": "Missing workload/peak assumptions and their evidence", "decision": "collect-evidence"}
+    # Validate policy inputs even when another decision branch takes priority.
+    # Nonfinite thresholds must not silently disable interference detection.
+    slowdown_threshold = number(model.get("slowdown_threshold", 1.2), "slowdown_threshold", True)
+    if slowdown_threshold < 1:
+        raise FlowError("slowdown_threshold must be >=1")
+    threshold = None
+    if "efficiency_target" in model:
+        threshold = number(model["efficiency_target"], "efficiency_target", True)
+        if threshold > 1:
+            raise FlowError("efficiency_target must be <=1")
     flops, traffic = model.get("flops"), model.get("bytes")
     if model.get("kind") == "gemm":
         dims = [number(model.get(x), x, True) for x in ("m", "n", "k")]
         batch = number(model.get("batch", 1), "batch", True)
-        flops = 2 * math.prod(dims) * batch
-    terms = []
+        flops = number(2 * math.prod(dims) * batch, "derived GEMM flops", True)
+    if flops is not None:
+        flops = number(flops, "flops")
+        if flops < 0:
+            raise FlowError("flops cannot be negative")
+    if traffic is not None:
+        traffic = number(traffic, "bytes")
+        if traffic < 0:
+            raise FlowError("bytes cannot be negative")
+    terms = {}
     if flops is not None and model.get("peak_flops_s") is not None:
-        terms.append(number(flops, "flops", True) / number(model["peak_flops_s"], "peak_flops_s", True) * 1e6)
+        terms["compute"] = number(flops / number(model["peak_flops_s"], "peak_flops_s", True) * 1e6, "compute bound")
     if traffic is not None and model.get("bandwidth_bytes_s") is not None:
-        terms.append(number(traffic, "bytes", True) / number(model["bandwidth_bytes_s"], "bandwidth_bytes_s", True) * 1e6)
+        terms["memory"] = number(traffic / number(model["bandwidth_bytes_s"], "bandwidth_bytes_s", True) * 1e6, "memory bound")
     if model.get("latency_floor_us") is not None:
-        terms.append(number(model["latency_floor_us"], "latency_floor_us", True))
-    if not terms:
+        terms["latency"] = number(model["latency_floor_us"], "latency_floor_us", True)
+    if not terms or max(terms.values()) <= 0:
         return {"status": "incomplete", "reason": "No applicable compute, traffic or latency model", "decision": "collect-evidence"}
-    lower = max(terms)
-    ratio = lower / actual
+    lower = max(terms.values())
+    ratio = number(lower / actual, "bound efficiency", True)
     isolated = model.get("isolated_us")
-    slowdown = actual / number(isolated, "isolated_us", True) if isolated is not None else None
+    slowdown = number(actual / number(isolated, "isolated_us", True), "model-to-isolated ratio", True) if isolated is not None else None
     reference = model.get("reference_us")
     decision = "compare-reachable-reference"
     if ratio > 1:
         decision = "check-model-or-measurement"
-    elif slowdown is not None and slowdown > model.get("slowdown_threshold", 1.2):
+    elif slowdown is not None and slowdown > slowdown_threshold:
         decision = "investigate-system-interference"
-    elif "efficiency_target" in model:
-        threshold = number(model["efficiency_target"], "efficiency_target", True)
-        if threshold > 1:
-            raise FlowError("efficiency_target must be <=1")
+    elif threshold is not None:
         decision = "optimize-implementation" if ratio < threshold else "retain-implementation"
     return {"status": "modeled" if ratio <= 1 else "inconsistent", "flops": flops, "bytes": traffic,
             "lower_bound_us": lower, "eta_bound": ratio,
-            "eta_reference": number(reference, "reference_us", True) / actual if reference is not None else None,
+            "bound_terms_us": terms,
+            "limiting_terms": [name for name, value in terms.items() if value == lower],
+            "arithmetic_intensity_flops_per_byte": number(flops / traffic, "arithmetic intensity") if flops is not None and traffic is not None and traffic > 0 else None,
+            "eta_reference": number(number(reference, "reference_us", True) / actual, "reference efficiency", True) if reference is not None else None,
             "model_to_isolated": slowdown, "decision": decision, "basis": model["basis"],
             "limits": "Optimistic bound under explicit assumptions; not a measured hardware utilization or guaranteed speedup."}
 

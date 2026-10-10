@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 — 2026-10-10
+
+- Strengthen performance decisions from inspected Hyperloom, GEAK and BBuf sources: evidence refresh, mapping/formal/counter timing boundaries, hotspot/overlap/fusion tables, conditional headroom, candidate engagement, combined validation and bounded strategy changes. Preserve training numerical/state contracts and HCU-specific tooling.
+- Extend shared diagnosis with replayable failure conditions, hypothesis elimination, bounded version bisection and cross-node isolation; distinguish host returns, device completion and consumer dependencies. Improve capability-based adaptation and graph/backward initialization checks.
+- Expose compute/memory/latency model terms and arithmetic intensity; reject invalid thresholds and overflowed model values before decision branching. Add CPU regressions; method and source review are not new hardware qualification.
+
 
 - Rename the environment/adaptation and scale/stability Skills to `hcu-train-environment-check-and-adapt` and `hcu-train-scale-and-stability`; update active references and migrate earlier installed entry directories without adding duplicate aliases.
 - Add evidence-driven incident triage, hang/collective, crash/device dump, memory, numerical, slowdown and recovery runbooks grounded in HCU knowledge and version-matched sources; connect adaptation and optimization failure handling. These method additions do not claim new hardware fault coverage.

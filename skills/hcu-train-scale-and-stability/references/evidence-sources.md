@@ -31,6 +31,9 @@ python -X utf8 <KB_ROOT>/kb.py --root <KB_ROOT> search-pr "graph proxy hang" --p
 | 调试与异构转储 | DTK 26.10 hipgdb `bb00bc7bb9d80da7cc80e8f5`；hipprof `b5019dc7bc37f3ca23f13f12`；旧转储示例 `49152d9ec8bc9495a62aa0ce` | 先查匹配手册和本机帮助；hipprof 的转储接口曾移除再恢复，旧路径变量有缺陷记录 |
 | 泄漏与 allocator | `4a472816b1d9de7d731896a2`；`pytorch-memory-stream-graph-lifecycle` | DTK 内存趋势/泄漏工具；allocated/reserved、跨流事件和 graph 池的不同生命周期 |
 | 数值偏差 | `dcu_probe-engineering-handbook`、`hcuprobe-hook-tensor-lifecycle`、`hcuprobe-cross-rank-first-diff` | 采集当时的 tensor、跨 rank 首次分歧、空匹配/缺 rank 的误判 |
+| RL 阶段阻塞/同步/恢复 | `verl-ppo-grpo-worker-chain`、`verl-weight-sync-checkpoint-lifecycle` | 按实际 worker/可选角色、权重传输 backend、sleep/wake 内存和保存完成状态追因，不只看 step 标签 |
+| 异步通信/graph 完成 | `torchcomms-async-functional-watchdog`、`pytorch-memory-stream-graph-lifecycle` | host 返回、设备完成、消费依赖和 watchdog 时间不同，按实际后端分支检查 |
+| 性能/驻留与采集副作用 | `xprof-xcompute-workflow`、`hipprof-2610-metrics`、`infra-resource-critical-path` | 资源/依赖、指标层级和 replay 扰动，防止把采集伪影当硬件瓶颈 |
 | 容错和健康重入 | `cluster-manager-engineering-handbook`、`cluster-fault-taint-recovery`，以及 `knowledge/projects/primus-safe/` | 区分子工程/部署入口，检测、处置、重建和解除隔离的独立条件 |
 
 例：本次 KB 中 RCCL 总览对应 `80b1215701a8cb657c9ec5f2aab37cd8a7086727`，Cluster Manager 主题对应 `026452b298814065b317273c28cc6d707567c20c`，hcuprobe 对应 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5`。这些用于说明参考快照，**不是工作流依赖锁或推荐部署版本**；现场另行固定。大库已记录的未合入 PR 与已部署的自定义分支分别检查。
@@ -47,3 +50,5 @@ python -X utf8 <KB_ROOT>/kb.py --root <KB_ROOT> search-pr "graph proxy hang" --p
 更新 Skill 同时检查：工具帮助/版本、信号和变量语义、日志字段、组与 rank 映射、源码路径、采集副作用、异常/空结果、恢复状态和验证边界。已登记上游用 `knowledge/maintenance.json` 联动；HCU 私有依赖未登记时从任务版本和大库入口主动补查。不要仅因为某个脚本仍 exit0 就保留旧解析结论。
 
 将已核对来源、未能核对的现场接口及必要验证写入更新记录；有真实环境后补现场用例，不用离线指南替代实测。指南变更还应复核环境适配与性能 Skill 的异常路由、主控交接和本机 Skill 同步。
+
+性能、适配和故障方法的公开参考对照见项目 `docs/practices/performance-methods.md`；BBuf 的复现/二分思路按训练状态和 HCU 工具改写，不直接采用其推理 HTTP/CUDA 调试命令。
