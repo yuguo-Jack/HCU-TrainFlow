@@ -22,6 +22,8 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 9. **算子流程。** 需要时调用 `$hygon-hip-baseline-generator`、`$hygon-hip-kernel-optimizer`、`$hygon-triton-kernel-optimizer`。先确认可用；缺失时按 docs/integrations.md 获取 thirdparty/cuda-optimized-skill 并安装，也可读取其 skills/<name>/SKILL.md 及配套资源。kernel 遇到优化瓶颈必须做性能分析；hipprof 与 XProf/XCompute 的命令和产物分别使用，不混写。指令/反汇编问题按目标 ISA 和技能中的编译产物方法处理。
 10. **验证。** 每轮候选做实际 dispatch、局部输出/梯度/参数更新与多 shape 回归，随后 profiler-off 重复测量。阶段候选稳定后再做冻结样本和容差的较长 loss 验收；不频繁长训，也不省略阶段验收。RL 加查 policy version、logprob、reward 和数据年龄。
 
+独立 GEMM/HBM/通信实测不及近期适用参考，或模型内性能异常时，沿项目 `docs/environment-discovery.md` 第 6 节推进差距闭环：查原件口径、配置/链路、所加载库与对应源码，按需搜 HCU-Knowledge，做授权内的单变量有界 A/B/A，核对正确性和实际作用路径，再回归保留或回退。不能把现场低值直接当可达上限，也不能因参考条件不全就停止排查；未解决用 `performance_discrepancy` / 当前 flow 问题保留，带已尝试证据升级专家。`analyze` 仅分析时不扩大执行权限，明确待执行步骤。
+
 ## 重要参考
 
 TraceLens 使用 thirdparty 清单锁定的 HCU fork，保留上游完整模块和原生 CLI。两个 TrainFlow 报告入口之外，按任务需要复用 TraceDiff、graph 报告、trace 分段/索引、源码定位及 EventReplay，具体依赖和入口见 docs/integrations.md。原生命令仍要遵循任务执行权限并记录私有输入/产物；缺少架构模型或事件映射时先标注缺口，优先用现有扩展点，必要的核心修改在独立 fork 开发 checkout 中完成并补回归。

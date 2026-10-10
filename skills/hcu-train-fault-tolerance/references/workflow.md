@@ -9,6 +9,7 @@
 - `docs/collaboration.md`：统一入口、候选复核、人的文件指导与断点接续。
 - `docs/quickstart.md`：安装、任务、证据及 CLI。
 - `docs/workflows.md`：三个工作流与验证门槛。
+- `docs/environment-discovery.md` 第 6 节：持续退化/扩容差距的分层排查、隔离对照与未解决事项升级。
 - `docs/profiling.md`：时间分母、热点建模和 TraceLens。
 - `docs/operations.md`：远程 watcher、事件重放与恢复边界。
 - `docs/training-observation.md`：真实进度、生命周期与守护的失效范围。

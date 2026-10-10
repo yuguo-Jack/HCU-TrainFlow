@@ -169,4 +169,6 @@ hcu-trainflow --workspace PRIVATE artifact-read SOURCE_ARTIFACT PRIVATE_SOURCE_F
 
 找到相近但不完全同条件的近期数据时，保留原文并给出有条件的差距分析，不因条件不齐就丢弃参考价值；也不自定一个百分比宣告通过。只有单位与方法确实可比时计算绝对/相对差距，再用当前条件的实测或明确的验收要求解决剩余不确定性。
 
+可信差距还要按[环境性能排查闭环](environment-discovery.md#6-性能不及预期时的排查顺序)继续查配置/链路/库实现及尝试可逆对照。参考查询的 compatible 不是当前性能通过，mismatched/missing 也不是停止排查的理由。沿用 diagnosis 经验记录保留原件、假设、尝试、正确性/作用证据、保留或回退及未解项；未解决的环境观测附 `performance_discrepancy`，不只更新参考页面就宣告处理完成。
+
 `reference-index` 先校验所有固定记录和 evidence，再重建 Markdown，不覆盖原件；页面生成失败可重试。记录原件被改写或证据丢失会报错，不能以重新建索引洗掉问题。整个 references 仍在原有私有 experience 导出边界内，不能直接上传公共仓。

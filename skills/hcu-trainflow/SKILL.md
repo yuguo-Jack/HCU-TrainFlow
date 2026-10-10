@@ -31,6 +31,8 @@ description: 统一编排 HCU 大模型训练适配、性能优化、大规模�
 
 review 按 `docs/collaboration.md` 使用完整字段；不以单词“完成”或退出码替代评审。每隔配置轮次及扩容/长训/结束边界做全目标检查。数值退化、无收益平台期、反复工具失败须带最小证据包请专家介入。
 
+环境/模型/扩容出现可信性能差距时，主控按项目 `docs/environment-discovery.md` 第 6 节派发基本排查与有界尝试，不能接受只有差距表的“完成”报告。复核原件口径、链路/库版本和 HCU 知识/源码后，在已有授权与资源准入范围内自主推进可逆对照；核验正确性、生效路径、回归与回退。`environment-check` 的 `follow_up_required` 或 `performance_discrepancy` 进入当前 flow/经验记录；条件未知不是忽略理由，未解决保持 fail/incomplete。分析-only 或实际权限不足时保留待执行项，报告已排除项与具体所需权限，不能虚构实验或扩大站点改动范围。
+
 ## 阶段分工
 
 Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize 按需加载 Torch 与通信专项，不增加独立 Skill。全流程先检查 HCU-Knowledge 的搜索 Skill、workspace 绑定及当前索引可用性；缺失按 docs/integrations.md 完成必需安装。三个阶段按实际 HCU 问题联查它，普通训练不触发大知识库更新。

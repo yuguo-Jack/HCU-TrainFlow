@@ -11,7 +11,7 @@
 - `docs/collaboration.md`：统一入口、候选复核、人的文件指导与断点接续。
 - `docs/quickstart.md`：安装、任务、证据及 CLI。
 - `docs/workflows.md`：三个工作流与验证门槛。
-- `docs/environment-discovery.md`：发现镜像/宿主工具、复用容错检查、区分工具误判与硬件问题、建立可比性能预期。
+- `docs/environment-discovery.md`：发现镜像/宿主工具、复用容错检查、区分工具误判与硬件问题、建立可比性能预期；第 6 节要求对可信差距继续基本排查和有界尝试。
 - `docs/source-transfer.md`：Windows/Linux 源码、执行位与仓内链接的固定内容传输。
 - `docs/workspace-maintenance.md`：可重建缓存登记、使用 pin、五分钟维护和 context 独立观察 Store。
 - `docs/training-observation.md`：真实训练日志、进程身份和退出回执；启动阶段与真实进展分开。

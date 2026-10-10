@@ -120,3 +120,9 @@ Installation review also found unnecessary full historical validation on each ex
 - The same source with different audit/profile settings is not one performance cohort. Keep initial state, input sequence, optimizer configuration, parallel layout and measurement mode explicit when comparing optimization and loss.
 - Small native FP32 parameter groups can coexist with mixed-precision optimizer groups. Main-branch checkpoint qualification must preserve their actual optimizer ordering; forward/backward success alone does not demonstrate save or restart correctness.
 - Offline plots must distinguish missing samples, copied heartbeat state and actual fresh metrics. Hashes bind the retained bytes; chart appearance does not establish quality or performance acceptance.
+
+## Performance discrepancies require follow-through
+
+A test can execute correctly and meet an old floor while a credible reference gap remains unexplained. Environment assessment now accepts a typed, evidence-linked unresolved discrepancy and preserves incomplete status; failed matched thresholds remain failures. The Agent must inspect original units/conditions, actual transport/library implementation and authorized bounded alternatives. Logical HCA/bond counts do not establish physical-port bandwidth; count actual active members and collect their traffic/error/congestion deltas. A/B/A is bounded diagnosis, not a replacement for repeated optimization comparisons, production network acceptance or model-level loss checks.
+
+The validator checks declarations and retained evidence references, not the truth of engineering reasoning. Removing a discrepancy field cannot by itself close an investigation: original reports, trial evidence and independent review remain required through the existing flow and private experience mechanisms. No new workflow state machine or automatic site-setting mutation was introduced.

@@ -155,3 +155,10 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - Replaced CAS overwrite publication with atomic no-clobber publication and verified-content reuse; bounded only Windows sharing conflicts. Added deterministic racing writers/readers, corrupt object, fsync/I/O and unsupported-filesystem regression cases. Mutable file publication remains separate.
 - Added explicit Linux checkpoint TMPDIR preflight with actual AF_UNIX and spawn Manager queue roundtrips, exact-path evidence and bounded own-process cleanup. Actual target-container short/oversized path tests succeeded/failed as expected without fallback; platform limitations remain explicit.
 - Local full regression: **875 passed, 4 Linux-specific tests skipped on Windows**, 58.74 seconds. Knowledge validator: **485 pages / 24 sources / no errors**. Cross-platform CI remains a separate result; matrix now completes all combinations even if one fails.
+
+## Performance discrepancy workflow review
+
+- Added explicit unresolved performance discrepancies, typed/evidence-linked validation, follow-up classification and a common reference-to-controlled-trial procedure. Synchronized the coordinator and all three phase Skills with that procedure; analysis-only and occupied-resource boundaries remain explicit.
+- Independent root review and full local regression: **905 passed, 4 platform-specific skips**, 59.03 seconds. Knowledge validator: **485 pages / 24 sources / no errors**. Private hardware experiments and publication are recorded separately; no site measurements or identifiers are included here.
+
+- Root reviewed the complete public diff and synced the four changed managed Skills (the two Wiki Skills were already current). The private A/B/A executed with native correctness and per-rank shutdown evidence; reference comparability and shared-network uncertainty remain explicit. Further site analysis stays in the private workspace.

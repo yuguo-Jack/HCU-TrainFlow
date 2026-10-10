@@ -111,5 +111,12 @@ Site inventory, model/data definitions, raw measurements and user guidance are r
 
 - Transport, immutable snapshots, bounded resource admission, training observation, multi-member health, private references and offline plots have reusable implementations and CPU regressions.
 - Actual component numerics, bounded training, multiple-rank profiling, an optimization comparison, stage loss observations and collector failure/recovery have been exercised. These are separate evidence cohorts, not a blanket production pass.
-- Main HCU delivery integration is being qualified separately; a native mixed-precision checkpoint failure is retained and must be repaired and retested. No donor result is relabelled as main-branch acceptance.
-- Initial public review, Skill synchronization and development commits are complete; actual clean-CI failures are repaired and the follow-up matrix must pass before closing this iteration. No tag/release; unsupported automatic recovery/notification and full-size model claims stay open.
+- Main HCU delivery integration was qualified separately: the mixed-precision checkpoint path was repaired, and bounded save/load/continued-step checks ran. Distributed and full numerical qualification remain separate; no donor performance result is relabelled as main-branch acceptance.
+- Initial public review, Skill synchronization and development commits are complete; actual clean-CI failures were repaired and the four-job follow-up matrix passed. No tag/release; unsupported automatic recovery/notification and full-size model claims stay open.
+
+## Performance discrepancy follow-up
+
+1. Require reference/method/configuration/path checks, HCU knowledge and fixed-source investigation, and authorized bounded trials before accepting a discrepancy investigation as complete — implemented.
+2. Preserve unresolved evidence-backed gaps through environment-check even when execution succeeds or an older floor is reached; distinguish failure from missing comparison evidence — implemented with regressions.
+3. Exercise the sequence on a private collective diagnosis and retain per-rank configuration, correctness, physical-port counters and rollback evidence — initial A/B/A executed with per-rank numerical/exit checks; counter/source review and any additional candidate stay in private evidence.
+4. Review, run the complete test suite and knowledge validator, synchronize managed Skills and publish development changes without release/tag — local review, complete regression and managed Skill synchronization passed; publication is recorded in Git history and remote CI.

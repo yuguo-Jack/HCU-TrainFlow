@@ -25,6 +25,24 @@ task-context 的每次实际重置还记录 context_epoch。切换 A→B→A 不
 
 观测是数组，每项重复 node/device/check/conditions/context，另含 status、executed、evidence 和 value。三元组不可重复，每个 required 项必须有匹配观测；匹配只覆盖契约声明的条件，Agent 必须把关键条件写全。
 
+性能检查低于可比且有依据的 `minimum` 时为 `fail`；条件或证据不足为 `incomplete`，不能凭统一百分比生成阈值。任何未通过的 performance 项均附 `follow_up`，报告的 `follow_up_required=true` 提醒当前 Agent 执行[差距排查闭环](environment-discovery.md#6-性能不及预期时的排查顺序)。`classification` 区分 `matched-performance-failure`、`provisional-performance-discrepancy`、`check-failure` 和 `evidence-gap`；这不是自动执行或根因判定。
+
+若测试退出正常或达到旧最低线，但原件支持仍有未处理的可信性能差距，负责 Agent **必须**在对应的 performance 观测中保留：
+
+```json
+{
+  "performance_discrepancy": {
+    "summary": "原表与当前数据存在待解释差距；列明可比部分及限制",
+    "evidence": ["REGISTERED_REFERENCE_SHA256", "REGISTERED_RAW_TEST_SHA256"],
+    "missing_conditions": ["原表的软件构建身份尚待核对"]
+  }
+}
+```
+
+以上片段合入原观测；示意 ID 必须替换为 `artifact-add` 返回的 64 位小写 SHA256，并同时放在观测自身的 `evidence` 数组。summary 与 evidence 非空，missing_conditions 可省略或为字符串数组；未知字段、伪类型和缺关联证据会报错。该记录表示**尚未关闭**的差距，不接受 `resolved=true` 等直接放行字段；即使 status=pass 也转为 incomplete，进入 `required_missing`，已确定的 fail 则保持 fail。程序不自动推断“明显”或猜缺失条件，Agent 不能用不填记录的方式忽略已发现的问题。
+
+纯函数/`environment-check` 验证字段及证据关联，不读取 artifact 内容来证明比较成立；报告登记 `report-add` 时按既有 Store 规则验证证据已注册且完整。原失败及处理经过在 flow/experience 中保留，读原件、做授权内有界尝试和回归后，才用新的观测重新判定；移除字段本身不构成关闭问题的证据。
+
 ## QualityContract 与记录
 
 ```json
