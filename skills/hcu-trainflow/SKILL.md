@@ -62,6 +62,8 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 
 需要展示训练趋势时，使用项目 `scripts/render_training_dashboard.py` 从规范化日志生成私有单 attempt 图表；按 `docs/training-dashboard.md` 选择身份、记录原件哈希并保留历史输出。绘图只是观察，不能替代阶段质量、性能或容错验收；未采集的指标明确留空。
 
+优化阶段推进前核对端到端 ≥90% 热点集合中的非通信算子优先级、上限/效率与逐项处置。初步融合后仍有显著空间，继续调用 Hygon 算子 Skill，必要时转 HIP；各项须有已达目标、近可达水平、无稳定收益或受阻原因的证据。未解决差距和覆盖缺口留在看板并汇报，不能因完成一种融合就关闭优化；详情见 optimize 的 `references/operator-ceiling-iteration.md`。独立容错工作可并行，不代替优化验收。
+
 ## 工作区维护与观察交接
 
 由主控在同一个默认五分钟交互轮询中检查维护是否到期；有已登记缓存时调用一次 `scripts/maintain_workspace.py ... tick`，默认 dry-run。已明确配置自动清理的部署可按该 policy 加 `--enable-delete`，正常执行无需反复询问。只处理登记的可重建代次；老目录不自动迁移或删除，活跃/未知作业、lease、使用 pin 和原件引用继续保护。不要并行派多个清理者，也不要在每条 Agent 消息后扫工作空间。触发方式、缓存生产者与安装资源核对见 [维护与观察交接](references/maintenance.md)。

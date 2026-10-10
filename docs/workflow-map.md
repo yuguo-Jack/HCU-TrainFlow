@@ -104,7 +104,7 @@ flowchart TD
     V --> H
     O --> H
     TORCH --> H
-    H --> RANK["候选排序：预计整步收益、置信度<br/>显存 / 编译成本、数值风险、依赖与回退"]
+    H --> RANK["先处理端到端主要占比<br/>空泡 / 通信 / 负载不均 / 计算<br/>计算按实际 op 占比逐项分析；跳过要有依据"]
     RANK --> MODE{"是否仅性能分析？"}
     MODE -->|是| REPORT["交付瓶颈、上限评估、证据缺口与实验建议<br/>不擅自修改配置或启动优化实验"]
     MODE -->|否| SYS["系统调参候选<br/>并行布局 / overlap / GPU_MAX_HW_QUEUES<br/>必要位置 compile / 显存与重算权衡"]
@@ -123,18 +123,20 @@ TraceLens 的逐 rank 分析可用代表样本；其完整 collective 报告要�
 
 ```mermaid
 flowchart TD
-    H["来自同一稳态窗口的热点和调用证据"] --> F["对照 NV 融合粒度与数值契约<br/>接口、前后向、保存值、累加和 cast"]
+    H["来自同一稳态窗口的热点和调用证据"] --> ORDER["按逻辑 op 贡献排序，再拆 phase / shape<br/>高占比上限未知者先补分析<br/>实施前说明选择与跳过理由"]
+    ORDER --> F["对照 NV 融合粒度与数值契约<br/>接口、前后向、保存值、累加和 cast"]
     H --> C["累计至少 90% 端到端墙钟热点覆盖<br/>重叠不重复累计；空泡与未归因缺口仍保留"]
     F --> R{"当前 HCU TE / Flash-Train / Primus Turbo 已支持？"}
-    R -->|是| USE["优先复用<br/>进入图 3.3 验证实际 dispatch"]
-    R -->|否| NEW["补融合实现<br/>TE 能力归 HCU TE<br/>编译 / cuDNN Frontend 等融合归 Flash-Train"]
+    R -->|是| USE["优先复用并验证实际 dispatch<br/>融合后继续评估效率与剩余空间"]
+    R -->|否| NEW["按已裁决优先级补实现<br/>新通用训练 HIP 算子归 Flash-Train<br/>TE / Primus Turbo 自有能力归对应 HCU 仓"]
     C --> TYPE{"热点类型"}
     TYPE -->|纯通信| COMM["按消息量、拓扑、等待和 overlap 评估<br/>同数据量独立通信测试"]
     TYPE -->|非通信或含计算的混合 kernel| MODEL["逐项建模<br/>真实 shape / dtype / phase<br/>FLOPs、字节量、延迟下限与可达参考"]
     MODEL --> EFF["评估当前效率和改进空间<br/>同 shape 独立实测 vs 模型内耗时"]
+    USE --> EFF
     EFF --> WHY{"评估结论"}
     WHY -->|系统并发 / 资源干扰| SYS["返回图 3.1<br/>检查 runtime、overlap、队列和显存"]
-    WHY -->|实现差距| TASK["形成优化任务<br/>进入图 3.3"]
+    WHY -->|实现差距| TASK["按优先级进入实现迭代<br/>融合仍低效时必要转 HIP<br/>进入图 3.3"]
     WHY -->|已接近合理上限| KEEP["保留当前实现与评估依据<br/>纳入整体候选验收"]
     WHY -->|模型或测量不足| MORE["补源码、计数器或 shape 证据<br/>修正假设与上限模型"]
     MORE --> MODEL
@@ -157,7 +159,11 @@ flowchart TD
     USE["复用已有 HCU 能力"] --> TEST
     TEST --> LOCAL{"局部正确且有收益？"}
     LOCAL -->|否| RETRY["修复、回退或更换假设<br/>重新进入本任务；无新方向时请专家"]
-    LOCAL -->|是| MERGE["集成兼容候选<br/>隔离测量，重抓模型 profile"]
+    LOCAL -->|是| CEILING{"更新瓶颈与上限后<br/>仍有显著可兑现空间？"}
+    CEILING -->|是| SK
+    CEILING -->|否：有证据说明原因| MERGE["集成兼容候选<br/>隔离测量，重抓模型 profile"]
+    CEILING -->|受阻或无法判断| BLOCK["记录缺口、已尝试项和最佳版本<br/>补证据或请专家；不当作优化达标"]
+    BLOCK --> H
     MERGE --> STABLE{"是否到稳定阶段验收点？"}
     STABLE -->|继续迭代| H["回到图 3.1 / 3.2<br/>更新模型 profile、热点及优化优先级"]
     STABLE -->|是| LOSS["相对初始冻结基线验证阶段 loss<br/>同时核对性能、显存和任务特有质量指标"]
@@ -170,7 +176,7 @@ flowchart TD
 
 - **覆盖率分母：**每 rank 的整个训练窗口墙钟；若 GPU busy 只有 60%，剩余空泡/等待不能从分母删掉以制造 90% 覆盖。不同 rank 的时长也不相加作全局时间。
 - **效率模型：**时间下界为 `max(FLOPs/匹配算力, bytes/匹配带宽, latency_floor)`；下界除以实测耗时是带假设的效率指标，不是硬件利用率。超过 1 要复核模型和测量。Attention 等复杂算子须用实际算法、IO 和重算路径建模。
-- **优化节奏：**融合对齐、其他热点分析和独立算子优化可以交错推进。不是等全部融合完成后才分析剩余热点，也不是每次 kernel 改动都长时验 loss。
+- **优化节奏：**先按主要占比和真实算子排序，再裁决实施；融合对齐后仍须复评和迭代。高占比上限未知项先补分析，不因容易实现而随意选小项；停止优化给证据，缺口不冒充近峰。独立方向可并行，稳定阶段验 loss。
 - **工具与归属：**XProf/XCompute 与 hipprof 按实际环境分别使用；必要时查底层库对应分支，不能用不匹配的软件栈解释现场行为。hipBLASLt/groupGEMM 当前不承诺自动 tune，记录可复现 size 和需求。
 
 详细约束见 [性能分析](profiling.md)、[优化 Skill](../skills/hcu-train-optimize/SKILL.md) 与 [三个阶段工作流](workflows.md)。

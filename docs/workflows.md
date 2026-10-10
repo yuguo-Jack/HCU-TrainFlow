@@ -18,7 +18,9 @@
 
 ## 性能优化
 
-优化阶段按实际调用选择大型引擎或 [Torch 原生训练专项](../skills/hcu-train-optimize/references/torch-native-training.md)，可以混用，不新增阶段。视频生成/VLA/世界模型侧重输入与时空 shape、autograd、compile/断图/重编译、DDP/FSDP 及编译后的实际后端；共同保留初始数值基线、≥90% 非通信热点建模和阶段 loss。AOTI 不默认用于训练。
+**按端到端主要占比推进。** 空泡大先解决空泡原因；通信大先判定是否达到匹配单测预期，异常先排查，符合预期的固有开销重点考虑 overlap/通算融合；负载不均则调整并行、调度或借鉴引擎实现；计算大就按真实算子占比逐项分析瓶颈、上限并优化，无需优化的说明依据。数学库 GEMM 可提取完整 size 和证据交用户协调调优，attention 等按适用性复用已有库或重写。每轮重新检查主导因素，不围绕预先选定的候选机械迭代。
+
+优化阶段按实际调用选择大型引擎或 [Torch 原生训练专项](../skills/hcu-train-optimize/references/torch-native-training.md)，可以混用，不新增阶段。视频生成/VLA/世界模型侧重输入与时空 shape、autograd、compile/断图/重编译、DDP/FSDP 及编译后的实际后端；共同保留初始数值基线、累计覆盖端到端 ≥90% 热点集合中各非通信算子的建模和阶段 loss。AOTI 不默认用于训练。
 
 [通信优化专项](../skills/hcu-train-optimize/references/communication-optimization.md) 覆盖真实 process groups、消息与依赖、DP bucket/FSDP 预取、TP/EP/PP/CP 调度、chunk-ready、AG-GEMM/GEMM-RS 和设备侧通算融合。对照纯通信、纯计算、模型内并发与整步表现，量化暴露时间、计算退化和额外显存，不以时间线相交宣称加速。
 
@@ -29,6 +31,8 @@
 不要要求先完成全部融合才能分析剩余热点。[HCU 工程联动](../skills/hcu-train-optimize/references/hcu-library-integration.md)将 TE、Flash-Train、Primus Turbo 与实际通信后端串联；遇到HCU问题先检索大知识库，再追当前分支。RCCL/rocSHMEM/DeepEP/UCCL/UltraEP/MoonEP各有能力和接口边界，按瓶颈复用，必要时独立修改、隔离重编和集成验证后按规范PR。算子实现交由已有 Hygon HIP/Triton 技能。子 Agent 可并行读取独立证据，但同资源实验串行，修改范围不重叠。
 
 比较实验保存 warmup、profiler-off 重复次数、配对次序、设备状态及方差。每轮局部正确性与实际 candidate 分发必须通过；阶段候选冻结后验 loss。初始基线和回退方案保持不变，不能一路与上一次误差更大的候选比较。
+
+**初步融合后继续优化。** 按[热点上限、融合与实现迭代](../skills/hcu-train-optimize/references/operator-ceiling-iteration.md)，将上述热点集合中的计算/copy/规约等算子按端到端贡献与可兑现空间排序，逐项追调用链、瓶颈和合理上限。复用的融合实现仍明显低效时继续调优，必要时转 HIP 并调用现有 Hygon 算子 Skill；回接模型后重新测量和排序。推进前给出每项最佳结果、剩余空间和停止原因，显著未解决差距保持待处理并汇报，不能用融合完成或单次加速代替优化验收。新通用训练算子默认交 HCU Flash-Train，TE/Primus Turbo 自有能力按职责交对应 HCU 仓；引擎只保留必要集成。
 
 独立单测已明显不及近期适用参考时，先沿上述差距闭环检查环境/数据路径，再判断实现上限或训练内干扰；不把低下的现场值当作“正常峰值”掩盖问题。只分析模式完成原件/源码分析和具体实验方案，未获执行权限的对照保留待验证。
 

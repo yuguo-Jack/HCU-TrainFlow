@@ -44,3 +44,7 @@ GEMM FLOPs = 2×M×N×K×batch。其他 op 由实际算法定义 FLOPs、有效/
 默认不加载其他厂商的架构峰值。确有匹配 HCU 的配置才传 `--gpu-arch-json`；复杂算子仍需补充实际算法和访存模型，不能仅凭自动 FLOPs 宣称达到上限。
 
 kernel 瓶颈升级到 Hygon 算子 Skill，按环境分别使用 XProf/XCompute 或 hipprof。测量吞吐时关闭 profiler；对照 NV 融合粒度和内部精度路径后再验端到端收益。
+
+## 从分析到优化队列
+
+计算占主导时，按真实逻辑算子的端到端贡献优先分析，再结合上限空间和证据选择实现任务。高占比项的模型未知是待解决问题，不能跳过去优先做容易实现的小项。按[热点上限、融合与实现迭代](../skills/hcu-train-optimize/references/operator-ceiling-iteration.md)维护两层排序、融合后复评、HIP迭代和逐项退出依据；保持不同 trace、rank、阶段的分母独立。已有融合仅是新的基线，仍需证明当前效率和继续优化或停止的原因。
