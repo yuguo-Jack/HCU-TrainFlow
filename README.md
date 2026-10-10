@@ -20,9 +20,9 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 [![HCU-TrainFlow 工作流总览：环境适配、性能优化与阶段验收、扩容长训；多 Agent、独立复核、远端执行和知识沉淀贯穿全程](docs/assets/workflow-overview.png)](docs/assets/workflow-overview.png)
 
-[原尺寸图片](docs/assets/workflow-overview.png) · [可编辑流程图与验收规则](docs/workflow-map.md)
+[流程图与验收规则](docs/workflow-map.md)
 
-优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。优先复用当前 HCU 工程配方和 TE、Flash-Train、Primus Turbo 等已有实现，按瓶颈联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等通信能力，按需使用三个 Hygon 算子 Skill。
+优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。抽离模型中关键算子同shape单测判断算子在模型中是否被通信、访存竞争或调度等因素显著拖慢。优先复用当前 HCU 工程配方和 TE、Flash-Train、Primus Turbo 等已有实现，按瓶颈联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等通信能力，按需使用三个 Hygon 算子 Skill。
 
 同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。适配前参考 HCU Train Sim、模型结构和实际可用卡数做容量预估，短跑校准后能放下就直接全参适配优化；资源不足才缩 layer 跑通或筛机；用户明确允许缩维时记录授权范围与模型差异。扩规模前先验收选定的完整配置，再逐级扩 DP 域并复核性能、显存和训练语义；缩维代理的结果不能声称为原完整模型验证。
 
