@@ -1,6 +1,6 @@
 # HCU-TrainFlow 工作流全景
 
-本文与 `0.4.0.dev1` 的实现和 Skill 约定对应。先看总览，再按问题进入阶段细图；所有图均为可编辑的 Mermaid，GitHub 可直接显示。新任务或中断恢复先读[主控接手与阶段交接](agent-playbook.md)。
+本文与 `0.5.0` 的实现和 Skill 约定对应。先看[工程介绍](project-overview.md)了解任务如何推进，再按问题进入下方阶段细图；所有图均为可编辑的 Mermaid，GitHub 可直接显示。新任务或中断恢复先读[主控接手与阶段交接](agent-playbook.md)。
 
 **读图约定：**实线表示推进、反馈或数据传递，虚线表示按需查询、指导或配套能力。方框是工作，菱形是判断，圆柱是持久资料。同一张图中的并行分支表示可拆工作，不表示每次必须启动同样数量的 Agent。
 
@@ -11,7 +11,9 @@
 ```mermaid
 flowchart TD
     U["模型、环境、数据与目标<br/>预训练 / SFT / RL / Torch 原生训练"] --> C["本地主控 hcu-trainflow<br/>明确范围、预算、验收与现场权限"]
-    C --> A["① 环境验收与模型适配<br/>hcu-train-adapt · 详见图 2"]
+    C --> SCOPE{"本轮工作范围"}
+    SCOPE -->|完整训练任务| A["① 环境验收与模型适配<br/>hcu-train-adapt · 详见图 2"]
+    SCOPE -->|独立请求| PART["按对应阶段执行并交付<br/>环境检查 / 适配 / 分析 / 优化 / 诊断 / 运行<br/>保留失败、未测项和适用范围"]
     A --> AG{"环境与初始数值基线通过？"}
     AG -->|缺失或失败| AR["补证据 / 修环境 / 修适配"]
     AR --> A
@@ -20,7 +22,7 @@ flowchart TD
     Q --> QG{"达到约定目标且数值通过？"}
     QG -->|未达到| OR["定位问题、修正或回退<br/>无新证据 / 达到预算边界时请专家介入"]
     OR --> O
-    QG -->|通过| S["③ 选定完整配置 → 扩 DP 域<br/>筛机、健康池与逐级扩容验证"]
+    QG -->|通过| S["③ 验收目标配置 → 扩 DP 域<br/>完整模型目标必要时恢复完整结构<br/>获准代理保留验证缺口 · 详见图 6"]
     S --> SG{"环境、质量与扩容验收通过？"}
     SG -->|失败| SR["按原因回到环境、适配或优化<br/>修复后重新验收受影响证据"]
     SR --> C
@@ -28,8 +30,9 @@ flowchart TD
     T --> TG{"达到任务约定的完成 / 交接条件？"}
     TG -->|否| T
     TG -->|是| Z["完成复核与交付<br/>代码 / 配方 / 证据 / 经验 / 运行交接"]
+    PART --> Z
     LOOP["所有阶段共用<br/>实施 → 测量 → 独立复核 → 修正 / 推进<br/>详见图 4"] -.-> C
-    H["BOARD.md 进展与问题<br/>GUIDANCE.md 指导 · 默认每 5 分钟采集"] -.-> C
+    H["BOARD.md 详细进展与证据<br/>GUIDANCE.md 指导 / QUESTIONS.md 问答<br/>文件默认每 5 分钟采集，回应有记录"] -.-> C
     K[("必装 HCU-Knowledge 贯穿三个阶段<br/>联查官方 Wiki / 私有经验 / PR / 底层源码<br/>详见图 7")] -.-> C
     C -.-> TEAM["按依赖动态拆解多 Agent 任务<br/>独立工作并行，集成与共享测量协调<br/>详见图 5"]
 ```
@@ -42,18 +45,29 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    I["确认模型 / 数据 / 用户 patch<br/>节点、设备、拓扑、调度方式和权限"] --> D["发现当前环境与工程实际工具<br/>Cluster Manager / run nhc / check 脚本 / DTK 命令"]
-    D --> E["逐节点与设备采集<br/>GEMM、HBM、机内互联、机间网络和集合通信"]
+    I["确认本轮模式、资源、工作区与权限<br/>适配任务另核模型 / 数据 / 用户 patch"] --> D["发现现场激活链与实际工具<br/>镜像 / 环境脚本 / Cluster Manager<br/>run nhc / check 脚本 / DTK 命令"]
+    D --> OCC{"授权资源当前可用？<br/>新鲜占用观测 + 调度 / 预约"}
+    OCC -->|有人使用或状态未知| WAIT["等待 / 选择获准空闲资源<br/>继续被动观察，不抢卡"]
+    WAIT --> OCC
+    OCC -->|可用，启动前复查| E["逐节点与设备采集健康和实测<br/>GEMM、HBM、机内互联、机间网络<br/>集合通信正确性与性能"]
     X["匹配硬件、精度、shape、拓扑、软件的预期<br/>官方资料 / HCU 知识 / 飞书记录"] -.-> E
-    E --> EG{"必需项齐全且结果符合预期？"}
-    EG -->|否| FIX["区分权限缺口、未测项与真实故障<br/>诊断修复 / 补测 / 必要时请专家"]
-    FIX --> D
+    E --> HW["归并后续建模所需硬件基线<br/>型号 / gfx / 计算资源 / 显存 / 频率<br/>分精度与指令路径的算力、分层带宽依据"]
+    HW --> EG{"必需项齐全且结果符合预期？"}
+    EG -->|否| FIX["区分可比失败与证据缺口<br/>核对配方、实际库和链路，有界对照<br/>保留 fail / incomplete，必要时升级专家"]
+    FIX --> FURTHER{"当前条件允许继续解决？"}
+    FURTHER -->|有授权和新证据| D
+    FURTHER -->|缺条件 / 预算边界| FMODE{"是否仅环境检查？"}
+    FMODE -->|是| ER
+    FMODE -->|否| HOLD["受影响阶段保持阻塞<br/>向用户给出证据、已排除项与推荐决定"]
+    HOLD -->|得到所需条件后| D
     EG -->|是| ONLY{"是否仅环境检查？"}
-    ONLY -->|是| ER["交付环境报告、适用范围与证据"]
-    ONLY -->|否| R["选择当前 HCU 工程适用分支及启动配方<br/>核对已有脚本、环境变量、依赖和用户 patch"]
+    ONLY -->|是| ER["交付 pass / fail / incomplete 环境报告<br/>预期与实测、命令、硬件基线、缺口<br/>检查完成不等于训练放行"]
+    ONLY -->|否| R["按模型支持与实际活跃实现选仓 / 分支<br/>区分执行基线与最终交付出口<br/>保持用户 patch，避免中途迁移实验基线"]
     W["官方引擎 Wiki + 对应依赖源码<br/>核对模型、精度及训练语义"] -.-> R
-    R --> L["本地独立开发 checkout<br/>固定源码与配置 → 同步远端 → 编译运行"]
-    L --> CAP["全参数容量预估：HCU Train Sim / 当前模型源码<br/>实际可用卡数、最重 rank 显存与余量；核对模型覆盖"]
+    R --> L["本地独立开发 checkout，不用知识库缓存<br/>锁官方 / HCU / 依赖 / submodule 提交"]
+    L --> SEM["核对实际模型与训练语义<br/>构造参数、辅助模块、优化器与参数分组<br/>tokenizer / mask / 精度 / 有效 batch"]
+    SEM --> RECIPE["优先复用适用 HCU 启动配方<br/>核对现场脚本顺序、各 rank 生效参数和库<br/>固定配置与源码，准备同步 / 编译 / 运行入口"]
+    RECIPE --> CAP["全参数容量预估：HCU Train Sim / 当前模型源码<br/>实际可用卡数、最重 rank 显存与余量；核对模型覆盖"]
     CAP --> FIT{"完整配置估算可行？"}
     FIT -->|可行| FULL["直接全参最小可行训练实例<br/>实际短跑校准峰值、布局和前后向"]
     FIT -->|证据不足| CHECK["补结构/公式/现场证据<br/>generic 近似不等于不能运行"]
@@ -124,19 +138,22 @@ TraceLens 的逐 rank 分析可用代表样本；其完整 collective 报告要�
 ```mermaid
 flowchart TD
     H["来自同一稳态窗口的热点和调用证据"] --> ORDER["按逻辑 op 贡献排序，再拆 phase / shape<br/>高占比上限未知者先补分析<br/>实施前说明选择与跳过理由"]
-    ORDER --> F["对照 NV 融合粒度与数值契约<br/>接口、前后向、保存值、累加和 cast"]
-    H --> C["累计至少 90% 端到端墙钟热点覆盖<br/>重叠不重复累计；空泡与未归因缺口仍保留"]
+    ORDER --> C["累计至少 90% 端到端墙钟热点覆盖<br/>重叠不重复累计；空泡与未归因缺口仍保留"]
+    C --> TYPE{"热点类型"}
+    TYPE -->|纯通信| COMM["按消息量、拓扑、等待和 overlap 评估<br/>同数据量独立通信测试"]
+    TYPE -->|非通信或含计算的混合 kernel| CALL["冻结本项真实调用<br/>shape / dtype / stride / phase / dispatch<br/>接口、前后向、累积方式与数值契约"]
+    CALL --> MODEL["工作线 A：逐项建模<br/>FLOPs、分层流量、必要延迟<br/>匹配硬件路径与可达参考"]
+    CALL --> ISO["工作线 B：同条件独立实测<br/>复用模型实现，比对模型内耗时<br/>定位实现慢或并发资源干扰"]
+    CALL --> F["对照 NV 融合粒度与数值契约<br/>接口、前后向、保存值、累加和 cast"]
     F --> R{"当前 HCU TE / Flash-Train / Primus Turbo 已支持？"}
     R -->|是| USE["优先复用并验证实际 dispatch<br/>融合后继续评估效率与剩余空间"]
     R -->|否| NEW["按已裁决优先级补实现<br/>新通用训练 HIP 算子归 Flash-Train<br/>TE / Primus Turbo 自有能力归对应 HCU 仓"]
-    C --> TYPE{"热点类型"}
-    TYPE -->|纯通信| COMM["按消息量、拓扑、等待和 overlap 评估<br/>同数据量独立通信测试"]
-    TYPE -->|非通信或含计算的混合 kernel| MODEL["逐项建模<br/>真实 shape / dtype / phase<br/>FLOPs、字节量、延迟下限与可达参考"]
-    MODEL --> EFF["评估当前效率和改进空间<br/>同 shape 独立实测 vs 模型内耗时"]
+    MODEL --> EFF["汇合本项证据，互相校正假设<br/>当前效率、实现空间与整步可兑现收益<br/>各项就绪即可推进，无全体算子屏障"]
+    ISO --> EFF
     USE --> EFF
     EFF --> WHY{"评估结论"}
     WHY -->|系统并发 / 资源干扰| SYS["返回图 3.1<br/>检查 runtime、overlap、队列和显存"]
-    WHY -->|实现差距| TASK["按优先级进入实现迭代<br/>融合仍低效时必要转 HIP<br/>进入图 3.3"]
+    WHY -->|实现差距| TASK["按优先级进入实现迭代<br/>本项依赖与上限依据就绪后派发<br/>融合仍低效时必要转 HIP · 图 3.3"]
     WHY -->|已接近合理上限| KEEP["保留当前实现与评估依据<br/>纳入整体候选验收"]
     WHY -->|模型或测量不足| MORE["补源码、计数器或 shape 证据<br/>修正假设与上限模型"]
     MORE --> MODEL
@@ -152,22 +169,31 @@ flowchart TD
 ```mermaid
 flowchart TD
     IN["已就绪的实现优化 / 融合任务<br/>同一轮可有多个独立任务"] --> TASK["动态分配 Agent 与独立 checkout<br/>按各自依赖进入实现和局部验证"]
-    TASK -->|自定义实现| SK["按需使用三个 Hygon 算子 Skill<br/>HIP 基线 / HIP 优化 / Triton 优化<br/>瓶颈时使用实际可用的性能分析工具"]
-    TASK -->|数学库路径| LIB["提取 rocBLAS / hipBLASLt 的 size<br/>rocBLAS 按教程 tune<br/>其他提交调优需求，保留已验证路径"]
-    SK --> TEST["逐轮局部验证<br/>实际分发、输出 / 梯度 / 优化器影响、多 shape<br/>profiler-off 配对重复测量"]
+    TASK -->|自定义实现| IMPL{"当前基线与实现路径"}
+    IMPL -->|缺正确可运行 HIP 基线| BASE["hygon-hip-baseline-generator<br/>建立数值 / 布局契约与保守 HIP 基线"]
+    BASE --> HIP["hygon-hip-kernel-optimizer<br/>HIP / C++ 实现与迭代"]
+    IMPL -->|已有 HIP 基线| HIP
+    IMPL -->|已有 Triton / Inductor 实现| TRITON["hygon-triton-kernel-optimizer<br/>优化当前 Triton 实现"]
+    HIP --> PROF["优化瓶颈必用实际工具查证<br/>hipprof 与 XProf / XCompute 分别使用<br/>结合计数器、ISA / 编译产物修正模型"]
+    TRITON --> PROF
+    TASK -->|数学库确有性能缺口| LIB["提取 rocBLAS / hipBLASLt 原生日志<br/>完整 bench 命令及版本、dtype、布局等条件<br/>rocBLAS 有界 tune；hipBLASLt / groupGEMM 交用户协调"]
+    PROF --> TEST["逐轮局部验证<br/>实际分发、输出 / 梯度 / 优化器影响、多 shape<br/>profiler-off 配对重复测量与稳定性"]
     LIB -->|获得可测候选后| TEST
     USE["复用已有 HCU 能力"] --> TEST
     TEST --> LOCAL{"局部正确且有收益？"}
     LOCAL -->|否| RETRY["修复、回退或更换假设<br/>重新进入本任务；无新方向时请专家"]
+    RETRY --> TASK
     LOCAL -->|是| CEILING{"更新瓶颈与上限后<br/>仍有显著可兑现空间？"}
-    CEILING -->|是| SK
+    CEILING -->|是| TASK
     CEILING -->|否：有证据说明原因| MERGE["集成兼容候选<br/>隔离测量，重抓模型 profile"]
     CEILING -->|受阻或无法判断| BLOCK["记录缺口、已尝试项和最佳版本<br/>补证据或请专家；不当作优化达标"]
     BLOCK --> H
     MERGE --> STABLE{"是否到稳定阶段验收点？"}
     STABLE -->|继续迭代| H["回到图 3.1 / 3.2<br/>更新模型 profile、热点及优化优先级"]
-    STABLE -->|是| LOSS["相对初始冻结基线验证阶段 loss<br/>同时核对性能、显存和任务特有质量指标"]
-    LOSS --> OK{"质量与性能目标通过？"}
+    STABLE -->|是| FROZEN["两组各自从已冻结的同一初始状态开始<br/>模型 / 优化器 / RNG / 数据游标<br/>核对配方、样本、容差与候选身份"]
+    FROZEN --> LOSS["稳定阶段 A/B loss / 性能 / 显存<br/>保留完整对照及原始 evidence<br/>以 quality_inputs 注册可重算输入"]
+    LOSS --> RECHECK["登记报告与晋级时重新计算质量对照<br/>核对当前 context、候选和已注册原件<br/>历史 pass / 连续窗口接跑不能直接晋级"]
+    RECHECK --> OK{"质量与性能目标通过？"}
     OK -->|否| BACK["定位 / 回退 / 修正<br/>必要时给专家证据包"]
     BACK --> H
     OK -->|是| REVIEW["独立复核当前候选与证据<br/>通过后进入扩容准备或交付"]
@@ -177,7 +203,9 @@ flowchart TD
 - **覆盖率分母：**每 rank 的整个训练窗口墙钟；若 GPU busy 只有 60%，剩余空泡/等待不能从分母删掉以制造 90% 覆盖。不同 rank 的时长也不相加作全局时间。
 - **效率模型：**时间下界为 `max(FLOPs/匹配算力, bytes/匹配带宽, latency_floor)`；下界除以实测耗时是带假设的效率指标，不是硬件利用率。超过 1 要复核模型和测量。Attention 等复杂算子须用实际算法、IO 和重算路径建模。
 - **优化节奏：**先按主要占比和真实算子排序，再裁决实施；融合对齐后仍须复评和迭代。高占比上限未知项先补分析，不因容易实现而随意选小项；停止优化给证据，缺口不冒充近峰。独立方向可并行，稳定阶段验 loss。
-- **工具与归属：**XProf/XCompute 与 hipprof 按实际环境分别使用；必要时查底层库对应分支，不能用不匹配的软件栈解释现场行为。hipBLASLt/groupGEMM 当前不承诺自动 tune，记录可复现 size 和需求。
+- **双线并行：**本项调用冻结后，同条件独立实测与上限建模可并行；不同算子按各自依赖分别进入实现。图中两条线汇合表示互相校正，不要求所有热点先完成单测。共享设备、NIC 和存储的实际测量仍须串行或确认隔离。
+- **工具与归属：**XProf/XCompute 与 hipprof 按实际环境分别使用；必要时查底层库对应分支，不能用不匹配的软件栈解释现场行为。数学库确有性能缺口时提交原生日志中的完整 bench 命令，框架 shape 表只是附件；hipBLASLt/groupGEMM 当前不承诺自动 tune。
+- **数值晋级：**稳定阶段按[阶段 A/B](training-state-validation.md#优化里程碑的阶段-ab-loss)建立同初态、同配方对照，登记[可重算的质量输入](contracts.md#qualitycontract-与记录)。程序核验身份和原件完整性；原件与实际运行是否一致仍由负责 Agent 和独立 reviewer 复核。局部收益或旧报告的 pass 不替代阶段质量。
 
 详细约束见 [性能分析](profiling.md)、[优化 Skill](../skills/hcu-train-optimize/SKILL.md) 与 [三个阶段工作流](workflows.md)。
 
@@ -209,12 +237,17 @@ flowchart TD
 ```mermaid
 flowchart TD
     IN["实际 groups / 消息 / 拓扑 / stream / buffer"] --> BASE["同条件测纯通信、纯计算、训练并发窗口<br/>校时，定位最慢 rank 与关键依赖"]
-    BASE --> WHY{"暴露时间来自哪里？"}
+    BASE --> MATCH{"纯通信符合适用参考？"}
+    MATCH -->|否或存在可信未解释差距| ENV["环境 / 库 / 网卡 / 协议与口径排查<br/>有界对照、回归和回退，保持缺口<br/>解决不了则带证据请专家介入"]
+    ENV -->|获得新证据或修复后| BASE
+    MATCH -->|是| WHY{"固有通信为何仍大量暴露？"}
+    WHY -->|慢 rank / 专家负载不均| BALANCE["核对各 rank 计算、路由和通信量<br/>调整布局 / 负载均衡或借鉴引擎实现"]
     WHY -->|触发或等待不当| SCHED["bucket / chunk / prefetch / 早发晚等<br/>DP、FSDP、TP、PP、CP、EP 对应调度"]
     WHY -->|资源竞争| RESOURCE["计算退化、SM / HBM / NIC / 队列<br/>GPU_MAX_HW_QUEUES 按当前 runtime 对照"]
-    WHY -->|计算通信边界可优化| REUSE["先查 HCU Flux / TE / MORI / rocSHMEM<br/>AG-GEMM、GEMM-RS、dispatch-combine"]
+    WHY -->|计算通信边界可优化| REUSE["先查 HCU Flux / TE / MORI / rocSHMEM<br/>DeepEP / UCCL / UltraEP / MoonEP 等当前能力<br/>AG-GEMM、GEMM-RS、dispatch-combine"]
     REUSE --> PROTOCOL["定义 chunk ready / 可见性 / progress<br/>buffer 复用、尾块、反向与梯度同步"]
     SCHED --> TEST["多 rank 局部正确性与并发压力<br/>消息 / shape / 空块 / 累积 / 保存恢复"]
+    BALANCE --> TEST
     RESOURCE --> TEST
     PROTOCOL --> TEST
     TEST --> E2E["整步对照：暴露时间、吞吐、计算退化<br/>显存峰值与最差 rank / 尾延迟"]
@@ -230,7 +263,8 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    START["task-create + flow-start<br/>保存目标、上下文、验收与预算"] --> NEXT["flow-next<br/>读取当前事实、工作状态和已采集指导"]
+    START["新任务：task-create + flow-start<br/>保存目标、上下文、验收与预算"] --> NEXT["flow-next<br/>读取当前事实、工作状态和已采集指导"]
+    RESUME["已有任务：恢复当前 Store / Task / context<br/>核对现场作业、Agent、看板和在途操作"] --> NEXT
     NEXT --> ACT{"返回的 action"}
     ACT -->|work / repair| WORK["阶段 Skill 实施与测量<br/>本地修改、远端验证、保存证据"]
     ACT -->|coordinate| TEAM["派发 / 消息 / 结果验收<br/>图 5"]
@@ -242,13 +276,13 @@ flowchart TD
     VER -->|revise| WORK
     VER -->|blocked 或 reviewer 失败| ISSUE["记录原因和缺口<br/>修复、重试或按预算请专家介入"]
     ISSUE --> NEXT
-    VER -->|accept| GATE["程序核对当前复核与报告门槛<br/>必做任务、阻塞消息、指导、上下文与快照"]
+    VER -->|accept| GATE["程序核对当前复核与报告门槛<br/>必做任务、阻塞消息、指导、上下文与快照<br/>阶段质量重新计算 quality_inputs"]
     ACT -->|advance| GATE
     GATE -->|条件不齐 / 已过期| NEXT
-    GATE -->|通过| ADV["flow-advance<br/>下一阶段 / optimizing 内 iterate / 完成"]
+    GATE -->|通过| ADV["flow-advance<br/>下一阶段 / 当前阶段内 iterate / 完成"]
     ADV -->|继续| NEXT
     ADV -->|完成| DONE["完成与交付记录"]
-    ACT -->|reconcile| REC["核查原操作、远端进程与产物<br/>明确结局后才允许后续执行"]
+    ACT -->|reconcile| REC["核查原操作、远端进程与产物<br/>包括取消 / 完成任务尚未核销的执行<br/>明确结局后才允许后续执行"]
     REC --> NEXT
     ACT -->|human| HUMAN["回应指导 / 补关键条件 / 专家介入<br/>需要调整目标时显式 replan"]
     HUMAN --> NEXT
@@ -257,7 +291,7 @@ flowchart TD
     NEXT -.-> BD["BOARD.md<br/>进展、证据、待决问题、Agent 状态与回复"]
 ```
 
-`accept` 不是 GPU 测试通过的替代物。`target: iterate` 保持在 optimizing，仍须具备局部正确性、真实 dispatch 和至少三组 profiler-off 配对测量；进入扩容准备仍须阶段质量与性能报告。
+`accept` 不是 GPU 测试通过的替代物。`target: iterate` 保持当前优化任务的阶段状态，仍须具备局部正确性、真实 dispatch 和至少三组 profiler-off 配对测量；完整任务进入扩容准备仍须阶段质量与性能报告，独立优化任务按其完成契约验收。
 
 环境、模型、数据或验证契约变化时重置比较上下文，旧报告保留但不可直接过当前门槛；改回旧配置也不能让旧验收自动复活。新的人的指导、依赖阻塞或候选修改会使未推进的旧复核失效。详见 [协作契约](collaboration.md)。
 
@@ -313,8 +347,10 @@ flowchart LR
     RUN -->|明确结束| LOG
     LOG --> EV
     RUN -->|结局不明| UNKNOWN
-    UNKNOWN --> REC["reconcile 原操作<br/>查询作业 / 进程 / 输出，保留核查证据"]
-    REC -->|结局确定后恢复调度| LEASE
+    UNKNOWN --> REC["reconcile 原操作与全部必需成员<br/>查询作业 / 进程 / 输出，保留核查证据"]
+    REC --> CLEAR{"结局与运行身份已核清？"}
+    CLEAR -->|否：保留阻塞与原租约| UNKNOWN
+    CLEAR -->|是：核销后恢复调度| LEASE
     EV --> JUDGE["Agent 解释证据并决定下一轮"]
 ```
 
@@ -324,41 +360,47 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Q["优化阶段质量 / 性能通过"] --> FULL["恢复完整模型，在可行模型并行规模验证<br/>复核数值、显存和保存恢复"]
-    PROXY["资源不足时仅缩 layer 跑通或提前筛机<br/>保留代理范围，不替代完整模型证据"] -.-> FULL
+    Q["优化阶段质量 / 性能通过"] --> SCOPE{"本轮验证目标"}
+    SCOPE -->|完整模型目标| FULL["选定完整配置；此前是代理时先恢复<br/>验收模型并行布局、数值、显存与保存恢复<br/>变化时重置 context 并重验受影响证据"]
+    SCOPE -->|用户明确授权代理验证| PROXY["沿选定代理配置扩 DP<br/>保留完整模型未覆盖项<br/>缩 layer 也不代表完整模型验收"]
     FULL --> POOL["Cluster Manager 为主筛机<br/>适用时结合 Primus Safe<br/>动态维护健康节点池"]
+    PROXY --> POOL
     POOL --> DP["逐级扩 DP 域<br/>明确强 / 弱扩展与有效全局 batch 策略"]
     DP --> SCALE["每级扩容验收<br/>吞吐效率 / 通信尾部 / 显存 / checkpoint<br/>当前环境 + 阶段质量 + scale 证据"]
     SCALE --> SG{"当前级验收通过？"}
     SG -->|否| FIXS["按问题返回环境 / 适配 / 优化<br/>修复后重新验收当前上下文"]
-    FIXS --> FULL
+    FIXS --> SCOPE
     SG -->|是| MORE{"还需继续扩 DP？"}
     MORE -->|是| POOL
     MORE -->|否| START["按部署授权启动长训<br/>明确唯一 recovery_owner、阈值和监测范围"]
     START --> JOB["训练与 checkpoint 持续运行"]
     JOB --> LOG["现场归一化器<br/>全局进展 JSONL：attempt / step / 时间<br/>loss / grad / 显存 / 恢复状态等"]
     LOG --> WATCH["远端 watcher 持久采集<br/>游标、真实推进时钟、incident 与 outbox"]
+    JOB --> MEMBERS["观测全部必需 launcher 成员<br/>进度日志源 / 身份 / 新鲜度 / 退出回执<br/>不把一个 rank 的进展当作全组健康"]
     WATCH --> HEALTH{"进展和指标符合预期？"}
+    MEMBERS --> HEALTH
     HEALTH -->|是| CURVE["持续记录与分 attempt 曲线<br/>step / loss / grad / 显存 / 事件<br/>吞吐与 checkpoint 结合原始证据"]
     CURVE --> END{"达到约定的完成 / 交接条件？"}
     END -->|否| JOB
     END -->|是| COMPLETE["完成报告、独立复核和运行交接"]
-    HEALTH -->|异常| OUT[("持久异常事件<br/>停滞 / 失联 / 恢复超时 / 非有限值 / 性能下降")]
-    OUT --> ALERT["站点通知接口<br/>优先既有容错的飞书告警通道"]
+    HEALTH -->|异常| OUT[("各观察源的持久异常事件<br/>停滞 / 失联 / 恢复超时 / 非有限值 / 性能下降<br/>独立 Store 与 peer，按实际接口汇接")]
+    OUT -->|已配置通知消费者| ALERT["站点通知接口<br/>优先既有容错的飞书告警通道<br/>实际发送与送达另行验收"]
     JOB -->|故障由既有规则处理| FT["现场既有容错负责人<br/>按授权隔离 / 重启 / 恢复"]
     OUT --> LOCAL{"本地 Agent 是否可接续？"}
     LOCAL -->|在线且桥接已配置| IN["本地 inbox / Agent bridge<br/>派发并确认接手"]
     LOCAL -->|离线或未配置| KEEP["远端继续监测、通知和既有容错<br/>事件保留，等待本机恢复"]
     KEEP -->|本机恢复| REPLAY["按 seq 导出 / 导入、去重与缺号检查<br/>核对当前 job / attempt / checkpoint / 节点池"]
-    REPLAY --> IN
+    REPLAY --> RECON["先核销 unknown / 部分启动的原操作<br/>迟到事件先核对当前现场<br/>不因旧告警或断线重复启动"]
+    RECON -->|结局已确定| IN
     IN --> AGENT["故障诊断<br/>卡住、core dump、内存 / 显存增长、通信等<br/>日志 / 栈 / 源码 / 最小复现"]
     AGENT --> FIX["准备修复与验证<br/>新代码、参数和重启动作遵守部署授权"]
     FIX --> FT
-    FT --> REC{"checkpoint 可恢复且 step 真实推进？"}
+    FT --> REC{"全组重新拉起、checkpoint 状态正确<br/>且 step 连续真实推进？"}
     REC -->|是| JOB
     REC -->|否 / 恢复超时| OUT
-    SUP["站点 supervisor 托管 watcher<br/>独立 observer 检查其心跳"] -.-> WATCH
-    SUP -->|watcher 失活| ALERT
+    SUP["部署的 supervisor 托管采集与观察进程"] -.-> WATCH
+    OBS["不同故障域的独立 observer / sentinel<br/>核对 watcher 身份、心跳和结束证据<br/>自己也需外部监管"] -.-> WATCH
+    OBS -->|失活 / 源不可读：保持未知原因| OUT
 ```
 
 本机休眠时远端不临时启动 LLM Agent；继续工作的是 watcher、站点告警和既有容错。通知送达、bridge 返回成功、Agent 接手、故障解决是四种不同状态，不能互相代替。
@@ -371,20 +413,22 @@ TrainFlow 提供 watcher、事件重放、inbox、bridge 接口和报告能力�
 
 ```mermaid
 flowchart TD
-    PROB["任意阶段的问题<br/>环境 / 适配 / 性能 / 精度 / 故障"] --> EXP["先查私有环境与模型经验<br/>核对实际版本、shape、数据和适用条件"]
-    EXP --> LOCAL["官方 Wiki 检索与原文阅读<br/>专题、案例、官方文档、PR、全仓目录"]
+    PROB["任意阶段的问题<br/>环境 / 适配 / 性能 / 精度 / 故障"] --> EXP["查本任务的 experience / 原始档案<br/>核对实际版本、shape、数据和适用条件"]
+    EXP --> LOCAL["TrainFlow 自带 Wiki 统一检索与原文阅读<br/>官方引擎 / 依赖、通用环境经验、最终模型总结<br/>专题、案例、教程、PR、全仓目录"]
     LOCAL --> ANSWER{"已有证据足以回答当前问题？"}
     ANSWER -->|是| USE["应用到当前假设<br/>实施前核对现场条件，之后实际验证"]
     ANSWER -->|否| PR["按问题在线搜已收录 / 未收录 PR<br/>描述、普通评论、行内评论、顶层 review"]
     PR --> CODE["追到固定 head / base 源码<br/>完整函数、调用者、对应底层依赖和测试"]
     CODE --> USE
+    CODE -.-> CACHE[("任务 workspace 的 reference / 查询缓存<br/>原始来源与固定提交，按需复用")]
+    CACHE -.-> EXP
     PROB -.-> HCU["必装 HCU-Knowledge，三个阶段按问题检索<br/>硬件、工具、patch、配方、优化与故障案例<br/>飞书在线访问另行授权"]
     HCU -.-> USE
     USE --> RESULT["实际里程碑结果<br/>基线、候选、阶段 loss、扩容、异常与恢复"]
-    RESULT --> PRIVATE[("私有经验 Wiki<br/>自动保留报告 / 阶段事件<br/>Agent 补充解释、指标口径、失败条件和回退")]
+    RESULT --> PRIVATE[("私有任务 experience / 档案<br/>自动保留报告 / 阶段事件<br/>Agent 补充解释、指标口径、失败条件和回退")]
     PRIVATE --> EXP
     PRIVATE --> CURATE{"跨项目通用环境经验<br/>或最终模型优化总结？"}
-    CURATE -->|是，复核必要证据| SHARED["共享 Wiki<br/>环境适用条件 / 最终性能与 loss"]
+    CURATE -->|是，复核必要证据| SHARED["共享 Wiki 的精选经验<br/>sites：通用环境与适用条件<br/>experiments：最终优化里程碑、性能与 loss"]
     CURATE -->|否| PRIVATE
     SHARED --> LOCAL
     PRIVATE --> DELIVERY["所属阶段负责交付<br/>对应工程 PR / Cookbook 最佳实践"]
@@ -420,6 +464,8 @@ flowchart TD
 | `completed` | `completion` | 达到约定范围的完成条件 |
 
 独立任务另按模式的交付契约判断，不能照搬全流程门槛。图中“先并行切分和显存预算”属于 Skill 的分析顺序，不是新增状态；图中“原生 Agent 派发”和“现场告警”也不意味着 CLI 自带模型服务或飞书机器人。
+
+`stage-quality` 的通过报告须引用已注册的 `quality_inputs`，程序在登记和晋级时重新计算同初态、同配方、当前候选的对照。旧报告仅有 pass、旧质量契约缺少初态/配方指纹，或原件属于其他 context/候选，都不能放行新阶段。详见 [质量契约](contracts.md#qualitycontract-与记录)。
 
 | 图中机制 | 实现 / 规则入口 |
 | --- | --- |

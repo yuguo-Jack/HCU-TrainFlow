@@ -181,3 +181,15 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - baseline初版→HIP优化、现有Triton→Triton优化的交接与负责人验收已写通用Skill；本机三项变更Skill已同步。
 - 真实CM恢复密封日志经现有解析/绘图得到3张图、9步记录，历史离线视图不进入实时监控。
 - 站点硬件知识及精选6原件随公共工程；全新Store可搜读；独立review唯一来源过度断言已修正。72项相关测试和490页/25来源校验通过，无release。
+
+## 2026-10-10：0.5.0 工程介绍与流程图
+
+本轮按用户要求将新模型/环境的完整说明整理为工程文档，更新图示并准备发布 `0.5.0`，不使用 dev 后缀。
+
+- [x] 新增 `docs/project-overview.md`，覆盖任务接手、环境、准确适配、容量、优化与算子迭代、质量、多 Agent、扩 DP、持续容错、交互、知识与交付。
+- [x] README 增加明显阅读入口，更新白底科技风总览图；12 张可编辑 Mermaid 补齐分支、并行分析、算子 Skill 交接和质量门槛。
+- [x] 独立文档复核并修正代理扩 DP、守护部署前提、完整 collective 采集口径；保留真实验证范围。
+- [x] 源码、包元数据、CLI、能力说明与 changelog 统一为 0.5.0；本机 editable 安装同步。
+- [x] 完成本地套件、Wiki、链接、实际 Mermaid 渲染及真实源码包检查。
+
+发布目标：本轮变更提交至 main，推送 origin，并创建 annotated `v0.5.0` tag；最终发布回执以 Git 远端 ref 核对为准。本轮不创建 GitHub Release，不执行远端训练或更新大知识库。

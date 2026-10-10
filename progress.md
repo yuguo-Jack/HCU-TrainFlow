@@ -210,3 +210,12 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - Added the common takeover/phase/evidence-reuse playbook and connected it to coordinator and docs. Clarified standalone environment/diagnose/optimize scope, stage A/B initial-state and recipe contracts, installation binding discovery, and existing physical qualification limits. Focused numerical/flow/proxy regressions: 90 passed before the additional identity checks; full validation follows integration.
 
 - Read current project instructions, coordinator Skill, skill-creator and file-planning instructions; session catchup reported no additional context. Inventoried source, docs, tests and six Skills. Started independent workflow and runtime audits without remote execution.
+
+## 2026-10-10：0.5.0 文档与版本发布准备
+
+- 完成工程介绍、README 入口、白底科技风主页图以及 12 张 Mermaid 的衔接更新；独立复核发现的范围和部署表述已修正。
+- 系统 Python 全量回归：1054 passed、4 platform-specific skips（71.54s）。Wiki：490 pages / 25 sources / zero errors。
+- Playwright + Mermaid 11.12.0 实际渲染 12 图，零解析错误，并检查优化及验收图截图；文档检查覆盖 33 份 Markdown、199 个本地链接，零失效文件链接。
+- 实际构建 0.5.0 sdist，确认新增介绍、流程图、PNG、提示文件逐字节保留；68/68 声明原件哈希一致，私有 workspace 和第三方 checkout 未入包。检查脚本兼容 Windows PKG-INFO 的 CRLF。
+- 源码版本、CLI 与本机 editable-package metadata 均为 0.5.0。远端 origin/main 没有新增提交，v0.5.0 tag 尚不存在；待本轮提交后推送并核对 main/tag refs。不创建 GitHub Release。
+- 没有运行新的硬件实验、更新 HCU-Knowledge 或修改其他任务的运行现场。

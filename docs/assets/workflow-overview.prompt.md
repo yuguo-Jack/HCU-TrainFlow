@@ -1,106 +1,110 @@
 # Workflow overview image source
 
-Generated with built-in imagegen. The content authority is [the editable workflow map](../workflow-map.md). The previous white overview is the style/composition reference. Workflow requirements do not imply completed HCU hardware validation.
+Version: **0.5.0**. Generated with the built-in imagegen tool using the previous white technology-style overview as the visual reference. The [project introduction](../project-overview.md) explains the method; the [editable workflow map](../workflow-map.md) gives the precise branches and acceptance rules. The illustration does not expand the [hardware validation scope](../capabilities.md).
 
 ## Reproduction prompt
 
 ```text
-Redesign the attached HCU-TrainFlow README workflow infographic. Use the attached image ONLY as the established visual style and general three-column composition; replace its content with the EXACT updated wording below. White background, elegant technological flat-vector appearance, pale blue/teal/lavender panels, dark navy sharp Chinese typography, thin blue outlines, orange validation feedback. High legibility, crisp Chinese text. Landscape 3:2, highest available resolution. No dark background, no neon or 3D. Do not retain old obsolete text “最小 DP 域”. Balance density with generous margins. Make center optimization panel wider than side panels. No logos from other projects.
+Redesign the supplied HCU-TrainFlow README workflow infographic for version 0.5.0. Use the old image as a STYLE reference: white background, refined flat technical infographic, pale blue/teal/lavender panels, dark navy Chinese typography, thin connectors, small orange feedback arrows. Maintain its attractive three-column composition but REPLACE ALL CONTENT with the wording below. It is a precise technical workflow, not promotional artwork. Wide landscape 3:2, highest available resolution; readable Chinese, no 3D, no dark background, no fake dashboards. Make the center column slightly wider. Preserve generous margins, hierarchy and straight unambiguous arrow routing. No additional text or claims.
 
-TITLE: “HCU-TrainFlow”
-SUBTITLE: “面向 HCU 训练的全流程智能体协同工作流”
-Scope small text: “预训练 · SFT · RL · 视频生成 · VLA · 世界模型”
+TITLE: HCU-TrainFlow
+SUBTITLE: 面向 HCU 大模型训练的全流程智能体协同工作流
+small scope: 预训练 · SFT · RL · Torch 原生训练
 
-TOP full-width coordinator band:
-“本地主控 Agent”
-“任务拆解 · 并行派发 · 消息交互 · 证据验收”
-Three independent small boxes “任务 A” “任务 B” “更多任务” connected from a shared horizontal bus, NOT sequential.
-Right note “独立优化并行 · 共享测量协调”
+Top full-width orchestration band:
+本地主控 Agent
+任务拆解 · 并行协作 · 证据验收 · 独立复核
+Three parallel boxes connected by branching lines, never serial: 任务 A / 任务 B / 更多任务
+small: 按实际热点分工 · 隔离资源测量
 
-MAIN PANEL 01 pale blue: “环境验收与模型适配”
-4 cards, stacked:
-“环境与全节点验收”
-“Cluster Manager / run nhc / DTK”
-“GEMM · HBM · 互联 · 通信”
+THREE STAGE PANELS:
 
-“优先复用 HCU 配方”
-“当前分支 · 环境变量 · 用户 patch”
+LEFT 01 pale blue title 环境验收与模型适配
+four stacked cards:
+环境与硬件基线
+健康 · GEMM / HBM · 互联 / 通信
+资源占用 · 实际版本 · 可达性能
 
-“跑通与初始数值基线”
-“输出 · 梯度 · optimizer · checkpoint”
+核对 HCU 启动配方
+环境脚本 · 活跃分支 · 用户 patch
+模型结构 · 数据 · 优化器语义
 
-“核对实际训练语义”
-“数据 / shape / mask / loss”
-“SFT · RL · Torch 原生训练”
-Bottom small orange note:
-“资源不足可仅缩 layer 跑通或筛机”
-“代理结果不代替完整模型验证”
+完整模型容量评估
+并行布局 · 显存余量 · 短跑校准
+放不下才缩层，其他变更按授权
 
-Panel 01 arrow right into Panel02 (normal sequential progression).
+跑通与初始数值基线
+前向 / 反向 · 更新 · checkpoint
+冻结源码、配置和比较条件
+bottom note: 代理结果保留适用范围
 
-MAIN PANEL02 wider pale teal: “性能分析与优化”
-5 compact cards stacked, each readable:
-“并行切分 × 显存预算”
-“布局 · 微批 · 累积 · 重算 · 余量”
+CENTER 02 pale teal title 性能分析与优化
+five stacked cards:
+并行切分与显存权衡
+TP / PP / DP / CP / EP · 微批 / 重算
 
-“端到端 profile + TraceLens”
-“每个实际非单例组至少 2 个代表 rank”
-“空泡 · 慢 rank · 显存 · 调度”
+端到端 profile + TraceLens
+实际并行组 · 代表 rank · 稳态窗口
+空泡 / 通信 / 计算：按主要占比推进
 
-“Torch 原生训练专项”
-“输入流水 · compile · 断图 / 重编译”
-“前向 / 反向 · DDP / FSDP”
+系统与通信优化
+输入流水 · compile · 调度
+overlap · 通算融合 · 资源竞争
 
-“通信 overlap 与通算融合”
-“暴露时间 · bucket / chunk · 预取”
-“依赖同步 · 资源竞争 · 整步净收益”
+重点算子：两条并行分析线
+同 shape 独立实测 ↔ 上限建模
+≥90% 端到端热点中的非通信算子
 
-“热点建模与实现优化”
-“≥90% 端到端热点中的非通信算子”
-“上限 / 效率 · HCU TE / Flash-Train”
-“优先复用 · HIP / Triton Skills”
-Under cards small line: “按收益与风险排序 · 每轮局部回归”
-At panel bottom an orange outlined validation diamond:
-“稳定阶段：loss 与性能通过？”
-small note under: “对照初始基线；不逐轮长时验 loss”
-Diamond failure arrow labeled “未通过” loops back UP along left gutter within center panel to optimization.
-Diamond pass arrow labeled “通过” must be a CONTINUOUS solid BLUE line leading along gutter between panels02/03 up to the FIRST card of panel03. Do not let it float/disconnect or point straight into long-training. Do not draw over text.
+复用与迭代实现
+HCU TE / Flash-Train / Primus Turbo
+Baseline → HIP · Triton 优化
+按收益排序 · 局部回归 · 停止有依据
 
-MAIN PANEL03 pale lavender: “扩 DP 域与长训守护”
-4 cards stacked:
-“恢复完整模型，再扩 DP”
-“可行布局验证 → 逐级扩 DP”
-“健康池 · 显存 / 通信 / 扩展效率”
+Bottom orange validation gate:
+阶段验收：同初态 A/B
+loss · 性能 · 显存 · 原始证据
+A failure loop labelled 修正 back to center implementation card. A pass connector labelled 通过 must lead to top first card of RIGHT panel, not straight to long-training.
 
-“持续监测与曲线”
-“step · loss · 吞吐 · 显存”
-“checkpoint · watcher 心跳”
+RIGHT 03 pale lavender title 扩 DP 域与持续容错
+four stacked cards:
+验收目标配置，再扩 DP
+必要时恢复完整模型
+健康池 · 扩展效率 · 显存 / 通信
 
-“故障诊断与既有容错”
-“唯一恢复负责人 · 按部署授权”
+接入既有容错
+唯一恢复负责人 · 按部署授权
+故障识别 → 清理 → 恢复 → 推进
 
-“本机离线，远端守护继续”
-“本机恢复 → 事件重放 → Agent 接续”
-Bottom strip:
-“达到约定条件后完成 / 交接”
+持续观测与曲线
+step · loss · 吞吐 · 显存
+checkpoint · 全部成员 · 观察器
 
-Below3panels full-width slim review loop:
-“全程证据与独立复核”
-“实施 → 测量 → 独立复核 → 修正 / 推进”
-“BOARD / GUIDANCE：每 5 分钟采集指导”
+已部署的远端守护持续运行
+事件持久化 · 重放与去重
+本机恢复后接续，唤醒需部署
+bottom: 达到约定条件后完成或交接
 
-BOTTOM two support boxes:
-Left title “本地协同 · 远端执行”
-“独立 checkout → 固定快照 → 远端编译与测量”
-“SSH / Docker / Conda / Slurm / K8s”
-“超时或断线：先核查原作业”
-Right title “HCU-Knowledge 贯穿三个阶段”
-“完整安装必需 · 支持复用已有知识库”
-“联查官方 Wiki / PR / 源码 · 私有经验沉淀”
-“局部 Wiki 按需更新；大知识库单独维护”
+Arrows: left to center. Center gate passed to right FIRST card. Subtle orange arrow from RIGHT down and back into CENTER labelled 新瓶颈返回优化. No arrow text overlay.
+
+Full-width review band below:
+实施 → 测量 → 独立复核 → 修正 / 推进
+BOARD / GUIDANCE / QUESTIONS · 每 5 分钟采集指导
+
+Two bottom support boxes:
+本地协同 · 远端执行
+固定源码快照 → 编译 / 训练 / 采集
+SSH / Docker / Conda / Slurm / K8s
+超时或断线：先核查原作业
+
+HCU-Knowledge 贯穿三个阶段
+联查官方 Wiki / PR / 对应分支源码
+共享 Wiki：官方资料 · 通用经验 · 最终里程碑
+局部 Wiki 按需更新，大知识库独立维护
 
 FOOTNOTE:
-“工作流机制示意 · 真实 HCU 环境与站点接续仍需逐项验证”
-
-Do not add any new claims or mandatory special agent roster. All labels must be grammatically precise Chinese. Avoid extra decorative text. Retain the clean attractive white technology style, large stage numbers 01/02/03, sparse outlined icons, strictly aligned cards.
+0.5.0 · 流程方法与实际验收范围分别记录 · 详见工程介绍与工作流全景
 ```
+
+## Final targeted edit
+
+Keep the generated layout and all other wording unchanged. In the fourth card of the right column, use the heading `已部署的远端守护持续运行`, retaining the event-replay and wake-up deployment notes. Make `新瓶颈返回优化` a one-way orange feedback arrow toward the center optimization loop; remove the arrowhead pointing into the right column. Preserve the blue acceptance path into the first scaling card.

@@ -6,7 +6,9 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。每轮以实际证据推进，经过独立复核和修正；人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前源码版本：`0.4.0.dev1`，开发里程碑，未发布正式版。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)。
+**当前版本：`0.5.0`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)。
+
+**首次了解工程，建议阅读 [HCU-TrainFlow 工程介绍](docs/project-overview.md)**：从接到一个新模型和环境开始，讲清三个阶段如何推进、如何选择优化对象、怎样保护训练质量，以及多 Agent、知识检索和持续守护如何配合。
 
 ## 如何开始
 
@@ -22,13 +24,13 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 [![HCU-TrainFlow 工作流总览：环境适配、性能优化与阶段验收、扩容长训；多 Agent、独立复核、远端执行和知识沉淀贯穿全程](docs/assets/workflow-overview.png)](docs/assets/workflow-overview.png)
 
-[流程图与验收规则](docs/workflow-map.md)
+[工程介绍](docs/project-overview.md) · [详细流程图与验收规则](docs/workflow-map.md)
 
 优化先权衡并行切分、显存峰值与余量、通信和实际吞吐，再用端到端 profile 推进系统调参与算子优化。保持初始数值基线；逐轮做局部正确性和性能回归，稳定阶段再验 loss。对累计 ≥90% 端到端热点中的非通信算子评估上限与效率。抽离模型中关键算子同shape单测判断算子在模型中是否被通信、访存竞争或调度等因素显著拖慢。优先复用当前 HCU 工程配方和 TE、Flash-Train、Primus Turbo 等已有实现，按瓶颈联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等通信能力，按需使用三个 Hygon 算子 Skill。
 
 按主要占比选择优化对象：空泡、通信或计算谁占主导，先处理谁。计算算子按实际占比逐项分析和迭代；初步融合后仍有显著空间就继续优化，必要时转 HIP，停止时给出依据。详见[热点排序与算子迭代](skills/hcu-train-optimize/references/operator-ceiling-iteration.md)。
 
-同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。适配前参考 HCU Train Sim、模型结构和实际可用卡数做容量预估，短跑校准后能放下就直接全参适配优化；资源不足才缩 layer 跑通或筛机；用户明确允许缩维时记录授权范围与模型差异。扩规模前先验收选定的完整配置，再逐级扩 DP 域并复核性能、显存和训练语义；缩维代理的结果不能声称为原完整模型验证。
+同一优化阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)：覆盖数据与 host 开销、compile/断图/重编译、前后向、DDP/FSDP，以及通信暴露、overlap、通算融合和资源竞争。环境适配、扩 DP 与容错共用既有流程。适配前参考 HCU Train Sim、模型结构和实际可用卡数做容量预估，短跑校准后能放下就直接全参适配优化；资源不足才缩 layer 跑通或筛机；用户明确允许缩维时记录授权范围与模型差异。完整模型目标在扩规模前恢复并验收完整配置，再逐级扩 DP 域；已获授权的代理任务可以扩选定代理配置的 DP，复核性能、显存和训练语义，同时保留原完整模型的验证缺口。
 
 完整阶段、优化回路、多 Agent、远端执行、长训守护和知识更新见 [工作流全景](docs/workflow-map.md)，其中列明阶段证据门槛及对应源码。
 
@@ -42,7 +44,7 @@ collaboration/<task>/GUIDANCE.md    人的评论、回答和优先级调整
 collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 ```
 
-在 `GUIDANCE.md` 写意见，默认每 **5 分钟**采集一次；主控在后续实验与推进前检查已采集的指导并记录处理结果。需要立即生效时可让 Agent 刷新，或运行 `flow-board` / `flow-watch --once`。文件轮询本身不运行模型。会话关闭后的自动接续需要部署 Agent bridge；本机离线时远端守护和原有容错继续运行。详见 [协作循环与文件交互](docs/collaboration.md) 和 [长训守护](docs/operations.md)。
+在 `GUIDANCE.md` 写意见，默认每 **5 分钟**采集一次；主控在后续实验与推进前检查已采集的指导并记录处理结果。需要立即生效时可让 Agent 刷新，或运行 `flow-board` / `flow-watch --once`。文件轮询本身不运行模型。会话关闭后的自动接续需要部署 Agent bridge；本机离线时，已部署并验收的远端守护和原有容错继续运行。详见 [协作循环与文件交互](docs/collaboration.md) 和 [长训守护](docs/operations.md)。
 
 解释性问题可写入 `QUESTIONS.md`，主控按同一周期读取并在原问题下回答，保留问题与回答版本。问题不自动改变资源或重启授权；采集器不会代替离线的 Agent 生成答案。
 
@@ -106,7 +108,7 @@ python scripts/validate_knowledge.py
 
 任务源码、完整日志/trace/checkpoint、数据与看板保存在独立 workspace；默认 `.work/` 忽略提交。工程 Wiki 仅包含官方资料、可复用环境经验和模型最终优化总结；工作流方法在 docs/skills，过程记录不进入 Wiki；凭据、私钥和 token 不入仓。
 
-- [工作流全景](docs/workflow-map.md) / [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
+- [工程介绍](docs/project-overview.md) / [工作流全景](docs/workflow-map.md) / [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
 - [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)
 - [性能分析](docs/profiling.md) / [远程执行](docs/remote-execution.md)
 - [真实训练观察](docs/training-observation.md) / [离线训练图表](docs/training-dashboard.md) / [缓存维护与观察换代](docs/workspace-maintenance.md)

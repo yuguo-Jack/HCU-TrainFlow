@@ -163,3 +163,11 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 - Starting tree is clean at 01f7bd2; project declares 0.4.0.dev0, only v0.1.0 is tagged. User now explicitly requests a tag after review, superseding the earlier no-tag instruction; no GitHub release is requested.
 - Existing instructions cover many real-environment lessons, but accumulated guidance and persistent phase state must be checked together for a fresh Agent handoff. In particular, bounded diagnostics under an incomplete environment gate must not silently become a qualified full workflow.
 - Preserve documented limits: the validated setup is SSH + Docker with a reduced model/workflow proxy; physical local shutdown, other execution adapters and full-model convergence remain distinct from CPU tests and bounded recovery drills.
+
+## 2026-10-10：0.5.0 文档一致性复核
+
+- 工程介绍按任务的输入、判断、证据和产出组织；正式流程与实际硬件验收范围分别陈述。
+- 旧总览中无条件“恢复完整模型”和“本机离线后守护继续”容易产生误读：现在区分完整目标与获准代理，以及已部署验收的远端守护。
+- 代表 rank 采样与 TraceLens 完整 collective 报告分开；后者需要全部 0..N-1 rank 文件及实际进程组上下文。
+- 算子同形状独立实测与上限建模可并行，优化按实际占比和剩余空间推进；完整数学库 bench 命令、baseline/HIP/Triton 衔接及阶段质量重算进入详图。
+- 主图由 built-in imagegen 更新并人工检查，复现提示保存于 docs/assets/workflow-overview.prompt.md；精确分支以可编辑 Mermaid 和文档契约为准。

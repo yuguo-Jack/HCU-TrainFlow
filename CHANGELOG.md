@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 — 2026-10-10
+
+- Add a complete project introduction covering task takeover, environment acceptance, faithful model adaptation, capacity planning, bottleneck-driven optimization, numerical validation, DP scaling and sustained recovery/observation.
+- Refresh the README overview and detailed workflow diagrams, including parallel same-shape replay and operator-ceiling work, baseline/HIP/Triton handoffs, native math-library benchmark reproduction, retained-input stage-quality checks and deployment-specific monitoring boundaries.
+- Connect the introduction, editable diagrams and existing implementation guides from the homepage. Align source, package metadata and current documentation on version 0.5.0 without a development suffix.
+- Carry forward the reviewed workflow and evidence contracts from 0.4.0.dev1. This documentation/version update does not add new hardware qualification; full-model convergence, new sites and production notification/Agent wake-up still require their own acceptance evidence.
+
 ## 0.4.0.dev1 — 2026-10-10 development milestone
 
 - Consolidate entry, stage handoffs, bounded diagnostics, evidence reuse and stopping decisions in the agent playbook. Keep environment-only, analysis-only, standalone optimization and diagnosis within the requested scope; preserve the full-task integration order.
