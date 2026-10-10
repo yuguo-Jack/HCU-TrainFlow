@@ -1,5 +1,7 @@
 # 工作目录与阅读入口
 
+发生异常时先按 [失败分流与诊断](diagnosis.md) 定位；资料、工具、源码和现场验证范围分别记录。
+
 筛机和健康复核按 `docs/cluster-health-and-screening.md`：复用现场 `run_nhc`、`clush` 与当前 ClusterManager，核对主动负载、超时、逐节点结果、健康重入规则与精确停止范围。没有失败节点交集不等于没有组级故障；先复核原始结果再更新节点池。
 
 安装本 Skill 不会复制整个 Wiki。设置 `TRAINFLOW_PROJECT` 指向已 clone 的 HCU-TrainFlow；`TRAINFLOW_WORKSPACE` 指向任务私有目录。

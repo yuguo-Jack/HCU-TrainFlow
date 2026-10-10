@@ -19,4 +19,4 @@
 
 说明阻塞、局部修复备选、迁移收益/成本、受影响机制与回归范围。既有授权范围内处理；超出既定范围先给用户具体选择。保留旧最好候选和未解决问题，正式切换更新比较上下文、观察器与任务计划，不让旧证据自动为新实现放行。
 
-执行与交付的具体步骤见 [工作流](../workflows.md) 和 adapt Skill 的 [基线规则](../../skills/hcu-train-adapt/references/workflow.md#适配工作树与最终交付)。
+执行与交付的具体步骤见 [工作流](../workflows.md) 和 adapt Skill 的 [基线规则](../../skills/hcu-train-environment-check-and-adapt/references/workflow.md#适配工作树与最终交付)。

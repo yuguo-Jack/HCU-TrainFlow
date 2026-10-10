@@ -1,5 +1,7 @@
 # 工作目录与阅读入口
 
+发生异常时先按 [失败分流与诊断](troubleshooting.md) 定位；资料、工具、源码和现场验证范围分别记录。
+
 环境检查需同时按 `docs/cluster-health-and-screening.md` 核对现场 `run_nhc`、ClusterShell `clush`、当前 ClusterManager 检查脚本；先单节点确认命令、范围与输出，再有限并发扩展。命令缺失或未返回结果记为未知，不能当节点健康。
 
 安装本 Skill 不会复制整个 Wiki。设置 `TRAINFLOW_PROJECT` 指向已 clone 的 HCU-TrainFlow；`TRAINFLOW_WORKSPACE` 指向任务私有目录。

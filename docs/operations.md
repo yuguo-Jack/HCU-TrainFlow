@@ -1,6 +1,8 @@
 # 长训守护、通知与重新接续
 
-统一主控由 `$hcu-trainflow` 进入，阶段 Skill 为 `$hcu-train-fault-tolerance`。为保持已有 TaskSpec 兼容，独立运行模式仍叫 `operate`；Skill 改名不要求改历史任务。
+统一主控由 `$hcu-trainflow` 进入，阶段 Skill 为 `$hcu-train-scale-and-stability`。为保持已有 TaskSpec 兼容，独立运行模式仍叫 `operate`；Skill 改名不要求改历史任务。
+
+排障步骤见 [故障诊断与恢复验收](../skills/hcu-train-scale-and-stability/references/diagnosis.md)，来源与在线查证见 [证据入口](../skills/hcu-train-scale-and-stability/references/evidence-sources.md)。按实际症状进入，不以重启成功代替根因和长稳验收。
 
 ## 部署结构
 

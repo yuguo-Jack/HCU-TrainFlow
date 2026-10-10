@@ -223,3 +223,12 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 ## 2026-10-10：README 与升级同步验收
 
 完成 README、集成说明、安装器和更新 Skill 的对应修订。安装/重命名/绑定/依赖相关 60 项测试通过；新增覆盖复制失败、校验失败保留原件、成功仅清理本次备份、拒绝目录外清理。Wiki 校验 490 页/25 来源/0错误。更新 Skill 源文件及已安装副本通过 quick_validate；实际同步六个工作流入口后，本次临时备份已清理，再次安装全部 already current，历史备份文件数仍为87，本机无旧名称入口。没有执行知识刷新、远端任务或其他依赖升级。
+
+## 2026-10-10：阶段命名与故障诊断补强
+
+- 两个阶段入口改为 hcu-train-environment-check-and-adapt、hcu-train-scale-and-stability；六 Skill 总体分工、CLI mode/state 和历史任务格式不变。
+- 新增按症状诊断、知识/源码查证、适配失败分流和优化异常交接四份引用指南；主控、更新 Skill、README、介绍/流程图和 maintenance targets 同步。
+- 62 项安装/完整配置/集成相关测试通过；6 个 Skill quick_validate 通过；490 页/25 来源 Wiki 校验无错误；228 个本地 Markdown 引用无断链。
+- 独立前向复核完成：通信超时/主机OOM/旧观察身份、显存增长/动态输入/空报告两组模拟场景均能形成正确的有界下一行动，没有发现误导或断链；不构成真实故障验证。
+- 本机六个 Skill 同步完成，目录绑定与逐文件哈希核对一致；旧 adapt/fault-tolerance 入口已清理，本次临时备份验证后清理，历史备份未动。
+- 提交目标 main，沿用 0.5.0 版本和既有 tag；推送回执在会话中核对，不发布新 tag。

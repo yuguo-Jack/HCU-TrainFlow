@@ -12,7 +12,7 @@
 flowchart TD
     U["模型、环境、数据与目标<br/>预训练 / SFT / RL / Torch 原生训练"] --> C["本地主控 hcu-trainflow<br/>明确范围、预算、验收与现场权限"]
     C --> SCOPE{"本轮工作范围"}
-    SCOPE -->|完整训练任务| A["① 环境验收与模型适配<br/>hcu-train-adapt · 详见图 2"]
+    SCOPE -->|完整训练任务| A["① 环境验收与模型适配<br/>hcu-train-environment-check-and-adapt · 详见图 2"]
     SCOPE -->|独立请求| PART["按对应阶段执行并交付<br/>环境检查 / 适配 / 分析 / 优化 / 诊断 / 运行<br/>保留失败、未测项和适用范围"]
     A --> AG{"环境与初始数值基线通过？"}
     AG -->|缺失或失败| AR["补证据 / 修环境 / 修适配"]
@@ -26,7 +26,7 @@ flowchart TD
     S --> SG{"环境、质量与扩容验收通过？"}
     SG -->|失败| SR["按原因回到环境、适配或优化<br/>修复后重新验收受影响证据"]
     SR --> C
-    SG -->|通过| T["长训：持续监测、既有容错与诊断<br/>hcu-train-fault-tolerance · 详见图 6"]
+    SG -->|通过| T["长训：持续监测、既有容错与诊断<br/>hcu-train-scale-and-stability · 详见图 6"]
     T --> TG{"达到任务约定的完成 / 交接条件？"}
     TG -->|否| T
     TG -->|是| Z["完成复核与交付<br/>代码 / 配方 / 证据 / 经验 / 运行交接"]
@@ -38,7 +38,7 @@ flowchart TD
 ```
 
 - **全流程入口：**`hcu-trainflow` 协调三个阶段 Skill，保留循环状态、证据和人的指导。
-- **独立入口：**`hcu-train-adapt` 可仅检查环境；`hcu-train-optimize` 可仅分析性能；`hcu-train-fault-tolerance` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
+- **独立入口：**`hcu-train-environment-check-and-adapt` 可仅检查环境；`hcu-train-optimize` 可仅分析性能；`hcu-train-scale-and-stability` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
 - **持续运行：**启动训练不等于完成任务；尚在约定监测范围内就继续观测和处理异常。完成或交接须有明确条件、责任人和证据。
 
 ## 2. 环境验收与模型适配
@@ -92,7 +92,7 @@ flowchart TD
 
 启动配方优先级是：**当前 HCU 分支同模型配方 → 同引擎相近模型的 HCU 配方 → 结合官方语义与 HCU 实现构建配方**。每一种都要核对实际生效参数，不能直接照搬 NV 的环境变量或旧 HCU 脚本。缩 layer 可用于适配/分析和筛机代理，不证明完整模型的显存、收敛和扩容能力。图中任务分支可组合，例如 Torch 原生 SFT；按实际语义核查，不是互斥类别。
 
-工具发现和预期查证由 Agent 按现场完成；当前工程没有为所有 HCU 型号内置一套恒定验收命令和阈值。仅环境检查也可交付明确的失败或不充分报告，这不等于通过训练准入。详见 [适配 Skill](../skills/hcu-train-adapt/SKILL.md)。
+工具发现和预期查证由 Agent 按现场完成；当前工程没有为所有 HCU 型号内置一套恒定验收命令和阈值。仅环境检查也可交付明确的失败或不充分报告，这不等于通过训练准入。详见 [适配 Skill](../skills/hcu-train-environment-check-and-adapt/SKILL.md)。
 
 ## 3. 性能分析、优化与验证
 
@@ -392,11 +392,13 @@ flowchart TD
     KEEP -->|本机恢复| REPLAY["按 seq 导出 / 导入、去重与缺号检查<br/>核对当前 job / attempt / checkpoint / 节点池"]
     REPLAY --> RECON["先核销 unknown / 部分启动的原操作<br/>迟到事件先核对当前现场<br/>不因旧告警或断线重复启动"]
     RECON -->|结局已确定| IN
-    IN --> AGENT["故障诊断<br/>卡住、core dump、内存 / 显存增长、通信等<br/>日志 / 栈 / 源码 / 最小复现"]
-    AGENT --> FIX["准备修复与验证<br/>新代码、参数和重启动作遵守部署授权"]
+    IN --> AGENT["故障分流：固定 attempt 与首次异常<br/>卡住 / 崩溃 / 内存 / 数值 / 性能 / 恢复<br/>日志、栈、全部成员与假设"]
+    AGENT --> EVID["HCU 知识库 → 在线 PR / 官方经验<br/>实际加载版本源码 → 有界复现"]
+    EVID -->|新证据与反证| AGENT
+    EVID --> FIX["准备修复与验证<br/>新代码、参数和重启动作遵守部署授权"]
     FIX --> FT
     FT --> REC{"全组重新拉起、checkpoint 状态正确<br/>且 step 连续真实推进？"}
-    REC -->|是| JOB
+    REC -->|是且质量与监控均已验收| JOB
     REC -->|否 / 恢复超时| OUT
     SUP["部署的 supervisor 托管采集与观察进程"] -.-> WATCH
     OBS["不同故障域的独立 observer / sentinel<br/>核对 watcher 身份、心跳和结束证据<br/>自己也需外部监管"] -.-> WATCH

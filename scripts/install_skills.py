@@ -13,8 +13,15 @@ sys.path.insert(0, str(ROOT / 'src'))
 from hcu_trainflow.dependencies import knowledge_ready, require_checkout
 from hcu_trainflow.core import FlowError
 
-NAMES = ('hcu-trainflow','hcu-train-adapt','hcu-train-optimize','hcu-train-fault-tolerance','hcu-engine-wiki-search','hcu-engine-wiki-skill-update')
-RENAMED = {'hcu-train-prepare': 'hcu-train-adapt', 'hcu-train-operate': 'hcu-train-fault-tolerance', 'hcu-engine-wiki-update': 'hcu-engine-wiki-skill-update'}
+NAMES = ('hcu-trainflow','hcu-train-environment-check-and-adapt','hcu-train-optimize','hcu-train-scale-and-stability','hcu-engine-wiki-search','hcu-engine-wiki-skill-update')
+# Cleanup compatibility only: install the current entry once, with no aliases.
+RENAMED = {
+    'hcu-train-adapt': 'hcu-train-environment-check-and-adapt',
+    'hcu-train-fault-tolerance': 'hcu-train-scale-and-stability',
+    'hcu-train-prepare': 'hcu-train-environment-check-and-adapt',
+    'hcu-train-operate': 'hcu-train-scale-and-stability',
+    'hcu-engine-wiki-update': 'hcu-engine-wiki-skill-update',
+}
 KERNEL_NAMES = ('hygon-hip-baseline-generator', 'hygon-hip-kernel-optimizer', 'hygon-triton-kernel-optimizer')
 KNOWLEDGE_NAMES = ('hcu-knowledge-search', 'hcu-knowledge-update')
 

@@ -175,3 +175,11 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 ## 2026-10-10：更新 Skill 与安装器分工
 
 原 README 的总览主要展开优化，环境适配及扩容持续容错缺少同等清晰的入口，现已按三阶段重写。--replace 是将已核对的源 Skill 同步到安装目录，不承担上游查证或内容更新；更新 Skill 此前未明确同步本机收尾，现已补齐。旧 prepare/operate 入口已不存在，安装器仅保留识别历史目录的兼容。新替换先保留旧内容，全部哈希/绑定验收后清理本次备份；历史备份不自动扫除，避免删除之前失败安装的恢复材料。
+
+## 2026-10-10：诊断方法与命名复核
+
+- HCU-Knowledge 已查 runtime-failure-triage、RCCL/rccl-test、Cluster Manager 与 hcuprobe 总览/专题、PyTorch allocator 生命周期，以及 DTK26.10 hipprof 手册。collective 参数不一致、signal handler、VMFault/assert 和库外分配都有关键适用边界，不能照抄旧故障命令。
+- DTK26.10 hipprof 文档保留历史 --input-core 移除/恢复及 --leak-check 修复记录，故工作流先检查实际版本/帮助，再选择采集方式；不混同 hipprof 和 XProf/XCompute。
+- 官方交叉核对：PyTorch distributed（Gloo monitored_barrier）、memory snapshot（allocator 可见范围）、Linux cgroup v2（memory.events 层级/增量）。具体来源已写入 Skill references/evidence-sources.md。
+- 本轮新指南属于文档/源码查证，不表示真实 hang/core/leak/数值/存储等故障已在当前集群复现。适配和优化增加异常分流，通用方法留 Skill，事件原件继续留 workspace。
+- 批量编辑曾因主控 Skill 无“运行约定”标题中止；检查实际标题后继续，前面成功的改动未重复插入。

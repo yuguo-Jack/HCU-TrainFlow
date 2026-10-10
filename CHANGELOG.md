@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rename the environment/adaptation and scale/stability Skills to `hcu-train-environment-check-and-adapt` and `hcu-train-scale-and-stability`; update active references and migrate earlier installed entry directories without adding duplicate aliases.
+- Add evidence-driven incident triage, hang/collective, crash/device dump, memory, numerical, slowdown and recovery runbooks grounded in HCU knowledge and version-matched sources; connect adaptation and optimization failure handling. These method additions do not claim new hardware fault coverage.
+
 - Expand the README overview into environment/model adaptation, performance and quality iteration, and DP scaling with sustained recovery/observation. Explain content maintenance through the Wiki/Skill update entry and installation synchronization separately.
 - Verify all installed Skill files and directory bindings before cleaning backups created by a successful replacement. Preserve originals on failure and leave historical backups untouched; obsolete entry names remain cleanup compatibility only. The Wiki/Skill update workflow now explicitly synchronizes changed local workflow Skills after validation.
 

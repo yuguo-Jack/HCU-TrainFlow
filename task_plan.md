@@ -202,3 +202,13 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [x] 针对性测试、知识与链接校验，本机同步及再次幂等安装均通过。
 
 本轮提交至 main，不移动已有 v0.5.0 tag；行为变化记入 Unreleased。
+
+## 2026-10-10：故障诊断补强与阶段 Skill 命名
+
+- [x] 查询 HCU 大知识库和匹配的官方证据，复核未充分实测的排障与适配/优化衔接。
+- [x] 补充按症状分流、证据采集、假设验证、升级和恢复验收的通用诊断指南；明确方法与实测边界。
+- [x] 阶段名称改为 hcu-train-environment-check-and-adapt / hcu-train-scale-and-stability，更新引用与安装迁移。
+- [x] 验证安装迁移、技能结构、文档与 Wiki，独立场景复核后修正。
+- [x] 同步本机 Skill，提交推送 main；不移动既有 v0.5.0。
+
+本轮只维护 TrainFlow，不刷新 HCU 大知识库、不操作远端训练或执行故障注入。

@@ -74,16 +74,18 @@ def test_skill_install_idempotent_and_cleans_successful_backup(tmp_path):
     cmd=[sys.executable,str(script),'--target',str(target),'--workflow-only']
     assert subprocess.run(cmd,capture_output=True).returncode==0
     assert subprocess.run(cmd,capture_output=True).returncode==0
-    changed=target/'hcu-train-adapt/SKILL.md';changed.write_text('local modified')
+    changed=target/'hcu-train-environment-check-and-adapt/SKILL.md';changed.write_text('local modified')
     assert subprocess.run(cmd,capture_output=True).returncode!=0
     assert subprocess.run(cmd+['--replace'],capture_output=True).returncode==0
     assert not list((tmp_path/'trainflow-skill-backups').rglob('SKILL.md'))
-    assert changed.read_bytes() == (script.parent.parent/'skills/hcu-train-adapt/SKILL.md').read_bytes()
+    assert changed.read_bytes() == (script.parent.parent/'skills/hcu-train-environment-check-and-adapt/SKILL.md').read_bytes()
 
 
 @pytest.mark.parametrize('old_name,new_name', [
-    ('hcu-train-prepare','hcu-train-adapt'),
-    ('hcu-train-operate','hcu-train-fault-tolerance'),
+    ('hcu-train-adapt','hcu-train-environment-check-and-adapt'),
+    ('hcu-train-fault-tolerance','hcu-train-scale-and-stability'),
+    ('hcu-train-prepare','hcu-train-environment-check-and-adapt'),
+    ('hcu-train-operate','hcu-train-scale-and-stability'),
     ('hcu-engine-wiki-update','hcu-engine-wiki-skill-update'),
 ])
 def test_skill_rename_removes_obsolete_entry_after_verified_replacement(tmp_path,old_name,new_name):
@@ -96,7 +98,7 @@ def test_skill_rename_removes_obsolete_entry_after_verified_replacement(tmp_path
     assert subprocess.run(cmd+['--replace'],capture_output=True).returncode == 0
     assert not old.exists() and (target/new_name/'SKILL.md').is_file()
     assert f'name: {new_name}' in (target/new_name/'SKILL.md').read_text(encoding='utf8')
-    assert (target/'hcu-train-fault-tolerance/SKILL.md').is_file()
+    assert (target/'hcu-train-scale-and-stability/SKILL.md').is_file()
     backups=list((tmp_path/'trainflow-skill-backups').rglob(old_name+'/SKILL.md'))
     assert not backups
 

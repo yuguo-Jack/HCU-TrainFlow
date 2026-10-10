@@ -43,7 +43,7 @@ python scripts/install_skills.py --target "$HOME/.codex/skills" --workflow-only 
 
 首次安装用 setup_trainflow；手动拉取 TrainFlow 新版本后，重新运行 setup_trainflow 并加 `--replace`，以核对包、依赖和全部 11 个入口。算子或知识库 Skill 的源版本确有变化时按对应维护范围同步，不因本仓文档变化而升级其他项目。HCU-Knowledge 的内容更新仍需单独授权。
 
-当前阶段入口是 `hcu-train-adapt`、`hcu-train-optimize` 和 `hcu-train-fault-tolerance`。安装器只为较早安装保留过时目录的清理兼容，不安装旧名称或旧别名。两个 HCU 知识 Skill 的 `workspace.json` 绑定实际知识 checkout；完整复制其脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
+当前阶段入口是 `hcu-train-environment-check-and-adapt`、`hcu-train-optimize` 和 `hcu-train-scale-and-stability`。安装器只为较早安装保留过时目录的清理兼容，不安装旧名称或旧别名。两个 HCU 知识 Skill 的 `workspace.json` 绑定实际知识 checkout；完整复制其脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
 
 六个 TrainFlow Skill 的安装目录各有 `workspace.json`，其中 `project_root` 指向本次安装使用的工程绝对路径；个人路径只写入安装目录，不写入仓库源文件。新会话从其他工作目录使用 Skill 时，先采用用户明确指定的项目或 `TRAINFLOW_PROJECT`，未指定时读取该绑定。绑定只用于定位项目，不设置或覆盖任务的 `TRAINFLOW_WORKSPACE`。工程搬家后从新位置运行安装器并加 `--replace`，校验新绑定成功后清理本次旧备份；两个 HCU 知识 Skill 的 `root` 继续独立指向知识 checkout。
 

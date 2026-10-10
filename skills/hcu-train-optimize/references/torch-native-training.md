@@ -4,7 +4,7 @@
 
 ## 1. 入口与共同契约
 
-沿用 adapt 的环境验收、HCU 配方、源码锁和初始数值基线；扩 DP、筛机、checkpoint 和故障接管仍交给 fault-tolerance。`analyze` 只分析，不启动编译或训练实验。大模型引擎路线和 Torch 路线可以同时存在，按实际调用边界选择，不按模型名字强制二选一。
+沿用 adapt 的环境验收、HCU 配方、源码锁和初始数值基线；扩 DP、筛机、checkpoint 和故障接管仍交给 规模长稳 Skill。`analyze` 只分析，不启动编译或训练实验。大模型引擎路线和 Torch 路线可以同时存在，按实际调用边界选择，不按模型名字强制二选一。
 
 记录真实入口：数据读取/解码/增强 → H2D → forward → loss → backward → 梯度累积/同步 → optimizer → EMA（如有）→ scheduler → 保存/评估。确定 train/eval、冻结模块、共享权重、AMP、loss scaler、随机源和自定义 autograd。视频/VLA/世界模型还要固定帧数、分辨率、视角、动作维度、时序展开、padding/mask 和采样分布；不得通过改变任务数据或损失定义制造加速。
 

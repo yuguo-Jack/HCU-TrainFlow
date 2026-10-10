@@ -217,6 +217,6 @@ def test_workflow_only_install_is_explicit_and_preserves_edits(tmp_path):
     result=subprocess.run([sys.executable,str(root/'scripts/install_skills.py'),'--workflow-only','--target',str(target)],capture_output=True,text=True)
     assert result.returncode==0,result.stderr
     assert len(list(target.glob('*/SKILL.md')))==6
-    (target/'hcu-train-adapt/SKILL.md').write_text('local edits')
+    (target/'hcu-train-environment-check-and-adapt/SKILL.md').write_text('local edits')
     result=subprocess.run([sys.executable,str(root/'scripts/install_skills.py'),'--workflow-only','--target',str(target)],capture_output=True,text=True)
-    assert result.returncode!=0 and (target/'hcu-train-adapt/SKILL.md').read_text()=='local edits'
+    assert result.returncode!=0 and (target/'hcu-train-environment-check-and-adapt/SKILL.md').read_text()=='local edits'

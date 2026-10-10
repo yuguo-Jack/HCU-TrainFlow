@@ -55,9 +55,9 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 ## Skill 使用例
 
 - `$hcu-trainflow`：在给定环境推进模型适配、优化和大规模验证，建立看板并持续复核。
-- `$hcu-train-adapt`：只检查分配的环境，按实际节点和设备生成缺项表。
+- `$hcu-train-environment-check-and-adapt`：只检查分配的环境，按实际节点和设备生成缺项表。
 - `$hcu-train-optimize`：只分析这些 ranks 的 trace，给热点、效率和下一步实验。
-- `$hcu-train-fault-tolerance`：诊断卡住，先保存全 rank 现场，不触发重启。
+- `$hcu-train-scale-and-stability`：诊断卡住，先保存全 rank 现场，不触发重启。
 - `$hcu-engine-wiki-search`：查 EP overlap 与重算的版本限制。
 - `$hcu-engine-wiki-skill-update`：复核最新官方/生态源码，并同步受影响的用法。
 

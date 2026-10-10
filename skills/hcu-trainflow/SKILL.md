@@ -41,9 +41,9 @@ review 按 `docs/collaboration.md` 使用完整字段；不以单词“完成”
 
 Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize 按需加载 Torch 与通信专项，不增加独立 Skill。全流程先检查 HCU-Knowledge 的搜索 Skill、workspace 绑定及当前索引可用性；缺失按 docs/integrations.md 完成必需安装。三个阶段按实际 HCU 问题联查它，普通训练不触发大知识库更新。
 
-- `$hcu-train-adapt`：环境验收、HCU 启动配方、全参容量预估与短跑校准、模型适配和初始基线。参考 HCU Train Sim 等工具核对真实卡数/显存及模型覆盖，能放下就优先全参，不够才缩 layer；缩维仍按授权。可仅检查环境。
+- `$hcu-train-environment-check-and-adapt`：环境验收、HCU 启动配方、全参容量预估与短跑校准、模型适配和初始基线。参考 HCU Train Sim 等工具核对真实卡数/显存及模型覆盖，能放下就优先全参，不够才缩 layer；缩维仍按授权。可仅检查环境。
 - `$hcu-train-optimize`：可仅分析性能；先评估并行切分、微批/梯度累积与显存余量，按吞吐和通信代价选择配置；系统、融合、算子优化采用测量→假设→实施→验证→复核。累计 ≥90% 端到端热点集合中的非通信算子逐项建模；比较真实 shape 的独立测试。每轮局部正确性和 profiler-off 性能，稳定阶段才长窗口验 loss，始终对初始基线。复用 HCU Flash-Train/TE/Primus Turbo，通信按实际需求联动 RCCL/rocSHMEM/DeepEP/UCCL/UltraEP/MoonEP 等，必要时深入底层库隔离修改和重编，必要时调用三个 Hygon kernel Skill。
-- `$hcu-train-fault-tolerance`：按本轮选定配置扩 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。完整模型目标须先恢复完整配置；用户明确以缩减模型验证本轮流程时，可扩该配置的 DP 并保留完整模型缺口，见 `docs/proxy-contract.md`。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
+- `$hcu-train-scale-and-stability`：按本轮选定配置扩 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。完整模型目标须先恢复完整配置；用户明确以缩减模型验证本轮流程时，可扩该配置的 DP 并保留完整模型缺口，见 `docs/proxy-contract.md`。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
 - `$hcu-engine-wiki-search` / `$hcu-engine-wiki-skill-update`：本地官方 Wiki 的检索和维护。需要 HCU 事实时读 HCU-Knowledge、当前底层库分支或官方资料；普通任务不顺带更新 HCU 大知识库。工具/脚本变了要复核相关 Skill、命令和解析器，不仅更新 Wiki。
 
 ## 看板指导
@@ -91,6 +91,10 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 命令与 JSON 以 `docs/multi-agent.md` 为准。团队消息事件及时处理，不受人的五分钟文件采集周期限制。成果由所属阶段交付，无需再增加细碎的独立 Skill。
 
 本地会话在线才有主控推理。`flow-watch` 只记文件变化，不会凭空启动 Agent；离线唤醒需已配置的本地 bridge/宿主服务。远端 watcher 和既有容错独立运行，本机恢复后重放事件、核对现场再续接。没有配置时如实说明接续方式，不能承诺全天自动接管。
+
+## 跨阶段异常交接
+
+异常可在任一阶段触发。环境/启动失败走环境检查与模型适配 Skill 的 `references/troubleshooting.md`；优化证据与数值异常走 optimize 的 `references/validation-diagnostics.md`；卡住、崩溃、泄漏、数值或恢复问题复用规模长稳 Skill 的 `references/diagnosis.md`。主控保留同一问题、context/attempt 和恢复 owner，按 HCU 知识库→在线 PR/官方资料→实际源码→有界验证补证，不新建互不相干的调查。基础排查仍受阻时给用户可决定的问题；不为一次故障机械派多个 Agent，修复返回受影响的验收门槛。
 
 ## 交付与边界
 
