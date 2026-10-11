@@ -30,7 +30,7 @@ hcu-trainflow wiki-read official-megatron-wiki/cases/paged-stash-launch
 hcu-trainflow wiki-search "weight transfer" --engine vllm --kind source-document
 ```
 
-索引使用 SQLite FTS5、英文符号/中文 bigram、标题与类型权重，不下载 embedding 模型。`--kind` 支持 authored、source-document、source-pr、source-map。`wiki-search` 按 `--project`（或 `TRAINFLOW_PROJECT`）核对当前本地文件，复用或重建对应内容指纹的索引；切换 checkout 或补充页面后不会沿用另一工程的旧结果。这一步只读本地知识，不刷新上游。并发索引使用独立临时文件，搜索绑定自己选定的代次。目录清单降权；搜索结果相关不等于结论适用。`wiki-read` 返回最近索引中的完整正文，文件变化时提示重新索引。
+索引使用 SQLite FTS5、英文符号/中文 bigram、标题与类型权重，不下载 embedding 模型。`--kind` 支持 authored、source-document、source-pr、source-map、site-knowledge、experiment-knowledge；后两项用于定向查通用环境经验和最终模型总结。`wiki-search` 按 `--project`（或 `TRAINFLOW_PROJECT`）核对当前本地文件，复用或重建对应内容指纹的索引；切换 checkout 或补充页面后不会沿用另一工程的旧结果。这一步只读本地知识，不刷新上游。并发索引使用独立临时文件，搜索绑定自己选定的代次。目录清单降权；搜索结果相关不等于结论适用。`wiki-read` 返回最近索引中的完整正文，文件变化时提示重新索引。
 
 多 Agent 或多个 checkout 共用私有工作区时，后续全文读取使用 `wiki-read PAGE_ID --generation SEARCH_RETURNED_GENERATION`，保证读取刚才命中的同一快照；也可 `--project PROJECT` 明确读取该工程当前本地版本。省略两者只兼容使用最近的 active 索引，不适合并发跨工程读取。
 
