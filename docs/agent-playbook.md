@@ -42,12 +42,12 @@
 
 ```text
 prepared --environment--> environment_checked --baseline--> baseline_validated
-baseline_validated --baseline--> profiling --analysis--> optimizing
+baseline_validated --复用未变基线审核--> profiling --analysis--> optimizing
 optimizing --stage-quality + performance--> scale_ready
 scale_ready --environment + stage-quality + scale--> training --completion--> completed
 ```
 
-每个箭头仍要经过候选提交、独立复核和程序检查；`flow-next` 返回的 `required_reports` 是当前模式的实际要求。优化阶段的 `iterate` 只保留局部候选，不代替阶段 loss。`stage-quality` 必须按质量契约登记可重算的 `quality_inputs`，包含固定初态和配方；旧窗口比较的 pass 不授予新阶段晋级。跨阶段可以并行准备资料、源码和独立验证，但相关 gate 未通过就不能把整阶段称为通过。
+实质阶段验收经过候选提交、独立复核和程序检查；未变化的已审基线进入 profiling 时复用原 review，不重复审核。`flow-next` 的 required_reports 与 action 为当前模式的实际要求，契约缺项先 repair，再请 reviewer。按[工作与审核的粒度](collaboration.md#工作与审核的粒度)区分初筛、候选和阶段，不逐小实验提交。优化阶段的 iterate 不代替阶段 loss；stage-quality 仍登记可重算的 quality_inputs、固定初态和配方。跨阶段可以并行准备资料、源码和独立验证，门槛未过不能把整阶段称为通过。
 
 ### 门槛未通过时，允许的有界诊断
 

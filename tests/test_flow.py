@@ -159,7 +159,9 @@ def test_iteration_is_not_stage_loss_validation(tmp_path):
     final = candidate(store, experiment=True)
     final['reports'].pop('stage-quality')
     flow.submit(store, 't', final)
-    flow.review(store, 't', verdict(store))
+    assert flow.next_step(store, 't')['action'] == 'repair'
+    with pytest.raises(FlowError, match='No current review'):
+        flow.review(store, 't', verdict(store))
     assert 'missing-or-replaced-report:stage-quality' in flow.next_step(store, 't')['reasons']
     with pytest.raises(FlowError):
         flow.advance(store, 't')
@@ -178,7 +180,6 @@ def test_legacy_stage_pass_cannot_be_waived_by_an_accepting_reviewer(tmp_path):
         store.event(db, 't', 'report-recorded', {'kind': 'stage-quality', 'artifact': legacy})
     final['reports']['stage-quality'] = legacy
     flow.submit(store, 't', final)
-    flow.review(store, 't', verdict(store))
     decision = flow.next_step(store, 't')
     assert decision['action'] == 'repair'
     assert 'missing-or-replaced-report:stage-quality' in decision['reasons']
@@ -194,7 +195,7 @@ def test_rejected_measurement_cannot_advance_iteration(tmp_path):
     data['correctness']['candidate_path_exercised'] = False
     value['experiment'] = flow.retain(store, data)
     flow.submit(store, 't', value)
-    flow.review(store, 't', verdict(store))
+    assert flow.next_step(store, 't')['action'] == 'repair'
     assert 'iteration-not-kept' in flow.next_step(store, 't')['reasons']
 
 
@@ -284,8 +285,11 @@ def test_full_stages_and_crash_after_final_transition(tmp_path):
     store = setup(tmp_path, mode='full')
     targets = ['environment_checked','baseline_validated','profiling','optimizing','scale_ready','training','completed']
     for destination in targets:
-        flow.submit(store,'t',candidate(store, experiment=destination == 'scale_ready'))
-        flow.review(store,'t',verdict(store))
+        if destination == 'profiling':
+            assert flow.next_step(store, 't')['review_reused'] is True
+        else:
+            flow.submit(store,'t',candidate(store, experiment=destination == 'scale_ready'))
+            flow.review(store,'t',verdict(store))
         if destination == 'completed':
             store.transition('t', destination)  # crash before flow-advance updates its round
             assert flow.next_step(Store(store.root),'t')['action'] == 'completed'
@@ -312,9 +316,9 @@ def test_queued_guidance_must_be_resolved_before_completion(tmp_path):
     sha = flow.sync_guidance(store,'t', force=True)['guidance']
     flow.acknowledge(store,'t',sha,'queued','Will include memory peak in the final analysis')
     flow.submit(store,'t',candidate(store))
-    flow.review(store,'t',verdict(store))
     assert 'queued-human-guidance-needs-final-disposition' in flow.next_step(store,'t')['reasons']
     flow.acknowledge(store,'t',sha,'applied','Final report includes the measured peak and its scope')
+    flow.review(store,'t',verdict(store))
     assert flow.advance(store,'t')['action'] == 'completed'
 
 
@@ -341,7 +345,7 @@ def test_snapshot_mismatch_prevents_advance(tmp_path):
     value = candidate(store)
     value['snapshot'] = store.put(b'A different candidate manifest')
     flow.submit(store,'t',value)
-    flow.review(store,'t',verdict(store))
+    assert flow.next_step(store, 't')['action'] == 'repair'
     assert 'snapshot-mismatch:analysis' in flow.next_step(store,'t')['reasons']
 
 
@@ -379,5 +383,94 @@ def test_new_required_assignment_supersedes_accepted_candidate(tmp_path):
     assert flow.next_step(store, 't')['action'] == 'repair'
     with pytest.raises(FlowError): flow.advance(store, 't')
     flow.submit(store, 't', candidate(store, label='updated-candidate'))
+    flow.review(store, 't', verdict(store))
+    assert flow.advance(store, 't')['action'] == 'completed'
+
+
+def reviewed_baseline(store, *, interrupted=False):
+    for destination in ('environment_checked', 'baseline_validated'):
+        value = candidate(store)
+        flow.submit(store, 't', value)
+        flow.review(store, 't', verdict(store))
+        if interrupted and destination == 'baseline_validated':
+            store.transition('t', destination)
+        else:
+            flow.advance(store, 't')
+    return value
+
+
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_unchanged_baseline_handoff_reuses_review_and_survives_restart(tmp_path, interrupted):
+    store = setup(tmp_path, mode='full', max_rounds=2)
+    value = reviewed_baseline(store, interrupted=interrupted)
+    store = Store(store.root)
+    decision = flow.next_step(store, 't')
+    assert decision['action'] == 'advance' and decision['review_reused'] is True
+    assert decision['target'] == 'profiling'
+    # Also covers a crash after the administrative transition's commit.
+    store.transition('t', 'profiling')
+    with store.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM flow_rounds WHERE task=?', ('t',)).fetchone()[0] == 2
+        assert store.current_reports(db, 't', value['context'])['baseline']['artifact'] == value['reports']['baseline']
+    events = [e for e in store.events() if e['kind'] == 'flow-review-reused']
+    assert len(events) == 1 and events[0]['payload']['candidate'] == decision['candidate']
+    assert events[0]['payload']['review'] == decision['review']
+    # No round consumed by handoff; the configured budget still applies to new work.
+    assert flow.next_step(Store(store.root), 't')['reasons'] == ['round-budget-or-progress-plateau']
+
+
+@pytest.mark.parametrize('change', ['report', 'guidance', 'replan', 'context', 'operation', 'team'])
+def test_baseline_review_reuse_never_waives_changed_or_unresolved_evidence(tmp_path, change):
+    store = setup(tmp_path, mode='full')
+    value = reviewed_baseline(store)
+    if change == 'report':
+        body = flow.artifact_json(store, value['reports']['baseline'])
+        store.report('t', 'baseline', {**body, 'note': 'New baseline evidence'})
+    elif change == 'guidance':
+        flow.board_paths(store, 't')[2].write_text('Recheck the baseline data order.', encoding='utf8')
+        sha = flow.sync_guidance(store, 't', force=True)['guidance']
+        flow.acknowledge(store, 't', sha, 'applied', 'Updated the requested baseline review scope')
+    elif change == 'replan':
+        flow.start(store, 't', {'acceptance': {'result': 'New scope'}}, reason='New requested acceptance')
+    elif change == 'context':
+        store.change_context('t', {'source': 'changed', 'data': 'frozen'})
+    elif change == 'team':
+        from hcu_trainflow import team
+        team.plan(store, 't', {'rationale': 'New review scope after baseline acceptance', 'max_parallel': 1,
+            'assignments': [{'id': 'background', 'owner': 'worker', 'goal': 'Additional baseline inspection',
+                'scope': 'Read-only fixture', 'mode': 'read', 'allowed_paths': ['.'],
+                'required': False, 'context': store.task('t')['context'],
+                'budget': {'max_operations': 1}, 'acceptance': 'Retained fixture evidence'}]})
+    else:
+        with store.db() as db:
+            db.execute("INSERT INTO operations VALUES('remote','t','hash','unknown',NULL,'now')")
+    decision = flow.next_step(store, 't')
+    assert not decision.get('review_reused')
+    with pytest.raises(FlowError):
+        store.transition('t', 'profiling')
+    if change == 'report':
+        # Repair uses a fresh explicit candidate/review, with unchanged state names.
+        flow.submit(store, 't', candidate(store, label='revalidated-baseline'))
+        flow.review(store, 't', verdict(store))
+        flow.advance(store, 't')
+        assert store.task('t')['state'] == 'profiling'
+
+
+def test_preflight_repairs_evidence_before_requesting_independent_review(tmp_path):
+    store = setup(tmp_path)
+    value = candidate(store)
+    value['reports'] = {}
+    submitted = flow.submit(store, 't', value)
+    assert submitted['status'] == 'needs-repair'
+    assert not any(e['kind'] == 'flow-review-requested' for e in store.events())
+    decision = flow.next_step(store, 't')
+    assert decision['action'] == 'repair'
+    assert decision['reasons'] == ['missing-or-replaced-report:analysis']
+    with pytest.raises(FlowError, match='No current review'):
+        flow.review(store, 't', verdict(store))
+    with store.db() as db:
+        row = flow.last_round(db, 't')
+        assert row['review'] is None and row['failures'] == 0
+    flow.submit(store, 't', candidate(store, label='complete-evidence'))
     flow.review(store, 't', verdict(store))
     assert flow.advance(store, 't')['action'] == 'completed'

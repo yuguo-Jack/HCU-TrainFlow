@@ -304,3 +304,13 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 两套全新目录的合成演示完成；16张工程Mermaid成功渲染，PNG无版本，390个链接/锚点、489页/25来源Wiki及59阅读页/78可达页均通过。
 - 系统Python editable升级0.6.0，六个系统Skill及绑定校验current；优化Skill已替换，其余保持当前。独立 --check 及 hcu-trainflow --version 确认一致。临时备份自动清理，新会话载入新版。
 - sdist隔离与资产覆盖已包含在全量测试中。发布前origin/main为e8d7a43，v0.6.0不存在；提交、main推送与annotated tag的结果以Git远端回执为准。本轮未刷新外部来源或HCU大知识库、未运行远端训练、不新增硬件资格声明。
+
+
+## 2026-10-11：减少重复审核与低效实验
+
+- 完成两项程序修复与三个阶段/两个 Wiki Skill/主控的执行粒度修订；共享规则在 docs/collaboration.md，其余入口按职责引用。README、介绍与可编辑流程图同步，不新增阶段/状态机/依赖。
+- 全量 CPU/本地协议回归 1175 passed、4 skipped（Windows 不具备的 Linux AF_UNIX/spawn）；之后新增团队范围变化的复用失效场景，最新定向 flow/Skill路由/团队审核61项全部通过，包含该新增用例。没有重跑无关硬件实验，也不新增 HCU 资格声明。
+- 489页/25来源知识校验、59阅读页/78可达页检查通过；63份Markdown的394个链接/锚点和16张Mermaid解析/渲染通过。
+- 系统Python editable 0.6.0与六个Codex Skill均完成替换，临时备份由安装器验证后清理；只读同步复核另行执行。无大知识库/上游来源更新，不改既有v0.6.0 tag；本轮改动记Unreleased。最终提交/推送以Git回执为准。
+
+- 收尾统一文本换行后，安装哈希检查发现四个Skill副本需刷新；仅重装变化的Skill，独立sync --check确认包、六个Skill和资源绑定全部current。提交前差异无空白错误，既有v0.6.0保持不动。

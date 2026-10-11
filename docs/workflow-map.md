@@ -305,17 +305,19 @@ flowchart TD
     START["新任务：task-create + flow-start<br/>保存目标、上下文、验收与预算"] --> NEXT["flow-next<br/>读取当前事实、工作状态和已采集指导"]
     RESUME["已有任务：恢复当前 Store / Task / context<br/>核对现场作业、Agent、看板和在途操作"] --> NEXT
     NEXT --> ACT{"返回的 action"}
-    ACT -->|work / repair| WORK["阶段 Skill 实施与测量<br/>本地修改、远端验证、保存证据"]
+    ACT -->|work / repair| WORK["阶段 Skill：有界初筛、实施与测量<br/>本地修改、远端验证、增量保存证据"]
     ACT -->|coordinate| TEAM["派发 / 消息 / 结果验收<br/>图 5"]
     TEAM --> NEXT
-    WORK --> SUB["flow-submit<br/>固定候选 manifest、代码、配置和报告哈希"]
-    SUB --> REV["独立 Agent 复核<br/>核对当前目标、context、候选与原始证据"]
+    WORK -->|形成可保留 / 交接候选| SUB["flow-submit<br/>固定候选 manifest、代码、配置和报告哈希"]
+    SUB --> PRE{"程序预检证据契约"}
+    PRE -->|缺项：先修复，不请求审核| NEXT
+    PRE -->|就绪| REV["独立 Agent 复核本次差异与受影响证据<br/>复用已有审查，指定边界全目标复核"]
     ACT -->|review| REV
     REV --> VER{"accept / revise / blocked"}
     VER -->|revise| WORK
     VER -->|blocked 或 reviewer 失败| ISSUE["记录原因和缺口<br/>修复、重试或按预算请专家介入"]
     ISSUE --> NEXT
-    VER -->|accept| GATE["程序核对当前复核与报告门槛<br/>必做任务、阻塞消息、指导、上下文与快照<br/>阶段质量重新计算 quality_inputs"]
+    VER -->|accept| GATE["程序核对当前复核与报告门槛<br/>未变基线交接可复用原审核<br/>指导、上下文、快照及阶段质量仍检查"]
     ACT -->|advance| GATE
     GATE -->|条件不齐 / 已过期| NEXT
     GATE -->|通过| ADV["flow-advance<br/>下一阶段 / 当前阶段内 iterate / 完成"]
@@ -331,6 +333,8 @@ flowchart TD
 ```
 
 `accept` 不是 GPU 测试通过的替代物。`target: iterate` 保持当前优化任务的阶段状态，仍须具备局部正确性、真实 dispatch 和至少三组 profiler-off 配对测量；完整任务进入扩容准备仍须阶段质量与性能报告，独立优化任务按其完成契约验收。
+
+同一假设下的局部初筛不逐次进入审核。基线验收后直接交接 profiling，符合未变条件时沿用原 review，既不新开轮次也不重复训练；变化后重新复核。详见[工作与审核的粒度](collaboration.md#工作与审核的粒度)。
 
 环境、模型、数据或验证契约变化时重置比较上下文，旧报告保留但不可直接过当前门槛；改回旧配置也不能让旧验收自动复活。新的人的指导、依赖阻塞或候选修改会使未推进的旧复核失效。详见 [协作契约](collaboration.md)。
 
@@ -501,7 +505,7 @@ flowchart TD
 | `prepared` | 任务与 flow 计划 | 固定目标、预算、上下文和范围 |
 | `environment_checked` | `environment` | 现场环境验收 |
 | `baseline_validated` | `baseline` | 初始正确性与数值基线 |
-| `profiling` | `baseline` | 以已验证基线开展采样分析 |
+| `profiling` | `baseline` | 未变基线交接复用刚完成的 review，以已验证基线开展采样分析 |
 | `optimizing` | `analysis` | 形成瓶颈证据，开始候选迭代 |
 | `scale_ready` | `stage-quality`、`performance` | 阶段质量与性能通过 |
 | `training` | `environment`、`stage-quality`、`scale` | 当前候选满足训练准入 |

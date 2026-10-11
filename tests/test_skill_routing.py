@@ -67,9 +67,12 @@ def test_complete_pipeline_routes_each_real_transition(tmp_path, installed_skill
         decision = cli_decision(store, capsys)
         assert decision['target'] == destination
         assert_installed(decision, expected, installed_skills)
-        value = candidate(store, experiment=destination == 'scale_ready')
-        flow.submit(store, 't', value)
-        flow.review(store, 't', verdict(store))
+        if destination == 'profiling':
+            assert decision['action'] == 'advance' and decision['review_reused'] is True
+        else:
+            value = candidate(store, experiment=destination == 'scale_ready')
+            flow.submit(store, 't', value)
+            flow.review(store, 't', verdict(store))
         flow.advance(store, 't')
     finished = cli_decision(store, capsys)
     assert finished['action'] == 'completed'

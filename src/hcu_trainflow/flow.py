@@ -259,6 +259,31 @@ def last_round(db, tid):
     return db.execute('SELECT * FROM flow_rounds WHERE task=? ORDER BY number DESC LIMIT 1', (tid,)).fetchone()
 
 
+def baseline_handoff(store, db, task, flow, row):
+    """Reuse the reviewed baseline only for its unchanged, administrative handoff.
+
+    This neither accepts a new candidate nor inherits review across a new goal,
+    context, report, team plan or human/peer instruction.
+    """
+    if (task['spec']['mode'] != 'full' or task['state'] != 'baseline_validated'
+            or not row or row['status'] not in {'accepted', 'advanced'}
+            or row['context'] != task['context'] or row['goal'] != flow['goal']
+            or task['revision'] != row['revision'] + 1 or not row['review']):
+        return None
+    candidate = artifact_json(store, row['candidate'])
+    if candidate['target'] != 'baseline_validated':
+        return None
+    reviewed_at = db.execute("SELECT MAX(seq) FROM events WHERE task=? AND kind='flow-reviewed'", (task['id'],)).fetchone()[0]
+    if reviewed_at is None or db.execute(
+            "SELECT 1 FROM events WHERE task=? AND seq>? AND kind IN "
+            "('human-guidance-received','team-planned','agent-message')",
+            (task['id'], reviewed_at)).fetchone():
+        return None
+    if gate(store, db, task, {**candidate, 'target': 'profiling'}):
+        return None
+    return candidate
+
+
 def next_step(store, tid):
     sync_guidance(store, tid)
     from .file_questions import state as question_state
@@ -305,13 +330,19 @@ def next_step(store, tid):
             else:
                 if row['failures'] >= flow['plan']['max_review_failures']:
                     return {**result, 'action': 'human', 'reasons': ['review-failures'], 'round': row['number']}
-                problems = gate(store, db, task, candidate) if row['status'] == 'accepted' else []
+                # Reject mechanically incomplete evidence before spending an
+                # independent review, and recheck it after review as before.
+                problems = gate(store, db, task, candidate)
                 team_reasons = completion_blockers(db, tid)
                 if team_reasons:
                     return {**result, 'action': 'coordinate', 'reasons': team_reasons, 'team': schedule(store, tid)}
                 return {**result, 'action': 'repair' if problems else 'advance' if row['status'] == 'accepted' else 'review',
                         'round': row['number'], 'candidate': row['candidate'], 'review': row['review'], 'reasons': problems,
                         'full_alignment_required': row['number'] % flow['plan']['full_review_every'] == 0 or candidate['target'] in {'scale_ready', 'training', 'completed'}}
+        if baseline_handoff(store, db, task, flow, row):
+            return {**result, 'action': 'advance', 'target': 'profiling',
+                    'round': row['number'], 'candidate': row['candidate'],
+                    'review': row['review'], 'review_reused': True, 'reasons': []}
         rounds = db.execute('SELECT * FROM flow_rounds WHERE task=? AND goal=? ORDER BY number DESC', (tid, flow['goal'])).fetchall()
         stalled = 0
         for previous in rounds:
@@ -371,9 +402,12 @@ def submit(store, tid, candidate):
         if row and row['status'] in {'submitted', 'accepted'}:
             db.execute("UPDATE flow_rounds SET status='superseded' WHERE task=? AND number=?", (tid, row['number']))
         db.execute('INSERT INTO flow_rounds VALUES(?,?,?,?,?,?,NULL,?,0)', (tid, number, task['context'], task['revision'], candidate['goal'], sha, 'submitted'))
-        store.event(db, tid, 'flow-review-requested', {'round': number, 'candidate': sha, 'context': task['context']}, channel='agent')
+        problems = gate(store, db, task, candidate)
+        store.event(db, tid, 'flow-candidate-needs-repair' if problems else 'flow-review-requested',
+                    {'round': number, 'candidate': sha, 'context': task['context'], 'reasons': problems}, channel='agent')
     render_board(store, tid)
-    return {'round': number, 'candidate': sha, 'status': 'awaiting-review'}
+    return {'round': number, 'candidate': sha,
+            'status': 'needs-repair' if problems else 'awaiting-review', 'reasons': problems}
 
 
 def review_failure(store, tid, number, reason):
@@ -452,14 +486,19 @@ def guard_transition(store, db, task, destination):
     reasons = blockers(db, task['id'], task, flow)
     if db.execute("SELECT 1 FROM operations WHERE task=? AND status IN ('started','unknown')", (task['id'],)).fetchone():
         reasons.append('reconcile-unresolved-execution')
+    task = {**task, 'spec': json.loads(task['spec']) if isinstance(task['spec'], str) else task['spec']}
+    if not reasons and destination == 'profiling' and baseline_handoff(store, db, task, flow, row):
+        # Store.transition commits this event and the state change atomically.
+        store.event(db, task['id'], 'flow-review-reused', {
+            'round': row['number'], 'candidate': row['candidate'], 'review': row['review'],
+            'target': destination, 'reason': 'unchanged-reviewed-baseline-handoff'})
+        return
     if not row or row['status'] != 'accepted' or row['context'] != task['context'] or row['goal'] != flow['goal'] or row['revision'] != task['revision']:
         reasons.append('current-independent-review-required')
     else:
         candidate = artifact_json(store, row['candidate'])
         if candidate['target'] != destination:
             reasons.append('review-target-mismatch')
-        # A sqlite row from Store.transition has a JSON spec; keep the gate shared.
-        task = {**task, 'spec': json.loads(task['spec']) if isinstance(task['spec'], str) else task['spec']}
         reasons += gate(store, db, task, candidate)
     if reasons:
         raise FlowError('Flow transition blocked: ' + ', '.join(reasons))
@@ -470,8 +509,9 @@ def advance(store, tid):
     if decision['action'] != 'advance':
         raise FlowError('Cannot advance: ' + decision['action'] + ' ' + ', '.join(decision.get('reasons', [])))
     candidate = artifact_json(store, decision['candidate'])
-    if candidate['target'] != 'iterate':
-        store.transition(tid, candidate['target'])
+    destination = decision.get('target', candidate['target'])
+    if destination != 'iterate':
+        store.transition(tid, destination)
     with store.db() as db:
         db.execute('BEGIN IMMEDIATE')
         if candidate['target'] == 'iterate':

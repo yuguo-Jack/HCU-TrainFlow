@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Preflight candidate evidence before requesting independent review; incomplete reports and mismatched snapshots go directly to repair. Recheck the same gates after review.
+- Reuse the immediately preceding baseline review for an unchanged handoff into profiling, with an atomic audit record and invalidation on changed evidence, guidance, team scope or context. Keep all substantive stage gates.
+- Distinguish cheap screening, retained candidates and stage acceptance. Reuse applicable tests and knowledge, start the leading hotspot without a global analysis barrier, scope scaling checks to changes, and avoid duplicate agent reviews and blocking Wiki maintenance.
+
 ## 0.6.0 — 2026-10-11
 
 - Keep project version numbers out of workflow diagrams and their generation instructions; centralize release metadata and align descriptive guides, TraceLens routing, scoped operator models, monitoring clocks and independent-mode handoffs.
