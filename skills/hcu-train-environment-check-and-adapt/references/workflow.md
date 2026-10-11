@@ -4,7 +4,7 @@
 
 环境检查需同时按 `docs/cluster-health-and-screening.md` 核对现场 `run_nhc`、ClusterShell `clush`、当前 ClusterManager 检查脚本；先单节点确认命令、范围与输出，再有限并发扩展。命令缺失或未返回结果记为未知，不能当节点健康。
 
-安装本 Skill 不会复制整个 Wiki。设置 `TRAINFLOW_PROJECT` 指向已 clone 的 HCU-TrainFlow；`TRAINFLOW_WORKSPACE` 指向任务私有目录。
+安装本 Skill 会复制其 references，共享 docs/Wiki 从工程读取。按入口约定采用用户明确的工程路径、`TRAINFLOW_PROJECT` 或安装目录 `workspace.json.project_root`；按项目 `docs/skill-reading-map.md` 的当前模式进入。`TRAINFLOW_WORKSPACE` 另指向任务私有目录。
 
 完整安装包含 11 个 Skill，HCU-Knowledge 及其检索/更新 Skill 是必需依赖；先核对目录绑定和本地可用性。资料权限不足时反馈具体来源，不能将缺少知识库的安装称为完整就绪。普通适配与查询不隐式更新 HCU-Knowledge。
 
@@ -23,7 +23,7 @@
 - `docs/wiki.md`：固定来源、更新复核和工作流维护。
 - `knowledge/README.md`：官方引擎与生态章节。
 
-不要读取安装目录相对路径猜测仓库位置；先使用明确项目路径。执行前检查 `hcu-trainflow --help` 和相关子命令帮助，不猜不存在的 flag。
+不要从安装目录的父级猜仓库位置；先核对上述工程绑定。执行前检查 `hcu-trainflow --help` 和相关子命令帮助，不猜不存在的 flag。
 
 ## 启动配方选择与核对
 

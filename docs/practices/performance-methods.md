@@ -1,6 +1,6 @@
 # 性能方法的来源与训练场景适配
 
-本页说明 TrainFlow 采用哪些参考方法、如何核对、为何保留差异。执行方法见优化 Skill 的 [证据驱动闭环](../../skills/hcu-train-optimize/references/evidence-driven-loop.md) 和 [算子上限迭代](../../skills/hcu-train-optimize/references/operator-ceiling-iteration.md)。这些是工作流方法，不是新 Agent 编排系统或额外必装运行时。
+本页说明 TrainFlow 采用哪些参考方法、如何核对、为何保留差异。执行方法见优化 Skill 的 [证据驱动闭环](../../skills/hcu-train-analyze-and-optimize/references/evidence-driven-loop.md) 和 [算子上限迭代](../../skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。这些是工作流方法，不是新 Agent 编排系统或额外必装运行时。
 
 ## 固定参考与采用范围
 

@@ -5,6 +5,10 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 
 # 训练引擎 Wiki 与 Skill 更新
 
+## 开始前定位与阅读
+
+先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。
+
 维护本工程官方 Wiki 和随源变化的工作流用法。它可以由训练任务按需主动调用；不替代或触发 HCU 大知识库 update。
 
 ## 更新协议
@@ -25,7 +29,7 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
    复核后又改正文/工作流或新增同来源专题时，重新检查并留下新回执；即使上游没有新变化也不能沿用过期复核。PR 重采后同样处理由作者页变动引起的待办。
 8. wiki-catalog 刷新来源/文档/PR 导航（wiki-update 已在收尾调用），wiki-index 更新搜索。运行本工程测试和真实问题检索，保存本次缺口及下次入口。Wiki 提交与 push 沿用任务授权；站点知识按本仓归属规则提交，凭据不入仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
-9. 若本仓 Skill 或 references 有变化，验证后在本次维护范围内同步实际 Agent 的安装目录：完整安装已就绪时运行 `scripts/install_skills.py --target <实际Skills目录> --workflow-only --replace`，核对六个入口和 `workspace.json` 绑定。安装器全部校验成功后清理本次临时旧备份，失败保留备份供恢复；报告同步结果并提醒新会话加载。仅 Wiki 内容变化无需重装 Skill；其他依赖 Skill 变更按 `docs/integrations.md` 的对应范围同步，不自动更新 HCU-Knowledge。
+9. **维护收尾包含本机同步。** 本仓 Wiki/docs、Skill/reference、脚本、CLI 或包配置有改动，复核和测试通过后，定位当前 Skill 安装所在的实际 Skills 目录，运行 `python scripts/sync_local_install.py --target <实际Skills目录>`，再以 `--check` 只读复核。它刷新本仓 editable Python 包和六个 Skill，检查内容哈希、绑定与阅读资源，成功后清理本次旧备份；失败不能报更新全部完成，按 `.work/setup/local-sync.json` 修复后重跑。源依赖约束、构建依赖或 thirdparty 锁有变化时先按 `docs/integrations.md` 完成对应安装/验证，局部同步不能代替依赖升级验收。仅文档/Wiki 内容通过 checkout 直接读取，但仍检查整个安装状态；同步完成后提醒新会话载入。其他安装目录只在明确选定时同步，不扫描所有 Agent；不自动更新 HCU-Knowledge。
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。
 
@@ -43,7 +47,7 @@ TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查�
 
 ## 运行约定
 
-先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
+仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 

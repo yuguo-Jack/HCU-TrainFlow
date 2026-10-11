@@ -5,6 +5,10 @@ description: 检查 HCU 训练环境并准确适配预训练、SFT、RL 模型�
 
 # HCU 训练环境检查与模型适配
 
+## 开始前定位与阅读
+
+先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。
+
 支持 `environment` 单独验收或 `adapt/full` 推进模型。先确定模式，环境检查任务交付检查结果后即可结束，不强行开始训练。
 
 同一流程适用于 Torch 原生的视频生成、VLA、世界模型等训练。核对数据解码/采样、时空输入与 mask、loss 分量、冻结模块、EMA、autograd 和 optimizer 语义；优化专项交给原 optimize Skill。仅缩 layer 的代理可用于跑通与筛机，记录代理配置及未覆盖范围，不作为完整模型显存、收敛或扩 DP 的证明；模型不适合缩层时，或用户明确允许缩维时，用显式授权列出每个可缩减维度并核对架构约束，不能暗改其他参数。详见项目 docs/proxy-contract.md。
@@ -18,7 +22,7 @@ description: 检查 HCU 训练环境并准确适配预训练、SFT、RL 模型�
 3. **建立验收矩阵。** 覆盖全部分配节点/设备的健康、GEMM、HBM、机内互联，以及适用 NIC/拓扑的机间通信与 RCCL 正确性。预期必须有硬件/同环境测量/用户资料依据，dtype、shape、单位和消息量可比。按项目 `docs/environment-discovery.md` 第 5 节归并硬件基线：型号/gfx、有效计算资源、存储容量/层级、频率/功耗，以及分精度/指令路径的算力和带宽参考；明确标称、现场实测、历史参考与未知项，绑定原件，交给后续算子建模。被动检查和主动压测分开；主动操作只在任务授权资源内执行。
 4. **选择并固定执行基线。** 公开 HYGON 与内部仓等价时优先公开；公开明显落后则参考真实活跃内部实现。比较模型支持、关键功能与依赖，不仅看默认分支或最新提交时间。起点可直接选适用的 HCU 主仓；否则采用可用的模型功能分支/用户 patch。将实际执行仓、基点、工作分支与最终交付仓、目标分支分别记录。完整任务先在同一执行基线上做完适配、优化、阶段 loss、扩 DP 和容错验证，再整合交付；不能因主仓更新或交付目标不同而中途迁移。保留用户 patch；开发 checkout 不得借用 HCU-Knowledge 缓存。锁官方、HCU、底层库和 submodule 提交；例外和回归范围见 [执行基线与交付顺序](references/workflow.md#适配工作树与最终交付)。
 5. **结合现场环境，优先复用 HCU 启动配方。** 先读所选 HCU 仓当前适用分支中的模型脚本、配置及其调用的环境/启动脚本，结合用户现有 patch 和部署方式使用。已有同模型配方优先；没有则参考同引擎相近模型的 HCU 配方，明确差异后适配。NV 官方配方与 official-megatron-wiki 用于核对模型、数据和训练语义；缺少 HCU 配方时才据此构建适合实际 HCU 环境的启动方案。逐项核对环境变量、依赖和 launcher，不能直接照搬 NV 命令，也不能默认旧 HCU 脚本仍有效。具体检查见 [启动配方选择与核对](references/workflow.md#启动配方选择与核对)。先核对完整模型容量：参考 HCU Train Sim 的匹配 adapter/源码、真实可用卡数和显存余量，模拟可行后短跑校准，能放下就直接全参适配和优化（可先一个最小可行 DP 实例）。卡确实不够才优先缩 num_layers；模拟不支持模型不等于容量不足，不能直接据此缩模。详见项目 `docs/practices/capacity-and-parallel-experiments.md`。用户明确允许维度缩减时，`proxy-check --authorization` 记录范围，另核对 head/分片/残差边界等约束。区分 decoder 层数和引擎子层 entry 数，完整模型仍需后续验收。
-若配方依赖 Primus Turbo 或专用通信后端，按项目 `skills/hcu-train-optimize/references/hcu-library-integration.md` 核对 HCU 分支、ABI、目标架构和实际加载；不要先全量安装候选库。
+若配方依赖 Primus Turbo 或专用通信后端，按项目 `skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md` 核对 HCU 分支、ABI、目标架构和实际加载；不要先全量安装候选库。
 
 模型范围变更时，按用户当前约束显式核对结构参数及辅助模块，记录实际层映射与配置差异；“只缩层”不能夹带宽度、专家数、跨层状态分组或辅助训练目标变化。重新评估并行分片和初始化峰值，创建新比较上下文；旧性能、热点与 loss 仍保留为历史证据。容量不足先重规划，不自行扩大缩模范围；已运行任务按部署约定安全收尾。
 
@@ -58,7 +62,7 @@ adapt/full 另交全参容量判断（模型覆盖、模拟工具/版本、布�
 
 ## 运行约定
 
-先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
+仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
 
 主 Agent 在本地主控，专家分工记录 owner、scope、允许修改路径、预算与验收证据。运行代码使用独立开发 checkout 和不可变源快照；远端只执行明确命令/守护，不要求部署模型 Agent。TaskSpec 的 execute/sync/notify 权限是任务约定，不是 OS 安全沙箱。实际节点、容器、Pod UID、Slurm allocation 由部署任务确认。
 

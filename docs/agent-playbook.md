@@ -2,6 +2,8 @@
 
 这是 `$hcu-trainflow` 在新任务、换 Agent 或中断恢复时的阅读入口。它把阶段决策串起来；具体工具和参数以对应 Skill、当前 CLI 帮助及实际部署源码为准。Agent 负责实施，CLI 保存状态并检查契约。不要把“读完流程”或“生成报告”当作已执行训练。
 
+先按 [Skill 与文档阅读导航](skill-reading-map.md) 定位资源并选择当前模式。安装目录只复制 Skill/reference；共享 docs/Wiki 从绑定工程读取。首次使用、升级或接手时核对安装状态，成员沿用对应入口，不要求一次加载所有参考文档。
+
 ## 1. 先恢复事实，再选择动作
 
 1. **定位**：确认项目 checkout、版本、私有 workspace、Task ID 和当前模式。新任务从用户的环境、模型和目标生成 TaskSpec；已有任务先读 `task-show`、`flow-next`、BOARD/DETAILS 和三个计划文件，不能另建同名任务来绕过旧阻塞。
@@ -65,7 +67,7 @@ prepared --environment--> environment_checked --baseline--> baseline_validated
 
 ## 4. 证据怎样复用，什么变化需要重验
 
-性能决策的具体方法见 [证据驱动闭环](../skills/hcu-train-optimize/references/evidence-driven-loop.md)：区分映射/稳态/计数器/正式计时，以热点源码、重叠和融合三表安排实验；刷新旧归因，组合复验，无进展时有据换方向。异常共用规模长稳 Skill 的 [诊断指南](../skills/hcu-train-scale-and-stability/references/diagnosis.md)，维护假设及反证、可重放失败条件和下一项区分检查，不反复堆采集命令。
+性能决策的具体方法见 [证据驱动闭环](../skills/hcu-train-analyze-and-optimize/references/evidence-driven-loop.md)：区分映射/稳态/计数器/正式计时，以热点源码、重叠和融合三表安排实验；刷新旧归因，组合复验，无进展时有据换方向。异常共用规模长稳 Skill 的 [诊断指南](../skills/hcu-train-scale-and-stability/references/diagnosis.md)，维护假设及反证、可重放失败条件和下一项区分检查，不反复堆采集命令。
 
 | 变化 | 处理 |
 | --- | --- |

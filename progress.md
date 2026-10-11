@@ -244,3 +244,12 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 版本统一0.5.1；准备提交main及annotated v0.5.1，不创建GitHub Release。现场能力声明保持原验证范围。
 
 - 发布前最终核对：359条本地链接无失效；六项已安装Skill内容/绑定一致；系统Python包与源码均0.5.1；HCU-Knowledge工作树干净；origin/main无外部新增提交，v0.5.1尚不存在。四项skip为Linux专用AF_UNIX/spawn现场测试。本轮发布目标为main与annotated v0.5.1，实际远端以Git回执为准。
+
+
+## 2026-10-11：阅读导航与本机维护同步
+
+- 完成分析与优化 Skill 更名、各文档/维护关联/元数据引用和安装迁移。
+- 新增分层与模式阅读导航、资源可达性检查；更新主控和五个独立入口及其工作区说明。
+- 新增本机包/六 Skill 同步及只读校验，安装失败保留明确阶段；完整安装/CI 检查本地阅读资源。
+- 全量回归 1094 passed / 4 skipped（Windows 不支持的 Linux 路径）；之后新增完整安装资源阻断用例，定向 39 passed。490 页/25 来源 Wiki 与六 Skill 结构校验通过。
+- 本机已实际同步包和六 Skill，旧优化目录清理；同步后只读校验通过。最后文档细化后再次同步并提交推送。

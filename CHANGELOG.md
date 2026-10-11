@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Rename the performance entry to `hcu-train-analyze-and-optimize`; migrate the previous installed entry without duplicate aliases. Preserve independent analysis-only use.
+- Clarify Skill/reference/shared-doc/Wiki ownership and mode-specific reading routes, with early project discovery and offline link/reference reachability checks.
+- Add verified local package and six-Skill synchronization, read-only drift checks, and explicit installation closure for Wiki/Skill and general project maintenance. No implicit upstream or large-knowledge-base refresh.
+
 ## 0.5.1 — 2026-10-10
 
 - Strengthen performance decisions from inspected Hyperloom, GEAK and BBuf sources: evidence refresh, mapping/formal/counter timing boundaries, hotspot/overlap/fusion tables, conditional headroom, candidate engagement, combined validation and bounded strategy changes. Preserve training numerical/state contracts and HCU-specific tooling.

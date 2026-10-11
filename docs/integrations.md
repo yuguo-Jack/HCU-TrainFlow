@@ -11,7 +11,7 @@ git lfs install
 python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills"
 ```
 
-完整安装依次检查/获取三个依赖，用当前系统 Python 安装 TrainFlow、TraceLens、HCU-Knowledge 包，获取受管知识 checkout 的 LFS 原件，知识库本机索引未就绪时调用其自身 bootstrap 恢复缓存/索引，doctor 验收后安装 **11 个 Skill**：六个 TrainFlow、三个 Hygon kernel、HCU knowledge search/update。安装脚本不安装 CUDA/DTK、训练 PyTorch、TE、cuDNN 或模型；这些由实际训练环境提供。
+完整安装依次检查/获取三个依赖，校验 Skill 阅读资源，再用当前系统 Python 安装 TrainFlow、TraceLens、HCU-Knowledge 包，获取受管知识 checkout 的 LFS 原件，知识库本机索引未就绪时调用其自身 bootstrap 恢复缓存/索引，doctor 验收后安装 **11 个 Skill**：六个 TrainFlow、三个 Hygon kernel、HCU knowledge search/update。安装脚本不安装 CUDA/DTK、训练 PyTorch、TE、cuDNN 或模型；这些由实际训练环境提供。
 
 失败返回非零，`.work/setup/status.json` 记录已完成阶段与失败阶段；修复后重跑会复用依赖和当前索引。缺私有仓权限、原件、Python 依赖或可用索引时不能声称完整安装通过。仅有 checkout 不等于知识搜索就绪。Git 使用本人已保存凭据；权限需本人获得，安装器不复制其他人的账号或自动提交访问申请。
 
@@ -32,20 +32,27 @@ HCU-Knowledge 贯穿环境适配、性能优化和扩 DP/容错，按问题查�
 更新分为内容维护和本机同步，由更新 Skill 衔接完成：
 
 1. **内容维护**：`$hcu-engine-wiki-skill-update` 检查官方/相关 HCU 工程变化，修订本仓 Wiki、受影响的 Skill、命令和解析器，完成对应复核与测试。
-2. **本机同步**：仓库内容验证后，安装器将 Skill 及 references 复制到实际 Agent 的 Skills 目录，并写入目录绑定。`--replace` 允许替换已有的不同内容，本身不搜索上游、不修订知识，也不决定依赖升级。
+2. **本机同步**：仓库内容验证后，由 `sync_local_install.py` 刷新本仓 editable Python 包和六个 Skill/reference，再核对包的实际导入位置、版本、文件哈希、目录绑定及阅读资源。docs/Wiki 从绑定工程直接读取。底层安装器的 `--replace` 允许替换已有的不同内容，本身不搜索上游、不修订知识，也不决定依赖升级。
 3. **安装验收与清理**：替换期间暂存本次旧内容；全部目标的文件哈希和绑定匹配后，自动清理本次临时备份。复制或校验失败则保留备份和错误，修复后再同步。未确认状态的历史备份不由本次安装自动扫除。
 
-完整安装已就绪、仅更新本仓六个 Skill 时，由 Agent 执行：
+完整安装已就绪，维护本仓 Wiki、docs、Skill、脚本或 CLI 后，由 Agent 在完成复核时执行（无论是不是通过更新 Skill 发起）：
 
 ```powershell
-python scripts/install_skills.py --target "$HOME/.codex/skills" --workflow-only --replace
+python scripts/sync_local_install.py --target "$HOME/.codex/skills"
+python scripts/sync_local_install.py --target "$HOME/.codex/skills" --check
 ```
 
-首次安装用 setup_trainflow；手动拉取 TrainFlow 新版本后，重新运行 setup_trainflow 并加 `--replace`，以核对包、依赖和全部 11 个入口。算子或知识库 Skill 的源版本确有变化时按对应维护范围同步，不因本仓文档变化而升级其他项目。HCU-Knowledge 的内容更新仍需单独授权。
+`--target` 使用当前 Agent 的真实安装目录，不从任务 cwd 猜测。该命令检查既有六个绑定，拒绝静默替换其他 checkout；刷新包时用 `--no-deps --no-build-isolation`，不联网获取上游、不升级依赖、不重建 HCU-Knowledge。状态写入忽略提交的 `.work/setup/local-sync.json`，含失败阶段；`--check` 只读检查，不安装或覆盖状态。内容和绑定全部验收成功才报 current；这仅证明本仓本机同步完成，不重新证明外部依赖、账号或现场硬件可用。失败可能留下部分已更新内容，检查失败阶段与保留的备份再重跑，不能声称已自动回滚。
 
-当前阶段入口是 `hcu-train-environment-check-and-adapt`、`hcu-train-optimize` 和 `hcu-train-scale-and-stability`。安装器只为较早安装保留过时目录的清理兼容，不安装旧名称或旧别名。两个 HCU 知识 Skill 的 `workspace.json` 绑定实际知识 checkout；完整复制其脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
+首次安装、安装不完整、工程搬家或 Python/构建依赖、thirdparty 锁变化时，用 `setup_trainflow.py --replace`，核对包、依赖和全部 11 个入口。普通手动 pull 之后可执行上述局部同步；依赖清单变化则走完整安装和对应回归。算子或知识库 Skill 的源版本确有变化时按对应维护范围同步，不因本仓文档变化而升级其他项目。HCU-Knowledge 的内容更新仍需单独授权。
+
+这是 Agent 维护流程的收尾动作，不是后台文件监视器：只运行 Git pull、单独调用 wiki-update CLI 或修改文件不会触发安装。通过更新 Skill 或按本仓 AGENTS.md 维护时，Agent 应执行同步并报告结果。已运行会话不会因此自动重载指令；完成后新开会话，当前仍在工作的 Agent 应重新读取受影响的 Skill/指南。
+
+当前阶段入口是 `hcu-train-environment-check-and-adapt`、`hcu-train-analyze-and-optimize` 和 `hcu-train-scale-and-stability`。安装器只为较早安装保留过时目录的清理兼容，不安装旧名称或旧别名。两个 HCU 知识 Skill 的 `workspace.json` 绑定实际知识 checkout；完整复制其脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
 
 六个 TrainFlow Skill 的安装目录各有 `workspace.json`，其中 `project_root` 指向本次安装使用的工程绝对路径；个人路径只写入安装目录，不写入仓库源文件。新会话从其他工作目录使用 Skill 时，先采用用户明确指定的项目或 `TRAINFLOW_PROJECT`，未指定时读取该绑定。绑定只用于定位项目，不设置或覆盖任务的 `TRAINFLOW_WORKSPACE`。工程搬家后从新位置运行安装器并加 `--replace`，校验新绑定成功后清理本次旧备份；两个 HCU 知识 Skill 的 `root` 继续独立指向知识 checkout。
+
+因此要保留工程 checkout；只复制系统 Skills 目录不足以移植完整 TrainFlow。Skill/reference、共享 docs 和 Wiki 的分工及按模式阅读入口见 [阅读导航](skill-reading-map.md)。`python scripts/check_skill_resources.py` 离线检查本地 Markdown 链接、Skill 入口中的工程路径和 reference 可达性；文件检查不代表 Agent 已阅读全文或真实实验已通过。
 
 飞书在线检索另外安装/配置 `lark-cli` 并用本人身份授权；浏览器辅助访问按需配置 `playwright-cli`。离线索引就绪不表示在线权限就绪，任务启动和使用在线来源时检查实际请求状态。Git、飞书和浏览器的身份分别管理。详细知识安装与权限规则见实际知识库的 `docs/installation.md`。
 
@@ -116,4 +123,4 @@ fork 保留原有模块、API 和全部 13 个 console 命令。TrainFlow 的两
 
 ## 训练环境中的 HCU 库
 
-TE、Flash-Train、HCU Primus Turbo、RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP等按实际模型和瓶颈选择；它们不是本地主控安装时统一替换的依赖。先查HCU大知识库，再核对活动分支与镜像ABI，必要时在任务隔离前缀/容器构建候选，保留旧制品。接口、验证与PR归属见[工程联动](../skills/hcu-train-optimize/references/hcu-library-integration.md)。
+TE、Flash-Train、HCU Primus Turbo、RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP等按实际模型和瓶颈选择；它们不是本地主控安装时统一替换的依赖。先查HCU大知识库，再核对活动分支与镜像ABI，必要时在任务隔离前缀/容器构建候选，保留旧制品。接口、验证与PR归属见[工程联动](../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。

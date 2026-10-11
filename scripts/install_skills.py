@@ -13,9 +13,10 @@ sys.path.insert(0, str(ROOT / 'src'))
 from hcu_trainflow.dependencies import knowledge_ready, require_checkout
 from hcu_trainflow.core import FlowError
 
-NAMES = ('hcu-trainflow','hcu-train-environment-check-and-adapt','hcu-train-optimize','hcu-train-scale-and-stability','hcu-engine-wiki-search','hcu-engine-wiki-skill-update')
+NAMES = ('hcu-trainflow','hcu-train-environment-check-and-adapt','hcu-train-analyze-and-optimize','hcu-train-scale-and-stability','hcu-engine-wiki-search','hcu-engine-wiki-skill-update')
 # Cleanup compatibility only: install the current entry once, with no aliases.
 RENAMED = {
+    'hcu-train-optimize': 'hcu-train-analyze-and-optimize',
     'hcu-train-adapt': 'hcu-train-environment-check-and-adapt',
     'hcu-train-fault-tolerance': 'hcu-train-scale-and-stability',
     'hcu-train-prepare': 'hcu-train-environment-check-and-adapt',
@@ -84,7 +85,10 @@ def main():
     parser.add_argument('--replace',action='store_true',help='Replace installed Skills; clean temporary backups only after all copies and bindings verify')
     parser.add_argument('--with-kernel-skills',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--workflow-only',action='store_true',help='Developer-only six-Skill refresh; not a complete TrainFlow installation')
+    parser.add_argument('--check',action='store_true',help='Read-only check of installed files, bindings and obsolete names; exit nonzero on drift')
     args=parser.parse_args()
+    if args.check and args.replace:
+        parser.error('--check and --replace cannot be combined')
     sources={name: ROOT/'skills'/name for name in NAMES}
     knowledge = None
     if not args.workflow_only:
@@ -115,12 +119,22 @@ def main():
         if not (source/'SKILL.md').is_file():parser.error('Missing source Skill: '+str(source))
         dest=checked_destination(target,name)
         if dest.is_relative_to(source.resolve()) or source.resolve().is_relative_to(dest):parser.error('Install outside source Skills: '+name)
-        if dest.exists() and tree_hash(dest)!=expected[name] and not args.replace:
+        if dest.exists() and tree_hash(dest)!=expected[name] and not args.replace and not args.check:
             parser.error('Existing different installation; inspect it then use --replace: '+name)
     for old in RENAMED:
         dest=checked_destination(target,old)
-        if dest.exists() and not args.replace:
+        if dest.exists() and not args.replace and not args.check:
             parser.error('Obsolete Skill entry found; inspect it then use --replace to install current names: '+old)
+    if args.check:
+        issues = [name+': missing or different content/binding' for name in sources
+                  if tree_hash(checked_destination(target,name)) != expected[name]]
+        issues.extend(old+': obsolete entry still installed' for old in RENAMED
+                      if checked_destination(target,old).exists())
+        print(json.dumps({'status':'incomplete' if issues else 'current',
+                          'checked_skills':len(sources), 'issues':issues},ensure_ascii=False))
+        if issues:
+            raise SystemExit(1)
+        return
     backups=[]
     for old in RENAMED:
         dest=checked_destination(target,old)

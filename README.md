@@ -41,7 +41,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 - **复用与深入实现**：优先复用 HCU TE、Flash-Train、Primus Turbo 等能力，对齐融合粒度和数值契约；缺 HIP 基线时先调用 baseline Skill，再进入 HIP 优化，已有 Triton 实现调用 Triton 优化 Skill。融合后仍有显著空间就继续迭代，瓶颈时使用实际性能工具；数学库有性能缺口时提取原生日志中的完整 bench 命令用于 tune。通信按需联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等。
 - **稳定阶段验 loss**：每轮做局部正确性、多形状和无 profiler 性能回归，集成后重测整步净收益；稳定阶段从同一冻结初态与配方比较 loss、性能和显存。达到目标、接近可达上限、无稳定收益或受阻，都须给出证据与停止依据。
 
-同一阶段包含 [Torch 原生训练专项](skills/hcu-train-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。机制选择联查官方教程与 PR、AMD Primus、MindSpeed 系列、LoongForge 和 HCU 底层源码。详见[热点排序与算子迭代](skills/hcu-train-optimize/references/operator-ceiling-iteration.md)。
+同一阶段包含 [Torch 原生训练专项](skills/hcu-train-analyze-and-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。机制选择联查官方教程与 PR、AMD Primus、MindSpeed 系列、LoongForge 和 HCU 底层源码。详见[热点排序与算子迭代](skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。
 
 ### 3. 扩 DP 域、容错与持续训练
 
@@ -53,7 +53,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 本地主控按依赖和收益拆解任务，独立方向并行，共享资源测量与耦合修改协调执行；代码以固定快照同步远端，超时或断线先核查原作业。HCU-Knowledge、局部官方 Wiki、PR 与源码查证贯穿三个阶段，看板持续展示技术结论并采集指导。各阶段按范围交付代码、配方、验证和回退方法；完整任务在执行基线上完成约定验证后再整合目标主仓，精选通用经验和最终里程碑进入共享 Wiki。
 
-阶段入口分别为 `$hcu-train-environment-check-and-adapt`（环境检查与模型适配）、`$hcu-train-optimize`（性能分析与优化）、`$hcu-train-scale-and-stability`（规模扩展与长稳运行）；统一委托仍使用 `$hcu-trainflow`。发生异常时按 [故障诊断指南](skills/hcu-train-scale-and-stability/references/diagnosis.md) 分流，结合 HCU 知识库、线上 PR 与实际源码查证，修复后回到对应阶段验收。
+阶段入口分别为 `$hcu-train-environment-check-and-adapt`（环境检查与模型适配）、`$hcu-train-analyze-and-optimize`（性能分析与优化）、`$hcu-train-scale-and-stability`（规模扩展与长稳运行）；统一委托仍使用 `$hcu-trainflow`。发生异常时按 [故障诊断指南](skills/hcu-train-scale-and-stability/references/diagnosis.md) 分流，结合 HCU 知识库、线上 PR 与实际源码查证，修复后回到对应阶段验收。
 
 完整分支、优化回路、独立任务与验收条件见 [工作流全景](docs/workflow-map.md)。
 
@@ -113,7 +113,14 @@ $env:TRAINFLOW_WORKSPACE = "D:/trainflow-work/my-task"
 
 日常维护使用 `$hcu-engine-wiki-skill-update`，由 Agent 检查官方与相关 HCU 工程变化，更新局部 Wiki、受影响的流程和 Skill，验证后同步本机安装。普通维护不更新 HCU-Knowledge，也不自动替换正在运行的训练依赖。
 
-手动拉取 TrainFlow 新版本后，可重新运行安装命令并加 `--replace`。这个参数只允许用已经核对的仓库内容替换本机已安装 Skill；内容查证与修订由更新 Skill 完成。安装器在全部内容及目录绑定校验成功后清理本次临时旧版本备份，失败时保留备份供恢复。完成后重新打开 Agent 会话。具体步骤见[维护与本机同步](docs/integrations.md#skills账号与升级)。
+已有完整安装时，更新 Skill 和本工程维护流程都会在验证后执行本机同步；手动 pull 后也可执行：
+
+```powershell
+python scripts/sync_local_install.py --target "$HOME/.codex/skills"
+python scripts/sync_local_install.py --target "$HOME/.codex/skills" --check
+```
+
+它刷新本仓 Python 包、六个 Skill/reference 并检查绑定与阅读资源，成功后清理本次临时旧备份。只运行 Git pull 或 wiki-update CLI 不会自动安装。首次安装、搬家或依赖清单变化仍用完整安装命令并加 `--replace`；普通同步不升级其他工程。完成后新开 Agent 会话。具体步骤见[维护与本机同步](docs/integrations.md#skills账号与升级)。
 
 ## 本地验证与阅读入口
 
@@ -124,18 +131,21 @@ hcu-trainflow collaboration-demo .work/collaboration-first
 hcu-trainflow demo .work/analysis-first
 python -m pytest -q
 python scripts/validate_knowledge.py
+python scripts/check_skill_resources.py
 ```
 
 两个 demo 使用合成输入，分别演示协作协议和训练分析/监测；不需要 GPU，不构成真实训练验证。每次演示使用新目录。
 
 | 目录 | 内容 |
 | --- | --- |
-| `skills/` | 统一协作入口、阶段流程和 Wiki 检索/更新 |
+| `skills/` | 入口、阶段决策与 Wiki 检索/更新；各自 `references/` 保存对应详细方法 |
 | `src/hcu_trainflow/` | 持久任务、复核循环、执行与证据、分析和监测 |
 | `knowledge/` | 官方训练引擎与生态 Wiki、固定来源、维护关联 |
 | `docs/` | 协作约定、安装、契约、部署及验证说明 |
 | `examples/`、`tests/` | 合成示例与本地回归 |
 | `thirdparty/` | 依赖清单和忽略提交的工具 checkout |
+
+安装后，Skill/reference 位于 Agent 系统目录，共享 docs 和 Wiki 通过 `workspace.json` 读取工程中的同一份内容，需保留 checkout。[阅读导航](docs/skill-reading-map.md) 列出每个模式的开始与条件入口；[性能方法来源](docs/practices/performance-methods.md) 说明 Hyperloom、GEAK、BBuf 的采用位置与调整依据。
 
 任务源码、完整日志/trace/checkpoint、数据与看板保存在独立 workspace；默认 `.work/` 忽略提交。工程 Wiki 仅包含官方资料、可复用环境经验和模型最终优化总结；工作流方法在 docs/skills，过程记录不进入 Wiki；凭据、私钥和 token 不入仓。
 

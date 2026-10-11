@@ -38,7 +38,7 @@ flowchart TD
 ```
 
 - **全流程入口：**`hcu-trainflow` 协调三个阶段 Skill，保留循环状态、证据和人的指导。
-- **独立入口：**`hcu-train-environment-check-and-adapt` 可仅检查环境；`hcu-train-optimize` 可仅分析性能；`hcu-train-scale-and-stability` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
+- **独立入口：**`hcu-train-environment-check-and-adapt` 可仅检查环境；`hcu-train-analyze-and-optimize` 可仅分析性能；`hcu-train-scale-and-stability` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
 - **持续运行：**启动训练不等于完成任务；尚在约定监测范围内就继续观测和处理异常。完成或交接须有明确条件、责任人和证据。
 
 ## 2. 环境验收与模型适配
@@ -96,7 +96,7 @@ flowchart TD
 
 ## 3. 性能分析、优化与验证
 
-图中每轮采集、分流和验证遵循 [证据驱动闭环](../skills/hcu-train-optimize/references/evidence-driven-loop.md)：根据实际结构变化刷新 profile，以热点源码、依赖重叠和融合契约共同决定下一轮；只分析模式交付证据和建议。参考方法的采用范围见 [性能方法](practices/performance-methods.md)。
+图中每轮采集、分流和验证遵循 [证据驱动闭环](../skills/hcu-train-analyze-and-optimize/references/evidence-driven-loop.md)：根据实际结构变化刷新 profile，以热点源码、依赖重叠和融合契约共同决定下一轮；只分析模式交付证据和建议。参考方法的采用范围见 [性能方法](practices/performance-methods.md)。
 
 ### 3.1 系统调参与瓶颈定位
 
@@ -209,7 +209,7 @@ flowchart TD
 - **工具与归属：**XProf/XCompute 与 hipprof 按实际环境分别使用；必要时查底层库对应分支，不能用不匹配的软件栈解释现场行为。数学库确有性能缺口时提交原生日志中的完整 bench 命令，框架 shape 表只是附件；hipBLASLt/groupGEMM 当前不承诺自动 tune。
 - **数值晋级：**稳定阶段按[阶段 A/B](training-state-validation.md#优化里程碑的阶段-ab-loss)建立同初态、同配方对照，登记[可重算的质量输入](contracts.md#qualitycontract-与记录)。程序核验身份和原件完整性；原件与实际运行是否一致仍由负责 Agent 和独立 reviewer 复核。局部收益或旧报告的 pass 不替代阶段质量。
 
-详细约束见 [性能分析](profiling.md)、[优化 Skill](../skills/hcu-train-optimize/SKILL.md) 与 [三个阶段工作流](workflows.md)。
+详细约束见 [性能分析](profiling.md)、[优化 Skill](../skills/hcu-train-analyze-and-optimize/SKILL.md) 与 [三个阶段工作流](workflows.md)。
 
 ### 3.4 Torch 原生训练专项（沿用同一优化闭环）
 
@@ -232,7 +232,7 @@ flowchart TD
     VERIFY -->|候选稳定| LOSS["回共同阶段 loss / 质量验收<br/>沿用 flow 复核与私有经验"]
 ```
 
-它补充 PyTorch 路径特有分析，不重复环境验收、热点上限建模、算子实现、扩 DP 和容错。AOTI/export 仅在真实使用该路径且训练/子模块契约明确时评估，不能默认替代训练编译。详见 [Torch 原生训练指引](../skills/hcu-train-optimize/references/torch-native-training.md)。
+它补充 PyTorch 路径特有分析，不重复环境验收、热点上限建模、算子实现、扩 DP 和容错。AOTI/export 仅在真实使用该路径且训练/子模块契约明确时评估，不能默认替代训练编译。详见 [Torch 原生训练指引](../skills/hcu-train-analyze-and-optimize/references/torch-native-training.md)。
 
 ### 3.5 通信调度、overlap 与通算融合
 
@@ -259,7 +259,7 @@ flowchart TD
     PASS -->|是| OUT["纳入共同候选与阶段 loss<br/>混合通算 kernel 仍建计算效率模型"]
 ```
 
-时间线相交只是观察；不等于通信已隐藏，也不保证训练更快。不同 Agent 共享同一 process-group/协议版本；耦合的同步与 buffer 生命周期由同一 owner 负责，设备/网络测量按资源协调。详见 [通信优化指引](../skills/hcu-train-optimize/references/communication-optimization.md)。
+时间线相交只是观察；不等于通信已隐藏，也不保证训练更快。不同 Agent 共享同一 process-group/协议版本；耦合的同步与 buffer 生命周期由同一 owner 负责，设备/网络测量按资源协调。详见 [通信优化指引](../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)。
 
 ## 4. 每阶段共用：实施、独立复核、修正
 

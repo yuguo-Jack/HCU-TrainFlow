@@ -194,3 +194,12 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 - 故障方法补充：假设及反证、可重放条件、采集缺失的降级、有界版本二分、节点/绑定交叉矩阵、四种异步完成、RL worker/同步/峰值/恢复边界。适配补能力分层修复、graph/backward初始化，性能异常与统一主控互通。
 - 发现并修复 analysis.model_operator 中 slowdown_threshold 不做有限性校验、其他阈值在早分支下未验证的问题；增加可复算 bound_terms_us/limiting_terms/算术强度，允许copy的零FLOPs，拒绝派生溢出。标签保持条件模型而非物理瓶颈。
 - 独立只读前向检验：graph/eager与过期shape、噪声小收益候选、OOM累计值/异步wait/混合attempt场景均正确保留证据缺口；20步合成trace计算并集74%、未解释26%、覆盖目标未达。未发现可行动的新问题。不是新HCU现场验收。
+
+
+## 2026-10-11：Skill 阅读分层与安装一致性
+
+- 已核实本机 Python editable 包绑定 D:/codex/projects/HCU-TrainFlow，六个系统 Skill 通过 workspace.json 绑定工程；docs/Wiki 不复制进系统 Skills，需保留 checkout。
+- 方法来源页与执行 references 职责不同。补充 docs/skill-reading-map.md，前移工程定位，明确按模式和条件读正文；详细文档链接不会自动注入上下文。
+- 独立阶段 references/workflow.md 的旧提示只提显式路径，现统一补充 workspace.json 绑定，避免与入口冲突。
+- 更新 Skill 原收尾仅针对 Skill/reference。现所有本仓维护接入 sync_local_install.py，刷新 editable 包与六个入口；只读检查不安装，不更新第三方或大知识库。依赖清单变化仍走完整安装。
+- 安装器迁移 hcu-train-optimize → hcu-train-analyze-and-optimize，无旧别名；缺资源、安装漂移、错误绑定有非零检查。完整安装和 CI 增加阅读资源检查。

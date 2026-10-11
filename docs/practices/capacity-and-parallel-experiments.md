@@ -62,7 +62,7 @@ hcu-train-sim run config.yaml --no-report
 - **统一复验与集成。** 汇总兼容改动与冲突，主控在共同参考实例上配对复验后组合，核对真实性能、显存、dispatch 与局部正确性。稳定候选才做阶段 loss，不让每个 Agent 频繁长时验 loss。多项收益不能简单相加。
 - **筛选最终总结。** 公共基线、实例/资源与变量、成对结果、失败条件、组合复验和阶段 loss 先记录在任务档案；当前优化阶段结束后，仅将最终总结与关键数据按知识架构筛选进入 `knowledge/experiments/`。中间候选与完整 trace 不进入共享 Wiki。
 
-协议复用 [多 Agent 协同](../multi-agent.md)、[代理范围](../proxy-contract.md) 和 [优化 Skill](../../skills/hcu-train-optimize/SKILL.md)，不另建调度系统。
+协议复用 [多 Agent 协同](../multi-agent.md)、[代理范围](../proxy-contract.md) 和 [优化 Skill](../../skills/hcu-train-analyze-and-optimize/SKILL.md)，不另建调度系统。
 
 ## 5. 持续维护
 

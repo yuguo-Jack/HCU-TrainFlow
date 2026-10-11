@@ -222,3 +222,11 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [x] 版本统一 0.5.1，同步本机 Skill；全部检查完成，按本轮发布操作提交并 push main 和 annotated v0.5.1；不创建 GitHub Release。
 
 仅维护 TrainFlow；不刷新 HCU 大知识库、不启动实际训练或自动升级运行依赖。用户所说 hyperloop 按本会话已明确参考的 Hyperloom 解读。
+
+
+## 2026-10-11：阅读分层、分析与优化命名及本机同步
+
+- [x] 核对并明确 Skill / references / docs / Wiki 的职责与模式阅读路径。
+- [x] 分析与优化入口更名，更新引用、维护关联和安装迁移。
+- [x] 完善工程维护后的本机包/Skill 同步与只读校验，明确依赖范围。
+- [x] 全面回归、安装验收和审查后提交推送 main；本轮不新增 tag。

@@ -82,6 +82,18 @@ def test_index_failure_blocks_skills_and_replaces_old_success(tmp_path, monkeypa
     assert not any('install_skills.py' in str(x) for x in commands)
 
 
+def test_full_setup_blocks_install_on_broken_reading_resources(tmp_path, monkeypatch):
+    module = setup_fakes(monkeypatch, tmp_path)
+    commands = []
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return SimpleNamespace(returncode=1 if any('check_skill_resources.py' in str(a) for a in argv) else 0)
+    with pytest.raises(FlowError, match='skill-resources'):
+        module.setup(tmp_path, tmp_path/'skills', run=run)
+    assert not any('pip' in c or any('install_skills.py' in str(a) for a in c) for c in commands)
+    assert json.loads((tmp_path/'.work/setup/status.json').read_text())['failed_stage'] == 'skill-resources'
+
+
 def test_default_installer_copies_eleven_and_binds_knowledge(tmp_path, monkeypatch):
     module = script('install_skills')
     module.ROOT = tmp_path
@@ -291,3 +303,147 @@ def test_reuse_only_current_external_index(tmp_path, monkeypatch, current, rollb
     reused = current and not rollback
     assert ('knowledge-bootstrap-reused' in result['completed_stages']) == reused
     assert any('bootstrap' in x for x in commands) != reused
+
+
+def test_analysis_skill_migration_and_readonly_drift_check(tmp_path, monkeypatch):
+    module = script('install_skills')
+    module.ROOT = tmp_path/'project'
+    target = tmp_path/'installed'
+    for name in module.NAMES:
+        source = module.ROOT/'skills'/name
+        source.mkdir(parents=True)
+        (source/'SKILL.md').write_text('current '+name)
+    old = target/'hcu-train-optimize'
+    old.mkdir(parents=True)
+    (old/'SKILL.md').write_text('old optimization entry')
+    argv = ['install_skills.py', '--target', str(target), '--workflow-only']
+    monkeypatch.setattr(sys, 'argv', [*argv, '--check'])
+    before = module.tree_hash(target)
+    with pytest.raises(SystemExit) as error:
+        module.main()
+    assert error.value.code == 1 and module.tree_hash(target) == before
+    monkeypatch.setattr(sys, 'argv', [*argv, '--replace'])
+    module.main()
+    new = target/'hcu-train-analyze-and-optimize'
+    assert new.is_dir() and not old.exists()
+    monkeypatch.setattr(sys, 'argv', [*argv, '--check'])
+    module.main()
+    (new/'SKILL.md').write_text('stale installed entry')
+    before = module.tree_hash(target)
+    with pytest.raises(SystemExit):
+        module.main()
+    assert module.tree_hash(target) == before
+
+
+def resource_fixture(project):
+    (project/'docs').mkdir(parents=True)
+    (project/'docs/skill-reading-map.md').write_text('# Reading routes\n')
+    skill = project/'skills/example'
+    (skill/'references').mkdir(parents=True)
+    (skill/'SKILL.md').write_text('Read `docs/skill-reading-map.md` and [detail](references/detail.md).\n')
+    (skill/'references/detail.md').write_text('# Detail\n')
+    return skill
+
+
+def test_reading_resources_detect_missing_guide_and_unreachable_reference(tmp_path):
+    module = script('check_skill_resources')
+    skill = resource_fixture(tmp_path)
+    assert module.check_resources(tmp_path)['status'] == 'current'
+    (skill/'references/detail.md').unlink()
+    (skill/'references/orphan.md').write_text('Never linked')
+    result = module.check_resources(tmp_path)
+    assert result['status'] == 'incomplete'
+    assert any('missing' in s and 'detail.md' in s for s in result['issues'])
+    assert any('no reading route' in s and 'orphan.md' in s for s in result['issues'])
+
+
+def test_reading_resources_handle_external_paths_examples_and_project_escape(tmp_path):
+    module = script('check_skill_resources')
+    resource_fixture(tmp_path)
+    page = tmp_path/'docs/skill-reading-map.md'
+    page.write_text('Upstream has `docs/external.md`. [Online](https://example.org/docs/guide.md)\n'
+                    '```markdown\n[Example](missing-example.md)\n```\n')
+    assert module.check_resources(tmp_path)['status'] == 'current'
+    page.write_text('[Escape](../../outside.md)\n')
+    assert any('leaves project' in s for s in module.check_resources(tmp_path)['issues'])
+
+
+def sync_fixture(tmp_path):
+    module = script('sync_local_install')
+    project, target = tmp_path/'project', tmp_path/'installed'
+    resource_fixture(project)
+    for name in module.NAMES:
+        write_json(target/name/'workspace.json', {'project_root': str(project.resolve())})
+    return module, project, target
+
+
+def test_local_sync_is_bounded_and_checks_package_before_replacing_skills(tmp_path):
+    module, project, target = sync_fixture(tmp_path)
+    commands = []
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0)
+    result = module.sync(project, target, run=run)
+    assert result['status'] == 'current'
+    assert result['completed_stages'] == ['preflight', 'package-install', 'package-check', 'skills-install', 'skills-check']
+    assert '--no-deps' in commands[0] and '--no-build-isolation' in commands[0]
+    assert '-I' in commands[1]
+    assert '--replace' in commands[2] and '--workflow-only' in commands[2]
+    assert '--check' in commands[3]
+    assert not any('setup_trainflow.py' in str(c) or 'git' in c for c in commands)
+    assert json.loads((project/'.work/setup/local-sync.json').read_text())['status'] == 'current'
+
+
+@pytest.mark.parametrize('failed_stage', ['package-install', 'package-check', 'skills-install', 'skills-check'])
+def test_failed_local_sync_never_leaves_old_success(tmp_path, failed_stage):
+    module, project, target = sync_fixture(tmp_path)
+    write_json(project/'.work/setup/local-sync.json', {'status': 'current'})
+    stages = iter(['package-install', 'package-check', 'skills-install', 'skills-check'])
+    def run(argv, **kwargs):
+        return SimpleNamespace(returncode=1 if next(stages) == failed_stage else 0)
+    with pytest.raises(FlowError, match=failed_stage):
+        module.sync(project, target, run=run)
+    state = json.loads((project/'.work/setup/local-sync.json').read_text())
+    assert state['status'] == 'incomplete' and state['failed_stage'] == failed_stage
+
+
+def test_local_check_is_readonly_and_never_runs_pip(tmp_path):
+    module, project, target = sync_fixture(tmp_path)
+    commands = []
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0)
+    module.sync(project, target, check_only=True, run=run)
+    assert len(commands) == 2 and '-I' in commands[0] and '--check' in commands[1]
+    assert not (project/'.work').exists()
+
+
+@pytest.mark.parametrize('binding', ['foreign', 'missing'])
+def test_local_sync_refuses_missing_or_foreign_binding_before_pip(tmp_path, binding):
+    module, project, target = sync_fixture(tmp_path)
+    path = target/module.NAMES[0]/'workspace.json'
+    if binding == 'foreign':
+        write_json(path, {'project_root': str(tmp_path/'other-project')})
+    else:
+        path.unlink()
+    with pytest.raises(FlowError, match='binding'):
+        module.sync(project, target, run=lambda *a, **kw: pytest.fail('No package/Skill mutation before binding check'))
+
+
+def test_local_sync_accepts_optimization_rename_but_rejects_uninstalled_entry(tmp_path):
+    module, project, target = sync_fixture(tmp_path)
+    (target/'hcu-train-analyze-and-optimize').rename(target/'hcu-train-optimize')
+    module.check_existing_binding(project.resolve(), target.resolve())
+    (target/module.NAMES[0]/'workspace.json').unlink()
+    (target/module.NAMES[0]).rmdir()
+    with pytest.raises(FlowError, match='not installed'):
+        module.check_existing_binding(project.resolve(), target.resolve())
+
+
+def test_interrupted_local_sync_preserves_incomplete_status(tmp_path):
+    module, project, target = sync_fixture(tmp_path)
+    def run(*a, **kw):
+        raise KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        module.sync(project, target, run=run)
+    assert json.loads((project/'.work/setup/local-sync.json').read_text())['status'] == 'interrupted'

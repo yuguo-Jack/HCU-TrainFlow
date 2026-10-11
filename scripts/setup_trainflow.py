@@ -42,6 +42,7 @@ def setup(project, skills_dir, knowledge_root=None, replace=False, run=subproces
         knowledge, _ = require_checkout(project, 'hcu-knowledge')
         tracelens, _ = require_checkout(project, 'tracelens')
         state['completed_stages'].append(stage)
+        command('skill-resources', [sys.executable, '-X', 'utf8', str(project/'scripts/check_skill_resources.py')])
         command('python-packages', [sys.executable, '-m', 'pip', 'install', '-e', str(project), '-e', str(tracelens), '-e', str(knowledge)])
         kb_state = next(x for x in result['dependencies'] if x['id'] == 'hcu-knowledge')
         if not kb_state['external']:

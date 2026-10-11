@@ -133,7 +133,7 @@ HCU 的环境与启动脚本决定实际部署方式；官方模型和训练代�
 
 Torch 原生训练在同一流程中加强输入流水、autograd、DDP/FSDP、`compile`、断图、重编译及前后向图分析。RL 还需拆开训练、rollout、推理、权重同步和样本流转，核对策略版本、logprob、reward 与样本时效。
 
-机制参考包括官方教程、开发分支和 PR，也包括 AMD Primus 系列、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 的适用实现。先查清适用条件和依赖，再在 HCU 上验证。见[性能分析](profiling.md)、[Torch 专项](../skills/hcu-train-optimize/references/torch-native-training.md)和[通信专项](../skills/hcu-train-optimize/references/communication-optimization.md)。
+机制参考包括官方教程、开发分支和 PR，也包括 AMD Primus 系列、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 的适用实现。先查清适用条件和依赖，再在 HCU 上验证。见[性能分析](profiling.md)、[Torch 专项](../skills/hcu-train-analyze-and-optimize/references/torch-native-training.md)和[通信专项](../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)。
 
 ## 6. 算子优化：同形状对照、上限建模与迭代实现
 
@@ -179,7 +179,7 @@ GEMM 确有性能缺口时，从 rocBLAS/hipBLASLt 的日志提取可复现的 *
 
 记录模型内耗时、独立耗时、当前效率、剩余空间、尝试结果和下一步。停止原因可以是接近可达上限、收益不稳定、资源或接口受限、质量风险、预算耗尽或需要专家支持；原因必须有证据。做出一个融合版本，并不自动表示该热点已完成优化。
 
-详细方法与交接表见[热点排序、上限评估与算子迭代](../skills/hcu-train-optimize/references/operator-ceiling-iteration.md)和[底层库联动](practices/hcu-library-routing.md)。
+详细方法与交接表见[热点排序、上限评估与算子迭代](../skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)和[底层库联动](practices/hcu-library-routing.md)。
 
 ## 7. 正确性与 loss：逐轮局部验证，稳定阶段严格对照
 
