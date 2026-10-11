@@ -166,6 +166,14 @@ def test_broken_authored_pr_link_is_detected(project):
     assert len(result) == 1 and 'broken local knowledge link' in result[0]
 
 
+def test_authored_links_use_exact_case_on_case_insensitive_hosts_too(project):
+    page(project, 'knowledge/CaseSensitive.md', {'id': 'case-target'})
+    page(project, 'knowledge/historical.md', {'id': 'historical'}, '[target](casesensitive.md)')
+    assert any('local knowledge link' in e for e in errors(project))
+    page(project, 'knowledge/historical.md', {'id': 'historical'}, '[target](CaseSensitive.md)')
+    assert errors(project) == []
+
+
 def test_matching_artifact_hash_does_not_hide_wrong_pr_identity(project):
     artifact = {'repository': 'other/tool', 'number': 12}
     name = 'knowledge/evidence/prs/org--tool/12.json'

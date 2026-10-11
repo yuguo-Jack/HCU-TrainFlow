@@ -1,5 +1,6 @@
 """Validate Wiki IDs, pinned source hashes/paths and maintenance targets offline."""
 import json
+import os
 from pathlib import Path
 import sys
 import hashlib
@@ -137,9 +138,19 @@ def validate_authored_links(root, path, body):
         target = urlsplit(link.strip('<>'))
         if target.scheme or target.netloc or not target.path:
             continue
-        dest = (path.parent / unquote(target.path)).resolve()
-        if not dest.is_relative_to(root.resolve()) or not dest.exists():
+        # Preserve authored spelling before resolve() canonicalizes case on
+        # Windows. A link that works there can still break in a Linux clone.
+        spelled = Path(os.path.abspath(path.parent / unquote(target.path)))
+        dest = spelled.resolve()
+        if not spelled.is_relative_to(root.resolve()) or not dest.is_relative_to(root.resolve()) or not dest.exists():
             errors.append(f'{path}: broken local knowledge link: {link}')
+        else:
+            parent = root.resolve()
+            for part in spelled.relative_to(parent).parts:
+                if part not in {child.name for child in parent.iterdir()}:
+                    errors.append(f'{path}: local knowledge link case mismatch: {link}')
+                    break
+                parent = parent / part
     return errors
 
 

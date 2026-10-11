@@ -277,3 +277,4 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 来源目录67项变化（含目录），保留5份HCU原始指南、37个固定源码文件证据；工具总览与Megatron profiling共同更新，22个维护目标逐项留回执，无待办。495页/25来源校验通过，代表性检索命中当前工具/专题/原文。
 - 本机TraceLens包已安装到新固定提交，TrainFlow 0.5.1 editable及六个Skill同步并核验。59个阅读页/76个可达资源无缺失。原始trace/张量/站点采集日志及中间结果留忽略目录或私有workspace；未改HCU-Knowledge。
 - 实测覆盖为gfx936/DTK26.10有界工具资格；其他硬件/版本、并发Graph、复杂有状态回放、GUI和完整训练loss仍按各自实际任务验证。TrainFlow本次提交后推送main；不新增tag/release。
+- 首次推送的Linux CI发现既有DeepSpeed案例PR目录链接大小写错误，Windows存在性检查未发现。已修正真实Git路径，并在Windows也逐层校验链接大小写；增加跨平台回归，定向33项及495页校验通过。此为新增检查暴露的文档可移植性问题，源码内容结论未改变；修复后再次同步并推送，远端最终检查以最新提交为准。

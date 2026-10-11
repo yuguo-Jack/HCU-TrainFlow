@@ -232,3 +232,4 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 - 同仓联动复核发现 Megatron profiling 专题也保留旧的 Windows-only 补丁描述；已与工具总览共同更新并绑定当前依赖，不能只修其中一页。
 - 独立审核补齐原生 Agent 的来源、CSV、架构、代码、metrics、findings 与报告内容绑定；comparative 模式绑定两侧 CSV 及比较利用率。`run` 不自动认可旧推理，需活跃 Agent 显式 review；输入变化后回执失效。
 - 发布后的 TraceLens `30f5dcd539dd4e588678e34168c7fcf726dd987e` 已在空闲 gfx936 上重跑 captured-value mm 回放，数值通过，10 个同步 device-event 样本完整；结束后无 KFD 残留。此计时不是源 trace 单 kernel 的相同范围，不据此计算模型拖慢倍数。
+- Linux CI揭示旧DeepSpeed PR链接大小写与Git目录不一致；Windows路径存在性不能单独证明可移植。链接已修复，知识校验器先保留书写大小写再核对每层目录，避免resolve规范化掩盖错误。

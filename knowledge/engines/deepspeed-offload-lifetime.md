@@ -14,7 +14,7 @@ sources: []
 
 ## 问题与动机
 
-[PR #8632 完整来源页](../prs/DeepSpeedAI--DeepSpeed/PR-8632.md) 在排查 CPU offload 下 NaN 时强化梯度存储生命周期和流顺序。范围是 ZeRO-1/2 的 optimizer CPU/NVMe offload 相关共享路径；不能推广到 ZeRO-3 或另有调度逻辑的 ZenFlow。
+[PR #8632 完整来源页](../prs/deepspeedai--DeepSpeed/PR-8632.md) 在排查 CPU offload 下 NaN 时强化梯度存储生命周期和流顺序。范围是 ZeRO-1/2 的 optimizer CPU/NVMe offload 相关共享路径；不能推广到 ZeRO-3 或另有调度逻辑的 ZenFlow。
 
 这是正确性修复，不能把“减少同步”天然视为优化。训练中的生产者、归约和 D2H 消费者可能运行在不同流上，tensor 在 Python 里仍存在也不能单独保证 buffer 没被复用。
 
