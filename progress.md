@@ -335,3 +335,7 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - README 增加九个详细任务/知识入口示例；知识验证 489 页/25 来源无错误，63 份文档的 403 个链接/锚点有效，16 张 Mermaid 渲染通过。正在执行全量回归和安装同步。
 
 - 0.6.2 本地验收：1225 passed / 4 平台跳过；本机 editable 包 0.6.2 与六个 Skill 同步并 --check 为 current，旧 Wiki 名称迁移后无残留，临时备份按安装器验证规则清理。计划按 main 提交推送、远端 CI、annotated tag 顺序发布。未刷新官方上游/大知识库，未进行远端训练实验。
+
+## 2026-10-12：能力说明补充
+
+补齐 capabilities、Wiki 查询指南、两个 Wiki Skill：官方发布/规划和 SFT/RL 模型资料本地不足时按需查询官网/仓库页面，再追特性 PR、实际模型配置和底层源码。只完善查询与维护规则，未扩充知识正文或刷新大知识库。59 个资源页、489 份知识/25 个来源及 405 个文档链接检查通过。按现有安装同步协议提交 main，原版本标签不变。

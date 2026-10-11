@@ -313,3 +313,9 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - 发布收尾：提交并推送 main，远端 CI 通过后创建并推送 v0.6.2，核验远端 SHA。
 
 不刷新上游/大知识库、不改活动训练依赖、不启动远端实验。描述性中文继续便于阅读，菜单名称使用英文标识。
+
+## 2026-10-12：能力说明与官方资料查询边界
+
+- [x] 核对 capabilities 历史、登记来源和实际搜索能力；暂不开展 Wiki 深度扩展。
+- [x] 补齐两 Wiki 入口与维护时机；明确官方 release/roadmap、SFT/RL 模型教程和底层源码的按需网页查证。
+- [x] 文档阅读资源、知识验证、链接检查通过；按现有安装同步协议收尾并提交 main，不移动既有 v0.6.2 标签。

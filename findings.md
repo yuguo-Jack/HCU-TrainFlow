@@ -276,3 +276,7 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 ## 2026-10-11：Wiki Skill 的名称与内容范围不一致
 
 中文菜单来自 TrainFlow Skill 的 agents/openai.yaml display_name；HCU-Knowledge 两个 Skill 没有这个覆盖，name 已是英文 ID。两个现有 Wiki Skill 的正文和 wiki-search 已涵盖官方资料、通用站点经验和最终模型总结，但入口名称/简介、部分导航仍称官方训练引擎。共享入库主要由 Agent 筛选；report/flow-advance 的 experience 自动记录仅落任务 Store，不能冒充已入共享 Wiki。需要把任务初期与最终收尾的调用责任写清并提供不阻塞训练的程序提醒。
+
+## 2026-10-12：官方页面回退
+
+capabilities.md 此前最近修改于 v0.6.1，v0.6.2 未单独同步 Wiki 命名/维护时机。CLI 线上自动回退仅针对 PR；Releases、roadmap Issue/Discussion/Project 与未登记官网由宿主网页工具按需查证。已实查 NVIDIA/Megatron-LM releases、roadmap issue 5676 和 verl Megatron 模型扩展官网/仓内原文，入口可读；不据此宣称全部官方网页已自动索引。

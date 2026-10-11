@@ -25,6 +25,7 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 2. 先读项目 `docs/wiki.md` 与 `docs/knowledge-architecture.md` 的“自动更新时的内容筛选”。按问题复核收录范围；已确定低相关资料在 sources.json 的 document_exclusions 登记路径模式和理由，不能只删页面让下次同步重建，也不能因目录通配符匹配就全收。`wiki-update PROJECT SOURCE` 依次检查完整树、document_globs 新文档（排除上述规则）、PR/讨论与登记源码；也可单独使用 wiki-inventory / wiki-sync-docs / wiki-sync-prs / wiki-refresh。重复运行续完 pending，检查所有阶段错误及 excluded_paths。未监测的新文件从完整树发现，按最新 commit 用 wiki-triage 记录 knowledge-added/not-relevant/deferred，不能只抓 README 宣称全仓无变化。web 来源生成内容指纹，不能当 Git SHA；TE/cuDNN 同时检查代码与官方教程。
 3. PR 来源页保存描述、普通评论、行内评论、独立 review 顶层状态/正文、文件列表及原始 JSON。首次增量发现默认最近 30 天，已保留历史 PR 每七天重新查讨论；需要扩大范围用 --since，不能称已覆盖全部历史。主动按问题 wiki-search-pr 补重要未收录 PR，再 wiki-pr 和 wiki-code 追最终代码；可显式 --retain-project 纳入公共来源页。缺 patch/分页/权限时保留失败并补证据，不将标题或初始描述直接编成案例。
 4. 比较实际 active ref 与已锁版本，处理 submodule gitlink，不用子仓 HEAD 偷换。发布计划、open PR、merged main、released 和运行可用分开。
+   官方发布与 roadmap 的查证入口见 `docs/wiki.md`“未收录的官方内容按需查证”；它们可能位于 Releases、官网、Issue/Discussion/Project，不能以 PR 采集代替。影响当前任务时按需阅读并追实现；持续策展按维护范围登记来源与覆盖缺口，未被现有采集器覆盖的页面不能宣称已自动全量同步。SFT/RL 模型专题可后续深化，当前问题仍须追官方模型配置、recipe 和 backend 源码。
 5. 对每个 affected overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
    PR 描述、review 或 diff 更新即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
 6. 按 knowledge/maintenance.json 同时检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤。HCU 命令可以依托大知识库当前内容或自主看最新工程源码；任务所用 HCU 模型脚本、其引入的环境配置、launcher 或依赖变化时，一并复核 adapt/optimize 的用法和任务配方。本仓 `knowledge/sites/` 同步维护实际站点配置与配方及关键证据；不能只更新官方 Wiki 文本。
