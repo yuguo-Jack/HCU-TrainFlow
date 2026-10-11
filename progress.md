@@ -295,3 +295,12 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 14 个 Mermaid 全部解析和渲染成功，人工检查总览图、新增 TraceLens 图与架构图；最终 237 个本地链接/章节检查无错误。489 页/25 来源知识校验无错误，59 个阅读页/77 个可达页无缺失。
 - 更新本机 Wiki 索引；系统 Python 0.5.1 editable 与六个 Skill 同步成功，独立 --check 确认 current。六个 Skill 内容本身未变，继续通过绑定读取新 docs。差异与空白校验通过，推送结果以 Git 回执为准。
 - 本轮为文档/图片变更，未重跑无关 GPU 实验或全量程序测试；没有新增实测资格、版本 tag 或上游依赖更新。
+
+## 2026-10-11：全工程衔接审查与 0.6.0
+
+- 主控检查执行/监测、热点与 TraceLens 证据、安装及知识维护入口；一名独立成员检查阶段协议、多 Agent 消息和结果依赖，修复后再次只读复核。
+- 修复截断通信完整性、晚到阻塞返工、首次启动中断重入、上下文往返旧消息四项问题；新增13个参数化后的回归用例，相关132项通过，全量1167通过、4项Linux专用测试在Windows跳过。
+- 流程图不标工程版本，修订分析/独立优化/全流程质量分流、TraceLens入口、监测时钟、状态交接与恢复资格。README、包元数据和changelog统一0.6.0；历史版本记录保留。
+- 两套全新目录的合成演示完成；16张工程Mermaid成功渲染，PNG无版本，390个链接/锚点、489页/25来源Wiki及59阅读页/78可达页均通过。
+- 系统Python editable升级0.6.0，六个系统Skill及绑定校验current；优化Skill已替换，其余保持当前。独立 --check 及 hcu-trainflow --version 确认一致。临时备份自动清理，新会话载入新版。
+- sdist隔离与资产覆盖已包含在全量测试中。发布前origin/main为e8d7a43，v0.6.0不存在；提交、main推送与annotated tag的结果以Git远端回执为准。本轮未刷新外部来源或HCU大知识库、未运行远端训练、不新增硬件资格声明。

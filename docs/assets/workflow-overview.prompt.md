@@ -1,6 +1,6 @@
 # 工作流总览图生成说明
 
-- 内容基准：HCU-TrainFlow 0.5.1 当前主线，2026-10-11 核对。
+- 内容基准：HCU-TrainFlow 当前主线；所有流程图均不写工程版本号。
 - 输出：[workflow-overview.png](workflow-overview.png)。首页使用摘要图，精确分支与验收门槛以[可编辑流程图](../workflow-map.md)和[能力边界](../capabilities.md)为准。
 - 生成方式：内置 `imagegen`，以此前的总览图为编辑输入，沿用白底、蓝绿紫配色和分阶段科技信息图风格。
 - 维护：图面不印版本号；流程、状态或边界变更时一起复核 README、工程介绍和细图。重新生成后检查文字、箭头及验证声明。
@@ -8,7 +8,7 @@
 ## 本次完整提示词
 
 ```text
-Edit the attached HCU-TrainFlow README overview infographic to reflect the current workflow. The existing image is the edit target and visual reference. Preserve the white background, refined flat technology style, dark navy Chinese typography, pale blue/teal/lavender rounded panels, small blue/teal/purple line icons, and restrained orange feedback arrows. High resolution wide landscape 3:2 composition, fully readable accurate Chinese. This is a technical workflow, not promotional art. Re-layout text cleanly as needed. No false dashboards or extra features. All panels inside safe margins. Never obscure text with arrows. Replace all wording with the following exact content, organized hierarchically. Do not retain the old 0.5.0 footer or add a version number.
+Edit the attached HCU-TrainFlow README overview infographic to reflect the current workflow. The existing image is the edit target and visual reference. Preserve the white background, refined flat technology style, dark navy Chinese typography, pale blue/teal/lavender rounded panels, small blue/teal/purple line icons, and restrained orange feedback arrows. High resolution wide landscape 3:2 composition, fully readable accurate Chinese. This is a technical workflow, not promotional art. Re-layout text cleanly as needed. No false dashboards or extra features. All panels inside safe margins. Never obscure text with arrows. Replace all wording with the following exact content, organized hierarchically. Do not add a project version number anywhere in the diagram.
 
 TITLE: HCU-TrainFlow
 SUBTITLE: 面向 HCU 大模型训练的全流程智能体协同工作流

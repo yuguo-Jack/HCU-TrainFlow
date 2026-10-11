@@ -77,13 +77,18 @@ def start(store, tid, plan, reason=None):
         old = get_flow(db, tid)
         if old and (old['goal'] != goal or needs_context_replan(db, tid)) and not reason:
             raise FlowError('Plan/context changed; use flow-replan with a concrete reason')
-        if old and old['goal'] == goal:
-            return {'task': tid, 'goal': goal, 'status': 'unchanged'}
-        db.execute('INSERT OR REPLACE INTO flows VALUES(?,?,?,?)', (tid, json.dumps(plan), goal, task['context']))
-        db.execute("UPDATE flow_rounds SET status='superseded' WHERE task=? AND status IN ('submitted','accepted')", (tid,))
-        store.event(db, tid, 'flow-replanned' if old else 'flow-started', {'goal': goal, 'reason': reason, 'context': task['context']})
+        unchanged = bool(old and old['goal'] == goal)
+        if not unchanged:
+            db.execute('INSERT OR REPLACE INTO flows VALUES(?,?,?,?)', (tid, json.dumps(plan), goal, task['context']))
+            db.execute("UPDATE flow_rounds SET status='superseded' WHERE task=? AND status IN ('submitted','accepted')", (tid,))
+            store.event(db, tid, 'flow-replanned' if old else 'flow-started', {'goal': goal, 'reason': reason, 'context': task['context']})
+    # A committed plan is not proof that filesystem initialization or the
+    # draft transition completed. Re-entry must finish these idempotent steps.
     directory, board, guidance = board_paths(store, tid)
     if not guidance.exists():
+        with store.db() as db:
+            if db.execute('SELECT 1 FROM flow_guidance_cursor WHERE task=?', (tid,)).fetchone():
+                raise FlowError('Human guidance file is missing; restore it rather than silently resetting the inbox')
         directory.mkdir(parents=True, exist_ok=True)
         # Never overwrite this file after creation; it belongs to the human.
         with guidance.open('x', encoding='utf8') as stream:
@@ -92,10 +97,10 @@ def start(store, tid, plan, reason=None):
         with store.db() as db:
             db.execute('INSERT OR IGNORE INTO flow_guidance VALUES(?,?,?,?,?,?)', (tid, sha, task['context'], 'template', '', utc()))
             db.execute('INSERT OR REPLACE INTO flow_guidance_cursor VALUES(?,?)', (tid, sha))
-    if task['state'] == 'draft':
+    if store.task(tid)['state'] == 'draft':
         store.transition(tid, 'prepared')
     views = render_board(store, tid)
-    return {'task': tid, 'goal': goal, 'status': 'started', **views}
+    return {'task': tid, 'goal': goal, 'status': 'unchanged' if unchanged else 'started', **views}
 
 
 def sync_guidance(store, tid, *, force=False):

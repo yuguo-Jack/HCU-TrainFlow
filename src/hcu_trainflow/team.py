@@ -166,13 +166,19 @@ def reservation_conflict(left, right):
     return conflict(left['spec'], right['spec'], shared_checkout=shared)
 
 
+def message_stale(db, row):
+    message = json.loads(row['payload'])
+    context = db.execute('SELECT context FROM tasks WHERE id=?', (row['task'],)).fetchone()['context']
+    sent = db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE task=? AND kind='agent-message' AND json_extract(payload,'$.message')=?", (row['task'], row['id'])).fetchone()[0]
+    return (message['context'] != context or message.get('flow_goal') != goal(db, row['task'])
+            or context_epoch(db, row['task']) > sent)
+
+
 def message_blockers(db, tid, endpoint):
     reasons=[]
-    context=db.execute('SELECT context FROM tasks WHERE id=?',(tid,)).fetchone()['context']
-    fg=goal(db,tid)
     for row in db.execute("SELECT * FROM agent_messages WHERE task=? AND status!='handled'",(tid,)):
         message=json.loads(row['payload'])
-        if message['context']!=context or message.get('flow_goal')!=fg:continue
+        if message_stale(db,row):continue
         if message['blocking'] and (message['recipient'] == endpoint or message['kind'] == 'question' and message['sender'] == endpoint):
             reasons.append('message:'+row['id'])
     return reasons
@@ -323,7 +329,7 @@ def review(store,aid,value):
         if row['status']!='returned' or stale(db,row) or not run or run['report']!=value['report']:raise FlowError('No matching current returned result')
         if value['verdict']=='accept':validate_inputs(db,row,run)
         if row['spec']['owner']==value['reviewer']:raise FlowError('Owner cannot accept their own result')
-        if message_blockers(db,row['task'],aid):raise FlowError('Resolve peer blockers before accepting result')
+        if value['verdict']=='accept' and message_blockers(db,row['task'],aid):raise FlowError('Resolve peer blockers before accepting result')
         state='accepted' if value['verdict']=='accept' else 'needs-revision'
         db.execute('UPDATE assignments SET status=? WHERE id=?',(state,aid))
         db.execute('UPDATE assignment_runs SET note=?,updated=? WHERE assignment=?',(sha,utc(),aid))
@@ -392,12 +398,14 @@ def send(store,tid,value):
         prior=db.execute('SELECT payload FROM agent_messages WHERE id=?',(message['id'],)).fetchone()
         if prior:
             if json.loads(prior['payload'])!=message:raise FlowError('Message ID collision')
+            prior_row=db.execute('SELECT * FROM agent_messages WHERE id=?',(message['id'],)).fetchone()
+            if message_stale(db,prior_row):raise FlowError('Message ID belongs to a stale context; use a new message ID')
             return {'id':message['id'],'status':'already-recorded'}
         if message['kind']=='answer':
             parent=db.execute('SELECT * FROM agent_messages WHERE id=? AND task=?',(message['reply_to'],tid)).fetchone()
             if not parent:raise FlowError('Answer needs an existing question')
             question=json.loads(parent['payload'])
-            if question['kind']!='question' or question['sender']!=message['recipient'] or question['recipient']!=message['sender'] or question.get('flow_goal')!=message['flow_goal'] or parent['status']=='handled':raise FlowError('Answer must return to the current question author')
+            if question['kind']!='question' or question['sender']!=message['recipient'] or question['recipient']!=message['sender'] or message_stale(db,parent) or parent['status']=='handled':raise FlowError('Answer must return to the current question author')
         elif message['reply_to'] is not None:raise FlowError('Only answers use reply_to')
         db.execute("INSERT INTO agent_messages VALUES(?,?,?,'pending',?,NULL)",(message['id'],tid,json.dumps(message),utc()))
         if message['blocking']:
@@ -407,12 +415,12 @@ def send(store,tid,value):
 
 
 def messages(store,tid,recipient=None):
-    context=store.task(tid)['context']
+    store.task(tid)
     with store.db() as db:
         values=[{**dict(r),'message':json.loads(r['payload'])} for r in db.execute('SELECT * FROM agent_messages WHERE task=? ORDER BY created,id',(tid,))]
         for row in values:
+            row['stale']=message_stale(db,row)
             row.pop('payload')
-            row['stale']=row['message']['context']!=context or row['message'].get('flow_goal')!=goal(db,tid)
     return [v for v in values if recipient is None or v['message']['recipient']==recipient]
 
 
@@ -424,8 +432,7 @@ def acknowledge(store,mid,owner,value):
         db.execute('BEGIN IMMEDIATE');row=db.execute('SELECT * FROM agent_messages WHERE id=?',(mid,)).fetchone()
         if not row:raise FlowError('Unknown message')
         m=json.loads(row['payload']);endpoint(db,row['task'],m['recipient'],owner)
-        current=db.execute('SELECT context FROM tasks WHERE id=?',(row['task'],)).fetchone()['context']
-        if m.get('flow_goal')!=goal(db,row['task']) or m['context']!=current:raise FlowError('Message context/goal is stale')
+        if message_stale(db,row):raise FlowError('Message context/goal is stale')
         if row['status']=='handled':raise FlowError('Message already handled')
         if value['decision']=='handled' and m['kind']=='question':raise FlowError('Answer the question; its author acknowledges the answer')
         if value['decision']=='handled' and m['blocking'] and not value['evidence']:raise FlowError('Resolving a blocker requires evidence')

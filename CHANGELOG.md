@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-10-11
+
+- Keep project version numbers out of workflow diagrams and their generation instructions; centralize release metadata and align descriptive guides, TraceLens routing, scoped operator models, monitoring clocks and independent-mode handoffs.
+- Recover interrupted flow initialization on an identical-plan retry without overwriting human guidance or reopening review rounds. Reject missing previously initialized guidance instead of silently resetting it.
+- Allow a returned assignment with a late peer blocker to re-enter revision while still blocking result acceptance and dependent work. Keep messages stale after a context round trip, including tasks without a flow.
+- Reject clipped communication hotspots as complete analysis while preserving interval accounting; complete pure collectives still use communication-specific assessment without a compute model. Add focused CPU protocol regressions; this release review adds no new hardware-training qualification.
 
 - Refresh the white-background overview, editable workflow diagrams, introduction and README navigation for the current mainline. Connect TraceLens evidence to optimization decisions, clarify analysis-only and delivery-only routes, and document curated Wiki updates without expanding hardware-validation claims.
 - Curate shared site pages around reusable conditions, measurements and evidence; keep session decisions and temporary facilities in task records. Add reasoned document exclusions to incremental Wiki collection, reject retained-page conflicts, and prevent excluded material from returning on sync. Keep full source navigation available.

@@ -84,6 +84,10 @@ baseline/candidate 各含 context、sample_fingerprint、aggregation、executed�
 
 models JSON 按分析输出中的 op key（优先）或 kernel name 映射。GEMM 提供 kind=gemm、m/n/k/batch；其他算子提供 flops/bytes/latency_floor_us。与之匹配的 peak_flops_s、bandwidth_bytes_s、basis 为依据，可追加 isolated_us、reference_us、efficiency_target 和 workload_evidence。
 
+按名称匹配时必须给出 `applies_to` 的 `shape`、`dtype`、`phase`；采集到 `input_strides` 时也必须绑定。它们与分析输出逐项匹配，不能把同名 kernel 在其他形状、布局或前后向的上限直接沿用。优先复制当前输出的完整 op key；更换窗口、实现或候选后仍要复核工作量与硬件依据。
+
+Graph 关联得到的 CPU 输入形状是调用上下文，不自动等于每个 GPU kernel 的工作量；这类条目需 `workload_evidence` 明确映射。窗口截断的热点调用（包括纯通信）保留其窗口内占比，但评估记为 incomplete，须重新选择完整调用窗口。
+
 峰值单位是 FLOP/s 和 byte/s，时间单位是微秒。输入缺 shape/dtype 时必须补 workload_evidence；通信项有实际计算时标 mixed_compute。没有证据的模型不因给了数字就变成有效硬件结论。
 
 ## ReportEnvelope

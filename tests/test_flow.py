@@ -18,6 +18,46 @@ def setup(tmp_path, mode='analyze', **limits):
     return store
 
 
+@pytest.mark.parametrize('failure_point', ['board_paths', 'transition', 'render_board'])
+def test_start_reentry_finishes_initialization_without_resetting_guidance(tmp_path, monkeypatch, failure_point):
+    store = Store(tmp_path / 'workspace')
+    store.create({'schema_version': 1, 'task_id': 't', 'mode': 'analyze',
+                  'objective': 'Resume interrupted startup', 'context': {'source': 'fixed'}})
+    plan = {'acceptance': {'result': 'Retain reviewed analysis'}}
+    target = store if failure_point == 'transition' else flow
+    original = getattr(target, failure_point)
+    def interrupted(*args, **kwargs):
+        raise RuntimeError('simulated process interruption')
+    monkeypatch.setattr(target, failure_point, interrupted)
+    with pytest.raises(RuntimeError, match='interruption'):
+        flow.start(store, 't', plan)
+    monkeypatch.setattr(target, failure_point, original)
+    guidance = flow.board_paths(store, 't')[2]
+    human_text = '# Human guidance\n\nKeep the agreed scope.\n'
+    if guidance.exists():
+        guidance.write_text(human_text, encoding='utf8')
+    had_guidance = guidance.exists()
+    with store.db() as db:
+        goal = flow.get_flow(db, 't')['goal']
+    resumed = flow.start(store, 't', plan)
+    assert resumed['status'] == 'unchanged' and resumed['goal'] == goal
+    assert store.task('t')['state'] == 'prepared'
+    if had_guidance:
+        assert guidance.read_text(encoding='utf8') == human_text
+    assert flow.board_paths(store, 't')[1].is_file()
+    flow.next_step(store, 't')  # Must not dispatch a draft task with a missing stage.
+    with store.db() as db:
+        assert db.execute("SELECT COUNT(*) FROM events WHERE kind='flow-started'").fetchone()[0] == 1
+
+
+def test_start_reentry_never_recreates_deleted_human_guidance(tmp_path):
+    store = setup(tmp_path)
+    flow.board_paths(store, 't')[2].unlink()
+    with pytest.raises(FlowError, match='restore'):
+        flow.start(store, 't', {'acceptance': {'result': 'Deliver evidence in the requested scope'}})
+    assert not flow.board_paths(store, 't')[2].exists()
+
+
 def candidate(store, target=None, experiment=False, label='candidate-1'):
     task = store.task('t')
     decision = flow.next_step(store, 't')

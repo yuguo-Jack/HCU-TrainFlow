@@ -5,13 +5,13 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 
 # HCU 训练性能分析与优化
 
-涉及 Graph、Roofline/算子效率、EventReplay、TraceLens 原生 Agent 或 hipprof/XProf/XCompute 时，读取工程 `docs/tracelens-analysis.md`，使用锁定 fork 的统一入口和实际资格边界。自动模型未知项仍须纳入热点任务；计数器、回放与 profiler-off 时间不可混用；原生 Agent metrics 完成后继续查证、撰写及复核，不把自动表格当成最终结论。
-
 ## 开始前定位与阅读
 
 先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。
 
 支持 `analyze` 只交付性能分析，也支持 `optimize/full` 迭代。分析任务不自动改实现或长时验 loss。
+
+涉及 Graph、Roofline/算子效率、EventReplay、TraceLens 原生 Agent 或 hipprof/XProf/XCompute 时，读取工程 `docs/tracelens-analysis.md`，使用锁定 fork 的统一入口和实际资格边界。自动模型未知项仍须纳入热点任务；计数器、回放与 profiler-off 时间不可混用；原生 Agent metrics 完成后继续查证、撰写及复核，不把自动表格当成最终结论。
 
 先识别实际训练执行路径：大型引擎按既有并行与融合路线；Torch 原生训练（包括视频生成、VLA、世界模型）按 [Torch 训练专项](references/torch-native-training.md) 补查输入流水、eager/compile、断图/重编译、autograd、DDP/FSDP 和实际 backend。引擎内部模块也可采用该专项，不另建一套流程。环境适配和扩 DP/容错继续复用另外两个阶段。
 
@@ -31,10 +31,12 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 4. **按主要占比选择优化主线。** 空泡大先追数据、CPU launch、同步、PP 调度；通信大先与同条件预期核对，异常先排查，已符合单测预期的固有开销重点做 overlap/通算融合；负载不均用并行、路由、调度等框架措施，按需借鉴第三方引擎；计算占主导时按计算算子占比逐项推进；其他主导瓶颈仍存在时，可并行做独立计算分析。通信按 [通信优化专项](references/communication-optimization.md) 分 process group、消息量、拓扑、依赖、暴露尾部与最慢 rank。联合分析计算被并发拖慢、bucket/chunk/prefetch、通算融合及其同步协议；不能只凭 stream 重叠判定有效。关注显存 reserved/allocated、图池、临时/通信 buffer，以及保存恢复峰值。`GPU_MAX_HW_QUEUES` 按目标 runtime 和对照实测调节，没有通用最佳值。
 
    解释profile前先明确实际完整CPU步标记、步数、窗口总长、单步分布和profiler开关；排除同名GPU重复标记，不能把多步总GPU时间与关profiler的单步中位数直接比较。CPU op时长可含设备等待，通信驻留可含等peer；仅见GPU空白不能直接归因为CPU计算。非通信热点90%不等于端到端墙钟90%，分母与缺口必须同时报告。形状/模型范围改变后重建热点模型，不继承旧效率结论。
-5. **复用 TraceLens。** 按项目 docs/integrations.md 安装锁定依赖，用 `tracelens-report TRACE --project PROJECT --rank RANK` 做 op/kernel、overlap 分析；完整 ranks 才用 `tracelens-collective`。检查日志、非空表、单位、统计分母及 unsupported 情形。原生表保留在私有 workspace，`generated` 不代表训练评估通过。TrainFlow 补充稳态窗口、实际 rank 分组、shape 与热点建模；不默认套用 AMD/NV 峰值，轻量归因不冒充跨 rank 关键路径。
+5. **复用 TraceLens。** 按项目 docs/integrations.md 安装锁定依赖，用 `tracelens-report TRACE --project PROJECT --rank RANK` 做 op/kernel、overlap 分析；完整 ranks 才用 `tracelens-collective`。需要 Graph 归因、硬件校准 Roofline、原生 Agent 准备、hipprof 或 counters 时，按项目 `docs/tracelens-analysis.md` 使用 `tracelens-analyze` 的对应模式；EventReplay 按其原生路径和副作用约束另行执行。检查日志、非空表、单位、统计分母及 unsupported 情形。原生表保留在私有 workspace，`generated` 不代表训练评估通过，`review-pending` 还需查证与独立复核。TrainFlow 补充稳态窗口、实际 rank 分组、shape 与热点建模；不默认套用 AMD/NV 峰值，轻量归因不冒充跨 rank 关键路径。
+
+   以下融合检查、上限评估、同条件复测和实现迭代按第 3–5 项的证据安排，不要求先对全模型做一轮融合才能建模。每个热点先明确调用契约、当前性能和实施理由；其依赖满足即可优化，其他热点继续分析。仅分析模式在报告与建议处交付，不执行后续修改或测量。
 6. **融合粒度与数值对齐。** 对照 NV 实际调用、接口、fwd/bwd、saved tensors、cast/accumulation。先查当前 HCU TE、Flash-Train、HCU Primus Turbo 已支持实现，核对与 AMD Primus/Primus-LM patch 的调用关系。TE 能力交 HCU TE，通用编译/cuDNN frontend 训练融合优先 Flash-Train，Primus Turbo 后端/模块问题交其 HCU 分支；依实际归属复用或修复。优先复用，不重复开发。
 7. **评估累计 ≥90% 端到端占比的热点集合。** 墙钟为分母，重叠不能重复累计，CPU/等待缺口不能删掉。其中每个非通信 op 按 shape/dtype/布局/phase 建立 FLOPs、HBM/其他有效流量或延迟模型，给理论/可达上限、当前效率、独立实测与优化决策。先按端到端贡献排序，再按可兑现收益与约束安排实施；跳过高占比项说明原因。混合通算 kernel 仍评估计算部分；纯通信单列消息/拓扑/等待。缺模型或覆盖不足须明确补证据，不能报全覆盖。具体按 [热点上限、融合与实现迭代](references/operator-ceiling-iteration.md) 建表并随新 profile 更新。
-8. **分发实施。** 提取真实热点中的计算、通信及 copy，按 [模型内外同条件对照](references/operator-comparison.md) 保留 shape/dtype/stride、实际实现、前后向/累积语义、通信各 rank 收发量及 copy 方向，再独立实测与模型内比较。先区分实现效率、提交等待和并发干扰；不以总耗时相近代替逐项检查。数学库 GEMM 先判断是否低于可靠预期或明显偏离合理上限；确需 tune 时按 [数学库日志与调优交接](references/math-library-tuning.md) 抓取实际 rocBLAS/hipBLASLt 日志中的完整 bench 命令，框架 shape 表仅作分析附件。rocBLAS 可按匹配教程有界 tune，hipBLASLt/grouped GEMM 交用户协调；不能仅因占比高就提调优。必要时看编译器/runtime/数学库/通信库对应分支源码；rocSHMEM 通算融合按瓶颈证据决定。
+8. **同条件复测与库调优交接。** 提取真实热点中的计算、通信及 copy，按 [模型内外同条件对照](references/operator-comparison.md) 保留 shape/dtype/stride、实际实现、前后向/累积语义、通信各 rank 收发量及 copy 方向，再独立实测与模型内比较。先区分实现效率、提交等待和并发干扰；不以总耗时相近代替逐项检查。数学库 GEMM 先判断是否低于可靠预期或明显偏离合理上限；确需 tune 时按 [数学库日志与调优交接](references/math-library-tuning.md) 抓取实际 rocBLAS/hipBLASLt 日志中的完整 bench 命令，框架 shape 表仅作分析附件。rocBLAS 可按匹配教程有界 tune，hipBLASLt/grouped GEMM 交用户协调；不能仅因占比高就提调优。必要时看编译器/runtime/数学库/通信库对应分支源码；rocSHMEM 通算融合按瓶颈证据决定。
 HCU 算子/通信候选和底层构建按 [工程联动](references/hcu-library-integration.md)：联查 HCU Primus Turbo、UCCL、UltraEP、MoonEP，以及现有 RCCL/rocSHMEM/DeepEP/MORI/Flux；按瓶颈和真实能力选用，不默认同名接口可替换。必要时在独立开发树改库、远端隔离重编，证明实际加载新制品并完成分层回归后按目标仓规范PR。
 
 9. **按优先级持续迭代算子实现。** 计算占主导时，以计算热点为主线；其他情况下按其端到端影响安排独立计算分析；先按真实逻辑 op 聚合占比，再拆 phase/shape，完成高占比项初查、上限/未知和选择裁决后派发。高占比但上限不清的先补分析，不能因易写或已有 benchmark 随便选较小项。初步融合不是结束：重新评估融合后的工作量、瓶颈与可达上限，仍有显著空间就继续实施和测量。必要时将受编译/布局/指令限制的实现转 HIP：缺正确基线调用 `$hygon-hip-baseline-generator`，再用 `$hygon-hip-kernel-optimizer`；适合 Triton 的调用 `$hygon-triton-kernel-optimizer`。先确认可用；缺失时按 docs/integrations.md 获取 thirdparty/cuda-optimized-skill 并安装，也可读取其 skills/<name>/SKILL.md 及配套资源。kernel 遇到优化瓶颈必须做性能分析；hipprof 与 XProf/XCompute 的命令和产物分别使用，不混写。指令/反汇编问题按目标 ISA 和技能中的编译产物方法处理。达到目标、近可达上限、多轮无收益或受阻均需逐项给出证据和原因；显著空间未解决要汇报并保留缺口，不能以“已有融合”或预算耗尽视为达标。
@@ -50,7 +52,7 @@ HCU 算子/通信候选和底层构建按 [工程联动](references/hcu-library-
 
 ## 重要参考
 
-TraceLens 使用 thirdparty 清单锁定的 HCU fork，保留上游完整模块和原生 CLI。两个 TrainFlow 报告入口之外，按任务需要复用 TraceDiff、graph 报告、trace 分段/索引、源码定位及 EventReplay，具体依赖和入口见 docs/integrations.md。原生命令仍要遵循任务执行权限并记录私有输入/产物；缺少架构模型或事件映射时先标注缺口，优先用现有扩展点，必要的核心修改在独立 fork 开发 checkout 中完成并补回归。
+TraceLens 使用 thirdparty 清单锁定的 HCU fork，保留上游完整模块和原生 CLI。TrainFlow 的报告、collective 与统一分析入口之外，按任务需要复用 TraceDiff、trace 分段/索引、源码定位及 EventReplay，具体依赖和入口见 docs/integrations.md 与 docs/tracelens-analysis.md。原生命令仍要遵循任务执行权限并记录私有输入/产物；缺少架构模型或事件映射时先标注缺口，优先用现有扩展点，必要的核心修改在独立 fork 开发 checkout 中完成并补回归。
 
 TE 精度、权重缓存、attention backend、userbuffers 和融合查 `knowledge/official-transformer-engine-wiki/`；cuDNN graph/plan、SDPA fwd/bwd、open-kernel 融合和 host 缓存查 `knowledge/official-cudnn-frontend-wiki/`。先读 Wiki 再定位目标版本源码与教程，保留 NV/HCU 实现边界和实际 dispatch 证据。
 

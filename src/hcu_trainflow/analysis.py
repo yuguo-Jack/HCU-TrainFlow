@@ -254,10 +254,10 @@ def analyze_trace(trace, window, models=None, target=0.9, attribution=None):
                         scope_error = 'Name-keyed model must include captured input_strides'
             if group['attribution_status'] in {'ambiguous', 'missing-entry'}:
                 group['assessment'] = {'status': 'incomplete', 'reason': 'Ambiguous or missing CPU/GPU event attribution'}
-            elif group["communication"] and not (model or {}).get("mixed_compute"):
-                group["assessment"] = {"status": "communication", "decision": "message-topology-wait-overlap-analysis"}
             elif group["clipped_calls"]:
                 group["assessment"] = {"status": "incomplete", "reason": "Window cuts through kernel calls; select complete calls"}
+            elif group["communication"] and not (model or {}).get("mixed_compute"):
+                group["assessment"] = {"status": "communication", "decision": "message-topology-wait-overlap-analysis"}
             elif group["in_hot_set"]:
                 if scope_error:
                     group['assessment'] = {'status': 'incomplete', 'reason': scope_error}

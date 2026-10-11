@@ -85,6 +85,22 @@ def test_no_trace_no_success():
     assert profile_plan([{'domain':'tp','ranks':[0,2]}],[0,1])['status']=='incomplete'
     assert profile_plan([{'domain':'tp','ranks':[0]}],[0])['status']=='pass'
 
+
+@pytest.mark.parametrize('category', ['communication', 'kernel'])
+@pytest.mark.parametrize('event_start,event_duration', [(0, 150), (50, 150), (0, 200)])
+def test_partial_collective_cannot_complete_hotspot_analysis(category, event_start, event_duration):
+    captured = {'rank': 0, 'traceEvents': [{'ph': 'X', 'cat': category, 'name': 'rcclAllReduce',
+                                          'ts': event_start, 'dur': event_duration}]}
+    result = analyze_trace(captured, {'start_us': 50, 'end_us': 150})
+    rank = result['ranks']['0']
+    op = rank['operators'][0]
+    assert rank['busy_union_us'] == 100 and rank['target_reached']
+    assert op['clipped_calls'] == 1 and op['assessment']['status'] == 'incomplete'
+    assert op['key'] in rank['missing_models'] and result['status'] == 'incomplete'
+    whole = analyze_trace(captured, {'start_us': event_start, 'end_us': event_start + event_duration})
+    assert whole['status'] == 'complete'
+    assert whole['ranks']['0']['operators'][0]['assessment']['status'] == 'communication'
+
 def test_missing_shape_or_rank():
     t={'traceEvents':[{'ph':'X','cat':'kernel','name':'x','ts':0,'dur':100}]}
     assert analyze_trace(t,{'start_us':0,'end_us':100},{'x':{'flops':1,'peak_flops_s':1e6,'basis':'test'}})['status']=='incomplete'

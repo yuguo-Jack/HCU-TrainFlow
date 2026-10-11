@@ -191,6 +191,45 @@ def test_revision_requires_new_token_and_new_result(store):
         team.claim(store, 'a', 'a-owner')
 
 
+def test_late_blocker_allows_revision_work_but_not_acceptance(store):
+    plan(store, spec(store, 'a'), spec(store, 'join', depends_on=['a']))
+    first = team.claim(store, 'a', 'a-owner')
+    report = finish(store, first)
+    team.send(store, 't', msg(store, sender='controller', recipient='a', kind='blocker'))
+    with pytest.raises(FlowError, match='Resolve peer blockers'):
+        accept(store, 'a', report)
+    assert accept(store, 'a', report, verdict='revise')['status'] == 'needs-revision'
+    assert team.schedule(store, 't')['dispatchable'] == ['a']
+    second = team.claim(store, 'a', 'a-owner')
+    assert second['token'] > first['token']
+    with pytest.raises(FlowError, match='Unresolved peer'):
+        finish(store, second)
+    with pytest.raises(FlowError, match='dependency-not-accepted'):
+        team.claim(store, 'join', 'join-owner')
+    team.acknowledge(store, 'q', 'a-owner', receipt(store))
+    accept(store, 'a', finish(store, second))
+    assert team.schedule(store, 't')['dispatchable'] == ['join']
+
+
+@pytest.mark.parametrize('with_flow', [False, True])
+def test_old_messages_do_not_revive_when_context_returns(tmp_path, with_flow):
+    store = Store(tmp_path / 'workspace')
+    store.create({'schema_version': 1, 'task_id': 't', 'mode': 'analyze',
+                  'objective': 'Check context-bound messages', 'context': {'source': 'fixed'}})
+    if with_flow:
+        flow.start(store, 't', {'acceptance': {'result': 'Review current evidence'}})
+    plan(store, spec(store, 'a'))
+    team.send(store, 't', msg(store, recipient='controller', kind='blocker'))
+    assert not team.messages(store, 't')[0]['stale']
+    store.change_context('t', {'source': 'changed'})
+    store.change_context('t', {'source': 'fixed'})
+    assert team.messages(store, 't')[0]['stale']
+    with store.db() as db:
+        assert 'message:q' not in team.completion_blockers(db, 't')
+    with pytest.raises(FlowError, match='stale'):
+        team.acknowledge(store, 'q', 'controller', receipt(store))
+
+
 def test_peer_question_answer_and_yield_avoid_slot_deadlock(store):
     plan(store, spec(store, 'a', peers=['b']), spec(store, 'b'), limit=1)
     first = team.claim(store, 'a', 'a-owner')

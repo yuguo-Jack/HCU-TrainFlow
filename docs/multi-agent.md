@@ -127,6 +127,8 @@ hcu-trainflow --workspace PRIVATE assignment-bind compute-r1 compute-analyst ACT
 
 verdict 可以是 `revise`，任务进入 needs-revision，成员重新领取获得新 token。局部验收不代替完整候选的独立 reviewer 和真实训练测试。新增必做任务或阻塞消息会使未推进的旧候选复核失效，避免凭增加工作前的旧 review 直接过关。
 
+结果已返回后才收到阻塞问题时，主控仍可 `revise` 退回，让成员重新领取并开展有界诊断；问题解决前不能再次返回成功、accept 验收或供下游消费。上下文重置后即使配置字节恢复原值，旧消息也只保留为历史，不会重新成为当前阻塞或可确认的答复。
+
 ## 主动与被动交流
 
 主动作出发现就 `agent-send`，被动方通过 `agent-inbox TASK --recipient ID` 读取，并 `agent-ack` 回执。关系来自 depends_on/peers（任一方声明即可），或与保留 endpoint `controller` 交流。跨任务、过期上下文、冒用 owner、重复 ID 但内容不同均拒绝。

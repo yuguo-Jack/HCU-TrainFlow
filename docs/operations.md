@@ -8,7 +8,9 @@
 
 训练节点或可靠管理节点运行日志归一化器、TrainFlow watcher 和原有容错工具。它们不依赖本机 Agent 在线。归一化器针对当前引擎版本适配，把已验证的全局训练进展写为追加 JSONL；不能把不同 rank 的零散同名 step 混成一条进展流。
 
-每行至少含 UTC epoch timestamp、attempt_id、step；可含 loss、grad_norm、device_memory_bytes、job_alive、checkpoint_verified、recovery_state 和 completed。新进程恢复使用新 attempt_id。显存可记录任务要求的最大设备值，逐设备全量数据另存原始证据。系统不从一条 rank0 日志推断所有设备都健康。
+归一化记录按[训练观测契约](training-observation.md)包含 attempt、phase、kind、progress 等字段；只有实际训练进展推进 step，不能用普通心跳或某个 rank 的局部计数冒充全局进度。时间戳必须说明 `timestamp_basis`：有可靠训练源时钟才计算吞吐和相对减速；采集/重放时间或未知时间只用于相应观测，不能伪装成训练步时。无源时钟的完成核销还需封存原始日志及字节位置、进程退出和最终步数证据。
+
+可附 loss、grad_norm、device_memory_bytes、job_alive、checkpoint_verified、recovery_state 等。新进程恢复使用新 attempt_id 并保留启动身份。显存可记录任务要求的最大设备值，逐设备全量数据另存原始证据。系统不从一条 rank0 日志推断所有设备都健康。旧格式的兼容读取不能代替新部署对上述契约的验收。
 
 ```bash
 hcu-trainflow --workspace /private/remote task-create /private/task.json

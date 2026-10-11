@@ -31,6 +31,8 @@
 
 先创建普通 TaskSpec，随后 `flow-start TASK PLAN.json`；旧任务不会自动挂接循环。所有文件在私有 workspace。主要命令：
 
+首次启动中断时，以同一任务和同一计划重试 `flow-start` 会补齐初始化及 draft→prepared 的收尾，保留原目标、轮次与已有人的指导。已登记的 `GUIDANCE.md` 丢失则恢复原文件，不用空模板覆盖历史。比较上下文或验收计划确实改变时，仍使用带理由的 `flow-replan`。
+
 | 命令 | 作用 |
 | --- | --- |
 | `flow-start TASK PLAN` | 固定验收目标和循环预算，初始化人的文件与看板 |
@@ -259,7 +261,7 @@ queued 的意见需在最终交付前改为实际应用或有理由的不适用�
 - 未明归属的 started 或任何 unknown 执行先核对原作业；已绑定到不同当前 assignment 的独立执行可按资源约束并行，不能以“再试一次”启动重复训练。所有执行结束后才可推进阶段。
 - 长训主控按实际进展记录实验和问题，不逐 step 触发代码 review。检测到异常先诊断再形成需复核的修复；不能每次 loss 抖动就改实现。
 - 本机离线，远端 watcher 和既有容错继续；本机恢复按 seq 接收事件并核对 attempt、checkpoint、节点池。独立 heartbeat observer 检测 watcher 自身失活。
-- 本版本提供通用 bridge 契约，没有验证你的实际 Codex launcher、飞书投递或集群恢复。真实环境提供后，要测试 Agent 中断、主机休眠、故障无人恢复、事件重放及人类指导生效。
+- 已有两节点有界恢复与本地消息/重放协议验证，具体范围见[能力与验证边界](capabilities.md)。通用 bridge 不等于实际 Codex launcher、飞书投递或生产持续恢复已经验收；每个新部署仍需测试 Agent 中断、主机休眠、故障无人恢复、事件重放及人类指导生效。
 
 ## 本地协议演示
 
