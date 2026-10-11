@@ -314,3 +314,15 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 系统Python editable 0.6.0与六个Codex Skill均完成替换，临时备份由安装器验证后清理；只读同步复核另行执行。无大知识库/上游来源更新，不改既有v0.6.0 tag；本轮改动记Unreleased。最终提交/推送以Git回执为准。
 
 - 收尾统一文本换行后，安装哈希检查发现四个Skill副本需刷新；仅重装变化的Skill，独立sync --check确认包、六个Skill和资源绑定全部current。提交前差异无空白错误，既有v0.6.0保持不动。
+
+## 2026-10-11：临时大文件维护与 0.6.1
+
+- 已核对维护模块、CLI、测试和阶段引用；开始扩展临时产物生命周期与容量检查。没有操作真实训练数据。
+
+- 扩展 register-temporary/retire/capacity 与阶段/低频 tick，复用 pin、活动保护、计划、隔离及部分失败回执。metadata-only 只用于关闭且退役的临时大文件，不宣称内容完整性。
+- 根据用户补充将清理与五分钟交互彻底分开，持久6小时周期/1小时节点冷却；接回主控和三个阶段，明确本地/远端/CFS唯一责任人与无自动后台调度的边界。
+- 全量回归最新一次1217 passed、4 skipped（Windows不具备的Linux专用测试）；随后补充原owner重新退役和明确零宽限收尾两项场景，最终定向结果另记。Wiki489页/25来源、阅读资源59页/78可达、395个Markdown链接/章节检查通过。没有改动模型执行/性能分析算法、没有删除真实任务数据或运行远端试验。
+
+- 最终清理/生命周期/调度回归86项通过，涵盖复核后重新退役、零宽限收尾、不重读大文件、低空间与六小时去重；旧缓存兼容测试全部保留。README、包元数据、__version__和CHANGELOG统一0.6.1，包含此前未打tag的工作流效率改进。
+- 系统Python editable升级0.6.1；主控和三个阶段Skill已替换，两个Wiki Skill仍current。六个绑定校验通过，临时备份由安装器验证后清理；独立--check和CLI版本检查通过。未升级外部依赖、未刷新大知识库，未添加新的常驻调度服务。
+- 本地检查和远端main基线核对完成，准备推送main并在GitHub检查后发布annotated v0.6.1；远端回执由最终交付确认。

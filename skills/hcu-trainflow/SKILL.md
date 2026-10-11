@@ -72,7 +72,7 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 
 ## 工作区维护与观察交接
 
-由主控在同一个默认五分钟交互轮询中检查维护是否到期；有已登记缓存时调用一次 `scripts/maintain_workspace.py ... tick`，默认 dry-run。已明确配置自动清理的部署可按该 policy 加 `--enable-delete`，正常执行无需反复询问。只处理登记的可重建代次；老目录不自动迁移或删除，活跃/未知作业、lease、使用 pin 和原件引用继续保护。不要并行派多个清理者，也不要在每条 Agent 消息后扫工作空间。触发方式、缓存生产者与安装资源核对见 [维护与观察交接](references/maintenance.md)。
+由主控在实验批次收尾、阶段交接、恢复核销或任务结束时维护；同阶段长训默认6小时间隔，与五分钟交互采集分开，不频繁扫目录。调用 `scripts/maintain_workspace.py ... tick --trigger ...`，默认 dry-run，已明确配置自动清理 policy 时加 `--enable-delete`。仅回收登记的过期可重建缓存，以及已停止使用、留存必要证据并显式退役的临时 checkpoint/调试大文件。基线、最佳/恢复点、原始证据、活跃/未知作业和 pin 继续保护。大写入前只查容量，低空间再处置；本地/远端各根单一负责人，不重复扫共享盘。触发、退役、保护和回执见 [维护与观察交接](references/maintenance.md)。
 
 实际 TaskSpec context 改变时，沿该参考完成**独立观察 Store、事件 peer 和 sentinel**的交接，保留旧游标和证据；不能只换 parser state-dir 或删 watcher 状态。多节点分别核对所有必需 member 的身份、ready、心跳和退出回执；先核对固定引擎源码和真实日志中的进度输出节点（可能是 rank0、全局最后一个 rank 或专用 logger）；该节点的 iteration/loss 只代表该日志覆盖范围。主控离线期间仅由已部署守护继续监测，不能把轮询脚本视为自动运行 Agent。
 

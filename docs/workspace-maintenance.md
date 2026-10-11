@@ -1,92 +1,123 @@
-# 私有缓存维护与观察器上下文换代
+# 工作区容量、临时产物清理与观察器上下文换代
 
-维护默认生成可审阅计划。自动删除仅对已明确登记、可重新生成的缓存开放；任务原始证据、源码工作树、模型权重、checkpoint、对象库和数据库各自保留。
+清理接在实验批次收尾、阶段交接、恢复核销和任务结束处。长时间停留在同一阶段时，默认每 **6 小时**才允许扫描一次；与五分钟人类交互轮询分开。维护默认 dry-run；部署中明确启用的自动清理策略可执行已登记且满足条件的项目，无需逐个重新询问。
 
-## 可清理的范围
-
-工作流的缓存生产者可以把临时下载包、可重复解压结果或构建缓存写到：
+## 清理范围与生命周期
 
 ```text
 PRIVATE_WORKSPACE/
-├── cache/recreatable/FAMILY/GENERATION/   # 显式登记后才受本策略管理
+├── cache/recreatable/FAMILY/GENERATION/  # 可重建缓存：至少保留最近3代，默认7天未使用
+├── scratch/disposable/FAMILY/GENERATION/ # 临时产物：显式退役、默认静置1小时
 └── .maintenance/
-    ├── cache-registry.json               # 登记、重建依据、使用 pin、删除历史
-    ├── plans/PLAN_HASH.json              # 只读检查产生的完整计划
-    ├── receipts/PLAN_HASH.json           # 实际执行和失败回执
-    └── quarantine/                      # 部分失败/中断后的隔离内容
+    ├── cache-registry.json              # 两类登记、生命周期、使用 pin、删除历史
+    ├── tick-state.json                  # 最近扫描时间、触发原因、未完成状态
+    ├── plans/PLAN_HASH.json             # 候选、保留理由及身份快照
+    ├── receipts/PLAN_HASH.json          # 实际删除或隔离回执
+    └── quarantine/                     # 中断后的隔离内容，禁止整目录清空
 ```
 
-`FAMILY` 表示同类缓存，`GENERATION` 使用新的唯一标识。只有这个精确的四层路径格式可登记。不扫描 `research/`、`runtime/`、`checkouts/`、`evidence/` 等目录推测哪些东西“看起来临时”。现有任务不用迁移全部目录；后续缓存生产步骤可以逐步采用这个专用目录。
+`FAMILY/GENERATION` 使用明确且唯一的目录标识；一个 generation 对应一个独立、可整体处置的产物。文件也放在自己的 generation 目录中，不把整个实验目录登记为可删除。未登记的旧目录不自动进入删除计划；不依据名称包含 `tmp`、`failed`、`core` 或年龄推断可丢弃。
 
-登记时必须提供重建的源/方法说明。说明仅作为事实记录，不会执行其中的命令。不要把唯一原件、未保存修改的源码、训练日志原件、临时尚未回传的结果或待核销的作业文件登记为缓存。源码快照清单、Git 目录、数据库、checkpoint/常见权重扩展名等有额外拒绝规则，这些规则不能替代登记者确认数据的可重建性。
+| 类型 | 如何进入回收候选 | 继续保护什么 |
+|---|---|---|
+| 可重建缓存 | 登记固定来源/重建方法；最近3代之外且超过使用/修改保留期 | 使用 pin、源码引用、当前及近期缓存 |
+| `temporary-checkpoint` | 已确认失败、无效或明确废弃的**临时保存点**；写者及异步上传已结束，没有恢复消费者，保留失败/废弃依据后显式退役 | 正在写入、最新有效、最佳、基线、回退/恢复所需保存点及其分片；不能只看某个 rank 结束或保存目录名字 |
+| `debug-output` | 已结束调试的 core dump、张量/内存转储等；必要原始证据与定位结论已留存 | 未定位故障唯一原件、仍在分析的 dump、未回传结果 |
+| `profiler-intermediate` | 已保留原 trace、采集配置和报告，重复解析/解压的中间副本不再使用 | 原 trace、shape/计时证据、待分析采集 |
+| `temporary-output` | 已核销实验的无用临时输出，责任人明确说明处置依据 | 源码/未提交改动、原始材料、正式模型权重、日志、Store objects/snapshots/数据库 |
 
-默认每族保留**最近登记的 3 代**，并至少 7 天未使用/修改才可删除；只能增加保留代数。年龄取登记时间、最近使用时间和树中最新修改时间的最大值。未来时间或时钟回退不会加速淘汰。未登记目录永远不进入计划。
+临时产物有 `active → retired → removed` 生命周期。登记即自动设置生产者 pin；仅释放 pin **不等于**退役。由登记 owner 确认写者停止、其他消费者均已释放 pin，先把不超过1 MiB的处置记录保存为 Store artifact（引用已保留的必要原始证据），再 `retire`。该命令不会探测/终止进程，也不会判断任意文字说明是否足以证明废弃；这些判断由阶段责任 Agent 根据作业、消费者和数据用途完成。关键原件不能以一份摘要替代。
 
-## 安装与命令
+生产者从创建时就选好上述目录；有价值的产物继续保留并设置用途明确的 pin；确需独立归档时先保存并验证正式副本及引用，再决定是否退役旧副本，不直接搬走仍登记使用的目录。旧产物需要纳管时，先确认所有者、根目录边界、依赖和停止状态；不要为满足路径格式自动搬动正在使用的目录。普通 checkpoint 目录不由本工具滚动删除，正式保存点保留策略继续由训练引擎/站点负责。临时保存点例外仅放开 checkpoint 文件后缀和目录名，数据库、证据、Git、链接等保护仍然生效。
 
-使用同版本 TrainFlow 安装包和仓库中的脚本。下面都是通用示例，路径、家族和生成标识应由实际任务配置提供。
+## 命令与生产者责任
+
+使用当前 checkout 的脚本，路径替换为任务真实值。策略选项放在子命令之前。
 
 ```bash
-# 登记已有、独立的可重建缓存目录。重建说明应含固定来源或版本。
+# 可重建缓存：使用前 pin，操作核销后由各自 owner 释放。
 python scripts/maintain_workspace.py --workspace /private/task \
   register cache/recreatable/compiler-build/build-001 \
-  --rebuild 'Rebuild from the retained source snapshot and recorded compiler version'
-
-# 消费者/写者打开缓存前登记 pin；结束且核销后由同一 owner 释放。
+  --rebuild 'Rebuild from retained source revision and recorded compiler'
 python scripts/maintain_workspace.py --workspace /private/task \
-  pin cache/recreatable/compiler-build/build-001 --owner compile-worker
+  pin cache/recreatable/compiler-build/build-001 --owner compiler
 python scripts/maintain_workspace.py --workspace /private/task \
-  pin cache/recreatable/compiler-build/build-001 --owner compile-worker --release
+  pin cache/recreatable/compiler-build/build-001 --owner compiler --release
 
-# 默认 dry-run。策略参数放在子命令之前。
+# 已创建的独立临时输出目录，在生产前登记；owner 自动持有 pin。
+python scripts/maintain_workspace.py --workspace /private/task \
+  register-temporary scratch/disposable/save/attempt-001 \
+  --kind temporary-checkpoint --owner checkpoint-writer
+
+# 写者、消费者和异步任务均核销；保存失败/废弃依据、保留点和必要原件的位置。
+# 此处保存的是小型处置记录，不是把数十 GB checkpoint 复制进 objects。
+hcu-trainflow --workspace /private/task artifact-add /private/task/retirement-record.md
+python scripts/maintain_workspace.py --workspace /private/task \
+  retire scratch/disposable/save/attempt-001 --owner checkpoint-writer \
+  --reason 'Incomplete save; writer exited, no recovery references; evidence retained' \
+  --evidence RETAINED_ARTIFACT_SHA256 --producer-stopped
+
+# 其他消费者使用同一 pin API；即使已退役，新 pin 仍阻止删除。
+python scripts/maintain_workspace.py --workspace /private/task \
+  pin scratch/disposable/save/attempt-001 --owner diagnostic-reader
+
+# 显式人工/Agent 检查不受自动 tick 的冷却时间限制；plan 不删除。
 python scripts/maintain_workspace.py --workspace /private/task plan
-python scripts/maintain_workspace.py --workspace /private/task \
-  --keep-last 4 --min-age-days 14 plan
-
-# 查看计划后显式允许执行；用上一条输出的真实哈希替换。
 python scripts/maintain_workspace.py --workspace /private/task \
   apply PLAN_SHA256 --enable-delete
 ```
 
-`plan` 输出计划路径、拟回收字节数、每一代的处理决定和保留理由；完整文件包含登记快照、目录根身份及拟删除树的逐文件 SHA-256/修改时间。已经因最近3代、pin、年龄或运行状态需要保留的条目只做廉价身份检查，标明 `tree=null`，不会每五分钟重读其全部内容。后续真正符合淘汰条件时才重新深扫。未加 `--enable-delete` 的 apply 会拒绝。计划最多有效一小时，过期重新检查。注册重复路径不会悄悄覆盖历史；重新生成使用新的 generation 名称。
+默认缓存保留最近3代且至少7天未使用，`--keep-last` 只能设为3或更多；缓存 `--min-age-days` 可调整但不得短于1小时。临时产物不套用“3代”，仅明确退役者可清理；`--temporary-min-age-hours` 默认1；任务收尾已确认全部写者/消费者终结且必要证据已留存时，可在部署策略中明确设0立即处理，不绕过退役、pin、作业和身份检查。年龄取登记/使用/退役时间与树中最新修改时间的最大值；时钟回退拒绝，未来时间继续保留。退役后文件变化会标记 `changed-after-retirement`，不会因再等一段时间自动变成可删除；由原 owner 重新核对写者、用途和证据，再显式 retire；程序保留前次退役记录并重算宽限期。根目录身份变化则停止核销，不自动覆盖登记。
 
-Python API 可复用 `register_cache`、`pin_cache`、`plan_retention`、`apply_retention`。所有缓存使用者必须参与 pin 约定，包括自主 Agent 以及单独运行的缓存生产工具；无法确认外部使用者时保留 pin，不启用删除。
+所有消费者，包括其他 Agent、进程、节点和 Store，都要在访问前 pin，并在核销后由原 owner 释放。保留点、基线、最好候选、未结故障设置用途明确的长期 pin，不能靠心跳过期自动解除。普通源码 checkout、关键证据和数据库放在清理根之外。
 
-## 定期维护入口
+## 触发时机与空间压力
 
-以下命令可由已有工作流轮询或现场调度机制调用，不额外安装常驻服务：
+| 时机 | 动作 |
+|---|---|
+| 一批实验/调参结束、阶段交接、故障恢复全部核销、任务收尾 | 阶段 Agent 标明本批废弃产物；主控调用对应 `--trigger` 的 tick。不是每个 step、kernel 或 Agent 消息触发 |
+| 同阶段长时间运行 | 已部署调用者按6小时或更长周期调用 periodic tick；无需新增常驻服务 |
+| 大 checkpoint、core dump、profile/回放采集、构建/同步前 | 只做 `capacity` 与站点配额检查，核对预计新增字节数和余量；不递归扫盘 |
+| 低空间 | 在保护规则内尝试提前回收；仍不足时暂停**新的大写入**并报告保留项/空间缺口，不擅自删除恢复点或终止训练 |
 
 ```bash
-# 默认仅检查一次；每5分钟触发它即可。
-python scripts/maintain_workspace.py --workspace /private/task tick
-
-# 一个有界会话内最多12轮，每轮间隔300秒。
+# 实验批次收尾；默认只生成计划，部署启用后加 --enable-delete。
 python scripts/maintain_workspace.py --workspace /private/task \
-  tick --iterations 12 --interval-seconds 300
+  tick --trigger experiment-batch --enable-delete
 
-# 只有部署时明确启用，才会对本轮检查后仍合格的缓存执行删除。
+# 同阶段长时间运行，默认6小时扫描间隔；配置为更长也可以。
 python scripts/maintain_workspace.py --workspace /private/task \
-  tick --enable-delete
+  tick --trigger periodic --scan-interval-hours 6 --enable-delete
+
+# 无文件树扫描；默认低于20 GiB或文件系统10%剩余时报告 low-space。
+# 按任务保存规模、站点配额和共享盘大小设置阈值，不能把默认值当充足证明。
+python scripts/maintain_workspace.py --workspace /private/task \
+  --min-free-gib 100 --min-free-percent 5 capacity
 ```
 
-默认扫描预算 60 秒，可设置 `--max-scan-seconds`，上限 300 秒；单棵树另有限制，超过预算会停止本轮。计时预算用于限制扫描工作，不能把它当成底层文件系统故障时的强制 I/O 超时。计划/回执仍可能占少量空间；当前没有递归清理这些维护证据。
+trigger 还有 `stage-transition`、`recovery-reconciled`、`task-close`、`space-pressure`。`tick-state.json` 持久保存上次扫描；periodic 默认6小时，阶段/空间触发也至少间隔1小时，防止密集实验或空间告警重复扫盘。`not-due` 只查容量、不遍历产物、不生成新计划。退役宽限期使本轮新废弃的大文件可能留到下一次合格时机。手动 `plan/apply` 可以在明确需要时重新检查；收尾策略如需零宽限，使用 `--temporary-min-age-hours 0`，其余保护与核销条件不变。
 
-任何未完成/未知操作、未到期资源 lease 都保护整个工作空间的缓存。这刻意比按路径猜测作业依赖更保守。远程 SSH 超时后即便 lease 过期，只要 operation 仍 unknown，仍不能清理。正常任务中可以周期检查，等作业核销且资源释放后再执行合格计划。该检查只覆盖当前 Store 已知状态；外部进程、其他 Store 和远端使用者仍必须登记使用 pin，不能仅凭一个 Store 没有活跃行推断所有消费者都已停止。
+CLI 退出码：0 表示命令正常结束（也可能是 dry-run/not-due 或全部保留），1 是错误/需要核销，2 是容量检查仍低于阈值。`--iterations` 的兼容有界轮询不会绕过扫描冷却，不建议用高频轮询替代阶段触发。发生部分失败/中断后 tick 停止自动重试；先核对计划、原路径、隔离内容和作业，再显式 `--resume-after-review`。该参数只重置本次调度资格，不跳过任何删除保护。
+
+默认扫描预算60秒、上限300秒，最多20000个目录项；超出时停止。缓存拟删除候选维持逐文件内容哈希及10 GiB单树预算。临时产物候选采用**文件身份、大小、mtime/ctime 的元数据快照**，不重读 checkpoint/dump 的全部字节，也没有该10 GiB内容扫描限制；它依赖已停止写者和 pin 协议，不能用于证明数值一致或 checkpoint 完整。已保护条目只检查根身份。扫描时间预算不是文件系统卡死时的强制 I/O 超时，也不是大目录删除的硬超时；避开训练关键 I/O 和性能计时窗口。
+
+回执中的 `remove_bytes` / `removed_logical_bytes` 为文件逻辑大小，不是承诺的磁盘释放量（稀疏、压缩、快照、已打开文件和共享盘其他写者都会影响）。看板 environment/recovery 简要记录触发点、前后实际可用空间、删除逻辑量、保留原因和未完成项，并链接计划/回执；无变化不刷屏。`capacity` 不包含用户/组配额，也不会自动阻断训练提交；主控和现场启动适配器须据退出码与保存估算作决定。
+
+## 本地、远端与共享文件系统
+
+各个**实际写盘根**单独登记容量和维护责任：本地任务空间、远端任务目录、容器写层/节点本地 scratch 可能属于不同磁盘。默认只操作授权任务根；不会清理整机 `/tmp`、Docker 镜像、其他用户目录或整个共享 `/cfs`。尽量把容器大文件显式映射到任务自己的远端目录。需要其他文件系统时先建立独立任务维护根，不能通过软链接跨出去。
+
+同一 CFS 目录在多节点或容器中可见时，只配置一个清理者，在真实挂载侧执行同版本脚本，不对每个挂载别名重复登记/计数；先验证共享盘锁、原子重命名与 SQLite 语义，未验证保持 dry-run。所有消费者共同使用该维护根/pin，不能用一个空白 Store 代替真实作业状态。本地主控离线时，仅已部署的远端调用者会执行低频 tick；本地恢复后先读远端 tick-state/回执再接续，避免重复清理。`flow-watch` 仍只采集交互文件，不会自动运行维护脚本。
+
+活跃/unknown operation 或有效 lease 保守地保护当前 Store 的**全部**缓存/临时产物；即使某个候选已退役，仍等到作业核销和资源释放后才删除。长训中可查容量和登记废弃项，必要清理安排在安全空档；空间不足不能删作业记录来解锁。外部运行者和其他 Store 仍需遵守 pin，本工具不会自动发现全部进程引用。
 
 ## 执行一致性与中断
 
-执行时取得维护独占锁，再持有 Store 的写事务检查操作/lease；期间新的 TrainFlow 命令意图与 lease 不能插入。随后复核计划哈希、登记内容、pin、当前 TaskSpec 的源码路径引用、所有代次的根身份，以及**全部拟删除条目的树内容**。拟删除条目的缺失、变更、链接、junction、挂载点、hardlink、特殊文件或预算超限都会拒绝继续。没有深扫的保留项不会在 apply 中临时升级为删除项；旧版计划结构须重新生成。
+`apply` 重查计划哈希（最长有效1小时）、登记/pin、Store 活动、源码引用、根身份及全部候选；临时产物还验证保留的处置 artifact。执行持维护锁与 Store 写事务；目标先原子移动到私有 quarantine，再复核，最后只删除隔离树。回执按 `rename-intent → quarantined → removed` 保存。链接、junction、跨设备/挂载点、hardlink、特殊文件、身份变化、缺失证据均拒绝；没有扫描的保留项不会临时升级成删除项。
 
-合格目标先原子重命名到私有隔离目录，再次复核其完整内容，最后只删除该明确隔离树。回执在重命名前写入，逐项记录 `rename-intent → quarantined → removed`。原始证据不会因为脚本退出码为零就自动获得其他任务的验收状态。
+中断时保留 `.maintenance/receipts/PLAN_HASH.json` 和 quarantine。核对真实已删/未删项、原路径是否被重新创建、消费者及原件，再制定范围明确的恢复/清理方案；不能递归清空 quarantine 或自动重试旧计划。最后才重新允许 tick。计划/回执本身体积小，本模块不递归清理这些维护证据。
 
-如果删除中断、文件仍被占用、内容发生变化或磁盘故障：
-
-1. 读取 `.maintenance/receipts/PLAN_HASH.json`，区分已删除项和仍隔离项。
-2. 保留隔离内容、登记表和计划。不要自动重新执行旧计划，也不要递归删除整个 quarantine。
-3. 核对原路径是否被重新建立、是否还有消费者、所需原件与重建依据是否完整。
-4. 明确恢复或再次清理方案后，再由人工或 Agent 进行范围明确的维护。当前模块故意不自动猜测部分失败应恢复哪一代。
-
-这是配合 pin 与工作流锁使用的维护工具，不是隔离恶意本机进程的安全沙箱。检查会拒绝已发现的并发修改；不遵守 pin、持续篡改目录结构的外部写者必须先停止或隔离。不能在这种目录上声称普通跨平台文件 API 消除了所有检查后替换竞态。共享文件系统也必须先验证锁、重命名和 SQLite 语义；验证前保持 dry-run。
+本工具是合作进程的生命周期管理，不是抵抗恶意目录替换的沙箱；不遵守 pin 的写者须先停止或隔离。不能声称普通跨平台文件 API 消除了所有检查后替换竞态。
 
 ## 观察器换 context：保留两层身份边界
 
@@ -131,7 +162,7 @@ observation-contexts/TASK_ID/CONTEXT_HASH-eSOURCE_CONTEXT_EPOCH/
 
 ## 安装与 Skill 引用链
 
-统一 Skill 的 `references/maintenance.md` 在既有五分钟交互循环触发维护，adapt/optimize/fault-tolerance 的 `references/workflow.md` 分别规定缓存生产、候选保留和长训交接责任。没有新增独立 Skill，也不把 `flow-watch` 的文件采集误称为已经运行维护命令。
+统一 Skill 的 `references/maintenance.md` 规定阶段收尾、低频维护与容量预检，三个阶段的 `references/workflow.md` 分别负责产物登记/退役、候选保留和长训交接。五分钟交互轮询不触发目录扫描，没有新增独立 Skill，也不把 `flow-watch` 的文件采集误称为已经运行维护命令。
 
 标准 `setup_trainflow.py` 以 checkout 做 editable 安装，`install_skills.py` 复制 Skill 自带 references；项目 `scripts/`、`docs/` 继续从 `TRAINFLOW_PROJECT` 定位。`retention.py` 是 wheel 中的 Python 模块，但 wheel 不包含整个项目脚本/文档/Wiki。远端只装 wheel 时，另同步同版本 `observe_training.py`、`manage_training_observer.py`，需要维护时同步 `maintain_workspace.py`，核对模块/脚本版本及哈希。本机 Skill 升级不代表远端脚本已更新。
 

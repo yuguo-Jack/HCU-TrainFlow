@@ -15,7 +15,7 @@
 - `docs/workflows.md`：三个工作流与验证门槛。
 - `docs/environment-discovery.md`：发现镜像/宿主工具、复用容错检查、区分工具误判与硬件问题、建立可比性能预期；第 6 节要求对可信差距继续基本排查和有界尝试。
 - `docs/source-transfer.md`：Windows/Linux 源码、执行位与仓内链接的固定内容传输。
-- `docs/workspace-maintenance.md`：可重建缓存登记、使用 pin、五分钟维护和 context 独立观察 Store。
+- `docs/workspace-maintenance.md`：容量预检、缓存/临时产物登记退役、阶段低频维护和 context 独立观察 Store。
 - `docs/training-observation.md`：真实训练日志、进程身份和退出回执；启动阶段与真实进展分开。
 - `docs/training-state-validation.md`：tokenizer 一致性、优化器状态、checkpoint 资源错误和短窗口续训等价验证。
 - `docs/profiling.md`：时间分母、热点建模和 TraceLens。
@@ -73,9 +73,9 @@
 
 ## 缓存与观察部署
 
-建立部署时记录私有缓存 policy，默认每五分钟由主控做一次有界 dry-run；已经明确开启自动清理的部署按同一 policy 调用 `scripts/maintain_workspace.py ... tick --enable-delete`。只由一个调用者维护，不让每个阶段或 Agent 重复扫描。当前没有登记缓存则跳过；不会自动整理旧目录。
+建立部署时记录本地/远端真实维护根、容量阈值、唯一清理者与 policy。适配批次结束、阶段交接时触发；长时间同阶段默认6小时一次，五分钟交互不扫盘。已启用自动清理的部署按同一 policy 调用 `scripts/maintain_workspace.py ... tick --trigger stage-transition --enable-delete`，否则 dry-run。共享盘只维护一次，旧目录不自动整理。大下载/构建/保存前先用 capacity 检查实际余量并另核对配额。
 
-新生成的源码传输 archive、可重建编译中间物可从一开始放在 `cache/recreatable/FAMILY/GENERATION`，通过 register 写明固定重建来源，使用前 pin、接收哈希核对和实际操作核销后释放。开发 checkout、Store objects/snapshots、原始材料、训练日志与 checkpoint 不放入该清理根。跨节点消费者也须遵守 pin，不能凭本机 lease 过期推断远端不再使用。
+新生成的源码传输 archive、可重建编译中间物可从一开始放在 `cache/recreatable/FAMILY/GENERATION`，通过 register 写明固定重建来源，使用前 pin、接收哈希核对和实际操作核销后释放。临时大文件另放 `scratch/disposable/FAMILY/GENERATION` 并 register-temporary；确认废弃、写者/消费者核销且必要证据已保存后才 retire。开发 checkout、Store objects/snapshots、原始材料、训练日志与有效 checkpoint 不放入清理根。跨节点消费者也须遵守 pin，不能凭本机 lease 过期推断远端不再使用。
 
 首次训练部署参考 `docs/training-observation.md`；已有观察任务改变真实 context 时按 `docs/workspace-maintenance.md` 准备新 context+epoch Store，保留旧 parser/monitor 数据。核对同版本 wheel/模块和显式同步的 observer 脚本；本机安装 Skill 不会更新远端。先 once，再 start 并验证 ready/心跳；每个必需 member 的进程与观察器都要检查，从固定源码与真实日志确认实际进度来源；其首次 iteration 不能覆盖其余节点。独立 sentinel 与事件 peer 随新 Store/launch 更新。
 

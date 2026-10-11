@@ -6,7 +6,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。候选与阶段结果以实际证据推进，经过独立复核和修正；有界初筛、局部试参和未变化的证据按需复用，不逐条命令审核。人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前版本：`0.6.0`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
+**当前版本：`0.6.1`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
 
 **首次了解工程，建议阅读 [HCU-TrainFlow 工程介绍](docs/project-overview.md)**：从接到一个新模型和环境开始，讲清三个阶段如何推进、如何选择优化对象、怎样保护训练质量，以及多 Agent、知识检索和持续守护如何配合。
 
@@ -74,7 +74,7 @@ collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 
 解释性问题可写入 `QUESTIONS.md`，主控按同一周期读取并在原问题下回答，保留问题与回答版本。问题不自动改变资源或重启授权；采集器不会代替离线的 Agent 生成答案。
 
-主控在同一周期检查已登记的可重建缓存，默认只生成清理计划；明确启用的部署策略可自动保留最近3代并清理过期代次，活跃作业与证据继续保护，老目录不会自动删除。模型/实验 context 换代时使用独立观察 Store，重新核对全部成员监测及独立 sentinel。见 [工作区维护与观察交接](docs/workspace-maintenance.md)。
+工作区清理在实验批次收尾、阶段交接或恢复核销时进行，同阶段长训默认每6小时一次，不随五分钟交互频繁扫盘。明确启用的策略可回收过期缓存、已退役的无效临时 checkpoint 和调试大文件；最新有效/最佳/基线/恢复点、原件和使用中的文件保留。大写入前只查容量，空间不足及时报告，本地/远端共享盘分别由唯一负责人维护；默认 dry-run，旧目录不自动删除。模型/实验 context 换代时使用独立观察 Store，重新核对全部成员监测及独立 sentinel。见 [工作区维护与观察交接](docs/workspace-maintenance.md)。
 
 ## 多 Agent 如何协同
 
@@ -157,6 +157,6 @@ python scripts/check_skill_resources.py
 - [工程介绍](docs/project-overview.md) / [工作流全景](docs/workflow-map.md) / [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
 - [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)
 - [性能分析](docs/profiling.md) / [远程执行](docs/remote-execution.md)
-- [真实训练观察](docs/training-observation.md) / [离线训练图表](docs/training-dashboard.md) / [缓存维护与观察换代](docs/workspace-maintenance.md)
+- [真实训练观察](docs/training-observation.md) / [离线训练图表](docs/training-dashboard.md) / [容量清理与观察换代](docs/workspace-maintenance.md)
 - [官方 Wiki](knowledge/README.md) / [搜索与更新](docs/wiki.md) / [私有训练经验与 Cookbook 记录](docs/experience-knowledge.md)
 - [贡献与公开边界](CONTRIBUTING.md) / [参考工程](THIRD_PARTY_NOTICES.md)

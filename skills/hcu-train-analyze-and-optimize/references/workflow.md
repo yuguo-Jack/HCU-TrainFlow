@@ -21,9 +21,9 @@
 
 ## 候选缓存与观察交接
 
-候选源码传输包、编译缓存和可重复解析的中间物，可按部署 policy 登记在 `cache/recreatable/FAMILY/GENERATION`；先保留固定来源和重建方法，使用前 pin，候选的远端操作明确完成并核销后释放。原始 trace、profile 窗口/shape 证据、初始数值基线、最好候选、恢复点及报告留在正常证据体系，不能因“已生成图表”就删除原件。旧临时目录不自动登记或清理。
+候选源码传输包、编译缓存和可重复解析的中间物，可按部署 policy 登记在 `cache/recreatable/FAMILY/GENERATION`；先保留固定来源和重建方法，使用前 pin，候选的远端操作明确完成并核销后释放。原始 trace、profile 窗口/shape 证据、初始数值基线、最好候选、恢复点及报告留在正常证据体系，不能因“已生成图表”就删除原件。调试 dump、重复 profiler 中间物和临时保存点另在 scratch/disposable 下登记 owner/pin；一批实验结束后，确认无用且停止写入、保留必要证据，才显式 retire。旧临时目录不自动登记或清理。
 
-清理由主控同一五分钟循环调用 `scripts/maintain_workspace.py ... tick`，默认 dry-run；已配置自动删除 policy 时使用 `--enable-delete`，无需每轮重复审批。活跃/unknown 作业、lease、pin 或源码引用继续阻止淘汰，已保护代次不做重复大文件哈希。此策略不自动重建被清理缓存，也不会从大知识库刷新源码。
+清理由主控在实验批次结束、阶段交接时调用 `scripts/maintain_workspace.py ... tick --trigger experiment-batch`，同阶段长时间工作默认6小时间隔，不随五分钟交互扫描。大采集/回放前只查容量；默认 dry-run，已配置自动删除 policy 时使用 `--enable-delete`，无需每轮重复审批。活跃/unknown 作业、lease、pin 或源码引用继续阻止淘汰，已保护代次不做重复大文件哈希。此策略不自动重建被清理缓存，也不会从大知识库刷新源码。
 
 真实 TaskSpec context 改变时，使用新 context+epoch 观察 Store；只换 parser state-dir 不能重置 monitor 的旧上下文。保留旧原始日志、退出/观察回执及事件后，按新 manifest once/start-ready 检查，重连独立 sentinel，以唯一新 peer 导入事件。普通同 context 重试改 attempt ID 即可。先由固定源码和真实日志确定 rank0、全局最后 rank 或专用 logger 中谁实际输出训练进展；多节点仍分别验证全部必需 member 的健康和失败日志；阶段完成同时检查全组真实终态。详细步骤和脚本以 `docs/workspace-maintenance.md` 为准。
 

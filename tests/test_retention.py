@@ -243,7 +243,7 @@ def test_cli_defaults_to_no_deletion(cache):
     store, _ = cache
     script = Path(__file__).parents[1] / "scripts/maintain_workspace.py"
     result = subprocess.run([sys.executable, "-B", str(script), "--workspace", str(store.root)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
+    assert result.returncode in (0, 2), result.stderr  # 2 reports real host disk pressure
     assert json.loads(result.stdout)["results"][0]["status"] == "dry-run"
     assert all((store.root / f"cache/recreatable/build/g{i}").exists() for i in range(5))
 

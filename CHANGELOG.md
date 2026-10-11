@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 — 2026-10-11
+
+- Maintain workspace capacity at experiment/phase/recovery milestones with a persisted six-hour periodic scan interval and one-hour milestone floor, separately from five-minute human guidance polling. Report low disk space without recursive scans before large writes.
+- Extend existing retention to explicitly owned, retired temporary checkpoints/debug outputs/profiler intermediates. Require producer closure and retained disposal evidence; protect active users, valid recovery/baseline/best data and original evidence. Use bounded metadata scans for large retired outputs, quarantine receipts and explicit recovery after interrupted sweeps.
+- Route maintenance through the coordinator and all three stage Skills; document local/remote/CFS ownership, capacity/quotas, lifecycle and limitations. Validate destructive behavior only in isolated local fixtures, without claiming remote-filesystem qualification.
 
 - Preflight candidate evidence before requesting independent review; incomplete reports and mismatched snapshots go directly to repair. Recheck the same gates after review.
 - Reuse the immediately preceding baseline review for an unchanged handoff into profiling, with an atomic audit record and invalidation on changed evidence, guidance, team scope or context. Keep all substantive stage gates.

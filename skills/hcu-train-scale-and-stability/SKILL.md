@@ -33,7 +33,7 @@ description: 扩展 HCU 训练规模、筛机并衔接既有容错，持续观�
 
 ## 观察交接与工作区维护
 
-按 [观察器换代与缓存保护](references/workflow.md#观察器换代与缓存保护) 执行新 context 的独立 Store/事件 peer 交接，重新连接独立 sentinel。已核实进度源的 iteration/loss 不是全部节点健康证明，不能固定假定 rank0 输出进度；每个必需 member 的 ready、心跳、进程与退出结果均要核对。清理随主控既有五分钟轮询；只有明确部署 policy 才自动删除合格登记缓存，训练/恢复文件继续 pin，unknown 作业先核销。保留故障与 checkpoint 原件，老目录不自动清理。
+按 [观察器换代与缓存保护](references/workflow.md#观察器换代与缓存保护) 执行新 context 的独立 Store/事件 peer 交接，重新连接独立 sentinel。已核实进度源的 iteration/loss 不是全部节点健康证明，不能固定假定 rank0 输出进度；每个必需 member 的 ready、心跳、进程与退出结果均要核对。按阶段交接、恢复核销和长训低频策略维护，大 checkpoint 保存前只查空间与配额。只有明确部署 policy 才自动回收合格缓存及显式退役的无效临时保存点/调试产物。最新有效、最佳、基线、回退/恢复 checkpoint 与故障唯一原件继续保护，unknown 作业先核销；老目录不自动清理。
 
 ## 故障诊断步骤
 

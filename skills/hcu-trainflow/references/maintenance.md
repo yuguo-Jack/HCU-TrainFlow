@@ -2,25 +2,30 @@
 
 先定位 `TRAINFLOW_PROJECT` 和 `TRAINFLOW_WORKSPACE`；命令从真实 checkout 的 `scripts/` 取，不从安装后的 Skill 相对路径推测。详细契约以项目 `docs/workspace-maintenance.md`、`docs/training-observation.md` 为准。三个阶段继续负责各自范围，不新增维护 Skill。
 
-## 接入既有五分钟轮询
+## 按阶段和低频时机维护
 
-主控在私有部署配置/计划中记录维护 policy：默认 dry-run；保持至少最近3代和默认7天未使用；只有部署已经明确允许自动清理时才启用删除。人类交互轮询到期后，由主控至多运行一次维护 tick；若没有登记的缓存，跳过。`flow-watch` 只收文件变化，不会自动执行这个脚本；离线自动维护需要现场已经配置的调用者，不能承诺写了 policy 就会后台运行。
+维护与默认五分钟人类交互采集分开：一批实验结束、阶段交接、故障恢复核销、任务收尾时触发；同阶段长训默认每6小时一次，阶段/空间触发也有1小时冷却。不要在每个参数点、kernel、Agent 消息或交互轮询中扫目录。先确认上一轮操作回执和本批产物生命周期，未到期的 tick 返回 not-due，不遍历文件树。
 
 ```bash
-python /path/to/HCU-TrainFlow/scripts/maintain_workspace.py --workspace /private/task tick
+python /path/to/HCU-TrainFlow/scripts/maintain_workspace.py --workspace /private/task \
+  tick --trigger experiment-batch
 ```
 
-已批准并记录的自动策略使用 `tick --enable-delete`；保留期参数放在子命令前。脚本首先做廉价保护判断，只有拟删除条目才深扫。活跃/unknown operation 或 lease 时保留，未知远端进程不因 lease 过期而解除保护。每次处理结果进入私有计划/回执；attention 时核对具体项并暂停自动重试，不替代原任务作业核销。
+部署 policy 明确允许自动清理后加 `--enable-delete`，不需重复询问；默认 dry-run。缓存保留最近3代/默认7天未使用；临时大文件通过 `register-temporary` 登记，确认写者与消费者结束、必要证据保留后 `retire`，默认静置1小时；最终收尾的零宽限策略及条件见详细文档。释放 pin 不等于允许删除。完整命令、生命周期及保护条件见项目 `docs/workspace-maintenance.md`。
+
+大 checkpoint 保存或大规模采集/构建前只用 `capacity` 检查磁盘剩余量，另查站点配额，与估计写入量和余量比较。低空间先回收合格项，仍不足就报告空间缺口并暂停新的大写入，不擅自终止训练或删除恢复点。看板只在发生清理、空间告警或 attention 时记录前后可用空间、逻辑删除量、保留原因和回执。
+
+本地、远端、容器节点盘分别确定真实维护根和唯一调用者；同一 CFS 挂载只管理一次。`flow-watch` 仍只收交互文件，离线维护需已有远端调用者显式部署同版本脚本。活跃/unknown operation 或 lease 保守阻止整个 Store 的删除；pin 还覆盖跨进程/节点/Store 使用者。attention 后先核对计划和隔离回执，核销后才用 `--resume-after-review`；不循环重试。
 
 ## 三个阶段如何参与
 
 | 阶段 | 生产者责任 | 观察交接 |
 |---|---|---|
-| adapt | 新建可重建传输/构建缓存才登记 `cache/recreatable/FAMILY/GENERATION`，保存重建源，使用前 pin，远端接收校验和操作核销后释放 | 首次训练先建立匹配 context 的观察 Store、真实 manifest 和 ready；初始化进度与真实 iteration 分开 |
-| optimize | 候选编译、传输、重复解析的可重建中间件可按策略登记；原 trace、数值基线、最好候选、源码快照和验收报告不归缓存 | 比较 context 确实改变时交接新观察范围；只改 attempt 时用新 attempt ID，不无故拆分 Store |
-| fault-tolerance | 训练/恢复中的文件持续 pin；故障、checkpoint、恢复证据不自动清理；只有作业终态和责任核销后释放缓存使用 | 旧观察器原参数精确停止/保留，新 Store及每个 member 观察器就绪，独立 sentinel 和事件 peer 同步换代 |
+| 检查与适配 | 建立本地/远端容量阈值、维护根与负责人；缓存登记重建方法，临时输出登记 owner/pin，适配批次收尾明确废弃项 | 首次训练建立匹配 context 的观察 Store、真实 manifest 和 ready；初始化进度与真实 iteration 分开 |
+| 分析与优化 | 一批候选核销后退役无用调试 dump、重复 profiler 中间物或临时保存点；保留原 trace、基线、最好候选及可复现证据 | 比较 context 确实改变时交接新观察范围；只改 attempt 时用新 attempt ID，不无故拆分 Store |
+| 扩规模与长稳 | 保存前查空间，恢复核销后处置无效临时保存点；最新有效、best、基线、回退/恢复 checkpoint 和故障唯一原件继续保护 | 旧观察器原参数精确停止/保留，新 Store及每个 member 观察器就绪，独立 sentinel 和事件 peer 同步换代 |
 
-普通老目录、未知临时文件、尚未回传结果不因名字含 tmp/cache 就自动登记。不要移动正在使用的目录以满足清理格式。缓存只要跨进程/节点/Store 使用，相关消费者就必须共同履行 pin；当前 Store 的 operation/lease 检查看不到所有外部使用者。
+不扫描整机猜哪些文件可删，不移动正在使用的目录来满足清理格式。正式模型、源码 checkout、原始材料、日志、证据与数据库在清理根之外；不因已经出图就丢弃原 trace。部署和数据用途未确认的旧目录保留。保留点用途、writer 停止和证据充分性由阶段 Agent 判断，不能误称维护脚本自动证明了这些事实。
 
 ## context 交接检查
 
