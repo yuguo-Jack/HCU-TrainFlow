@@ -1,14 +1,16 @@
 ---
 id: knowledge-index
-title: TrainFlow 官方资料、环境经验与模型里程碑
+title: HCU-TrainFlow-Wiki：官方资料、环境经验与模型总结
 visibility: public
 ---
 
-# TrainFlow 官方资料、环境经验与模型里程碑
+# HCU-TrainFlow-Wiki：官方资料、环境经验与模型总结
 
 本库只收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。临时排查、未定候选和逐次实验留在 workspace/看板，不纳入共享检索。HCU-Knowledge 是完整安装的必需依赖，按问题联查，普通任务不更新它。
 
 重点覆盖 Megatron 生态、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；主要 SFT/RL 引擎按目录、调用链、安装运行测试、优化和故障诊断组织，仍不宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
+
+入口为 `$hcu-trainflow-wiki-search` 与 `$hcu-trainflow-wiki-skill-update`。任务初期核对相关官方知识，阶段和最终收尾整理可复用经验，具体见 [知识维护时机](../docs/knowledge-architecture.md#任务中的维护时机)。
 
 ## 共享知识与工作流文档
 

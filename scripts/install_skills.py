@@ -22,7 +22,9 @@ RENAMED = {
     'hcu-train-fault-tolerance': 'hcu-train-scale-and-stability',
     'hcu-train-prepare': 'hcu-train-environment-check-and-adapt',
     'hcu-train-operate': 'hcu-train-scale-and-stability',
-    'hcu-engine-wiki-update': 'hcu-engine-wiki-skill-update',
+    'hcu-engine-wiki-update': 'hcu-trainflow-wiki-skill-update',
+    'hcu-engine-wiki-skill-update': 'hcu-trainflow-wiki-skill-update',
+    'hcu-engine-wiki-search': 'hcu-trainflow-wiki-search',
 }
 KERNEL_NAMES = ('hygon-hip-baseline-generator', 'hygon-hip-kernel-optimizer', 'hygon-triton-kernel-optimizer')
 KNOWLEDGE_NAMES = ('hcu-knowledge-search', 'hcu-knowledge-update')

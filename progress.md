@@ -326,3 +326,12 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 最终清理/生命周期/调度回归86项通过，涵盖复核后重新退役、零宽限收尾、不重读大文件、低空间与六小时去重；旧缓存兼容测试全部保留。README、包元数据、__version__和CHANGELOG统一0.6.1，包含此前未打tag的工作流效率改进。
 - 系统Python editable升级0.6.1；主控和三个阶段Skill已替换，两个Wiki Skill仍current。六个绑定校验通过，临时备份由安装器验证后清理；独立--check和CLI版本检查通过。未升级外部依赖、未刷新大知识库，未添加新的常驻调度服务。
 - 本地检查和远端main基线核对完成，准备推送main并在GitHub检查后发布annotated v0.6.1；远端回执由最终交付确认。
+
+## 2026-10-11：Skill 名称、Wiki 生命周期与 0.6.2
+
+- 已读现有元数据、两个 Wiki Skill、安装迁移/绑定校验和知识归属；准备保持六个工作流入口数量不变进行改名及衔接。
+
+- 0.6.2：六个菜单名称与英文 ID 对齐，两个 Wiki 目录/引用/维护关联与旧名迁移完成。范围明确包含官方资料、通用站点经验、最终模型总结与受影响用法。新增非阻塞 knowledge_followup 提示及恢复去重记录规范，不改变训练 gates 或自动采集。
+- README 增加九个详细任务/知识入口示例；知识验证 489 页/25 来源无错误，63 份文档的 403 个链接/锚点有效，16 张 Mermaid 渲染通过。正在执行全量回归和安装同步。
+
+- 0.6.2 本地验收：1225 passed / 4 平台跳过；本机 editable 包 0.6.2 与六个 Skill 同步并 --check 为 current，旧 Wiki 名称迁移后无残留，临时备份按安装器验证规则清理。计划按 main 提交推送、远端 CI、annotated tag 顺序发布。未刷新官方上游/大知识库，未进行远端训练实验。

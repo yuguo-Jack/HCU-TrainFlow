@@ -472,14 +472,14 @@ flowchart TD
     USE --> RESULT["实际里程碑结果<br/>基线、候选、阶段 loss、扩容、异常与恢复"]
     RESULT --> PRIVATE[("私有任务 experience / 档案<br/>自动保留报告 / 阶段事件<br/>Agent 补充解释、指标口径、失败条件和回退")]
     PRIVATE --> EXP
-    PRIVATE --> CURATE{"跨项目通用环境经验<br/>或最终模型优化总结？"}
+    PRIVATE --> CURATE{"环境 / 优化阶段验收及最终收尾<br/>筛选通用环境经验或最终模型总结"}
     CURATE -->|是，复核必要证据| SHARED["共享 Wiki 的精选经验<br/>sites：通用环境与适用条件<br/>experiments：最终优化里程碑、性能与 loss"]
     CURATE -->|否| PRIVATE
     SHARED --> LOCAL
     PRIVATE --> DELIVERY["所属阶段负责交付<br/>对应工程 PR / Cookbook 最佳实践"]
     DELIVERY --> PUBLIC["公开前按目标仓规则审阅<br/>只交付可公开方法 / 代码 / 获准示例"]
     DELIVERY --> TRACK["经验中记录交付关联<br/>draft / submitted / merged / rejected / superseded"]
-    REFRESH["局部官方 Wiki 按需自主更新<br/>问题驱动 / 里程碑 / 版本漂移"] --> SCOPE["先审收录范围、相关性和复用价值<br/>检查带理由的文档排除项<br/>完整源码目录仍可查询"]
+    REFRESH["官方资料按相关版本定向更新<br/>任务初期 / 问题驱动 / 版本漂移"] --> SCOPE["先审收录范围、相关性和复用价值<br/>检查带理由的文档排除项<br/>完整源码目录仍可查询"]
     SCOPE --> FETCH["目录、文档、源码和 PR 讨论增量采集<br/>排除项不再入库；既有页冲突显式处理<br/>失败 / 分页未完成保留待办"]
     FETCH --> IMPACT["联动复核总览、专题、案例<br/>相关 Skill / 命令 / 解析器用法"]
     IMPACT --> APPLY["绑定当前页与来源哈希的回执<br/>apply 版本锁 → 重建检索索引"]
@@ -488,13 +488,13 @@ flowchart TD
     IMPACT -->|现场暂不能验证| PENDING["用法保持待现场验证<br/>不冒称 Skill 已在 HCU 通过"]
 ```
 
-- **两个局部 Wiki Skill：**`hcu-engine-wiki-search` 负责检索、PR 和源码追查；`hcu-engine-wiki-skill-update` 负责增量采集、知识复核及关联用法检查。普通查询写私有缓存，正式收录才进入公共知识目录。
+- **两个局部 Wiki Skill：**`hcu-trainflow-wiki-search` 负责检索、PR 和源码追查；`hcu-trainflow-wiki-skill-update` 负责官方来源增量维护、通用经验/最终总结提炼及关联用法检查；任务初期和收尾的非阻塞提示由 Agent 执行并记录，重复轮询复用处理结果。普通查询写私有缓存，正式收录才进入公共知识目录。
 - **大知识库边界：**HCU-Knowledge 是完整安装的必需组件，可复用独立 checkout，三个阶段按问题查询；普通 TrainFlow 工作不附带更新它，更新走单独明确的维护任务。本地索引恢复不等于刷新上游内容。
 - **版本边界：**局部官方 Wiki 更新不会自动替换当前训练任务的依赖或运行源码。采用新实现要形成新候选并重新验证；官方已吸收的功能应复核本地 patch 是否可以退场。
 - **经验边界：**性能、loss、环境和事故的完整档案留 workspace；仅可跨项目复用的通用环境经验，以及模型最终优化里程碑总结和关键数据进入随工程提交的 Wiki；中间候选、一次性排查和完整失败过程不入库。公开 Cookbook 的方法与其私有验证记录建立关联，记录交付不等于自动发送 PR。
 - **内容筛选：**正式同步遵守来源文档范围及带理由的排除项，保留的旧页与新规则冲突时显式整理，不能静默删除或下次又自动收回。完整源码树和在线 PR 检索保持可用，文档筛选不代替 Agent 对知识价值的复核。
 
-详见 [官方 Wiki 检索与维护](wiki.md)、[私有训练经验](experience-knowledge.md) 和 [公开边界](../CONTRIBUTING.md)。
+详见 [HCU-TrainFlow-Wiki 检索与维护](wiki.md)、[私有训练经验](experience-knowledge.md) 和 [公开边界](../CONTRIBUTING.md)。
 
 ## 8. 图与程序状态的准确对应
 

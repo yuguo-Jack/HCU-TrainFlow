@@ -80,7 +80,7 @@ scale_ready --environment + stage-quality + scale--> training --completion--> co
 | 上游源码/工具命令变化 | 读匹配分支 diff/help，复核调用、库加载、解析器与 Skill；先在隔离候选中验证，不替换运行中的依赖 |
 | 只有文档更新、线上 PR 搜索 | 私有留存或局部 Wiki 维护；不自动刷新 HCU 大知识库，也不把未合入 PR 当现场已有能力 |
 
-报告绑定当前 `candidate_snapshot`。复用以前的环境或基线证据时，说明哪些依赖没变、原件 ID 和适用依据；不能只替换哈希字段。失败/被拒候选和最佳版本都留存，清理只处理已登记可重建缓存。
+报告绑定当前 `candidate_snapshot`。复用以前的环境或基线证据时，说明哪些依赖没变、原件 ID 和适用依据；不能只替换哈希字段。失败/被拒候选的必要证据和最佳版本留存；清理按工作区维护规则处理已登记可重建缓存，以及已停止使用、留存证据并显式退役的临时大文件，不能删除受保护的基线、恢复点或原始证据。
 
 ## 5. 多 Agent、看板与长训的接续
 
@@ -104,5 +104,7 @@ scale_ready --environment + stage-quality + scale--> training --completion--> co
 | hang/core/OOM、筛机与恢复 | fault-tolerance Skill、[运行守护](operations.md)、[全部成员观测](distributed-observation.md) |
 | 看板数据、图表、观察器/缓存换代 | [训练观察](training-observation.md)、[图表](training-dashboard.md)、[维护](workspace-maintenance.md) |
 | 工具过时、PR 与原始源码、知识归属 | 两个 Wiki Skill、[知识架构](knowledge-architecture.md)、[安装集成](integrations.md) |
+
+任务初期确认执行版本后、环境验收后、优化阶段验收及最终交付前，按 [知识维护时机](knowledge-architecture.md#任务中的维护时机) 调用 `$hcu-trainflow-wiki-skill-update` 检查或整理适用内容；在原计划/看板记录实际结果。独立交付由负责阶段处理，取消任务不写成功总结；不把私有档案自动记录称为共享 Wiki 更新。
 
 查 HCU 问题优先用已安装的大知识库及匹配的现场/源码证据；查机制和官方演进用局部 Wiki、在线 PR 和原始代码。未澄清的事实继续查证，不把旧经验当成当前站点保证。当前真实验证范围见[能力说明](capabilities.md)。

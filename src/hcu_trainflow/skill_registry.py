@@ -8,9 +8,12 @@ STAGE_SKILLS = {
     'fault-tolerance': 'hcu-train-scale-and-stability',
 }
 
+WIKI_SEARCH_SKILL = 'hcu-trainflow-wiki-search'
+WIKI_UPDATE_SKILL = 'hcu-trainflow-wiki-skill-update'
+
 WORKFLOW_SKILLS = (
     'hcu-trainflow',
     *STAGE_SKILLS.values(),
-    'hcu-engine-wiki-search',
-    'hcu-engine-wiki-skill-update',
+    WIKI_SEARCH_SKILL,
+    WIKI_UPDATE_SKILL,
 )

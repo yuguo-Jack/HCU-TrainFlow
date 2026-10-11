@@ -1,9 +1,11 @@
 ---
-name: hcu-engine-wiki-search
-description: 检索官方训练引擎与生态优化机制，核对固定提交、上下游依赖和原始源码；按需联查 HCU 领域知识库。
+name: hcu-trainflow-wiki-search
+description: 检索 HCU-TrainFlow-Wiki 的官方资料、通用环境经验和模型优化总结；核对版本与证据，必要时追查线上 PR 和源码。
 ---
 
-# 训练引擎官方 Wiki 检索
+# hcu-trainflow-wiki-search
+
+本入口覆盖整个 HCU-TrainFlow-Wiki：官方引擎/依赖的源码、教程与 PR，跨任务通用环境经验，以及模型最终优化里程碑的总结、性能/显存/loss 数据和证据。先按问题跨类型检索，再按模型、环境、版本与验证范围筛选；站点实测不能当成所有环境的承诺，历史最终结果不能当成当前模型的基线。任务中间试验只在对应私有 Store 内查询。
 
 ## 开始前定位与阅读
 
@@ -19,7 +21,7 @@ description: 检索官方训练引擎与生态优化机制，核对固定提交�
 4. **本地不能回答就主动搜索线上 PR**。零命中且有 engine/source/repo 范围时默认自动回退；有命中但机制、版本、原因或证据不足时主动 `wiki-search-pr "英文机制/错误/符号" --engine ENGINE`，或显式 `--repo OWNER/REPO` 搜未收录仓。不能因找到入口页就结束。跨问题拆查询，必要时翻 `--page`，权限/限流/未完分页不等于没有答案。
 5. 对相关 PR 执行 `wiki-pr OWNER/REPO N`，读取描述、普通/行内评论、独立 review、diff 和最终 head/base。再 `wiki-code ACTUAL_HEAD_REPO FULL_SHA PATH` 读完整函数、调用方、下游库与测试；fork、删除/重命名用实际 repo/old_path。PR 初稿可能与最终实现不同，已合入也不表示实际依赖包含该改动。
 6. 跨主题按依赖连接：schedule→通信/TE→显存→数值→恢复，RL→rollout→weight sync→训练；对关键底层库追实际分支/锁定 SHA。大文件、目录级追查可拉固定源码到独立参考目录，开发/提 PR 使用独立工作 checkout，不能混用知识库缓存。
-7. 普通 search/read/code 只写私有缓存，不自动正式收录材料。确需补专题时调用 `$hcu-engine-wiki-skill-update`；正式 PR 来源页需显式 `wiki-pr ... --retain-project PROJECT --engine ENGINE`。必要时联查 HCU knowledge search/飞书，权限不足及时反馈，不顺带更新 HCU 大知识库。
+7. 普通 search/read/code 只写私有缓存，不自动正式收录材料。确需补专题且当前任务包含知识维护时，移交 `$hcu-trainflow-wiki-skill-update`；纯搜索只报告缺口；正式 PR 来源页需显式 `wiki-pr ... --retain-project PROJECT --engine ENGINE`。必要时联查 HCU knowledge search/飞书，权限不足及时反馈，不顺带更新 HCU 大知识库。
 
 底层库可用 `--engine transformer-engine` 或 `--engine cudnn-frontend` 定向搜索。TE 独立 Wiki 覆盖精度/权重缓存、attention、overlap/显存、融合与教程；cuDNN Frontend 覆盖 graph/plan、SDPA、open kernels、host 缓存与教程。跨 TE→cuDNN→HCU TE/Flash-Train 的问题分别检索并核对调用条件，不能把官方 NV 示例命令直接当成 HCU 配方。
 
@@ -29,7 +31,7 @@ HCU-Knowledge 是完整安装的必需项；缺少 search 或绑定不可用时�
 
 ## 回答要求
 
-给结论、适用条件、固定来源、实现位置、反例/约束与待验证项。找不到源码或本页只是入口导航时明确说明。遇到版本漂移可建议/执行本项目官方 Wiki 更新（符合当前任务范围），运行中任务的源锁保持不变。
+给结论、适用条件、固定来源、实现位置、反例/约束与待验证项。找不到源码或本页只是入口导航时明确说明。遇到版本漂移先报告相关来源与缺口；当前任务包含维护时交给 `$hcu-trainflow-wiki-skill-update` 处理。纯搜索请求不更新共享 Wiki，运行中任务的源锁保持不变。
 
 ## 运行约定
 

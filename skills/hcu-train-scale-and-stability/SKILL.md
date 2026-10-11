@@ -3,7 +3,7 @@ name: hcu-train-scale-and-stability
 description: 扩展 HCU 训练规模、筛机并衔接既有容错，持续观测训练质量与稳定性；按证据诊断卡住、崩溃、内存和恢复故障，支持仅故障诊断。
 ---
 
-# HCU 训练规模扩展与长稳运行
+# hcu-train-scale-and-stability
 
 ## 开始前定位与阅读
 
@@ -67,6 +67,10 @@ description: 扩展 HCU 训练规模、筛机并衔接既有容错，持续观�
 
 故障涉及新通信/算子后端时，追实际加载制品、接口与上下游版本，参考项目 `skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md`；仅替换通信库不代表故障恢复或训练状态正确，不新增并行恢复负责人。
 
+## Wiki 维护衔接
+
+独立调用本阶段也按 `docs/knowledge-architecture.md` 的“任务中的维护时机”执行：确认实际模型/环境/分支后检查相关官方资料，必要时调用 `$hcu-trainflow-wiki-skill-update` 定向更新；阶段验收与最终交付前筛选本阶段可复用的通用环境经验或合格的最终模型总结。没有最终优化与数值验收就不写最终优化总结，没有可共享知识则记录原因。复用任务已有处理记录，不反复刷新、不把私有 experience 自动记录当作共享 Wiki 已更新。
+
 ## 运行约定
 
 仅跨项目可复用的通用环境经验和模型最终优化里程碑总结/关键数据按收录规则写入本仓 `knowledge/`；完整任务档案留 workspace，凭据/私钥/token 永不入仓。CLI 用 `hcu-trainflow --workspace <private-path>`；源码环境可用 `python -m hcu_trainflow`。先读项目 `docs/quickstart.md` 和当前任务上下文，再按需读相关章节。
@@ -79,7 +83,7 @@ HCU-Knowledge 随完整安装提供，贯穿环境适配、性能优化和扩 DP
 
 ## 局部知识的使用与里程碑记录
 
-开始任务或出现新问题、证据冲突、版本差异时，按需跨引擎 wiki-search 检索官方资料、可复用环境经验及模型最终总结；工作流方法按需读 docs/practices，已有实验用 experience-search 查本任务记录并核对 context、条件和 loss 状态。相同问题已有适用证据时直接引用，不在每个重要实验前重复检索。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
+开始任务或出现新问题、证据冲突、版本差异时，按需跨引擎 wiki-search 检索官方资料、可复用环境经验及模型最终总结；工作流方法按需读 docs/practices，已有实验用 experience-search 查本任务记录并核对 context、条件和 loss 状态。相同问题已有适用证据时直接引用，不在每个重要实验前重复检索。需要机制依据时调用 hcu-trainflow-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。HCU-TrainFlow-Wiki 中的资料或经验发现版本漂移时，按需调用更新入口复核；HCU 大知识库不随本任务更新。
 
 report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。 工程 Wiki 仅收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。按 docs/knowledge-architecture.md 筛选：环境经验进入 `knowledge/sites/`；完成当前优化阶段且数值验收清楚的最终总结才进入 `knowledge/experiments/`。临时排查、单次调参、逐算子中间报告和未定候选只留 workspace/看板，不因已测量就入库。必要证据采用仓内相对链接和清单，入库后从新 Store 验证可读可搜。
 

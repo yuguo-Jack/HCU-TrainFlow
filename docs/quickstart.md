@@ -48,7 +48,7 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 验收 | occupancy-check、environment-check、proxy-check、iteration-check、quality-check |
 | 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective、tracelens-analyze |
 | 长训 | watch、heartbeat-check、events-export/import、monitor-report |
-| 官方 Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog |
+| HCU-TrainFlow-Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog |
 | 私有训练经验 | experience-record/sync/index/search/read/compare |
 | 公开交付 | public-export |
 
@@ -61,8 +61,8 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 - `$hcu-train-environment-check-and-adapt`：只检查分配的环境，按实际节点和设备生成缺项表。
 - `$hcu-train-analyze-and-optimize`：只分析这些 ranks 的 trace，给热点、效率和下一步实验。
 - `$hcu-train-scale-and-stability`：诊断卡住，先保存全 rank 现场，不触发重启。
-- `$hcu-engine-wiki-search`：查 EP overlap 与重算的版本限制。
-- `$hcu-engine-wiki-skill-update`：复核最新官方/生态源码，并同步受影响的用法。
+- `$hcu-trainflow-wiki-search`：查 EP overlap 与重算的版本限制。
+- `$hcu-trainflow-wiki-skill-update`：复核最新官方/生态源码，并同步受影响的用法。
 
 第三方使用者自行配置私有工作区和资源；不要拷贝另一位用户的凭据或现场目录。
 

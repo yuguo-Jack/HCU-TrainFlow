@@ -1,15 +1,21 @@
 ---
-name: hcu-engine-wiki-skill-update
-description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核受影响的 Skill、命令和解析器，保持可追溯知识与用法。
+name: hcu-trainflow-wiki-skill-update
+description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与最终模型总结，并更新受影响的工作流 Skill、命令和解析器，验证后同步本机安装。
 ---
 
-# 训练引擎 Wiki 与 Skill 更新
+# hcu-trainflow-wiki-skill-update
 
 ## 开始前定位与阅读
 
 先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。
 
-维护本工程官方 Wiki 和随源变化的工作流用法。它可以由训练任务按需主动调用；不替代或触发 HCU 大知识库 update。
+维护 HCU-TrainFlow-Wiki 的官方资料、可复用环境经验、模型最终优化总结，以及随源变化的工作流用法。它可以由训练任务按需主动调用；不替代或触发 HCU 大知识库 update。
+
+## 调用时机与更新范围
+
+先读 `docs/knowledge-architecture.md` 的“任务中的维护时机”。任务初期在确认模型、环境和执行分支后检查相关官方资料的新鲜度，有影响的缺口在依赖该事实前定向更新；环境验收和优化阶段收尾分别筛选通用站点经验与已验收的模型最终总结，任务最终完成前再汇总一次。恢复任务先读已有处理记录，不能每次轮询重复刷新。
+
+先判断本次属于官方来源、经验总结、工作流用法维护中的哪些范围：官方来源按下述更新协议；只提炼经验时按“站点、模型经验与任务档案的维护”处理，不附带全量采集 PR。两者都执行相关性、证据、索引/检索和安装收尾检查。直接修改本仓流程/Skill 后同样同步安装。CLI 的 knowledge_followup 只是给 Agent 的非阻塞提醒，不是自动执行服务；把实际处理结果写入原任务计划/看板。未形成可复用知识就记录原因，不凑页面。
 
 训练中按相关来源和变化范围维护：只有影响当前命令、接口或结论的漂移才立即处理；无关上游新特性、全库补采和共享总结排到合适里程碑，不作为开始实验的前置工作。用户明确要求全量更新时仍覆盖全部登记来源。复核按影响选代码/检索/安装测试，纯文字改动不触发整套 GPU 实验；采集成功且未变内容不反复重读，关联判断和当前内容哈希仍须一致。
 
@@ -47,7 +53,7 @@ TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查�
 
 整理已有页面也执行内容筛选：正文保留结论、适用条件、关键数据及最少充分证据；会话决策、待办、临时设施与逐次试验归任务档案。实际测量身份/版本/配方和可复用的具体 PR 问题仍需保留，不能为“通用”而删掉复现条件。引用与来源规则一并复核，排除既有文档需整理生成页及 ledger；不篡改原件、观测日期或未验证状态。完整规则只维护在 `docs/knowledge-architecture.md`。
 
-参照 `docs/knowledge-architecture.md` 与 `docs/experience-knowledge.md`。共享 Wiki 只收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。筛选后分别进入 `knowledge/sites/` 或 `knowledge/experiments/`，复制必要原件并登记哈希；临时排查、逐次调参、算子中间报告、未验候选和 Cookbook 草稿只留任务 Store/看板。最终总结须交代数值验收与未达目标，不把局部通过改名成最终结果。跨任务搜索从工程 Wiki 进入。任务 report 和 flow-advance 自动沉淀原 context 与证据；里程碑后确认自动写入成功，必要时 experience-sync 续接。关键环境验收、基线、性能/显存优化、阶段 loss、扩容、故障及 Cookbook 交付由对应阶段补 experience-record 解释；失败尝试也保存。不能猜指标单位或补造 loss。Cookbook 记录关联原经验 ID、脱敏审核和 draft/submitted/merged 等状态及 PR 链接，外部 Cookbook 的数据发布要求单独遵守；本仓可保留符合收录条件的关键实测数据。局部经验和官方 Wiki 可自主按需更新，不调用 HCU 大知识库更新。
+参照 `docs/knowledge-architecture.md` 与 `docs/experience-knowledge.md`。共享 Wiki 只收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。筛选后分别进入 `knowledge/sites/` 或 `knowledge/experiments/`，复制必要原件并登记哈希；临时排查、逐次调参、算子中间报告、未验候选和 Cookbook 草稿只留任务 Store/看板。最终总结须交代数值验收与未达目标，不把局部通过改名成最终结果。跨任务搜索从工程 Wiki 进入。任务 report 和 flow-advance 只向私有任务 Store 自动沉淀原 context 与证据，不等于已更新共享 Wiki；里程碑后确认自动写入成功，必要时 experience-sync 续接。关键环境验收、基线、性能/显存优化、阶段 loss、扩容、故障及 Cookbook 交付由对应阶段补 experience-record 解释；失败尝试也保存。不能猜指标单位或补造 loss。Cookbook 记录关联原经验 ID、脱敏审核和 draft/submitted/merged 等状态及 PR 链接，外部 Cookbook 的数据发布要求单独遵守；本仓可保留符合收录条件的关键实测数据。局部经验和官方 Wiki 可自主按需更新，不调用 HCU 大知识库更新。
 
 ## 运行约定
 

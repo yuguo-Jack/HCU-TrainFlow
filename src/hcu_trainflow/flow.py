@@ -6,7 +6,7 @@ claims to authenticate reviewer identity, or treats a code review as a GPU test.
 import json
 import time
 from .core import FlowError, GATES, atomic_write, child, context_epoch, safe_id, utc
-from .skill_registry import STAGE_SKILLS
+from .skill_registry import STAGE_SKILLS, WIKI_UPDATE_SKILL
 
 DEFAULTS = {'max_rounds': 20, 'max_stalled_rounds': 3, 'full_review_every': 4,
             'max_review_failures': 3, 'poll_seconds': 300}
@@ -44,6 +44,25 @@ def needs_context_replan(db, tid):
 def board_paths(store, tid):
     directory = child(store.root, 'collaboration/' + safe_id(tid))
     return directory, child(directory, 'BOARD.md'), child(directory, 'GUIDANCE.md')
+
+
+def knowledge_followup(task, goal, phase):
+    """Advisory for the Agent, not a source fetch, shared write or acceptance gate."""
+    scopes = {
+        'task-start': ['relevant-official-freshness', 'affected-workflow-usage'],
+        'environment-milestone': ['reusable-site-experience', 'confirmed-version-freshness'],
+        'optimization-milestone': ['qualified-final-model-summary', 'affected-workflow-usage'],
+        'task-completion': ['reusable-site-experience', 'qualified-final-model-summary', 'cookbook-linkage'],
+    }
+    return {
+        'skill': WIKI_UPDATE_SKILL, 'phase': phase, 'task_mode': task['spec']['mode'],
+        'scope': scopes[phase], 'blocking': False, 'automatic_execution': False,
+        'disposition_key': f"{task['context']}:{goal}:{phase}",
+        'guide': 'docs/knowledge-architecture.md#任务中的维护时机',
+        'instruction': 'Reuse the disposition in the task plan/BOARD; check or curate only applicable knowledge. '
+                       'Record updated, checked-current, deferred with reason, or no-shareable-knowledge. '
+                       'No repeated update on polling; no invented final optimization/loss results in standalone modes.',
+    }
 
 
 def start(store, tid, plan, reason=None):
@@ -100,7 +119,8 @@ def start(store, tid, plan, reason=None):
     if store.task(tid)['state'] == 'draft':
         store.transition(tid, 'prepared')
     views = render_board(store, tid)
-    return {'task': tid, 'goal': goal, 'status': 'unchanged' if unchanged else 'started', **views}
+    return {'task': tid, 'goal': goal, 'status': 'unchanged' if unchanged else 'started', **views,
+            'knowledge_followup': knowledge_followup(task, goal, 'task-start')}
 
 
 def sync_guidance(store, tid, *, force=False):
@@ -311,6 +331,8 @@ def next_step(store, tid):
         if uncertain:
             return {**result, 'action': 'reconcile', 'operations': uncertain}
         if terminal:
+            if task['state'] == 'completed':
+                result['knowledge_followup'] = knowledge_followup(task, flow['goal'], 'task-completion')
             return {**result, 'action': task['state']}
         reasons = blockers(db, tid, task, flow)
         if task['state'] in {'paused', 'blocked', 'failed'}:
@@ -358,6 +380,12 @@ def next_step(store, tid):
         team_reasons=completion_blockers(db,tid)
         if team_reasons:
             return {**result,'action':'coordinate','reasons':team_reasons,'team':schedule(store,tid)}
+        phase = {'prepared': 'task-start', 'environment_checked': 'environment-milestone',
+                 'scale_ready': 'optimization-milestone'}.get(task['state'])
+        if phase == 'task-start' and row and row['goal'] == flow['goal']:
+            phase = None  # Standalone iterations also remain in prepared; do not repeat startup work.
+        if phase:
+            result['knowledge_followup'] = knowledge_followup(task, flow['goal'], phase)
         return {**result, 'action': action, 'target': target(task),
                 'required_reports': required_reports(task, target(task)), 'last_review': row['review'] if row else None,
                 'poll_seconds': flow['plan']['poll_seconds']}

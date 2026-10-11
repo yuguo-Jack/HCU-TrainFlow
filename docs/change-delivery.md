@@ -43,4 +43,4 @@
 
 至少给出目标仓/分支、源提交或补丁身份、PR 链接或补丁位置、改动摘要、已运行/复用的验证、未验证项及当前 CI/review 状态。区分代码已整理、PR 已提交、CI 通过、已合入和实际部署，不互相替代。
 
-成果符合共享知识收录条件时按 [知识归属](knowledge-architecture.md) 更新精选总结与既有 Cookbook/PR 状态；普通零散 PR 不自动进入 Wiki。交付 TrainFlow 自身修改还需按 [本机同步](integrations.md#skills账号与升级) 更新本地安装，并报告结果。
+成果符合共享知识收录条件时调用 `$hcu-trainflow-wiki-skill-update`，按 [知识归属与维护时机](knowledge-architecture.md#任务中的维护时机) 更新精选总结与既有 Cookbook/PR 状态；普通零散 PR 不自动进入 Wiki。直接交付没有 flow 提醒，由负责阶段在原计划中记录本次筛选结果，不补造训练总结。交付 TrainFlow 自身修改还需按 [本机同步](integrations.md#skills账号与升级) 更新本地安装，并报告结果。

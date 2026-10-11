@@ -1,6 +1,6 @@
 # 任务经验档案与工程 Wiki
 
-官方 Wiki 解释通用实现；任务经验保存某个环境、模型、源码和数据条件下的完整实际结果。跨项目可复用的环境经验和模型最终优化总结经筛选后整理到随工程提交的 `knowledge/`，见 [知识归属](knowledge-architecture.md)。本页 CLI 针对所选任务 Store，不代替工程 Wiki。参考 Hyperloom 将策略、实现身份和测量证据分开的做法，TrainFlow 增加训练上下文、阶段 loss、失败候选和 Cookbook 交付关系。
+官方 Wiki 解释通用实现；任务经验保存某个环境、模型、源码和数据条件下的完整实际结果。跨项目可复用的环境经验和模型最终优化总结经筛选后整理到随工程提交的 `knowledge/`，见 [知识归属](knowledge-architecture.md)。本页 CLI 针对所选任务 Store，不代替工程 Wiki；自动记录成功也不代表共享页已更新。共享提炼由 `$hcu-trainflow-wiki-skill-update` 在 [阶段和收尾时机](knowledge-architecture.md#任务中的维护时机) 执行，没有可共享结论则如实留记录。参考 Hyperloom 将策略、实现身份和测量证据分开的做法，TrainFlow 增加训练上下文、阶段 loss、失败候选和 Cookbook 交付关系。
 
 ## 保存位置
 

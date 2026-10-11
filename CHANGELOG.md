@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2 — 2026-10-11
+
+- Align all six Skill menu labels with their English IDs. Rename the Wiki entrypoints to `hcu-trainflow-wiki-search` and `hcu-trainflow-wiki-skill-update`, with direct migration from the former names during installation upgrades.
+- Cover official sources, transferable site experience and qualified final model summaries in both Wiki entrypoints and documentation. Keep private task records distinct from curated shared knowledge; include affected workflow usage and local installation in maintenance.
+- Add nonblocking task-start, environment/optimization milestone and completion reminders for scoped knowledge maintenance. The Agent records dispositions and reuses them on resume; the CLI does not fetch sources, publish summaries or add a training acceptance gate.
+- Expand README prompts for full, standalone analysis/optimization, environment, scaling, diagnosis, delivery and Wiki usage. Verify routing, migration, documentation and local installation without claiming new hardware qualification.
+
 ## 0.6.1 — 2026-10-11
 
 - Maintain workspace capacity at experiment/phase/recovery milestones with a persisted six-hour periodic scan interval and one-hour milestone floor, separately from five-minute human guidance polling. Report low disk space without recursive scans before large writes.

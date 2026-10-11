@@ -3,7 +3,7 @@ name: hcu-trainflow
 description: 统一编排 HCU 大模型训练适配、性能优化、大规模验证与持续容错；拆解并行 Agent 任务，协调依赖、消息与证据验收，持续实施、独立复核和修正，并处理看板指导。也可只检查环境、分析性能、诊断故障，或审查交付已有训练改动。
 ---
 
-# HCU-TrainFlow
+# hcu-trainflow
 
 接受一句任务，例如“在指定 Slurm 环境对这个模型做适配、优化和大规模验证”。由你管理步骤、证据、专家分工、阶段复核和人类指导；不要求用户手工串接三个 Skill 或填写内部 JSON。遵守当前宿主的执行、委派和发布授权。
 
@@ -18,6 +18,12 @@ description: 统一编排 HCU 大模型训练适配、性能优化、大规模�
 3. 创建或恢复 TaskSpec；冻结初始数值基线、比较上下文、预算、执行权限、唯一容错负责人。区分执行基线与最终交付目标：起点可用适合模型的 HCU 主仓，否则 `full` 任务在选定功能分支/用户 patch 上完成优化、阶段 loss、扩 DP、容错和持续监测后再整合主仓；独立阶段按自身已授权目标验收交付，不强加扩容/长训。不得把最终目标当作中途换基线的理由。按 adapt 的基线规则记录例外/受影响回归。参考适用 HCU 脚本与现场方式，不机械照搬 NV 配方。读取原始证据的权限不等于允许发布数据或重启任意任务。
 4. 写出可验收的目标和阶段计划，`flow-start` 挂接持久循环。用 `flow-board` 向用户提供中文 BOARD.md、要求与指导 GUIDANCE.md、提问与回答 QUESTIONS.md 的路径；技术判断需要的细节直接在 BOARD，完整团队和历史在 DETAILS.md。预算是停止盲目试错的边界；实际调整理由用 `flow-replan` 留痕，不能偷偷降低目标或延长循环。
 5. 每个模型私有工作区保留 `task_plan.md`、`findings.md`、`progress.md`：分别记录当前计划、可追溯发现和实验/决策经过。它们补充看板与结构化 evidence，不代替程序门槛；跨环境/版本结论标明适用范围，仅经筛选的通用环境经验和模型最终优化总结进入工程 Wiki，完整过程留任务档案，见 `docs/knowledge-architecture.md`。
+
+## 知识维护的阶段衔接
+
+按 `docs/knowledge-architecture.md` 的“任务中的维护时机”执行：初期确认模型/环境/实际分支后检查相关官方资料，必要时调用 `$hcu-trainflow-wiki-skill-update` 定向更新；环境验收后筛选通用经验，优化阶段验收及任务最终完成前筛选最终总结、关键数据与 Cookbook 关联。独立阶段也执行适合自身范围的筛选，不凭分析报告制造最终优化结果。直接交付模式没有 flow 提醒，由负责阶段按同一规则收尾。
+
+`flow-start` / `flow-next` 返回的 `knowledge_followup` 是非阻塞维护提示；它不会联网更新或写共享 Wiki。按提示的 disposition_key 在既有计划/看板记录检查、更新、延期理由或无适合收录的知识，恢复后复用处理记录；不随轮询反复刷新。关键事实缺失仍须在使用前查证，无关全库更新不挡当前任务。
 
 ## 每轮工作
 
@@ -48,7 +54,7 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 - `$hcu-train-environment-check-and-adapt`：环境验收、HCU 启动配方、全参容量预估与短跑校准、模型适配和初始基线。参考 HCU Train Sim 等工具核对真实卡数/显存及模型覆盖，能放下就优先全参，不够才缩 layer；缩维仍按授权。可仅检查环境。
 - `$hcu-train-analyze-and-optimize`：可仅分析性能；先评估并行切分、微批/梯度累积与显存余量，按吞吐和通信代价选择配置；系统、融合、算子优化采用测量→假设→实施→验证→复核。累计 ≥90% 端到端热点集合中的非通信算子逐项建模；比较真实 shape 的独立测试。每轮局部正确性和 profiler-off 性能，稳定阶段才长窗口验 loss，始终对初始基线。复用 HCU Flash-Train/TE/Primus Turbo，通信按实际需求联动 RCCL/rocSHMEM/DeepEP/UCCL/UltraEP/MoonEP 等，必要时深入底层库隔离修改和重编，必要时调用三个 Hygon kernel Skill。
 - `$hcu-train-scale-and-stability`：按本轮选定配置扩 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。完整模型目标须先恢复完整配置；用户明确以缩减模型验证本轮流程时，可扩该配置的 DP 并保留完整模型缺口，见 `docs/proxy-contract.md`。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
-- `$hcu-engine-wiki-search` / `$hcu-engine-wiki-skill-update`：本地官方 Wiki 的检索和维护。需要 HCU 事实时读 HCU-Knowledge、当前底层库分支或官方资料；普通任务不顺带更新 HCU 大知识库。工具/脚本变了要复核相关 Skill、命令和解析器，不仅更新 Wiki。
+- `$hcu-trainflow-wiki-search` / `$hcu-trainflow-wiki-skill-update`：HCU-TrainFlow-Wiki 的检索与维护，覆盖官方资料、可复用环境经验及模型最终优化总结。需要 HCU 事实时读 HCU-Knowledge、当前底层库分支或官方资料；普通任务不顺带更新 HCU 大知识库。工具/脚本变了要复核相关 Skill、命令和解析器，不仅更新 Wiki。
 
 ## 看板指导
 
@@ -106,7 +112,7 @@ Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize �
 
 ## 局部知识的使用与里程碑记录
 
-开始任务或出现新问题、证据冲突、版本差异时，按需跨引擎 wiki-search 检索官方资料、可复用环境经验及模型最终总结；工作流方法按需读 docs/practices，已有实验用 experience-search 查本任务记录并核对 context、条件和 loss 状态。相同问题已有适用证据时直接引用，不在每个重要实验前重复检索。需要机制依据时调用 hcu-engine-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。局部官方 Wiki 发现版本漂移可按需自主更新；HCU 大知识库不随本任务更新。
+开始任务或出现新问题、证据冲突、版本差异时，按需跨引擎 wiki-search 检索官方资料、可复用环境经验及模型最终总结；工作流方法按需读 docs/practices，已有实验用 experience-search 查本任务记录并核对 context、条件和 loss 状态。相同问题已有适用证据时直接引用，不在每个重要实验前重复检索。需要机制依据时调用 hcu-trainflow-wiki-search；本地不足必须主动搜线上 PR，再读完整讨论、最终 diff、固定源码、调用者和测试，不能只停在已有入口页。HCU-TrainFlow-Wiki 中的资料或经验发现版本漂移时，按需调用更新入口复核；HCU 大知识库不随本任务更新。
 
 report 和 flow-advance 自动把原上下文与报告沉淀到私有 experience。到达环境验收、初始基线、重要候选、阶段 loss、扩容/恢复或结束里程碑后，确认写入成功；失败用 experience-sync 重放。按 docs/experience-knowledge.md 补充结构化解释记录，包括实际性能/显存口径、适用/失败条件和回退，不伪造测量，不把局部通过当成长训 loss 通过。只分析或诊断的任务同样记录已知与待验证项。 工程 Wiki 仅收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。按 docs/knowledge-architecture.md 筛选：环境经验进入 `knowledge/sites/`；完成当前优化阶段且数值验收清楚的最终总结才进入 `knowledge/experiments/`。临时排查、单次调参、逐算子中间报告和未定候选只留 workspace/看板，不因已测量就入库。必要证据采用仓内相对链接和清单，入库后从新 Store 验证可读可搜。
 

@@ -6,7 +6,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。候选与阶段结果以实际证据推进，经过独立复核和修正；有界初筛、局部试参和未变化的证据按需复用，不逐条命令审核。人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前版本：`0.6.1`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
+**当前版本：`0.6.2`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
 
 **首次了解工程，建议阅读 [HCU-TrainFlow 工程介绍](docs/project-overview.md)**：从接到一个新模型和环境开始，讲清三个阶段如何推进、如何选择优化对象、怎样保护训练质量，以及多 Agent、知识检索和持续守护如何配合。
 
@@ -19,6 +19,44 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 主控先按[接手与阶段交接指南](docs/agent-playbook.md)确认现场、任务范围与已有证据，再调用当前阶段 Skill，按主要瓶颈推进。安装会给 Skill 保存本机工程位置；换目录开新任务也可定位，任务 workspace 与资源权限仍单独确认。
 
 主控会建立任务、确认缺失的关键条件，然后按阶段推进。已知环境和授权可以复用；正常步骤持续执行，遇到权限缺口、数值异常、收益平台期或需要专家判断时再提出具体问题。内部任务文件和命令由 Agent 管理。
+
+### 使用示例
+
+下面的 `<...>` 替换为实际信息；不必手工准备完整 TaskSpec，Agent 会核对已有资料并询问真正缺失的条件。统一入口会按请求范围选阶段，也可直接调用相应阶段 Skill。
+
+**从新模型开始完整推进**
+
+> `$hcu-trainflow` 在 `<SSH/Docker、Slurm 或 K8s 环境>` 上，用 `<训练引擎及分支>` 适配并优化 `<模型名称/官方配置>` 的预训练。授权节点和资源范围是 `<范围>`，已有 HCU 启动脚本为 `<路径>`，数据为 `<路径及说明>`。先检查环境与全参容量，资源不足优先只缩 layer，其他结构变化先与我确认。目标是 `<吞吐/规模/质量目标>`，优化到稳定阶段再验 loss，然后按约定扩 DP、验证恢复与长时观察。建立可指导的看板，按瓶颈推进，阶段收尾整理可复用知识。
+
+**只全面检查环境**
+
+> `$hcu-trainflow` 这次只检查 `<集群和镜像>`，可使用 `<空闲节点/卡范围>`，现场激活脚本为 `<路径>`。核对健康、硬件/软件版本、GEMM、HBM、机内和跨机通信，对照有来源的预期。性能差距先做基本排查与有界对照，列出缺项、实际结果和建议，不启动模型训练。可复用的环境配方和实测参考按规则整理进 Wiki。
+
+**已有模型，只做性能分析**
+
+> `$hcu-trainflow` `<模型>` 已在 `<源码 SHA、配置、环境>` 跑通。本次只分析性能，已有 trace、日志和启动脚本在 `<目录>`，允许的补采范围是 `<范围>`。先检查采样代表性，用 TraceLens 解释空泡、通信、计算及显存，评估并行切分与余量；对累计 ≥90% 热点中的非通信算子按贡献给出条件上限、当前效率、未知项和优先级。给出融合、overlap 或实现优化的证据与建议，暂不改代码或开展优化实验。
+
+**适配完成，进入优化迭代**
+
+> `$hcu-trainflow` 接手 `<Megatron 或 Torch 原生训练工程>` 的优化，基线与已有验收在 `<路径>`，执行基线为 `<分支/SHA>`。保持模型、数据和数值契约，先根据 profile 判断主要瓶颈，再处理并行/微批/显存取舍、通信 overlap 或计算热点。核对已有融合实现和同 shape 对照，有明显剩余空间再进入相应算子 Skill。目标为 `<目标>`；报告实际整步收益、显存代价与阶段 loss，达到边界时说明原因。本次不扩大到长训部署。
+
+**已优化，只扩规模并接管长训**
+
+> `$hcu-trainflow` `<模型及配置>` 的优化和阶段质量证据在 `<目录>`，本次从 `<当前规模>` 扩到 `<目标规模>`。先核对已有证据与新增节点，扩 DP 并验证吞吐、通信、显存及训练语义。接入 `<现有容错工具>`，恢复与故障注入权限是 `<明确范围>`，告警渠道和本机离线策略为 `<约定>`。持续观察 step/loss、checkpoint、成员健康和恢复进度，发现异常按证据诊断，训练启动后继续履行观察约定。
+
+**只诊断故障，或只整理交付**
+
+> `$hcu-trainflow` 只诊断 `<作业 ID>` 的 `<卡住/core dump/OOM/恢复失败>`。日志、core、启动配方和源码版本在 `<路径>`，允许的诊断操作是 `<范围>`。先保全证据、确认进程与资源状态，联查 HCU 知识和当前源码，逐步排除原因；没有授权不终止或重启作业。交付结论、证据、待验证项和下一步建议。
+
+> `$hcu-trainflow` 只审查和交付 `<本地分支或补丁>`，目标仓/分支为 `<目标>`。核对已有验证与差异，只补受影响的检查，按目标规范整理提交、PR 描述和回退方式，完成后创建 PR 并报告 CI。不重新启动完整训练工作流；符合 Wiki 收录条件的最终结论和交付关联一并整理。
+
+**跨官方资料、环境经验和模型总结查知识**
+
+> `$hcu-trainflow-wiki-search` 查 `<问题，例如某版本 TP overlap 的启用条件和显存代价>`。当前模型、引擎版本、HCU 环境是 `<条件>`。同时找官方教程/PR、适用的站点经验和最终模型总结，区分源码结论与实测结果；本地不足就在线查 PR 并追对应源码，给出适用边界和证据链接，不更新知识库。
+
+**维护 Wiki 与受影响的工作流用法**
+
+> `$hcu-trainflow-wiki-skill-update` 针对 `<当前任务/引擎及版本范围>` 检查相关官方 Wiki 的新鲜度，补充影响当前使用的文档、PR 和源码变化。任务 `<工作区/报告路径>` 已完成 `<实际验收范围>`，请筛选可复用环境经验与合格的最终模型总结，保留关键数据、数值验收及限制，零散中间试验留任务档案。同时复核受影响的 Skill、命令和解析器，验证并同步本机安装；列明更新、仍待验证和无需收录的部分，不顺带刷新 HCU-Knowledge 或升级活动训练依赖。
 
 ## 工作流总览
 
@@ -53,7 +91,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ### 贯穿全程的协同与交付
 
-本地主控按依赖和收益拆解任务，独立方向并行，共享资源测量与耦合修改协调执行；代码以固定快照同步远端，超时或断线先核查原作业。HCU-Knowledge、局部官方 Wiki、PR 与源码查证贯穿三个阶段，看板持续展示技术结论并采集指导。各阶段按范围交付代码、配方、验证和回退方法；完整任务在执行基线上完成约定验证后再整合目标主仓，精选通用经验和最终里程碑进入共享 Wiki。
+本地主控按依赖和收益拆解任务，独立方向并行，共享资源测量与耦合修改协调执行；代码以固定快照同步远端，超时或断线先核查原作业。HCU-Knowledge、HCU-TrainFlow-Wiki、PR 与源码查证贯穿三个阶段，看板持续展示技术结论并采集指导。各阶段按范围交付代码、配方、验证和回退方法；完整任务在执行基线上完成约定验证后再整合目标主仓，精选通用经验和最终里程碑进入共享 Wiki。
 
 阶段入口分别为 `$hcu-train-environment-check-and-adapt`（环境检查与模型适配）、`$hcu-train-analyze-and-optimize`（性能分析与优化）、`$hcu-train-scale-and-stability`（规模扩展与长稳运行）；统一委托仍使用 `$hcu-trainflow`。也可仅委托接手已有修改、代码审查或提 PR，直接执行[交付规范](docs/change-delivery.md)，无需重新开展训练阶段。发生异常时按 [故障诊断指南](skills/hcu-train-scale-and-stability/references/diagnosis.md) 分流，结合 HCU 知识库、线上 PR 与实际源码查证，修复后回到对应阶段验收。
 
@@ -86,9 +124,11 @@ collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 
 ## 知识如何参与工作流
 
-**HCU-Knowledge 是完整安装的必需组成，贯穿三个阶段。** 按问题检索硬件、工具、HCU 工程、配方、优化与故障案例，并联查私有训练经验和官方引擎 Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。必需安装不表示每个命令都强制查询。
+**HCU-Knowledge 是完整安装的必需组成，贯穿三个阶段。** 按问题检索硬件、工具、HCU 工程、配方、优化与故障案例，并联查任务私有档案和 HCU-TrainFlow-Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。必需安装不表示每个命令都强制查询。
 
-局部官方 Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。共享 Wiki 只收录官方资料、跨项目可复用的环境经验，以及模型最终优化里程碑的总结和关键数据。环境经验放 `knowledge/sites/`，最终总结放 `knowledge/experiments/`，必要证据随仓提交。中间候选、调参试验和临时排查留在 workspace 与看板；外部 Cookbook 的发布要求单独处理。参见 [知识归属与跨任务复用](docs/knowledge-architecture.md)。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
+HCU-TrainFlow-Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。共享 Wiki 只收录官方资料、跨项目可复用的环境经验，以及模型最终优化里程碑的总结和关键数据。环境经验放 `knowledge/sites/`，最终总结放 `knowledge/experiments/`，必要证据随仓提交。中间候选、调参试验和临时排查留在 workspace 与看板；外部 Cookbook 的发布要求单独处理。参见 [知识归属与跨任务复用](docs/knowledge-architecture.md)。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
+
+任务初期在确认模型、环境和执行分支后，主控检查相关官方资料的新鲜度，必要时定向更新；环境验收、优化阶段结束和任务最终完成前，筛选通用经验与已验收的最终总结。中断恢复复用处理记录，没有可复用内容就如实记录。`flow-start` / `flow-next` 的维护提示由在线 Agent 执行，不是后台自动采集，也不会每轮全量刷新。详见 [知识维护时机](docs/knowledge-architecture.md#任务中的维护时机)。
 
 每次更新先检查内容相关性与复用价值，再联动复核总览、专题、案例和使用入口。来源登记收录范围及带理由的排除项，防止已清理的低相关文档在自动同步时重新入库；完整源码导航与按问题查 PR/代码的能力保留。更新并验证后同步本机包和六个 TrainFlow Skill，保持安装内容与工程一致。
 
@@ -116,7 +156,7 @@ $env:TRAINFLOW_WORKSPACE = "D:/trainflow-work/my-task"
 
 ### 后续更新
 
-日常维护使用 `$hcu-engine-wiki-skill-update`，由 Agent 检查官方与相关 HCU 工程变化，更新局部 Wiki、受影响的流程和 Skill，验证后同步本机安装。普通维护不更新 HCU-Knowledge，也不自动替换正在运行的训练依赖。
+日常维护使用 `$hcu-trainflow-wiki-skill-update`，由 Agent 检查相关官方与 HCU 工程变化、整理符合收录规则的环境经验和最终模型总结，并更新受影响的流程与 Skill，验证后同步本机安装。旧的 `hcu-engine-wiki-*` 安装名称会在升级时迁移为 `hcu-trainflow-wiki-*`，菜单显示名称与实际英文 Skill ID 一致。普通维护不更新 HCU-Knowledge，也不自动替换正在运行的训练依赖。
 
 已有完整安装时，更新 Skill 和本工程维护流程都会在验证后执行本机同步；手动 pull 后也可执行：
 
@@ -158,5 +198,5 @@ python scripts/check_skill_resources.py
 - [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)
 - [性能分析](docs/profiling.md) / [远程执行](docs/remote-execution.md)
 - [真实训练观察](docs/training-observation.md) / [离线训练图表](docs/training-dashboard.md) / [容量清理与观察换代](docs/workspace-maintenance.md)
-- [官方 Wiki](knowledge/README.md) / [搜索与更新](docs/wiki.md) / [私有训练经验与 Cookbook 记录](docs/experience-knowledge.md)
+- [HCU-TrainFlow-Wiki](knowledge/README.md) / [搜索与更新](docs/wiki.md) / [私有训练经验与 Cookbook 记录](docs/experience-knowledge.md)
 - [贡献与公开边界](CONTRIBUTING.md) / [参考工程](THIRD_PARTY_NOTICES.md)

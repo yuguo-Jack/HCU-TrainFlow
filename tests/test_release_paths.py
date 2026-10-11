@@ -86,7 +86,9 @@ def test_skill_install_idempotent_and_cleans_successful_backup(tmp_path):
     ('hcu-train-fault-tolerance','hcu-train-scale-and-stability'),
     ('hcu-train-prepare','hcu-train-environment-check-and-adapt'),
     ('hcu-train-operate','hcu-train-scale-and-stability'),
-    ('hcu-engine-wiki-update','hcu-engine-wiki-skill-update'),
+    ('hcu-engine-wiki-update','hcu-trainflow-wiki-skill-update'),
+    ('hcu-engine-wiki-skill-update','hcu-trainflow-wiki-skill-update'),
+    ('hcu-engine-wiki-search','hcu-trainflow-wiki-search'),
 ])
 def test_skill_rename_removes_obsolete_entry_after_verified_replacement(tmp_path,old_name,new_name):
     script=Path(__file__).resolve().parents[1]/'scripts/install_skills.py';target=tmp_path/'skills'

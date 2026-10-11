@@ -9,6 +9,8 @@ import yaml
 
 from hcu_trainflow import flow
 from hcu_trainflow.cli import main
+from hcu_trainflow.core import Store
+from hcu_trainflow.skill_registry import WORKFLOW_SKILLS, WIKI_UPDATE_SKILL
 from test_flow import setup, candidate, verdict
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +37,56 @@ def assert_installed(decision, expected, installed):
     assert frontmatter['name'] == decision['skill']
     binding = json.loads((path.parent/'workspace.json').read_text(encoding='utf-8'))
     assert Path(binding['project_root']) == ROOT
+
+
+def test_installed_menu_matches_english_skill_ids(installed_skills):
+    assert sorted(p.name for p in installed_skills.iterdir() if p.is_dir()) == sorted(WORKFLOW_SKILLS)
+    for name in WORKFLOW_SKILLS:
+        entry = installed_skills/name
+        metadata = yaml.safe_load((entry/'agents/openai.yaml').read_text(encoding='utf-8'))['interface']
+        frontmatter = yaml.safe_load((entry/'SKILL.md').read_text(encoding='utf-8').split('---', 2)[1])
+        assert metadata['display_name'] == frontmatter['name'] == name
+        assert '$' + name in metadata['default_prompt']
+        assert name.isascii()
+
+
+def test_knowledge_reminders_resume_without_changing_acceptance(tmp_path, installed_skills, capsys):
+    store = setup(tmp_path, mode='analyze')
+    initial = cli_decision(store, capsys)
+    followup = initial['knowledge_followup']
+    assert followup['phase'] == 'task-start'
+    assert followup['task_mode'] == 'analyze'
+    assert followup['skill'] == WIKI_UPDATE_SKILL
+    assert (installed_skills/followup['skill']/'SKILL.md').is_file()
+    assert followup['blocking'] is False and followup['automatic_execution'] is False
+    assert flow.next_step(Store(store.root), 't')['knowledge_followup'] == followup
+    # No maintenance report or response is required to advance actual task evidence.
+    flow.submit(store, 't', candidate(store))
+    flow.review(store, 't', verdict(store))
+    result = flow.advance(store, 't')
+    assert result['action'] == 'completed'
+    assert result['knowledge_followup']['phase'] == 'task-completion'
+    assert result['knowledge_followup']['task_mode'] == 'analyze'
+    assert result['knowledge_followup']['disposition_key'] != followup['disposition_key']
+    assert flow.next_step(Store(store.root), 't')['knowledge_followup'] == result['knowledge_followup']
+    assert 'skill' not in result  # Completion remains terminal, not a new training stage.
+
+
+def test_iteration_does_not_repeat_initial_wiki_check(tmp_path):
+    store = setup(tmp_path, mode='optimize')
+    flow.submit(store, 't', candidate(store, target='iterate', experiment=True))
+    flow.review(store, 't', verdict(store))
+    result = flow.advance(store, 't')
+    assert result['action'] == 'work'
+    assert 'knowledge_followup' not in result
+
+
+def test_cancelled_task_has_no_success_curation_prompt(tmp_path):
+    store = setup(tmp_path)
+    store.transition('t', 'cancelled', reason='User ended this task')
+    result = flow.next_step(store, 't')
+    assert result['action'] == 'cancelled'
+    assert 'knowledge_followup' not in result
 
 
 @pytest.mark.parametrize('mode,expected', [
@@ -73,7 +125,14 @@ def test_complete_pipeline_routes_each_real_transition(tmp_path, installed_skill
             value = candidate(store, experiment=destination == 'scale_ready')
             flow.submit(store, 't', value)
             flow.review(store, 't', verdict(store))
-        flow.advance(store, 't')
+        advanced = flow.advance(store, 't')
+        expected_phase = {'environment_checked': 'environment-milestone',
+                          'scale_ready': 'optimization-milestone',
+                          'completed': 'task-completion'}.get(destination)
+        if expected_phase:
+            assert advanced['knowledge_followup']['phase'] == expected_phase
+        else:
+            assert 'knowledge_followup' not in advanced
     finished = cli_decision(store, capsys)
     assert finished['action'] == 'completed'
     assert 'skill' not in finished
