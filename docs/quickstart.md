@@ -2,7 +2,7 @@
 
 ## 依赖
 
-Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需 pytest。Git 用于源码与版本管理，SSH/scp、Docker、kubectl、Slurm 客户端只在使用相应执行方式时需要。TraceLens 通过固定 checkout 和本机 Python 的报告 API 集成，完整安装包含三个算子 Skill 及必需 HCU-Knowledge，步骤见 [第三方集成](integrations.md)。HCU 训练依赖由目标环境提供，本包不下载 PyTorch/DTK/模型。
+Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需 pytest。Git 用于源码与版本管理，SSH/scp、Docker、kubectl、Slurm 客户端只在使用相应执行方式时需要。TraceLens 通过固定 checkout、本机 Python 报告 API 与分析入口集成，Graph、Roofline、Agent 和 profiler 的输入要求见 [TraceLens 指南](tracelens-analysis.md)。完整安装包含三个算子 Skill 及必需 HCU-Knowledge，步骤见 [第三方集成](integrations.md)。HCU 训练依赖由目标环境提供，本包不下载 PyTorch/DTK/模型。
 
 首次接入真实集群，先读 [环境发现与验收](environment-discovery.md)、[远程执行与准入](remote-execution.md) 和 [源码传输](source-transfer.md)。启动训练前按 [训练观测](training-observation.md) 建立真实 attempt、日志与退出回执；部署了观察器不等于已接通跨节点告警或 Agent 唤醒。
 
@@ -20,6 +20,8 @@ hcu-trainflow collaboration-demo .work/collaboration-001
 ## 创建任务
 
 推荐通过 `$hcu-trainflow` 提供环境、模型和目标，由 Agent 建立内部任务与协作循环。也可从 `examples/task.json` 复制到私有目录并修改，用 CLI 手动操作。先明确只分析、只诊断还是完整推进。
+
+仅审查/交付已有改动时，直接由主控读取[交付规范](change-delivery.md)，不执行下面的 `task-create` 或创建训练协作循环；按实际差异完成相关验证与 PR 审查即可。
 
 首次接手或换 Agent 先读[主控接手与阶段交接](agent-playbook.md)：恢复现场与原任务，按当前最大瓶颈选择工作，区分探索、局部通过和阶段验收，避免重跑已有效的实验。
 
@@ -44,7 +46,7 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 | 多 Agent | team-plan/next、assignment-add/claim/bind/return/review/yield/cancel、agent-send/inbox/ack |
 | 事件投递 | inbox、inbox-dispatch |
 | 验收 | occupancy-check、environment-check、proxy-check、iteration-check、quality-check |
-| 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective |
+| 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective、tracelens-analyze |
 | 长训 | watch、heartbeat-check、events-export/import、monitor-report |
 | 官方 Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog |
 | 私有训练经验 | experience-record/sync/index/search/read/compare |
@@ -55,6 +57,7 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 ## Skill 使用例
 
 - `$hcu-trainflow`：在给定环境推进模型适配、优化和大规模验证，建立看板并持续复核。
+- `$hcu-trainflow`：只审查这份已有 patch，与指定目标分支比较，补齐相关验证后整理提交和 PR。
 - `$hcu-train-environment-check-and-adapt`：只检查分配的环境，按实际节点和设备生成缺项表。
 - `$hcu-train-analyze-and-optimize`：只分析这些 ranks 的 trace，给热点、效率和下一步实验。
 - `$hcu-train-scale-and-stability`：诊断卡住，先保存全 rank 现场，不触发重启。
@@ -69,6 +72,6 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 
 默认每 5 分钟采集交互文件，`flow-board TASK` 或 `flow-watch TASK --once` 可立即采集。运行期间用 `team-next TASK` 查看可派发任务、活跃会话、依赖与冲突，用 `agent-inbox TASK --recipient ASSIGNMENT` 查看定向消息。完整契约和运行时接入见 [多 Agent 协同](multi-agent.md)。
 
-## 官方 Wiki 与私有训练经验
+## 共享 Wiki 与私有任务档案
 
-见 [搜索、在线 PR 和增量更新](wiki.md)，以及 [环境/模型经验和 Cookbook 记录](experience-knowledge.md)。官方 Wiki 可无需 GPU 独立使用。报告及阶段推进自动沉淀私有经验，重要里程碑再由 Agent 补解释；知识检索不触发 HCU 大知识库更新。
+见 [搜索、在线 PR 和增量更新](wiki.md)，以及 [环境/模型经验和 Cookbook 记录](experience-knowledge.md)。官方资料检索与更新无需 GPU；报告及阶段推进自动记录在私有任务档案。复核后只将通用站点经验和模型最终优化总结提升到共享 Wiki，更新时遵守[内容筛选规则](knowledge-architecture.md)，保留文档排除项。知识检索不触发 HCU 大知识库更新；工程维护验证后按[本机同步说明](integrations.md#skills账号与升级)同步安装。

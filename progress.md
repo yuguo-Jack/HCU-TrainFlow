@@ -287,3 +287,11 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 更新 Skill 和知识归属文档要求每次新增/修订检查复用价值，正文与过程记录分开；程序不冒充内容价值判断。
 - 定向90项通过，489页/25来源知识校验无错误，59个阅读页/76个可达资源无缺失。新索引验证六页已移出，RCCL、ZeRO offload、Paged Stash 仍正常命中；回归覆盖旧索引切换、新上游排除文件与同步冲突。
 - 系统Python包及六个已安装Skill同步并独立--check通过，更新Skill格式验证通过。本轮未刷新上游/大知识库，未变更运行依赖或执行远端任务，不新增tag。
+
+## 2026-10-11：README、介绍与流程图更新
+
+- 内置 imagegen 生成新版白底总览，保留准确阶段名、动态 Agent、热点优先级、并行单测/建模、阶段 A/B、扩 DP/长稳、精选 Wiki 与独立模式；提示词随图提交。
+- 同步首页、工程介绍、架构/细图、快速开始、阶段说明、能力边界，以及 knowledge/thirdparty/practices README。
+- 14 个 Mermaid 全部解析和渲染成功，人工检查总览图、新增 TraceLens 图与架构图；最终 237 个本地链接/章节检查无错误。489 页/25 来源知识校验无错误，59 个阅读页/77 个可达页无缺失。
+- 更新本机 Wiki 索引；系统 Python 0.5.1 editable 与六个 Skill 同步成功，独立 --check 确认 current。六个 Skill 内容本身未变，继续通过绑定读取新 docs。差异与空白校验通过，推送结果以 Git 回执为准。
+- 本轮为文档/图片变更，未重跑无关 GPU 实验或全量程序测试；没有新增实测资格、版本 tag 或上游依赖更新。

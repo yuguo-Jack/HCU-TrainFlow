@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Refresh the white-background overview, editable workflow diagrams, introduction and README navigation for the current mainline. Connect TraceLens evidence to optimization decisions, clarify analysis-only and delivery-only routes, and document curated Wiki updates without expanding hardware-validation claims.
 - Curate shared site pages around reusable conditions, measurements and evidence; keep session decisions and temporary facilities in task records. Add reasoned document exclusions to incremental Wiki collection, reject retained-page conflicts, and prevent excluded material from returning on sync. Keep full source navigation available.
 - Qualify the HCU TraceLens fork on real gfx936/DTK 26.10 traces: training Graph attribution, captured-value EventReplay, measured-envelope Roofline, native Agent analysis, hipprof JSON/pftrace equivalence and XProf/XCompute counter/SQTT capture. Keep platform, workload and timing limitations explicit.
 - Add a pinned offline `tracelens-analyze` entry for Graph, Roofline, Agent preparation, hipprof and counters, with immutable input receipts and separate incomplete/review-pending states. Connect the analysis to hotspot prioritization and existing kernel Skills.

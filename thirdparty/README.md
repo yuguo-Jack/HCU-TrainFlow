@@ -4,7 +4,7 @@
 
 | ID | 默认目录 | 用途 |
 | --- | --- | --- |
-| `tracelens` | `TraceLens/` | HCU fork，保留上游模块与原生 CLI，TrainFlow 复用报告 API |
+| `tracelens` | `TraceLens/` | HCU fork，保留上游模块与 CLI；接入报告、Graph、Roofline/效率、原生 Agent、HCU profiler，并按需在远端执行 EventReplay |
 | `cuda-optimized-skill` | `cuda-optimized-skill/` | 三个 Hygon HIP/Triton Skill、脚本和参考资料 |
 | `hcu-knowledge` | `HCU-Knowledge/` | 必需 HCU 大领域知识库，贯穿三个阶段；当前需读取权限 |
 
@@ -13,3 +13,5 @@
 `bootstrap_thirdparty.py` 默认拉全部必需 checkout，`--only ID` 仅用于定向维护，`--status` 仅检查 Git 身份。Git 就绪不等于可查询；完整安装还需知识 bootstrap/doctor。没有权限或索引失败时报告未完成。任何依赖本地修改和来源差异都保留，不 reset/clean。
 
 受管目录固定清单提交；独立知识库保留实际提交并做本机可用性验收。TraceLens 稀疏检出完整代码/文档，按需扩展；旧上游迁移到 fork、Skills 替换备份、飞书权限和升级步骤见 [安装指南](../docs/integrations.md)。训练引擎 fork/PR 开发继续使用任务独立 checkout，不能借用知识库源码缓存。
+
+TraceLens 的离线入口、原生 Agent 推理交接、远端回放及真实 HCU 验证边界见[分析指南](../docs/tracelens-analysis.md)。依赖安装成功和报告生成不表示所有硬件、模型或训练路径已经验证。

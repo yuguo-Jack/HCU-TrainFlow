@@ -12,8 +12,6 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ## 如何开始
 
-性能分析中的训练 Graph、算子 Roofline/效率、EventReplay、原生 Agent 和 HCU profiler 入口，见 [TraceLens 分析与验证](docs/tracelens-analysis.md)。自动报告与已验证硬件范围单独说明，分析结果继续进入热点优先级、算子迭代及数值/端到端验收。
-
 安装后，在支持 Skill 的 Agent 中说：
 
 > `$hcu-trainflow` 在我提供的环境中，对指定模型进行适配、性能优化和大规模验证。已有启动脚本、数据路径和资源范围如下……
@@ -24,11 +22,11 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ## 工作流总览
 
-[![HCU-TrainFlow 工作流总览：环境适配、性能优化与阶段验收、扩容长训；多 Agent、独立复核、远端执行和知识沉淀贯穿全程](docs/assets/workflow-overview.png)](docs/assets/workflow-overview.png)
+[![HCU-TrainFlow 工作流总览：环境检查与模型适配、性能分析与优化、规模扩展与长稳运行；支持独立任务，多 Agent、证据复核和精选知识贯穿全程](docs/assets/workflow-overview.png)](docs/assets/workflow-overview.png)
 
 [工程介绍](docs/project-overview.md) · [详细流程图与验收规则](docs/workflow-map.md)
 
-### 1. 环境验收与模型适配
+### 1. 环境检查与模型适配
 
 - **发现并验收现场**：确认节点与卡的授权、占用、拓扑、镜像、DTK 和关键库版本，复用当前 Cluster Manager、run_nhc、检查脚本及 DTK 工具。检查健康、GEMM、HBM、机内互联和机间通信，逐项对照有来源的预期；缺项、性能差距和排查结果明确记录，需要时请专家介入。
 - **准确适配模型**：选择适用且活跃的 HCU 仓库/分支，优先核对已有启动脚本、环境变量和现场激活链；结合官方实现确认模型结构、数据、精度、优化器与训练语义，保留用户 patch 和执行基线。预训练、SFT、RL 与 Torch 原生训练分别补查其数据和执行语义。
@@ -45,7 +43,9 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 同一阶段包含 [Torch 原生训练专项](skills/hcu-train-analyze-and-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。机制选择联查官方教程与 PR、AMD Primus、MindSpeed 系列、LoongForge 和 HCU 底层源码。详见[热点排序与算子迭代](skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。
 
-### 3. 扩 DP 域、容错与持续训练
+**TraceLens 贯穿分析和验证**：时间线与 Graph 关联真实训练调用，Roofline/效率分析提供带条件的上限，EventReplay 支持按真实输入做独立对照；hipprof JSON/pftrace 与 XProf/XCompute 证据按各自口径接入。原生 Agent 指标准备、实际推理和复核分别记录，高占比未知项继续补证据。报告生成、分析完成和训练验收是不同状态，预测空间须由无 profiler 的整步收益及质量对照验证。见 [TraceLens 分析与实测边界](docs/tracelens-analysis.md)。
+
+### 3. 规模扩展与长稳运行
 
 - **逐级扩容**：完整模型目标必要时先恢复并验收完整配置；获准的代理任务可以扩选定代理配置的 DP，并保留完整模型验证缺口。以 Cluster Manager 为主筛机、交叉检查疑似节点并维护健康池，逐级核对吞吐、扩展效率、通信、显存和训练语义；新瓶颈返回优化。
 - **验证恢复链路**：接入现场既有容错并明确唯一恢复负责人，按部署授权诊断卡住、core dump、OOM、泄露等问题。验证旧进程处理、checkpoint 完整性、重新拉起及训练状态恢复，观察 step 是否真实持续推进。
@@ -88,6 +88,8 @@ collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 **HCU-Knowledge 是完整安装的必需组成，贯穿三个阶段。** 按问题检索硬件、工具、HCU 工程、配方、优化与故障案例，并联查私有训练经验和官方引擎 Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。必需安装不表示每个命令都强制查询。
 
 局部官方 Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。共享 Wiki 只收录官方资料、跨项目可复用的环境经验，以及模型最终优化里程碑的总结和关键数据。环境经验放 `knowledge/sites/`，最终总结放 `knowledge/experiments/`，必要证据随仓提交。中间候选、调参试验和临时排查留在 workspace 与看板；外部 Cookbook 的发布要求单独处理。参见 [知识归属与跨任务复用](docs/knowledge-architecture.md)。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
+
+每次更新先检查内容相关性与复用价值，再联动复核总览、专题、案例和使用入口。来源登记收录范围及带理由的排除项，防止已清理的低相关文档在自动同步时重新入库；完整源码导航与按问题查 PR/代码的能力保留。更新并验证后同步本机包和六个 TrainFlow Skill，保持安装内容与工程一致。
 
 性能分析的证据刷新、热点/重叠/融合三表、上限判读、组合验证与停滞处理，见 [性能方法与参考来源](docs/practices/performance-methods.md)。故障调查沿各阶段 Skill 共用的诊断指南推进，结合 HCU 大知识库和当前源码持续查证。
 
@@ -142,7 +144,7 @@ python scripts/check_skill_resources.py
 | --- | --- |
 | `skills/` | 入口、阶段决策与 Wiki 检索/更新；各自 `references/` 保存对应详细方法 |
 | `src/hcu_trainflow/` | 持久任务、复核循环、执行与证据、分析和监测 |
-| `knowledge/` | 官方训练引擎与生态 Wiki、固定来源、维护关联 |
+| `knowledge/` | 官方训练引擎与生态 Wiki、通用站点经验、最终模型总结，以及固定来源与维护关联 |
 | `docs/` | 协作约定、安装、契约、部署及验证说明 |
 | `examples/`、`tests/` | 合成示例与本地回归 |
 | `thirdparty/` | 依赖清单和忽略提交的工具 checkout |

@@ -1,6 +1,6 @@
 # HCU-TrainFlow 工作流全景
 
-本文与 `0.5.0` 的实现和 Skill 约定对应。先看[工程介绍](project-overview.md)了解任务如何推进，再按问题进入下方阶段细图；所有图均为可编辑的 Mermaid，GitHub 可直接显示。新任务或中断恢复先读[主控接手与阶段交接](agent-playbook.md)。
+本文与 `0.5.1` 当前主线的实现和 Skill 约定对应。先看[工程介绍](project-overview.md)了解任务如何推进，再按问题进入下方阶段细图；所有图均为可编辑的 Mermaid，GitHub 可直接显示。新任务或中断恢复先读[主控接手与阶段交接](agent-playbook.md)。
 
 **读图约定：**实线表示推进、反馈或数据传递，虚线表示按需查询、指导或配套能力。方框是工作，菱形是判断，圆柱是持久资料。同一张图中的并行分支表示可拆工作，不表示每次必须启动同样数量的 Agent。
 
@@ -12,8 +12,9 @@
 flowchart TD
     U["模型、环境、数据与目标<br/>预训练 / SFT / RL / Torch 原生训练"] --> C["本地主控 hcu-trainflow<br/>明确范围、预算、验收与现场权限"]
     C --> SCOPE{"本轮工作范围"}
-    SCOPE -->|完整训练任务| A["① 环境验收与模型适配<br/>hcu-train-environment-check-and-adapt · 详见图 2"]
+    SCOPE -->|完整训练任务| A["① 环境检查与模型适配<br/>hcu-train-environment-check-and-adapt · 详见图 2"]
     SCOPE -->|独立请求| PART["按对应阶段执行并交付<br/>环境检查 / 适配 / 分析 / 优化 / 诊断 / 运行<br/>保留失败、未测项和适用范围"]
+    SCOPE -->|仅审查或交付已有修改| DELIVER["直接执行改动审查与交付规范<br/>核对差异 / 目标分支 / 相关验证 / PR<br/>无需训练 TaskSpec 或重走训练阶段"]
     A --> AG{"环境与初始数值基线通过？"}
     AG -->|缺失或失败| AR["补证据 / 修环境 / 修适配"]
     AR --> A
@@ -22,7 +23,7 @@ flowchart TD
     Q --> QG{"达到约定目标且数值通过？"}
     QG -->|未达到| OR["定位问题、修正或回退<br/>无新证据 / 达到预算边界时请专家介入"]
     OR --> O
-    QG -->|通过| S["③ 验收目标配置 → 扩 DP 域<br/>完整模型目标必要时恢复完整结构<br/>获准代理保留验证缺口 · 详见图 6"]
+    QG -->|通过| S["③ 规模扩展与长稳运行<br/>验收目标配置 → 扩 DP 域<br/>完整目标必要时恢复结构；代理保留缺口 · 图 6"]
     S --> SG{"环境、质量与扩容验收通过？"}
     SG -->|失败| SR["按原因回到环境、适配或优化<br/>修复后重新验收受影响证据"]
     SR --> C
@@ -31,6 +32,7 @@ flowchart TD
     TG -->|否| T
     TG -->|是| Z["完成复核与交付<br/>代码 / 配方 / 证据 / 经验 / 运行交接"]
     PART --> Z
+    DELIVER --> Z
     LOOP["所有阶段共用<br/>实施 → 测量 → 独立复核 → 修正 / 推进<br/>详见图 4"] -.-> C
     H["BOARD.md 详细进展与证据<br/>GUIDANCE.md 指导 / QUESTIONS.md 问答<br/>文件默认每 5 分钟采集，回应有记录"] -.-> C
     K[("必装 HCU-Knowledge 贯穿三个阶段<br/>联查官方 Wiki / 私有经验 / PR / 底层源码<br/>详见图 7")] -.-> C
@@ -39,9 +41,10 @@ flowchart TD
 
 - **全流程入口：**`hcu-trainflow` 协调三个阶段 Skill，保留循环状态、证据和人的指导。
 - **独立入口：**`hcu-train-environment-check-and-adapt` 可仅检查环境；`hcu-train-analyze-and-optimize` 可仅分析性能；`hcu-train-scale-and-stability` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
+- **仅交付入口：**主控直接执行[改动审查与交付](change-delivery.md)，核对已有证据并做受影响验证，不创建训练任务或要求无关阶段报告。
 - **持续运行：**启动训练不等于完成任务；尚在约定监测范围内就继续观测和处理异常。完成或交接须有明确条件、责任人和证据。
 
-## 2. 环境验收与模型适配
+## 2. 环境检查与模型适配
 
 ```mermaid
 flowchart TD
@@ -103,13 +106,13 @@ flowchart TD
 ```mermaid
 flowchart TD
     B["固定比较条件与初始数值基线<br/>模型 / 数据 / 精度 / 有效 batch-token / 版本"] --> P["优先评估并行切分与显存预算<br/>TP / PP / DP / CP / EP / SP<br/>微批、累积、重算、状态分片与 offload"]
-    P --> M["筛选布局候选<br/>最吃紧 rank 峰值 + 必要余量<br/>短跑校准吞吐、通信与流水空泡"]
-    M --> RES{"有额外隔离资源和独立优化假设？"}
+    P --> M["核对已有布局证据与可行候选<br/>最吃紧 rank 峰值 + 必要余量<br/>只分析时未获准实验保留为建议"]
+    M --> RES{"允许优化且有隔离资源<br/>和独立优化假设？"}
     RES -->|是| INST["多个完整模型可行实例并行优化<br/>公共基线、分工/资源独立、及时交换结果<br/>主控在共同实例复验组合"]
     RES -->|否| T
     INST --> T
-    T["稳态端到端采样：torchprof<br/>覆盖各实际非单例并行组至少 2 个代表 rank"]
-    T --> TL["TraceLens + TrainFlow 窗口分析<br/>补 CPU-op 对应的 shape / dtype / layout / phase"]
+    T["读取已有或获准采集的稳态 torchprof<br/>覆盖各实际非单例并行组至少 2 个代表 rank<br/>证据缺口保留，不代替执行授权"]
+    T --> TL["TraceLens + TrainFlow 窗口分析<br/>shape / dtype / layout / phase + Graph 调用关联<br/>Roofline / 回放 / Agent 证据链见图 3.6"]
     TL --> A["按证据并行分析<br/>CPU / 数据 / launch 空泡"]
     TL --> C["通信依赖、暴露时间与 overlap<br/>bucket / chunk / 预取 / 通算融合<br/>慢 rank、拓扑及计算竞争 · 详见图 3.5"]
     TL --> V["显存生命周期与峰值<br/>激活 / 状态 / workspace / 通信 / graph"]
@@ -133,6 +136,8 @@ flowchart TD
 
 并行布局须在显存、通信、流水空泡和吞吐之间权衡，不以“占满显存”为目标。改变微批、累积或并行度时保持训练语义可比；布局变化会改变热点与 shape，需要重新分析。具体指南见 [并行切分与显存调参](../knowledge/official-megatron-wiki/parallelism.md)。
 
+只分析模式仍检查布局、显存、热点和上限，但不为了走完图而改配置或启动优化候选；补充采集按已有授权，缺少执行条件时交付具体实验建议。优化模式才执行候选布局的短跑校准与迭代。
+
 TraceLens 的逐 rank 分析可用代表样本；其完整 collective 报告要求全部 `0..N-1` rank 文件及实际通信上下文。时间对齐、RCCL 识别和统计口径要在现场核对。TrainFlow 的重叠时间归因是初步排序方法，不是自动关键路径证明。
 
 ### 3.2 融合粒度、非通信热点与优化空间
@@ -144,8 +149,8 @@ flowchart TD
     C --> TYPE{"热点类型"}
     TYPE -->|纯通信| COMM["按消息量、拓扑、等待和 overlap 评估<br/>同数据量独立通信测试"]
     TYPE -->|非通信或含计算的混合 kernel| CALL["冻结本项真实调用<br/>shape / dtype / stride / phase / dispatch<br/>接口、前后向、累积方式与数值契约"]
-    CALL --> MODEL["工作线 A：逐项建模<br/>FLOPs、分层流量、必要延迟<br/>匹配硬件路径与可达参考"]
-    CALL --> ISO["工作线 B：同条件独立实测<br/>复用模型实现，比对模型内耗时<br/>定位实现慢或并发资源干扰"]
+    CALL --> MODEL["工作线 A：逐项建模 / TraceLens Roofline<br/>FLOPs、分层流量、必要延迟<br/>匹配硬件与可达参考；未知项继续补证据"]
+    CALL --> ISO["工作线 B：同条件独立实测 / EventReplay<br/>复用实际输入与实现，核对数值和 dispatch<br/>比对模型内耗时，定位实现或资源干扰"]
     CALL --> F["对照 NV 融合粒度与数值契约<br/>接口、前后向、保存值、累加和 cast"]
     F --> R{"当前 HCU TE / Flash-Train / Primus Turbo 已支持？"}
     R -->|是| USE["优先复用并验证实际 dispatch<br/>融合后继续评估效率与剩余空间"]
@@ -260,6 +265,38 @@ flowchart TD
 ```
 
 时间线相交只是观察；不等于通信已隐藏，也不保证训练更快。不同 Agent 共享同一 process-group/协议版本；耦合的同步与 buffer 生命周期由同一 owner 负责，设备/网络测量按资源协调。详见 [通信优化指引](../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)。
+
+### 3.6 TraceLens 证据怎样进入优化闭环
+
+```mermaid
+flowchart TD
+    INPUT["冻结来源、依赖版本和训练窗口<br/>rank / phase / dispatch / shape / dtype / layout"] --> SRC{"按问题选择已有证据或获准采集"}
+    SRC -->|Torch profile| TL["时间线 / 算子 / 通信报告<br/>代表 rank 与完整 collective 范围分开"]
+    SRC -->|训练 Graph| GRAPH["capture 恢复前后向调用关系<br/>replay 提供实际运行时间<br/>保留匹配记录和缺失 shape"]
+    SRC -->|hipprof JSON 或 pftrace| HIP["保留 API / kernel / copy / memset<br/>统一时间单位、对齐进程与 dispatch<br/>无 ATen 信息时不补造 shape"]
+    TL --> CONTEXT["合并原件与算子上下文<br/>端到端分母、重叠、调用数和未知项"]
+    GRAPH --> CONTEXT
+    HIP --> CONTEXT
+    CONTEXT --> MODEL["Roofline / 效率与条件上限<br/>精度与算法对应的计算量、流量、延迟<br/>硬件标称与现场实测参考分列"]
+    CONTEXT --> REPLAY["按需 EventReplay / 专项单测<br/>实际输入、布局、dispatch 与数值核对<br/>有状态 / 随机 / 通信另作专项验证"]
+    CONTEXT --> COUNTER["瓶颈查证：XProf counter / SQTT<br/>XCompute 解析并绑定具体 dispatch<br/>保留单位与 N/A，重放时间不作基准"]
+    CONTEXT --> AGENT["原生 Agent 指标准备<br/>由实际 Agent 完成分类分析与证据引用<br/>显式复核后汇总；待复核仍未完成"]
+    MODEL --> JOIN["主控核对瓶颈、未知项与优先级<br/>上限模型和独立测量互相校正<br/>区分实现空间与整步可兑现收益"]
+    REPLAY --> JOIN
+    COUNTER --> JOIN
+    AGENT --> JOIN
+    JOIN --> MODE{"当前委托范围"}
+    MODE -->|仅分析| REPORT["分析报告、限制与实验建议<br/>未执行项明确保留"]
+    MODE -->|允许优化| ITER["按主要瓶颈进入图 3.1 / 3.2 / 3.3<br/>独立热点可分别进入实现迭代"]
+    ITER --> VERIFY["局部正确性与无 profiler 配对测量<br/>集成后核对整步收益和显存<br/>稳定阶段同初态 A/B loss 验收"]
+    VERIFY -->|新证据 / 新瓶颈| INPUT
+    JOIN -.->|模型缺失或归因不足| GAP["补源码、输入或测量<br/>不能将高占比 unknown 当作已达上限"]
+    GAP -.-> INPUT
+```
+
+这些是按问题选择的证据路径，不要求每次全跑一遍。`tracelens-analyze` 的模式为 `graph / roofline / agent / hipprof / counters`；EventReplay 走原生 API 和获准远端实验。图中 Graph replay 的时间归因与 EventReplay 的独立算子复测是两种用途。
+
+`generated` 只表示产物生成；Agent 指标齐全仍需实际推理与复核；算子模型的时间下界不等于确定可达的整步速度。高占比未知项、缺 rank 或缺数值验证均保留为缺口。工具的实际 HCU 资格范围见 [TraceLens 分析与验证](tracelens-analysis.md)，不扩大完整模型收敛或生产长稳的结论。
 
 ## 4. 每阶段共用：实施、独立复核、修正
 
@@ -438,10 +475,12 @@ flowchart TD
     PRIVATE --> DELIVERY["所属阶段负责交付<br/>对应工程 PR / Cookbook 最佳实践"]
     DELIVERY --> PUBLIC["公开前按目标仓规则审阅<br/>只交付可公开方法 / 代码 / 获准示例"]
     DELIVERY --> TRACK["经验中记录交付关联<br/>draft / submitted / merged / rejected / superseded"]
-    REFRESH["局部官方 Wiki 按需自主更新<br/>问题驱动 / 里程碑 / 版本漂移"] --> FETCH["目录、文档、源码和 PR 讨论增量采集<br/>失败 / 分页未完成保留待办"]
+    REFRESH["局部官方 Wiki 按需自主更新<br/>问题驱动 / 里程碑 / 版本漂移"] --> SCOPE["先审收录范围、相关性和复用价值<br/>检查带理由的文档排除项<br/>完整源码目录仍可查询"]
+    SCOPE --> FETCH["目录、文档、源码和 PR 讨论增量采集<br/>排除项不再入库；既有页冲突显式处理<br/>失败 / 分页未完成保留待办"]
     FETCH --> IMPACT["联动复核总览、专题、案例<br/>相关 Skill / 命令 / 解析器用法"]
     IMPACT --> APPLY["绑定当前页与来源哈希的回执<br/>apply 版本锁 → 重建检索索引"]
-    APPLY --> LOCAL
+    APPLY --> INSTALL["验证知识、阅读入口与受影响用法<br/>同步本机包和六个 TrainFlow Skill<br/>核验绑定与内容，不更换运行中依赖"]
+    INSTALL --> LOCAL
     IMPACT -->|现场暂不能验证| PENDING["用法保持待现场验证<br/>不冒称 Skill 已在 HCU 通过"]
 ```
 
@@ -449,6 +488,7 @@ flowchart TD
 - **大知识库边界：**HCU-Knowledge 是完整安装的必需组件，可复用独立 checkout，三个阶段按问题查询；普通 TrainFlow 工作不附带更新它，更新走单独明确的维护任务。本地索引恢复不等于刷新上游内容。
 - **版本边界：**局部官方 Wiki 更新不会自动替换当前训练任务的依赖或运行源码。采用新实现要形成新候选并重新验证；官方已吸收的功能应复核本地 patch 是否可以退场。
 - **经验边界：**性能、loss、环境和事故的完整档案留 workspace；仅可跨项目复用的通用环境经验，以及模型最终优化里程碑总结和关键数据进入随工程提交的 Wiki；中间候选、一次性排查和完整失败过程不入库。公开 Cookbook 的方法与其私有验证记录建立关联，记录交付不等于自动发送 PR。
+- **内容筛选：**正式同步遵守来源文档范围及带理由的排除项，保留的旧页与新规则冲突时显式整理，不能静默删除或下次又自动收回。完整源码树和在线 PR 检索保持可用，文档筛选不代替 Agent 对知识价值的复核。
 
 详见 [官方 Wiki 检索与维护](wiki.md)、[私有训练经验](experience-knowledge.md) 和 [公开边界](../CONTRIBUTING.md)。
 
@@ -477,7 +517,8 @@ flowchart TD
 | 候选、独立复核、指导与阶段推进 | [flow.py](../src/hcu_trainflow/flow.py)、[主控 Skill](../skills/hcu-trainflow/SKILL.md) |
 | 任务拆解、领取、依赖、会话与消息 | [team.py](../src/hcu_trainflow/team.py) |
 | 代码快照、命令卡、远端执行与核查 | [execution.py](../src/hcu_trainflow/execution.py) |
-| 覆盖率、时间模型、数值检查、TraceLens | [analysis.py](../src/hcu_trainflow/analysis.py)、[quality.py](../src/hcu_trainflow/quality.py)、[tracelens.py](../src/hcu_trainflow/tracelens.py) |
+| 覆盖率、时间模型、数值检查 | [analysis.py](../src/hcu_trainflow/analysis.py)、[quality.py](../src/hcu_trainflow/quality.py) |
+| TraceLens 报告与 Graph / Roofline / Agent / profiler 分析 | [tracelens.py](../src/hcu_trainflow/tracelens.py)、[tracelens_features.py](../src/hcu_trainflow/tracelens_features.py)、[分析边界](tracelens-analysis.md) |
 | watcher、事件同步与 Agent bridge | [monitor.py](../src/hcu_trainflow/monitor.py)、[coordination.py](../src/hcu_trainflow/coordination.py) |
 | 官方知识、源码 / PR、来源更新 | [wiki.py](../src/hcu_trainflow/wiki.py)、[official.py](../src/hcu_trainflow/official.py) |
 | 私有经验及交付边界 | [experience.py](../src/hcu_trainflow/experience.py)、[delivery.py](../src/hcu_trainflow/delivery.py) |

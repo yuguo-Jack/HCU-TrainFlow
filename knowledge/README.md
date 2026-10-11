@@ -64,6 +64,8 @@ visibility: public
 
 `wiki-update` 检查全仓目录、文档与 PR 增量、登记源码，生成受影响页面和工作流清单；用 Wiki update Skill 深读差异、PR 顶层 review/评论/代码后修订所有关联结论，最后 `wiki-review` 写复核回执、`wiki-apply` 写来源锁、`wiki-index` 重建搜索。运行中的任务继续使用原锁定快照，升级需重新建立 context。
 
+收录前先按[内容筛选规则](../docs/knowledge-architecture.md)检查相关性和复用价值。来源配置的 `document_scope` 说明范围，`document_exclusions` 保存排除路径及理由；增量同步不会恢复已排除页，保留页与排除规则冲突时先明确整理。完整源码导航和线上 PR 检索仍保留。更新时同时复核同仓总览、专题、案例与受影响用法，验证后按[本机同步步骤](../docs/integrations.md#skills账号与升级)更新安装；普通查询不做正式收录。
+
 ## 官方底层训练库
 
 - [Transformer Engine 官方工程：定位、目录与训练调用链](official-transformer-engine-wiki/overview.md)
