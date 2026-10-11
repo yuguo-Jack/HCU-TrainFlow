@@ -120,7 +120,7 @@ def monitor_series(samples, *, diagnostics=None):
             if not isinstance(basis, str):
                 basis = "unknown-clock"
             info["clock_bases"][basis] = info["clock_bases"].get(basis, 0) + 1
-            if basis in {"source-log-clock", "legacy-normalized-clock"}:
+            if basis == "source-log-clock" or (legacy and basis == "legacy-normalized-clock"):
                 suffix = ""
             elif basis in {"first-observed-no-source-clock", "collector-clock-source-time-invalid"}:
                 suffix = " [collector clock; event time unverified]"

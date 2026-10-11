@@ -24,7 +24,7 @@ def kinds(samples, now, policy=POLICY):
 
 
 def iteration(timestamp, step, **extra):
-    return sample(timestamp, step, "iteration", "training", **extra)
+    return sample(timestamp, step, "iteration", "training", **{"timestamp_basis": "source-log-clock", **extra})
 
 
 def terminal(**extra):
@@ -230,3 +230,40 @@ def test_incomplete_log_seal_cannot_verify_clockless_completion():
     assert "completion-unverified" not in kinds([row, end], 122)
     end["exit_receipt"]["log_evidence"]["bytes"] = 79
     assert "completion-unverified" in kinds([row, end], 122)
+
+
+@pytest.mark.parametrize("basis", [None, "missing", "unknown-clock", "legacy-normalized-clock"])
+def test_modern_unknown_clock_needs_source_proof_and_cannot_measure_slowdown(basis):
+    rows = [iteration(110, 9, timestamp_basis=basis), iteration(120, 10, timestamp_basis=basis)]
+    if basis == "missing":
+        for row in rows:
+            row.pop("timestamp_basis")
+    policy = {**POLICY, "reference_step_seconds": 1, "performance_window": 2}
+    assert "sustained-slowdown" not in kinds(rows, 120, policy)
+    assert "completion-unverified" in kinds([*rows, terminal()], 122)
+    # Missing event time can still be proven by a verified immutable log seal.
+    for i, row in enumerate(rows):
+        row["source"] = {"path": "test.log", "offset": i * 80, "bytes": 80}
+    end = terminal(log_seal_verified=True)
+    end["exit_receipt"]["log_evidence"] = {"path": "test.log", "bytes": 160, "sha256": "f" * 64}
+    assert "completion-unverified" not in kinds([*rows, end], 122)
+
+
+def test_upgrade_recomputes_unverified_completion_from_retained_observations(tmp_path, monkeypatch):
+    from hcu_trainflow import monitor
+    store, path = stored(tmp_path)
+    rows = [iteration(110, 9), iteration(120, 10), terminal()]
+    for row in rows:
+        row.pop("timestamp_basis", None)
+    append(path, rows, store)
+    with monkeypatch.context() as old:
+        old.setattr(monitor, "_PROGRESS_VERSION", 3)
+        old.setattr(monitor, "_event_time_known", lambda row: row.get("timestamp_basis") in {None, "source-log-clock"})
+        assert poll_log(store, "t", path, POLICY, now=122)["completion_verified"] is True
+    result = poll_log(Store(store.root), "t", path, POLICY, now=123)
+    assert result["completion_verified"] is False
+    assert "completion-unverified" in {issue["kind"] for issue in result["issues"]}
+    with store.db() as db:
+        cursor = json.loads(db.execute("SELECT value FROM meta WHERE key='watch:t'").fetchone()[0])
+    assert cursor["progress_version"] == 4
+    assert cursor["progress"]["a"]["clockless_source_invalid"] is True

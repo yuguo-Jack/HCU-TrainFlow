@@ -82,6 +82,8 @@ def test_modern_missing_clock_basis_is_not_assumed_to_be_source_or_collector():
     assert diagnostics["clock_bases"] == {"unknown-clock": 1}
     legacy = {"context": "a" * 64, "attempt_id": "old", "timestamp": 100, "step": 1, "loss": 2}
     assert "loss" in monitor_series([legacy])
+    # Modern records cannot opt into the old format's implicit clock contract.
+    assert "loss [unknown clock; event time unverified]" in monitor_series([sample(timestamp_basis="legacy-normalized-clock")])
 
 
 @pytest.mark.parametrize("value", [None, [], "bad", {"0": None}, {"0": {"observed_at": 100, "allocator_allocated_bytes": True}}])

@@ -6,6 +6,7 @@ claims to authenticate reviewer identity, or treats a code review as a GPU test.
 import json
 import time
 from .core import FlowError, GATES, atomic_write, child, context_epoch, safe_id, utc
+from .skill_registry import STAGE_SKILLS
 
 DEFAULTS = {'max_rounds': 20, 'max_stalled_rounds': 3, 'full_review_every': 4,
             'max_review_failures': 3, 'poll_seconds': 300}
@@ -258,6 +259,8 @@ def next_step(store, tid):
     from .file_questions import state as question_state
     inbox = question_state(store, tid)
     task = store.task(tid)
+    mode = task['spec']['mode']
+    stage = STAGES.get(task['state']) if mode == 'full' else 'adapt' if mode in {'environment', 'adapt'} else 'optimize' if mode in {'analyze', 'optimize'} else 'fault-tolerance'
     with store.db() as db:
         flow = get_flow(db, tid)
         if not flow:
@@ -284,6 +287,7 @@ def next_step(store, tid):
             reasons.append('task-' + task['state'])
         if reasons:
             return {**result, 'action': 'human', 'reasons': reasons}
+        result['skill'] = STAGE_SKILLS[stage]
         if row and row['status'] == 'blocked' and row['goal'] == flow['goal']:
             return {**result, 'action': 'human', 'reasons': ['review-blocked'], 'review': row['review']}
         if row and row['status'] in {'submitted', 'accepted'}:
@@ -314,13 +318,11 @@ def next_step(store, tid):
             stalled += 1
         if len(rounds) >= flow['plan']['max_rounds'] or stalled >= flow['plan']['max_stalled_rounds']:
             return {**result, 'action': 'human', 'reasons': ['round-budget-or-progress-plateau'], 'rounds': len(rounds), 'stalled': stalled}
-        mode = task['spec']['mode']
-        stage = STAGES.get(task['state'], 'adapt') if mode == 'full' else 'adapt' if mode in {'environment', 'adapt'} else 'optimize' if mode in {'analyze', 'optimize'} else 'fault-tolerance'
         action = 'repair' if row and row['status'] in {'revise', 'superseded'} else 'work'
         team_reasons=completion_blockers(db,tid)
         if team_reasons:
             return {**result,'action':'coordinate','reasons':team_reasons,'team':schedule(store,tid)}
-        return {**result, 'action': action, 'skill': 'hcu-train-' + stage, 'target': target(task),
+        return {**result, 'action': action, 'target': target(task),
                 'required_reports': required_reports(task, target(task)), 'last_review': row['review'] if row else None,
                 'poll_seconds': flow['plan']['poll_seconds']}
 

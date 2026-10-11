@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Share canonical Skill IDs between runtime dispatch and installation; verify all six independent modes, full-stage transitions and repair decisions against real installed entries.
+- Define a shared change-review/PR delivery procedure with a direct coordinator route. Delivery-only requests reuse stage responsibilities without creating a training task, fabricating training reports or closing unrelated goals.
+- Require explicit source-clock provenance for modern monitoring records; unknown clocks cannot imply measured slowdown or bypass log-seal completion checks. Rebuild persisted progress on upgrade and keep plotted clock labels consistent.
+- Resolve full-setup Skill destinations before subprocess directory changes so relative paths install exactly where the success receipt reports.
 - Rename the performance entry to `hcu-train-analyze-and-optimize`; migrate the previous installed entry without duplicate aliases. Preserve independent analysis-only use.
 - Clarify Skill/reference/shared-doc/Wiki ownership and mode-specific reading routes, with early project discovery and offline link/reference reachability checks.
 - Add verified local package and six-Skill synchronization, read-only drift checks, and explicit installation closure for Wiki/Skill and general project maintenance. No implicit upstream or large-knowledge-base refresh.

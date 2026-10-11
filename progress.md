@@ -253,3 +253,13 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 新增本机包/六 Skill 同步及只读校验，安装失败保留明确阶段；完整安装/CI 检查本地阅读资源。
 - 全量回归 1094 passed / 4 skipped（Windows 不支持的 Linux 路径）；之后新增完整安装资源阻断用例，定向 39 passed。490 页/25 来源 Wiki 与六 Skill 结构校验通过。
 - 本机已实际同步包和六 Skill，旧优化目录清理；同步后只读校验通过。最后文档细化后再次同步并提交推送。
+
+## 2026-10-11：入口、独立交付与整体契约复核
+
+- 复现旧 Skill 动态路由，添加真实 CLI/临时安装场景后修复；交付-only 复用三阶段交付职责和共用文档，独立只读走查通过。
+- 1 个独立审查任务复现监控时钟与完整安装相对路径两处边界，主控修复并加回归；旧监控状态迁移纳入检查。
+- 定向回归 155 passed；知识校验 490 页/25 源无错误；阅读资源 58 个检查页/75 个可达页无问题。
+- PowerShell 下 rg 不展开传入的路径通配符，个别初查命令失败；改用目录与 --glob/明确文件继续，未改数据。
+- 全量回归 1109 passed / 4 skipped（Windows 不支持的 Linux 专用场景）；两套 CLI 合成演示完成；六 Skill 格式和阅读资源校验通过。
+- 系统 Python 可编辑包及六个本机 Skill 已同步到当前工程，再以独立 --check 核验版本、内容和绑定，全部 current；独立监控复现重跑已转为 completion-unverified，不再派生 slowdown。
+- 最终差异审查完成，提交推送为最后操作，实际结果以 Git 回执为准。本轮不打新 tag；未执行远端训练或更新 HCU 大知识库，知识库工作树仍干净。

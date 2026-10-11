@@ -12,8 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from hcu_trainflow.dependencies import knowledge_ready, require_checkout
 from hcu_trainflow.core import FlowError
+from hcu_trainflow.skill_registry import WORKFLOW_SKILLS
 
-NAMES = ('hcu-trainflow','hcu-train-environment-check-and-adapt','hcu-train-analyze-and-optimize','hcu-train-scale-and-stability','hcu-engine-wiki-search','hcu-engine-wiki-skill-update')
+NAMES = WORKFLOW_SKILLS
 # Cleanup compatibility only: install the current entry once, with no aliases.
 RENAMED = {
     'hcu-train-optimize': 'hcu-train-analyze-and-optimize',

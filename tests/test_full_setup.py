@@ -68,6 +68,37 @@ def test_missing_private_access_prevents_installation(tmp_path, monkeypatch):
     assert json.loads((tmp_path/'.work/setup/status.json').read_text())['status'] == 'incomplete'
 
 
+def test_relative_full_setup_target_matches_actual_install_from_other_cwd(tmp_path, monkeypatch):
+    setup = setup_fakes(monkeypatch, tmp_path)
+    installer = script('install_skills')
+    project, caller, kernel, knowledge = [tmp_path/name for name in ('project', 'caller', 'kernel', 'kb')]
+    caller.mkdir()
+    for parent, names in [(project, installer.NAMES), (kernel, installer.KERNEL_NAMES), (knowledge, installer.KNOWLEDGE_NAMES)]:
+        for name in names:
+            source = parent/'skills'/name
+            source.mkdir(parents=True)
+            (source/'SKILL.md').write_text(name, encoding='utf-8')
+    installer.ROOT = project
+    monkeypatch.setattr(installer, 'require_checkout', lambda p, name: (knowledge if name == 'hcu-knowledge' else kernel, {}))
+    ready = SimpleNamespace(returncode=0, stdout='{"local_ready": true, "index_current": true, "snapshot_mode": "current"}')
+    monkeypatch.setattr(installer.subprocess, 'run', lambda *a, **kw: ready)
+    def run(argv, cwd, **kwargs):
+        for i, arg in enumerate(argv):
+            if str(arg).endswith('install_skills.py'):
+                with monkeypatch.context() as child:
+                    child.chdir(cwd)
+                    child.setattr(sys, 'argv', argv[i:])
+                    installer.main()
+        return ready
+    monkeypatch.chdir(caller)
+    state = setup.setup(project, Path('relative-skills'), run=run)
+    expected = caller/'relative-skills'
+    assert state['status'] == 'ready'
+    assert Path(state['skills_dir']) == expected
+    assert len(list(expected.glob('*/SKILL.md'))) == 11
+    assert not (project/'relative-skills').exists()
+
+
 def test_index_failure_blocks_skills_and_replaces_old_success(tmp_path, monkeypatch):
     module = setup_fakes(monkeypatch, tmp_path)
     write_json(tmp_path/'.work/setup/status.json', {'status': 'ready'})

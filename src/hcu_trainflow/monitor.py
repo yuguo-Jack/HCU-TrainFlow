@@ -10,7 +10,7 @@ from .core import FlowError, fingerprint, read_json, utc, write_json
 
 _PHASES = {"startup", "training", "finished", "failed", "unknown"}
 _KINDS = {"iteration", "memory", "heartbeat", "lifecycle"}
-_PROGRESS_VERSION = 3
+_PROGRESS_VERSION = 4
 
 
 def _finite(value):
@@ -31,7 +31,8 @@ def _iteration(sample):
 def _event_time_known(sample):
     # Legacy normalized input has its own event-time contract. A raw adapter
     # must explicitly distinguish event time from collector fallback time.
-    return sample.get("timestamp_basis") in {None, "source-log-clock"}
+    basis = sample.get("timestamp_basis")
+    return basis == "source-log-clock" or (basis is None and not _modern(sample))
 
 
 def _validate_contract(sample):

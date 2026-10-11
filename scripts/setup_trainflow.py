@@ -11,7 +11,8 @@ from hcu_trainflow.dependencies import bind_knowledge, knowledge_ready, require_
 
 
 def setup(project, skills_dir, knowledge_root=None, replace=False, run=subprocess.run):
-    project = Path(project).resolve()
+    project = Path(project).expanduser().resolve()
+    skills_dir = Path(skills_dir).expanduser().resolve()
     record = project / '.work/setup/status.json'
     state = {'status': 'running', 'completed_stages': []}
     write_json(record, state)
@@ -63,7 +64,7 @@ def setup(project, skills_dir, knowledge_root=None, replace=False, run=subproces
             command('knowledge-bootstrap', [sys.executable, '-X', 'utf8', str(knowledge/'tools/setup_workspace.py'), 'bootstrap'], knowledge)
         command('knowledge-doctor', doctor, knowledge)
         command('skills', [sys.executable, '-X', 'utf8', str(project/'scripts/install_skills.py'), '--target', str(skills_dir), *(['--replace'] if replace else [])])
-        state.update(status='ready', knowledge_root=str(knowledge), skills_dir=str(Path(skills_dir).expanduser().resolve()),
+        state.update(status='ready', knowledge_root=str(knowledge), skills_dir=str(skills_dir),
                      note='Local search and 11 Skills installed; online accounts and real HCU execution require site validation')
     except (FlowError, OSError) as exc:
         state.update(status='incomplete', failed_stage=stage, message=str(exc))
