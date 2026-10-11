@@ -5,6 +5,8 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 
 # HCU 训练性能分析与优化
 
+涉及 Graph、Roofline/算子效率、EventReplay、TraceLens 原生 Agent 或 hipprof/XProf/XCompute 时，读取工程 `docs/tracelens-analysis.md`，使用锁定 fork 的统一入口和实际资格边界。自动模型未知项仍须纳入热点任务；计数器、回放与 profiler-off 时间不可混用；原生 Agent metrics 完成后继续查证、撰写及复核，不把自动表格当成最终结论。
+
 ## 开始前定位与阅读
 
 先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。

@@ -87,6 +87,7 @@ python -m pip install -e thirdparty/TraceLens
 ```bash
 hcu-trainflow --workspace .work/analysis tracelens-report examples/tracelens-trace.json --project . --rank 0
 hcu-trainflow --workspace .work/analysis tracelens-collective '/private/traces/rank*.json' --project . --world-size 8
+hcu-trainflow --workspace .work/analysis tracelens-analyze request.json --project .
 ```
 
 单 rank 支持 PyTorch JSON 与 `.json.gz`，保存 native CSV、stdout/stderr、请求参数及 `report.json`；报告记录输入哈希和锁定的 TraceLens 提交。输出总在 workspace 内的新目录，不覆盖旧结果。`generated` 只表示产生了非空报告，完整训练结论仍需稳态窗口、实际 process groups、shape 与上限模型。
@@ -97,7 +98,7 @@ hcu-trainflow --workspace .work/analysis tracelens-collective '/private/traces/r
 
 ### 完整上游能力的入口
 
-fork 保留原有模块、API 和全部 13 个 console 命令。TrainFlow 的两个快捷命令之外，还可直接使用原生工具：
+fork 保留原有模块、API 和 13 个上游 console 命令；HCU 扩展通过 Python 模块及 `tracelens-analyze` 调用。Graph、Roofline、Agent、hipprof/pftrace、XProf/XCompute 和 EventReplay 的具体选择与实测边界见 [HCU 分析契约](tracelens-analysis.md)。其他原生工具仍可直接使用：
 
 | 需求 | 上游入口 |
 | --- | --- |
@@ -109,7 +110,7 @@ fork 保留原有模块、API 和全部 13 个 console 命令。TrainFlow 的两
 | JAX、rocprofv3、pftrace HIP/HSA、内存拷贝、Genesis | 对应原生 report 命令，参数和格式以该版本文档为准 |
 | Agent 分析和扩展 | 上游 Agent 目录及 optional extras，按需要配置 |
 
-它们不会被 TrainFlow 自动调用，也不自动继承任务权限/产物归档；执行时使用同一任务的私有输入输出目录并保存命令、源码版本与原始证据。全部 CLI 的 `--help` 已检查，但各功能的 HCU 数据识别、额外依赖与精度/模型仍需对应验证。rocprof/pftrace 解析能力不代表自动兼容 hipprof 或 XProf/XCompute。详见 fork 的 [能力与维护说明](https://github.com/yuguo-Jack/TraceLens/blob/hcu/docs/hcu-integration.md)。
+统一入口外的原生工具不自动继承任务权限或归档；执行时使用任务私有目录并保留命令、版本和证据。HCU hipprof 与 XProf/XCompute 使用各自明确的适配器，不伪装成 rocprofv3 输入。已做真实 gfx936 资格测试的能力与尚未覆盖的平台/功能分开记录，不能用 help/import 代替真实分析。详见 fork 的 [能力与维护说明](https://github.com/yuguo-Jack/TraceLens/blob/hcu/docs/hcu-integration.md)。
 
 ## 更新与回退
 

@@ -13,6 +13,27 @@ def test_overlap_does_not_double_count():
     assert sum(x['attributed_us'] for x in r['operators'])==100
     assert sum(x['raw_us'] for x in r['operators'])==160
 
+
+def test_same_kernel_name_cannot_reuse_a_different_shape_model():
+    t = trace([('gemm', 0, 50), ('gemm', 50, 50)])
+    t['traceEvents'][1]['args']['shape'] = [4096, 4096]
+    model = {'flops': 128, 'peak_flops_s': 1e9, 'basis': 'small fixture',
+             'applies_to': {'shape': [8, 8], 'dtype': 'fp32', 'phase': 'unknown'}}
+    result = analyze_trace(t, {'start_us': 0, 'end_us': 100}, {'gemm': model})
+    ops = result['ranks']['0']['operators']
+    assert ops[0]['assessment']['status'] == 'modeled'
+    assert ops[1]['assessment']['status'] == 'incomplete'
+    assert result['status'] == 'incomplete'
+
+
+def test_exact_operator_key_is_the_preferred_model_binding():
+    t = trace([('gemm', 0, 100)])
+    w = {'start_us': 0, 'end_us': 100}
+    key = analyze_trace(t, w)['ranks']['0']['operators'][0]['key']
+    model = {'flops': 128, 'peak_flops_s': 1e9, 'basis': 'bound fixture'}
+    assert analyze_trace(t, w, {'gemm': model})['status'] == 'incomplete'
+    assert analyze_trace(t, w, {key: model})['status'] == 'complete'
+
 def test_idle_gap_cannot_fake_90_percent():
     r=analyze_trace(trace([('a',0,40)]),{'start_us':0,'end_us':100},{'a':{'flops':1,'peak_flops_s':1e6,'basis':'fixture'}})
     assert r['status']=='incomplete' and r['ranks']['0']['operator_e2e_coverage']==0.4

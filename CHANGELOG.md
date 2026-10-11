@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Qualify the HCU TraceLens fork on real gfx936/DTK 26.10 traces: training Graph attribution, captured-value EventReplay, measured-envelope Roofline, native Agent analysis, hipprof JSON/pftrace equivalence and XProf/XCompute counter/SQTT capture. Keep platform, workload and timing limitations explicit.
+- Add a pinned offline `tracelens-analyze` entry for Graph, Roofline, Agent preparation, hipprof and counters, with immutable input receipts and separate incomplete/review-pending states. Connect the analysis to hotspot prioritization and existing kernel Skills.
+- Bind hotspot models to exact operator keys or explicit shape/dtype/phase/stride scope; audit dependency-to-Wiki baselines, generated catalogs, PR identity and retained-document metadata. Historical references remain valid historical evidence.
+
 - Share canonical Skill IDs between runtime dispatch and installation; verify all six independent modes, full-stage transitions and repair decisions against real installed entries.
 - Define a shared change-review/PR delivery procedure with a direct coordinator route. Delivery-only requests reuse stage responsibilities without creating a training task, fabricating training reports or closing unrelated goals.
 - Require explicit source-clock provenance for modern monitoring records; unknown clocks cannot imply measured slowdown or bypass log-seal completion checks. Rebuild persisted progress on upgrade and keep plotted clock labels consistent.

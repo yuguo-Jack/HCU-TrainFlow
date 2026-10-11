@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-11'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
@@ -21,16 +21,28 @@ sources:
   sha256: a6a17536d6cd4c66f956651b519d5e96b84c088133543f99ae90798a49b8899f
 - source: hcu-tracelens
   path: setup.py
-  commit: e4e891de60d3ac3cff3046a58e5852d0814b3dc6
+  commit: 30f5dcd539dd4e588678e34168c7fcf726dd987e
   sha256: 29d8f29499f4a8f4a5fc2c0aa6407d6f400a7c5bfdfb3ba2be274aff493fc253
 - source: hcu-tracelens
   path: TraceLens/Agent/Analysis/utils/deterministic_fallback.py
-  commit: e4e891de60d3ac3cff3046a58e5852d0814b3dc6
+  commit: 30f5dcd539dd4e588678e34168c7fcf726dd987e
   sha256: 8fa877065e24b81512ee67f8d57d5424a95ddcfc0851a501828713e44c536935
 - source: hcu-tracelens
   path: docs/hcu-integration.md
-  commit: e4e891de60d3ac3cff3046a58e5852d0814b3dc6
-  sha256: c9ad787d82130aa710e1fd009bbae950739a087ceea796257abfdda4bc5a40a5
+  commit: 30f5dcd539dd4e588678e34168c7fcf726dd987e
+  sha256: d8ef02421a13654ac7c6d87cb76d5c007c4b2ffbdcd7eb2e6b7d7f45ffc2d74c
+- source: hcu-tracelens
+  path: TraceLens/Trace2Tree/training_graph.py
+  commit: 30f5dcd539dd4e588678e34168c7fcf726dd987e
+  sha256: d04f4709cb67accd1173295a8349079db0fc55bb10ed99c0d095863d9cfdc26a
+- source: hcu-tracelens
+  path: TraceLens/Agent/Analysis/utils/hcu_analysis.py
+  commit: 30f5dcd539dd4e588678e34168c7fcf726dd987e
+  sha256: 90e30f678f53d0be4a328f5ff7692c0ee5c8ffe04447639bfb249fb2ac0904e1
+- source: hcu-tracelens
+  path: TraceLens/PerfModel/hcu_roofline.py
+  commit: 30f5dcd539dd4e588678e34168c7fcf726dd987e
+  sha256: 5dca9f9203c7978920c7a3b550fdf519f5f10a332f117de21a1c8edf9d21a5fc
 ---
 
 # 训练 profiler 采样与 TraceLens 联动
@@ -43,20 +55,20 @@ sources:
 
 ## 分析顺序
 
-1. 空泡先分 CPU launch、数据读取、同步、PP 等待和内存分配；看到空白不能直接下 CPU 瓶颈结论。
-2. 看同域 rank 的偏斜、collective 顺序、消息大小和等待。
-3. 看融合粒度与 NV 参考真实调用链，再看 shape 对应 kernel。
-4. 对累计覆盖端到端墙钟时间至少 90% 的热点集合逐个评估非通信计算项。
+1. 先识别端到端主导开销。空泡占主导时区分 CPU launch、数据读取、同步、PP 等待和内存分配；看到空白不能直接下 CPU 瓶颈结论。
+2. 通信或偏斜占主导时，核对同域 rank 的 collective 顺序、消息大小和等待；与同调用基准比较后再选择链路排查、overlap、通算融合或框架负载均衡。
+3. 计算占主导时按实际占比排队，核对 NV 参考调用链和已有 HCU 融合实现，再分析真实 shape 对应 kernel 的瓶颈与条件上限。
+4. 对累计覆盖端到端墙钟时间至少 90% 的热点集合逐个评估非通信计算项；保留未知项，初步融合后仍需复评效率并衔接 HIP/Triton 迭代。
 
 TrainFlow 的区间扫描将同 rank 重叠区间等份归因，作为可检查的排序代理；不是分布式关键路径证明。未归因/CPU/等待留在分母，覆盖不足显示 incomplete，不能偷偷换成 kernel 总时间。使用 TraceLens 的算子关联/collective/overlap 报告补足细节，跨 rank 对齐另保留校时依据。
 
 ## TraceLens HCU fork 与完整功能复用
 
-TrainFlow 当前锁定 `yuguo-Jack/TraceLens` 的 `hcu` 分支提交，AMD 上游作为独立来源持续监测。fork 完整保留报告、通信分析、TraceDiff、PerfModel、EventReplay、trace 索引与 kernel 源码定位；当前最小补丁修复了 Windows CSV 字段上限导致的原生 CLI 导入失败。
+TrainFlow 当前锁定 `yuguo-Jack/TraceLens` 的 `hcu` 分支提交，AMD 上游作为独立来源持续监测。fork 保留报告、通信分析、TraceDiff、PerfModel、EventReplay、trace 索引与 kernel 源码定位；HCU 扩展已包括 HIP runtime 类别、训练 Graph 归因、带设备来源的 Roofline、实际值回放、原生 Agent 输入/结果绑定和 DTK profiler 适配。
 
-训练分析优先使用已有模块：比较候选前后性能用 TraceDiff，graph attribution 用原生 graph 报告，跨任务查 shape/kernel 用 trace 索引，定位实现用源码解析器。同一任务原始 trace 与结果保存在私有 workspace。CLI 能启动不代表 HCU 事件已完整识别；回放、JAX/XPlane、Origami 模型等功能按对应依赖单独验证。
+训练分析优先使用已有模块：比较候选前后性能用 TraceDiff；训练 Graph 用显式 capture/replay、输入签名和文件哈希的 `training_graph` 契约，当前仅接受可核验的串行单 stream；跨任务查 shape/kernel 用 trace 索引，定位实现用源码解析器。同一任务原始 trace 与结果保存在私有 workspace。统一 `tracelens-analyze` 准备 Graph、Roofline、Agent、hipprof 与 counter 证据；活跃 Agent 必须读原件、解释未知项并显式复核 findings，脚本不会代替推理。源输入或报告改变后旧回执失效。
 
-硬件峰值通过现有架构 JSON/扩展接口输入，算子规则沿已有映射和模型扩展；无法表达真实 HCU 格式时才修改核心解析，并提供最小复现与回归。不得为了让报告完成而套用其他硬件峰值、忽略未关联 kernel 或改变端到端分母。安装、迁移与功能入口见 [集成说明](../../docs/integrations.md)。
+硬件理论峰值、实测 sustained 参考和同 shape 可达水平分别通过有来源的架构数据表达。条件模型差距不等于端到端收益；EventReplay 的同步调用时间与单个 kernel trace 时间必须对齐范围再比较。不得为了让报告完成而套用其他硬件峰值、忽略未关联 kernel 或改变端到端分母。安装见 [集成说明](../../docs/integrations.md)，接口、实际 gfx936/DTK26.10 工具验证及未覆盖范围见 [HCU 分析契约](../../docs/tracelens-analysis.md)。JAX/XPlane、Origami、并发 Graph、完整 Megatron 训练质量不能由本轮工具资格测试推定已验证。
 
 ## 固定源码与更新范围
 
@@ -65,4 +77,4 @@ TrainFlow 当前锁定 `yuguo-Jack/TraceLens` 的 `hcu` 分支提交，AMD 上�
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。
 
-- [HCU TraceLens fork：能力、补丁与维护](https://github.com/yuguo-Jack/TraceLens/blob/e4e891de60d3ac3cff3046a58e5852d0814b3dc6/docs/hcu-integration.md)
+- [HCU TraceLens fork：能力、补丁与维护](https://github.com/yuguo-Jack/TraceLens/blob/30f5dcd539dd4e588678e34168c7fcf726dd987e/docs/hcu-integration.md)

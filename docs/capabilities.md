@@ -24,6 +24,8 @@
 
 ## 后续验收重点
 
+当前主线另完成了 gfx936/DTK 26.10 的 TraceLens 有界资格验证：训练 Graph 前后向映射、实际输入 EventReplay、实测参考 Roofline、原生 Agent 指标及推理复核、hipprof JSON/pftrace 同源对照、XProf/XCompute counter 与 SQTT。命令、计时/数据边界和未覆盖项见 [TraceLens HCU 分析](tracelens-analysis.md)；没有因此扩大完整模型 loss、多架构或生产长稳的验证声明。
+
 1. 在每个目标环境重新确认资源、权限、启动方式和预期；冻结真实源码、依赖、模型、数据与基线身份，保留早期发现记录。
 2. 根据端到端证据推进系统/通信/算子候选，验证局部正确性和收益，并在稳定阶段验 loss。
 3. 在非平凡并行域采集至少两个适当 rank 的 profile，核对切分、显存、通信与负载均衡；不能把单卡结果外推到多机。

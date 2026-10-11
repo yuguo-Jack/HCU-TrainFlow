@@ -240,3 +240,16 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [x] 完成场景复核、完整测试、知识与资源检查及本机同步；最终提交推送结果以 Git 回执为准，不新增 tag。
 
 范围：本地TrainFlow代码与方法审查、CPU合成场景。不开实际训练，不变更远程环境，不刷新HCU-Knowledge。
+
+## 2026-10-11：TraceLens 全能力验收与方法联动
+
+用户要求：补齐并验证 HCU Roofline/效率预测、Graph、EventReplay、Agent 分析及 HCU profiler 输入；参考 Hyperloom 与公开实战，系统复核 TrainFlow 各阶段方法，修复 Wiki/代码/Skill 漂移，最后复核安装与提交推送。
+
+- [x] 固定源版本、独立开发 checkout、功能/依赖/数据/实际环境准入清单。
+- [x] Roofline/效率/条件上限：真实硬件参数、算子语义与计数口径，联动热点排序、同 shape replay、优化 Skill。
+- [x] Graph/回放/Agent：最小实景验证、失败路径、输入与数值契约、可重跑分析产物。
+- [x] HCU profiler 输入：核对 hipprof/XProf/XCompute 实际格式，与 rocprofv3/pftrace 共用解析或增加明确转换，不能只改名称。
+- [x] 官方实战与 Hyperloom 方法对照；合理保留，仅对有证据缺口修订；局部 Wiki/来源/维护映射同步。
+- [x] 定向与全量回归、实际验证记录、独立复核、本机安装；TraceLens fork 已发布并锁入 TrainFlow，本次提交交付更新，不新增 tag。Git 推送结果以远端回执为准。
+
+执行边界：不更新大 HCU 知识库。复用此前授权集群，先核对连接/镜像/占卡与残留作业，只在空闲隔离资源进行有界测试；本地代码同步到 /cfs/yuguo 下对应目录，保留原始输入和失败证据。不用模拟/CLI help 代替真实功能验收，环境不可达/依赖不支持及时反馈并继续可做的代码与离线验证。

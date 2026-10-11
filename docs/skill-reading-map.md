@@ -36,6 +36,8 @@ Markdown 链接不会自动将所有文档注入 Agent 上下文。主控在任�
 
 每个阶段都有自身交付与复核责任；只有用户要求完整流程时才串起全部阶段。命令以当前 CLI 帮助、实际部署分支和授权为准。
 
+分析涉及 Graph、效率/上限、EventReplay、原生 Agent 或 HCU profiler 格式时，性能阶段及成员须补读 [TraceLens HCU 分析契约](tracelens-analysis.md)。环境阶段检查采集依赖、更新阶段复核解析器时也使用该页的能力与权限边界。
+
 ## Hyperloom、GEAK、BBuf 的借鉴内容
 
 - **采用依据与固定源码位置**：[性能方法来源](practices/performance-methods.md)。这是追溯和维护入口，执行时不要求全文阅读三个参考工程。

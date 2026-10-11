@@ -217,3 +217,18 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 - 独立审查复现从工程外执行完整安装、使用相对 skills_dir，子进程实际位置与 ready 回执不同。入口统一归一化目标；新增真实安装器的 11 个合成 Skill 回归，外部包/Git/KB 操作模拟，未触碰外部仓。
 - 交付-only 正向走读：主控→阅读导航/接手指南→change-delivery→所属阶段相关契约可闭合；无硬件时保留未验证项并按目标仓规范 draft/阻塞，不建无关训练状态机，不新增 Skill。
 - 复核模块边界：执行权限/租约/未知结果核销、上下文/候选/独立审核门槛、数值输入和阶段 loss、团队依赖与资源范围、持久监控、局部 Wiki 更新哈希、本机安装绑定和文档读取路线。未给缺证据的猜测追加修改；合成/CPU 回归不等于新增 HCU 实测覆盖。
+
+
+## 2026-10-11 TraceLens 真实资格与方法复核
+
+- BW1000_H/gfx936、DTK26.10、Torch2.11.0/HIP7.2.26365 空闲设备完成 eager/fwd+bwd Graph、真实值 EventReplay、FP32/BF16/copy calibration；原件在任务私有 workspace。同期占用检查避开已被占用节点。
+- hipprof 原始 JSON 与真实 binary pftrace 经官方 Perfetto 转换后六张表一致：92 kernel、18 copy、26 memset。发现 procId 可能为 autograd worker，关联须用 pid/index；整数纳秒不能被微秒显示舍入取代。
+- XProf3.16.0/aqlprofile3.6.2 初始报 Cannot open mem；专用临时容器 /dev/mem+SYS_RAWIO 与 hyhal只读后 counter/SQTT实采成功。XComputeLight4.8.0读perf导出10CSV成功；N/A、无单位SQTT列与额外replay时间不可当零或无profile基线。未修改已有训练容器。
+- 原生Agent分类成功但发现缺失列被当0、CPU时间回退为GPU时间、旧输出可能复用；这些影响解释的缺口分别修正。Qualification probe逐步同步，其88.69%idle不能当生产训练瓶颈。
+- 实测4096GEMM envelope不能假定512×768×256调用可达，自动headroom仅条件筛查，3个mm支持/7项unknown不掩盖覆盖缺口。
+- 同名kernel可跨shape/phase，TrainFlow模型新增精确key或applies_to契约。保留初始oracle、profiler-off配对、阶段loss、实际rank组、单一恢复owner等合理流程。
+- 外部主源复核涵盖PyTorch FSDP/compile实战、FlashAttention IO、AMD FP8组合消融、MLPerf训练Graph；不复制推理窗口、固定阈值或NV/AMD峰值。详见docs/practices/performance-methods.md与私有method-review.md。
+- Wiki旧e4基线与依赖f22存在漂移，增加明确dependency_sources关联校验；来源升级需要同步当前页面、inventory、文档证据和维护目标，历史固定证据可保留。
+- 同仓联动复核发现 Megatron profiling 专题也保留旧的 Windows-only 补丁描述；已与工具总览共同更新并绑定当前依赖，不能只修其中一页。
+- 独立审核补齐原生 Agent 的来源、CSV、架构、代码、metrics、findings 与报告内容绑定；comparative 模式绑定两侧 CSV 及比较利用率。`run` 不自动认可旧推理，需活跃 Agent 显式 review；输入变化后回执失效。
+- 发布后的 TraceLens `30f5dcd539dd4e588678e34168c7fcf726dd987e` 已在空闲 gfx936 上重跑 captured-value mm 回放，数值通过，10 个同步 device-event 样本完整；结束后无 KFD 残留。此计时不是源 trace 单 kernel 的相同范围，不据此计算模型拖慢倍数。

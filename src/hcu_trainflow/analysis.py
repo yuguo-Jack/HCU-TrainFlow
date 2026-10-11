@@ -232,7 +232,26 @@ def analyze_trace(trace, window, models=None, target=0.9, attribution=None):
             cumulative += group["e2e_share"]
             group["cumulative_e2e_share"] = cumulative
             group["mean_kernel_us"] = group["raw_us"] / group["calls"]
-            model = models.get(group["key"], models.get(group["name"]))
+            model = models.get(group["key"])
+            name_fallback = model is None and group["name"] in models
+            if name_fallback:
+                model = models[group["name"]]
+            scope_error = None
+            if model is not None:
+                if not isinstance(model, dict):
+                    raise FlowError('Operator model must be an object')
+                scope = model.get('applies_to')
+                # One compiled kernel name can service many shapes, strides,
+                # precisions and training phases. A name alone is not a workload.
+                if name_fallback and (not isinstance(scope, dict) or not all(k in scope for k in ('shape', 'dtype', 'phase'))):
+                    scope_error = 'Name-keyed model requires applies_to shape, dtype and phase; prefer the exact operator key'
+                elif scope is not None:
+                    if not isinstance(scope, dict) or not scope or any(k not in {'shape', 'dtype', 'phase', 'input_strides', 'cpu_op', 'callsite'} for k in scope):
+                        scope_error = 'Invalid operator model applies_to scope'
+                    elif any(fingerprint(group.get(k)) != fingerprint(v) for k, v in scope.items()):
+                        scope_error = 'Operator workload does not match the model applies_to scope'
+                    elif name_fallback and group.get('input_strides') is not None and 'input_strides' not in scope:
+                        scope_error = 'Name-keyed model must include captured input_strides'
             if group['attribution_status'] in {'ambiguous', 'missing-entry'}:
                 group['assessment'] = {'status': 'incomplete', 'reason': 'Ambiguous or missing CPU/GPU event attribution'}
             elif group["communication"] and not (model or {}).get("mixed_compute"):
@@ -240,7 +259,9 @@ def analyze_trace(trace, window, models=None, target=0.9, attribution=None):
             elif group["clipped_calls"]:
                 group["assessment"] = {"status": "incomplete", "reason": "Window cuts through kernel calls; select complete calls"}
             elif group["in_hot_set"]:
-                if group['requires_workload_mapping'] and not (model or {}).get('workload_evidence'):
+                if scope_error:
+                    group['assessment'] = {'status': 'incomplete', 'reason': scope_error}
+                elif group['requires_workload_mapping'] and not (model or {}).get('workload_evidence'):
                     group['assessment'] = {'status': 'incomplete', 'reason': 'CPU input shapes are context; provide explicit per-kernel workload evidence before computing bounds'}
                 elif (group["shape"] is None or group["dtype"] is None) and not (model or {}).get("workload_evidence"):
                     group["assessment"] = {"status": "incomplete", "reason": "Missing shape/dtype capture or explicit workload evidence"}

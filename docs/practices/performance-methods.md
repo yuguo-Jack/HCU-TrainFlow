@@ -14,6 +14,22 @@
 
 用户 fork `yuguo-Jack/Hyperloom@0425bde3f6e76e1588400c37d056dfd3bb75ac11` 是此前参考；本次针对 AMD 上游新版本补看方法，未更新或覆盖用户 fork。
 
+TraceLens 原生 Agent 的方法另按 HCU fork `f22c517ee6a87850bcc3668facc6452c1b3b5bd2` 的[分析步骤](https://github.com/yuguo-Jack/TraceLens/blob/f22c517ee6a87850bcc3668facc6452c1b3b5bd2/TraceLens/Agent/Analysis/skills/analysis-orchestrator/reference.md)复核。其 top-10 选项和 idle >15% 的 CPU 分析触发条件是该工具的筛选策略，不是 TrainFlow 的 ≥90% 端到端覆盖标准；未生成某类 finding 也不证明不存在该瓶颈。Agent 的字段/表一致性检查只验证报告契约，实际因果、训练正确性与收益仍按本仓闭环复验。`fusion_flagged` 去重不能作为已近上限或停止算子迭代的理由。
+
+## 真实训练案例的采用边界
+
+2026-10-11 核对以下官方实战或论文主源。案例用于建立候选机制；移植时仍核对阶段、模型规模、硬件、依赖、精度和测量范围，不继承原性能数字或验收状态。
+
+| 主源与实际范围 | 可复用的方法与限制 |
+|---|---|
+| [PyTorch FSDP](https://pytorch.org/blog/maximizing-training/)：7B、128 A100，完成 2T token 训练 | 联合判断容量、重算和吞吐；不同规模采用不同重算策略。MFU 的有用工作与 HFU 的实际执行/重算 FLOPs 分开，不能把 kernel 效率当完整训练利用率。 |
+| [PyTorch FSDP + compile](https://pytorch.org/blog/maximizing-training-throughput/)：RoPE 编译适配、输入流水排障、loss/grad norm 与评估，后续 448 GPU 的 7B 训练 | 减少断图还需验证真实 dispatch、数据处理、完整步收益和训练质量；扩大数据规模可能暴露新的 CPU 瓶颈。 |
+| [FlashAttention 论文 v2](https://arxiv.org/html/2205.14135v2)：前后向算法、HBM/SRAM IO 模型与实际训练实验 | 重算可增加 FLOPs 同时减少 IO；按当前算法、tiling 与阶段建模，输入输出最小字节量不能代替实际流量。不同序列长度的质量实验不当作同负载加速。 |
+| [AMD/PyTorch FP8 训练](https://pytorch.org/blog/fp8-training-on-amd-gpus-with-torchtitan-and-torchao-upstreaming-performance-improvements/)及 [#3972 固定合入](https://github.com/pytorch/ao/commit/7bb7f061ad4d612b4bb3a23b5dedcafa27da8e49)、[#4311 固定合入](https://github.com/pytorch/ao/commit/41cf132b23ee5ae129f7d60bd47aa42909d3621a) | 必要组合保留消融，逐 shape 保留退化，前向/dgrad/wgrad 的精度分别核对。#4311 的 DeepSeek-V3 收益实际来自四层 all-MoE、EP=8、steps 2–10 的代理，不能证明完整 671B 容量、长期 loss 或当前 HCU 收益。 |
+| [NVIDIA MLPerf Training 6.0](https://developer.nvidia.com/blog/nvidia-blackwell-tops-mlperf-training-6-0-with-industry-leading-scale-and-performance/)：大规模 Llama/DeepSeek 训练至 benchmark 质量门槛 | 整步 Graph 联合解决动态 MoE 同步、buffer 生命周期和 CPU 提交；通信优先级、延迟 wgrad 与 PP 均衡通过整步实验验证。CUDA 支持与数字不成为 HCU 支持承诺，benchmark 达标不证明完整预训练收敛。 |
+
+引用案例时同时保留原始实验范围和固定代码来源；新闻标题、摘要或一个代理的吞吐不能扩大为完整模型结论。训练 Graph/算子回放的输入、状态与归因边界见 [profiling](../profiling.md) 和 [模型内外对照](../../skills/hcu-train-analyze-and-optimize/references/operator-comparison.md)。
+
 ## 与 HCU 知识连接
 
 通过 `$hcu-knowledge-search` 定位下列 ID；路径属于独立 HCU-Knowledge，不要求把内部材料复制到本公开工程。先读正文、原件与固定来源，再核对现场版本。
@@ -57,4 +73,4 @@ flowchart TD
 
 更新 Wiki/Skill 时一起复核上述固定路径的新版本与本仓采用规则；重点看默认门槛、测量方法、profile 刷新、dispatch、oracle、模式/重放副作用和支持范围。只比较相关差异，不机械合并上游流程或下载整个依赖生态。相关能力变化还应检查 `analysis.py`、质量评估、TraceLens 解析、主控交接和三个阶段的异常路由。
 
-本次方法经源码/知识查证和本地回归；没有新增 GPU 测量或故障注入。现场采集命令、跨节点因果分析、实际算子效率和生产故障恢复仍以任务验证为准。文档中的 Amdahl、Roofline 是带假设的评估方法，不能自动证明物理瓶颈、实际加速或训练收敛。
+上述实战方法经源码/知识查证和本地回归，未在 HCU 复现这些案例的完整训练或故障注入。TraceLens 工具另在 gfx936 上完成有界真实采集、Graph、回放和校准，范围见 [分析与验证](../tracelens-analysis.md)。现场跨节点因果、模型实际算子效率和生产故障恢复仍以任务验证为准。文档中的 Amdahl、Roofline 是带假设的评估方法，不能自动证明物理瓶颈、实际加速或训练收敛。

@@ -37,6 +37,8 @@
 
 `fullgraph` 可用于暴露断图，但不规定全训练循环必须单图；DDP 的通信时机可能依赖图边界。不要默认 suppress errors 后声称编译生效。手改生成缓存只适合定位，正式方案回到模型、图变换、编译器或稳定自定义算子入口，验证清空缓存后的重建。
 
+训练 Graph 按完整优化器步及累积边界核对；一次 graph launch 可能只覆盖 fwd、bwd、重算或更新的一部分。capture 的源码映射与正式 replay 的时间分开，逐图保留准确 shape/stride/phase 特化和调用序列；不能用推理请求的 batch bucket 或相邻 launch 替代训练步语义。参数更新、共享 buffer 地址/存活期、grad 清零/累积、随机操作及动态 MoE 调度必须与原训练契约一致；编译图或 capture 成功后仍验证完整步数值、显存和 profiler-off 收益。
+
 **AOTInductor/export 不作为默认训练加速方案。** 仅当项目确实使用导出路径，或冻结编码器/评估/rollout 等子模块有明确需求时评估；分别核查 autograd、参数更新与部署支持。AOTAutograd 的训练图处理不能和 AOTI 推理打包混为一谈。需要可训练自定义算子时补正确 backward，以及当前编译路径需要的注册/形状/别名描述，再交给已有 Hygon kernel Skill。
 
 ## 4. 收益排序与交付

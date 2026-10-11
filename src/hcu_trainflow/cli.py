@@ -81,6 +81,7 @@ def parser():
     q = cmd("profile-analyze", "trace", "window"); q.add_argument("--models"); q.add_argument("--output"); q.add_argument("--groups"); q.add_argument('--attribution', help='TraceLens export bound to this exact trace and window')
     q = cmd('tracelens-report', 'trace'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--rank', type=int); q.add_argument('--gpu-arch-json'); q.add_argument('--timeout', type=int, default=1800); q.add_argument('--window', help='Explicit training-step window for CPU/GPU shape attribution')
     q = cmd('tracelens-collective', 'trace_pattern'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--world-size', type=int, required=True); q.add_argument('--timeout', type=int, default=1800)
+    q = cmd('tracelens-analyze', 'request'); q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT', '.')); q.add_argument('--timeout', type=int, default=1800)
     q = cmd("watch", "task", "log", "policy"); q.add_argument("--once", action="store_true"); q.add_argument("--interval", type=float, default=10)
     q = cmd("observe-training", "task", "manifest", "policy"); q.add_argument("--exit-receipt"); q.add_argument("--state-dir")
     q = cmd("heartbeat-check", "file"); q.add_argument("--max-age", type=float, required=True)
@@ -209,6 +210,9 @@ def execute(a):
     if c == "iteration-check": return quality.assess_iteration(**read_json(a.file))
     if c == "profile-plan":
         value = read_json(a.file); return analysis.profile_plan(value["groups"], value["available"])
+    if c == 'tracelens-analyze':
+        from .tracelens_features import run_feature
+        return run_feature(store, a.project, a.request, a.timeout)
     if c in {'tracelens-report', 'tracelens-collective'}:
         from .tracelens import run_report
         if c == 'tracelens-report':
@@ -316,7 +320,7 @@ def main(argv=None):
         result = execute(args)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
         status = result.get("status") if isinstance(result, dict) else None
-        return 2 if status in {"fail", "failed", "incomplete", "partial", "rejected", "unknown", "attention"} else 0
+        return 2 if status in {"fail", "failed", "incomplete", "partial", "rejected", "unknown", "attention", "needs-agent-review"} else 0
     except KeyboardInterrupt:
         return 130
     except (FlowError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:

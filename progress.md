@@ -263,3 +263,17 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 全量回归 1109 passed / 4 skipped（Windows 不支持的 Linux 专用场景）；两套 CLI 合成演示完成；六 Skill 格式和阅读资源校验通过。
 - 系统 Python 可编辑包及六个本机 Skill 已同步到当前工程，再以独立 --check 核验版本、内容和绑定，全部 current；独立监控复现重跑已转为 completion-unverified，不再派生 slowdown。
 - 最终差异审查完成，提交推送为最后操作，实际结果以 Git 回执为准。本轮不打新 tag；未执行远端训练或更新 HCU 大知识库，知识库工作树仍干净。
+
+
+## 2026-10-11 TraceLens 全能力维护
+
+已完成独立fork开发、实际HCU采集及有界回放、XProf/XCompute实采、原生Agent推理复核和通用入口实现。复核修复跨shape模型复用、缺失数据当0、PF源文件覆盖、转换子进程超时残留及XCompute状态接口。正在收尾来源升级、全量回归与本机安装，再发布fork和TrainFlow。未更新HCU大库、未启动新的长训或发布tag。
+
+### 收尾验收
+
+- TraceLens HCU fork 已发布 `30f5dcd539dd4e588678e34168c7fcf726dd987e`；GitHub HCU portability 五个作业（Linux/Windows、Python3.10/3.12 与 CPU replay）全部 success。215 项定向通过；最后 Agent/Roofline 60 项通过，兼容组585项通过/3跳过/1缺大trace fixture排除，组间有重叠不相加。
+- TrainFlow 全量1146通过/4个Linux专用场景在Windows跳过；Wiki刷新后的定向68项通过。真实原件在干净锁定依赖上重跑六个请求：JSON/PF/Graph/counters生成，Roofline保留7个unknown，Agent准备返回needs-agent-review及退出码2；同源JSON/PF六张表一致。
+- 当前活跃 Agent 已完成真实六类别推理、显式review及聚合：metrics_complete/findings complete/report complete，failures为空；旧输入和旧推理不能自动沿用。
+- 来源目录67项变化（含目录），保留5份HCU原始指南、37个固定源码文件证据；工具总览与Megatron profiling共同更新，22个维护目标逐项留回执，无待办。495页/25来源校验通过，代表性检索命中当前工具/专题/原文。
+- 本机TraceLens包已安装到新固定提交，TrainFlow 0.5.1 editable及六个Skill同步并核验。59个阅读页/76个可达资源无缺失。原始trace/张量/站点采集日志及中间结果留忽略目录或私有workspace；未改HCU-Knowledge。
+- 实测覆盖为gfx936/DTK26.10有界工具资格；其他硬件/版本、并发Graph、复杂有状态回放、GUI和完整训练loss仍按各自实际任务验证。TrainFlow本次提交后推送main；不新增tag/release。

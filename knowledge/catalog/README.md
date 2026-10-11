@@ -6,7 +6,7 @@ engine: cross-engine
 review_level: inventory-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 9d660deb0a33c9e43dcb96748094078ddbdbd8582f088f9e2b4913bcd3a59b98
+generated_body_sha256: cbd40b2529d6143f3506cb42b9c85bd0b4316c6787ea754fdf41c9cf73951ddc
 ---
 
 # 官方来源覆盖目录
@@ -190,4 +190,9 @@ generated_body_sha256: 9d660deb0a33c9e43dcb96748094078ddbdbd8582f088f9e2b4913bcd
 
 来源：yuguo-Jack/TraceLens
 
-- [源码目录](../source-maps/hcu-tracelens.md)：1354 路径，固定 `e4e891de60d3ac3cff3046a58e5852d0814b3dc6`，目录覆盖。
+- [源码目录](../source-maps/hcu-tracelens.md)：1376 路径，固定 `30f5dcd539dd4e588678e34168c7fcf726dd987e`，目录覆盖。
+- [文档目录](../upstream-docs/hcu-tracelens/)：扫描发现 5 份；保留 5 份（包含历史）；历史范围 0 份。扫描模式见 sources.json，pending 由更新运行报告给出。
+
+## hygon-ai-train-simulator
+
+来源：HYGON-AI/hcu-train-simulator

@@ -124,7 +124,9 @@ def test_native_forward_backward_phase_uses_real_sequence_link(tmp_path, native)
 def test_cpu_shapes_cannot_automatically_become_kernel_flops():
     trace, window, mapping = consumer_fixture()
     model = {'kind': 'gemm', 'm': 8, 'n': 16, 'k': 8, 'peak_flops_s': 1e12, 'basis': 'authored fixture'}
-    result = analyze_trace(trace, window, {'shared_kernel_name': model}, attribution=mapping)
+    initial = analyze_trace(trace, window, attribution=mapping)
+    models = {row['key']: model for row in initial['ranks']['0']['operators']}
+    result = analyze_trace(trace, window, models, attribution=mapping)
     assert all(x['assessment']['status'] == 'incomplete' for x in result['ranks']['0']['operators'])
     assert 'per-kernel workload evidence' in result['ranks']['0']['operators'][0]['assessment']['reason']
 

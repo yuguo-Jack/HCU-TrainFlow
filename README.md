@@ -12,6 +12,8 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ## 如何开始
 
+性能分析中的训练 Graph、算子 Roofline/效率、EventReplay、原生 Agent 和 HCU profiler 入口，见 [TraceLens 分析与验证](docs/tracelens-analysis.md)。自动报告与已验证硬件范围单独说明，分析结果继续进入热点优先级、算子迭代及数值/端到端验收。
+
 安装后，在支持 Skill 的 Agent 中说：
 
 > `$hcu-trainflow` 在我提供的环境中，对指定模型进行适配、性能优化和大规模验证。已有启动脚本、数据路径和资源范围如下……

@@ -4,6 +4,8 @@
 
 保存 PyTorch/Chrome trace、明确 start_us/end_us、实际 process groups、rank、phase、shape/dtype/stride 及 workload 捕获证据。`profile-plan` 要求每个实际非单例组至少两个可用 rank；并不是任意 rank0/rank1 都足够。
 
+跨 rank 判断到达先后或因果链时，保存共同参考时基、校时方法、offset/drift 与误差界，再按实际 group、调用序列及 producer → consumer → join 对应。待解释的时间差不大于误差时保持未知；单 rank 的区间时长仍可独立报告。GPU 空白还可能来自输入/提交、依赖/peer 等待、流水线空泡或缺事件，不能仅凭空白定性 CPU 或链路瓶颈。
+
 ```bash
 hcu-trainflow profile-plan examples/groups.json
 hcu-trainflow profile-analyze examples/trace.json examples/window.json --models examples/models.json --groups examples/process-groups.json --output .work/analysis.json
@@ -21,6 +23,8 @@ GEMM FLOPs = 2×M×N×K×batch。其他 op 由实际算法定义 FLOPs、有效/
 
 每项模型必须给 basis；峰值来自匹配硬件/精度/软件/频率条件。shape 的数学最小字节量忽略 cache、重读和中间量，需写清假设。eta>1 表示模型或测量待复核，不截成 100%。建议再给同 shape 独立测试与可达参考，以判断是实现差距还是训练并发干扰。
 
+模型按 operator key 与实际 phase/shape/dtype/stride/算法适用范围核对；同名 kernel 可对应不同工作量，不能把某次 M/N/K 模型沿用于其他调用。确实通用的名字级延迟模型也须说明条件。kernel 的 eta_bound、完整训练 MFU 与 HFU 分别命名：MFU 使用有用模型工作，HFU 使用包含重算的实际执行工作，并注明 FLOPs、设备数、完整窗口和匹配精度峰值；MoE、辅助头或混合精度不能无条件套 `6N × tokens` 或单一矩阵峰值。
+
 纯通信项单列 message/topology/wait/overlap；有计算工作的混合 kernel 用 mixed_compute，仍评估计算部分。attention 的 score/softmax/IO/recompute 与 backward 不能简单视作一个 GEMM。
 
 ## 模型内外对照
@@ -29,13 +33,21 @@ GEMM FLOPs = 2×M×N×K×batch。其他 op 由实际算法定义 FLOPs、有效/
 
 端到端吞吐来自 profiler-off 稳态运行。干净 profile 与额外包装采集分别记录；诊断运行用于定位与建立可重放输入，不把其 CPU wrapper 耗时当 GPU kernel 延迟。先核对实际分发和数值，再比较模型内外耗时分布与匹配的上限，最后回到端到端验证收益。
 
+扩展效率说明基准设备数与工作量：固定完整工作量的强扩展可用 `(T_base / T_N) / (N / N_base)`；弱扩展固定局部负载时，全局 batch、有效 token 数及质量语义可能改变，不能直接沿用强扩展结论。
+
 ## TraceLens
+
+Graph、Roofline、原生 Agent、EventReplay、hipprof/pftrace 与 XProf/XCompute 的入口选择、实测范围和失败处理见 [HCU 分析与验证](tracelens-analysis.md)。命中功能时先读该页，再解释自动报告或发起实验。
 
 安装与依赖版本见 [第三方集成](integrations.md)。`tracelens-report TRACE --project PROJECT --rank RANK` 调用锁定版本的 PyTorch report API，输出原生 op/kernel、overlap 等 CSV、输入哈希、日志与报告清单。JSON 和 `.json.gz` 均可读取；不是重新实现一套 TraceLens。
 
 `tracelens-collective 'rank*.json' --project PROJECT --world-size N` 要求完整 `0..N-1` 文件和实际通信上下文。并行域只采两个代表 rank 时，仍可逐 rank 分析，但不足以运行要求完整 ranks 的 collective 报告。RCCL 事件能否识别、collective 映射和分组字段须在目标 trace 上核对；合成单 rank 回归不代表真实 HCU 通信已验证。
 
 `generated` 表示非空报告生成，不表示优化完成。TraceLens 原生百分比的统计窗口/分母不自动等于 TrainFlow 稳态窗口墙钟；Agent 需结合窗口、process groups 和 shape 证据解释，两套结果不能直接相加。缺失 CPU-op 关联、空表、超时与执行失败都会明确保留。
+
+训练 Graph 的一次 launch 不等于一完整训练步：fwd/bwd/重算/更新及梯度累积可能分别捕获或重放。capture 只用于恢复调用映射，正式时间来自真实稳态 replay；核对精确图特化、phase、调用序列、参数/地址与 RNG/状态契约。推理 annotation、最近 batch bucket、CSV 非空或 sanity 日志没有报错均不能证明训练映射完整；根/特化未匹配及事件数/耗时不一致保持缺口。具体支持范围以锁定源码和目标 trace 资格结果为准。
+
+EventReplay 的元数据 IR 或随机输入执行仅证明该范围的合成调用可用；真实数据依赖、梯度、alias 与原地状态需按[独立重放契约](../skills/hcu-train-analyze-and-optimize/references/operator-comparison.md)补齐。原生 Agent 的 top-10、空泡触发门槛及 `SUCCESS` 不替代本仓覆盖、因果和训练验收，见[证据闭环](../skills/hcu-train-analyze-and-optimize/references/evidence-driven-loop.md)。
 
 选窗口时以 CPU `user_annotation` 的完整 `ProfilerStep#` 为依据。HIP trace 还可能在多个 GPU stream 输出同名 `gpu_user_annotation`；这些是同一步的设备区间，不能当成额外训练步。inventory 分别记录 CPU/GPU step annotation 数目，同时保留原总数。必须对照实际训练循环调用 `prof.step()` 的位置和 profiler schedule，不能由命令的起止数字直接推断采了几步。
 

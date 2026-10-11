@@ -30,7 +30,7 @@ def run_demo(destination):
     health_contract = {"context": ctx, "required": [{"node": "synthetic-node", "device": "0", "check": "fixture", "conditions": {"fixture": True}}]}
     health = assess_health(health_contract, [{"node": "synthetic-node", "device": "0", "check": "fixture", "conditions": {"fixture": True}, "context": ctx, "status": "pass", "executed": 1, "evidence": evidence}])
     trace = {"traceEvents": [{"ph": "X", "cat": "kernel", "name": "fixture_gemm", "ts": 0, "dur": 95, "args": {"rank": rank, "shape": [8, 8, 8], "dtype": "float32", "phase": "forward"}} for rank in (0, 1)]}
-    analysis = analyze_trace(trace, {"start_us": 0, "end_us": 100}, {"fixture_gemm": {"kind": "gemm", "m": 8, "n": 8, "k": 8, "peak_flops_s": 20e6, "basis": "Synthetic peak for testing only", "efficiency_target": 0.4}})
+    analysis = analyze_trace(trace, {"start_us": 0, "end_us": 100}, {"fixture_gemm": {"kind": "gemm", "m": 8, "n": 8, "k": 8, "peak_flops_s": 20e6, "basis": "Synthetic peak for testing only", "efficiency_target": 0.4, "applies_to": {"shape": [8, 8, 8], "dtype": "float32", "phase": "forward"}}})
     coverage = profile_plan([{"domain": "dp", "ranks": [0, 1]}], [0, 1])
     contract = {"context": ctx, "sample_fingerprint": "synthetic-samples", "aggregation": "fixed-token-mean", "min_steps": 3, "atol": 0.001, "rtol": 0, "tolerance_basis": "Synthetic regression fixture"}
     record = {"context": ctx, "sample_fingerprint": contract["sample_fingerprint"], "aggregation": contract["aggregation"], "executed": 3, "evidence": evidence, "candidate_path_exercised": True, "steps": [1, 2, 3], "loss": [2.0, 1.9, 1.8]}
