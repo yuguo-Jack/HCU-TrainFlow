@@ -71,6 +71,10 @@ decision 为 knowledge-added（必须链接知识页）、not-relevant 或 defer
 
 `document_globs` 在全树上发现新/改文档，`wiki-sync-docs` 按 blob SHA 增量处理，缺失输出可恢复。未匹配新文件仍可通过树发现并扩大模式。删除文档保留历史页、source_state 和 ledger 标记（区分已从树删除与不在当前扫描模式）；相对链接从原始固定文件解析。扫描文本不等于解读所有图表/Notebook。
 
+收录范围先按[知识筛选规则](knowledge-architecture.md#自动更新时的内容筛选)审查。`document_scope` 说明训练用途；`document_exclusions` 是“上游路径 glob → 排除理由”的映射，优先于 `document_globs`。例如 `{"docs/_tutorials/azure.md":"云账号与平台部署教程，当前无训练优化专题引用"}`。同步输出及文档 ledger 的 `excluded_paths` 明示命中路径和理由，既不下载也不恢复这些生成页；完整源码树与在线按问题查代码功能保留。
+
+新增排除规则若命中已保留 ledger 记录，同步会要求先整理页面、引用和 ledger，避免默默删除历史资料或留下已排除页面污染检索。范围收紧后运行 `wiki-catalog`、知识校验及搜索检查；已移出页不应在新索引中出现。上游删除与人为排除是不同原因，不用 `historical_paths` 代替排除决策。不要仅收窄通配符却留下旧页，也不要把低相关判断扩展成一刀切删除特定框架/模型的资料。
+
 ### PR 采集与续接
 
 `wiki-sync-prs` 初次默认发现最近 30 天更新的 PR；后续使用游标并回看一天，`--since` 可扩大窗口。已收录旧 PR 即使不在窗口，也周期复核讨论（默认七天）。`--max-prs` 只是批次，pending 未清零不推进发现游标，失败保留旧页，重复命令续采。默认窗口不是全历史覆盖；问题检索可找到任意旧 PR。

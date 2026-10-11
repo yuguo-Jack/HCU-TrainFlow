@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Curate shared site pages around reusable conditions, measurements and evidence; keep session decisions and temporary facilities in task records. Add reasoned document exclusions to incremental Wiki collection, reject retained-page conflicts, and prevent excluded material from returning on sync. Keep full source navigation available.
 - Qualify the HCU TraceLens fork on real gfx936/DTK 26.10 traces: training Graph attribution, captured-value EventReplay, measured-envelope Roofline, native Agent analysis, hipprof JSON/pftrace equivalence and XProf/XCompute counter/SQTT capture. Keep platform, workload and timing limitations explicit.
 - Add a pinned offline `tracelens-analyze` entry for Graph, Roofline, Agent preparation, hipprof and counters, with immutable input receipts and separate incomplete/review-pending states. Connect the analysis to hotspot prioritization and existing kernel Skills.
 - Bind hotspot models to exact operator keys or explicit shape/dtype/phase/stride scope; audit dependency-to-Wiki baselines, generated catalogs, PR identity and retained-document metadata. Historical references remain valid historical evidence.

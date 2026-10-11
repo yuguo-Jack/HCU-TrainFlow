@@ -433,11 +433,41 @@ def apply_refresh(store, project, stage_id):
             'workflow_pending':receipt.get('workflow_deferred',[]),'runtime_validated':False}
 
 
+def document_exclusions(source):
+    """Explicit, reviewed scope decisions; never infer relevance from keywords."""
+    rules = source.get('document_exclusions', {})
+    if not isinstance(rules, dict) or any(
+        not isinstance(pattern, str) or not pattern.strip()
+        or not isinstance(reason, str) or not reason.strip()
+        for pattern, reason in rules.items()
+    ):
+        raise FlowError('document_exclusions must map nonempty path globs to review reasons')
+    return rules
+
+
+def select_document_paths(source, entries):
+    patterns = source.get('document_globs', ['README*', 'docs/*.md', 'docs/*.rst'])
+    rules = document_exclusions(source)
+    candidates = sorted(p for p, row in entries.items() if row['type'] == 'blob'
+                        and Path(p).suffix.lower() in {'.md', '.rst', '.mdx', '.txt'}
+                        and any(fnmatch.fnmatchcase(p, g) for g in patterns))
+    excluded = {p: reason for p in candidates for pattern, reason in rules.items()
+                if fnmatch.fnmatchcase(p, pattern)}
+    return [p for p in candidates if p not in excluded], excluded
+
+
 def sync_documents(store, project, source_id, token=None, max_documents=40):
     """Discover documents from the complete fixed tree; retry incomplete batches."""
     if not 1<=max_documents<=500:raise FlowError('max-documents must be 1..500')
     source=source_for(project,source_id)
     if not source or source.get('kind')=='web':raise FlowError('Select Git source')
+    rules=document_exclusions(source)
+    ledger_path=Path(project)/'knowledge/catalog/document-ledgers'/f'{source_id}.json'
+    ledger=read_json(ledger_path) if ledger_path.exists() else {'records':{}}
+    retained_excluded=sorted(p for p in ledger['records'] if any(fnmatch.fnmatchcase(p,g) for g in rules))
+    if retained_excluded:
+        raise FlowError('Curate retained documents excluded by policy before syncing (pages, links and ledger): '
+                        + ', '.join(retained_excluded))
     repo=repo_name(source['repository'])
     info,_=api(repo,'',token)
     if info.get('private') is not False:raise FlowError('Only public repository documents may be retained')
@@ -445,10 +475,7 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
     if not tree_path.exists():raise FlowError('Run wiki-inventory --retain first')
     tree=read_json(tree_path);sha=tree['commit']
     patterns=source.get('document_globs',['README*','docs/*.md','docs/*.rst'])
-    paths=sorted(p for p,r in tree['entries'].items() if r['type']=='blob' and
-                 Path(p).suffix.lower() in {'.md','.rst','.mdx','.txt'} and any(fnmatch.fnmatchcase(p,g) for g in patterns))
-    ledger_path=Path(project)/'knowledge/catalog/document-ledgers'/f'{source_id}.json'
-    ledger=read_json(ledger_path) if ledger_path.exists() else {'records':{}}
+    paths,excluded=select_document_paths(source,tree['entries'])
     def needs_copy(p):
         old=ledger['records'].get(p,{})
         return old.get('blob')!=tree['entries'][p]['sha'] or not old.get('page') or not child(project,old['page']).is_file()
@@ -471,7 +498,7 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
             write_json(ledger_path,ledger);processed.append(path)
         except (OSError,FlowError,UnicodeError,ValueError) as exc:errors.append({'path':path,'error':str(exc)[:240]})
     # Removed documents remain as historical records; never silently delete their content.
-    ledger.update(commit=sha,patterns=patterns,discovered=len(paths),historical_paths=sorted(set(ledger['records'])-set(paths)))
+    ledger.update(commit=sha,patterns=patterns,excluded_paths=excluded,discovered=len(paths),historical_paths=sorted(set(ledger['records'])-set(paths)))
     for name,row in ledger['records'].items():
         page=child(project,row['page'])
         if not page.exists():continue
@@ -485,7 +512,8 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
     write_json(ledger_path,ledger)
     remaining=[p for p in paths if needs_copy(p)]
     return {'source':source_id,'status':'partial' if remaining or errors else 'collected-not-reviewed',
-            'processed':processed,'pending':len(remaining),'errors':errors,'patterns':patterns,'discovered':len(paths)}
+            'processed':processed,'pending':len(remaining),'errors':errors,'patterns':patterns,'discovered':len(paths),
+            'excluded_paths':excluded}
 
 
 def catalog(project):
@@ -496,12 +524,16 @@ def catalog(project):
         docs=root/'catalog/document-ledgers'/f'{sid}.json'
         body+='## '+sid+'\n\n'
         body+='来源：'+source['repository']+'\n\n'
+        if source.get('document_scope'):
+            body+='文档收录范围：'+source['document_scope']+'\n\n'
         if tree.exists():
             value=read_json(tree)
             body+=f'- [源码目录](../source-maps/{sid}.md)：{len(value["entries"])} 路径，固定 `{value["commit"]}`，目录覆盖。\n'
         if docs.exists():
             value=read_json(docs)
             body+=f'- [文档目录](../upstream-docs/{sid}/)：扫描发现 {value["discovered"]} 份；保留 {len(value["records"])} 份（包含历史）；历史范围 {len(value.get("historical_paths",[]))} 份。扫描模式见 sources.json，pending 由更新运行报告给出。\n'
+            if source.get('document_exclusions'):
+                body+=f'- 按已复核范围排除 {len(value.get("excluded_paths",{}))} 份文档；规则与理由见 sources.json 的 document_exclusions。排除不代表上游删除，仍可按固定源码路径查阅。\n'
         if source.get('kind')!='web':
             for page in sorted((root/'prs'/source['repository'].replace('/','--')).glob('PR-*.md')):
                 meta,_=wiki.parse_page(page)

@@ -14,13 +14,13 @@ observed_at: '2026-10-10T01:22:41.549842+00:00'
 
 ## 用途和结论
 
-本条为 TrainFlow 自带 Wiki 的跨任务站点经验，正文和必要原件随工程提交。2026-10-10 UTC，在 110、76 两台空闲节点、各8卡的16-rank all-to-all，采用现场完整配方后，1/2/4 GiB out-of-place busbw 三次独立启动中位数为41.68/42.57/42.06 GB/s，最大42.94 GB/s。先前仅DTK自建配置1GiB中位30.99。历史44.83使用不同DTK/驱动且细节未齐，剩余约7%差距未消除，不当成严格同条件达标证明。用户后续指示继续模型工作与完整流程验证，历史比较保留未完成；原报告“等待优先级答复”是当时状态，现已由后续指导解除该执行阻塞。
+本条为 TrainFlow 自带 Wiki 的跨任务站点经验，正文和必要原件随工程提交。2026-10-10 UTC，在 110、76 两台空闲节点、各8卡的16-rank all-to-all，采用现场完整配方后，1/2/4 GiB out-of-place busbw 三次独立启动中位数为41.68/42.57/42.06 GB/s，最大42.94 GB/s。先前仅DTK自建配置1GiB中位30.99。历史44.83使用不同DTK/驱动且细节未齐，剩余约7%差距未消除，不当成严格同条件达标证明。
 
 ## 环境与软件身份
 
 | 项 | 本次条件 |
 |---|---|
-| 入口与节点 | SSH+Docker；测量10.32.4.110、10.32.4.76；host网络；任务容器trainflow-yuguo-kimi-k3 |
+| 入口与节点 | SSH+Docker；测量10.32.4.110、10.32.4.76；host网络；不可变镜像身份如下，执行容器身份见原始回执 |
 | 计算设备 | 每台8×BW1000_H，gfx936，80 CU；每卡65520 MiB可见VRAM；PCIe当前32GT/s×16 |
 | 镜像 | 10.16.1.152:5000/jenkins/model_test_env/megatron:0.19.2-ubuntu22.04-dtk2610-py3.12-1009 |
 | 镜像不可变ID | sha256:1861c9e3ac1384838486851a0696622ec53150ee624f270eb950d844d2b2e60d |
@@ -31,7 +31,6 @@ observed_at: '2026-10-10T01:22:41.549842+00:00'
 | 网络 | 管理网eth0；RoCE mlx5_bond_0..3对应bond0..3，各bond两条200000Mbps物理从口；IEEE802.3ad LACP fast、layer3+4、MTU9100；GID index3，Ethernet ACTIVE |
 | XDP | 两节点模块值14；前后已开，不是此次新增开关；RCCL GDR和实际路径以日志/库源码确认 |
 | 测试源码与二进制 | rccl-test HEAD155f4748e6de7ce3ab54a0bf09931d9316262260；用户alltoall_perf SHA2564d087dab19bb500a127b2dfc0eda5657704c712104e744f4ce2e24bc231dc88d |
-| 工作目录 | /cfs/yuguo/kimi-k3-pretrain；原件只读复制到任务目录，未改用户/cfs/env.sh及其测试目录 |
 
 ## 现场环境变量和加载顺序
 
@@ -55,11 +54,11 @@ export NCCL_ALGO=Ring
 
 以上为本次有效通信部分，不是所有HCU集群通用默认。原脚本还条件加载/opt/dtk/rccl/patch/fix_topo.xml及fix_graph.xml；两文件在本镜像均不存在，因此未标为已加载。实际/tmp/topo.xml的路径和各节点哈希保留原件。不另加NCCL_IB_HCA限制，HCA顺序由真实verbs枚举确认。未设置的环境变量不能简单等同功能关闭。GDR_LEVEL=2的当前源码语义为PXB，跨版本须复核。
 
-## 命令与执行差异
+## 测试命令与复用条件
 
-用户原命令和完整执行argv见下方固定报告/计划。核心是16ranks、hostfile每节点slots=8、`-bind-to none -map-by slot`、`--mca coll_hcoll_enable 0 --mca pml ob1 --mca btl_tcp_if_include eth0 --mca btl ^openib`，各rank依次加载两脚本后运行原alltoall_perf，参数 `-b 1M -e 4G -f 2 -g 1`。
+完整执行argv见下方各轮MPI回执。核心是16ranks、hostfile每节点slots=8、`-bind-to none -map-by slot`、`--mca coll_hcoll_enable 0 --mca pml ob1 --mca btl_tcp_if_include eth0 --mca btl ^openib`，各rank依次加载两脚本后运行原alltoall_perf，参数 `-b 1M -e 4G -f 2 -g 1`。
 
-原hostfile节点67/93有显存占用，未抢用；改为空闲110/76。用户SSH端口12333对应原入口，本次任务专属SSH28476替代，并针对MPI5/PRRTE核实实际参数。临时服务/密钥已回收，因此旧命令不能不经重建直接重跑。后续模型任务应使用自己的合法launcher/端口/hostfile，保持并核对通信配方，不复制他人凭据。每次启动前核查节点进程、FD、显存和利用率；两次新鲜观测仍不能代表外部网络独占。
+复用时按当前MPI/PRRTE版本核对launcher、SSH连接参数及hostfile；原件中的任务端口和容器名称只用于追溯测量。每次启动前核查节点进程、FD、显存和利用率，确认资源可用；设备空闲观测不能证明外部网络独占。
 
 ## 计时、正确性与因果边界
 
@@ -72,7 +71,7 @@ export NCCL_ALGO=Ring
 1. 先用本记录定位原件，核对实际设备/镜像/库/网卡/GID/脚本和训练启动环境是否一致；检查权限与新鲜设备准入。
 2. 相同条件可先引用本次预期范围，但启动时确认每rank变量和实际加载库；现场值不替代新任务的健康/正确性证据。
 3. 新站点、DTK/RCCL、NIC/交换策略、拓扑文件、规模/消息/模式变化须重新判断；不要把固定RoCE端口、GID、TC或ALGO无条件复制到其他集群。
-4. 指标参考按本次观测日起7天复核（本次开发镜像与脚本仍会变动）；更早发生配置变化立即失配/复核。新记录保留旧证据，不覆盖历史成绩。
+4. 引用时保留观测日期；配置变化或需要当前验收成绩时重新测量。新记录保留旧证据，不通过更新正文日期延长测量有效性。
 5. 回退采用任务局部不再source该配方、恢复已保存的原启动配置；不修改宿主驱动、交换机或他人文件。新任务中的模型E2E收益需单独验证。
 
 ## 大消息结果（out-of-place busbw）
@@ -91,7 +90,7 @@ export NCCL_ALGO=Ring
 
 - [环境摘要](environment.json)、[证据清单](manifest.json)：明确来源、处理方式、哈希和观测时间。
 - [全部结果](evidence/2026-10-10-rccl/results.json)、[CSV](evidence/2026-10-10-rccl/sweep.csv)、[现场脚本原件](evidence/2026-10-10-rccl/site-env.sh)、[源码/配方快照回执](evidence/2026-10-10-rccl/source-receipt.json)。脚本原件用于查阅；复用时按前文 source 模式核对，不能直接执行其中更换 apt 源的分支。
-- [原调查报告](evidence/2026-10-10-rccl/original-investigation.txt) 保留当时尚待用户决定的历史状态，当前执行结论以前文为准。
+- [原调查报告](evidence/2026-10-10-rccl/original-investigation.txt) 保留测量背景和配置对照；其中过程状态不作为当前操作指令。
 - 第1轮：[rank0 完整输出](evidence/2026-10-10-rccl/run-1/rank-00.stdout)、[全部16 rank 原始回执和日志ZIP](evidence/2026-10-10-rccl/run-1/all-ranks.zip)、[ZIP成员哈希](evidence/2026-10-10-rccl/run-1/archive-members.json)、[实际MPI argv](evidence/2026-10-10-rccl/run-1/mpi-started.json)、[组完成回执](evidence/2026-10-10-rccl/run-1/group-result.json)。
 - 第2轮：[rank0 完整输出](evidence/2026-10-10-rccl/run-2/rank-00.stdout)、[全部16 rank 原始回执和日志ZIP](evidence/2026-10-10-rccl/run-2/all-ranks.zip)、[ZIP成员哈希](evidence/2026-10-10-rccl/run-2/archive-members.json)、[实际MPI argv](evidence/2026-10-10-rccl/run-2/mpi-started.json)、[组完成回执](evidence/2026-10-10-rccl/run-2/group-result.json)。
 - 第3轮：[rank0 完整输出](evidence/2026-10-10-rccl/run-3/rank-00.stdout)、[全部16 rank 原始回执和日志ZIP](evidence/2026-10-10-rccl/run-3/all-ranks.zip)、[ZIP成员哈希](evidence/2026-10-10-rccl/run-3/archive-members.json)、[实际MPI argv](evidence/2026-10-10-rccl/run-3/mpi-started.json)、[组完成回执](evidence/2026-10-10-rccl/run-3/group-result.json)。

@@ -14,7 +14,7 @@ description: 更新局部官方训练 Wiki、PR review 与依赖锁，并复核�
 ## 更新协议
 
 1. 检查公共 GitHub/文档权限、限流与实际访问，不把 404 当成已删除。读取 knowledge/sources.json 与已有 observed/reviewed 游标。
-2. 先读项目 `docs/wiki.md`。`wiki-update PROJECT SOURCE` 依次检查完整树、document_globs 新文档、PR/讨论与登记源码；也可单独使用 wiki-inventory / wiki-sync-docs / wiki-sync-prs / wiki-refresh。重复运行续完 pending，检查所有阶段错误。未监测的新文件从完整树发现，按最新 commit 用 wiki-triage 记录 knowledge-added/not-relevant/deferred，不能只抓 README 宣称全仓无变化。web 来源生成内容指纹，不能当 Git SHA；TE/cuDNN 同时检查代码与官方教程。
+2. 先读项目 `docs/wiki.md` 与 `docs/knowledge-architecture.md` 的“自动更新时的内容筛选”。按问题复核收录范围；已确定低相关资料在 sources.json 的 document_exclusions 登记路径模式和理由，不能只删页面让下次同步重建，也不能因目录通配符匹配就全收。`wiki-update PROJECT SOURCE` 依次检查完整树、document_globs 新文档（排除上述规则）、PR/讨论与登记源码；也可单独使用 wiki-inventory / wiki-sync-docs / wiki-sync-prs / wiki-refresh。重复运行续完 pending，检查所有阶段错误及 excluded_paths。未监测的新文件从完整树发现，按最新 commit 用 wiki-triage 记录 knowledge-added/not-relevant/deferred，不能只抓 README 宣称全仓无变化。web 来源生成内容指纹，不能当 Git SHA；TE/cuDNN 同时检查代码与官方教程。
 3. PR 来源页保存描述、普通评论、行内评论、独立 review 顶层状态/正文、文件列表及原始 JSON。首次增量发现默认最近 30 天，已保留历史 PR 每七天重新查讨论；需要扩大范围用 --since，不能称已覆盖全部历史。主动按问题 wiki-search-pr 补重要未收录 PR，再 wiki-pr 和 wiki-code 追最终代码；可显式 --retain-project 纳入公共来源页。缺 patch/分页/权限时保留失败并补证据，不将标题或初始描述直接编成案例。
 4. 比较实际 active ref 与已锁版本，处理 submodule gitlink，不用子仓 HEAD 偷换。发布计划、open PR、merged main、released 和运行可用分开。
 5. 对每个 affected overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
@@ -42,6 +42,8 @@ TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查�
 按工程定位→目录→编译安装→运行/测试→调用链→优化机制→问题诊断→版本/依赖→证据组织。案例按问题/瓶颈→为什么改→实现符号→适用条件→正确性/性能证据→失败条件/回退。尚未逐模型覆盖的入口页保持 coverage 标记，不以页数代替深度。
 
 ## 站点、模型经验与任务档案的维护
+
+整理已有页面也执行内容筛选：正文保留结论、适用条件、关键数据及最少充分证据；会话决策、待办、临时设施与逐次试验归任务档案。实际测量身份/版本/配方和可复用的具体 PR 问题仍需保留，不能为“通用”而删掉复现条件。引用与来源规则一并复核，排除既有文档需整理生成页及 ledger；不篡改原件、观测日期或未验证状态。完整规则只维护在 `docs/knowledge-architecture.md`。
 
 参照 `docs/knowledge-architecture.md` 与 `docs/experience-knowledge.md`。共享 Wiki 只收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。筛选后分别进入 `knowledge/sites/` 或 `knowledge/experiments/`，复制必要原件并登记哈希；临时排查、逐次调参、算子中间报告、未验候选和 Cookbook 草稿只留任务 Store/看板。最终总结须交代数值验收与未达目标，不把局部通过改名成最终结果。跨任务搜索从工程 Wiki 进入。任务 report 和 flow-advance 自动沉淀原 context 与证据；里程碑后确认自动写入成功，必要时 experience-sync 续接。关键环境验收、基线、性能/显存优化、阶段 loss、扩容、故障及 Cookbook 交付由对应阶段补 experience-record 解释；失败尝试也保存。不能猜指标单位或补造 loss。Cookbook 记录关联原经验 ID、脱敏审核和 draft/submitted/merged 等状态及 PR 链接，外部 Cookbook 的数据发布要求单独遵守；本仓可保留符合收录条件的关键实测数据。局部经验和官方 Wiki 可自主按需更新，不调用 HCU 大知识库更新。
 

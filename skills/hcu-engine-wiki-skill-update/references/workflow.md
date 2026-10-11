@@ -9,6 +9,7 @@
 - `docs/profiling.md`：时间分母、热点建模和 TraceLens。
 - `docs/operations.md`：远程 watcher、事件重放与恢复边界。
 - `docs/wiki.md`：固定来源、更新复核和工作流维护。
+- `docs/knowledge-architecture.md` 的“自动更新时的内容筛选”：入库价值、正文/过程归属、文档排除与旧页清理；新增和修订页面时必读。
 - `knowledge/README.md`：官方引擎与生态章节。
 
 不要从安装目录的父级猜仓库位置；先核对上述工程绑定。执行前检查 `hcu-trainflow --help` 和相关子命令帮助，不猜不存在的 flag。

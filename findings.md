@@ -233,3 +233,8 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 - 独立审核补齐原生 Agent 的来源、CSV、架构、代码、metrics、findings 与报告内容绑定；comparative 模式绑定两侧 CSV 及比较利用率。`run` 不自动认可旧推理，需活跃 Agent 显式 review；输入变化后回执失效。
 - 发布后的 TraceLens `30f5dcd539dd4e588678e34168c7fcf726dd987e` 已在空闲 gfx936 上重跑 captured-value mm 回放，数值通过，10 个同步 device-event 样本完整；结束后无 KFD 残留。此计时不是源 trace 单 kernel 的相同范围，不据此计算模型拖慢倍数。
 - Linux CI揭示旧DeepSpeed PR链接大小写与Git目录不一致；Windows路径存在性不能单独证明可移植。链接已修复，知识校验器先保留书写大小写再核对每层目录，避免resolve规范化掩盖错误。
+
+
+## 2026-10-11：Wiki 内容筛选复核
+
+站点正文夹带用户继续执行的决策、临时容器/端口和排期；这些归过程档案，复现身份及证据仍保留。document_globs 的广匹配会恢复单独删掉的生成页，因此加入 document_exclusions（路径模式→复核理由），并阻止与既有 ledger 冲突的自动同步。仅排除 DeepSpeed 的 CIFAR/GAN/Azure 入门和 SGLang 前端语言三篇，共六份来源页；源码树、PR、性能/训练资料和原始站点证据均保留。内容价值由 Agent 判断，程序仅执行明确范围并校验一致性。

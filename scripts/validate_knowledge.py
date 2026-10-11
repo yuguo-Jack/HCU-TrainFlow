@@ -5,9 +5,12 @@ from pathlib import Path
 import sys
 import hashlib
 import re
+import fnmatch
 from urllib.parse import unquote, urlsplit
 from hcu_trainflow.wiki import parse_page
 from hcu_trainflow.knowledge_evidence import validate_manifests
+from hcu_trainflow.official import document_exclusions
+from hcu_trainflow.core import FlowError
 
 GENERATED_KINDS = {'source-pr', 'source-map', 'source-document'}
 
@@ -160,6 +163,12 @@ def validate(root):
     lock=json.loads((root/'knowledge/source-lock.json').read_text(encoding='utf-8'))
     registry=json.loads((root/'knowledge/sources.json').read_text(encoding='utf-8'))
     sources={x['id']:x for x in registry}
+    exclusion_rules={}
+    for sid,source in sources.items():
+        try:
+            exclusion_rules[sid]=document_exclusions(source)
+        except FlowError as exc:
+            errors.append(f'{sid}: {exc}')
     records={(x['repo'],x['commit'],x['path']):x for x in lock['files']}
     if len(sources) != len(registry):errors.append('Duplicate source registry id')
     if len(records) != len(lock['files']):errors.append('Duplicate source lock record')
@@ -173,6 +182,12 @@ def validate(root):
         if meta.get('kind') in GENERATED_KINDS:
             if meta.get('generated_body_sha256')!=hashlib.sha256(body.encode()).hexdigest():errors.append(str(path)+': generated source page modified')
             if meta.get('runtime_validated') is not False:errors.append(str(path)+': generated source material cannot claim runtime validation')
+            if meta.get('kind')=='source-document':
+                for sid,source in sources.items():
+                    if repository_name(meta.get('repository')) in source_repositories(source):
+                        for pattern,reason in exclusion_rules.get(sid,{}).items():
+                            if fnmatch.fnmatchcase(meta.get('path',''),pattern):
+                                errors.append(f'{path}: document excluded by {sid} policy ({reason}); curate page, links and ledger')
         else:
             errors.extend(validate_authored_links(root, path, body))
         if meta.get('kind')=='source-pr':

@@ -6,7 +6,7 @@ engine: cross-engine
 review_level: inventory-only
 runtime_validated: false
 sources: []
-generated_body_sha256: cbd40b2529d6143f3506cb42b9c85bd0b4316c6787ea754fdf41c9cf73951ddc
+generated_body_sha256: e97554677cd6340fc365fc3bf454466bf6e19534b77cc12cf653a462fba57f77
 ---
 
 # 官方来源覆盖目录
@@ -105,8 +105,11 @@ generated_body_sha256: cbd40b2529d6143f3506cb42b9c85bd0b4316c6787ea754fdf41c9cf7
 
 来源：deepspeedai/DeepSpeed
 
+文档收录范围：训练引擎、并行与ZeRO、offload、数值、性能、显存、恢复及相关运行接口；通用机制和必要示例保留，基础应用/云平台入门按问题另查。
+
 - [源码目录](../source-maps/deepspeedai-deepspeed.md)：2422 路径，固定 `bc1ad320a9afb516797577924a9983c6d7cd6793`，目录覆盖。
-- [文档目录](../upstream-docs/deepspeedai-deepspeed/)：扫描发现 62 份；保留 62 份（包含历史）；历史范围 0 份。扫描模式见 sources.json，pending 由更新运行报告给出。
+- [文档目录](../upstream-docs/deepspeedai-deepspeed/)：扫描发现 59 份；保留 59 份（包含历史）；历史范围 0 份。扫描模式见 sources.json，pending 由更新运行报告给出。
+- 按已复核范围排除 3 份文档；规则与理由见 sources.json 的 document_exclusions。排除不代表上游删除，仍可按固定源码路径查阅。
 - [PR #8534：Deprecate loco zero++](../prs/deepspeedai--DeepSpeed/PR-8534.md)
 - [PR #8632：Harden ZeRO-1/2 offload gradient storage lifetime and stream ordering](../prs/deepspeedai--DeepSpeed/PR-8632.md)
 
@@ -140,8 +143,11 @@ generated_body_sha256: cbd40b2529d6143f3506cb42b9c85bd0b4316c6787ea754fdf41c9cf7
 
 来源：sgl-project/sglang
 
+文档收录范围：RL rollout配套推理、权重同步、显存生命周期、并行/通信、Graph与编译、性能诊断和部署；前端语言入门不默认收录。
+
 - [源码目录](../source-maps/sgl-project-sglang.md)：11888 路径，固定 `bd2d73daa5afda6bcad8d479a834f2e70bbe9569`，目录覆盖。
-- [文档目录](../upstream-docs/sgl-project-sglang/)：扫描发现 62 份；保留 62 份（包含历史）；历史范围 0 份。扫描模式见 sources.json，pending 由更新运行报告给出。
+- [文档目录](../upstream-docs/sgl-project-sglang/)：扫描发现 59 份；保留 59 份（包含历史）；历史范围 0 份。扫描模式见 sources.json，pending 由更新运行报告给出。
+- 按已复核范围排除 3 份文档；规则与理由见 sources.json 的 document_exclusions。排除不代表上游删除，仍可按固定源码路径查阅。
 - [PR #39265：[sglang-miles] Allocate packed weight receive buffers directly from metadata](../prs/sgl-project--sglang/PR-39265.md)
 
 ## vllm-project-vllm

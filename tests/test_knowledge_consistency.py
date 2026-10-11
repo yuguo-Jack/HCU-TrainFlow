@@ -151,6 +151,20 @@ def test_generated_document_metadata_cannot_disagree_with_its_ledger(project):
     assert any('document page/ledger identity or hash mismatch' in e for e in errors(project))
 
 
+def test_excluded_document_is_rejected_even_without_ledger_record(project):
+    document(project)
+    edit_json(project,'knowledge/sources.json',lambda v:v[0].update(
+        document_exclusions={'README.md':'Scope reviewed; reference elsewhere'}))
+    assert any('document excluded' in e for e in errors(project))
+    edit_json(project,'knowledge/catalog/document-ledgers/tool.json',lambda v:v.update(records={}))
+    assert any('document excluded' in e for e in errors(project))
+
+
+def test_malformed_exclusion_policy_does_not_silently_allow_documents(project):
+    edit_json(project,'knowledge/sources.json',lambda v:v[0].update(document_exclusions={'README.md':''}))
+    assert any('review reasons' in e for e in errors(project))
+
+
 def test_inventory_is_not_runtime_validation_but_a_measured_site_may_be(project):
     page(project, 'knowledge/site.md', {'id': 'site', 'kind': 'site-knowledge', 'runtime_validated': True})
     assert errors(project) == []

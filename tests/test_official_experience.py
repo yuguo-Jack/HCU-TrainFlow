@@ -189,6 +189,57 @@ def test_document_discovery_retry_delete_and_restore(tmp_path,monkeypatch):
     assert wiki.parse_page(page)[0]['source_state']=='current-scan'
 
 
+def test_document_scope_survives_sync_and_reindex(tmp_path, monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'private')
+    registry=read_json(root/'knowledge/sources.json')
+    registry[0]['document_globs']=['docs/*.md']
+    write_json(root/'knowledge/sources.json',registry)
+    tree=root/'knowledge/catalog/repositories/engine.json'
+    entries={p:{'type':'blob','sha':'b'*40} for p in ['docs/training.md','docs/frontend/start.md']}
+    write_json(tree,{'commit':'a'*40,'entries':entries})
+    monkeypatch.setattr(official,'api',lambda *a:({'private':False},''))
+    calls=[]
+    def code(s,r,c,p,t=None,max_chars=None):
+        calls.append(p)
+        raw=b'# Training overlap' if p=='docs/training.md' else b'# PortalNoise'
+        return {'artifact':s.put(raw),'url':'https://github.com/org/engine/blob/'+c+'/'+p}
+    monkeypatch.setattr(official,'read_code',code)
+    official.sync_documents(store,root,'engine')
+    before=wiki.index_wiki(store,root)
+    assert wiki.search_wiki(store,'PortalNoise')['results']
+    registry[0]['document_exclusions']={'docs/frontend/*':'Frontend language is outside this training scope'}
+    write_json(root/'knowledge/sources.json',registry)
+    excluded_page=root/'knowledge/upstream-docs/engine/docs/frontend/start.md.md'
+    before_bytes=excluded_page.read_bytes()
+    with pytest.raises(FlowError,match='Curate retained documents'):
+        official.sync_documents(store,root,'engine')
+    assert excluded_page.read_bytes()==before_bytes
+    # Explicit curation removes the reviewed generated page and its ledger entry.
+    ledger_path=root/'knowledge/catalog/document-ledgers/engine.json'
+    ledger=read_json(ledger_path)
+    del ledger['records']['docs/frontend/start.md']
+    write_json(ledger_path,ledger);excluded_page.unlink()
+    # A new upstream document in the same excluded scope must not be copied either.
+    entries['docs/frontend/new.md']={'type':'blob','sha':'c'*40}
+    write_json(tree,{'commit':'d'*40,'entries':entries})
+    calls.clear()
+    result=official.sync_documents(store,root,'engine')
+    assert calls==[] and result['pending']==0 and result['discovered']==1
+    assert set(result['excluded_paths'])=={'docs/frontend/start.md','docs/frontend/new.md'}
+    assert not excluded_page.exists()
+    assert read_json(ledger_path)['excluded_paths']==result['excluded_paths']
+    after=wiki.index_wiki(store,root)
+    assert before['generation']!=after['generation']
+    assert not wiki.search_wiki(store,'PortalNoise')['results']
+    assert wiki.search_wiki(store,'overlap')['results']
+
+
+@pytest.mark.parametrize('rules', [['docs/*'], {'docs/*':''}, {'': 'no scope'}, {'docs/*':None}])
+def test_document_scope_requires_review_reasons(rules):
+    with pytest.raises(FlowError,match='review reasons'):
+        official.select_document_paths({'document_exclusions':rules},{})
+
+
 def test_inventory_pending_survives_unchanged_fetch_and_requires_triage(tmp_path,monkeypatch):
     root=project(tmp_path);store=Store(tmp_path/'s')
     def api(repo,suffix,token=None):
