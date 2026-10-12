@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Register the internal GitLab mirror for HCU-Knowledge, add explicit installation source selection, and accept either registered origin for managed or existing knowledge checkouts while preserving version pins.
 - Rename the check/adaptation entry to `hcu-train-check-and-adapt` across runtime dispatch, installed UI, reading routes and maintenance references; migrate previous installations without leaving duplicate entries.
 - Add pinned, opt-in KernelWiki installation, standalone repair/check support and package exclusions. Keep default setup at 11 required Skills and preserve independent KernelWiki Git checkouts.
 - Update the kernel-Skill dependency pin to the reviewed HCU cases/PR/KernelWiki guidance.

@@ -347,3 +347,10 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 ## 2026-10-12：能力说明补充
 
 补齐 capabilities、Wiki 查询指南、两个 Wiki Skill：官方发布/规划和 SFT/RL 模型资料本地不足时按需查询官网/仓库页面，再追特性 PR、实际模型配置和底层源码。只完善查询与维护规则，未扩充知识正文或刷新大知识库。59 个资源页、489 份知识/25 个来源及 405 个文档链接检查通过。按现有安装同步协议提交 main，原版本标签不变。
+
+## 2026-10-12：HCU-Knowledge 内部镜像安装入口
+
+- thirdparty 清单与说明登记内部 GitLab 同步仓，GitHub 保持默认主来源；完整安装和定向 bootstrap 新增 `--knowledge-source gitlab`，仅影响新建 checkout。
+- 修复来源校验只接受 GitHub 的限制：受管 checkout 和独立知识库绑定均接受两处登记来源，保留已有 origin、固定提交与本地修改，不自动降级或切换。
+- 两边远端 main 均为 `bd33cae44563b80c75615f6f6de7f047c0298d83`，锁定提交 `80da7cef` 为其祖先。72 项依赖/安装回归通过，含本地 Git 实际检出、镜像绑定与来源保护；知识验证 489 页/25 来源、阅读资源 59 页/78 可达均无错误。
+- 本机包与六个 TrainFlow Skill 同步并独立 `--check` 通过；未刷新知识库、未重下载 LFS、未重跑完整新机安装。版本保持 0.6.2，本轮不新增 tag。

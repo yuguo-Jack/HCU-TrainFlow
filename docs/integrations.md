@@ -15,6 +15,21 @@ python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills"
 
 失败返回非零，`.work/setup/status.json` 记录已完成阶段与失败阶段；修复后重跑会复用依赖和当前索引。缺私有仓权限、原件、Python 依赖或可用索引时不能声称完整安装通过。仅有 checkout 不等于知识搜索就绪。Git 使用本人已保存凭据；权限需本人获得，安装器不复制其他人的账号或自动提交访问申请。
 
+### HCU-Knowledge 的 GitHub 与内部 GitLab 来源
+
+- [GitHub 主仓](https://github.com/yuguo-Jack/HCU-Knowledge)：默认来源，需要私有仓读取权限。
+- [内部 GitLab 镜像](http://42.228.13.241:10068/dcutoolkit/deeplearing/hcu-knowledge)：供有该项目读取权限的内部人员使用，无需 GitHub 私有仓权限；仍需相应网络和 GitLab 身份。
+
+首次安装时选择内部来源：
+
+```powershell
+python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills" --knowledge-source gitlab
+```
+
+两个来源在 `thirdparty/manifest.json` 登记并共用固定提交，Git LFS 从实际 checkout 的 origin 获取。`--knowledge-source` 只决定新建受管知识 checkout 的来源；已有受管或独立 checkout 保留当前 origin，不自动迁移。已经从 GitLab 独立克隆的知识库也可用下面的 `--knowledge-root` 方式复用。依赖身份检查接受这两个登记地址，其他来源仍需人工核对。
+
+只获取知识依赖可用 `python scripts/bootstrap_thirdparty.py --only hcu-knowledge --knowledge-source gitlab`；它不代替完整安装。镜像缺固定提交或 LFS 对象时报告失败，不能放宽版本锁。切换已有 checkout 的来源须核对其本地状态后显式修改 origin；默认不自动尝试另一个站点。
+
 ### 可选 KernelWiki
 
 需要为算子优化补充 NVIDIA 实现、PR 和优化机制参考时，可安装 [KernelWiki](https://github.com/mit-han-lab/KernelWiki)。来源与提交锁定在 `thirdparty/manifest.json`，checkout 放 `thirdparty/KernelWiki/`，安装入口保留上游名称 `$KernelWiki`。

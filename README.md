@@ -154,7 +154,9 @@ $env:TRAINFLOW_PROJECT = (Get-Location).Path
 $env:TRAINFLOW_WORKSPACE = "D:/trainflow-work/my-task"
 ```
 
-已有独立知识库时加 `--knowledge-root /path/to/HCU-Knowledge`，复用原件、索引与配置，不重复克隆、不拉取其上游更新。缺少私有仓权限、LFS 原件或索引不可用时安装会报告未完成；不会静默跳过。飞书等在线能力另用本人账号授权。详见 [依赖与安装说明](docs/integrations.md)。
+HCU-Knowledge 默认从 GitHub 获取；内部人员首次安装可加 `--knowledge-source gitlab`，使用[内部 GitLab 镜像](http://42.228.13.241:10068/dcutoolkit/deeplearing/hcu-knowledge)，无需 GitHub 私有仓权限，仍需 GitLab 项目读取权限。已有 checkout 保留其来源。
+
+已有独立知识库时加 `--knowledge-root /path/to/HCU-Knowledge`，支持上述两处来源，复用原件、索引与配置，不重复克隆、不拉取其上游更新。缺少仓库权限、LFS 原件或索引不可用时安装会报告未完成；不会静默跳过。飞书等在线能力另用本人账号授权。详见 [依赖与安装说明](docs/integrations.md)。
 
 可选安装 [KernelWiki](https://github.com/mit-han-lab/KernelWiki) 为算子优化提供 NVIDIA 案例、PR 和源码参考：在上面的安装命令加 `--with-kernelwiki`，共安装 12 个 Skill。默认不安装；已有环境的单独补装方式见[安装说明](docs/integrations.md#可选-kernelwiki)。
 

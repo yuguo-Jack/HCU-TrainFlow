@@ -10,7 +10,7 @@ from hcu_trainflow.core import FlowError, write_json
 from hcu_trainflow.dependencies import bind_knowledge, knowledge_ready, require_checkout, sync_dependencies
 
 
-def setup(project, skills_dir, knowledge_root=None, replace=False, run=subprocess.run, *, with_kernelwiki=False):
+def setup(project, skills_dir, knowledge_root=None, replace=False, run=subprocess.run, *, with_kernelwiki=False, knowledge_source=None):
     project = Path(project).expanduser().resolve()
     skills_dir = Path(skills_dir).expanduser().resolve()
     record = project / '.work/setup/status.json'
@@ -34,7 +34,7 @@ def setup(project, skills_dir, knowledge_root=None, replace=False, run=subproces
     try:
         if knowledge_root:
             bind_knowledge(project, knowledge_root)
-        result = sync_dependencies(project)
+        result = sync_dependencies(project, **({'knowledge_source': knowledge_source} if knowledge_source else {}))
         if with_kernelwiki:
             optional = sync_dependencies(project, only=['kernelwiki'])
             result['dependencies'].extend(optional['dependencies'])
@@ -87,11 +87,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--skills-dir', type=Path, required=True)
     parser.add_argument('--knowledge-root', type=Path, help='Reuse an existing KB without source updates; missing LFS objects must be restored there first')
+    parser.add_argument('--knowledge-source', choices=['github', 'gitlab'], help='Source for a new managed knowledge checkout (default: github); existing origins are preserved')
     parser.add_argument('--replace', action='store_true', help='Replace installed Skills; clean temporary backups after successful verification')
     parser.add_argument('--with-kernelwiki', action='store_true', help='Fetch and install optional NVIDIA KernelWiki for kernel optimization reference')
     args = parser.parse_args()
     try:
-        setup(ROOT, args.skills_dir, args.knowledge_root, args.replace, with_kernelwiki=args.with_kernelwiki)
+        setup(ROOT, args.skills_dir, args.knowledge_root, args.replace, with_kernelwiki=args.with_kernelwiki,
+              knowledge_source=args.knowledge_source)
     except (FlowError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

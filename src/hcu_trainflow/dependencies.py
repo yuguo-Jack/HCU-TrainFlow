@@ -8,6 +8,15 @@ import subprocess
 from .core import FlowError, read_json, write_json
 
 
+def source_urls(item):
+    """Registered equivalent origins; mirrors share the same pinned commit."""
+    return [item['url'], *item.get('mirrors', {}).values()]
+
+
+def matches_source(item, origin):
+    return origin.removesuffix('.git') in {url.removesuffix('.git') for url in source_urls(item)}
+
+
 def knowledge_ready(result):
     """Accept the current checkout's usable index, never a rollback snapshot."""
     try:
@@ -42,7 +51,7 @@ def bind_knowledge(project, path):
             raise FlowError('Incomplete HCU-Knowledge checkout: ' + name)
     top = git(path, 'rev-parse', '--show-toplevel').stdout.strip()
     origin = git(path, 'remote', 'get-url', 'origin').stdout.strip()
-    if Path(top).resolve() != path or origin.removesuffix('.git') != item['url'].removesuffix('.git'):
+    if Path(top).resolve() != path or not matches_source(item, origin):
         raise FlowError('HCU-Knowledge checkout identity differs from the registered source')
     write_json(root / 'thirdparty.local.json', {'hcu_knowledge_root': str(path)})
     return path
@@ -69,6 +78,14 @@ def load_manifest(project):
         for url in [item['url']] + ([item['upstream_url']] if item.get('upstream_url') else []):
             if not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git', url):
                 raise FlowError('Expected credential-free GitHub HTTPS URL')
+        mirrors = item.get('mirrors', {})
+        if not isinstance(mirrors, dict):
+            raise FlowError('Dependency mirrors must be named repository URLs')
+        for name, url in mirrors.items():
+            if (not re.fullmatch(r'[a-z0-9-]+', name) or name == 'github'
+                    or not isinstance(url, str)
+                    or not re.fullmatch(r'https?://[A-Za-z0-9.-]+(?::[0-9]+)?/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)+[A-Za-z0-9_-][A-Za-z0-9_.-]*\.git', url)):
+                raise FlowError('Expected a named, credential-free HTTP(S) mirror repository URL')
         if item.get('upstream_url') and not re.fullmatch(r'[0-9a-f]{40}', item.get('upstream_commit', '')):
             raise FlowError('Fork needs a pinned upstream baseline')
         for value in item.get('sparse_paths', []):
@@ -100,8 +117,9 @@ def inspect_checkout(root, item):
     if top.returncode or Path(top.stdout.strip()).resolve() != path.resolve():
         return {**result, 'status': 'invalid-checkout'}
     origin = git(path, 'remote', 'get-url', 'origin', check=False)
-    if origin.returncode or origin.stdout.strip().removesuffix('.git') != item['url'].removesuffix('.git'):
+    if origin.returncode or not matches_source(item, origin.stdout.strip()):
         return {**result, 'status': 'origin-mismatch'}
+    result['origin'] = origin.stdout.strip()
     head = git(path, 'rev-parse', '--verify', 'HEAD', check=False)
     dirty = git(path, 'status', '--porcelain', '--untracked-files=normal').stdout.strip()
     revision = head.stdout.strip() if not head.returncode else None
@@ -133,12 +151,16 @@ def migrate_upstream_origin(root, item, state):
     return inspect_checkout(root, item)
 
 
-def sync_dependencies(project, only=None, include_optional=False, status_only=False, migrate_origin=False):
+def sync_dependencies(project, only=None, include_optional=False, status_only=False, migrate_origin=False, *, knowledge_source=None):
     root, entries = load_manifest(project)
     requested = set(only or [])
     if requested - {x['id'] for x in entries}:
         raise FlowError('Unknown dependency ID')
     selected = [x for x in entries if x['id'] in requested] if requested else [x for x in entries if include_optional or not x.get('optional')]
+    if knowledge_source is not None:
+        knowledge = next((x for x in selected if x['id'] == 'hcu-knowledge'), None)
+        if knowledge is None or knowledge_source not in {'github', *knowledge.get('mirrors', {})}:
+            raise FlowError('Select hcu-knowledge and a registered knowledge source')
     results = []
     for item in selected:
         try:
@@ -150,7 +172,10 @@ def sync_dependencies(project, only=None, include_optional=False, status_only=Fa
                 if state['status'] == 'missing':
                     path.mkdir(parents=True)
                     git(path, 'init')
-                    git(path, 'remote', 'add', 'origin', item['url'])
+                    url = item['url']
+                    if item['id'] == 'hcu-knowledge' and knowledge_source not in {None, 'github'}:
+                        url = item['mirrors'][knowledge_source]
+                    git(path, 'remote', 'add', 'origin', url)
                 # No reset/clean: Git refuses collisions. Local changes are caught before fetching.
                 filtering = ['--filter=blob:none'] if item.get('sparse_paths') else []
                 git(path, 'fetch', '--depth', '1', *filtering, 'origin', item['commit'])

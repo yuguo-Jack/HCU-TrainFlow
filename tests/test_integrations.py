@@ -72,6 +72,79 @@ def test_dependency_paths_cannot_escape(tmp_path):
     with pytest.raises(FlowError): dependencies.load_manifest(root)
 
 
+def knowledge_mirror_fixture(tmp_path):
+    root, items = manifest(tmp_path)
+    item = items[0]
+    item.update(id='hcu-knowledge', mirrors={'gitlab': 'http://gitlab.example:10068/group/subgroup/kb.git'})
+    seed, sha = create_checkout(root, {**item, 'path': 'thirdparty/seed'})
+    item['commit'] = sha
+    write_json(root/'thirdparty/manifest.json', {'schema_version': 1, 'dependencies': items})
+    return root, item, seed
+
+
+@pytest.mark.parametrize('source', [None, 'github', 'gitlab'])
+def test_knowledge_clone_source_pin_and_existing_origin_are_preserved(tmp_path, monkeypatch, source):
+    root, item, seed = knowledge_mirror_fixture(tmp_path)
+    expected = item['mirrors']['gitlab'] if source == 'gitlab' else item['url']
+    real_git = dependencies.git
+    def local_fetch(path, *args, **kwargs):
+        if args[0] == 'fetch':
+            assert real_git(path, 'remote', 'get-url', 'origin').stdout.strip() == expected
+            assert args == ('fetch', '--depth', '1', 'origin', item['commit'])
+            return real_git(path, 'fetch', '--depth', '1', str(seed), item['commit'])
+        return real_git(path, *args, **kwargs)
+    monkeypatch.setattr(dependencies, 'git', local_fetch)
+    state = dependencies.sync_dependencies(root, knowledge_source=source)
+    assert state['status'] == 'ready'
+    assert state['dependencies'][0]['origin'] == expected
+    path, _ = dependencies.require_checkout(root, 'hcu-knowledge')
+    assert (path/'file.txt').read_text() == 'original'
+    def read_only(path, *args, **kwargs):
+        assert args[0] in {'rev-parse', 'remote', 'status'}
+        assert args[0] != 'remote' or args[1] == 'get-url'
+        return real_git(path, *args, **kwargs)
+    monkeypatch.setattr(dependencies, 'git', read_only)
+    # The option is only a creation preference; repeated installs do not migrate origin.
+    assert dependencies.sync_dependencies(root, knowledge_source='gitlab')['status'] == 'ready'
+    (path/'file.txt').write_text('local edits')
+    assert dependencies.sync_dependencies(root)['dependencies'][0]['status'] == 'dirty'
+    assert (path/'file.txt').read_text() == 'local edits'
+
+
+def test_external_gitlab_binding_preserves_revision_and_rejects_unknown_source(tmp_path, monkeypatch):
+    root, item, seed = knowledge_mirror_fixture(tmp_path)
+    for name in ('kb.py', 'tools/setup_workspace.py', 'knowledge/INDEX.md',
+                 'skills/hcu-knowledge-search/SKILL.md', 'skills/hcu-knowledge-update/SKILL.md'):
+        path = seed/name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('fixture')
+    dependencies.git(seed, 'remote', 'set-url', 'origin', item['mirrors']['gitlab'])
+    dependencies.bind_knowledge(root, seed)
+    real_git = dependencies.git
+    def read_only(path, *args, **kwargs):
+        assert args[0] in {'rev-parse', 'remote', 'status'}
+        assert args[0] != 'remote' or args[1] == 'get-url'
+        return real_git(path, *args, **kwargs)
+    monkeypatch.setattr(dependencies, 'git', read_only)
+    state = dependencies.sync_dependencies(root)['dependencies'][0]
+    assert state['status'] == 'ready' and state['external'] and state['dirty']
+    real_git(seed, 'remote', 'set-url', 'origin', 'http://gitlab.example:10068/other/kb.git')
+    assert dependencies.inspect_checkout(root, item)['status'] == 'origin-mismatch'
+    with pytest.raises(FlowError, match='identity'):
+        dependencies.bind_knowledge(root, seed)
+
+
+@pytest.mark.parametrize('url', ['http://user:secret@gitlab.example/g/kb.git',
+                                'http://gitlab.example/g/kb.git?token=secret',
+                                'file:///tmp/kb.git', 'http://gitlab.example/../kb.git'])
+def test_mirror_urls_reject_credentials_and_unsupported_addresses(tmp_path, url):
+    root, items = manifest(tmp_path)
+    items[0]['mirrors'] = {'gitlab': url}
+    write_json(root/'thirdparty/manifest.json', {'schema_version': 1, 'dependencies': items})
+    with pytest.raises(FlowError, match='mirror'):
+        dependencies.load_manifest(root)
+
+
 @pytest.mark.parametrize('condition', ['clean', 'dirty', 'unknown-head', 'upstream-conflict', 'status-only'])
 def test_fork_origin_migration_preserves_unrecognized_state(tmp_path,condition):
     root,items=manifest(tmp_path)

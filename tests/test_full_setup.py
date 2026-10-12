@@ -69,6 +69,27 @@ def test_missing_private_access_prevents_installation(tmp_path, monkeypatch):
     assert json.loads((tmp_path/'.work/setup/status.json').read_text())['status'] == 'incomplete'
 
 
+def test_gitlab_selection_reaches_setup_and_bootstrap(tmp_path, monkeypatch):
+    module = setup_fakes(monkeypatch, tmp_path, external=False)
+    selected = []
+    def sync(project, *args, **kwargs):
+        selected.append(kwargs['knowledge_source'])
+        return {'status': 'ready', 'dependencies': [
+            {'id': 'hcu-knowledge', 'status': 'ready', 'external': False}]}
+    monkeypatch.setattr(module, 'sync_dependencies', sync)
+    commands = []
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0)
+    assert module.setup(tmp_path, tmp_path/'skills', run=run, knowledge_source='gitlab')['status'] == 'ready'
+    assert ['git', 'lfs', 'pull'] in commands  # Uses the selected checkout's origin.
+    bootstrap = script('bootstrap_thirdparty')
+    monkeypatch.setattr(bootstrap, 'sync_dependencies', sync)
+    monkeypatch.setattr(sys, 'argv', ['bootstrap_thirdparty.py', '--only', 'hcu-knowledge', '--knowledge-source', 'gitlab'])
+    assert bootstrap.main() == 0
+    assert selected == ['gitlab', 'gitlab']
+
+
 def test_relative_full_setup_target_matches_actual_install_from_other_cwd(tmp_path, monkeypatch):
     setup = setup_fakes(monkeypatch, tmp_path)
     installer = script('install_skills')

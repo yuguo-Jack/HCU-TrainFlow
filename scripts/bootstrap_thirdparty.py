@@ -15,6 +15,7 @@ def main():
     p.add_argument('--only', nargs='+', help='Targeted dependency repair; default: all required dependencies')
     p.add_argument('--include-knowledge', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--knowledge-root', type=Path, help='Explicitly reuse an existing HCU-Knowledge checkout without pulling or resetting it')
+    p.add_argument('--knowledge-source', choices=['github', 'gitlab'], help='Source for a new managed knowledge checkout (default: github); existing origins are preserved')
     p.add_argument('--status', action='store_true', help='Inspect only; no fetch or checkout')
     p.add_argument('--migrate-origin', action='store_true', help='Explicitly migrate a clean registered upstream baseline to its fork, preserving an upstream remote')
     args = p.parse_args()
@@ -25,7 +26,8 @@ def main():
             bind_knowledge(ROOT, args.knowledge_root)
         # Historical --include-knowledge remains a no-op: HCU-Knowledge is required.
         # It must not accidentally opt users into newly registered optional tools.
-        result = sync_dependencies(ROOT, args.only, False, args.status, args.migrate_origin)
+        result = sync_dependencies(ROOT, args.only, False, args.status, args.migrate_origin,
+                                   **({'knowledge_source': args.knowledge_source} if args.knowledge_source else {}))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result['status'] == 'ready' else 2
     except (FlowError, OSError, ValueError, KeyError) as exc:
