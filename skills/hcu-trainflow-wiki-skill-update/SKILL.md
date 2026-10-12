@@ -44,6 +44,8 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查看 fork 的上游基准、补丁记录及 HCU 验证状态；保留可复用模块和全部原生能力，优先扩展现有解析/模型。上游已有等价修复时经回归后退役本地补丁，不能只改 Wiki 就自动推进训练依赖。
 
+精度方法维护还需复核项目 `docs/practices/model-accuracy-diagnosis.md` 与三个阶段的入口。按 HCU-Knowledge 的 dcu_probe 项目或当前源码核对 hcu-probe/hcuprobe 包与 CLI、配置、hook/异步快照/flush、compare 映射和跨 rank 首差、训推接入；同时核对 PyTorch/TE 的精度与随机性接口。来源变更不代表所有后端已实测，保留登记/离线/现场的验证范围，不自动刷新 HCU 大库。
+
 ## 组织标准
 
 流程与 Skill 只提炼跨模型、跨项目可迁移的方法。保留触发条件、输入契约、判断依据、验证和回退；命令用可发现的接口和参数化配置表示。单项目 shape/拓扑、地址、补丁、临时编译选项或实验顺序留在 workspace，不升级为通用默认或必做步骤。现有内容与新版本不同，先核对适用条件，不能把一次现场成功推广成所有环境适用。

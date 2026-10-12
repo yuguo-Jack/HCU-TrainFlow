@@ -42,6 +42,7 @@ flowchart TD
 - **全流程入口：**`hcu-trainflow` 协调三个阶段 Skill，保留循环状态、证据和人的指导。
 - **独立入口：**`hcu-train-check-and-adapt` 可仅检查环境；`hcu-train-analyze-and-optimize` 可仅分析性能；`hcu-train-scale-and-stability` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
 - **仅交付入口：**主控直接执行[改动审查与交付](change-delivery.md)，核对已有证据并做受影响验证，不创建训练任务或要求无关阶段报告。
+- **精度排查：**三个阶段共用图 3.5 的 NV 对照 / HCU 自查及 Probe 首差路径，修复后回所属阶段验收。
 - **持续运行：**启动训练不等于完成任务；尚在约定监测范围内就继续观测和处理异常。完成或交接须有明确条件、责任人和证据。
 
 ## 2. 环境检查与模型适配
@@ -83,7 +84,7 @@ flowchart TD
     TYPE -->|SFT| F["另核模板、packing、loss mask"]
     TYPE -->|RL| RL["另核 actor / critic / ref / reward / rollout<br/>权重同步、policy version、logprob 和异步语义"]
     TYPE -->|Torch 原生训练| N["视频 / VLA / 世界模型等<br/>数据与时空 shape、mask、autograd、EMA"]
-    P --> B["冻结初始正确性 / 数值基线<br/>有 NV 环境时补跨平台对照"]
+    P --> B["冻结初始正确性 / 数值基线<br/>NV 对照或 HCU 独立参考自查 · 图 3.5"]
     F --> B
     RL --> B
     N --> B
@@ -201,7 +202,7 @@ flowchart TD
     FROZEN --> LOSS["稳定阶段 A/B loss / 性能 / 显存<br/>保留完整对照及原始 evidence<br/>以 quality_inputs 注册可重算输入"]
     LOSS --> RECHECK["登记报告与晋级时重新计算质量对照<br/>核对当前 context、候选和已注册原件<br/>历史 pass / 连续窗口接跑不能直接晋级"]
     RECHECK --> OK{"质量与性能目标通过？"}
-    OK -->|否| BACK["定位 / 回退 / 修正<br/>必要时给专家证据包"]
+    OK -->|否| BACK["性能问题重定位 / 回退<br/>精度问题进入图 3.5<br/>必要时给专家证据包"]
     BACK --> H
     OK -->|是| REVIEW["独立复核当前候选与证据<br/>通过后进入扩容准备或交付"]
     KEEP["已接近上限的当前实现<br/>保留原验证与适用依据"] --> MERGE
@@ -297,6 +298,39 @@ flowchart TD
 这些是按问题选择的证据路径，不要求每次全跑一遍。`tracelens-analyze` 的模式为 `graph / roofline / agent / hipprof / counters`；EventReplay 走原生 API 和获准远端实验。图中 Graph replay 的时间归因与 EventReplay 的独立算子复测是两种用途。
 
 `generated` 只表示产物生成；Agent 指标齐全仍需实际推理与复核；算子模型的时间下界不等于确定可达的整步速度。高占比未知项、缺 rank 或缺数值验证均保留为缺口。工具的实际 HCU 资格范围见 [TraceLens 分析与验证](tracelens-analysis.md)，不扩大完整模型收敛或生产长稳的结论。
+
+### 3.5 模型精度诊断（跨阶段复用）
+
+适配基线、优化回归和长稳质量异常均进入本分支，方法见[模型精度诊断](practices/model-accuracy-diagnosis.md)。它不增加独立 Skill 或每轮长训；仅环境检查不触发模型实验。
+
+```mermaid
+flowchart TD
+    IN["初始参考 / 输出或梯度偏差 / loss 异常<br/>RL 训推差异 / 扩并行或恢复后偏离"] --> FIX["保全首错前状态、固定样本和候选身份<br/>对齐模型、数据、精度、优化器与逻辑分片"]
+    FIX --> NV{"有可用且可比的 NV 环境？"}
+    NV -->|有| CROSS["共同初态和实际输入<br/>对齐语义边界，必要时仅局部模块对照<br/>核对两端自身波动与真实数值路径"]
+    NV -->|没有或无法完整对照| SELF["HCU 可信基线 / 独立参考 / 小规模高精度<br/>eager 与融合、输出 / 梯度 / 更新逐层查证<br/>重复一致本身不证明正确"]
+    CROSS --> COLLECT["按需 HCU Probe / 引擎 dump / 核实的 hook<br/>先少量统计，再补首差附近实体张量<br/>对齐 rank / step / microbatch / phase"]
+    SELF --> COLLECT
+    COLLECT --> COVER{"采集完整、映射和条件可比？"}
+    COVER -->|缺失或不匹配| GAP["记录 incomplete，修复过滤 / 映射 / flush<br/>补所需相关 rank；不把空报告当通过"]
+    GAP --> COLLECT
+    GAP -->|缺条件或无新证据| EXPERT["交付已排除项、原件与待验证范围<br/>保留候选阻塞，按任务边界请专家介入"]
+    COVER -->|可比| CHECK{"声明契约通过<br/>且无待解释的原异常？"}
+    CHECK -->|是| STAGE
+    CHECK -->|否| FIRST["定位最早可信分歧或未复现条件<br/>输入 → 前向 → backward → 规约 → 更新<br/>沿通信边回溯生产者，不按最大误差判根因"]
+    FIRST --> CODE["误差分布、finite、阈值依据与独立复现<br/>查 HCU 大库 / PR / 当前调用方和底层源码"]
+    CODE --> FOUND{"根因或可验证修复成立？"}
+    FOUND -->|未知| NEXT["选择最有区分力的有界实验<br/>改变一个因素并保留原配方"]
+    NEXT --> FIX
+    NEXT -->|证据或预算边界| EXPERT
+    FOUND -->|成立| LOCAL["受影响输出 / 梯度 / 更新及状态回归<br/>恢复原 compile、融合、精度与并行配置"]
+    LOCAL --> GOOD{"真实路径通过？"}
+    GOOD -->|否| FIRST
+    GOOD -->|是| STAGE["回所属阶段验收<br/>稳定里程碑同初态 loss；关闭重型采集再测性能<br/>局部正确、跨平台、阶段质量、收敛分开报告"]
+```
+
+同一问题沿用 context/attempt、原始证据和 owner；有界诊断不另设重复审批。工具与方法已登记，具体模型/后端在任务需要时验证，不能从图中推断全部已在硬件实测。
+
 
 ## 4. 每阶段共用：实施、独立复核、修正
 

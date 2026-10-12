@@ -26,6 +26,10 @@
 
 当前主线另完成了 gfx936/DTK 26.10 的 TraceLens 有界资格验证：训练 Graph 前后向映射、实际输入 EventReplay、实测参考 Roofline、原生 Agent 指标及推理复核、hipprof JSON/pftrace 同源对照、XProf/XCompute counter 与 SQTT。命令、计时/数据边界和未覆盖项见 [TraceLens HCU 分析](tracelens-analysis.md)；没有因此扩大完整模型 loss、多架构或生产长稳的验证声明。
 
+## 模型精度诊断的覆盖
+
+三个阶段共用[精度诊断方法](practices/model-accuracy-diagnosis.md)：NV 对照、HCU 自查、HCU Probe 采集和匹配、跨 rank 首差、SFT/RL 与恢复后偏差。已核对固定 Probe 源码及官方方法，登记调用入口和验收边界；本轮没有新增 HCU/NV 模型对照或 Probe 现场实验，不要求预先实测全部后端。现有质量门槛继续核对冻结初态、配方、样本和实际候选；Probe 不会由 CLI 自动安装/执行，也不自动判模型通过。
+
 ## 后续验收重点
 
 1. 在每个目标环境重新确认资源、权限、启动方式和预期；冻结真实源码、依赖、模型、数据与基线身份，保留早期发现记录。

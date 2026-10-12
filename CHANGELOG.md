@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.6.3 — 2026-10-12
+
+- Add shared model-accuracy diagnosis across adaptation, optimization and stable training: NVIDIA comparisons, HCU-only independent references, HCU Probe capture/matching/first-divergence, and distributed/SFT/RL/recovery checks. Preserve local regression and milestone loss cadence.
+- Connect coordinator, stage and maintenance Skills to the shared guide and update the editable workflow diagrams, reading routes and capability boundaries; this adds methodology, not new on-device qualification.
 
 - Register the internal GitLab mirror for HCU-Knowledge, add explicit installation source selection, and accept either registered origin for managed or existing knowledge checkouts while preserving version pins.
 - Rename the check/adaptation entry to `hcu-train-check-and-adapt` across runtime dispatch, installed UI, reading routes and maintenance references; migrate previous installations without leaving duplicate entries.

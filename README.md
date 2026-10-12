@@ -6,7 +6,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。候选与阶段结果以实际证据推进，经过独立复核和修正；有界初筛、局部试参和未变化的证据按需复用，不逐条命令审核。人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前版本：`0.6.2`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
+**当前版本：`0.6.3`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
 
 **首次了解工程，建议阅读 [HCU-TrainFlow 工程介绍](docs/project-overview.md)**：从接到一个新模型和环境开始，讲清三个阶段如何推进、如何选择优化对象、怎样保护训练质量，以及多 Agent、知识检索和持续守护如何配合。
 
@@ -92,6 +92,8 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 - **长时观察与接续**：持续记录 loss、吞吐、显存、全部必需成员、checkpoint 和恢复状态，生成曲线并检查观察器自身健康。本机离线时由已部署并验收的远端守护和既有容错继续工作；恢复后核对现场、重放事件并接续 Agent，告警和自动唤醒分别验收。
 
 ### 贯穿全程的协同与交付
+
+**模型精度诊断**贯穿适配、优化和长稳：有 NV 环境进行同初态、同样本的分层对照；没有 NV 则用可信基线、独立参考和 HCU 自查。按需结合 HCU Probe 定位前向、梯度、更新或通信的首处分歧，局部修复回归后在稳定里程碑验 loss。详见[精度诊断方法](docs/practices/model-accuracy-diagnosis.md)和[精度分支图](docs/workflow-map.md#35-模型精度诊断跨阶段复用)。
 
 本地主控按依赖和收益拆解任务，独立方向并行，共享资源测量与耦合修改协调执行；代码以固定快照同步远端，超时或断线先核查原作业。HCU-Knowledge、HCU-TrainFlow-Wiki、PR 与源码查证贯穿三个阶段，看板持续展示技术结论并采集指导。各阶段按范围交付代码、配方、验证和回退方法；完整任务在执行基线上完成约定验证后再整合目标主仓，精选通用经验和最终里程碑进入共享 Wiki。
 

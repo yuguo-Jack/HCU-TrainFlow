@@ -28,6 +28,8 @@ graph/compile 首次执行问题单独检查前向与 backward worker 的库 han
 
 ## 3. 基线失败时的最小递进
 
+精度问题先读[模型精度诊断](../../../docs/practices/model-accuracy-diagnosis.md)：对齐真实模型/样本/初态，有 NV 做对应语义边界对照，无 NV 用独立参考与本机分层自查，再按下述递进收窄。不能只看最终 loss 或以 seed 相同代替张量一致。
+
 在不改变问题所需条件的前提下，从导入/构造 → 固定小输入前向 → backward → 真实 optimizer 更新 → 对应并行组 → 短窗口保存恢复逐步定位；已经有证据通过的阶段直接复用，不能为形式全重跑。每步记录目标调用是否实际执行、有效样本、输出/梯度/状态检查和未覆盖范围。使用随机 token 或缩层代理验证链路时明确其用途，不能据此验收目标训练质量。
 
 数值与运行异常统一读项目 `skills/hcu-train-scale-and-stability/references/diagnosis.md`，按其知识/PR/源码查证方法推进；`environment` 仍只交环境检查结果，不强制进入上述模型递进。未知配方、无参考预期、安装 ABI 不明和尚未定位的异常都有明确下一步和 owner，不为了让流程变绿取消检查。

@@ -35,6 +35,8 @@ description: 扩展 HCU 训练规模、筛机并衔接既有容错，持续观�
 
 按 [观察器换代与缓存保护](references/workflow.md#观察器换代与缓存保护) 执行新 context 的独立 Store/事件 peer 交接，重新连接独立 sentinel。已核实进度源的 iteration/loss 不是全部节点健康证明，不能固定假定 rank0 输出进度；每个必需 member 的 ready、心跳、进程与退出结果均要核对。按阶段交接、恢复核销和长训低频策略维护，大 checkpoint 保存前只查空间与配额。只有明确部署 policy 才自动回收合格缓存及显式退役的无效临时保存点/调试产物。最新有效、最佳、基线、回退/恢复 checkpoint 与故障唯一原件继续保护，unknown 作业先核销；老目录不自动清理。
 
+loss/梯度异常、训推不一致、扩并行或恢复后偏离时，读项目 `docs/practices/model-accuracy-diagnosis.md`，保留首错前状态和固定样本，按 NV 对照或 HCU 自查定位。Probe 采集/首差候选与恢复负责人分工明确；缺证据不报正常，也不默认反复从同一问题 checkpoint 重启。
+
 ## 故障诊断步骤
 
 先读 [故障诊断与恢复验收](references/diagnosis.md)，按症状进入卡住/通信、崩溃/设备错误、内存、数值、性能退化或保存恢复分支；不机械执行全部检查。`diagnose` 只做当前授权范围的调查与交付，其他阶段也可复用这些方法。

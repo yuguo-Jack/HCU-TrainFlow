@@ -120,6 +120,8 @@ Linux 下先由目标 PID 的 `/proc/<pid>/cgroup` 与实际挂载确定路径�
 
 ## 6. 数值异常与训练质量
 
+本分支先读[模型精度诊断](../../../docs/practices/model-accuracy-diagnosis.md)，选择有 NV 的跨平台对照或无 NV 的分层自查。该指南统一 Probe 接入、匹配/误差判读、首差与修复验收；下述是运行故障的上下文与 RL 衔接。
+
 先固定同一数据/模型/优化器/RNG/并行布局与候选快照；参考项目 `docs/training-state-validation.md`。NaN/Inf、梯度消失或阶段 loss 偏离必须转入排障，不能以吞吐提升放行。
 
 沿输入/tokenizer/mask/labels → 首个前向差异 → loss 归一化 → backward/梯度归约 → clipping/unscale → optimizer 更新定位第一处分歧。先检查数据和配方一致性，再逐层缩小；关注混合参数组、低精度缩放状态、溢出跳步和累积边界。首个被发现的坏张量还要沿通信或异步边回溯生产者。

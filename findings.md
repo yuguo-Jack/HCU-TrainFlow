@@ -288,3 +288,15 @@ wiki-search 实际只索引 knowledge/**/*.md。中间试验即便写了待验�
 ## 2026-10-12：官方页面回退
 
 capabilities.md 此前最近修改于 v0.6.1，v0.6.2 未单独同步 Wiki 命名/维护时机。CLI 线上自动回退仅针对 PR；Releases、roadmap Issue/Discussion/Project 与未登记官网由宿主网页工具按需查证。已实查 NVIDIA/Megatron-LM releases、roadmap issue 5676 和 verl Megatron 模型扩展官网/仓内原文，入口可读；不据此宣称全部官方网页已自动索引。
+
+## 2026-10-12：精度诊断缺口
+
+现有方法分散在 training-state-validation、三个阶段 reference 和质量比较程序中，缺统一的有/无 NV 路线及 Probe 可用性/采集判读。HCU-Knowledge dcu_probe 固定 b8dddb57 当前包为 hcu-probe、import/CLI 为 hcuprobe，目录迁移至 python/hcuprobe；旧 dcu_probe 示例不可机械照搬。Probe 统计、摘要和实体数据能力不同，空匹配不通过，异步 clone/flush 会影响显存和同步，跨 rank 首差需通信组元数据。
+
+保持六个 Skill 数量与 QualityContract 阶段门槛不变，新增跨阶段方法正文并接回阅读链；不把无 NV 的重复一致性写成正确性或跨平台等价。
+
+### 精度方法最终复核
+
+- 原有质量代码保留真实候选、同初态/配方、样本与原始对照重算；日志/长稳监控保留非有限历史，不因后续有限采样清除异常。本轮未发现需要修改这些门槛的缺陷，保持运行逻辑。
+- 方法须区分初始基线通过、未复现旧异常与找到首差；流程图补直接返回阶段的正常分支，间歇问题仍保留。动态 loss scaling 的跳步需要核对状态与参数是否更新，不把所有溢出等同于不可恢复故障，也不消除原始告警。
+- 共用指南放 docs/practices，由六个既有入口体系按需路由；不增加新 Skill，不把具体排查中间件放共享 Wiki。维护关联覆盖相关官方源码与三个阶段，HCU Probe 当前接口另按大库/现场源码查证。

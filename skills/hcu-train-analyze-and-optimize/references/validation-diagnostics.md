@@ -16,6 +16,8 @@
 
 ## 局部正确性失败的排查顺序
 
+有 NV/无 NV 对照、HCU Probe 生命周期与误差判读的共用正文见[模型精度诊断](../../../docs/practices/model-accuracy-diagnosis.md)。先按其中方法确定可信 reference、采集覆盖与首差；以下是优化候选的交接顺序。
+
 1. 先排除 reference 和 candidate 使用了不同数据、随机状态、布局/stride、shape、精度、训练模式、累积或参数组。检查 reference 本身与目标模型契约是否一致。
 2. 找首次分歧而不是末端最大的误差：算子输入 → 中间输出 → 梯度 → 归约/缩放 → 更新。按需查 HCU hcuprobe/TE dump、知识库同类问题和官方 PR；核对采集覆盖和异步快照是否保存了当时数据。
 3. 对 fused kernel 检查 cast 舍入点、累积精度、mask/边界、in-place/alias、反向保存量、跨流读写依赖；数值近似只有在已约定契约内才可接受。未知项交回原算子 Skill 补基线/定位，不自动放宽容差。
