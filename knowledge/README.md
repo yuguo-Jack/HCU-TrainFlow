@@ -8,7 +8,7 @@ visibility: public
 
 本库只收录官方资料、跨项目可复用的通用环境经验，以及模型最终优化里程碑的总结和关键数据。临时排查、未定候选和逐次实验留在 workspace/看板，不纳入共享检索。HCU-Knowledge 是完整安装的必需依赖，按问题联查，普通任务不更新它。
 
-重点覆盖 Megatron 生态、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；主要 SFT/RL 引擎按目录、调用链、安装运行测试、优化和故障诊断组织，仍不宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
+重点覆盖 Megatron 生态、TorchTitan、Transformer Engine、cuDNN Frontend 与 AMD/华为/百度的代表性机制；主要 SFT/RL 引擎按目录、调用链、安装运行测试、优化和故障诊断组织，仍不宣称完成逐模型 Wiki。TE/cuDNN 同时登记官方源码与网站教程。`review_level` 与 `runtime_validated` 显式表示阅读和验证状态。source-lock 记录采集内容，不代表所有文件逐行复核。
 
 入口为 `$hcu-trainflow-wiki-search` 与 `$hcu-trainflow-wiki-skill-update`。任务初期核对相关官方知识，阶段和最终收尾整理可复用经验，具体见 [知识维护时机](../docs/knowledge-architecture.md#任务中的维护时机)。
 
@@ -84,3 +84,23 @@ visibility: public
 - [cuDNN 开放 Kernel：MoE 融合、FROST 与稀疏 Attention](official-cudnn-frontend-wiki/open-kernel-fusions.md)
 - [案例：cuDNN Kernel 不慢，模型却被构图和 Host 调度拖慢](official-cudnn-frontend-wiki/cases/host-dispatch-and-cache.md)
 - [cuDNN Frontend 官方教程、源码实例与更新索引](official-cudnn-frontend-wiki/tutorials-and-update.md)
+
+## TorchTitan 官方训练工程
+
+覆盖当前主线的 Python recipe、预训练/SFT/TitanRL、并行与显存、编译/通信、低精度和恢复；含源码调用链与三个优化案例。上游教程/PR 实验与 HCU 现场验证分别标记。
+
+- [TorchTitan 官方工程：定位、能力边界与阅读路线](official-torchtitan-wiki/overview.md)
+- [TorchTitan 代码目录与问题定位地图](official-torchtitan-wiki/source-map.md)
+- [TorchTitan 安装、Python 配方、启动与分层测试](official-torchtitan-wiki/build-run-test.md)
+- [TorchTitan 模型配方、数据语义与 Kimi/FLUX 适配边界](official-torchtitan-wiki/models-and-data.md)
+- [TorchTitan 训练循环、有效 token、优化器与数值诊断](official-torchtitan-wiki/training-and-numerics.md)
+- [TorchTitan 并行域、容量、重算与显存生命周期](official-torchtitan-wiki/parallelism-and-memory.md)
+- [TorchTitan 局部编译、融合、异步 TP 与 GraphTrainer](official-torchtitan-wiki/compile-fusion-and-communication.md)
+- [TorchTitan MoE 路由、通信内存与低精度权重生命周期](official-torchtitan-wiki/moe-and-low-precision.md)
+- [TorchTitan 性能采集、TraceLens 联动与问题定位](official-torchtitan-wiki/profiling-and-diagnosis.md)
+- [TorchTitan Checkpoint、恢复语义与长稳训练](official-torchtitan-wiki/checkpoint-and-stability.md)
+- [TitanRL：训练生成协同、权重同步与精度边界](official-torchtitan-wiki/titanrl.md)
+- [案例：TorchTitan WGRAD 原地累积的显存收益与梯度所有权](official-torchtitan-wiki/cases/inplace-wgrad-accumulation.md)
+- [案例：Kimi Attention Residual 融合很快，模型却未必更快](official-torchtitan-wiki/cases/kimi-attnres-fusion.md)
+- [案例：TitanRL 权重同步的训练侧暂存与生成侧峰值](official-torchtitan-wiki/cases/rl-weight-sync-memory.md)
+- [TorchTitan 官方教程、Release、特性 PR 与持续更新](official-torchtitan-wiki/releases-prs-and-update.md)

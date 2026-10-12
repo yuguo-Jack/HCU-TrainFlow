@@ -1,0 +1,145 @@
+---
+id: doc-pytorch-torchtitan-6221432155ab6e5aaad9
+title: pytorch/torchtitan / torchtitan/models/flux/README.md
+engine: torchtitan
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: pytorch/torchtitan
+commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+path: torchtitan/models/flux/README.md
+raw_sha256: c5f425ce7a9e52c349d0dfa96c500182a3012009b7fb36381bb30f9e40a0e5cb
+sources: []
+generated_body_sha256: addf5e752fadc32927f552c32bb6b656e6b378673a354332d218a8988cb988d6
+source_state: current-scan
+---
+
+# pytorch/torchtitan / torchtitan/models/flux/README.md
+
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/flux/README.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# FLUX model in torchtitan
+
+## Overview
+This directory contains the implementation of the [FLUX](https://github.com/black-forest-labs/flux/tree/main) model in torchtitan. In torchtitan, we showcase the pre-training process of text-to-image part of the FLUX model.
+
+## Prerequisites
+Install the required dependencies:
+```bash
+pip install -r requirements-flux.txt
+```
+
+## Usage
+First, download the autoencoder model from HuggingFace with your own access token:
+```bash
+python scripts/download_hf_assets.py --repo_id black-forest-labs/FLUX.1-dev --additional_patterns ae.safetensors --hf_token <your_access_token>
+```
+
+This step will download the autoencoder model from HuggingFace and save it to the `assets/hf/FLUX.1-dev/ae.safetensors` file.
+
+Run the following command to train the debug model on a single GPU:
+```bash
+MODULE=torchtitan_recipes.tests.models.flux CONFIG=flux_debugmodel ./run_train.sh
+```
+
+If you want to train with other configs, run the following command:
+```bash
+MODULE=torchtitan_recipes.models.flux CONFIG=flux_schnell ./run_train.sh
+```
+
+To generate images from a trained checkpoint, launch the inference entrypoint
+with the same launcher. Prompts are read from `config.inference.prompts_path`
+(default: [`inference/prompts.txt`](inference/prompts.txt)):
+```bash
+ENTRYPOINT=torchtitan.models.flux.inference.infer \
+MODULE=torchtitan_recipes.tests.models.flux CONFIG=flux_debugmodel_inference \
+./run_train.sh
+```
+
+
+## Supported Features
+- Parallelism: The model supports FSDP, HSDP, CP for training on multiple GPUs.
+- Activation checkpointing: The model uses activation checkpointing to reduce memory usage during training.
+- `torch.compile`: Independent loss-function compilation. See [torch.compile](#torchcompile) below.
+- MXFP8 quantization: Dynamic MXFP8 quantization for linear layers on SM100+ (Blackwell) hardware. See [MXFP8 Quantization](#mxfp8-quantization) below.
+- Distributed checkpointing and loading.
+    - Notes on the current checkpointing implementation: To keep the model weights are sharded the same way as checkpointing, we need to shard the model weights before saving the checkpoint. This is done by checking each module at the end of evaluation, and sharding the weights of the module if it is a FSDPModule.
+- CI for FLUX model. Supported periodically running integration tests on 8 GPUs, and unittests.
+
+## torch.compile
+
+The loss function can be compiled independently with:
+
+```python
+config.model.local_compile_regions = ["loss"]
+```
+
+The model itself is not compiled by the standard Trainer.
+
+## MXFP8 Quantization
+
+The Flux model supports MXFP8 (Microscaling FP8) quantization for accelerating training on SM100+ hardware (B200, B100). This uses the existing `MXFP8LinearConverter` from torchtitan, which dynamically quantizes linear layers to MXFP8 precision.
+
+**Requirements:**
+- SM100+ GPU (e.g., NVIDIA B200, B100)
+- `torchao` nightly
+
+### Using Config Presets
+
+Pre-configured MXFP8 presets:
+
+```bash
+# Flux schnell with MXFP8
+MODULE=torchtitan_recipes.models.flux CONFIG=flux_schnell_mxfp8 ./run_train.sh
+
+# Flux dev with MXFP8
+MODULE=torchtitan_recipes.models.flux CONFIG=flux_dev_mxfp8 ./run_train.sh
+```
+
+### Custom Configuration
+
+To create a custom MXFP8 config, define a new function in a recipe module.
+`build_model_config` applies `converters` and returns the model config assigned
+to `config.model`:
+
+```python
+from torchtitan.config.transform import MXFP8LinearConverter
+from torchtitan.models.flux import build_model_config
+from torchtitan.models.flux.trainer import FluxTrainer
+from torchtitan_recipes.models.flux import flux_dev, flux_schnell
+
+
+def my_custom_mxfp8() -> FluxTrainer.Config:
+    config = flux_schnell()  # or flux_dev()
+    config.model = build_model_config(
+        "flux-schnell",  # or "flux-dev" with flux_dev()
+        parallelism=config.parallelism,
+        converters=[
+            MXFP8LinearConverter.Config(
+                fqns=[
+                    "double_blocks",
+                    "single_blocks",
+                    "img_in",
+                    "txt_in",
+                    "time_in",
+                    "vector_in",
+                    "final_layer",
+                ],
+            ),
+        ],
+    )
+    return config
+```
+
+The `fqns` parameter specifies which fully qualified module names to quantize. The listed names cover all the linear-layer-containing submodules in the Flux transformer. Dimensions must be aligned to 32 bytes for MXFP8; Flux's default hidden sizes satisfy this requirement.
+
+## TODO
+- [ ] More parallelism support (Tensor Parallelism, Pipeline Parallelism, etc)

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.4 — 2026-10-12
+
+- Add a curated official TorchTitan Wiki: engineering map, Python recipes, installation/run/test paths, model/data semantics, numerical validation, parallelism/memory, compilation/communication, MoE/precision, profiling, checkpoint/recovery and TitanRL. Include three source/PR-grounded optimization cases.
+- Register scoped official documents, complete source navigation, recent and selected historical PR descriptions/reviews/comments/diffs, fixed source hashes, release evidence and incremental maintenance links. Reuse existing local/online search and code lookup; distinguish released, main and open changes.
+- Connect the Torch-native optimization reference and Wiki navigation, retain upstream licensing and explicitly record that no new TorchTitan/HCU training qualification was performed.
+
 ## 0.6.3 — 2026-10-12
 
 - Add shared model-accuracy diagnosis across adaptation, optimization and stable training: NVIDIA comparisons, HCU-only independent references, HCU Probe capture/matching/first-divergence, and distributed/SFT/RL/recovery checks. Preserve local regression and milestone loss cadence.

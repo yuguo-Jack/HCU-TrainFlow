@@ -6,7 +6,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。候选与阶段结果以实际证据推进，经过独立复核和修正；有界初筛、局部试参和未变化的证据按需复用，不逐条命令审核。人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前版本：`0.6.3`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
+**当前版本：`0.6.4`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
 
 **首次了解工程，建议阅读 [HCU-TrainFlow 工程介绍](docs/project-overview.md)**：从接到一个新模型和环境开始，讲清三个阶段如何推进、如何选择优化对象、怎样保护训练质量，以及多 Agent、知识检索和持续守护如何配合。
 
@@ -81,7 +81,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 - **复用与实现迭代**：优先复用现有 HCU 算子库、通信库的能力；能力或性能不足时，基于对应库补充实现并借助算子 Skill 持续优化。对齐接口与数值契约，以实际性能分析、局部回归和整步收益验证结果；具体工程分工见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。
 - **稳定阶段验 loss**：每轮做局部正确性、多形状和无 profiler 性能回归，集成后重测整步净收益；稳定阶段从同一冻结初态与配方比较 loss、性能和显存。达到目标、接近可达上限、无稳定收益或受阻，都须给出证据与停止依据。
 
-同一阶段包含 [Torch 原生训练专项](skills/hcu-train-analyze-and-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。机制选择联查官方教程与 PR、AMD Primus、MindSpeed 系列、LoongForge 和 HCU 底层源码。详见[热点排序与算子迭代](skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。
+同一阶段包含 [Torch 原生训练专项](skills/hcu-train-analyze-and-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。机制选择联查官方教程与 PR、[TorchTitan 官方 Wiki](knowledge/official-torchtitan-wiki/overview.md)、AMD Primus、MindSpeed 系列、LoongForge 和 HCU 底层源码。详见[热点排序与算子迭代](skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。
 
 **TraceLens 贯穿分析和验证**：时间线与 Graph 关联真实训练调用，Roofline/效率分析提供带条件的上限，EventReplay 支持按真实输入做独立对照；hipprof JSON/pftrace 与 XProf/XCompute 证据按各自口径接入。原生 Agent 指标准备、实际推理和复核分别记录，高占比未知项继续补证据。报告生成、分析完成和训练验收是不同状态，预测空间须由无 profiler 的整步收益及质量对照验证。见 [TraceLens 分析与实测边界](docs/tracelens-analysis.md)。
 

@@ -371,3 +371,15 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 本轮为图文调整，不改执行代码、不启动训练、不刷新知识库，不新增 tag；同步本机安装后提交推送 main。
 
 - 本机 editable 包 0.6.3、六个 Skill 和资源绑定同步完成，独立 `--check` 返回 current；本地差异检查通过，远端 main 基线未变化。
+
+- 文档范围检查发现递归 glob 会纳入上游 .claude 提示词，已逐文件移除本轮生成副本并登记永久排除，保留源码路径导航。首次 PowerShell 批量清理被自动策略阻止，改用明确文件路径的补丁删除成功，未修改上游参考 checkout。最终保留 64 份官方文档。
+
+### TorchTitan 补充与发布检查
+
+- 新增 15 页作者专题（含 WGRAD 累积、Attention Residual 融合、RL 权重同步三个案例）；保留 64 份官方教程、59 份 PR 原文/review/评论/diff、完整 1187 路径清单及官方 release 快照，登记 76 个监测文件。精读 PR 回执覆盖 12 项相关变更；其他 PR 保持 source-reported，未读源码路径没有标成全面复核。
+- 核对了当前 recipe 目录、CLI、EP mesh、token 归一化、DistMuon、重算/graph 与 RL 状态；补充实际测试路径，并修正初稿中 RL wrapper 路径及两个暂存 helper 的旧名称。案例保留上游报告的退化、数值与未验证范围，不只摘取提速。
+- 增量文档重跑：64 份发现/保留，0 新处理、0 pending、0 errors；同来源总览/专题/案例与五个维护入口完成联动复核。删除本轮重复采集且未被引用的 7 份公共 PR 中间副本，当前原件及私有采集证据保留。
+- 102 项相关回归通过；628 页知识/26 来源、60 阅读资源页/81 可达页无错误，64 份描述/Skill Markdown 的 442 处链接/锚点有效。新 Wiki 作者页本地链接另由知识校验覆盖。
+- 六类检索问题的预期页排在前两位；线上查到未收录 DistributedMuon PR #4105，读取完整 PR 到私有缓存并验证固定源码读取。首次搜索限定五项产生真实分页 partial，扩大到十项覆盖七个结果后完成，不将 partial 当作失败或全量结果。
+- 系统 Python editable 包升级至 0.6.4，六个 Skill/引用绑定同步，独立 --check 为 current。未安装 TorchTitan、未执行其 CPU/GPU 测试或训练、未更新 HCU-Knowledge；本轮上游测试内容核对和 TrainFlow 工具回归分别记录。远端 main 基线为 2967a9a，准备提交推送并打 v0.6.4。
+- Git 暂存检查发现上游 PR 评论自带行尾空格；保留原文和正文 hash，在 `.gitattributes` 仅对生成的 PR/官方文档页沿用原始证据的 whitespace 例外，作者文档仍照常检查。

@@ -49,6 +49,14 @@ sources: []
 
 - [modelscope/ms-swift #10188：docs: clarify configuration for fractional loss weights](prs/modelscope--ms-swift/PR-10188.md)
 - [modelscope/ms-swift #10242：[bugfix] drop dp_cp_group from content_metadata when saving mcore checkpoint](prs/modelscope--ms-swift/PR-10242.md)
+## torchtitan
+
+- [#5033：Kimi Attention Residual 的局部编译与 Triton 融合](prs/pytorch--torchtitan/PR-5033.md)；[案例：独立算子收益与模型吞吐](official-torchtitan-wiki/cases/kimi-attnres-fusion.md)。
+- [#5137：HiMidLo LM-head WGRAD 累积](prs/pytorch--torchtitan/PR-5137.md)、[#5250：BF16 Linear 原地 WGRAD](prs/pytorch--torchtitan/PR-5250.md)；[梯度生命周期案例](official-torchtitan-wiki/cases/inplace-wgrad-accumulation.md)。
+- [#5107：trainer pinned CPU 权重暂存](prs/pytorch--torchtitan/PR-5107.md)、[#5268：generator 按 FSDP group 加载](prs/pytorch--torchtitan/PR-5268.md)；[权重同步与内存案例](official-torchtitan-wiki/cases/rl-weight-sync-memory.md)。
+- [#5277：工程目录与依赖重组](prs/pytorch--torchtitan/PR-5277.md)、[#5280：构建已分片模型配置及 RL 两角色模型](prs/pytorch--torchtitan/PR-5280.md)。
+- [全部已收录 PR 与来源目录](catalog/README.md#pytorch-torchtitan)；[发布/主线/未合入优化及更新范围](official-torchtitan-wiki/releases-prs-and-update.md)。
+
 ## transformer-engine
 
 - [NVIDIA/TransformerEngine #3517：[PyTorch] Support distributed weights in GroupedLinear's grouped-tensor path](prs/NVIDIA--TransformerEngine/PR-3517.md)

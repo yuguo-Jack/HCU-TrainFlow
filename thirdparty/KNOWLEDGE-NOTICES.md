@@ -21,3 +21,4 @@ The following repository notices accompany the retained documents. File-specific
 - [verl-project/verl / LICENSE](licenses/volcengine-verl/LICENSE) · [fixed original](https://github.com/verl-project/verl/blob/5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d/LICENSE)
 - [verl-project/verl / Notice.txt](licenses/volcengine-verl/Notice.txt) · [fixed original](https://github.com/verl-project/verl/blob/5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d/Notice.txt)
 - [vllm-project/vllm / LICENSE](licenses/vllm-project-vllm/LICENSE) · [fixed original](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/LICENSE)
+- [pytorch/torchtitan / LICENSE](licenses/pytorch-torchtitan/LICENSE) · [fixed original](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/LICENSE)

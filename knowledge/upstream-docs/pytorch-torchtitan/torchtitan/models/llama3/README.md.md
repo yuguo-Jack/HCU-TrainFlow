@@ -1,0 +1,101 @@
+---
+id: doc-pytorch-torchtitan-d7a759f413b2fe10cf31
+title: pytorch/torchtitan / torchtitan/models/llama3/README.md
+engine: torchtitan
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: pytorch/torchtitan
+commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+path: torchtitan/models/llama3/README.md
+raw_sha256: 18494f66902ecc4c2e7e08b63ae0a26abe02dd366d2d536b8d9697a5e91c7b2d
+sources: []
+generated_body_sha256: e934b40657311b5695b6cf23468c3d72fa123dc01932fee19abf4225026045a1
+source_state: current-scan
+---
+
+# pytorch/torchtitan / torchtitan/models/llama3/README.md
+
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/llama3/README.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Llama 3
+
+Llama 3 is the reference decoder model in torchtitan. Training recipes cover
+Llama 3.1 8B, 70B, and 405B, plus a small debug model used by CI.
+
+## Download the tokenizer
+
+Follow the access instructions on the official
+[meta-llama](https://huggingface.co/meta-llama/Llama-3.1-8B) repository, then:
+
+```bash
+python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer
+```
+
+The 8B, 70B, and 405B recipes expect tokenizer assets under
+`./assets/hf/Llama-3.1-8B` (and the matching 70B / 405B paths).
+
+## Training
+
+```bash
+# Debug model (used by integration tests)
+MODULE=torchtitan_recipes.tests.models.llama3 CONFIG=llama3_debugmodel ./run_train.sh
+
+# Llama 3.1 8B
+MODULE=torchtitan_recipes.models.llama3 CONFIG=llama3_8b ./run_train.sh
+```
+
+Other recipes include `llama3_70b`. See
+[`torchtitan_recipes/models/llama3.py`](../../../torchtitan_recipes/models/llama3.py).
+
+## Supported Parallelisms
+
+Coverage below matches the sharding set in [`flavors.py`](./flavors.py),
+`BaseModel.parallelize()`, and the Llama 3 jobs in
+`tests/integration_tests/features.py`.
+
+| Feature | Notes |
+|---------|-------|
+| FSDP / HSDP | Default data-parallel path |
+| Tensor Parallel (TP) | Including sequence parallel; async TP is exercised on H100 |
+| Context Parallel (CP) | Composes with FSDP, HSDP, DDP, and TP |
+| Pipeline Parallel (PP) | 1F1B, Interleaved1F1B, and GPipe. Zero-bubble / split-backward PP tests are disabled in `tests/integration_tests/features.py` because FlexInnerAttention `BlockMask` is not a Tensor |
+| DDP | Including DDP+CP |
+| Activation checkpointing | Selective and full |
+| `torch.compile` | 1D and multi-dimensional jobs |
+| MXFP8 | Eager recipe `llama3_8b_mxfp8`; GraphTrainer recipes `graph_trainer_llama3_debugmodel_mxfp8` and `graph_trainer_llama3_8b_mxfp8` |
+
+## Numerical checks
+
+Llama 3 is the baseline used to validate distributed training techniques. See
+`tests/integration_tests` and the
+[validation guide](../../../docs/debugging.md#validating-a-distributed-training-technique)
+rather than treating any single published KL or MFU number as a parity claim.
+
+### Loss convergence
+
+A reference convergence run on Llama 3.1 8B, covering parallelisms and training
+optimizations, following the validation guide's methodology. Results were
+obtained on 2025-01-21 with the then-latest `torch`, `torchao`, and `torchtitan`.
+
+- Base recipe: `llama3_8b` from [torchtitan_recipes/models/llama3.py](../../../torchtitan_recipes/models/llama3.py)
+- 262144 tokens per step: DP degree 8, one gradient accumulation step, and
+  32768 tokens per microbatch without PP or 8192 tokens with four PP microbatches
+- 3000 steps with 600 warmup steps
+
+| Parallelism              | Techniques                                        | Remarks                           |
+| ------------------------ | ------------------------------------------------- | --------------------------------- |
+| FSDP 8                   | default                                           | 1D control set                    |
+| FSDP 8, TP 2, PP 2       | torch.compile, Float8, async TP, Interleaved 1F1B | 3D test set                       |
+| FSDP 8, TP 2, CP 2, PP 2 | torch.compile, Float8, async TP, Interleaved 1F1B | 4D test set                       |
+| FSDP 8, CP 8             | default                                           | to verify CP with a larger degree |
+
+![Llama 3.1 8B loss curves](../../../assets/images/loss_curves.png)

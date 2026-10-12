@@ -6,7 +6,7 @@ engine: cross-engine
 review_level: inventory-only
 runtime_validated: false
 sources: []
-generated_body_sha256: e97554677cd6340fc365fc3bf454466bf6e19534b77cc12cf653a462fba57f77
+generated_body_sha256: 78c5da53c648b06196efa374e37f9b31d3ce2feebadd5b76409d38125383408c
 ---
 
 # 官方来源覆盖目录
@@ -202,3 +202,73 @@ generated_body_sha256: e97554677cd6340fc365fc3bf454466bf6e19534b77cc12cf653a462f
 ## hygon-ai-train-simulator
 
 来源：HYGON-AI/hcu-train-simulator
+
+
+## pytorch-torchtitan
+
+来源：pytorch/torchtitan
+
+文档收录范围：Official pretraining/SFT/RL recipes, architecture, N-D sharding, performance, precision, data/checkpoint and debugging. Experimental modules remain explicitly experimental; upstream benchmark data are not HCU results.
+
+- [源码目录](../source-maps/pytorch-torchtitan.md)：1187 路径，固定 `65aaaa960698ab5d6e98c874177b41b9c30e9c58`，目录覆盖。
+- [文档目录](../upstream-docs/pytorch-torchtitan/)：扫描发现 64 份；保留 64 份（包含历史）；历史范围 0 份。扫描模式见 sources.json，pending 由更新运行报告给出。
+- 按已复核范围排除 12 份文档；规则与理由见 sources.json 的 document_exclusions。排除不代表上游删除，仍可按固定源码路径查阅。
+- [PR #4651：Fix EP shape live-outs by keeping same-root AllToAll dim-0 queries chunk-local](../prs/pytorch--torchtitan/PR-4651.md)
+- [PR #4760：[CP] Optimize Kimi K3 MLA all-gather and Ulysses communication](../prs/pytorch--torchtitan/PR-4760.md)
+- [PR #4772：Add global batch-wise MoE auxiliary loss](../prs/pytorch--torchtitan/PR-4772.md)
+- [PR #4835：[Deepseek V4] Dsv4 sparse indexer loss](../prs/pytorch--torchtitan/PR-4835.md)
+- [PR #5033：[KimiK3 Perf] Add local compilation and overrides fla kernel for Kimi attention residual](../prs/pytorch--torchtitan/PR-5033.md)
+- [PR #5101：Move FullAC to torch_remat](../prs/pytorch--torchtitan/PR-5101.md)
+- [PR #5107：[rl] Stage trainer weight casts in pinned CPU memory](../prs/pytorch--torchtitan/PR-5107.md)
+- [PR #5137：[HiMidLoLinear] Accumulate LM-head WGRAD into the running fp32 grad in place](../prs/pytorch--torchtitan/PR-5137.md)
+- [PR #5153：[module] Keep Module buffers in their dtype across module casts](../prs/pytorch--torchtitan/PR-5153.md)
+- [PR #5182：[rl] Fail an invalid generation request without crashing the generator](../prs/pytorch--torchtitan/PR-5182.md)
+- [PR #5186：[rl] DAPO-Math: score Math-Verify in worker processes with a hard timeout](../prs/pytorch--torchtitan/PR-5186.md)
+- [PR #5188：[rl] DAPO-Math grader: box the gold answer before parsing](../prs/pytorch--torchtitan/PR-5188.md)
+- [PR #5190：[rl] Extract the generator's engine loop into VLLMEngineLoop](../prs/pytorch--torchtitan/PR-5190.md)
+- [PR #5217：[rl] release a routing session when its rollout ends (2/5)](../prs/pytorch--torchtitan/PR-5217.md)
+- [PR #5218：[rl] drain mode: wait for the pinned generator instead of re-pinning (3/5)](../prs/pytorch--torchtitan/PR-5218.md)
+- [PR #5219：[rl] opt-in repin_load_ratio for sticky routing (4/5)](../prs/pytorch--torchtitan/PR-5219.md)
+- [PR #5220：[rl] hold each multi-turn session's KV between its turns (5/5)](../prs/pytorch--torchtitan/PR-5220.md)
+- [PR #5227：[fix] wandb: stop dropping validation metrics logged at a training step (1/2)](../prs/pytorch--torchtitan/PR-5227.md)
+- [PR #5228：[rl] Periodic validation, optionally overlapped with training (2/2)](../prs/pytorch--torchtitan/PR-5228.md)
+- [PR #5233：[WIP] [rl] Bump StickySessionRoutingStrategy max_sessions default to 262144](../prs/pytorch--torchtitan/PR-5233.md)
+- [PR #5234：[rl] Name training-loop timings by what they measure (1/2)](../prs/pytorch--torchtitan/PR-5234.md)
+- [PR #5235：[rl] Reply to the weight push from its worker thread, so the pull overlaps forward/backward (2/2)](../prs/pytorch--torchtitan/PR-5235.md)
+- [PR #5250：[Linear] In-place WGRAD accumulation for the bf16 Linear](../prs/pytorch--torchtitan/PR-5250.md)
+- [PR #5251：[rl] Fix generator OOM from weight sync spike](../prs/pytorch--torchtitan/PR-5251.md)
+- [PR #5254：[rl] Count every token in perf/trainer throughput; log controller GC time](../prs/pytorch--torchtitan/PR-5254.md)
+- [PR #5255：[rl] MoE router replay: train on the experts the generator chose](../prs/pytorch--torchtitan/PR-5255.md)
+- [PR #5256：[rl] keep session KV in an evict-last free-queue tier instead of pinning it (on #5220)](../prs/pytorch--torchtitan/PR-5256.md)
+- [PR #5257：[rl] vLLM priority scheduling: serve rollout groups in the order they started](../prs/pytorch--torchtitan/PR-5257.md)
+- [PR #5259：Fuse DSv3 sequence-wise loss forward/backward](../prs/pytorch--torchtitan/PR-5259.md)
+- [PR #5263：[MoE] Opt-in shared-expert overlap with deferred DeepEP dispatch](../prs/pytorch--torchtitan/PR-5263.md)
+- [PR #5266：Make the vision encoder CP-invariant, only dp_shard](../prs/pytorch--torchtitan/PR-5266.md)
+- [PR #5267：[qwen3.5] Raise offset_rmsnorm's recompile limit to 16](../prs/pytorch--torchtitan/PR-5267.md)
+- [PR #5268：[rl] FSDP generator: sync weights one FSDP module at a time](../prs/pytorch--torchtitan/PR-5268.md)
+- [PR #5269：[rl] spawn_proc_mesh: roles that share a host mesh get disjoint GPUs](../prs/pytorch--torchtitan/PR-5269.md)
+- [PR #5270：[rl] Verifiers generation server: reject prompts that leave no room for an output token](../prs/pytorch--torchtitan/PR-5270.md)
+- [PR #5271：[rl] RL model defaults in every run: fp32 lm_head, frozen MoE expert bias and router gate](../prs/pytorch--torchtitan/PR-5271.md)
+- [PR #5272：[rl] trainer ranks pull their own microbatches by RDMA ref](../prs/pytorch--torchtitan/PR-5272.md)
+- [PR #5273：[rl] Store each turn's prompt as a delta on the previous turn (linear-size multi-turn rollouts) (1/2)](../prs/pytorch--torchtitan/PR-5273.md)
+- [PR #5274：[rl] RolloutTurn and TrainingSample per-token fields as numpy arrays (2/2)](../prs/pytorch--torchtitan/PR-5274.md)
+- [PR #5276：[Kimi K3] Make the vision encoder CP-invariant](../prs/pytorch--torchtitan/PR-5276.md)
+- [PR #5277：Reorganize repo structure, dependencies, docs, and tests](../prs/pytorch--torchtitan/PR-5277.md)
+- [PR #5279：[DistMuon] Send redistributed inputs and directions in BF16](../prs/pytorch--torchtitan/PR-5279.md)
+- [PR #5280：Build sharded model configs; separate RL trainer and generator models](../prs/pytorch--torchtitan/PR-5280.md)
+- [PR #5282：Initialize CPU-offloaded EMA directly in pinned host storage](../prs/pytorch--torchtitan/PR-5282.md)
+- [PR #5283：Fix tuple assignment in spmd_types.py](../prs/pytorch--torchtitan/PR-5283.md)
+- [PR #5284：[rl] Build and pack training batches in their own process](../prs/pytorch--torchtitan/PR-5284.md)
+- [PR #5285：[rl] Add an opt-in RDMA fast path for trainer microbatches](../prs/pytorch--torchtitan/PR-5285.md)
+- [PR #5286：[rl] read each trainer rank's microbatches two ahead of training](../prs/pytorch--torchtitan/PR-5286.md)
+- [PR #5288：Resolve commits before checkout in loss_compare and checkpoint_compat_test](../prs/pytorch--torchtitan/PR-5288.md)
+- [PR #5289：[data] Give each DatasetConcatConfig child its own seed](../prs/pytorch--torchtitan/PR-5289.md)
+- [PR #5290：[rl] Controller GC: freeze the setup heap, fold generator metrics per rollout and group](../prs/pytorch--torchtitan/PR-5290.md)
+- [PR #5291：[rl] Build and pack training batches in their own process](../prs/pytorch--torchtitan/PR-5291.md)
+- [PR #5292：[rl] Drain in-flight rollouts during shutdown](../prs/pytorch--torchtitan/PR-5292.md)
+- [PR #5294：[rl] Keep Verifiers env-server workers off the trainer imports](../prs/pytorch--torchtitan/PR-5294.md)
+- [PR #5295：Remove shared SDPA and use Varlen attention in Flux](../prs/pytorch--torchtitan/PR-5295.md)
+- [PR #5296：[Attn] Remove SDPA and use Varlen attention in Flux](../prs/pytorch--torchtitan/PR-5296.md)
+- [PR #5298：[rl][easy] Require torchmonarch>=0.7.0](../prs/pytorch--torchtitan/PR-5298.md)
+- [PR #5299：[rl] offload idle session KV to CPU (6/6)](../prs/pytorch--torchtitan/PR-5299.md)
+- [PR #5300：[rl] Send each trainer DP replica only its column of the grid](../prs/pytorch--torchtitan/PR-5300.md)

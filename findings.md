@@ -304,3 +304,21 @@ capabilities.md 此前最近修改于 v0.6.1，v0.6.2 未单独同步 Wiki 命�
 ## 2026-10-12：总览图的信息层级
 
 总览无需枚举具体算子库/通信库；概括优先复用、能力或性能不足时基于对应库实现，并链接现有详细联动指南即可。扩规模与长稳部分需显式写精度/loss及恢复后的复核，交付需覆盖训练引擎及相关库/工具的责任归属、跨仓 PR 依赖和验证。保留原操作方法和运行边界，未增加阶段或修改执行逻辑。新版总览图采用更细边框/箭头和低饱和配色，深色文字维持可读性。
+
+## 2026-10-12：TorchTitan 当前主线入口
+
+官方 README 当前已采用 MODULE/CONFIG 选择 Python recipe，支持预训练/SFT 与 TitanRL，模型/并行/底层依赖必须以固定主线源码确认。历史 TOML/旧路径不可直接当作当前命令；官方 README 的支持或跑分不代表 HCU 已验证。将完整目录、正文精读与 PR 原文采集区分。
+
+### TorchTitan 初步源码核对
+
+- 固定主线 65aaaa960698ab5d6e98c874177b41b9c30e9c58。官方 Releases 最新非预发布 v0.3.0（2026-09-03），当前 main 的 assets/version.txt 仍是 0.2.2；版本文件不能替代发布查询或固定提交。
+- 现行调用链为 ConfigLoader → Trainer → TrainingEngine；训练行为由 Python recipe 配置，通用 --section.option 已不支持。模型 config 在构造时按 parallelism 分片，改变 CP/EP 等必须重建配置。
+- EP 从同一 dense world 切出 sparse mesh，不额外乘进 world_size；global token loss normalization、HSDP 梯度同步、torch_remat 区域与副作用要按现实现记录。
+- Fake PG / real-PP-fake-SPMD 仅验证有限配置、形状/显存路径，不能提供真实通信、loss 或吞吐结论。官方文档和当前源码也有历史表述差异，作者页明确以符号实现校核。
+
+### TorchTitan 优化与验证边界
+
+- 官方当前 CUDA graph 检查明确排除 ROCm；Kimi K3 的 DistMuon recipe 对 TP>1 报错，不能通过换 AdamW 掩盖训练语义变更。
+- #5033 的独立 Attention Residual Triton fwd+bwd 比 local compile 快，但指定端到端 debug 实验更慢；#5266 的视觉 CP 改造通信量减少，也没有直接带来 step 提速。把 kernel/collective 局部数据与模型结果分别保留。
+- #5137/#5250 的 WGRAD 优化依赖 AccumulateGrad 的 buffer 重挂接；分离 backward、tracing 和数值舍入必须一起看。#5107/#5268 的 RL 内存优化分别改变 trainer CPU staging 与 generator FSDP group 加载，不是统一开关。
+- 所有新来源通过既有动态 registry、全文索引、在线 PR 与固定代码链路工作，不需新增搜索后端或安装训练框架。Release/roadmap 由 Agent 定向核查，CLI 文档/PR 增量采集不等于自动理解所有新功能。
