@@ -34,10 +34,10 @@ def test_new_source_requires_authored_route(tmp_path):
 def test_missing_dimension_and_generated_page_cannot_pass(tmp_path):
     row = fixture(tmp_path)
     del row['dimensions']['call_chain']
-    generated = tmp_path / 'knowledge/source-maps/upstream.md'
-    generated.parent.mkdir()
+    generated = tmp_path / 'knowledge/projects/example/knowledgebase/upstream/source-map/upstream.md'
+    generated.parent.mkdir(parents=True)
     generated.write_text('# File listing')
-    row['entry'] = 'knowledge/source-maps/upstream.md'
+    row['entry'] = 'knowledge/projects/example/knowledgebase/upstream/source-map/upstream.md'
     save(tmp_path, row)
     errors = check.validate_coverage(tmp_path)
     assert any('call_chain' in x for x in errors)

@@ -104,8 +104,9 @@ def parser():
     q=cmd('wiki-read','id'); select=q.add_mutually_exclusive_group()
     select.add_argument('--generation'); select.add_argument('--project')
     cmd('wiki-catalog','project')
+    cmd('wiki-routes','project')
     q = cmd("wiki-search", "query"); q.add_argument("--limit", type=int, default=10); q.add_argument("--engine"); q.add_argument("--stage")
-    q.add_argument('--kind',choices=['authored','source-pr','source-map','source-document','site-knowledge','experiment-knowledge'])
+    q.add_argument('--kind',choices=['authored','source-pr','source-map','source-document','site-knowledge','experiment-knowledge','external-reference'])
     q.add_argument('--project', default=os.environ.get('TRAINFLOW_PROJECT','.')); q.add_argument('--online-pr',choices=['auto','always','off'],default='auto')
     q.add_argument('--pr-query'); q.add_argument('--repo',action='append',default=[]); q.add_argument('--source')
     q = cmd('wiki-search-pr', 'query'); q.add_argument('--project',default=os.environ.get('TRAINFLOW_PROJECT','.'))
@@ -271,6 +272,9 @@ def execute(a):
         generation=wiki.index_wiki(store,a.project)['generation'] if a.project else a.generation
         return wiki.read_page(store,a.id,generation)
     if c == 'wiki-catalog': return official.catalog(a.project)
+    if c == 'wiki-routes':
+        from .knowledge_layout import external_routes
+        return {'routes':external_routes(a.project), 'instruction':'Read external knowledge and verify the actual dependency; do not collect duplicate HCU repository Wikis or update HCU-Knowledge as a side effect.'}
     if c == 'wiki-search-pr':
         return official.annotate_prs(a.project,official.search_prs(store,a.query,official.engine_repos(a.project,a.engine,a.source,a.repo),
                                    limit=a.limit,state=a.state,branch=a.branch,page=a.page))

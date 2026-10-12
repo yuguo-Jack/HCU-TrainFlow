@@ -7,6 +7,7 @@ import base64
 import fnmatch
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import re
 from urllib.parse import quote, urlencode
@@ -14,6 +15,7 @@ from urllib.parse import quote, urlencode
 import yaml
 
 from . import wiki
+from . import knowledge_layout as layout
 from .core import FlowError, atomic_write, child, digest, fingerprint, read_json, safe_id, utc, write_json
 
 
@@ -29,10 +31,16 @@ def api(repo, suffix, token=None):
 
 
 def source_for(project, identity):
-    return next((s for s in read_json(Path(project)/'knowledge/sources.json') if s['id'] == identity), None)
+    layout.require_local_owner(project, identity)
+    source=next((s for s in read_json(Path(project)/'knowledge/sources.json') if s['id'] == identity), None)
+    if source:
+        layout.require_local_owner(project, source['repository'])
+    return source
 
 
 def engine_repos(project, engine=None, source=None, repos=()):
+    if source:
+        layout.require_local_owner(project, source)
     registry = read_json(Path(project)/'knowledge/sources.json')
     ids = set()
     if engine:
@@ -86,7 +94,7 @@ def search_prs(store, query, repos, token=None, limit=10, state='all', branch=No
 
 def annotate_prs(project, result):
     for row in result.get('results',[]):
-        path=Path(project)/'knowledge/prs'/row['repository'].replace('/','--')/f'PR-{row["number"]}.md'
+        path=layout.pr_root(project,row['repository'])/f'PR-{row["number"]}.md'
         meta,_=wiki.parse_page(path) if path.exists() else ({},'')
         row['locally_retained']=bool(meta)
         row['local_page_id']=meta.get('id')
@@ -184,6 +192,7 @@ def pr_page_hashes(project, identity, repository, previous=()):
             affected[page.relative_to(project).as_posix()]=digest(page.read_bytes())
     # Removing a citation cannot silently approve the surviving prose.
     for name in previous:
+        name=layout.current_path(project,name)
         page=child(project,name)
         if page.is_file():affected.setdefault(name,digest(page.read_bytes()))
     return affected
@@ -191,15 +200,17 @@ def pr_page_hashes(project, identity, repository, previous=()):
 
 def retain_pr(store, project, result, engine, token=None):
     """Explicitly publish public source material, never arbitrary private artifacts."""
+    project=Path(project).resolve()
     data=json.loads(store.artifact(result['artifact']))
     repo=repo_name(data['repository']); number=data['number']
+    layout.require_local_owner(project,repo)
     info,_=api(repo,'',token)
     if info.get('private') is not False:
         raise FlowError('Public Wiki accepts verified public repositories only')
     if any(not v['complete'] for v in data['coverage'].values() if isinstance(v,dict)):
         raise FlowError('Incomplete discussion pagination; keep prior published page and retry')
     slug=repo.replace('/','--'); pid=f'pr-{slug.lower()}-{number}'
-    path=Path(project)/'knowledge/prs'/slug/f'PR-{number}.md'
+    path=layout.pr_root(project,repo)/f'PR-{number}.md'
     old_meta,_=wiki.parse_page(path) if path.exists() else ({},'')
     retained={k:v for k,v in data.items() if k!='observed_at'}
     raw_bytes=json.dumps(retained,ensure_ascii=False,sort_keys=True,indent=2).encode()
@@ -225,7 +236,7 @@ def retain_pr(store, project, result, engine, token=None):
             if ref['repository'] and ref['commit']:
                 body+=f'  - [{side}](https://github.com/{ref["repository"]}/blob/{ref["commit"]}/{quote(name,safe="/")})\n'
     body+='\n## Evidence and interpretation boundary\n\n'
-    rel='../../evidence/prs/'+slug+'/'+raw.name
+    rel=Path(os.path.relpath(raw,path.parent)).as_posix()
     body+=f'[Original JSON, discussions and patches]({rel}) · SHA-256 `{raw_sha}`.\n\n'
     body+=f'Diff complete: {data["coverage"]["diff_complete"]}. Missing/binary/truncated patches require pinned source inspection. This is a source page, not an independently verified optimization case. Open, merged and released are different states; recheck the deployed dependency.\n'
     meta={'id':pid,'title':d['title'],'engine':engine,'stages':['adapt','optimize','fault-tolerance'],
@@ -236,7 +247,7 @@ def retain_pr(store, project, result, engine, token=None):
     pointer=store.root/'wiki/pr-review'/f'{pid}.json'
     prior=read_json(pointer) if pointer.exists() else {}
     affected=pr_page_hashes(project,pid,repo,prior.get('affected_pages',[]))
-    reviewed={p:d['page_sha256'] for p,d in prior.get('decisions',{}).get('pages',{}).items()}
+    reviewed=layout.current_hashes(project,{p:d['page_sha256'] for p,d in prior.get('decisions',{}).get('pages',{}).items()})
     invalidated=prior.get('status')=='content-reviewed' and reviewed!=affected
     if old_meta.get('artifact_sha256')!=raw_sha or not prior or invalidated or set(prior.get('affected_pages',[]))!=set(affected):
         write_json(pointer,{'id':pid,'artifact_sha256':raw_sha,'affected_pages':sorted(affected),
@@ -246,21 +257,24 @@ def retain_pr(store, project, result, engine, token=None):
 
 
 def review_pr(store, project, identity, decisions):
+    project=Path(project).resolve()
     safe_id(identity)
     pointer=store.root/'wiki/pr-review'/f'{identity}.json'
     pending=read_json(pointer)
     if pending['artifact_sha256']!=decisions.get('artifact_sha256'):raise FlowError('Review must address current retained PR artifact')
     if pending.get('page'):
-        source_page=child(project,pending['page'])
+        source_page=child(project,layout.current_path(project,pending['page']))
+        pending['page']=source_page.relative_to(project).as_posix()
         meta,_=wiki.parse_page(source_page)
     else:
         # Receipts created before project page bindings remain reviewable.
-        matches=[(page,meta) for page in (Path(project)/'knowledge/prs').rglob('*.md')
+        matches=[(page,meta) for page in (Path(project)/'knowledge/projects').rglob('PR-*.md')
                  if (meta:=wiki.parse_page(page)[0]).get('id')==identity]
         if len(matches)!=1:raise FlowError('Current retained PR source page is missing or ambiguous')
         source_page,meta=matches[0]
     if meta.get('id')!=identity or meta.get('artifact_sha256')!=pending['artifact_sha256']:
         raise FlowError('Current retained PR artifact changed; collect it again before review')
+    pending['affected_pages']=[layout.current_path(project,name) for name in pending['affected_pages']]
     affected=pr_page_hashes(project,identity,meta['repository'],pending['affected_pages'])
     if set(affected)!=set(pending['affected_pages']):
         pending={**pending,'affected_pages':sorted(affected),'status':'pending-content-review',
@@ -280,6 +294,7 @@ def review_pr(store, project, identity, decisions):
 
 
 def inventory(store, project, source_id, token=None, retain=False):
+    project=Path(project).resolve()
     source=source_for(project,source_id)
     if not source or source.get('kind')=='web':raise FlowError('Select registered Git source')
     repo=repo_name(source['repository'])
@@ -317,7 +332,7 @@ def inventory(store, project, source_id, token=None, retain=False):
         meta={'id':source_id+'-source-map','title':repo+' source directory map','kind':'source-map',
               'engine':source.get('engine',source_id),'review_level':'inventory-only','runtime_validated':False,
               'stages':['adapt','optimize','fault-tolerance'],'sources':[]}
-        generated_page(Path(project)/'knowledge/source-maps'/f'{source_id}.md',meta,body)
+        generated_page(layout.source_map(project,source_id),meta,body)
     return report
 
 
@@ -344,14 +359,18 @@ def triage_inventory(store, project, source_id, decisions):
 
 def sync_prs(store, project, source_id, token=None, max_prs=10, since=None):
     """Bounded resumable refresh, preserving failed records and discussion audits."""
+    project=Path(project).resolve()
     if not 1<=max_prs<=100:raise FlowError('max-prs must be 1..100')
     source=source_for(project,source_id)
     if not source or source.get('kind')=='web':raise FlowError('Select registered Git source')
     repo=repo_name(source['repository']); engine=source.get('engine',source_id)
     ledger_path=Path(project)/'knowledge/catalog/pr-ledgers'/f'{source_id}.json'
     ledger=read_json(ledger_path) if ledger_path.exists() else {'records':{},'scope':'registered PR sources plus recent updated discovery'}
+    for record in ledger['records'].values():
+        if record.get('page'):
+            record['page']=layout.current_path(project,record['page'])
     # Explicitly retained older PRs are also refreshed, even outside the discovery window.
-    for page in (Path(project)/'knowledge/prs'/repo.replace('/','--')).glob('PR-*.md'):
+    for page in layout.pr_root(project,repo).glob('PR-*.md'):
         meta,_=wiki.parse_page(page)
         ledger['records'].setdefault(str(meta['pr_number']),{'id':meta['id'],'updated_at':meta['updated_at']})
     state_path=store.root/'wiki/pr-sync'/f'{source_id}.json'
@@ -403,6 +422,7 @@ def sync_prs(store, project, source_id, token=None, max_prs=10, since=None):
 def apply_refresh(store, project, stage_id):
     safe_id(stage_id)
     stage=read_json(store.root/'wiki/staging'/f'{stage_id}.json')
+    layout.require_local_owner(project, stage['source'])
     receipt=read_json(store.root/'wiki/reviews'/f'{stage_id}.json')
     reviewed_pages = receipt.get('page_hashes', {p: d['page_sha256'] for p, d in receipt['decisions'].items()})
     if wiki.source_page_hashes(project, stage['source']) != reviewed_pages:
@@ -458,12 +478,16 @@ def select_document_paths(source, entries):
 
 def sync_documents(store, project, source_id, token=None, max_documents=40):
     """Discover documents from the complete fixed tree; retry incomplete batches."""
+    project=Path(project).resolve()
     if not 1<=max_documents<=500:raise FlowError('max-documents must be 1..500')
     source=source_for(project,source_id)
     if not source or source.get('kind')=='web':raise FlowError('Select Git source')
     rules=document_exclusions(source)
     ledger_path=Path(project)/'knowledge/catalog/document-ledgers'/f'{source_id}.json'
     ledger=read_json(ledger_path) if ledger_path.exists() else {'records':{}}
+    for record in ledger['records'].values():
+        if record.get('page'):
+            record['page']=layout.current_path(project,record['page'])
     retained_excluded=sorted(p for p in ledger['records'] if any(fnmatch.fnmatchcase(p,g) for g in rules))
     if retained_excluded:
         raise FlowError('Curate retained documents excluded by policy before syncing (pages, links and ledger): '
@@ -485,7 +509,7 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
         try:
             result=read_code(store,repo,sha,path,token,max_chars=1000000)
             raw=store.artifact(result['artifact'])
-            target=Path(project)/'knowledge/upstream-docs'/source_id/(path+'.md')
+            target=layout.document_root(project,source_id)/(path+'.md')
             body=f'# {repo} / {path}\n\n[Original at fixed commit]({result["url"]})\n\n'
             body+='Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.\n\n---\n\n'+raw.decode('utf-8')+'\n'
             meta={'id':'doc-'+source_id+'-'+fingerprint(path)[:20],'title':repo+' / '+path,'engine':source.get('engine',source_id),
@@ -517,6 +541,7 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
 
 
 def catalog(project):
+    project=Path(project).resolve()
     root=Path(project)/'knowledge'
     body='# 官方来源覆盖目录\n\n此页由来源目录和已保留页面重建。完整路径、文档采集和内容精读是不同覆盖层；没有逐模型或硬件验证的隐含承诺。\n\n'
     for source in read_json(root/'sources.json'):
@@ -528,20 +553,69 @@ def catalog(project):
             body+='文档收录范围：'+source['document_scope']+'\n\n'
         if tree.exists():
             value=read_json(tree)
-            body+=f'- [源码目录](../source-maps/{sid}.md)：{len(value["entries"])} 路径，固定 `{value["commit"]}`，目录覆盖。\n'
+            link=Path(os.path.relpath(layout.source_map(project,sid),root/'catalog')).as_posix()
+            body+=f'- [源码目录]({link})：{len(value["entries"])} 路径，固定 `{value["commit"]}`，目录覆盖。\n'
         if docs.exists():
             value=read_json(docs)
-            body+=f'- [文档目录](../upstream-docs/{sid}/)：扫描发现 {value["discovered"]} 份；保留 {len(value["records"])} 份（包含历史）；历史范围 {len(value.get("historical_paths",[]))} 份。扫描模式见 sources.json，pending 由更新运行报告给出。\n'
+            link=Path(os.path.relpath(layout.document_root(project,sid),root/'catalog')).as_posix()
+            body+=f'- [文档目录]({link}/)：扫描发现 {value["discovered"]} 份；保留 {len(value["records"])} 份（包含历史）；历史范围 {len(value.get("historical_paths",[]))} 份。扫描模式见 sources.json，pending 由更新运行报告给出。\n'
             if source.get('document_exclusions'):
                 body+=f'- 按已复核范围排除 {len(value.get("excluded_paths",{}))} 份文档；规则与理由见 sources.json 的 document_exclusions。排除不代表上游删除，仍可按固定源码路径查阅。\n'
         if source.get('kind')!='web':
-            for page in sorted((root/'prs'/source['repository'].replace('/','--')).glob('PR-*.md')):
+            for page in sorted(layout.pr_root(project,source['repository']).glob('PR-*.md')):
                 meta,_=wiki.parse_page(page)
                 body+=f'- [PR #{meta["pr_number"]}：{meta["title"]}](../{page.relative_to(root).as_posix()})\n'
         body+='\n'
     generated_page(root/'catalog/README.md',{'id':'official-source-catalog','title':'官方源码 文档 PR 覆盖与更新索引',
         'kind':'source-map','engine':'cross-engine','review_level':'inventory-only','runtime_validated':False,'sources':[]},body)
+    project_catalog(project)
     return {'status':'catalogued','source_count':len(read_json(root/'sources.json'))}
+
+
+def project_catalog(project):
+    """Rebuild navigation, keeping authored mechanisms separate from source copies."""
+    project=Path(project).resolve()
+    root=Path(project)/'knowledge'
+    coverage=root/'coverage.json'
+    groups={r['id']:r for r in read_json(coverage).get('projects',[])} if coverage.exists() else {}
+    registry=read_json(root/'sources.json')
+    identities={layout.project_id(project,source=s['id']) for s in registry}
+    if (root/'projects').exists():
+        identities.update(p.name for p in (root/'projects').iterdir() if p.is_dir())
+    index='# 官方工程 Wiki\n\n按工程归属组织。每个工程内 `upstream/` 保存来源，`local/` 保存经过整理的解释；来源数量不表示内容已全部复核。\n\n'
+    for identity in sorted(identities):
+        directory=root/'projects'/identity
+        group=groups.get(identity,{})
+        body=f'# {identity}\n\n'
+        if group.get('entry'):
+            target=Path(project)/group['entry']
+            title=wiki.parse_page(target)[0].get('title',identity)
+            link=Path(os.path.relpath(target,directory)).as_posix()
+            body+=f'从[工程总览：{title}]({link})进入。\n\n'
+        body+='## 整理后的知识\n\n'
+        for section,label in [('overview','定位与代码地图'),('guides','安装、运行与测试'),('topics','机制专题'),('cases','优化案例'),('changes','版本与更新')]:
+            pages=sorted((directory/'knowledgebase/local'/section).rglob('*.md'))
+            if not pages:continue
+            body+='### '+label+'\n\n'
+            for page in pages:
+                title=wiki.parse_page(page)[0].get('title',page.stem)
+                body+=f'- [{title}]({page.relative_to(directory).as_posix()})\n'
+            body+='\n'
+        body+='## 上游资料\n\n'
+        for source in registry:
+            if layout.project_id(project,source=source['id'])!=identity:continue
+            sid=source['id']
+            url=source['repository'] if source.get('kind')=='web' else 'https://github.com/'+source['repository']
+            body+=f'- [{sid}]({url})\n'
+        for kind,label in [('docs','官方文档原文'),('prs','PR 描述、review 与固定代码'),('source-map','完整源码路径')]:
+            path=directory/'knowledgebase/upstream'/kind
+            if path.exists():body+=f'- [{label}]({path.relative_to(directory).as_posix()}/)\n'
+        body+='\n原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。\n'
+        generated_page(directory/'README.md',{'id':'project-'+identity,'title':identity+' 官方工程 Wiki 导航',
+            'kind':'source-map','review_level':'navigation-only','runtime_validated':False,'sources':[]},body)
+        index+=f'- [{identity}]({identity}/README.md)\n'
+    generated_page(root/'projects/README.md',{'id':'official-projects-index','title':'官方工程 Wiki 目录',
+        'kind':'source-map','review_level':'navigation-only','runtime_validated':False,'sources':[]},index)
 
 
 def update_source(store, project, source_id, token=None, max_prs=10, max_documents=40, since=None):

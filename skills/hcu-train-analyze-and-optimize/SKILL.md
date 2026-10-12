@@ -30,7 +30,7 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 **并行组织热点工作。** 获取固定模型 profile 和真实调用契约后，“同 shape 独立实测与模型内对照”和“上限评估、融合挖掘与实现优化”是可并行的两条工作线，不以全部单测完成作为启动分析的前提。按实际热点把不同算子或实现独立的算子族分给不同成员；上限初估可先基于源码、FLOPs/字节量和匹配硬件参考，实测返回后修正效率、剩余空间及优先级。分析发现新的 shape/数值/dispatch 条件，应反向补充重放契约。模型内外差距指向竞争或等待时，与系统/通信负责人共享证据，避免只重写 kernel。共享 GPU/NIC/带宽上的性能测量串行，有可核验隔离资源才并行测；开发与 CPU 分析不必等待测量资源。每个可用候选独立验收并及时交流，最终在同一固定模型实例验证组合收益与数值，稳定阶段统一验 loss。任务依赖、编辑范围和结果验收遵循主控 Skill 的团队协议，不能为满足并行形式机械增加 Agent。
 
 1. **固定比较对象。** 初始基线不可覆盖；锁定源码、数据、环境、shape、拓扑、precision、sample/token 聚合和预算。未完成环境验收须标明对性能解释的限制。
-2. **先评估并行切分与显存预算。** 延续适配阶段容量判断，资源足够时优先完整参数配置，必要时参考 HCU Train Sim 并以实际短跑校准，不能习惯性缩层。 结合模型、卡数、机内/机间拓扑和实际 HCU 配方，参考局部 Wiki 的 `official-megatron-wiki/parallelism.md` 及官方并行/性能教程，比较 TP/PP/DP/CP/EP、SP、微批/梯度累积、重算与状态分片。先估最吃紧 rank 的峰值和必要余量，再以短跑实测吞吐、通信、PP 空泡和显存校准；不把显存填满作为目标。保持模型、有效全局 batch/token、精度与优化器语义可比；记录候选矩阵，选定布局后更新 rank 分组与算子 shape，再深入优化。只分析模式给建议，不擅自试跑。详见项目 `docs/workflows.md`。
+2. **先评估并行切分与显存预算。** 延续适配阶段容量判断，资源足够时优先完整参数配置，必要时参考 HCU Train Sim 并以实际短跑校准，不能习惯性缩层。 结合模型、卡数、机内/机间拓扑和实际 HCU 配方，参考局部 Wiki 的 `knowledge/projects/megatron/knowledgebase/local/topics/parallelism.md` 及官方并行/性能教程，比较 TP/PP/DP/CP/EP、SP、微批/梯度累积、重算与状态分片。先估最吃紧 rank 的峰值和必要余量，再以短跑实测吞吐、通信、PP 空泡和显存校准；不把显存填满作为目标。保持模型、有效全局 batch/token、精度与优化器语义可比；记录候选矩阵，选定布局后更新 rank 分组与算子 shape，再深入优化。只分析模式给建议，不擅自试跑。详见项目 `docs/workflows.md`。
 3. **抓训练端到端剖面。** 优先使用实际 HCU 启动链已有的 torch profiler 支持，必要时对照官方实现接入；保留已验收的环境与 launcher，并记录采集所需改动。每个实际非单例并行组至少两个有代表性的 rank。保留完整稳态步和 phase，区分 fwd/bwd/optimizer/通信/数据/checkpoint；跨 rank 先校时。warmup、编译和 profiling 开销不能混进性能对照。
 4. **按主要占比选择优化主线。** 空泡大先追数据、CPU launch、同步、PP 调度；通信大先与同条件预期核对，异常先排查，已符合单测预期的固有开销重点做 overlap/通算融合；负载不均用并行、路由、调度等框架措施，按需借鉴第三方引擎；计算占主导时按计算算子占比逐项推进；其他主导瓶颈仍存在时，可并行做独立计算分析。通信按 [通信优化专项](references/communication-optimization.md) 分 process group、消息量、拓扑、依赖、暴露尾部与最慢 rank。联合分析计算被并发拖慢、bucket/chunk/prefetch、通算融合及其同步协议；不能只凭 stream 重叠判定有效。关注显存 reserved/allocated、图池、临时/通信 buffer，以及保存恢复峰值。`GPU_MAX_HW_QUEUES` 按目标 runtime 和对照实测调节，没有通用最佳值。
 
@@ -60,7 +60,7 @@ HCU 算子/通信候选和底层构建按 [工程联动](references/hcu-library-
 
 TraceLens 使用 thirdparty 清单锁定的 HCU fork，保留上游完整模块和原生 CLI。TrainFlow 的报告、collective 与统一分析入口之外，按任务需要复用 TraceDiff、trace 分段/索引、源码定位及 EventReplay，具体依赖和入口见 docs/integrations.md 与 docs/tracelens-analysis.md。原生命令仍要遵循任务执行权限并记录私有输入/产物；缺少架构模型或事件映射时先标注缺口，优先用现有扩展点，必要的核心修改在独立 fork 开发 checkout 中完成并补回归。
 
-TE 精度、权重缓存、attention backend、userbuffers 和融合查 `knowledge/official-transformer-engine-wiki/`；cuDNN graph/plan、SDPA fwd/bwd、open-kernel 融合和 host 缓存查 `knowledge/official-cudnn-frontend-wiki/`。先读 Wiki 再定位目标版本源码与教程，保留 NV/HCU 实现边界和实际 dispatch 证据。
+TE 精度、权重缓存、attention backend、userbuffers 和融合查 `knowledge/projects/transformer-engine/README.md`；cuDNN graph/plan、SDPA fwd/bwd、open-kernel 融合和 host 缓存查 `knowledge/projects/cudnn-frontend/README.md`。先读 Wiki 再定位目标版本源码与教程，保留 NV/HCU 实现边界和实际 dispatch 证据。
 
 按项目 [优化参考选择表](../../docs/optimization-reference-map.md)联查 Megatron、TorchTitan、DeepSpeed、Primus、MindSpeed/MindSpeed-LLM、LoongForge 与相关 SFT/RL/推理依赖，不按厂商或引擎名称固定排序；各入口都可追官方教程、PR 和源码。先比较补丁基线/gitlink、触发条件、测试和回退；官方能力真正进入当前 HCU 分支且回归等价后再退役旧 patch。
 

@@ -21,6 +21,7 @@ import urllib.request
 import yaml
 
 from .core import FlowError, atomic_write, child, digest, fingerprint, read_json, safe_id, utc, write_json
+from . import knowledge_layout as layout
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -199,10 +200,12 @@ def pages(url, token=None, max_pages=100):
 
 def refresh_source(store, project, source_id, token=None, fixed_commit=None):
     safe_id(source_id)
+    layout.require_local_owner(project, source_id)
     registry = read_json(Path(project) / "knowledge/sources.json")
     source = next((x for x in registry if x["id"] == source_id), None)
     if not source:
         raise FlowError("Source is not registered")
+    layout.require_local_owner(project, source['repository'])
     if fixed_commit is not None and (source.get('kind') == 'web' or not re.fullmatch(r'[0-9a-f]{40}', fixed_commit)):
         raise FlowError('Fixed source acquisition requires a full Git commit')
     if source.get('kind') == 'web':
@@ -325,7 +328,7 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
                      if files.get(name, {}).get("sha256") != reviewed["files"].get(name, {}).get("sha256")
                      or (source.get('kind') == 'web' and files.get(name, {}).get('url') != reviewed['files'].get(name, {}).get('url')))
     page_hashes = source_page_hashes(project, source_id)
-    reviewed_hashes = reviewed.get('page_hashes', {p['page']: p['page_sha256'] for p in reviewed.get('affected_pages', [])})
+    reviewed_hashes = layout.current_hashes(project, reviewed.get('page_hashes', {p['page']: p['page_sha256'] for p in reviewed.get('affected_pages', [])}))
     # Removing a citation does not by itself review the surviving prose.
     for name in reviewed_hashes.keys() - page_hashes.keys():
         path = child(project, name)
@@ -343,8 +346,8 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
                 maintenance.extend(rule["targets"])
     pending_path=store.root/'wiki/workflow-pending'/(source_id+'.json')
     if pending_path.exists():
-        maintenance.extend(read_json(pending_path).get('targets',[]))
-    reviewed_workflows = reviewed.get('workflow_hashes', {})
+        maintenance.extend(layout.current_path(project,name) for name in read_json(pending_path).get('targets',[]))
+    reviewed_workflows = layout.current_hashes(project, reviewed.get('workflow_hashes', {}))
     for name, sha256 in reviewed_workflows.items():
         path = child(project, name)
         if not path.is_file() or digest(path.read_bytes()) != sha256:

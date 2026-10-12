@@ -157,7 +157,7 @@ fork 保留原有模块、API 和 13 个上游 console 命令；HCU 扩展通过
 ## 更新与回退
 
 1. TraceLens 同时查看 AMD 上游与 HCU fork 的差异、实际脚本/API；新版本可能修改报告字段、Skill 步骤和依赖。优先复用现有模块及扩展接口；需要核心修改时保留复现证据与回归。
-2. 经复核修改 manifest 的固定 commit，然后只同步选定依赖；dirty checkout 会阻止覆盖。
+2. 经复核修改 manifest 的固定 commit，同时复核 integration_contracts 中的接口文档并更新 reviewed_commit，然后只同步选定依赖；dirty checkout 会阻止覆盖。该绑定验证工具锁与接口维护状态，不要求采集 HCU fork 的仓库 Wiki。
 3. TraceLens 重新安装同一 Python，跑合成报告及目标 trace；算子 Skill 重新校验，再显式安装替换。
 4. 涉及 HCU-Knowledge 时按用户授权单独更新，使用它自己的安装/迁移/校验流程。
 5. 提交清单、相关用法和验证记录；回退到旧清单后重新同步/安装。正在运行的训练任务继续保留原来的源码和环境快照。

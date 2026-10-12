@@ -30,7 +30,7 @@
 
 [通信优化专项](../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md) 覆盖真实 process groups、消息与依赖、DP bucket/FSDP 预取、TP/EP/PP/CP 调度、chunk-ready、AG-GEMM/GEMM-RS 和设备侧通算融合。对照纯通信、纯计算、模型内并发与整步表现，量化暴露时间、计算退化和额外显存，不以时间线相交宣称加速。
 
-先评估并行切分与显存预算、核对布局和性能基线，再用端到端采样确定优先方向。系统调参、overlap、显存、融合和形状级实现优化按证据分流，不要求依次做完每一类才处理下一类。并行度、微批/梯度累积、重算与状态分片共同影响显存、通信、PP 空泡和算子 shape；优化候选按最吃紧 rank 的峰值及必要余量筛选，再用 profiler-off 吞吐实测选择，不能只追求“能装下”或“占满显存”。具体对照项和已有官方教程见 [并行切分与显存调参](../knowledge/official-megatron-wiki/parallelism.md#调参推理)。
+先评估并行切分与显存预算、核对布局和性能基线，再用端到端采样确定优先方向。系统调参、overlap、显存、融合和形状级实现优化按证据分流，不要求依次做完每一类才处理下一类。并行度、微批/梯度累积、重算与状态分片共同影响显存、通信、PP 空泡和算子 shape；优化候选按最吃紧 rank 的峰值及必要余量筛选，再用 profiler-off 吞吐实测选择，不能只追求“能装下”或“占满显存”。具体对照项和已有官方教程见 [并行切分与显存调参](../knowledge/projects/megatron/knowledgebase/local/topics/parallelism.md#调参推理)。
 
 [TraceLens 分析链路](workflow-map.md#36-tracelens-证据怎样进入优化闭环)按问题接入时间线、Graph 调用归属、Roofline/效率、EventReplay 和 HCU profiler 证据。原生 Agent 指标准备后仍需实际推理与复核；高占比未知项继续查证，预测空间须通过无 profiler 的局部及整步对照验证。只分析时读取已有证据、补充获准采集并给出建议，不擅自实施优化。
 

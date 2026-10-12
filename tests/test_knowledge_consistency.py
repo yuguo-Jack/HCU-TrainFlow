@@ -48,7 +48,7 @@ def source_ref(commit, sha):
 @pytest.fixture
 def project(tmp_path):
     write_json(tmp_path, 'knowledge/sources.json', [{
-        'id': 'tool', 'repository': 'org/tool', 'ref': 'main',
+        'id': 'tool', 'knowledge_project': 'tool', 'repository': 'org/tool', 'ref': 'main',
         'paths': ['kernel.py'], 'baseline_commit': CURRENT,
         'baseline_files': {'kernel.py': {'sha256': CURRENT_HASH}},
     }])
@@ -66,8 +66,9 @@ def project(tmp_path):
                                 'current_pages': ['knowledge/current.md']}],
     })
     page(tmp_path, 'knowledge/current.md', {'id': 'current', 'sources': [source_ref(CURRENT, CURRENT_HASH)]})
+    page(tmp_path, 'knowledge/projects/tool/README.md', {'id':'project-tool'})
     page(tmp_path, 'knowledge/historical.md', {'id': 'historical', 'sources': [source_ref(OLD, OLD_HASH)]})
-    page(tmp_path, 'knowledge/source-maps/tool.md', {'id': 'map', 'kind': 'source-map'},
+    page(tmp_path, 'knowledge/projects/tool/knowledgebase/upstream/source-map/tool.md', {'id': 'map', 'kind': 'source-map'},
          f'# Directory\n\nCommit `{CURRENT}` · ref `main`.')
     write_json(tmp_path, 'knowledge/catalog/repositories/tool.json', {
         'source': 'tool', 'repository': 'org/tool', 'ref': 'main', 'commit': CURRENT, 'entries': {},
@@ -77,6 +78,22 @@ def project(tmp_path):
 
 def errors(project):
     return validator.validate(project)['errors']
+
+
+def test_external_hcu_source_cannot_be_registered_again(project):
+    edit_json(project,'knowledge/sources.json',lambda rows:rows[0].update(repository='HYGON-AI/tool'))
+    assert any('HCU-Knowledge' in e for e in errors(project))
+
+
+def test_dependency_commit_change_requires_integration_contract_review(project):
+    write_json(project,'thirdparty/manifest.json',{
+        'dependencies':[{'id':'runtime','commit':CURRENT}],
+        'integration_contracts':[{'dependency':'runtime','reviewed_commit':OLD,
+                                  'documents':['knowledge/current.md']}],
+    })
+    assert any('integration contract needs' in e for e in errors(project))
+    edit_json(project,'thirdparty/manifest.json',lambda v:v['integration_contracts'][0].update(reviewed_commit=CURRENT))
+    assert errors(project)==[]
 
 
 def test_current_coverage_allows_intentionally_pinned_history(project):
@@ -116,7 +133,7 @@ def test_equal_commit_can_be_referenced_by_a_release_tag(project):
     {'dependency': 'missing', 'source': 'tool', 'current_pages': ['knowledge/current.md']},
     {'dependency': 'runtime', 'source': 'missing', 'current_pages': ['knowledge/current.md']},
     {'dependency': 'runtime', 'source': 'tool', 'current_pages': []},
-    {'dependency': 'runtime', 'source': 'tool', 'current_pages': ['knowledge/source-maps/tool.md']},
+    {'dependency': 'runtime', 'source': 'tool', 'current_pages': ['knowledge/projects/tool/knowledgebase/upstream/source-map/tool.md']},
 ])
 def test_binding_requires_real_dependency_source_and_authored_coverage(project, binding):
     edit_json(project, 'thirdparty/manifest.json', lambda v: v.update(dependency_sources=[binding]))
@@ -124,20 +141,20 @@ def test_binding_requires_real_dependency_source_and_authored_coverage(project, 
 
 
 def test_a_valid_generated_body_hash_does_not_hide_stale_map_commit(project):
-    page(project, 'knowledge/source-maps/tool.md', {'id': 'map', 'kind': 'source-map'},
+    page(project, 'knowledge/projects/tool/knowledgebase/upstream/source-map/tool.md', {'id': 'map', 'kind': 'source-map'},
          f'# Directory\n\nCommit `{OLD}` · ref `main`.')
     assert any('source map/catalog commit mismatch' in e for e in errors(project))
 
 
 def document(project, commit=OLD, sha=OLD_HASH):
-    page(project, 'knowledge/upstream-docs/tool/readme.md', {
+    page(project, 'knowledge/projects/tool/knowledgebase/upstream/docs/tool/README.md.md', {
         'id': 'doc', 'kind': 'source-document', 'repository': 'org/tool',
         'path': 'README.md', 'commit': commit, 'raw_sha256': sha,
     }, '# Upstream\n\n[Upstream relative link](not-copied.md)')
     write_json(project, 'knowledge/catalog/document-ledgers/tool.json', {
         'commit': CURRENT, 'historical_paths': [],
         'records': {'README.md': {'commit': OLD, 'sha256': OLD_HASH,
-                                 'page': 'knowledge/upstream-docs/tool/readme.md'}},
+                                 'page': 'knowledge/projects/tool/knowledgebase/upstream/docs/tool/README.md.md'}},
     })
 
 
@@ -168,7 +185,7 @@ def test_malformed_exclusion_policy_does_not_silently_allow_documents(project):
 def test_inventory_is_not_runtime_validation_but_a_measured_site_may_be(project):
     page(project, 'knowledge/site.md', {'id': 'site', 'kind': 'site-knowledge', 'runtime_validated': True})
     assert errors(project) == []
-    page(project, 'knowledge/source-maps/tool.md', {'id': 'map', 'kind': 'source-map', 'runtime_validated': True},
+    page(project, 'knowledge/projects/tool/knowledgebase/upstream/source-map/tool.md', {'id': 'map', 'kind': 'source-map', 'runtime_validated': True},
          f'# Directory\n\nCommit `{CURRENT}` · ref `main`.')
     assert any('cannot claim runtime validation' in e for e in errors(project))
 
@@ -192,7 +209,7 @@ def test_matching_artifact_hash_does_not_hide_wrong_pr_identity(project):
     artifact = {'repository': 'other/tool', 'number': 12}
     name = 'knowledge/evidence/prs/org--tool/12.json'
     write_json(project, name, artifact)
-    page(project, 'knowledge/prs/org--tool/PR-12.md', {
+    page(project, 'knowledge/projects/tool/knowledgebase/upstream/prs/org--tool/PR-12.md', {
         'id': 'pr-org--tool-12', 'kind': 'source-pr', 'repository': 'org/tool',
         'pr_number': 12, 'artifact_path': name,
         'artifact_sha256': hashlib.sha256((project / name).read_bytes()).hexdigest(),

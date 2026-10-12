@@ -34,6 +34,8 @@
 
 ## 官方 Wiki 的统一阅读粒度
 
+官方资料按 `knowledge/projects/<project>/knowledgebase/{upstream,local}` 统一组织，原文/PR 与整理后的机制解释分开；HCU 仓库知识通过 HCU-Knowledge 联查，本仓仅维护工作流接口和有复用价值的经验。
+
 所有登记来源共用[九项内容标准](wiki-authoring-standard.md)：定位、目录、安装、运行测试、数值/状态契约、调用链、性能显存、诊断恢复、版本与 PR。各仓入口和具体机制见[覆盖导航](../knowledge/COVERAGE.md)，跨引擎优化见[参考选择](optimization-reference-map.md)。Megatron、TorchTitan、DeepSpeed、SFT/RL、推理后端与第三方参考均有同等阅读维度；页数可以不同，不能用大量原文或 PR 数量代替专题讲解。
 
 源码目录、教程和 PR 增量分别采集；作者页说明选定机制、证据及边界，正文复核后才应用来源更新。组织检查仅确认阅读入口完整，不证明每个结论正确或通过 HCU 实测。发布线、开发分支和未合入 PR 分开追踪；本轮没有增加训练、性能或故障注入的硬件验证声明。

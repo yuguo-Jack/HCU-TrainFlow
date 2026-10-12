@@ -51,7 +51,7 @@
 
 ## 5. 版本查证入口
 
-需要 PyTorch 原生训练的完整实现参考时，读取项目 Wiki 的 `knowledge/official-torchtitan-wiki/overview.md`，通过 Wiki search 继续查配方、并行/重算、局部编译、MoE/低精度、梯度累积和 RL 权重同步案例。先看它的版本与支持限制，再追 PR 和固定源码；这些是机制参考，不自动成为 HCU 部署配方，也不要求当前任务使用 TorchTitan。
+需要 PyTorch 原生训练的完整实现参考时，读取项目 Wiki 的 `knowledge/projects/torchtitan/knowledgebase/local/overview/overview.md`，通过 Wiki search 继续查配方、并行/重算、局部编译、MoE/低精度、梯度累积和 RL 权重同步案例。先看它的版本与支持限制，再追 PR 和固定源码；这些是机制参考，不自动成为 HCU 部署配方，也不要求当前任务使用 TorchTitan。
 
 - [PyTorch compile 教程](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial)：eager 与编译调用路线。
 - [编译问题定位源码文档](https://github.com/pytorch/pytorch/blob/main/docs/source/user_guide/torch_compiler/torch.compiler_troubleshooting.md)：断图、重编译、定位方法。

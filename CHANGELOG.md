@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.7 — 2026-10-12
+
+- Organize official Wikis by project under `knowledge/projects/<project>/knowledgebase/{upstream,local}`. Keep tutorials, PR source pages and source maps with their project; keep immutable PR JSON centrally. Add generated project navigation and update links, coverage, ledgers, collection paths and installed reading routes.
+- Delegate HCU repository knowledge to HCU-Knowledge instead of maintaining duplicate Cluster Manager, Train Simulator or HCU TraceLens Wikis. Preserve searchable external routes, workflow maintenance targets and verified experience. Keep official AMD TraceLens knowledge separate from the pinned HCU integration contract.
+- Preserve retained page IDs and original document/PR evidence bytes. Resolve old maintenance paths without approving stale content; changed interpretations still require review. Block HCU repository re-import through official collectors and validation.
+- Replace the isolated release snapshot archive with official release links and relevant version explanations. Keep substantial optimization cases distinct from routine changes.
+- Validate migration, indexing, incremental refresh, review compatibility and installation offline; this change adds no new hardware qualification.
+
 ## 0.6.6 — 2026-10-12
 
 - Align affected environment, adaptation, library-tuning and recovery guidance with the latest read-only HCU-Knowledge audit; refresh its dependency pin while preserving the existing local checkout binding. Distinguish Cluster Manager result schemas and exit status, actual grouped-GEMM arguments, backend/version coupling and recovery ownership.

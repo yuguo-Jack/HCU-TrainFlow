@@ -20,10 +20,12 @@
 
 ## 页面与证据
 
-- 总览作为工程入口，链接运行指南、机制专题、案例、官方文档和 PR。保留既有路径和 ID，避免更新后旧查询入口失效。
+- 每个工程以 `knowledge/projects/<project>/README.md` 统一导航，`knowledgebase/upstream` 放官方文档/PR/源码地图，`knowledgebase/local` 放 overview/guides/topics/cases/changes。路径调整同步引用与迁移映射，保持页面 ID 稳定。
 - 机制专题写清 **问题 → 配置/调用链 → 实现位置 → 适用条件 → 验证 → 限制/回退**。关联到实际文件、符号和完整固定提交；对重要 PR 同时读描述、review、最终代码与测试。
 - 案例使用相同证据标准，不要求将所有 PR 写成案例。引用上游性能数字时保留设备、输入、版本和测量范围；没有实测不填估计收益。
 - 原文、PR 与全仓路径保存在原来源层。作者正文解释机制和选择，不粘贴整篇文档，也不通过通用模板重复凑篇幅。
+
+上述内容维度适用于局部官方工程；HCU 仓库知识归 HCU-Knowledge，不在 TrainFlow 再建平行 Wiki。HCU 工具的流程接口和适用边界留本仓 docs，通用使用经验按规范进 sites；联查与受影响用法登记 `catalog/external-knowledge.json`。Release/roadmap 保留官方入口与必要版本解释，不要求单独归档发布页 JSON。
 
 ## 更新时如何选择案例
 

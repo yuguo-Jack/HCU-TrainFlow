@@ -13,6 +13,8 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 维护 HCU-TrainFlow-Wiki 的官方资料、可复用环境经验、模型最终优化总结，以及随源变化的工作流用法。它可以由训练任务按需主动调用；不替代或触发 HCU 大知识库 update。
 
+**知识归属先于采集。** 官方项目统一在 `knowledge/projects/<project>/knowledgebase/`：`upstream` 放原文、PR 和源码地图，`local` 放整理后的总览/指南/专题/案例/版本解释。`sources.json.knowledge_project` 决定生成位置，新增资料不要重建旧的分散目录。HCU 仓库知识通过 `$hcu-knowledge-search` 查询，不在本仓再收 HCU 源码文档、PR 或整套项目 Wiki；有明确的大库修订请求才另用其 update Skill。普通 HCU 源码查证保留任务缓存。
+
 ## 调用时机与更新范围
 
 先读 `docs/knowledge-architecture.md` 的“任务中的维护时机”。任务初期在确认模型、环境和执行分支后检查相关官方资料的新鲜度，有影响的缺口在依赖该事实前定向更新；环境验收和优化阶段收尾分别筛选通用站点经验与已验收的模型最终总结，任务最终完成前再汇总一次。恢复任务先读已有处理记录，不能每次轮询重复刷新。
@@ -32,7 +34,7 @@ HCU 大知识库已更新或用户要求对齐时，先只读核对其当前提�
    官方发布与 roadmap 的查证入口见 `docs/wiki.md`“未收录的官方内容按需查证”；它们可能位于 Releases、官网、Issue/Discussion/Project，不能以 PR 采集代替。影响当前任务时按需阅读并追实现；持续策展按维护范围登记来源与覆盖缺口，未被现有采集器覆盖的页面不能宣称已自动全量同步。SFT/RL 模型专题可后续深化，当前问题仍须追官方模型配置、recipe 和 backend 源码。
 5. 对每个 affected overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
    PR 描述、review 或 diff 更新即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
-6. 按 knowledge/maintenance.json 同时检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤。HCU 命令可以依托大知识库当前内容或自主看最新工程源码；任务所用 HCU 模型脚本、其引入的环境配置、launcher 或依赖变化时，一并复核 adapt/optimize 的用法和任务配方。本仓 `knowledge/sites/` 同步维护实际站点配置与配方及关键证据；不能只更新官方 Wiki 文本。
+6. 按 knowledge/maintenance.json 检查官方变化影响；另读 knowledge/catalog/external-knowledge.json（或 `wiki-routes PROJECT`）核对 HCU 工具的维护关联。依托大库与实际部署/最新源码检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤；只修订本仓使用契约，不复制 HCU 仓库知识。任务所用 HCU 模型脚本、环境配置、launcher 或依赖变化时，复核适配/分析优化用法和配方。可复用站点经验按规范放 `knowledge/sites/`，临时排查留任务档案；检查依据、版本及未验证项记入本轮维护记录。
    新增或升级 HCU Primus Turbo、UCCL、UltraEP、MoonEP 等库时，复核 optimize 的 `references/hcu-library-integration.md`、通信专项及 adapt/规模长稳 Skill 调用；分别核对 HCU 主线/专项线、ABI/编译器、provider、同步/异步/精度边界与消费者。知识检索不足时读实际源码，不自动刷新大知识库。
    HCU Train Simulator 或训练引擎的模型 adapter、显存/求解公式、Profile、并行约束变化时，复核 `docs/practices/capacity-and-parallel-experiments.md` 和 adapt/optimize/coordinator；检查全参判断、余量与多实例资源隔离，保留旧预测/实测版本，不自动切换活动训练依赖。
    PyTorch/编译器/DDP/FSDP 或通信库版本变化时，同步复核 optimize 的 `references/torch-native-training.md` 和 `references/communication-optimization.md`；核实日志接口、编译/通信触发、同步与 buffer 生命周期。未登记的依赖变化也要按任务版本主动查源码，不能因为不在维护清单就跳过。
@@ -46,7 +48,7 @@ HCU 大知识库已更新或用户要求对齐时，先只读核对其当前提�
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。
 
-TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查看 fork 的上游基准、补丁记录及 HCU 验证状态；保留可复用模块和全部原生能力，优先扩展现有解析/模型。上游已有等价修复时经回归后退役本地补丁，不能只改 Wiki 就自动推进训练依赖。
+TraceLens 的官方来源为 `amd-agi-tracelens`；HCU fork 通过外部维护关联、thirdparty 锁和 docs 的集成契约核对，不能再作为局部 Wiki 来源采集。检查其上游基准、接口、补丁与 HCU 验证状态；上游有等价修复时经回归再退役本地补丁。锁变化时同步复核 manifest 的 integration_contracts，不能只改 Wiki 就自动推进训练依赖。
 
 精度方法维护还需复核项目 `docs/practices/model-accuracy-diagnosis.md` 与三个阶段的入口。按 HCU-Knowledge 的 dcu_probe 项目或当前源码核对 hcu-probe/hcuprobe 包与 CLI、配置、hook/异步快照/flush、compare 映射和跨 rank 首差、训推接入；同时核对 PyTorch/TE 的精度与随机性接口。来源变更不代表所有后端已实测，保留登记/离线/现场的验证范围，不自动刷新 HCU 大库。
 

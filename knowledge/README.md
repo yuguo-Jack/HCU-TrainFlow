@@ -23,11 +23,12 @@ visibility: public
 ## 搜索与来源层
 
 - [PR 描述、review、diff 与固定源码索引](PR-INDEX.md)
-- [全仓源码路径](source-maps/) / [官方教程原文](upstream-docs/) / [来源游标与文档清单](catalog/)
+- [按项目进入：整理后的知识、官方文档、PR 与源码地图](projects/README.md)
+- [全库来源游标与文档清单](catalog/) / [外部 HCU 知识与用法关联](catalog/external-knowledge.json)
 - [搜索与持续更新](../docs/wiki.md) / [私有训练经验与 Cookbook 记录](../docs/experience-knowledge.md)
-- [Megatron LM/Core 工程地图](official-megatron-wiki/engineering-guide.md)
-- [Paged Stash launch 与 PR 描述漂移案例](official-megatron-wiki/cases/paged-stash-launch.md)
-- [DeepSpeed offload 梯度生命周期案例](engines/deepspeed-offload-lifetime.md)
+- [Megatron LM/Core 工程地图](projects/megatron/knowledgebase/local/overview/engineering-guide.md)
+- [Paged Stash launch 与 PR 描述漂移案例](projects/megatron/knowledgebase/local/cases/paged-stash-launch.md)
+- [DeepSpeed offload 梯度生命周期案例](projects/deepspeed/knowledgebase/local/cases/deepspeed-offload-lifetime.md)
 
 ## 官方工程与优化参考
 
@@ -35,23 +36,23 @@ visibility: public
 
 | 工程 | 阅读入口与核心问题 |
 | --- | --- |
-| [Megatron LM/Core](official-megatron-wiki/overview.md) | 并行与调度、训练 loss、MoE、offload/Paged Stash、checkpoint |
-| [Megatron Bridge](official-megatron-wiki/bridge.md) | 配方配置、模型转换、训练接入与状态归属 |
-| [Energon](official-megatron-wiki/energon.md) | 数据管线、packing、多 worker 分片与精确恢复 |
-| [TorchTitan](official-torchtitan-wiki/overview.md) | Torch 原生分布式训练、compile/融合、MoE、TitanRL |
-| [DeepSpeed](engines/deepspeed.md) | ZeRO 状态/内存、offload 流生命周期、流水及恢复 |
-| [MS-SWIFT](engines/swift.md) | SFT packing/loss、Megatron 与 GRPO 权重生命周期 |
-| [LLaMA-Factory](engines/llamafactory.md) | 多模态 SFT、LoRA、两代入口、CP 与 chunk loss |
-| [verl](engines/verl.md) | 动态批次、策略 loss、训推权重/KV 与 checkpoint |
-| [slime](engines/slime.md) | packed CP、策略更新、增量权重与训练恢复 |
-| [AReaL](engines/areal.md) | 异步 rollout、策略版本、更新与恢复一致性 |
-| [SGLang](engines/sglang.md) | rollout 调度/显存、权重更新与 cache 边界 |
-| [vLLM](engines/vllm.md) | sleep/wake、分布式权重物化、replica 与 KV 生命周期 |
-| [AMD Primus](ecosystem/primus.md) | 后端、版本锁、重算、编译与通信 overlap |
-| [MindSpeed / MindSpeed-LLM](ecosystem/mindspeed.md) | 核心机制与模型 recipe、MoE/流水、精度与约束 |
-| [百度 LoongForge](ecosystem/loongforge.md) | 模型适配、EP overlap、offload 与固定子仓 |
-| [Transformer Engine](official-transformer-engine-wiki/overview.md) | 低精度/缓存、attention、融合、权重布局及前后向 |
-| [cuDNN Frontend](official-cudnn-frontend-wiki/overview.md) | Graph/plan、开放 kernel、稀疏 attention 与 autograd |
+| [Megatron LM/Core](projects/megatron/knowledgebase/local/overview/overview.md) | 并行与调度、训练 loss、MoE、offload/Paged Stash、checkpoint |
+| [Megatron Bridge](projects/bridge/knowledgebase/local/overview/bridge.md) | 配方配置、模型转换、训练接入与状态归属 |
+| [Energon](projects/energon/knowledgebase/local/overview/energon.md) | 数据管线、packing、多 worker 分片与精确恢复 |
+| [TorchTitan](projects/torchtitan/knowledgebase/local/overview/overview.md) | Torch 原生分布式训练、compile/融合、MoE、TitanRL |
+| [DeepSpeed](projects/deepspeed/knowledgebase/local/overview/engineering-guide.md) | ZeRO 状态/内存、offload 流生命周期、流水及恢复 |
+| [MS-SWIFT](projects/swift/knowledgebase/local/overview/engineering-guide.md) | SFT packing/loss、Megatron 与 GRPO 权重生命周期 |
+| [LLaMA-Factory](projects/llamafactory/knowledgebase/local/overview/engineering-guide.md) | 多模态 SFT、LoRA、两代入口、CP 与 chunk loss |
+| [verl](projects/verl/knowledgebase/local/overview/engineering-guide.md) | 动态批次、策略 loss、训推权重/KV 与 checkpoint |
+| [slime](projects/slime/knowledgebase/local/overview/engineering-guide.md) | packed CP、策略更新、增量权重与训练恢复 |
+| [AReaL](projects/areal/knowledgebase/local/overview/engineering-guide.md) | 异步 rollout、策略版本、更新与恢复一致性 |
+| [SGLang](projects/sglang/knowledgebase/local/overview/engineering-guide.md) | rollout 调度/显存、权重更新与 cache 边界 |
+| [vLLM](projects/vllm/knowledgebase/local/overview/engineering-guide.md) | sleep/wake、分布式权重物化、replica 与 KV 生命周期 |
+| [AMD Primus](projects/primus/knowledgebase/local/overview/engineering-guide.md) | 后端、版本锁、重算、编译与通信 overlap |
+| [MindSpeed / MindSpeed-LLM](projects/mindspeed/knowledgebase/local/overview/engineering-guide.md) | 核心机制与模型 recipe、MoE/流水、精度与约束 |
+| [百度 LoongForge](projects/loongforge/knowledgebase/local/overview/engineering-guide.md) | 模型适配、EP overlap、offload 与固定子仓 |
+| [Transformer Engine](projects/transformer-engine/knowledgebase/local/overview/overview.md) | 低精度/缓存、attention、融合、权重布局及前后向 |
+| [cuDNN Frontend](projects/cudnn-frontend/knowledgebase/local/overview/overview.md) | Graph/plan、开放 kernel、稀疏 attention 与 autograd |
 
 HCU 实际仓库、分支和修改归属通过 [HCU 库联动](../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)与大知识库查证；上述官方能力不自动等于 HCU 分支已适配。
 
@@ -59,13 +60,19 @@ HCU 实际仓库、分支和修改归属通过 [HCU 库联动](../skills/hcu-tra
 
 | 工程 | 核心内容 |
 | --- | --- |
-| [TraceLens](tooling/tracelens.md) | 调用树、Graph、通信、Roofline、Replay 与 Agent 分析 |
-| [HCU Cluster Manager](tooling/cluster-manager.md) | 当前环境检查入口、结果判读、作业控制和恢复 |
-| [HCU Train Simulator](tooling/train-simulator.md) | 模型容量、并行方案及实测校准 |
-| [Hyperloom](tooling/hyperloom.md) | 证据更新、dispatch/oracle、优化与知识沉淀 |
-| [BBuf Skills](tooling/bbuf-skills.md) | 性能分析、诊断与有界实验的方法参考 |
+| [TraceLens](projects/tracelens/knowledgebase/local/overview/engineering-guide.md) | 调用树、Graph、通信、Roofline、Replay 与 Agent 分析 |
+| [Hyperloom](projects/hyperloom/knowledgebase/local/overview/engineering-guide.md) | 证据更新、dispatch/oracle、优化与知识沉淀 |
+| [BBuf Skills](projects/bbuf-skills/knowledgebase/local/overview/engineering-guide.md) | 性能分析、诊断与有界实验的方法参考 |
 
 工具输入/输出与数值、实际执行和上游方法的适用范围分别说明；不套用不存在的模型训练能力。
+
+## HCU 知识联查
+
+HCU 仓库的目录、构建、源码、PR 和案例由 HCU-Knowledge 维护。本库不复制其项目 Wiki：[Cluster Manager](catalog/external/cluster-manager.md)、[Train Simulator](catalog/external/train-simulator.md)提供大库入口；[HCU TraceLens](catalog/external/hcu-tracelens.md)连接实际工具与本仓集成契约。其他 HCU 工程按问题调用 `$hcu-knowledge-search`。通用工具方法和已验证站点经验仍分别归 docs 与 sites。
+
+## 目录规则
+
+每个官方项目位于 `projects/<project>/`，`README.md` 统一导航。项目内 `knowledgebase/upstream/{docs,prs,source-map}` 保存来源，`knowledgebase/local/{overview,guides,topics,cases,changes}` 保存解释。跨项目原始 PR JSON 集中放 `evidence/prs/`，每篇 PR 页链接其固定原件。`catalog/` 维护游标与关联。Release/roadmap 通过官方链接和相关版本解释查证，不另建发布页全量快照库。
 
 ## 更新方法
 

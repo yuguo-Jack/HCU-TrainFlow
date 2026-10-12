@@ -6,11 +6,13 @@
 
 | 位置 | 内容和边界 |
 | --- | --- |
-| `official-*-wiki/`、`engines/`、`ecosystem/` | 作者编写的总览、调用链、专题、案例，有明确阅读范围 |
-| `upstream-docs/<source>/` | 固定提交中的官方文档全文，source-document，不自动成为 HCU 配方 |
-| `prs/<owner--repo>/` | PR 描述、普通/行内评论、独立 review、固定文件入口，source-pr |
+| `projects/<project>/README.md` | 同一工程的统一阅读入口 |
+| `projects/<project>/knowledgebase/local/` | 总览、指南、专题、案例与版本解释，有明确阅读范围 |
+| `projects/<project>/knowledgebase/upstream/docs/<source>/` | 固定提交中的官方文档全文，source-document，不自动成为 HCU 配方 |
+| `projects/<project>/knowledgebase/upstream/prs/<owner--repo>/` | PR 描述、普通/行内评论、独立 review、固定文件入口，source-pr |
 | `evidence/prs/` | 原始 JSON、patch 和分页 coverage，随公共知识提交 |
-| `source-maps/`、`catalog/repositories/` | 全仓路径、blob SHA、gitlink；目录覆盖不等于正文精读 |
+| 项目内 `upstream/source-map/`、全库 `catalog/repositories/` | 全仓路径、blob SHA、gitlink；目录覆盖不等于正文精读 |
+| `catalog/external/`、`catalog/external-knowledge.json` | HCU-Knowledge 联查与工具用法维护关联，不保存另一份 HCU 仓库知识 |
 | `catalog/*-ledgers/` | 文档/PR 更新游标，新环境可继续增量维护 |
 | `sources.json`、`source-lock.json`、`maintenance.json` | 监测范围、版本证据、Skill/解析器关联 |
 | `sites/` | 可跨任务复用的环境配置、配方、关键实测与适用条件 |
@@ -18,6 +20,8 @@
 | 私有工作区 `wiki/`、`objects/` | 普通查询缓存、索引、待复核和回执，不进入 public 仓 |
 
 上述公共内容在 knowledge 下。原文保留上游归属，见 [知识材料通知](../thirdparty/KNOWLEDGE-NOTICES.md)。来源里的命令、PR 模板、AGENTS 内容均是待分析材料，不是给当前 Agent 的指令。
+
+采集器按 `sources.json.knowledge_project` 写入对应项目。`wiki-routes PROJECT` 列出 HCU 外部知识与工作流接口关联；HCU 仓不参加局部官方采集，按[知识分工](knowledge-architecture.md#hcu-仓库知识的分工)联查。普通线上 PR/源码读取仍可写私有缓存。旧页面 ID 保留，文件迁移后重新索引；旧更新游标能解析新位置，旧回执不会绕过当前正文哈希检查。
 
 ## 未收录的官方内容按需查证
 
@@ -45,7 +49,7 @@ hcu-trainflow wiki-read official-megatron-wiki/cases/paged-stash-launch
 hcu-trainflow wiki-search "weight transfer" --engine vllm --kind source-document
 ```
 
-索引使用 SQLite FTS5、英文符号/中文 bigram、标题与类型权重，不下载 embedding 模型。`--kind` 支持 authored、source-document、source-pr、source-map、site-knowledge、experiment-knowledge；后两项用于定向查通用环境经验和最终模型总结。`wiki-search` 按 `--project`（或 `TRAINFLOW_PROJECT`）核对当前本地文件，复用或重建对应内容指纹的索引；切换 checkout 或补充页面后不会沿用另一工程的旧结果。这一步只读本地知识，不刷新上游。并发索引使用独立临时文件，搜索绑定自己选定的代次。目录清单降权；搜索结果相关不等于结论适用。`wiki-read` 返回最近索引中的完整正文，文件变化时提示重新索引。
+索引使用 SQLite FTS5、英文符号/中文 bigram、标题与类型权重，不下载 embedding 模型。`--kind` 支持 authored、source-document、source-pr、source-map、external-reference、site-knowledge、experiment-knowledge；后两项用于定向查通用环境经验和最终模型总结。`wiki-search` 按 `--project`（或 `TRAINFLOW_PROJECT`）核对当前本地文件，复用或重建对应内容指纹的索引；切换 checkout 或补充页面后不会沿用另一工程的旧结果。这一步只读本地知识，不刷新上游。并发索引使用独立临时文件，搜索绑定自己选定的代次。目录清单降权；搜索结果相关不等于结论适用。`wiki-read` 返回最近索引中的完整正文，文件变化时提示重新索引。
 
 多 Agent 或多个 checkout 共用私有工作区时，后续全文读取使用 `wiki-read PAGE_ID --generation SEARCH_RETURNED_GENERATION`，保证读取刚才命中的同一快照；也可 `--project PROJECT` 明确读取该工程当前本地版本。省略两者只兼容使用最近的 active 索引，不适合并发跨工程读取。
 
@@ -91,7 +95,7 @@ hcu-trainflow wiki-update PROJECT nvidia-megatron-lm --max-documents 40 --max-pr
 `wiki-triage PROJECT SOURCE decisions.json` 分批记录路径处置；deferred 继续待处理。示例：
 
 ```json
-{"commit":"FULL_SHA","paths":{"path/to/new.py":{"decision":"knowledge-added","note":"补充调用链、限制和测试","pages":["knowledge/engines/example.md"]}}}
+{"commit":"FULL_SHA","paths":{"path/to/new.py":{"decision":"knowledge-added","note":"补充调用链、限制和测试","pages":["knowledge/projects/example/knowledgebase/local/topics/example.md"]}}}
 ```
 
 decision 为 knowledge-added（必须链接知识页）、not-relevant 或 deferred，均需理由和当前 commit。

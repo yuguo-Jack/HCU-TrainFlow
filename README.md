@@ -6,7 +6,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。候选与阶段结果以实际证据推进，经过独立复核和修正；有界初筛、局部试参和未变化的证据按需复用，不逐条命令审核。人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前版本：`0.6.6`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
+**当前版本：`0.6.7`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
 
 **首次了解工程，建议阅读 [HCU-TrainFlow 工程介绍](docs/project-overview.md)**：从接到一个新模型和环境开始，讲清三个阶段如何推进、如何选择优化对象、怎样保护训练质量，以及多 Agent、知识检索和持续守护如何配合。
 
@@ -83,7 +83,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 - **复用与实现迭代**：优先复用现有 HCU 算子库、通信库的能力；能力或性能不足时，基于对应库补充实现并借助算子 Skill 持续优化。对齐接口与数值契约，以实际性能分析、局部回归和整步收益验证结果；具体工程分工见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。
 - **稳定阶段验 loss**：每轮做局部正确性、多形状和无 profiler 性能回归，集成后重测整步净收益；稳定阶段从同一冻结初态与配方比较 loss、性能和显存。达到目标、接近可达上限、无稳定收益或受阻，都须给出证据与停止依据。
 
-同一阶段包含 [Torch 原生训练专项](skills/hcu-train-analyze-and-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。按瓶颈联查 [Megatron](knowledge/official-megatron-wiki/overview.md)、[TorchTitan](knowledge/official-torchtitan-wiki/overview.md)、[DeepSpeed](knowledge/engines/deepspeed.md)、[AMD Primus](knowledge/ecosystem/primus.md)、[MindSpeed 系列](knowledge/ecosystem/mindspeed.md)和 [LoongForge](knowledge/ecosystem/loongforge.md)的教程、PR 与实现；SFT/RL、训推协同和底层依赖见[参考选择表](docs/optimization-reference-map.md)。需要改底层时，按实际归属修改 HCU 算子、通信、数学库或编译器/Runtime，并隔离构建验证，见[仓库与修改归属](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。详见[热点排序与算子迭代](skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。
+同一阶段包含 [Torch 原生训练专项](skills/hcu-train-analyze-and-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。按瓶颈联查 [Megatron](knowledge/projects/megatron/knowledgebase/local/overview/overview.md)、[TorchTitan](knowledge/projects/torchtitan/knowledgebase/local/overview/overview.md)、[DeepSpeed](knowledge/projects/deepspeed/knowledgebase/local/overview/engineering-guide.md)、[AMD Primus](knowledge/projects/primus/knowledgebase/local/overview/engineering-guide.md)、[MindSpeed 系列](knowledge/projects/mindspeed/knowledgebase/local/overview/engineering-guide.md)和 [LoongForge](knowledge/projects/loongforge/knowledgebase/local/overview/engineering-guide.md)的教程、PR 与实现；SFT/RL、训推协同和底层依赖见[参考选择表](docs/optimization-reference-map.md)。需要改底层时，按实际归属修改 HCU 算子、通信、数学库或编译器/Runtime，并隔离构建验证，见[仓库与修改归属](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。详见[热点排序与算子迭代](skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。
 
 **TraceLens 贯穿分析和验证**：时间线与 Graph 关联真实训练调用，Roofline/效率分析提供带条件的上限，EventReplay 支持按真实输入做独立对照；hipprof JSON/pftrace 与 XProf/XCompute 证据按各自口径接入。原生 Agent 指标准备、实际推理和复核分别记录，高占比未知项继续补证据。报告生成、分析完成和训练验收是不同状态，预测空间须由无 profiler 的整步收益及质量对照验证。见 [TraceLens 分析与实测边界](docs/tracelens-analysis.md)。
 
@@ -133,6 +133,8 @@ collaboration/<task>/QUESTIONS.md   问题、Agent 回答和追问
 ## 知识如何参与工作流
 
 **HCU-Knowledge 是完整安装的必需组成，贯穿三个阶段。** 按问题检索硬件、工具、HCU 工程、配方、优化与故障案例，并联查任务私有档案和 HCU-TrainFlow-Wiki；本地证据不足时继续在线搜索 PR、阅读讨论并追到对应版本的源码和底层依赖。必需安装不表示每个命令都强制查询。
+
+官方资料按 `knowledge/projects/<project>/knowledgebase/{upstream,local}` 统一组织，原文/PR 与整理后的机制解释分开；HCU 仓库知识通过 HCU-Knowledge 联查，本仓仅维护工作流接口和有复用价值的经验。
 
 HCU-TrainFlow-Wiki 可按问题和版本变化自主更新，并联动复核相关 Skill、命令与解析器用法；普通查询或训练任务不附带更新 HCU-Knowledge，也不会自动替换正在运行的训练依赖。共享 Wiki 只收录官方资料、跨项目可复用的环境经验，以及模型最终优化里程碑的总结和关键数据。环境经验放 `knowledge/sites/`，最终总结放 `knowledge/experiments/`，必要证据随仓提交。中间候选、调参试验和临时排查留在 workspace 与看板；外部 Cookbook 的发布要求单独处理。参见 [知识归属与跨任务复用](docs/knowledge-architecture.md)。详见 [知识检索与维护](docs/wiki.md) 和 [训练经验记录](docs/experience-knowledge.md)。
 

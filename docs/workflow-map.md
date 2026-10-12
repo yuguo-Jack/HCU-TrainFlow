@@ -135,7 +135,7 @@ flowchart TD
     H -.-> REF["按问题联查官方教程、源码与 PR<br/>Megatron / TorchTitan / DeepSpeed / SFT / RL<br/>Primus、MindSpeed、LoongForge 与 HCU 对应分支"]
 ```
 
-并行布局须在显存、通信、流水空泡和吞吐之间权衡，不以“占满显存”为目标。改变微批、累积或并行度时保持训练语义可比；布局变化会改变热点与 shape，需要重新分析。具体指南见 [并行切分与显存调参](../knowledge/official-megatron-wiki/parallelism.md)。
+并行布局须在显存、通信、流水空泡和吞吐之间权衡，不以“占满显存”为目标。改变微批、累积或并行度时保持训练语义可比；布局变化会改变热点与 shape，需要重新分析。具体指南见 [并行切分与显存调参](../knowledge/projects/megatron/knowledgebase/local/topics/parallelism.md)。
 
 只分析模式仍检查布局、显存、热点和上限，但不为了走完图而改配置或启动优化候选；补充采集按已有授权，缺少执行条件时交付具体实验建议。优化模式才执行候选布局的短跑校准与迭代。
 

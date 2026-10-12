@@ -1,5 +1,17 @@
 # HCU-TrainFlow development plan
 
+## Current: project-first Wiki and HCU knowledge ownership (2026-10-12)
+
+Scope: reorganize the bound TrainFlow checkout and its installed Skills; HCU-Knowledge is a read-only reference in this task. User authorizes commit, GitHub push and a new tag. No remote training runs or broad source refresh.
+
+1. Inventory authored/source pages, generators, evidence, references and HCU overlaps; define project ownership and stable path mappings — complete.
+2. Migrate official knowledge to projects/<id>/knowledgebase/{upstream,local}, preserve stable IDs/evidence; delegate HCU repository knowledge to HCU-Knowledge and retain useful operating experience — complete: 20 projects, 24 official sources; external HCU routing and integration contracts retained.
+3. Update collection/search/update/compatibility code, metadata, documentation and Skills; prevent excluded HCU knowledge or old paths from reappearing — complete: shared path authority, legacy maintenance mapping, owner guards, navigation and Skill guidance.
+4. Review migrations and lifecycle behavior; test indexing, PR/doc refresh, old workspace records, package/install and full CPU suite — complete: 1,272 passed, 4 platform skips; 5,185 knowledge pages and all reading/coverage checks pass.
+5. Synchronize local installation, publish reviewed main and new annotated tag, verify remote refs — installation complete and checked; v0.6.7 ready for publication with remote verification at task close.
+
+Preserve source-reported versus reviewed versus hardware-validated boundaries. Detailed cases are only for substantial optimizations. Keep migration tooling and temporary outputs in ignored .work/wiki-layout; no deletion of original evidence merely to reduce size. Reorganization may retire redundant HCU source copies after verifying their replacement route and references.
+
 ## Current: HCU alignment and balanced official Wiki (2026-10-12)
 
 1. Audit the latest HCU-Knowledge commit, TrainFlow dependency locks, all installed Skills and three-stage usage — complete; read-only HCU audit, only demonstrated drift repaired.

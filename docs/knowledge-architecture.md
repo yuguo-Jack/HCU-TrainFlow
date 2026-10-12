@@ -4,7 +4,8 @@ TrainFlow 的共享 Wiki 保存在工程 `knowledge/`，随 Git 提交、克隆�
 
 | 内容 | 位置 | 保存范围 |
 | --- | --- | --- |
-| 官方引擎与依赖 | `knowledge/official-*-wiki/` 等现有专题 | 固定源码、教程、PR/review、调用链、优化机制及限制 |
+| 官方引擎、依赖与参考工程 | `knowledge/projects/<project>/knowledgebase/` | 项目内区分上游原文与作者知识，包含教程、PR/review、调用链、优化机制及限制 |
+| HCU 仓库知识 | HCU-Knowledge；本仓仅保存 `knowledge/catalog/external/` 联查入口 | 不复制 HCU 仓库 Wiki、源码文档、PR 或整套版本证据 |
 | 工作流方法说明 | `docs/practices/` | 环境发现、配方核对、调参、验证与交付的方法；属于使用文档，不混入知识检索 |
 | 跨项目环境经验 | `knowledge/sites/<site-id>/` | 经验证、有明确适用条件的硬件/软件/拓扑、环境配方、单测参考与通用排障经验；说明其他项目如何借鉴 |
 | 模型最终优化里程碑 | `knowledge/experiments/<case-id>/` | 已结束优化阶段的最终基线/结果、关键改动、性能/显存/loss、适用边界和必要证据；不持续追加中间候选 |
@@ -32,6 +33,21 @@ TrainFlow 的共享 Wiki 保存在工程 `knowledge/`，随 Git 提交、克隆�
 
 ```text
 knowledge/
+  projects/<project>/
+    README.md                # 项目统一入口，由 wiki-catalog 更新导航
+    knowledgebase/
+      upstream/
+        docs/<source>/       # 官方文档原文，保持上游内容
+        prs/<owner--repo>/    # PR 描述、评论、review 与固定代码入口
+        source-map/          # 自动生成的完整源码路径
+      local/
+        overview/            # 工程定位与解释性代码地图
+        guides/              # 安装、运行与测试
+        topics/              # 机制与调用链
+        cases/               # 重大或高价值优化案例
+        changes/             # 版本差异、发布入口与维护说明
+  evidence/prs/              # PR 原始 JSON，按内容哈希保存，不重复正文
+  catalog/                   # 全库来源目录、增量游标、外部联查及旧路径迁移
   sites/
     <site-id>/
       README.md              # 身份、能力、局限、导航和复用入口
@@ -42,6 +58,18 @@ knowledge/
   experiments/<case-id>/     # 最终优化里程碑；尚未定案的项目留在 workspace
 docs/practices/              # 工作流方法说明，不进入 wiki-search
 ```
+
+`sources.json` 的 `knowledge_project` 决定资料所属项目，多个关联来源可以共享一个项目（如 MindSpeed 与 MindSpeed-LLM、代码仓与网站教程）。Bridge、Energon 有独立入口，与 Megatron 互相链接。无内容的分类无需空建。`upstream` 是来源，`local` 是解释；`evidence` 是核验原件，不是另一份 Wiki。Release/roadmap 以官方入口和必要的版本解释保留，不单建全量发布页快照目录。
+
+目录迁移保留原页面 ID；旧 ID 中含历史目录名是稳定标识，不是文件路径。`catalog/path-migrations.json` 供维护程序解析旧记录，旧正文哈希不会因此被重新批准；内容变化仍须复核。重新 `wiki-index` 即可搜索新位置，不需要重新下载上游或模型。
+
+## HCU 仓库知识的分工
+
+HCU 源码、构建运行、PR/MR、优化案例与版本知识由 **HCU-Knowledge** 维护。TrainFlow 先用 `$hcu-knowledge-search` 查实际项目/分支/依赖；证据不足再读真实源码与帮助，临时原件留任务缓存。不得因局部 Wiki 更新而重复采集 HCU 仓或顺带更新大库。明确要求修订 HCU 仓库知识时，交给它自己的 update Skill。
+
+TrainFlow 仍负责自身怎样使用这些工具：`catalog/external-knowledge.json` 登记外部项目、查询入口、需要关注的接口和受影响文件；`wiki-routes PROJECT` 可列出这些关联。更新 Skill 依据当前大库或实际源码检查接口、输出、参数及副作用，修订本仓 docs/Skills/解析器，记录检查依据及待验证项。可复用使用经验按现有规范进 `sites/`，通用方法进 docs，临时排查留 workspace。外部登记不承诺后台自动扫描。
+
+HCU TraceLens 是本仓实际集成的定制工具：官方 AMD Wiki 与 HCU 接口文档分开。其 fork 的锁与集成文档通过 `thirdparty/manifest.json` 的 `integration_contracts` 关联；依赖 commit 变化会要求复核契约，不再靠复制 fork 的整套来源/Wiki 做绑定。校验不代替接口回归，也不假设 HCU-Knowledge 已覆盖该 fork。
 
 专题页必须有唯一 `id`、标题、阶段、知识类型、观测/复核日期与验证边界。原命令与最终执行命令、固定源码/镜像/库身份、关键参数、结果、正确性、因果边界、复用前检查和失效触发都应写清。标称值、历史值、本次实测分别表达；“脚本跑完”不能写成环境达标。某站点的 NIC/GID/TC/固定端口等不能成为所有 HCU 集群默认值。
 

@@ -5,6 +5,8 @@ description: 检索 HCU-TrainFlow-Wiki 的官方资料、通用环境经验和�
 
 # hcu-trainflow-wiki-search
 
+官方工程从 `knowledge/projects/<project>/README.md` 进入，项目内 `knowledgebase/upstream` 是文档/PR/源码路径，`knowledgebase/local` 是整理后的解释。HCU 仓库的源码、构建、PR/案例和当前分支知识归 `$hcu-knowledge-search`；本库只留外部联查入口与通用使用经验。命中 `kind: external-reference` 时按其 owner/hcu_project 转查大库或集成文档，不能把入口页当作问题已有完整答案。`wiki-routes PROJECT` 可列出维护关联。普通查询不更新任何知识库。
+
 本入口覆盖整个 HCU-TrainFlow-Wiki：官方引擎/依赖的源码、教程与 PR，跨任务通用环境经验，以及模型最终优化里程碑的总结、性能/显存/loss 数据和证据。先按问题跨类型检索，再按模型、环境、版本与验证范围筛选；站点实测不能当成所有环境的承诺，历史最终结果不能当成当前模型的基线。任务中间试验只在对应私有 Store 内查询。
 
 ## 开始前定位与阅读

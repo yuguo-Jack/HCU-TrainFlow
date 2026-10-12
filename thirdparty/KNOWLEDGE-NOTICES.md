@@ -4,6 +4,8 @@ Copied upstream documentation, source PR descriptions and discussions remain att
 
 The following notices accompany retained material at the current source snapshots. File-specific notices continue to apply; inspect the original before reusing code from a document or PR.
 
+HCU repository Wikis are maintained in HCU-Knowledge. Their notices remain here where workflow integration/usage guidance or retained historical attribution still refers to those dependencies; this does not imply a second HCU source/document/PR collection in TrainFlow.
+
 - [AMD-AGI/Primus / LICENSE](licenses/amd-agi-primus/LICENSE) · [fixed original](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/LICENSE)
 - [AMD-AGI/TraceLens / LICENSE](licenses/amd-agi-tracelens/LICENSE) · [fixed original](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/LICENSE)
 - [Ascend/MindSpeed-LLM / LICENSE](licenses/ascend-mindspeed-llm/LICENSE) · [fixed original](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/LICENSE)

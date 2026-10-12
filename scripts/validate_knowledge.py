@@ -50,7 +50,8 @@ def validate_catalog(root, sources, pages):
         source = sources.get(sid)
         if not source or data.get('source') != sid or repository_name(data.get('repository')) not in source_repositories(source):
             errors.append(f'{path}: catalog source identity mismatch')
-        mapping = (root / 'knowledge/source-maps' / (sid + '.md')).resolve()
+        from hcu_trainflow.knowledge_layout import source_map
+        mapping = source_map(root, sid).resolve()
         if mapping not in pages:
             errors.append(f'{path}: missing generated source map')
         else:
@@ -190,6 +191,8 @@ def validate(root):
                                 errors.append(f'{path}: document excluded by {sid} policy ({reason}); curate page, links and ledger')
         else:
             errors.extend(validate_authored_links(root, path, body))
+        if meta.get('review_level') == 'navigation-only' or meta.get('id') == 'official-source-catalog':
+            errors.extend(validate_authored_links(root, path, body))
         if meta.get('kind')=='source-pr':
             raw=(root/meta.get('artifact_path','')).resolve()
             if not raw.is_relative_to((root/'knowledge/evidence/prs').resolve()) or not raw.is_file():errors.append(str(path)+': missing PR evidence')
@@ -214,8 +217,64 @@ def validate(root):
     errors.extend(validate_baselines(sources, records))
     errors.extend(validate_catalog(root, sources, pages))
     errors.extend(validate_dependency_sources(root, sources, pages))
+    errors.extend(validate_project_layout(root, sources, pages))
     errors.extend(validate_manifests(root))
     return {'pages':len(ids),'sources':len(sources),'errors':errors}
+
+
+def validate_project_layout(root, sources, pages):
+    """Check ownership and paths without turning directory checks into review."""
+    from hcu_trainflow import knowledge_layout as layout
+    errors = []
+    for sid, source in sources.items():
+        try:
+            layout.require_local_owner(root, sid)
+            layout.require_local_owner(root, source['repository'])
+        except FlowError as exc:
+            errors.append(str(exc))
+        if not source.get('knowledge_project'):
+            errors.append(f'{sid}: missing knowledge_project')
+        entry = root / 'knowledge/projects' / layout.project_id(root, source=sid) / 'README.md'
+        if not entry.is_file():
+            errors.append(f'{sid}: missing project README')
+    for path, (meta, _) in pages.items():
+        kind = meta.get('kind')
+        expected = None
+        if kind in {'source-pr', 'source-document'}:
+            try:
+                layout.require_local_owner(root, meta.get('repository', ''))
+            except FlowError as exc:
+                errors.append(str(exc))
+        if kind == 'source-pr':
+            expected = layout.pr_root(root, meta['repository']) / path.name
+        elif kind == 'source-document':
+            registered = next((s for s in sources.values() if s.get('repository') == meta.get('repository')), None)
+            if registered:
+                expected = layout.document_root(root, registered['id']) / (meta['path'] + '.md')
+        if expected and path != expected.resolve():
+            errors.append(f'{path}: source material outside owning project')
+    for row in layout.external_routes(root):
+        if row['id'] in sources:
+            errors.append(f'{row["id"]}: external knowledge must not be locally collected')
+        for name in [row['entry'], *row.get('targets', [])]:
+            target = local_path(root, name)
+            if not target or not target.is_file():
+                errors.append(f'{row["id"]}: missing external route/maintenance target {name}')
+    manifest = root / 'thirdparty/manifest.json'
+    if manifest.is_file():
+        data = json.loads(manifest.read_text(encoding='utf-8'))
+        deps = {d['id']:d for d in data.get('dependencies', [])}
+        for contract in data.get('integration_contracts', []):
+            dependency = deps.get(contract['dependency'], {})
+            if not dependency or dependency.get('commit') != contract.get('reviewed_commit'):
+                errors.append(f'{contract["dependency"]}: integration contract needs dependency-version review')
+            if not contract.get('documents'):
+                errors.append(f'{contract["dependency"]}: missing integration documents')
+            for name in contract.get('documents', []):
+                target = local_path(root, name)
+                if not target or not target.is_file():
+                    errors.append(f'Missing integration contract {name}')
+    return errors
 
 if __name__=='__main__':
     result=validate(Path(__file__).resolve().parents[1]);print(json.dumps(result,ensure_ascii=False,indent=2));sys.exit(bool(result['errors']))

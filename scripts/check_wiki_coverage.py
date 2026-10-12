@@ -42,7 +42,7 @@ def validate_coverage(root):
         path = (root / value).resolve()
         if not path.is_relative_to(root / 'knowledge') or not path.is_file() or path.suffix != '.md':
             errors.append(f'{label}: invalid knowledge page {value}')
-        elif any(part in {'upstream-docs', 'source-maps', 'prs'} for part in path.relative_to(root / 'knowledge').parts):
+        elif any(part in {'upstream', 'upstream-docs', 'source-maps', 'prs'} for part in path.relative_to(root / 'knowledge').parts):
             errors.append(f'{label}: generated sources do not replace authored explanations')
 
     for row in data.get('projects', []):

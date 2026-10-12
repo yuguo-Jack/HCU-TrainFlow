@@ -49,7 +49,7 @@ def test_private_or_partial_pr_cannot_publish(tmp_path,monkeypatch):
     monkeypatch.setattr(wiki,'_get_json',api)
     r=official.read_pr(store,'org/engine',1)
     with pytest.raises(FlowError,match='public'):official.retain_pr(store,root,r,'engine')
-    assert not (root/'knowledge/prs').exists()
+    assert not (root/'knowledge/projects/engine/knowledgebase/upstream/prs').exists()
     def broken(url,token=None):
         if '/reviews?' in url:raise FlowError('permission')
         return pr_api(url,token)
@@ -176,7 +176,7 @@ def test_document_discovery_retry_delete_and_restore(tmp_path,monkeypatch):
     def code(s,r,c,p,t=None,max_chars=None):return {'artifact':s.put(b'# New\r\n'), 'url':'https://github.com/org/engine/blob/'+c+'/'+p}
     monkeypatch.setattr(official,'read_code',code)
     r=official.sync_documents(store,root,'engine');assert r['pending']==0 and r['discovered']==1
-    page=root/'knowledge/upstream-docs/engine/docs/new.md.md'
+    page=root/'knowledge/projects/engine/knowledgebase/upstream/docs/engine/docs/new.md.md'
     assert page.exists()
     page.unlink()
     assert official.sync_documents(store,root,'engine')['processed']==['docs/new.md']
@@ -209,7 +209,7 @@ def test_document_scope_survives_sync_and_reindex(tmp_path, monkeypatch):
     assert wiki.search_wiki(store,'PortalNoise')['results']
     registry[0]['document_exclusions']={'docs/frontend/*':'Frontend language is outside this training scope'}
     write_json(root/'knowledge/sources.json',registry)
-    excluded_page=root/'knowledge/upstream-docs/engine/docs/frontend/start.md.md'
+    excluded_page=root/'knowledge/projects/engine/knowledgebase/upstream/docs/engine/docs/frontend/start.md.md'
     before_bytes=excluded_page.read_bytes()
     with pytest.raises(FlowError,match='Curate retained documents'):
         official.sync_documents(store,root,'engine')
