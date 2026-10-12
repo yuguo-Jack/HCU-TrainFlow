@@ -1,0 +1,170 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "276fbcff2717bd934cfa37c8a2e4c391f3e7237b",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nDeepSeek-V4.1's decode indexer writes its logits into a `[rows, max_model_len]` buffer, a width that must stay static for CUDA graphs (1M with the default `max_model_len`). Each row only holds its own context, but `select_candidate_blocks` scored every block of the full width and then ran `torch.topk(2048)` over all of them. At 1M that costs about 850 us per decode step, whatever the actual context length. This PR makes candidate selection length-aware.\n\n- **Score only valid blocks.** `_block_scores_kernel` now runs a fixed `(rows, 32)` grid that walks each row's tiles only up to the row's end, and it writes each row's valid block count.\n- **DeepSelect instead of `torch.topk`.** On the DeepSelect path, the block count is passed as DeepSelect's per-row `end`. Short rows are padded with -1. Candidate order does not matter, because the sparse expansion sorts. The full-width `torch.topk` path stays as the fallback for no DeepSelect, non-contiguous output, `topk > 4096` and narrow logits, and its behaviour is unchanged.\n- **NaN rows.** DeepSelect leaves NaN rows only partly written, which can happen during warmup or capture on an uninitialized KV cache. On the DeepSelect path, NaN blocks are pinned like the newest block, as `torch.topk` ranks NaN first. NaN rows therefore still get complete, in-range candidates.\n- **bf16 decode logits.** The decode indexer now asks DeepGEMM for bf16 logits when the top-k backend is `deep_select` and DCP is off. This halves the bytes that the top-k and candidate passes read. The logits kernel still accumulates in fp32 and only rounds the output, which is byte-identical to `bf16(fp32 logits)`. The other top-k backends and the DCP merge still get fp32.\n- **Footprint.** `candidate_blocks.py`, the decode call in `sparse_attn_indexer.py`, and a `logits_dtype` passthrough on `fp8_fp4_paged_mqa_logits` (default fp32). The DeepSelect availability check reuses `has_deep_select()`.\n\n## Kernel microbenchmark\n\n`select_candidate_blocks` alone, DeepSeek-V4.1-Flash decode shapes: 384 rows (64 requests x 6 tokens), logits width 1,048,576 (default `max_model_len`, ratio-1 candidate-source layer), 2048 candidate blocks of 8. 1 x GB300, FlashInfer CUPTI timing with CUDA graph replay and cold L2, median. Logits are continuous random values; random FP4 inputs give heavily tied logits, which is pathological for radix selection and does not match the model.\n\n| context (tokens) | main, fp32 logits (us) | this PR, fp32 logits (us) | this PR, bf16 logits (us) | speedup (bf16 vs main) |\n|---:|---:|---:|---:|---:|\n| 131,072 | 847.8 | 77.0 | 42.9 | 19.8x |\n| 176,000 | 861.2 | 116.8 | 62.2 | 13.8x |\n| 400,000 | 884.0 | 205.9 | 119.9 | 7.4x |\n| 1,048,576 | 939.0 | 408.2 | 254.9 | 3.7x |\n\nmain's cost is flat because it always scores and sorts the full width. This PR scales with the context and is still faster at the full 1M.\n\nThe dense indexer top-k reads the same logits, so the bf16 switch also speeds it up. DeepSelect top-512 at 131K context, ratio-2 layer (65K keys) / ratio-1 layer (131K keys): fp32 42.2 / 62.7 us, bf16 28.8 / 45.4 us. The logits kernel itself takes the same time with fp32 and bf16 output (93.0 vs 94.2 us, 180.6 vs 181.5 us).\n\n## Test Plan\n\n```bash\npytest tests/model_executor/layers/test_mla_short_prefill_indexer.py -q -k \"candidate or sparse_topk_remap\"\npre-commit run --files vllm/model_executor/kernels/attention/dsa/candidate_blocks.py vllm/model_executor/layers/sparse_attn_indexer.py vllm/utils/deep_gemm.py\n```\n\nAlso checked locally, without adding tests:\n- Against the previous implementation, on 384-row decode inputs (1M width, random ends, `row_repeat=6`, rows shorter than 2048 blocks, empty rows, ends past the width), prefill rows with starts, and the fallback path: the selected candidate sets are identical. The only exception is an exact score tie at the 2048th block, where either choice is valid.\n- The fallback path forced on is identical to the previous implementation (fp32). With bf16 logits, the DeepSelect path and the fallback select the same blocks, compared by score so ties do not count.\n- NaN rows (fully NaN, and partly NaN) on the DeepSelect path: every id is in range and unique, nothing stale is left, and the NaN blocks are selected.\n- bf16 paged MQA logits are byte-identical to the fp32 output rounded to bf16.\n\n## Test Result\n\nOn 1 x GB300: 6 passed (the four `test_candidate_kernels_preserve_packed_bounds_and_padding` cases, including `out[:, ::2]` at 32768 columns, `test_select_candidate_blocks_tolerates_empty_rows`, and `test_sparse_topk_remap_bounds_nan_rows`). Pre-commit (ruff, format, typos, mypy) passes.\n\n## E2E decode (DEP4)\n\nDeepSeek-V4.1-Flash, DEP4 (DP4 x TP1 + EP) on one GB300 node. `FLASHMLA_MEGA_ATTN_DSV41` with the MXFP4 indexer cache and sparse indexer logits, DeepGEMM mega MoE, `--sparse-indexer-topk-backend deep_select`, DSpark (5 tokens, synthetic acceptance), `max_num_seqs=64`, default `max_model_len` (1M), `DecodeBenchConnector`. 256 random-token requests with 125,000 input and 8,000 output tokens, all admitted at once. The nsys window opens about 40 s in, at a context of about 131K. GPU time is per decode step and GPU, averaged over all GPU-steps in the window. The E2E runs used a DSv4.1 development tree whose `candidate_blocks.py` and `sparse_attn_indexer.py` are identical to main's, with and without this patch; the unit tests ran on this branch.\n\n| | base | this PR |\n|---|---:|---:|\n| indexer + candidate selection (us/step) | 1698 | 886 |\n| `_block_scores_kernel` (us/step) | 208 | 26 |\n| `torch.topk` kernels (`computeBlockDigitCounts`, `gatherTopK`, sort, ...) (us/step) | 619 | 0 |\n| target forward GPU busy (ms/step) | 24.11 | 23.36 |\n| median ITL (ms) | 26.52 | 25.65 |\n\nA rerun with the final code gives the same 886 us.\n\n## Accuracy\n\nGSM8K with lm-eval 0.4.13 on this PR: 1319 problems, 5-shot completions, temperature 0, 1024-token cap, concurrency 32, one DEP4 `vllm serve` (MegaAttn, MXFP4 indexer cache with sparse logits, DeepGEMM mega MoE, `deep_select` top-k, so the decode indexer runs with bf16 logits and the new selection path). DSpark used 5 speculative tokens with standard rejection sampling and adaptive verification off. Acceptance comes from the `vllm:spec_decode_*` counters over the eval.\n\n| | strict match | flexible extract | acceptance length, incl. bonus | per-position acceptance |\n|---|---|---|---|---|\n| this PR | **92.57%** | 92.49% (±0.7) | **3.423** | 0.790 / 0.646 / 0.452 / 0.329 / 0.205 |\n| #59923 (DSpark, adaptive verification on) | 92.57% | | 3.398 | 0.795 / 0.644 / 0.446 / 0.319 / 0.194 |\n| #59511 base (DSpark, adaptive verification on) | 92.57% | | 3.365 | 0.792 / 0.641 / 0.441 / 0.310 / 0.181 |\n\nGSM8K contexts are short (under 16K tokens), so the candidate-source layer keeps every valid block either way. Here the bf16 logits mainly feed the dense top-512. No accuracy or acceptance change is claimed.\n\n<details>\n<summary>Commands</summary>\n\n```bash\nvllm serve <model> --served-model-name DeepSeek-V4.1-Flash \\\n  --data-parallel-size 4 --enable-expert-parallel --tokenizer-mode deepseek_v41 --language-model-only \\\n  --gpu-memory-utilization 0.85 --max-num-seqs 64 --max-num-batched-tokens 16384 --max-model-len 32768 \\\n  --attention-config '{\"backend\":\"FLASHMLA_MEGA_ATTN_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}' \\\n  --moe-backend deep_gemm_mega_moe --sparse-indexer-topk-backend deep_select --no-enable-prefix-caching \\\n  --engram-config '{\"cpu_offload\":true,\"embedding_across_dp\":true,\"dp_shared_memory\":true,\"use_thp\":false}' \\\n  --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"enable_adaptive_verification\":false}' \\\n  --compilation-config '{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[6,12,...,384],\"max_cudagraph_capture_size\":384}'\n\nlm-eval run --model local-completions \\\n  --model_args \"model=DeepSeek-V4.1-Flash,base_url=http://127.0.0.1:8010/v1/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,tokenizer_backend=None\" \\\n  --tasks gsm8k --num_fewshot 5 --gen_kwargs \"max_gen_toks=1024,temperature=0\"\n```\n\n</details>\n\n## Not a duplicate\n\nI searched open PRs for `select_candidate_blocks`, `candidate_blocks`, `candidate blocks DeepSelect`, `indexer candidate topk` and `DSv4.1 indexer bf16 logits`. #59668 fuses the ROCm candidate mask (`rocm_aiter_mla_sparse.py`) and does not touch candidate selection.\n\n---\n\nAI assistance (Claude Code) was used to write and benchmark this change. I reviewed every changed line and ran the tests and benchmarks above.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "1344c73f81f3352b00a938f5ccd8c8a451a0ae86",
+      "headRepository": {
+        "nameWithOwner": "Juntian777/vllm"
+      },
+      "merged": false,
+      "number": 61039,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-11T00:52:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61039#pullrequestreview-5481393166"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMVQwMDo1Mjo0N1q0MjAyNi0xMC0xMVQwMDo1Mjo0N1rPAAAAAUa3bA4=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Perf][DSv4.1] Length-aware candidate block selection in the decode indexer",
+      "updatedAt": "2026-10-11T00:53:19Z",
+      "url": "https://github.com/vllm-project/vllm/pull/61039"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "276fbcff2717bd934cfa37c8a2e4c391f3e7237b"
+    },
+    "body": "## Purpose\n\nDeepSeek-V4.1's decode indexer writes its logits into a `[rows, max_model_len]` buffer, a width that must stay static for CUDA graphs (1M with the default `max_model_len`). Each row only holds its own context, but `select_candidate_blocks` scored every block of the full width and then ran `torch.topk(2048)` over all of them. At 1M that costs about 850 us per decode step, whatever the actual context length. This PR makes candidate selection length-aware.\n\n- **Score only valid blocks.** `_block_scores_kernel` now runs a fixed `(rows, 32)` grid that walks each row's tiles only up to the row's end, and it writes each row's valid block count.\n- **DeepSelect instead of `torch.topk`.** On the DeepSelect path, the block count is passed as DeepSelect's per-row `end`. Short rows are padded with -1. Candidate order does not matter, because the sparse expansion sorts. The full-width `torch.topk` path stays as the fallback for no DeepSelect, non-contiguous output, `topk > 4096` and narrow logits, and its behaviour is unchanged.\n- **NaN rows.** DeepSelect leaves NaN rows only partly written, which can happen during warmup or capture on an uninitialized KV cache. On the DeepSelect path, NaN blocks are pinned like the newest block, as `torch.topk` ranks NaN first. NaN rows therefore still get complete, in-range candidates.\n- **bf16 decode logits.** The decode indexer now asks DeepGEMM for bf16 logits when the top-k backend is `deep_select` and DCP is off. This halves the bytes that the top-k and candidate passes read. The logits kernel still accumulates in fp32 and only rounds the output, which is byte-identical to `bf16(fp32 logits)`. The other top-k backends and the DCP merge still get fp32.\n- **Footprint.** `candidate_blocks.py`, the decode call in `sparse_attn_indexer.py`, and a `logits_dtype` passthrough on `fp8_fp4_paged_mqa_logits` (default fp32). The DeepSelect availability check reuses `has_deep_select()`.\n\n## Kernel microbenchmark\n\n`select_candidate_blocks` alone, DeepSeek-V4.1-Flash decode shapes: 384 rows (64 requests x 6 tokens), logits width 1,048,576 (default `max_model_len`, ratio-1 candidate-source layer), 2048 candidate blocks of 8. 1 x GB300, FlashInfer CUPTI timing with CUDA graph replay and cold L2, median. Logits are continuous random values; random FP4 inputs give heavily tied logits, which is pathological for radix selection and does not match the model.\n\n| context (tokens) | main, fp32 logits (us) | this PR, fp32 logits (us) | this PR, bf16 logits (us) | speedup (bf16 vs main) |\n|---:|---:|---:|---:|---:|\n| 131,072 | 847.8 | 77.0 | 42.9 | 19.8x |\n| 176,000 | 861.2 | 116.8 | 62.2 | 13.8x |\n| 400,000 | 884.0 | 205.9 | 119.9 | 7.4x |\n| 1,048,576 | 939.0 | 408.2 | 254.9 | 3.7x |\n\nmain's cost is flat because it always scores and sorts the full width. This PR scales with the context and is still faster at the full 1M.\n\nThe dense indexer top-k reads the same logits, so the bf16 switch also speeds it up. DeepSelect top-512 at 131K context, ratio-2 layer (65K keys) / ratio-1 layer (131K keys): fp32 42.2 / 62.7 us, bf16 28.8 / 45.4 us. The logits kernel itself takes the same time with fp32 and bf16 output (93.0 vs 94.2 us, 180.6 vs 181.5 us).\n\n## Test Plan\n\n```bash\npytest tests/model_executor/layers/test_mla_short_prefill_indexer.py -q -k \"candidate or sparse_topk_remap\"\npre-commit run --files vllm/model_executor/kernels/attention/dsa/candidate_blocks.py vllm/model_executor/layers/sparse_attn_indexer.py vllm/utils/deep_gemm.py\n```\n\nAlso checked locally, without adding tests:\n- Against the previous implementation, on 384-row decode inputs (1M width, random ends, `row_repeat=6`, rows shorter than 2048 blocks, empty rows, ends past the width), prefill rows with starts, and the fallback path: the selected candidate sets are identical. The only exception is an exact score tie at the 2048th block, where either choice is valid.\n- The fallback path forced on is identical to the previous implementation (fp32). With bf16 logits, the DeepSelect path and the fallback select the same blocks, compared by score so ties do not count.\n- NaN rows (fully NaN, and partly NaN) on the DeepSelect path: every id is in range and unique, nothing stale is left, and the NaN blocks are selected.\n- bf16 paged MQA logits are byte-identical to the fp32 output rounded to bf16.\n\n## Test Result\n\nOn 1 x GB300: 6 passed (the four `test_candidate_kernels_preserve_packed_bounds_and_padding` cases, including `out[:, ::2]` at 32768 columns, `test_select_candidate_blocks_tolerates_empty_rows`, and `test_sparse_topk_remap_bounds_nan_rows`). Pre-commit (ruff, format, typos, mypy) passes.\n\n## E2E decode (DEP4)\n\nDeepSeek-V4.1-Flash, DEP4 (DP4 x TP1 + EP) on one GB300 node. `FLASHMLA_MEGA_ATTN_DSV41` with the MXFP4 indexer cache and sparse indexer logits, DeepGEMM mega MoE, `--sparse-indexer-topk-backend deep_select`, DSpark (5 tokens, synthetic acceptance), `max_num_seqs=64`, default `max_model_len` (1M), `DecodeBenchConnector`. 256 random-token requests with 125,000 input and 8,000 output tokens, all admitted at once. The nsys window opens about 40 s in, at a context of about 131K. GPU time is per decode step and GPU, averaged over all GPU-steps in the window. The E2E runs used a DSv4.1 development tree whose `candidate_blocks.py` and `sparse_attn_indexer.py` are identical to main's, with and without this patch; the unit tests ran on this branch.\n\n| | base | this PR |\n|---|---:|---:|\n| indexer + candidate selection (us/step) | 1698 | 886 |\n| `_block_scores_kernel` (us/step) | 208 | 26 |\n| `torch.topk` kernels (`computeBlockDigitCounts`, `gatherTopK`, sort, ...) (us/step) | 619 | 0 |\n| target forward GPU busy (ms/step) | 24.11 | 23.36 |\n| median ITL (ms) | 26.52 | 25.65 |\n\nA rerun with the final code gives the same 886 us.\n\n## Accuracy\n\nGSM8K with lm-eval 0.4.13 on this PR: 1319 problems, 5-shot completions, temperature 0, 1024-token cap, concurrency 32, one DEP4 `vllm serve` (MegaAttn, MXFP4 indexer cache with sparse logits, DeepGEMM mega MoE, `deep_select` top-k, so the decode indexer runs with bf16 logits and the new selection path). DSpark used 5 speculative tokens with standard rejection sampling and adaptive verification off. Acceptance comes from the `vllm:spec_decode_*` counters over the eval.\n\n| | strict match | flexible extract | acceptance length, incl. bonus | per-position acceptance |\n|---|---|---|---|---|\n| this PR | **92.57%** | 92.49% (±0.7) | **3.423** | 0.790 / 0.646 / 0.452 / 0.329 / 0.205 |\n| #59923 (DSpark, adaptive verification on) | 92.57% | | 3.398 | 0.795 / 0.644 / 0.446 / 0.319 / 0.194 |\n| #59511 base (DSpark, adaptive verification on) | 92.57% | | 3.365 | 0.792 / 0.641 / 0.441 / 0.310 / 0.181 |\n\nGSM8K contexts are short (under 16K tokens), so the candidate-source layer keeps every valid block either way. Here the bf16 logits mainly feed the dense top-512. No accuracy or acceptance change is claimed.\n\n<details>\n<summary>Commands</summary>\n\n```bash\nvllm serve <model> --served-model-name DeepSeek-V4.1-Flash \\\n  --data-parallel-size 4 --enable-expert-parallel --tokenizer-mode deepseek_v41 --language-model-only \\\n  --gpu-memory-utilization 0.85 --max-num-seqs 64 --max-num-batched-tokens 16384 --max-model-len 32768 \\\n  --attention-config '{\"backend\":\"FLASHMLA_MEGA_ATTN_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}' \\\n  --moe-backend deep_gemm_mega_moe --sparse-indexer-topk-backend deep_select --no-enable-prefix-caching \\\n  --engram-config '{\"cpu_offload\":true,\"embedding_across_dp\":true,\"dp_shared_memory\":true,\"use_thp\":false}' \\\n  --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"standard\",\"enable_adaptive_verification\":false}' \\\n  --compilation-config '{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[6,12,...,384],\"max_cudagraph_capture_size\":384}'\n\nlm-eval run --model local-completions \\\n  --model_args \"model=DeepSeek-V4.1-Flash,base_url=http://127.0.0.1:8010/v1/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,tokenizer_backend=None\" \\\n  --tasks gsm8k --num_fewshot 5 --gen_kwargs \"max_gen_toks=1024,temperature=0\"\n```\n\n</details>\n\n## Not a duplicate\n\nI searched open PRs for `select_candidate_blocks`, `candidate_blocks`, `candidate blocks DeepSelect`, `indexer candidate topk` and `DSv4.1 indexer bf16 logits`. #59668 fuses the ROCm candidate mask (`rocm_aiter_mla_sparse.py`) and does not touch candidate selection.\n\n---\n\nAI assistance (Claude Code) was used to write and benchmark this change. I reviewed every changed line and ran the tests and benchmarks above.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 3,
+    "head": {
+      "repo": {
+        "full_name": "Juntian777/vllm"
+      },
+      "sha": "1344c73f81f3352b00a938f5ccd8c8a451a0ae86"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/61039",
+    "merged": false,
+    "number": 61039,
+    "state": "open",
+    "title": "[Perf][DSv4.1] Length-aware candidate block selection in the decode indexer",
+    "updated_at": "2026-10-11T00:53:19Z"
+  },
+  "files": [
+    {
+      "additions": 56,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1344c73f81f3352b00a938f5ccd8c8a451a0ae86/vllm%2Fmodel_executor%2Fkernels%2Fattention%2Fdsa%2Fcandidate_blocks.py",
+      "changes": 76,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fkernels%2Fattention%2Fdsa%2Fcandidate_blocks.py?ref=1344c73f81f3352b00a938f5ccd8c8a451a0ae86",
+      "deletions": 20,
+      "filename": "vllm/model_executor/kernels/attention/dsa/candidate_blocks.py",
+      "patch": "@@ -3,7 +3,14 @@\n \n import torch\n \n+from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import has_deep_select\n+from vllm.model_executor.layers.indexer_topk import (\n+    deep_select_topk,\n+    get_deep_select_stride_requirement,\n+    is_deep_select_supported,\n+)\n from vllm.triton_utils import tl, triton\n+from vllm.utils.math_utils import round_up\n \n \n @triton.jit\n@@ -17,38 +24,47 @@ def _block_scores_kernel(\n     starts,\n     ends,\n     scores,\n+    valid_blocks,\n     stride_row,\n     stride_col,\n     stride_start,\n     stride_end,\n+    stride_scores,\n     width,\n     nblocks,\n     BLOCK_SIZE: tl.constexpr,\n     HAS_STARTS: tl.constexpr,\n     ROW_REPEAT: tl.constexpr,\n     TILE: tl.constexpr,\n+    FULL_WIDTH: tl.constexpr,\n ):\n+    # Writes each row's valid block count; FULL_WIDTH also scores the -inf tail.\n     row = tl.program_id(0).to(tl.int64)\n-    blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)\n     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0\n     end = tl.load(ends + row // ROW_REPEAT * stride_end)\n+    col_end = tl.minimum(end, width)\n+    num_valid = tl.cdiv(tl.maximum(col_end - start, 0), BLOCK_SIZE)\n+    if tl.program_id(1) == 0:\n+        tl.store(valid_blocks + row, num_valid)\n+    num_blocks = nblocks if FULL_WIDTH else num_valid\n     offsets = tl.arange(0, triton.next_power_of_2(BLOCK_SIZE))\n-    cols = start + blocks[:, None] * BLOCK_SIZE + offsets[None, :]\n-    values = tl.load(\n-        logits + row * stride_row + cols * stride_col,\n-        (blocks[:, None] < nblocks)\n-        & (offsets[None, :] < BLOCK_SIZE)\n-        & (cols < end)\n-        & (cols < width),\n-        other=-float(\"inf\"),\n-    )\n-    reduced = tl.reduce(values, 1, _max_with_nan)\n-    reduced = tl.where(\n-        (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE),\n-        float(\"inf\"),\n-        reduced,\n-    )\n-    tl.store(scores + row * nblocks + blocks, reduced, blocks < nblocks)\n+    num_tiles = tl.cdiv(num_blocks, TILE)\n+    for tile_id in range(tl.program_id(1), num_tiles, tl.num_programs(1)):\n+        blocks = tile_id * TILE + tl.arange(0, TILE)\n+        cols = start + blocks[:, None] * BLOCK_SIZE + offsets[None, :]\n+        values = tl.load(\n+            logits + row * stride_row + cols * stride_col,\n+            (offsets[None, :] < BLOCK_SIZE) & (cols < col_end),\n+            other=-float(\"inf\"),\n+        ).to(tl.float32)\n+        reduced = tl.reduce(values, 1, _max_with_nan)\n+        # Pin the newest block. DeepSelect leaves NaN rows partially written,\n+        # so also pin NaN blocks (torch.topk ranks NaN first too).\n+        pinned = (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE)\n+        if not FULL_WIDTH:\n+            pinned |= reduced != reduced\n+        reduced = tl.where(pinned, float(\"inf\"), reduced)\n+        tl.store(scores + row * stride_scores + blocks, reduced, blocks < num_blocks)\n \n \n @triton.jit(do_not_specialize=[\"k\"])\n@@ -160,22 +176,42 @@ def select_candidate_blocks(\n         out.fill_(-1)\n         return\n     nblocks = triton.cdiv(width, block_size)\n-    scores = logits.new_empty((rows, nblocks))\n-    _block_scores_kernel[(rows, triton.cdiv(nblocks, 128))](\n+    # Logits are max_model_len wide (CUDA-graph static) but rows are shorter:\n+    # DeepSelect stops at each row's valid block count. Order does not matter.\n+    use_deep_select = has_deep_select() and nblocks >= topk_blocks\n+    if use_deep_select:\n+        in_align, out_align = get_deep_select_stride_requirement()\n+        padded = round_up(nblocks, in_align // logits.element_size())\n+        scores = logits.new_empty((rows, padded))[:, :nblocks]\n+        use_deep_select = (\n+            out.stride(1) == 1\n+            and out.stride(0) * out.element_size() % out_align == 0\n+            and is_deep_select_supported(scores, topk_blocks)\n+        )\n+    else:\n+        scores = logits.new_empty((rows, nblocks))\n+    valid_blocks = torch.empty(rows, dtype=torch.int32, device=logits.device)\n+    _block_scores_kernel[(rows, 32)](\n         logits,\n         row_ks,\n         row_ke,\n         scores,\n+        valid_blocks,\n         *logits.stride(),\n         row_ks.stride(0) if row_ks is not None else 0,\n         row_ke.stride(0),\n+        scores.stride(0),\n         width,\n         nblocks,\n         block_size,\n         row_ks is not None,\n         row_repeat,\n-        128,\n+        TILE=128,\n+        FULL_WIDTH=not use_deep_select,\n     )\n+    if use_deep_select:\n+        deep_select_topk(scores, topk_blocks, end=valid_blocks, output_idx=out)\n+        return\n     # Keep the existing top-k tie behavior.\n     top = scores.topk(min(topk_blocks, nblocks), dim=-1)\n     _store_candidates_kernel[(rows, triton.cdiv(topk_blocks, 256))](",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1344c73f81f3352b00a938f5ccd8c8a451a0ae86/vllm%2Fmodel_executor%2Fkernels%2Fattention%2Fdsa%2Fcandidate_blocks.py",
+      "sha": "a822b0ff0bcdfca302295285e186ad392a998835",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1344c73f81f3352b00a938f5ccd8c8a451a0ae86/vllm%2Fmodel_executor%2Flayers%2Fsparse_attn_indexer.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Fsparse_attn_indexer.py?ref=1344c73f81f3352b00a938f5ccd8c8a451a0ae86",
+      "deletions": 0,
+      "filename": "vllm/model_executor/layers/sparse_attn_indexer.py",
+      "patch": "@@ -710,6 +710,12 @@ def sparse_attn_indexer(\n             if use_fp4_cache\n             else padded_q_quant_decode_tokens\n         )\n+        # bf16 halves top-k/candidate reads; other top-k backends and DCP need fp32.\n+        logits_dtype = (\n+            torch.bfloat16\n+            if topk_backend == \"deep_select\" and dcp_world_size == 1\n+            else torch.float32\n+        )\n         if current_platform.is_xpu():\n             if padded_q_scale is not None:\n                 raise RuntimeError(\"XPU fp8_paged_mqa_logits does not support FP4 Q\")\n@@ -736,6 +742,7 @@ def sparse_attn_indexer(\n                 max_model_len=max_model_len,\n                 clean_logits=False,\n                 indices=decode_metadata.indices,\n+                logits_dtype=logits_dtype,\n             )\n         num_rows = logits.shape[0]\n         if candidate_blocks is not None:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1344c73f81f3352b00a938f5ccd8c8a451a0ae86/vllm%2Fmodel_executor%2Flayers%2Fsparse_attn_indexer.py",
+      "sha": "d582e92fcf6934df729d54450f7577947aeab357",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1344c73f81f3352b00a938f5ccd8c8a451a0ae86/vllm%2Futils%2Fdeep_gemm.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Futils%2Fdeep_gemm.py?ref=1344c73f81f3352b00a938f5ccd8c8a451a0ae86",
+      "deletions": 1,
+      "filename": "vllm/utils/deep_gemm.py",
+      "patch": "@@ -701,6 +701,7 @@ def fp8_fp4_paged_mqa_logits(\n     max_model_len: int,\n     clean_logits: bool,\n     indices: torch.Tensor | None = None,\n+    logits_dtype: torch.dtype = torch.float32,\n ) -> torch.Tensor:\n     \"\"\"Compute MQA logits using a paged KV-cache.\n \n@@ -726,10 +727,11 @@ def fp8_fp4_paged_mqa_logits(\n         max_model_len: Maximum sequence length used to size the logits output.\n         clean_logits: Whether to clean the unfilled logits into `-inf`.\n         indices: Optional request index for each varlen row.\n+        logits_dtype: `torch.float32` (default) or `torch.bfloat16`.\n \n     Returns:\n         Logits tensor of shape [B * next_n, max_model_len], dtype\n-        `torch.float32`.\n+        `logits_dtype`.\n \n     \"\"\"\n     _lazy_init()\n@@ -743,6 +745,8 @@ def fp8_fp4_paged_mqa_logits(\n     if block_tables.dim() >= 2 and block_tables.stride(-1) != 1:\n         block_tables = block_tables.clone(memory_format=torch.contiguous_format)\n     kwargs = {} if indices is None else {\"indices\": indices}\n+    if logits_dtype != torch.float32:\n+        kwargs[\"logits_dtype\"] = logits_dtype\n     return _fp8_fp4_paged_mqa_logits_impl(\n         q,\n         kv_cache,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1344c73f81f3352b00a938f5ccd8c8a451a0ae86/vllm%2Futils%2Fdeep_gemm.py",
+      "sha": "68686874b4fe6a14f803a8f61fdf6aae6bd713fa",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [],
+  "number": 61039,
+  "refs": {
+    "base": {
+      "commit": "276fbcff2717bd934cfa37c8a2e4c391f3e7237b",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "1344c73f81f3352b00a938f5ccd8c8a451a0ae86",
+      "repository": "Juntian777/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61039#pullrequestreview-5481393166",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-11T00:52:47Z",
+      "user": {
+        "login": "claude"
+      }
+    }
+  ]
+}

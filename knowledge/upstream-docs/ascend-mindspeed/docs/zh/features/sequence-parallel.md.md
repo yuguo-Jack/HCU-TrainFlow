@@ -1,0 +1,65 @@
+---
+id: doc-ascend-mindspeed-c6c157b18e9bbc51cbf5
+title: Ascend/MindSpeed / docs/zh/features/sequence-parallel.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/sequence-parallel.md
+raw_sha256: 02db2d7c92a199c20170861d03ae270d40a8e5e57f0fb90a41aad6cc3a5c0621
+sources: []
+generated_body_sha256: 798401c9b0b34c1f0f8bb47801105528bd4d5c71ce5479d086b66d76c0cd214d
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/sequence-parallel.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/sequence-parallel.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Megatron序列并行
+
+## 背景与挑战
+
+在大模型训练中，张量并行虽能有效降低内存占用并加快训练速度，但其要求将模型各层分割为独立块，这在处理如LayerNorm和Dropout等操作时存在局限。尽管这些操作计算成本较低，但存储激活所需的冗余内存显著，为了解决这一问题，序列并行作为一种补充策略被引入，旨在分摊那些在张量并行中无法切分的内存和计算负担。
+
+## 解决方案
+
+序列并行（Sequence Parallelism，SP）策略在张量并行的基础上进一步提高计算效率，是一种通过将输入数据的序列维度进行切分的并行计算方式。
+
+将LayerNorm以及Dropout等操作的输入按序列维度进行了切分，使得各个设备只需要做一部分的LayerNorm和Dropout等操作。
+
+为了方便理解，以下图为例：假设输入$X$的大小为$ s \times b \times h $，按照序列维度切分$X=[X_1^s,X_2^s]$，经过LayerNorm操作后的结果为$Y=[Y_1^s,Y_2^s]$，随后进行张量模型并行。
+
+<p align="left"> <img src="../figures/sequence-parallel.png" height="200px" width="530px" style="display:block;" alt="序列并行示意图"> </p>
+
+具体细节请参见文献[Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/pdf/2205.05198)。
+
+## 使用场景
+
+序列并行技术适用于以下场景：
+
+* 内存占用过高：即使采用了张量并行，内存占用仍接近或超出处理器内存限制。
+* 优化计算资源：旨在进一步降低内存开销，提升训练速度。
+
+## 使用方法
+
+序列并行依赖张量并行，因此启用序列并行需在训练脚本中加入以下参数配置：
+
+```bash
+--tensor-model-parallel-size N  # 设置张量模型并行大小，N为单个并行组内的NPU数目
+--sequence-parallel  # 开启序列并行
+```
+
+## 使用效果
+
+通过序列并行策略，利用多设备协同作用，在张量并行的基础上，进一步降低了内存占用，使得设备可以容纳更大参数的模型训练。

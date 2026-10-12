@@ -322,6 +322,50 @@ def test_failed_inventory_skips_document_refresh_and_preserves_run(tmp_path,monk
     assert (root/'knowledge/catalog/README.md').is_file()
 
 
+def test_update_keeps_inventory_snapshot_when_branch_advances(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s');old='a'*40;new='b'*40
+    branch={'head':old}
+    monkeypatch.setattr(official,'inventory',lambda *a:{'commit':branch['head']})
+    monkeypatch.setattr(official,'sync_documents',lambda *a:{'status':'collected'})
+    def prs(*args):
+        branch['head']=new
+        return {'status':'collected'}
+    monkeypatch.setattr(official,'sync_prs',prs)
+    observed=[]
+    def collect(s,source,token):
+        observed.append(source['ref'])
+        sha=branch['head'] if source['ref']=='main' else source['ref']
+        return sha,{'a.py':{'sha256':s.put(sha.encode())}},[]
+    monkeypatch.setattr(wiki,'collect_git_files',collect)
+    result=official.update_source(store,root,'engine')
+    assert result['stages']['content']['commit']==old
+    assert result['stages']['content']['ref']=='main'
+    assert observed==[old] and branch['head']==new
+    assert official.source_for(root,'engine')['ref']=='main'
+
+
+def test_fixed_refresh_rejects_wrong_snapshot_and_short_ref(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    monkeypatch.setattr(wiki,'collect_git_files',lambda *a:('b'*40,{},[]))
+    with pytest.raises(FlowError,match='full Git commit'):
+        wiki.refresh_source(store,root,'engine',fixed_commit='main')
+    with pytest.raises(FlowError,match='changed during'):
+        wiki.refresh_source(store,root,'engine',fixed_commit='a'*40)
+
+
+def test_first_review_requires_authored_pages_even_without_source_changes(tmp_path):
+    root=project(tmp_path);store=Store(tmp_path/'s');source=official.source_for(root,'engine')
+    files={'a.py':{'sha256':'b'*64}}
+    source['baseline_files']=files
+    page=root/'knowledge/topic.md'
+    page.write_text(official.markdown({'id':'topic','sources':[{'source':'engine','path':'a.py'}]},'# New interpretation'))
+    stage=wiki.stage_source_refresh(store,root,source,'a'*40,files,[],'main')
+    assert stage['changed_paths']==[]
+    assert [p['page'] for p in stage['affected_pages']]==['knowledge/topic.md']
+    with pytest.raises(FlowError,match='Every affected'):
+        wiki.review_refresh(store,stage['stage_id'],{},root)
+
+
 def test_local_edits_cannot_bypass_source_review_via_unchanged_refresh(tmp_path):
     root=project(tmp_path);store=Store(tmp_path/'s')
     page=root/'knowledge/topic.md'

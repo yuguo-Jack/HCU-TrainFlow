@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
 path: docs/training/async_rl.md
-raw_sha256: 83360f0d6e8aa521b1f218f249c286360246af696747a975ed318e2ef8abc7c1
+raw_sha256: b0ae0dcf3d0af40e1ecb2d39caf524be13c4c3918e0ef24b4c0d9612c221383f
 sources: []
-generated_body_sha256: cc2a57a4d17682fb35b3452009bfda87f0f53aed63629ef350c02dce859fc8de
+generated_body_sha256: bd2fa421f83abbf8f1dceafd4845b35963aaa59aa78423616d3cfe24827bbcae
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/async_rl.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/docs/training/async_rl.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/training/async_rl.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -71,10 +71,11 @@ With `VLLM_SERVER_DEV_MODE=1`, the vLLM HTTP server exposes the same functionali
 - `POST /pause?mode=keep` - Pause generation
 - `POST /resume` - Resume generation
 - `POST /abort_requests` - Abort in-flight requests without pausing the scheduler (send `{}` to abort all, or `{"request_ids": [...]}`)
+- `POST /update_weight_version` - Set the `weight_version` label without changing weights (send `{"new_version": "v8"}`)
 - `GET /weight_info` - Return the latest committed `weight_version`
 
 !!! note "Data Parallelism"
-    When using data parallelism with vLLM's **internal load balancer** (i.e. `data_parallel_backend="ray"`), pause and resume are handled automatically across all DP ranks -- a single call is sufficient. When using an **external load balancer** (i.e. multiple independent vLLM instances behind a proxy), you must send pause and resume requests to **every** engine instance individually before and after the weight update.
+    When using data parallelism with vLLM's **internal load balancer** (i.e. `data_parallel_backend="ray"`), pause and resume are handled automatically across all DP ranks -- a single call is sufficient. When using an **external load balancer** (i.e. multiple independent vLLM instances behind a proxy), you must send pause and resume requests to **every** engine instance individually before and after the weight update, and set the weight version on every instance too.
 
 ## Typical Async RL Flow
 
@@ -82,11 +83,26 @@ A typical async RL loop with weight syncing looks like this:
 
 1. Start generating rollouts from the current policy
 2. Once trainer has new weights to update to, pause generation with `mode="keep"`
-3. Sync the updated weights from the trainer to the inference engine (see [Weight Transfer](weight_transfer/README.md))
+3. Sync the updated weights from the trainer to the inference engine (see [Weight Transfer](weight_transfer/README.md)) and set their weight version
 4. Resume generation -- in-flight requests continue with the new weights
 5. Repeat
 
 The key insight is that requests paused with `mode="keep"` will produce tokens from the **old** weights before the pause and tokens from the **new** weights after resume. The `clear_cache` parameter controls whether the KV cache is invalidated during the pause. When `clear_cache=True`, previously cached key-value entries are discarded, so all tokens generated after resume will be computed entirely with the new weights. When `clear_cache=False`, existing KV cache entries are retained, meaning some tokens in context may still reflect the old weights (stale KV cache).
+
+## Weight Versions in Outputs
+
+To tell which tokens came from which weights, set a weight-version label while generation is paused, after the new weights are loaded: pass `weight_version` to `finish_weight_update`, or call `update_weight_version` (`POST /update_weight_version` over HTTP). Labels are strings you choose, such as the trainer step; vLLM doesn't order or check them.
+
+The final output of every sequence then carries `weight_versions`, one span per label over its output-token indexes. A request paused with `mode="keep"` across one update gets two spans:
+
+```python
+completion = final_output.outputs[0]
+for span in completion.weight_versions:
+    # The tokens in [span.start, span.end) were sampled by weights `span.version`.
+    print(span.version, completion.token_ids[span.start : span.end])
+```
+
+The offsets cover the whole output, so with streamed delta outputs, collect the tokens before slicing. `/inference/v1/generate` returns the same list on each choice; see [Tokens In <> Tokens Out API](../serving/online_serving/token_in_token_out.md#weight-versions).
 
 ## Example
 

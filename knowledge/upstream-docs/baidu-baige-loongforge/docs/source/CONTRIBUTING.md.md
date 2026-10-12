@@ -1,0 +1,232 @@
+---
+id: doc-baidu-baige-loongforge-0747df059a972962380a
+title: baidu-baige/LoongForge / docs/source/CONTRIBUTING.md
+engine: loongforge
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: baidu-baige/LoongForge
+commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+path: docs/source/CONTRIBUTING.md
+raw_sha256: e63930dcedc409d94bf464bcce7cf398956297ee3af732ae291dfdac29b6c009
+sources: []
+generated_body_sha256: 294d6c08cd9fd2120adb3d41f2cf2a6425aa7a0c81c918217881ff22495c9a77
+source_state: current-scan
+---
+
+# baidu-baige/LoongForge / docs/source/CONTRIBUTING.md
+
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/CONTRIBUTING.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Contribute
+👍🎉 First off, thanks for taking the time to contribute! 🎉👍
+
+Please check out the [Apache Code of Conduct](https://www.apache.org/foundation/policies/conduct.html) first.
+
+We welcome community contributors to LoongForge. Feel free to share your ideas or submit code—help us make LoongForge even better!
+
+Before getting started, please read the following open-source contribution guidelines and adhere to the relevant agreements.
+
+## How to Contribute
+We welcome and encourage contributions from the community. Whether it's fixing bugs, adding new features, improving documentation, or sharing ideas, all contributions help make LoongForge better.
+
+## Issues
+We use GitHub Issues to track bugs, feature requests, and other public discussions.
+
+### Search Existing Issues First
+Before opening a new issue, please search through existing issues to check whether a similar bug report or feature request already exists. This helps avoid duplicates and keeps discussions focused.
+
+### Reporting New Issues
+When opening a new issue, please provide as much information as possible, such as:
+* A clear and detailed problem description
+* Relevant logs or error messages
+* Code snippets, screenshots, or videos if applicable
+
+The more context you provide, the easier it will be for maintainers to diagnose and resolve the issue.
+
+## Pull Requests
+We strongly welcome pull requests to help improve LoongForge.
+
+All pull requests will be reviewed by the maintainers. The `Static Checks` workflow runs the blocking CPU checks for each PR. Once it passes and the review is approved, the pull request can be merged into the `master` branch.
+
+### Repository Structure
+
+LoongForge manages its dependencies using two strategies:
+
+| Repository | Strategy | Where changes land |
+|---|---|---|
+| **LoongForge** (this repo) | fork → PR | `baidu-baige/LoongForge` |
+| **Loong-Megatron** | fork → PR | `baidu-baige/Loong-Megatron` |
+| **TransformerEngine** | patch files | `patches/TransformerEngine_<tag>/` in LoongForge |
+
+### Step 0 — Fork the repositories
+
+Fork the repositories you intend to modify on GitHub:
+
+```
+baidu-baige/LoongForge        →  your-name/LoongForge
+baidu-baige/Loong-Megatron   →  your-name/Loong-Megatron   # only if modifying Megatron
+```
+
+### Step 1 — Clone your fork and initialize submodules
+
+```bash
+git clone --recurse-submodules https://github.com/your-name/LoongForge.git
+cd LoongForge
+
+# Add the official repo as upstream
+git remote add upstream https://github.com/baidu-baige/LoongForge.git
+```
+
+### Step 2 — Configure Loong-Megatron remotes (only if modifying Megatron)
+
+```bash
+cd third_party/Loong-Megatron
+# origin already points to baidu-baige/Loong-Megatron via the submodule config
+git remote add my-fork https://github.com/your-name/Loong-Megatron.git
+
+# Verify
+git remote -v
+# origin    https://github.com/baidu-baige/Loong-Megatron.git (fetch)
+# my-fork   https://github.com/your-name/Loong-Megatron.git   (fetch)
+cd ../..
+```
+
+### Step 3 — Create a development branch
+
+```bash
+# LoongForge
+git checkout master
+git pull upstream master
+git checkout -b feature/your-feature-name
+
+# Loong-Megatron (only if modifying Megatron)
+cd third_party/Loong-Megatron
+git checkout loong-main/core_v0.15.0
+git pull origin loong-main/core_v0.15.0
+git checkout -b feature/your-feature-name
+cd ../..
+```
+
+### Step 4 — Develop and commit your changes
+
+Make your changes, then commit:
+
+```bash
+git add .
+git commit -m "feat: add your commit message"
+```
+
+### Step 5 — Sync with upstream and push to your fork
+
+```bash
+# (Optional but recommended) Rebase on the latest upstream master before pushing
+git pull --rebase upstream master
+git push -u origin feature/your-feature-name
+```
+
+For Loong-Megatron changes, push to your Megatron fork instead:
+
+```bash
+cd third_party/Loong-Megatron
+git pull --rebase origin loong-main/core_v0.15.0
+git push -u my-fork feature/your-feature-name
+```
+
+### Step 6 — Create a Pull Request
+
+Open a PR on GitHub from your feature branch to the target upstream branch:
+
+- **LoongForge changes**: `your-name/LoongForge:feature/xxx` → `baidu-baige/LoongForge:master`
+- **Megatron changes**: `your-name/Loong-Megatron:feature/xxx` → `baidu-baige/Loong-Megatron:loong-main/core_v0.15.0`
+- **TE changes**: commit the patch file to LoongForge, then open a PR as in the LoongForge flow above
+
+---
+
+### Pre-Submission Checklist
+
+Before submitting a pull request, please make sure that:
+
+1. You create your branch from the correct base branch (`master` for LoongForge, `loong-main/core_v0.15.0` for Loong-Megatron).
+2. You update relevant code comments or documentation if APIs are changed.
+3. You add the appropriate copyright and license notice to the top of any new source files when applicable, and preserve upstream notices for third-party derived files.
+4. For original source files, prefer using the SPDX-based Apache-2.0 header described in the project guidelines.
+5. Your code passes linting and style checks.
+6. Your changes are fully tested.
+7. You submit the pull request against the correct development branch as required.
+
+## Continuous Integration
+
+Every PR runs the following checks through the `Static Checks` GitHub Actions workflow on CPU runners (no GPU/XPU). The individual workflows are reusable checks called by `static-checks.yml` and are not triggered directly.
+
+| Workflow | What it checks | Reproduce locally |
+|---|---|---|
+| Static Checks | All blocking CPU checks below | Open or update a PR |
+| PR Title Check | Title matches `[<modules>] <type>: <description>` | n/a — edit the PR title |
+| License Header | Newly added `.py/.sh/.cu/.cpp/.h` files have the SPDX Apache-2.0 header | `pre-commit run spdx-check --files <path>` |
+| Secret Scan | gitleaks finds no leaked secrets in staged files locally and new commits in CI | `pre-commit run gitleaks` (staged files); CI scans the PR commit range |
+| Ruff | New or modified Python files pass Ruff (`E4,E7,E9,F,S506`; `E402`/`E501`/`E731`/`F841` ignored) | `ruff check <changed-python-files>` |
+| Build | `python -m build` and wheel import smoke succeed on Python 3.12 | `python -m build --sdist --wheel --outdir dist/` |
+| Sensitive Scan | No blocking internal-only information is present in changed files | `pre-commit run sensitive-scan --all-files` |
+| Workflow Lint | GitHub Actions files pass `actionlint`, YAML parsing, and CI helper contract tests | `actionlint && node --test tests/test_ci_helpers.js` |
+
+`workflow_dispatch` on `static-checks.yml` is diagnostic and publishes a final job
+named `manual-static-checks`. Only the automatically triggered PR job is named
+`static-checks` and can satisfy the required merge check.
+
+### Valid PR title modules
+
+`llm, vlm, vla, diffusion, train, data, ops, ckpt, peft, docker, xpu, ci, docs, tests, scripts, release`
+
+### Valid PR title types
+
+`feat, fix, refactor, perf, docs, test, chore, ci`
+
+### Example
+
+`[llm, ckpt] feat: support Qwen3-Next checkpoint conversion`
+
+### Setting up pre-commit locally
+
+```bash
+pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+Once installed, the hygiene, SPDX, gitleaks, and sensitive-information hooks
+run automatically on `git commit`. The first gitleaks run may take a few
+minutes while pre-commit builds the pinned release in its isolated Go
+environment. The gitleaks hook scans staged content; the sensitive-information
+hook scans the files passed by pre-commit. These hooks complement, but do not
+replace, the PR commit-range and full CI scans.
+
+### GPU validation
+
+Maintainers may request GPU validation with `/ok-to-test --suite llm_vlm|embodied`.
+The suite selects the corresponding self-hosted runner (`llm_vlm` on a and
+`embodied` on p). The default run uses the suite's known-good baseline;
+`--model` requests a baseline-backed subset for additional validation. Add
+`--build-image` to build the PR Dockerfile on that same runner and run the
+regression against the local candidate image. Runner and machine configuration
+is provided through protected Environment variables, and new commits
+invalidate previous GPU results. The PR Check reports queued, candidate-image
+build, regression, cancelled, and final states. When a new commit arrives, the
+older queued or running suite job is cancelled; cleanup of its temporary
+context, regression container, and candidate image is targeted and best-effort
+without globally pruning the runner's shared BuildKit cache.
+
+## License
+By contributing to LoongForge, you agree that your original contributions will be licensed under the [Apache License 2.0](https://github.com/baidu-baige/LoongForge/blob/master/LICENSE).
+
+Please note that some files in this repository include or are derived from third-party open-source projects. For such files, contributors must retain the original copyright, license, and attribution notices required by the upstream project, and add modification notices where appropriate. See the corresponding file headers for additional details.
+
+For practical file header templates and examples, please refer to our **[License and File Header Guidelines](https://loongforge.readthedocs.io/en/latest/HEADER_GUIDELINES.html)**.

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA-NeMo/Megatron-Bridge
-commit: 34ddd53b0e023d93f107f29b7dc61f9c5dd76a57
+commit: 53681c1aa264b54a1afa320830738382ee2a44f4
 path: docs/training/README.md
-raw_sha256: 0a93ea272713be2af229f9ec50b3770a9220275073b69ef15b8bf7039d4a9023
+raw_sha256: a68ce5f5361bf05b042904e14c7f7391ffeeabf783914ffbcd912f1e18eb2185
 sources: []
-generated_body_sha256: 520e5907a167dbd470d71058242c1a4450eb2afbec6f5f16486d0a2412517583
+generated_body_sha256: 9c1d1f7ef01b6f1d4124b1905fc5e66f6b9fe87f724e0e571bd7c3d3a1db3d24
 source_state: current-scan
 ---
 
 # NVIDIA-NeMo/Megatron-Bridge / docs/training/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/34ddd53b0e023d93f107f29b7dc61f9c5dd76a57/docs/training/README.md)
+[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/docs/training/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -71,6 +71,7 @@ This directory contains comprehensive documentation for training and customizing
 | **[Mixed Precision](mixed-precision.md)** | Mixed precision training for memory efficiency | Reducing memory usage |
 | **[Communication Overlap](communication-overlap.md)** | Overlapping communication with computation | Optimizing distributed training |
 | **[Hierarchical Context Parallel](hierarchical-context-parallel.md)** | Hierarchical `a2a+p2p` context parallel guidance | Advanced long-sequence scaling |
+| **[Dynamic Context Parallel](dynamic-context-parallel.md)** | Per-microbatch context-parallel groups sized by global-batch packing | Variable-length long-context training |
 | **[Attention Optimizations](attention-optimizations.md)** | Optimizing attention mechanisms | Improving training speed |
 | **[Activation Recomputation](activation-recomputation.md)** | Gradient checkpointing strategies | Reducing memory footprint |
 | **[CPU Offloading](cpu-offloading.md)** | Offloading to CPU for memory management | Working with limited GPU memory |
@@ -90,6 +91,7 @@ This directory contains comprehensive documentation for training and customizing
 |----------|---------|--------------|
 | **[PEFT](peft.md)** | Parameter-Efficient Fine-Tuning (LoRA, etc.) | Fine-tuning with limited resources |
 | **[Packed Sequences](packed-sequences.md)** | Sequence packing for efficiency | Optimizing data loading |
+| **[MegatronMIMO Intra-Microbatch Reordering](mimo-intra-microbatch-reorder.md)** | Balance per-sample vision load across module DP ranks | Non-colocated MIMO VLM finetuning with uneven image load |
 | **[Megatron FSDP](megatron-fsdp.md)** | Stable overview of Megatron FSDP | Choosing an FSDP path |
 | **[Distillation](../modelopt/distillation.md)** | Knowledge distillation techniques | Transferring knowledge between models |
 | **[Checkpointing](checkpointing.md)** | Checkpoint saving, loading, and resuming | Managing training state |

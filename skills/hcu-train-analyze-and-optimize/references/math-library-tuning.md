@@ -39,6 +39,8 @@ export HIPBLASLT_LOG_FILE="${diagnostic_dir}/hipblaslt.rank${RANK}.%i.log"
 
 用同一 DTK/库的 bench 检查命令可解析、正确性及算法/workspace兼容；grouped GEMM保留每组真实尺寸。独立 bench 的缓存、stream、同步与并发条件可能不同，不能据其与模型服务时间的差就自动归因于库。
 
+设备侧 grouped 参数尤其要追到真实每组 M/N/K、stride、指针和 alpha/beta；host heuristic 使用的平均尺寸或占位描述不一定是实际 workload，不能当 tune size。当前 bench 若不能重放这些设备参数，交接原生日志、完整分组参数与最小复现，明确无法直接还原的字段，不伪造一条等价命令。shape capture 的首样本缓存也不代表后续动态 token 分布；采集与正式计时分开。
+
 ## 4. 工单与回归
 
 调优交接至少包含：为什么需要 tune、端到端权重、合理参考及差距、原生 bench 命令与原日志、硬件/gfx/CU、DTK/加载库路径与版本/哈希、实际 kernel/算法（若可得）、正确性与计时口径、相关源码/配置及限制。未知项明确列出。参数分析表是附件，不能替代原生 bench 日志。

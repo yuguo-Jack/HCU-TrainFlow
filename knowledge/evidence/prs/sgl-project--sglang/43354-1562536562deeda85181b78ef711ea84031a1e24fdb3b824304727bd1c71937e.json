@@ -1,0 +1,150 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "91b3692a4c39453694f53ff54b67186ca4a7f34c",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\n**What users see.** On the ROCm images `lmsysorg/sglang-rocm` v0.5.20 and v0.5.21, Qwen3.6-35B-A3B-FP8 at TP1 produces garbage when only one request is running: a few correct tokens, then `!!!!`. The same bug also causes two other problems:\n- a re-sent cached prompt comes back wrong when exactly one token has to be recomputed (radix cache, `extra_buffer`);\n- the MTP draft is corrupted under NEXTN, which slows speculative decoding.\n\n**Reproduce** (MI350X, `lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261002`; `SGLANG_USE_AITER=1` is the image default):\n```bash\npython -m sglang.launch_server --model-path Qwen/Qwen3.6-35B-A3B-FP8 --tp-size 1\ncurl -s localhost:30000/v1/chat/completions -H 'Content-Type: application/json' -d '{\n  \"messages\": [{\"role\": \"user\", \"content\": \"Explain in detail how a hash table handles collisions, with examples.\"}],\n  \"max_tokens\": 64, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}}'\n# Before: \"# Hash Table Collision Handling\\n\\n## What Is!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!...\"\n# After:  \"# Hash Table Collision Resolution: A Detailed Explanation\\n\\n## 1. What Is a Collision?\\n\\nA **hash table** maps keys to ...\"\n# Sending the same request again (radix-cache hit): before \"#!!!!!!!!!!!!!!!!!!...\", after a coherent answer.\n# (Verified with an extra --mem-fraction-static 0.4 only because the GPU was shared.)\n```\n\n**Cause.** For very small batches, aiter splits the stage1 MoE GEMM along K and adds the partial results into one buffer. For Qwen3.6-35B at M=1, K=2048 is split 8 ways (256 each), so every split owns exactly one K tile. In that configuration CK skips zeroing the buffer, but the splits still accumulate into it. The buffer comes from `torch.empty`, so the result lands on stale memory.\n\naiter guarded this case in ROCm/aiter#3997, but ROCm/aiter#4394 dropped the guard. It is tracked in ROCm/aiter#4032. The v0.5.16 image (aiter `d9e5ef7`) still has the guard.\n\n## Modifications\n\nAt `AiterRunnerCore` init, sglang wraps `aiter.fused_moe.ck_moe_stage1` once:\n- For fp8 block-scale (per_1x128) calls whose split leaves a single K tile per split, the wrapper lowers the split to the largest count that keeps ≥ 2 K tiles per split. For example, K=2048 goes from 8 splits to 4. If no such count exists, the call runs unsplit.\n- All other calls are passed through unchanged.\n\n**Why in sglang, and why it is safe:**\n- **No released image has the aiter fix**, so v0.5.20/v0.5.21 users hit this now.\n- **Narrow:** only calls that currently return wrong results change. sglang already patches aiter the same way (`apply_aiter_small_moe_sort_patch`, #36559).\n- **Clear removal condition:** a `TODO` drops it once the minimum supported aiter carries the guard again. If aiter fixes it first, the wrapper is harmless.\n- **Not `AITER_KSPLIT=1`:** that disables split-K for every call and slows small-batch decode.\n- **Lowers the split instead of disabling split-K** (what #3997 does). Running unsplit leaves most of the GPU idle (32 workgroups on 256 CUs) and is slower. Lowering the split is correct and slightly faster than the original: 27.7 µs vs 28.8 µs per MoE call.\n- **Supersedes #29633.** That PR only avoided one path to M=1 (the radix cache), so it could not fix decode, the spec draft, or TP > 1.\n- **Interaction with #41982:** on gfx950, small-M FP8 calls with the Qwen3.5-397B-A17B shapes now go to sglang's `smallm_moe_gfx950` kernel and never reach `ck_moe_stage1`. This change covers the remaining shapes, and gfx942.\n\n## Accuracy Tests\n\nQwen3.6-35B-A3B-FP8, TP1, MI350X, `v0.5.21-rocm724-mi35x-20261002`, `--attention-backend triton --mamba-radix-cache-strategy extra_buffer`. Serving logprobs are compared against logprobs recomputed by a clean prefill, following sglang's `kl_test_utils`.\n\n| Case | Before | After |\n|---|---|---|\n| Single-request decode, no spec | NaN in 2032/2048 tokens | KL 1.6e-3 (sglang's threshold for hybrid models: 2e-3) |\n| Re-sent cached prompt, 1 token to recompute | NaN in 8/8 | KL 4.6e-3, same range as an unaffected control (2-token recompute) |\n| Batch ≥ 2 (not touched by this change) | KL 1.8e-3 | KL 1.2e-3, within noise |\n\n<details><summary>Details: equivalence on unchanged paths, kernel-level check, affected models and TP</summary>\n\n**Equivalence on unchanged paths**\n- Byte-identical output is not a usable criterion. aiter's fused MoE is not deterministic run to run, even without this change: two runs of the unpatched server on the same inputs give identical tokens for only 6/16 sequences.\n- Equivalence is therefore measured against that noise. On paths this change does not touch, KL between unpatched and patched is 6.6e-4. The unpatched-vs-unpatched noise is 5.4e-4 to 7.6e-4.\n- The prefill-logprob |Δ| quantiles across servers match unpatched-vs-unpatched reruns (p50 0.007–0.010 vs 0.007–0.008).\n\n**Kernel level**\n- `fused_moe` is compared against an fp32 reference, including with the caching allocator pre-filled with NaN.\n- Before: wrong exactly in the single-tile-split cases. After: correct in every case.\n\n**Affected models and TP** (MI350X/MI355X, default heuristic):\n- Qwen3.6-35B-A3B-FP8:\n  - TP1 at M=1\n  - TP2 at M≤2\n  - TP4/TP8 at M≤4\n- Qwen3.5-397B-A17B-FP8: TP8 at M=1. On gfx950 this is now covered by #41982.\n- Qwen3.8-Flash-Next-FP8:\n  - TP4 at M=1\n  - TP8 at M≤2\n- Dense models are not affected.\n- 397B and Flash-Next were verified at kernel level only.\n\n</details>\n\n## Speed Tests and Profiling\n\nQwen3.6-35B-A3B-FP8, TP1, MI350X, single request, same image and flags as above:\n\n| | Before | After |\n|---|---|---|\n| NEXTN, 10,000-token generation (3 long-form prompts) | 360 tok/s | **426 tok/s (+18%)** |\n| NEXTN, 256-token answers | TPOT 3.23 ms | **2.13 ms** |\n| No spec | 3.40 ms *(produces garbage, not a valid baseline)* | 3.44 ms |\n\n- The NEXTN speedup comes from the MTP draft being correct again: accept length goes up ×1.13–1.46, depending on content.\n- With batch ≥ 2 at TP1 this change does not act, so speed is unchanged.\n\n<details><summary>GPU time per MoE call at M=1</summary>\n\n| Shape | Before (wrong) | Split-K disabled | This PR |\n|---|---|---|---|\n| 35B TP1 | 28.8 µs | 31.5 µs | **27.7 µs** |\n| 397B TP8 | 32.3 µs | 40.5 µs | **26.5 µs** |\n\n</details>\n\n## Tests\n\nAdded `test/registered/amd/test_aiter_moe_splitk_kbatch_guard.py`:\n- It runs `fused_moe` at M=1/2/4/8 and compares against an fp32 reference.\n- It fails at M=1 without the guard and passes on MI350X.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (not applicable)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #37916671528](https://github.com/sgl-project/sglang/actions/runs/37916671528)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37916671150](https://github.com/sgl-project/sglang/actions/runs/37916671150)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37916671514](https://github.com/sgl-project/sglang/actions/runs/37916671514)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "ntgiang71096"
+            },
+            "body": "@hnyls2002 Following up on your note in #29633: the M=1 issue does still reproduce on the unified-cache tree. The root cause turned out to be in aiter's split-K path rather than the radix cache: `ck_moe_stage1` with a single K tile per split, whose guard from ROCm/aiter#3997 was dropped in ROCm/aiter#4394. This PR fixes it in the aiter MoE runner. That also covers plain single-request decode and the MTP draft, not just the 1-token extend.\n\nCould you take a look and run `/tag-and-rerun-ci` when you have a moment? Thanks!\n",
+            "createdAt": "2026-10-09T10:36:08Z",
+            "updatedAt": "2026-10-09T10:36:08Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43354#issuecomment-6079192068"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWpZHAQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad",
+      "headRepository": {
+        "nameWithOwner": "ntgiang71096/sglang"
+      },
+      "merged": false,
+      "number": 43354,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[AMD] Fix wrong MoE output at small batch with aiter fp8 block-scale (split-K with one K tile per split)",
+      "updatedAt": "2026-10-09T10:36:08Z",
+      "url": "https://github.com/sgl-project/sglang/pull/43354"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "91b3692a4c39453694f53ff54b67186ca4a7f34c"
+    },
+    "body": "## Motivation\n\n**What users see.** On the ROCm images `lmsysorg/sglang-rocm` v0.5.20 and v0.5.21, Qwen3.6-35B-A3B-FP8 at TP1 produces garbage when only one request is running: a few correct tokens, then `!!!!`. The same bug also causes two other problems:\n- a re-sent cached prompt comes back wrong when exactly one token has to be recomputed (radix cache, `extra_buffer`);\n- the MTP draft is corrupted under NEXTN, which slows speculative decoding.\n\n**Reproduce** (MI350X, `lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261002`; `SGLANG_USE_AITER=1` is the image default):\n```bash\npython -m sglang.launch_server --model-path Qwen/Qwen3.6-35B-A3B-FP8 --tp-size 1\ncurl -s localhost:30000/v1/chat/completions -H 'Content-Type: application/json' -d '{\n  \"messages\": [{\"role\": \"user\", \"content\": \"Explain in detail how a hash table handles collisions, with examples.\"}],\n  \"max_tokens\": 64, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}}'\n# Before: \"# Hash Table Collision Handling\\n\\n## What Is!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!...\"\n# After:  \"# Hash Table Collision Resolution: A Detailed Explanation\\n\\n## 1. What Is a Collision?\\n\\nA **hash table** maps keys to ...\"\n# Sending the same request again (radix-cache hit): before \"#!!!!!!!!!!!!!!!!!!...\", after a coherent answer.\n# (Verified with an extra --mem-fraction-static 0.4 only because the GPU was shared.)\n```\n\n**Cause.** For very small batches, aiter splits the stage1 MoE GEMM along K and adds the partial results into one buffer. For Qwen3.6-35B at M=1, K=2048 is split 8 ways (256 each), so every split owns exactly one K tile. In that configuration CK skips zeroing the buffer, but the splits still accumulate into it. The buffer comes from `torch.empty`, so the result lands on stale memory.\n\naiter guarded this case in ROCm/aiter#3997, but ROCm/aiter#4394 dropped the guard. It is tracked in ROCm/aiter#4032. The v0.5.16 image (aiter `d9e5ef7`) still has the guard.\n\n## Modifications\n\nAt `AiterRunnerCore` init, sglang wraps `aiter.fused_moe.ck_moe_stage1` once:\n- For fp8 block-scale (per_1x128) calls whose split leaves a single K tile per split, the wrapper lowers the split to the largest count that keeps ≥ 2 K tiles per split. For example, K=2048 goes from 8 splits to 4. If no such count exists, the call runs unsplit.\n- All other calls are passed through unchanged.\n\n**Why in sglang, and why it is safe:**\n- **No released image has the aiter fix**, so v0.5.20/v0.5.21 users hit this now.\n- **Narrow:** only calls that currently return wrong results change. sglang already patches aiter the same way (`apply_aiter_small_moe_sort_patch`, #36559).\n- **Clear removal condition:** a `TODO` drops it once the minimum supported aiter carries the guard again. If aiter fixes it first, the wrapper is harmless.\n- **Not `AITER_KSPLIT=1`:** that disables split-K for every call and slows small-batch decode.\n- **Lowers the split instead of disabling split-K** (what #3997 does). Running unsplit leaves most of the GPU idle (32 workgroups on 256 CUs) and is slower. Lowering the split is correct and slightly faster than the original: 27.7 µs vs 28.8 µs per MoE call.\n- **Supersedes #29633.** That PR only avoided one path to M=1 (the radix cache), so it could not fix decode, the spec draft, or TP > 1.\n- **Interaction with #41982:** on gfx950, small-M FP8 calls with the Qwen3.5-397B-A17B shapes now go to sglang's `smallm_moe_gfx950` kernel and never reach `ck_moe_stage1`. This change covers the remaining shapes, and gfx942.\n\n## Accuracy Tests\n\nQwen3.6-35B-A3B-FP8, TP1, MI350X, `v0.5.21-rocm724-mi35x-20261002`, `--attention-backend triton --mamba-radix-cache-strategy extra_buffer`. Serving logprobs are compared against logprobs recomputed by a clean prefill, following sglang's `kl_test_utils`.\n\n| Case | Before | After |\n|---|---|---|\n| Single-request decode, no spec | NaN in 2032/2048 tokens | KL 1.6e-3 (sglang's threshold for hybrid models: 2e-3) |\n| Re-sent cached prompt, 1 token to recompute | NaN in 8/8 | KL 4.6e-3, same range as an unaffected control (2-token recompute) |\n| Batch ≥ 2 (not touched by this change) | KL 1.8e-3 | KL 1.2e-3, within noise |\n\n<details><summary>Details: equivalence on unchanged paths, kernel-level check, affected models and TP</summary>\n\n**Equivalence on unchanged paths**\n- Byte-identical output is not a usable criterion. aiter's fused MoE is not deterministic run to run, even without this change: two runs of the unpatched server on the same inputs give identical tokens for only 6/16 sequences.\n- Equivalence is therefore measured against that noise. On paths this change does not touch, KL between unpatched and patched is 6.6e-4. The unpatched-vs-unpatched noise is 5.4e-4 to 7.6e-4.\n- The prefill-logprob |Δ| quantiles across servers match unpatched-vs-unpatched reruns (p50 0.007–0.010 vs 0.007–0.008).\n\n**Kernel level**\n- `fused_moe` is compared against an fp32 reference, including with the caching allocator pre-filled with NaN.\n- Before: wrong exactly in the single-tile-split cases. After: correct in every case.\n\n**Affected models and TP** (MI350X/MI355X, default heuristic):\n- Qwen3.6-35B-A3B-FP8:\n  - TP1 at M=1\n  - TP2 at M≤2\n  - TP4/TP8 at M≤4\n- Qwen3.5-397B-A17B-FP8: TP8 at M=1. On gfx950 this is now covered by #41982.\n- Qwen3.8-Flash-Next-FP8:\n  - TP4 at M=1\n  - TP8 at M≤2\n- Dense models are not affected.\n- 397B and Flash-Next were verified at kernel level only.\n\n</details>\n\n## Speed Tests and Profiling\n\nQwen3.6-35B-A3B-FP8, TP1, MI350X, single request, same image and flags as above:\n\n| | Before | After |\n|---|---|---|\n| NEXTN, 10,000-token generation (3 long-form prompts) | 360 tok/s | **426 tok/s (+18%)** |\n| NEXTN, 256-token answers | TPOT 3.23 ms | **2.13 ms** |\n| No spec | 3.40 ms *(produces garbage, not a valid baseline)* | 3.44 ms |\n\n- The NEXTN speedup comes from the MTP draft being correct again: accept length goes up ×1.13–1.46, depending on content.\n- With batch ≥ 2 at TP1 this change does not act, so speed is unchanged.\n\n<details><summary>GPU time per MoE call at M=1</summary>\n\n| Shape | Before (wrong) | Split-K disabled | This PR |\n|---|---|---|---|\n| 35B TP1 | 28.8 µs | 31.5 µs | **27.7 µs** |\n| 397B TP8 | 32.3 µs | 40.5 µs | **26.5 µs** |\n\n</details>\n\n## Tests\n\nAdded `test/registered/amd/test_aiter_moe_splitk_kbatch_guard.py`:\n- It runs `fused_moe` at M=1/2/4/8 and compares against an fp32 reference.\n- It fails at M=1 without the guard and passes on MI350X.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (not applicable)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #37916671528](https://github.com/sgl-project/sglang/actions/runs/37916671528)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37916671150](https://github.com/sgl-project/sglang/actions/runs/37916671150)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37916671514](https://github.com/sgl-project/sglang/actions/runs/37916671514)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "ntgiang71096/sglang"
+      },
+      "sha": "757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/43354",
+    "merged": false,
+    "number": 43354,
+    "state": "open",
+    "title": "[AMD] Fix wrong MoE output at small batch with aiter fp8 block-scale (split-K with one K tile per split)",
+    "updated_at": "2026-10-09T10:36:08Z"
+  },
+  "files": [
+    {
+      "additions": 46,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad/python%2Fsglang%2Fsrt%2Flayers%2Fmoe%2Fmoe_runner%2Faiter.py",
+      "changes": 46,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fmoe%2Fmoe_runner%2Faiter.py?ref=757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad",
+      "deletions": 0,
+      "filename": "python/sglang/srt/layers/moe/moe_runner/aiter.py",
+      "patch": "@@ -46,6 +46,51 @@\n \n _MOE_SORTING_DISPATCH_POLICY = envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()\n \n+# aiter's block-fp8 split-K stage1 (ck_moe_stage1) accumulates the splits into\n+# a torch.empty fp32 buffer, which CK zeroes only when every split owns at\n+# least two K tiles (KBatch = K // (splitk * 256) > 1). For tiny M, aiter's\n+# default heuristic can still choose a split with KBatch == 1; e.g. M=1 for\n+# Qwen3.5/3.6-FP8 at TP1, M<=4 at TP4. The stage1 output is then garbage.\n+# aiter #3997 guarded this by running such calls unsplit and #4394 dropped the\n+# guard. Lowering the split to the largest count that keeps two K tiles per\n+# split is also correct, and faster than running unsplit.\n+# TODO(ntgiang71096): remove once the minimum supported aiter carries the\n+# guard again (ROCm/aiter#4032).\n+_AITER_SPLITK_K_PER_BLOCK = 256\n+\n+\n+def _aiter_safe_splitk(k: int, splitk: int) -> int:\n+    \"\"\"Largest split <= splitk whose splits each own >= 2 K tiles; 0 runs unsplit.\"\"\"\n+    for split in range(splitk, 1, -1):\n+        tiles, rem = divmod(k, split * _AITER_SPLITK_K_PER_BLOCK)\n+        if rem == 0 and tiles >= 2:\n+            return split\n+    return 0\n+\n+\n+@functools.cache\n+def apply_aiter_splitk_kbatch_guard() -> None:\n+    \"\"\"Keep aiter's block-fp8 split-K stage1 at >= 2 K tiles per split.\"\"\"\n+    try:\n+        import aiter.fused_moe as fm\n+        from aiter import QuantType\n+    except ImportError:\n+        return\n+    orig_stage1 = fm.ck_moe_stage1\n+\n+    @functools.wraps(orig_stage1)\n+    def ck_moe_stage1_guarded(*args, **kwargs):\n+        splitk = kwargs.get(\"splitk\", 1)\n+        if splitk > 1 and kwargs.get(\"quant_type\") == QuantType.per_1x128:\n+            hidden_states = args[0] if args else kwargs[\"hidden_states\"]\n+            k = hidden_states.shape[-1]\n+            if k // (splitk * _AITER_SPLITK_K_PER_BLOCK) < 2:\n+                kwargs[\"splitk\"] = _aiter_safe_splitk(k, splitk)\n+        return orig_stage1(*args, **kwargs)\n+\n+    fm.ck_moe_stage1 = ck_moe_stage1_guarded\n+    logger.info(\"aiter split-K KBatch guard applied\")\n+\n \n class AiterQuantType(str, Enum):\n     NONE = \"No\"\n@@ -255,6 +300,7 @@ def __init__(self, *args, **kwargs):\n         )\n \n         apply_aiter_small_moe_sort_patch()\n+        apply_aiter_splitk_kbatch_guard()\n \n     def run(\n         self,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad/python%2Fsglang%2Fsrt%2Flayers%2Fmoe%2Fmoe_runner%2Faiter.py",
+      "sha": "f4d1979a89b4a5508181827e440028eee4eb8abc",
+      "status": "modified"
+    },
+    {
+      "additions": 118,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad/test%2Fregistered%2Famd%2Ftest_aiter_moe_splitk_kbatch_guard.py",
+      "changes": 118,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Famd%2Ftest_aiter_moe_splitk_kbatch_guard.py?ref=757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad",
+      "deletions": 0,
+      "filename": "test/registered/amd/test_aiter_moe_splitk_kbatch_guard.py",
+      "patch": "@@ -0,0 +1,118 @@\n+\"\"\"aiter block-fp8 fused MoE at tiny M vs a float32 torch reference.\n+\n+For K=2048, topk=8, inter=512 (Qwen3.5/3.6-FP8 MoE at TP1), aiter's default\n+heuristic splits stage1 eight ways at M=1, so each split owns a single 256-wide\n+K tile. The split-K accumulator is then never zeroed and the output is\n+garbage. The sglang aiter runner installs a guard that runs such calls unsplit\n+(ROCm/aiter#4032).\n+\"\"\"\n+\n+import unittest\n+\n+import torch\n+import torch.nn.functional as F\n+\n+from sglang.test.ci.ci_register import register_amd_ci\n+from sglang.test.test_utils import CustomTestCase\n+\n+register_amd_ci(est_time=60, suite=\"stage-b-test-1-gpu-small-amd\")\n+\n+\n+def _rocm_with_aiter():\n+    if not (torch.version.hip and torch.cuda.is_available()):\n+        return False\n+    try:\n+        import aiter  # noqa: F401\n+    except ImportError:\n+        return False\n+    return True\n+\n+\n+def _block_quant_128(w):\n+    # [E, N, K] -> fp8 [E, N, K] with one fp32 scale per 128x128 block\n+    from aiter import dtypes, pertoken_quant\n+\n+    e, n, k = w.shape\n+    blocks = w.view(e, n // 128, 128, k // 128, 128).permute(0, 1, 3, 2, 4)\n+    q, s = pertoken_quant(\n+        blocks.reshape(e, -1, 128 * 128).contiguous(), quant_dtype=dtypes.fp8\n+    )\n+    q = q.view(e, n // 128, k // 128, 128, 128).permute(0, 1, 3, 2, 4)\n+    return q.reshape(e, n, k).contiguous(), s.view(e, n // 128, k // 128)\n+\n+\n+def _dequant_128(q, s):\n+    return q.float() * s.repeat_interleave(128, 1).repeat_interleave(128, 2)\n+\n+\n+@unittest.skipUnless(_rocm_with_aiter(), \"ROCm with aiter only\")\n+class TestAiterMoeSplitKKBatchGuard(CustomTestCase):\n+    E, INTER, DIM, TOPK = 16, 512, 2048, 8\n+\n+    @classmethod\n+    def setUpClass(cls):\n+        from aiter.ops.shuffle import shuffle_weight\n+\n+        from sglang.srt.layers.moe.moe_runner.aiter import (\n+            apply_aiter_splitk_kbatch_guard,\n+        )\n+\n+        apply_aiter_splitk_kbatch_guard()\n+        torch.manual_seed(0)\n+        dev = torch.device(\"cuda\", 0)\n+        w1 = torch.randn(cls.E, 2 * cls.INTER, cls.DIM, device=dev) * 0.05\n+        w2 = torch.randn(cls.E, cls.DIM, cls.INTER, device=dev) * 0.05\n+        w1_q, cls.w1_scale = _block_quant_128(w1.to(torch.bfloat16))\n+        w2_q, cls.w2_scale = _block_quant_128(w2.to(torch.bfloat16))\n+        cls.w1_ref = _dequant_128(w1_q, cls.w1_scale)\n+        cls.w2_ref = _dequant_128(w2_q, cls.w2_scale)\n+        cls.w1 = shuffle_weight(w1_q, (16, 16))\n+        cls.w2 = shuffle_weight(w2_q, (16, 16))\n+        # same layout flag the fp8 MoE method sets on its shuffled weights\n+        cls.w1.is_shuffled = True\n+        cls.w2.is_shuffled = True\n+        cls.dev = dev\n+\n+    def _reference(self, x, topk_weights, topk_ids):\n+        from aiter import dtypes, pertoken_quant\n+\n+        # aiter quantizes activations per 1x128 group before stage1\n+        x_q, x_s = pertoken_quant(x.view(x.shape[0], -1, 128), quant_dtype=dtypes.fp8)\n+        x_deq = (x_q.float() * x_s).view(x.shape[0], -1)\n+        out = torch.zeros(x.shape[0], self.DIM, device=self.dev)\n+        for t in range(x.shape[0]):\n+            for slot in range(self.TOPK):\n+                e = int(topk_ids[t, slot])\n+                h = x_deq[t] @ self.w1_ref[e].t()\n+                act = F.silu(h[: self.INTER]) * h[self.INTER :]\n+                out[t] += float(topk_weights[t, slot]) * (act @ self.w2_ref[e].t())\n+        return out\n+\n+    def test_small_m_matches_reference(self):\n+        from aiter import ActivationType, QuantType\n+        from aiter.fused_moe import fused_moe, fused_topk\n+\n+        for m in (1, 2, 4, 8):\n+            with self.subTest(m=m):\n+                x = torch.randn(m, self.DIM, device=self.dev).to(torch.bfloat16)\n+                logits = torch.randn(m, self.E, device=self.dev).to(torch.bfloat16)\n+                topk_weights, topk_ids = fused_topk(x, logits, self.TOPK, True)\n+                out = fused_moe(\n+                    x,\n+                    self.w1,\n+                    self.w2,\n+                    topk_weights,\n+                    topk_ids,\n+                    quant_type=QuantType.per_128x128,\n+                    activation=ActivationType.Silu,\n+                    w1_scale=self.w1_scale,\n+                    w2_scale=self.w2_scale,\n+                ).float()\n+                ref = self._reference(x, topk_weights, topk_ids)\n+                self.assertTrue(torch.isfinite(out).all())\n+                cos = F.cosine_similarity(out.flatten(), ref.flatten(), dim=0)\n+                self.assertGreater(cos.item(), 0.99)\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad/test%2Fregistered%2Famd%2Ftest_aiter_moe_splitk_kbatch_guard.py",
+      "sha": "5b63e55f1d5b43376ac535303d9c186c062557d1",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "@hnyls2002 Following up on your note in #29633: the M=1 issue does still reproduce on the unified-cache tree. The root cause turned out to be in aiter's split-K path rather than the radix cache: `ck_moe_stage1` with a single K tile per split, whose guard from ROCm/aiter#3997 was dropped in ROCm/aiter#4394. This PR fixes it in the aiter MoE runner. That also covers plain single-request decode and the MTP draft, not just the 1-token extend.\n\nCould you take a look and run `/tag-and-rerun-ci` when you have a moment? Thanks!\n",
+      "created_at": "2026-10-09T10:36:08Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43354#issuecomment-6079192068",
+      "updated_at": "2026-10-09T10:36:08Z",
+      "user": {
+        "login": "ntgiang71096"
+      }
+    }
+  ],
+  "number": 43354,
+  "refs": {
+    "base": {
+      "commit": "91b3692a4c39453694f53ff54b67186ca4a7f34c",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "757b9eaf1c4990b3ed34aa69e7688fd804f4a9ad",
+      "repository": "ntgiang71096/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": []
+}

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: examples/fully_async/README.md
-raw_sha256: f8d013677325f9511574c3b09e1d4ebe10b72c2aad1e9d36f65730600faf2587
+raw_sha256: 325cdf5eea17920f24197317b3cfb30ab7b3375e6b07e19d6b687d0fb133adc3
 sources: []
-generated_body_sha256: 20de1f8d2bdf3326b95536db411539564606af34e0cef788b46dac6cf05124c8
+generated_body_sha256: 38cfc7fce244e181c7d64e3be02e6d0c9e549b0a2b22304ea7269d0cdc514692
 source_state: current-scan
 ---
 
 # THUDM/slime / examples/fully_async/README.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/examples/fully_async/README.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/examples/fully_async/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -89,22 +89,55 @@ multi-turn agent (Claude Code in a Docker-Proxy sandbox) this way.
 
 ## Worker Internals (Very Short)
 
-* First call: create a process-wide `AsyncRolloutWorker` (thread + asyncio
-  loop). The worker is shared across all subsequent `generate_rollout`
-  calls so its queue stays warm.
-* Loop keeps up to `args.sglang_server_concurrency` tasks in flight using
-  `generate_and_rm_group`.
+* With the default object-store data source, the first call creates a
+  manager-local `AsyncRolloutWorker` (thread + asyncio loop). The data source
+  owns it across subsequent calls so its queue stays warm.
+* With `--rollout-data-transport straw`, queue readers select
+  `DistributedRollout`: one generation actor on each eligible Ray node with
+  CPU resources. These actors request generations from the SGLang engines;
+  they do not load additional model replicas.
+* The concurrency budget is `sglang_server_concurrency` times the logical
+  engine count, divided into prompt-group slots. Distributed workers share
+  those slots and need at least one group per worker node.
 * Completed groups land on an output queue; each `generate_rollout` call
   drains until it has `rollout_batch_size` groups and returns them sorted
   by `sample.index`.
 * Groups containing an `ABORTED` sample are pushed back into
   `data_buffer.add_samples` instead of being shipped to training.
-* Worker is stopped automatically at process exit via `atexit`.
+* The data source coordinates pause, checkpoint and close. Admission pauses
+  around weight synchronization; in-flight work is preserved before resuming.
+
+## Partial rollout and durable storage
+
+Partial rollout is also useful with synchronous training. With
+`--partial-rollout`, the standard sampler retains unfinished prefixes after
+enough complete groups are accepted, then resumes them in a later rollout.
+Oversampling supplies spare groups; for example use a target batch of 8 groups
+and `--over-sampling-batch-size 16`. Completed groups form the training batch;
+unfinished groups are saved for continuation.
+
+Async workers rebuffer aborted groups through their own lifecycle. A continued
+response can contain several weight versions. Optional
+`--mask-offpolicy-in-partial-rollout` excludes existing prefix tokens from the
+loss, but does not remove prefix-distribution mismatch.
+
+straw persists tasks, partial/ready groups and packed tensors on shared storage.
+For multi-node execution, configure a verified JuiceFS mount at the same path
+on all nodes, along with `--rollout-data-dir`, `--rollout-queue-run-id`,
+`--rollout-storage-profile juicefs` and `--rollout-storage-declaration`.
+Recovery needs a completed model/optimizer and rollout checkpoint plus the
+referenced data pool and compatible worker topology. See the
+[scheduling tutorial](https://github.com/THUDM/slime/blob/main/docs/en/advanced/rollout-scheduling.md)
+and [straw guide](https://github.com/THUDM/slime/blob/main/docs/en/advanced/straw.md).
 
 ## Limitations
 
 * No evaluation mode (would conflict with the continuous-running model).
 * Ordering across rollouts is best-effort — within a rollout, groups are
   sorted by index before being handed to training.
-* TODO: partial-rollout-style resume for `ABORTED` trajectories is not
-  yet wired; for now the trajectory is re-queued and starts over.
+* Distributed fully async does not support `--rollout-all-samples-process-path`.
+* straw does not support `--buffer-filter-path`; its persisted queue has its
+  own completed/partial/fresh ordering and staleness priority.
+* Restoring queue state does not restore GPU KV caches or guarantee identical
+  future random generations. Custom generation hooks must preserve the
+  continuation and abort contracts.

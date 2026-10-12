@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: docs/en/advanced/straw.md
-raw_sha256: bcf23bb8436edc2e4ff08728e25fd5bba1a990fa7fee8de9199cc1e5da315719
+raw_sha256: 829161f121d5361be141a6a04173b73f272879def602251aa1b5943277a26f4d
 sources: []
-generated_body_sha256: 6a75cc71c5dd8efd268d30a96c3753fb4548dffbfe3d5b9bbf3c4692a8e2f439
+generated_body_sha256: 3727e0810c91c2f118d25e00e196b4bfdcedaa4f97758008470642f05c7b4461
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/straw.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/straw.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/advanced/straw.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -117,9 +117,9 @@ for custom rollout functions and queue readers.
 
 ## Packed storage and supported data
 
-Packing is enabled whenever Straw transport is selected. Each writer appends
+Packing is enabled whenever straw transport is selected. Each writer appends
 multiple samples and tensors to the same file (a pack), reducing small-file
-metadata overhead on shared storage. slime uses Straw's default target size,
+metadata overhead on shared storage. slime uses straw's default target size,
 currently **1 GiB**. Use `--rollout-queue-segment-mib` to override it in MiB.
 
 The target size controls file rotation; readers can access each publication
@@ -144,7 +144,7 @@ and ordinary fields still occupy manager memory.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `--rollout-queue-segment-mib` | Unset; uses Straw's default (currently `1024`) | Override the target pack rotation size in MiB; explicit values must be positive. |
+| `--rollout-queue-segment-mib` | Unset; uses straw's default (currently `1024`) | Override the target pack rotation size in MiB; explicit values must be positive. |
 | `--rollout-io-concurrency` | `4` | Bound concurrent serialization and filesystem I/O submissions |
 | `--rollout-queue-lease-seconds` | `300` | Worker lease duration; active readers renew it |
 

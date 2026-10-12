@@ -15,42 +15,41 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/config/OVERRIDE.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e300303059959a1d608c0aea248259fbf01a215021dc2a04f05f599dffd9d9d3
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: d24fa16f2b8cef0aed3a4f601d55ec88f5a22b44572c00c0e411d8933ed5bcef
 - source: pytorch-torchtitan
   path: torchtitan/models/common/async_linear.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 7e4212aaa3a0ad55eeaa9f76e40199cf5ef1324cd1687bea267c8ab2898432ea
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/async_tensor_parallel.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: d8695578b569e0232d9f44d1bd6190851318ce7a2b1f1261c7868d2009003be0
 - source: pytorch-torchtitan
   path: torchtitan/distributed/cuda_graph.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 54e3ae358d4f2b1a1dd95cb25b56af36cabca604881f0e2df65044d1e3f101d2
 - source: pytorch-torchtitan
   path: torchtitan/experiments/graph_trainer/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: d10ff4000251b9ea00f8156e0c3387cfe481d56250d87b402d72251cb7ce6c28
 - source: pytorch-torchtitan
   path: torchtitan/distributed/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 92cfc9a282f2afbd4975f8a769a854bd7fcce444f85011206835db414bc9cbe0
 - source: pytorch-torchtitan
   path: torchtitan_recipes/overrides/kimi_attention_residual.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 3782d82d0a72504e572969d3cdf3310dae6b29949910f131d7a9c4cda1a2ea3a
 pr_sources:
 - pr-pytorch--torchtitan-5033
 - pr-pytorch--torchtitan-5250
 - pr-pytorch--torchtitan-5263
 ---
-
 # TorchTitan 局部编译、融合、异步 TP 与 GraphTrainer
 
 ## 先确认实际执行路径
@@ -99,14 +98,14 @@ GraphPP 可以构造 stage-local 前后向、FSDP unshard/reduce、分离 dI/dW 
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/config/OVERRIDE.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/OVERRIDE.md)
-- [torchtitan/config/transform/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/transform/README.md)
-- [torchtitan/models/common/async_linear.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/common/async_linear.py)
-- [torchtitan/config/transform/async_tensor_parallel.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/transform/async_tensor_parallel.py)
-- [torchtitan/distributed/cuda_graph.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/cuda_graph.py)
-- [torchtitan/experiments/graph_trainer/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/experiments/graph_trainer/README.md)
-- [torchtitan/distributed/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/README.md)
-- [torchtitan_recipes/overrides/kimi_attention_residual.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan_recipes/overrides/kimi_attention_residual.py)
+- [torchtitan/config/OVERRIDE.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/OVERRIDE.md)
+- [torchtitan/config/transform/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/transform/README.md)
+- [torchtitan/models/common/async_linear.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/common/async_linear.py)
+- [torchtitan/config/transform/async_tensor_parallel.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/transform/async_tensor_parallel.py)
+- [torchtitan/distributed/cuda_graph.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/cuda_graph.py)
+- [torchtitan/experiments/graph_trainer/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/experiments/graph_trainer/README.md)
+- [torchtitan/distributed/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/README.md)
+- [torchtitan_recipes/overrides/kimi_attention_residual.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan_recipes/overrides/kimi_attention_residual.py)
 
 - [PR #5033：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5033.md)
 - [PR #5250：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5250.md)

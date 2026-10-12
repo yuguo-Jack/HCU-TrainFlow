@@ -3,11 +3,19 @@ id: engines/deepspeed-offload-lifetime
 title: DeepSpeed ZeRO-1/2 offload：梯度所有权与流顺序
 engine: deepspeed
 kind: authored
-stages: [optimize, fault-tolerance]
+stages:
+- optimize
+- fault-tolerance
 review_level: pr-diff-and-selected-source-reading
 runtime_validated: false
-pr_sources: [pr-deepspeedai--deepspeed-8632]
-sources: []
+pr_sources:
+- pr-deepspeedai--deepspeed-8632
+sources:
+- source: deepspeedai-deepspeed
+  path: deepspeed/runtime/zero/stage_1_and_2.py
+  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+  sha256: aa9556509f8249b9e82f6208297311c69e25eb6e560e64c7670fe3bb928436b3
+reviewed_on: '2026-10-12'
 ---
 
 # DeepSpeed ZeRO-1/2 offload：梯度所有权与流顺序
@@ -40,4 +48,10 @@ PR 保留原 overlap barrier，并在其上增加约束；修改后也没有一�
 
 先核对 HCU 分支是否已有等价修复以及 runtime 的 stream/event/allocator 语义。不能直接假定 CUDA stream API 的名称相同就意味着所有行为相同；必要时读实际 HIP/PyTorch 后端和底层实现。
 
-若候选引起回归，可切回经验证的无问题配置并保留故障证据，而不是删除生命周期保护。调参和实现稳定后再安排阶段 loss；单测通过不等同长训已验证。本案例没有 HCU 实测数据，所有现场记录留在私有经验 Wiki。
+若候选引起回归，可切回经验证的无问题配置并保留故障证据，而不是删除生命周期保护。调参和实现稳定后再安排阶段 loss；单测通过不等同长训已验证。本案例没有 HCU 实测数据。中间排查留在任务 workspace；可复用环境经验和已验收的最终总结按知识筛选规范进入共享 Wiki。
+
+## 当前源码与更新范围
+
+2026-10-12 复核官方 master 固定提交 `1c862f7df93f0345b977c67f5408d967b94bf4ae` 的 [`stage_1_and_2.py`](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/deepspeed/runtime/zero/stage_1_and_2.py)：大梯度独立存储、bucket ready/reuse event 和 offload copy 等待仍有实现依据。事件/record_stream 路径还检查 accelerator 的 `resolves_data_dependency()`；不能把某后端的显式事件数当成所有设备的执行模式。
+
+更新时联动 [DeepSpeed 总览](deepspeed.md)、[ZeRO 生命周期专题](deepspeed/topics/zero-state-lifecycle.md)、本案例与实际调用方。PR 的改因、当前主干和现场所用 HCU 分支分别查证。

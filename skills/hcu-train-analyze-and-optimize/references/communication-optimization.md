@@ -6,6 +6,8 @@
 
 ## 1. 建立边界和基线
 
+先核对消费者锁定的通信依赖和实际 backend/topology。节点内 IPC、特殊互联、普通 RDMA 的能力标志和测试配方不可互换；不能仅凭 `internode` 字段判断物理节点范围，也不把某专项关闭网络的配方用于常规跨机。provider 的编译期 ABI、GPU/HCA 映射和注册内存所属 PD/QP 要与加载制品一致，环境变量不能修复 ABI 不匹配。更换 EP 后端另验同步/异步、Graph、多次并发调用及梯度归并；存在 dispatch/combine API 不等于这些能力均已实现。
+
 按实际 process group 记录 rank→设备/节点/NIC、TP/PP/DP/CP/EP（含组合组）、消息字节、dtype、collective/P2P、调用序列、stream/event、producer→consumer 和 buffer 生命周期。每个非单例组至少两个代表 rank；定位最慢 rank、全组一致性或运行 TraceLens collective 报告时补全所需 ranks。校时后再比较跨 rank 先后。
 
 对相同消息量、成员、dtype、拓扑分别测：纯通信、对应 GEMM/attention 等纯计算、当前训练并发窗口。记录启动/排队、真正传输、等待、整步尾部暴露时间及 overlap 时计算退化。RCCL kernel 持续时间可能含等待/协议轮询，不能全算成链路传输；时间线相交也不能证明通信被有效隐藏。

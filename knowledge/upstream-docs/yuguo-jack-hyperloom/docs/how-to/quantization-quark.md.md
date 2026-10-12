@@ -1,0 +1,94 @@
+---
+id: doc-yuguo-jack-hyperloom-6ccae548d64856ffd28d
+title: yuguo-Jack/Hyperloom / docs/how-to/quantization-quark.md
+engine: hyperloom
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: yuguo-Jack/Hyperloom
+commit: 0425bde3f6e76e1588400c37d056dfd3bb75ac11
+path: docs/how-to/quantization-quark.md
+raw_sha256: ddc84ff55d1663a2d3772a5945a962971deeb7f30e26ded7cfd509ca7119b849
+sources: []
+generated_body_sha256: 853da9e1061798058e9c1c6e577dba3ebe09b36fc1a2985bc138f9f50b68c62b
+source_state: current-scan
+---
+
+# yuguo-Jack/Hyperloom / docs/how-to/quantization-quark.md
+
+[Original at fixed commit](https://github.com/yuguo-Jack/Hyperloom/blob/0425bde3f6e76e1588400c37d056dfd3bb75ac11/docs/how-to/quantization-quark.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+---
+myst:
+    html_meta:
+        "description": "Enable and configure the optional AMD Quark quantization prelude in Hyperloom. Covers structured quantization schemes, Quark checkout, and environment variable configuration."
+        "keywords": "Hyperloom, quantization, AMD Quark, fp8, mxfp4, ptq, MI355X, AMD GPU, ROCm, LLM inference, quantize-scheme"
+---
+# Enable quantization with AMD Quark in Hyperloom
+
+The optional quantization prelude drives [AMD Quark](https://quark.docs.amd.com/)
+before the optimization loop starts, then rewrites `--model` to the exported
+quantized model so the rest of Hyperloom optimizes that artifact.
+
+Quantization is disabled unless you explicitly enable the deterministic primary
+switch:
+
+```bash
+export HYPERLOOM_QUANTIZE_ENABLED=1
+```
+
+Then choose one request style:
+
+```bash
+# Free-text power-user path. Failure hard-stops the run with exit code 3.
+python3 -m hyperloom.inference_optimizer.cli optimize \
+  --model /models/source \
+  --quantize "fp8 global scheme, fp8 kv_cache, exclude lm_head"
+
+# Structured path. `none` or omit means no quantization.
+python3 -m hyperloom.inference_optimizer.cli optimize \
+  --model /models/source \
+  --quantize-scheme fp8
+```
+
+Structured schemes are `fp8`, `ptpc_fp8`, `mxfp4`, and `mxfp4_fp8`.
+`mxfp4` / `mxfp4_fp8` are MI355X-only; when a structured scheme is unsupported
+on the selected GPU, Hyperloom prints `QUANTIZATION_SKIPPED`, sets
+`HYPERLOOM_QUANTIZATION_SKIPPED`, and continues on the unquantized model.
+
+## Quark checkout
+
+`quantization_agent` requires an AMD Quark checkout at runtime. Hyperloom does
+not bundle Quark or implement quantization itself; it invokes Quark's published
+skills (`quark-torch-ptq` -> `quark-torch-result-validator` ->
+`quark-torch-llm-eval`) end to end.
+
+Quark is open-sourced at
+[`https://github.com/amd/Quark.git`](https://github.com/amd/Quark.git) and is
+also published on PyPI (`pip install amd-quark`). The
+`.claude/skills/quark-torch-*` skill entry points that Hyperloom drives ship on
+the `release/0.12` branch (and later), so clone that branch when you need the
+agent-driven prelude.
+
+When you run `python -m hyperloom.inference_optimizer.cli optimize`, set the
+Quark checkout explicitly with `QUARK_ROOT`:
+
+`python -m hyperloom.inference_optimizer.cli optimize` has no `--quark-root`
+flag; that argument only exists on the standalone `quantization-agent` CLI. For
+the `optimize` path, set `QUARK_ROOT` explicitly. The path must contain
+`.claude/skills/quark-torch-ptq/SKILL.md` plus the validator and eval skills. If
+the resolved checkout is missing after quantization is enabled, the run fails
+fast instead of silently optimizing the unquantized source model.
+
+```text
+HYPERLOOM_QUANTIZE_ENABLED=1
+QUARK_ROOT=/opt/amd/Quark
+```

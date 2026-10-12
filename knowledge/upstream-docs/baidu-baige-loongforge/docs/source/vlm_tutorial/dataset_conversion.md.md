@@ -1,0 +1,119 @@
+---
+id: doc-baidu-baige-loongforge-ed3492c29c4045ac8f53
+title: baidu-baige/LoongForge / docs/source/vlm_tutorial/dataset_conversion.md
+engine: loongforge
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: baidu-baige/LoongForge
+commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+path: docs/source/vlm_tutorial/dataset_conversion.md
+raw_sha256: b54335733a7f80e894c9d3a01223ae38f19ed47851dbbb628d4138ed1046d954
+sources: []
+generated_body_sha256: b29d35548fbf508802cc05b576c628e306b116ca21f9d343317654c919cef507
+source_state: current-scan
+---
+
+# baidu-baige/LoongForge / docs/source/vlm_tutorial/dataset_conversion.md
+
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/vlm_tutorial/dataset_conversion.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# VLM Dataset Conversion
+
+## 1. Dataset Format and Processing
+
+Considering the diversity of multimodal datasets, this project adopts the Energon loader to improve data processing performance, which requires datasets to be stored in standard WebDataset format. WebDataset stores data in native file formats (jpg, mp4, etc.), allowing various native multimodal datasets to be simply compressed and converted to WebDataset format, then read by Energon.
+
+Reference Documentation:
+
+* Energon: [https://nvidia.github.io/Megatron-Energon/](https://nvidia.github.io/Megatron-Energon/)
+* WebDataset: [https://huggingface.co/docs/hub/datasets-webdataset](https://huggingface.co/docs/hub/datasets-webdataset)
+
+This directory provides `tools/vlm_data_preprocess/convert_to_webdataset.py` for converting `.json/.jsonl` annotation files + original media files (images/videos) into WebDataset directories that Energon can directly read (while generating Energon-required indexes and `dataset.yaml`).
+
+## 2. Supported Data Types (`--sample_type`)
+
+Different `dataset.yaml` files are written based on `--sample_type`, determining the field organization of samples inside tar files:
+
+Common pretrain datasets can use caption format, SFT datasets can use VQA format. For multi-image or mixed SFT requirements, `multi_mix_qa` format is recommended.
+
+| sample_type | Applicable Scenario | Description |
+|-------------|-------------------|-------------|
+| `vqa` | Single image VQA | Generates `VQASample` mapping, image field is `jpg`, text extracted from `json[...]` |
+| `caption` | Single image caption | Generates `CaptioningSample` mapping, image field is `jpg`, text extracted from `json[...]` |
+| `multi_mix_qa` | Multi-image/video mixed QA | Uses `CrudeWebdataset`, passes `subflavors.sample_type` to downstream cooker for parsing |
+| `multi_vid_vqa` | Multi-video VQA | Same as above |
+| `packed_multi_mix_qa` / `packed_chat_mix` / `packed_captioning` / `packed_vqa` | Post offline-packing data | The `subflavors.sample_type` written by the `offline_packing` workflow; the current WDS-native pipeline emits `packed_multi_mix_qa` / `packed_chat_mix`, while `packed_captioning` / `packed_vqa` are legacy types from the older packing path (see section 5) |
+| Other strings | Custom scenarios | Still writes `CrudeWebdataset`, but ensure downstream implements corresponding `sample_type` parsing logic |
+
+Notes:
+
+* `--media` is only used to write dataset metadata (for distinguishing image/video/mix). Whether actual samples contain images/videos is determined by whether each entry contains `image(s)` / `video(s)`.
+* If an entry has neither `image(s)` nor `video(s)`, it will be written as a "pure text sample" (containing only `json`).
+
+## 3. Conversion Script Usage
+
+Supported input files:
+
+* `--json_file`: `.json` (list[dict]) or `.jsonl` (one dict per line)
+* `--image_dir` / `--video_dir`: Original media file root directory (relative paths stored in entries)
+
+```bash
+python tools/vlm_data_preprocess/convert_to_webdataset.py \
+  --output_dir /workspace/wds_data/ \
+  --json_file tests/datasets/vlm/mllm_demo.json \
+  --image_dir tests/datasets/vlm/ \
+  --video_dir tests/datasets/vlm/ \
+  --media mix \
+  --columns_messages messages \
+  --maxcount 10000 \
+  --maxsize 3000000000 \
+  --sample_type multi_mix_qa
+```
+
+Parameter Description:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--output_dir` | - | Output directory (generates `pretrain-*.tar` + Energon metadata directory) |
+| `--json_file` | - | Input `.json/.jsonl` |
+| `--image_dir` | - | Image root directory (required when samples contain `image(s)` or `sample_type=vqa/caption`) |
+| `--video_dir` | - | Video root directory (required when samples contain `video(s)`) |
+| `--media` | `image` | `image/video/mix` |
+| `--columns_messages` | `messages` | Key for dialogue/text field in entry |
+| `--maxcount` | `10000` | Maximum number of samples per shard (tar) |
+| `--maxsize` | `3000000000` | Maximum byte size per shard (tar) |
+| `--sample_type` | - | Data type (see table above) |
+
+Output Description:
+
+* Output directory contains `pretrain-0.tar`, `pretrain-1.tar`... (each tar stores several files corresponding to `__key__` according to WebDataset specification, such as `xxx.jpg`/`xxx.json`/`xxx.0_a.mp4`, etc.)
+* Also generates Energon-required metadata directory (usually named `.wds/`), containing `dataset.yaml` and index files; during training, `--data-path` typically points to `--output_dir`
+
+## 4. Input JSON Conventions (Common Fields)
+
+Each entry supports the following field combinations (all relative paths, will be concatenated with `--image_dir/--video_dir` to read binary files):
+
+* Images: `image: "a/b.jpg"` or `images: ["a/b.jpg", "c/d.jpg"]`
+* Videos: `video: "a/b.mp4"` or `videos: ["a/b.mp4", "c/d.mp4"]`
+* Text/Dialogue: Default reads `messages` (can be modified with `--columns_messages`)
+
+Text field requirements for different `sample_type` (aligned with script-generated `dataset.yaml`):
+
+* `vqa`: `messages` should support reading `json[0][content]` and `json[1][content]` (commonly a list with length ≥ 2, elements containing `content`)
+* `caption`: `messages` should support reading `json[captions][0][content]` (e.g., dict contains `captions: [{content: ...}]`)
+* `multi_mix_qa` / `multi_vid_vqa`, etc.: Script writes a structured `json` (containing `texts/media/name`), downstream parses according to corresponding `sample_type` cooker
+
+## 5. Offline Packing Data Processing
+
+In multimodal scenarios, sequence offline packing processing methods are provided
+
+See [Offline Data Packing Guide](https://loongforge.readthedocs.io/en/latest/features/offline_data_packing.html) for details

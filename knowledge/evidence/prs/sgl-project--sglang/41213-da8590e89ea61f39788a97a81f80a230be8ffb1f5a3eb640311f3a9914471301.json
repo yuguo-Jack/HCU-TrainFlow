@@ -1,0 +1,433 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "9e0b001db4955b2d183e8c73d8438c49ecafac95",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nFive independent, unrelated-but-small fixes found:\n\n1. Partial rotary embeddings crash on XPU's fallback kernel path.\n2. `UnifiedRadixCache.dec_lock_ref` missing a default argument, crashing the scheduler.\n3. Transformers-backend fallback (`--model-impl transformers`) failing to load/serve remote-code models with legacy tied-weights conventions or wrapper classes (found via `YannQi/R-4B`).\n4. A silent accuracy bug in the OpenAI-compatible chat-completions content formatter, affecting any model whose chat template expects structured (\"openai\"-format) content but receives a plain string.\n5. Custom remote-code tokenizers with a stale `_pad()` override crashing on every request once `padding_side` started being forwarded (found via `zai-org/chatglm2-6b`).\n\n## Modifications\n\n### 1. `RotaryEmbedding.forward_xpu()` partial rotary embeddings (`python/sglang/srt/layers/rotary_embedding/base.py`)\n\nThe fallback-kernel branch (used when `head_size` is not in `[128, 256, 512]`) calls `torch.ops.sgl_kernel.rotary_embedding(...)` without slicing to `rotary_dim` first. That compiled kernel asserts `rotary_dim == head_size` internally and raises `RuntimeError: Rotary dim doesn't match query head_size` for any model with partial rotary embeddings (`rotary_dim < head_size`) on XPU, e.g. `adept/persimmon-8b-chat`, `microsoft/phi-2`, `stabilityai/stablelm-2-1_6b`, `stabilityai/stablelm-3b-4e1t`, `stabilityai/stablelm-zephyr-3b`. Independent of `--attention-backend`, since rotary embedding dispatch is keyed on device type (`is_xpu()`).\n\nFix: add an `elif self.head_size != self.rotary_dim` branch that falls back to `forward_native()`, mirroring the existing pattern where `forward_cpu`/`forward_npu` already fall back to `forward_native` for their own unsupported cases.\n\n### 2. `UnifiedRadixCache.dec_lock_ref` missing default (`python/sglang/srt/mem_cache/unified_radix_cache.py`)\n\n`BasePrefixCache.dec_lock_ref` declares `params: Optional[DecLockRefParams] = None`, but `UnifiedRadixCache`'s override (introduced in #36848) dropped the default, requiring `params` positionally. `schedule_policy.py`'s `_lock_node` calls `self.tree_cache.dec_lock_ref(last_node)` with no `params` whenever the acquire receipt's `to_dec_params()` returns `None`, even though `is_tree_cache()` is `True` for `UnifiedRadixCache`. This crashes with `TypeError: UnifiedRadixCache.dec_lock_ref() missing 1 required positional argument: 'params'`.\n\nFix: restore the default, matching the abstract interface and every other concrete `dec_lock_ref` implementation. Backend-agnostic -- reproduced on Intel XPU, but the code path has no device-specific branching.\n\n### 3. Transformers-backend fallback: legacy tied-weights + wrapped-model remote code (`python/sglang/srt/models/transformers.py`, `python/sglang/srt/utils/hf_transformers_patches.py`, `python/sglang/srt/parser/jinja_template_utils.py`)\n\nFour fixes for models routed through the Transformers-backend fallback (`TransformersBase`), found while debugging `YannQi/R-4B`:\n\n- `PreTrainedModel.get_expanded_tied_weights_keys()` (transformers 5.17.0) assumes `_tied_weights_keys` is a `{target: source}` dict. Remote model code that still declares it as a list (pre-v5 convention, e.g. `YannQi/R-4B`'s `modeling_r.py`) crashes with `AttributeError: 'list' object has no attribute 'keys'`. Patched to convert a list-style mapping into the expected dict by resolving the source path from `get_input_embeddings()`. That call is itself guarded: some remote-code classes with this same list-style convention never override `get_input_embeddings()` either, so a failure there is caught and the mapping is left untouched -- the model still fails to load, but with the original, well-understood `AttributeError` instead of a different, confusing exception raised from inside this patch.\n- Some remote-code repos map `AutoModel` to the same class as `AutoModelForCausalLM` / `AutoModelForImageTextToText` -- a full `*ForConditionalGeneration` wrapper with its own `.model` backbone and `.lm_head` -- rather than a bare backbone class (again, `YannQi/R-4B`). That adds an extra `model.` nesting level relative to the checkpoint's flat weight names, and `_run_hf_backbone()` would call the wrapper's full forward (returning logits, not hidden states) instead of the backbone's. `TransformersBase.__init__` now detects and unwraps this redundant wrapper.\n- `R-4B`'s checkpoint ships `vision_tower` weights under a `model.vision_tower.vision_model.*` prefix (the unwrap above makes `self.model` the bare backbone, so the checkpoint's own `model.` prefix on top of the already-flattened `vision_tower.vision_model.*` convention needs remapping too). The existing `vision_tower.vision_model.` -> `model.vision_tower.` remap only covered the un-prefixed variant; added the `model.`-prefixed one.\n- `R-4B`'s `vision_config.torch_dtype` is `float32`, independent of the top-level dtype used to serve the model. `TransformersBase._init_parameters()` materializes meta-device params via `torch.empty_like(param.data, ...)`, which preserves each param's own (possibly stale) dtype. Modules rebuilt by `recursive_replace()` (Linear/RMSNorm) get the uniform engine dtype, but untouched modules (vision tower's Conv2d/LayerNorm/Embedding) kept the divergent `float32`, causing `RuntimeError: mat1 and mat2 must have the same dtype, but got Float and Half` on the first mixed op. Now forces every floating-point param to the engine's `torch.get_default_dtype()` instead.\nPlus one fix in the OpenAI-compatible chat-completions layer found while validating accuracy end-to-end on the same model:\n\n- In `process_content_for_template_format()` (`jinja_template_utils.py`, used by all OpenAI-compatible chat completions, not just the Transformers backend): sglang already detects whether a model's chat template expects `\"string\"` or `\"openai\"` (structured list) content, but when a caller sends plain-string `content` against an `\"openai\"`-format template, the function passed it through unchanged instead of wrapping it into `[{\"type\": \"text\", \"text\": ...}]`. `R-4B`'s own `chat_template.jinja` iterates `message['content']` expecting a list, so a plain string renders as empty content -- the model gets no question text, silently, no error. This affects any model whose template is classified `\"openai\"`-format when a caller sends legacy-style string content, not just R-4B.\n\n### 4. Tokenizer `_pad()` compat shim for stale custom signatures (`python/sglang/srt/utils/patch_tokenizer.py`)\n\ntransformers 5.x's `PreTrainedTokenizerBase.pad()` now always forwards `padding_side` down to `_pad()`. Custom remote-code tokenizers with a stale, fixed `_pad()` signature (no `padding_side` param, no `**kwargs` catch-all -- e.g. `zai-org/chatglm2-6b`'s `ChatGLMTokenizer`, unchanged for years) crash with:\n\n```\nTypeError: ChatGLMTokenizer._pad() got an unexpected keyword argument 'padding_side'\n```\n\non every single generation request, regardless of memory/backend settings.\n\nFix: detects the mismatch structurally via `inspect.signature` (not a name/class check), so any other custom tokenizer with the same stale signature is covered too, and wraps `_pad()` to drop the `padding_side` kwarg before delegating to the original implementation (which already reads `self.padding_side` directly, so behavior is unchanged).\n\n## Accuracy Tests\n\nAll five fixes were validated end-to-end on real Intel XPU hardware (docker `lmsysorg/sglang:v0.5.20-xpu`), not just reasoned about statically:\n\n- **Rotary fix**: 20-example accuracy smoke checks (server + client, real GPU) for `adept/persimmon-8b-chat` (intel_xpu backend, gsm8k), `microsoft/phi-2` (triton backend, gsm8k), `stabilityai/stablelm-3b-4e1t` (triton backend, hellaswag), `stabilityai/stablelm-zephyr-3b` (triton backend, gsm8k) -- all previously crashed with `RuntimeError: Rotary dim doesn't match query head_size`, all now serve and produce results.\n- **Radix cache fix**: reproduced the crash on `lmsysorg/sglang:v0.5.20-xpu` running `docvqa_val`/`gsm8k` evals (e.g. `HuggingFaceTB/SmolVLM2-2.2B-Instruct`, `CohereLabs/aya-vision-8b`); with the fix overlaid, a 20-example `docvqa_val` run against `HuggingFaceTB/SmolVLM2-2.2B-Instruct` completes successfully (accuracy 0.4831, no crash).\n- **Transformers-backend + chat-template fixes**: `YannQi/R-4B`, `--model-impl transformers --trust-remote-code`, task `gsm8k`: server now starts, loads weights, and serves correctly (all four crashes are gone); produces real (non-zero) accuracy using the model's own unmodified `chat_template.jinja` -- no `--chat-template` override needed.\n- **Tokenizer `_pad()` shim**: confirmed on real Intel XPU hardware against `zai-org/chatglm2-6b`: the `TypeError` no longer occurs and generation requests proceed past tokenization/padding.\n\n## Speed Tests and Profiling\n\nNot applicable. All five fixes are either startup-time compatibility shims, exception-path corrections, or a content-formatting correction in the request-preprocessing layer -- none touch inference-loop math or kernels.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit) guide -- `pre-commit run` passes clean on every changed file.\n- [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests) guide -- not added; each fix was validated by reproducing the original crash on real hardware and confirming it's gone (see Accuracy Tests), consistent with how the originating PRs were validated.\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations) -- not applicable; all five are internal bug fixes with no user-facing API or CLI changes.\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed) -- see Accuracy Tests above; no speed impact.\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\nCloses #41088, closes #41142. Supersedes and replaces #41798 and #41796 (folded in here at the author's request to land together; those two will be closed in favor of this PR).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38210797156](https://github.com/sgl-project/sglang/actions/runs/38210797156)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38210796959](https://github.com/sgl-project/sglang/actions/runs/38210796959)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38210797045](https://github.com/sgl-project/sglang/actions/runs/38210797045)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "headRepository": {
+        "nameWithOwner": "vshekhawat-hlab/sglang"
+      },
+      "merged": false,
+      "number": 41213,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "mingfeima"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "mingfeima"
+                  },
+                  "body": "set None here still reaches `tree_core.dec_lock_ref`, and `_assert_receipt_anchor` reads params.node_id. A normal node then raises AttributeError instead of the old TypeError. Handle params is None before calling tree_core.",
+                  "createdAt": "2026-10-08T07:26:07Z",
+                  "line": 988,
+                  "originalLine": 980,
+                  "path": "python/sglang/srt/mem_cache/unified_radix_cache.py",
+                  "updatedAt": "2026-10-08T07:31:17Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4216160915"
+                },
+                {
+                  "author": {
+                    "login": "mingfeima"
+                  },
+                  "body": "Dropping `padding_side` silently ignores a per-call override when it differs from the tokenizer default.\n\nPreserve the requested side or reject unsupported overrides explicitly, and cover both cases in a test.",
+                  "createdAt": "2026-10-08T07:26:56Z",
+                  "line": null,
+                  "originalLine": 78,
+                  "path": "python/sglang/srt/utils/patch_tokenizer.py",
+                  "updatedAt": "2026-10-08T07:31:17Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4216168324"
+                },
+                {
+                  "author": {
+                    "login": "mingfeima"
+                  },
+                  "body": "use_dpsk_v32_encoding does not need this wrap. A plain string used to return immediately, and the v32 branch later joins the text parts back into that same string. Keep the wrap only for content_format == \"openai\".",
+                  "createdAt": "2026-10-08T07:28:38Z",
+                  "line": null,
+                  "originalLine": 212,
+                  "path": "python/sglang/srt/parser/jinja_template_utils.py",
+                  "updatedAt": "2026-10-08T07:31:17Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4216183457"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wOFQwNzoyODozOFrO-03aoQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 3
+            },
+            "state": "CHANGES_REQUESTED",
+            "submittedAt": "2026-10-08T07:31:17Z",
+            "url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5453162743"
+          },
+          {
+            "author": {
+              "login": "vshekhawat-hlab"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "vshekhawat-hlab"
+                  },
+                  "body": "ACk and Fixed in the latest update by normalizing the parameters to a proper DecLockRefParams() instance before passing them to the session or tree_core. Its node_id defaults to None, matching the sentinel expected by _assert_receipt_anchor.\n\nVerified that the original repro now succeeds and also validated accuracy for SmolVLM2-2.2B-Instruct.\n",
+                  "createdAt": "2026-10-09T06:59:49Z",
+                  "line": 988,
+                  "originalLine": 980,
+                  "path": "python/sglang/srt/mem_cache/unified_radix_cache.py",
+                  "updatedAt": "2026-10-09T06:59:49Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4227526997"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wOVQwNjo1OTo0OVrO-_rxVQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-09T06:59:49Z",
+            "url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5466870925"
+          },
+          {
+            "author": {
+              "login": "vshekhawat-hlab"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "vshekhawat-hlab"
+                  },
+                  "body": "ACK and changed as per review comment.",
+                  "createdAt": "2026-10-09T07:27:44Z",
+                  "line": null,
+                  "originalLine": 212,
+                  "path": "python/sglang/srt/parser/jinja_template_utils.py",
+                  "updatedAt": "2026-10-09T07:27:45Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4227727380"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wOVQwNzoyNzo0NFrO-_4AFA==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-09T07:27:45Z",
+            "url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5467117258"
+          },
+          {
+            "author": {
+              "login": "vshekhawat-hlab"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "vshekhawat-hlab"
+                  },
+                  "body": "ACK. Fixed by applying the requested padding side to self.padding_side, which the legacy _pad() reads directly, and restoring the original value after the call instead of silently dropping the override.",
+                  "createdAt": "2026-10-09T07:37:49Z",
+                  "line": null,
+                  "originalLine": 78,
+                  "path": "python/sglang/srt/utils/patch_tokenizer.py",
+                  "updatedAt": "2026-10-09T07:37:49Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4227796403"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wOVQwNzozNzo0OVrO-_8Nsw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-09T07:37:49Z",
+            "url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5467202168"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wOVQwNzozNzo0OVq0MjAyNi0xMC0wOVQwNzozNzo0OVrPAAAAAUXe4ng=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "state": "OPEN",
+      "title": "fix: Rotary embeddings on XPU, UnifiedRadixCache default, Transformers-backend remote-code fallback, and tokenizer pad() compat shim",
+      "updatedAt": "2026-10-12T08:43:01Z",
+      "url": "https://github.com/sgl-project/sglang/pull/41213"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "9e0b001db4955b2d183e8c73d8438c49ecafac95"
+    },
+    "body": "## Motivation\n\nFive independent, unrelated-but-small fixes found:\n\n1. Partial rotary embeddings crash on XPU's fallback kernel path.\n2. `UnifiedRadixCache.dec_lock_ref` missing a default argument, crashing the scheduler.\n3. Transformers-backend fallback (`--model-impl transformers`) failing to load/serve remote-code models with legacy tied-weights conventions or wrapper classes (found via `YannQi/R-4B`).\n4. A silent accuracy bug in the OpenAI-compatible chat-completions content formatter, affecting any model whose chat template expects structured (\"openai\"-format) content but receives a plain string.\n5. Custom remote-code tokenizers with a stale `_pad()` override crashing on every request once `padding_side` started being forwarded (found via `zai-org/chatglm2-6b`).\n\n## Modifications\n\n### 1. `RotaryEmbedding.forward_xpu()` partial rotary embeddings (`python/sglang/srt/layers/rotary_embedding/base.py`)\n\nThe fallback-kernel branch (used when `head_size` is not in `[128, 256, 512]`) calls `torch.ops.sgl_kernel.rotary_embedding(...)` without slicing to `rotary_dim` first. That compiled kernel asserts `rotary_dim == head_size` internally and raises `RuntimeError: Rotary dim doesn't match query head_size` for any model with partial rotary embeddings (`rotary_dim < head_size`) on XPU, e.g. `adept/persimmon-8b-chat`, `microsoft/phi-2`, `stabilityai/stablelm-2-1_6b`, `stabilityai/stablelm-3b-4e1t`, `stabilityai/stablelm-zephyr-3b`. Independent of `--attention-backend`, since rotary embedding dispatch is keyed on device type (`is_xpu()`).\n\nFix: add an `elif self.head_size != self.rotary_dim` branch that falls back to `forward_native()`, mirroring the existing pattern where `forward_cpu`/`forward_npu` already fall back to `forward_native` for their own unsupported cases.\n\n### 2. `UnifiedRadixCache.dec_lock_ref` missing default (`python/sglang/srt/mem_cache/unified_radix_cache.py`)\n\n`BasePrefixCache.dec_lock_ref` declares `params: Optional[DecLockRefParams] = None`, but `UnifiedRadixCache`'s override (introduced in #36848) dropped the default, requiring `params` positionally. `schedule_policy.py`'s `_lock_node` calls `self.tree_cache.dec_lock_ref(last_node)` with no `params` whenever the acquire receipt's `to_dec_params()` returns `None`, even though `is_tree_cache()` is `True` for `UnifiedRadixCache`. This crashes with `TypeError: UnifiedRadixCache.dec_lock_ref() missing 1 required positional argument: 'params'`.\n\nFix: restore the default, matching the abstract interface and every other concrete `dec_lock_ref` implementation. Backend-agnostic -- reproduced on Intel XPU, but the code path has no device-specific branching.\n\n### 3. Transformers-backend fallback: legacy tied-weights + wrapped-model remote code (`python/sglang/srt/models/transformers.py`, `python/sglang/srt/utils/hf_transformers_patches.py`, `python/sglang/srt/parser/jinja_template_utils.py`)\n\nFour fixes for models routed through the Transformers-backend fallback (`TransformersBase`), found while debugging `YannQi/R-4B`:\n\n- `PreTrainedModel.get_expanded_tied_weights_keys()` (transformers 5.17.0) assumes `_tied_weights_keys` is a `{target: source}` dict. Remote model code that still declares it as a list (pre-v5 convention, e.g. `YannQi/R-4B`'s `modeling_r.py`) crashes with `AttributeError: 'list' object has no attribute 'keys'`. Patched to convert a list-style mapping into the expected dict by resolving the source path from `get_input_embeddings()`. That call is itself guarded: some remote-code classes with this same list-style convention never override `get_input_embeddings()` either, so a failure there is caught and the mapping is left untouched -- the model still fails to load, but with the original, well-understood `AttributeError` instead of a different, confusing exception raised from inside this patch.\n- Some remote-code repos map `AutoModel` to the same class as `AutoModelForCausalLM` / `AutoModelForImageTextToText` -- a full `*ForConditionalGeneration` wrapper with its own `.model` backbone and `.lm_head` -- rather than a bare backbone class (again, `YannQi/R-4B`). That adds an extra `model.` nesting level relative to the checkpoint's flat weight names, and `_run_hf_backbone()` would call the wrapper's full forward (returning logits, not hidden states) instead of the backbone's. `TransformersBase.__init__` now detects and unwraps this redundant wrapper.\n- `R-4B`'s checkpoint ships `vision_tower` weights under a `model.vision_tower.vision_model.*` prefix (the unwrap above makes `self.model` the bare backbone, so the checkpoint's own `model.` prefix on top of the already-flattened `vision_tower.vision_model.*` convention needs remapping too). The existing `vision_tower.vision_model.` -> `model.vision_tower.` remap only covered the un-prefixed variant; added the `model.`-prefixed one.\n- `R-4B`'s `vision_config.torch_dtype` is `float32`, independent of the top-level dtype used to serve the model. `TransformersBase._init_parameters()` materializes meta-device params via `torch.empty_like(param.data, ...)`, which preserves each param's own (possibly stale) dtype. Modules rebuilt by `recursive_replace()` (Linear/RMSNorm) get the uniform engine dtype, but untouched modules (vision tower's Conv2d/LayerNorm/Embedding) kept the divergent `float32`, causing `RuntimeError: mat1 and mat2 must have the same dtype, but got Float and Half` on the first mixed op. Now forces every floating-point param to the engine's `torch.get_default_dtype()` instead.\nPlus one fix in the OpenAI-compatible chat-completions layer found while validating accuracy end-to-end on the same model:\n\n- In `process_content_for_template_format()` (`jinja_template_utils.py`, used by all OpenAI-compatible chat completions, not just the Transformers backend): sglang already detects whether a model's chat template expects `\"string\"` or `\"openai\"` (structured list) content, but when a caller sends plain-string `content` against an `\"openai\"`-format template, the function passed it through unchanged instead of wrapping it into `[{\"type\": \"text\", \"text\": ...}]`. `R-4B`'s own `chat_template.jinja` iterates `message['content']` expecting a list, so a plain string renders as empty content -- the model gets no question text, silently, no error. This affects any model whose template is classified `\"openai\"`-format when a caller sends legacy-style string content, not just R-4B.\n\n### 4. Tokenizer `_pad()` compat shim for stale custom signatures (`python/sglang/srt/utils/patch_tokenizer.py`)\n\ntransformers 5.x's `PreTrainedTokenizerBase.pad()` now always forwards `padding_side` down to `_pad()`. Custom remote-code tokenizers with a stale, fixed `_pad()` signature (no `padding_side` param, no `**kwargs` catch-all -- e.g. `zai-org/chatglm2-6b`'s `ChatGLMTokenizer`, unchanged for years) crash with:\n\n```\nTypeError: ChatGLMTokenizer._pad() got an unexpected keyword argument 'padding_side'\n```\n\non every single generation request, regardless of memory/backend settings.\n\nFix: detects the mismatch structurally via `inspect.signature` (not a name/class check), so any other custom tokenizer with the same stale signature is covered too, and wraps `_pad()` to drop the `padding_side` kwarg before delegating to the original implementation (which already reads `self.padding_side` directly, so behavior is unchanged).\n\n## Accuracy Tests\n\nAll five fixes were validated end-to-end on real Intel XPU hardware (docker `lmsysorg/sglang:v0.5.20-xpu`), not just reasoned about statically:\n\n- **Rotary fix**: 20-example accuracy smoke checks (server + client, real GPU) for `adept/persimmon-8b-chat` (intel_xpu backend, gsm8k), `microsoft/phi-2` (triton backend, gsm8k), `stabilityai/stablelm-3b-4e1t` (triton backend, hellaswag), `stabilityai/stablelm-zephyr-3b` (triton backend, gsm8k) -- all previously crashed with `RuntimeError: Rotary dim doesn't match query head_size`, all now serve and produce results.\n- **Radix cache fix**: reproduced the crash on `lmsysorg/sglang:v0.5.20-xpu` running `docvqa_val`/`gsm8k` evals (e.g. `HuggingFaceTB/SmolVLM2-2.2B-Instruct`, `CohereLabs/aya-vision-8b`); with the fix overlaid, a 20-example `docvqa_val` run against `HuggingFaceTB/SmolVLM2-2.2B-Instruct` completes successfully (accuracy 0.4831, no crash).\n- **Transformers-backend + chat-template fixes**: `YannQi/R-4B`, `--model-impl transformers --trust-remote-code`, task `gsm8k`: server now starts, loads weights, and serves correctly (all four crashes are gone); produces real (non-zero) accuracy using the model's own unmodified `chat_template.jinja` -- no `--chat-template` override needed.\n- **Tokenizer `_pad()` shim**: confirmed on real Intel XPU hardware against `zai-org/chatglm2-6b`: the `TypeError` no longer occurs and generation requests proceed past tokenization/padding.\n\n## Speed Tests and Profiling\n\nNot applicable. All five fixes are either startup-time compatibility shims, exception-path corrections, or a content-formatting correction in the request-preprocessing layer -- none touch inference-loop math or kernels.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit) guide -- `pre-commit run` passes clean on every changed file.\n- [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests) guide -- not added; each fix was validated by reproducing the original crash on real hardware and confirming it's gone (see Accuracy Tests), consistent with how the originating PRs were validated.\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations) -- not applicable; all five are internal bug fixes with no user-facing API or CLI changes.\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed) -- see Accuracy Tests above; no speed impact.\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\nCloses #41088, closes #41142. Supersedes and replaces #41798 and #41796 (folded in here at the author's request to land together; those two will be closed in favor of this PR).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38210797156](https://github.com/sgl-project/sglang/actions/runs/38210797156)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38210796959](https://github.com/sgl-project/sglang/actions/runs/38210796959)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38210797045](https://github.com/sgl-project/sglang/actions/runs/38210797045)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "vshekhawat-hlab/sglang"
+      },
+      "sha": "fb9518efb31fe9e2d9350acde1d0c44a33dec683"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/41213",
+    "merged": false,
+    "number": 41213,
+    "state": "open",
+    "title": "fix: Rotary embeddings on XPU, UnifiedRadixCache default, Transformers-backend remote-code fallback, and tokenizer pad() compat shim",
+    "updated_at": "2026-10-12T08:43:01Z"
+  },
+  "files": [
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Flayers%2Frotary_embedding%2Fbase.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Frotary_embedding%2Fbase.py?ref=fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "deletions": 0,
+      "filename": "python/sglang/srt/layers/rotary_embedding/base.py",
+      "patch": "@@ -502,6 +502,8 @@ def forward_xpu(\n                 self.is_neox_style,\n             )\n             return query, key\n+        elif self.head_size != self.rotary_dim:\n+            return self.forward_native(positions, query, key)\n         else:\n             self._match_cos_sin_cache_dtype(query)\n             # Use fallback kernel of 'rotary_embedding'.",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Flayers%2Frotary_embedding%2Fbase.py",
+      "sha": "2c35b15ec7a118cf877f19b2fa488741f6661c3e",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_radix_cache.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_radix_cache.py?ref=fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "deletions": 1,
+      "filename": "python/sglang/srt/mem_cache/unified_radix_cache.py",
+      "patch": "@@ -985,9 +985,11 @@ def inc_lock_ref(\n     def dec_lock_ref(\n         self,\n         node_id: NodeId,\n-        params: DecLockRefParams,\n+        params: Optional[DecLockRefParams] = None,\n         skip_swa: bool = False,\n     ) -> DecLockRefResult:\n+        if params is None:\n+            params = DecLockRefParams()\n         if self.disable:\n             return DecLockRefResult()\n         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_radix_cache.py",
+      "sha": "8628090581dac1a705eed21b065fb3cb24aedbd4",
+      "status": "modified"
+    },
+    {
+      "additions": 12,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Fmodels%2Ftransformers.py",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodels%2Ftransformers.py?ref=fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "deletions": 4,
+      "filename": "python/sglang/srt/models/transformers.py",
+      "patch": "@@ -625,6 +625,11 @@ def __init__(\n                     torch_dtype=torch.get_default_dtype(),\n                     trust_remote_code=True,\n                 )\n+                inner = getattr(self.model, \"model\", None)\n+                if isinstance(inner, torch.nn.Module) and hasattr(\n+                    self.model, \"lm_head\"\n+                ):\n+                    self.model = inner\n         else:\n             raise ValueError(\n                 f\"Model {model_cls} does not support custom attention backends \"\n@@ -671,13 +676,15 @@ def _can_torch_compile(self) -> bool:\n \n     def _init_parameters(self, module: nn.Module):\n         \"\"\"Materialize any parameters still on the meta device.\"\"\"\n+        target_dtype = torch.get_default_dtype()\n         for name, param in module.named_parameters(recurse=False):\n             if param.device == torch.device(\"meta\"):\n+                new_dtype = (\n+                    target_dtype if torch.is_floating_point(param) else param.dtype\n+                )\n                 new_param = nn.Parameter(\n-                    torch.empty_like(\n-                        param.data,\n-                        device=get_device(),\n-                    )\n+                    torch.empty(param.shape, dtype=new_dtype, device=get_device()),\n+                    requires_grad=param.requires_grad,\n                 )\n                 setattr(module, name, new_param)\n         for child in module.children():\n@@ -1360,6 +1367,7 @@ def __init__(self, *args, **kwargs):\n                 WeightsMapper(\n                     orig_to_new_prefix={\n                         \"vision_tower.vision_model.\": \"model.vision_tower.\",\n+                        \"model.vision_tower.vision_model.\": \"model.vision_tower.\",\n                     }\n                 )\n                 | self.weight_mapper",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Fmodels%2Ftransformers.py",
+      "sha": "2cc12809134cdde78c118794d601064013e9b9f0",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Fparser%2Fjinja_template_utils.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fparser%2Fjinja_template_utils.py?ref=fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "deletions": 3,
+      "filename": "python/sglang/srt/parser/jinja_template_utils.py",
+      "patch": "@@ -204,9 +204,13 @@ def process_content_for_template_format(\n     Returns:\n         Processed message dictionary\n     \"\"\"\n-    if not isinstance(msg_dict.get(\"content\"), list):\n-        # Already a string or None, no processing needed\n-        return {k: v for k, v in msg_dict.items() if v is not None}\n+    content = msg_dict.get(\"content\")\n+    if not isinstance(content, list):\n+        if content_format == \"openai\" and isinstance(content, str):\n+            msg_dict = {**msg_dict, \"content\": [{\"type\": \"text\", \"text\": content}]}\n+        else:\n+            # Already a string or None, no processing needed\n+            return {k: v for k, v in msg_dict.items() if v is not None}\n \n     if content_format == \"openai\" or use_dpsk_v32_encoding:\n         # OpenAI format: preserve structured content list, normalize types",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Fparser%2Fjinja_template_utils.py",
+      "sha": "b9c0375631167e79555520c0a64f3e0eec0a106b",
+      "status": "modified"
+    },
+    {
+      "additions": 40,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Futils%2Fhf_transformers_patches.py",
+      "changes": 40,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Futils%2Fhf_transformers_patches.py?ref=fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "deletions": 0,
+      "filename": "python/sglang/srt/utils/hf_transformers_patches.py",
+      "patch": "@@ -66,6 +66,7 @@ def apply_all():\n     _patch_removed_symbols()\n     _patch_image_processor_kwargs()\n     _patch_image_process_cuda_tensor()\n+    _patch_list_style_tied_weights_keys()\n \n     # v5 general patches\n     _ensure_is_torch_fx_available_compat()\n@@ -402,6 +403,45 @@ def patched_process_image(\n         )\n \n \n+def _patch_list_style_tied_weights_keys():\n+    try:\n+        from transformers import PreTrainedModel\n+    except ImportError:\n+        return\n+\n+    if not hasattr(PreTrainedModel, \"get_expanded_tied_weights_keys\"):\n+        return\n+\n+    _orig = PreTrainedModel.get_expanded_tied_weights_keys\n+\n+    def _patched(self, *args, **kwargs):\n+        mapping = getattr(self, \"_tied_weights_keys\", None)\n+        if isinstance(mapping, list):\n+            try:\n+                input_embeddings = self.get_input_embeddings()\n+            except NotImplementedError:\n+                # Some remote-code classes never override get_input_embeddings\n+                # either -- leave _tied_weights_keys as the original list so\n+                # this surfaces as the one well-understood crash below\n+                # (AttributeError: 'list' object has no attribute 'keys'),\n+                # not a confusing second failure from inside this patch.\n+                input_embeddings = None\n+            if input_embeddings is not None:\n+                source = next(\n+                    (\n+                        f\"{name}.weight\"\n+                        for name, module in self.named_modules()\n+                        if module is input_embeddings\n+                    ),\n+                    None,\n+                )\n+                if source is not None:\n+                    self._tied_weights_keys = {target: source for target in mapping}\n+        return _orig(self, *args, **kwargs)\n+\n+    PreTrainedModel.get_expanded_tied_weights_keys = _patched\n+\n+\n # ---------------------------------------------------------------------------\n # v5 general patches\n # ---------------------------------------------------------------------------",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Futils%2Fhf_transformers_patches.py",
+      "sha": "865c56bd9228a651d9286454be245cb7085293ab",
+      "status": "modified"
+    },
+    {
+      "additions": 51,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Futils%2Fpatch_tokenizer.py",
+      "changes": 51,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Futils%2Fpatch_tokenizer.py?ref=fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "deletions": 0,
+      "filename": "python/sglang/srt/utils/patch_tokenizer.py",
+      "patch": "@@ -1,3 +1,4 @@\n+import inspect\n import logging\n \n from sglang.srt.environ import envs\n@@ -15,9 +16,29 @@ def patch_tokenizer(tokenizer):\n         )\n         return _SpecialTokensCachePatcher.patch(tokenizer)\n \n+    if _needs_pad_padding_side_shim(tokenizer):\n+        logger.info(\n+            f\"Applying _pad(padding_side=...) compat shim for {type(tokenizer)}\"\n+        )\n+        return _PadPaddingSideShim.patch(tokenizer)\n+\n     return tokenizer\n \n \n+def _needs_pad_padding_side_shim(tokenizer) -> bool:\n+    pad_fn = getattr(type(tokenizer), \"_pad\", None)\n+    if pad_fn is None:\n+        return False\n+    try:\n+        sig = inspect.signature(pad_fn)\n+    except (TypeError, ValueError):\n+        return False\n+    params = sig.parameters\n+    if \"padding_side\" in params:\n+        return False\n+    return not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())\n+\n+\n def unpatch_tokenizer(tokenizer):\n     return _SpecialTokensCachePatcher.unpatch(tokenizer)\n \n@@ -40,6 +61,36 @@ def decode_without_hf_kwargs(tokenizer, token_ids, skip_special_tokens):\n     return tokenizer.decode(token_ids)\n \n \n+class _PadPaddingSideShim:\n+    _PATCHED_FLAG = \"_sglang_pad_padding_side_patched\"\n+\n+    @classmethod\n+    def patch(cls, tokenizer):\n+        tokenizer_cls = type(tokenizer)\n+\n+        if getattr(tokenizer_cls, cls._PATCHED_FLAG, False):\n+            return tokenizer\n+\n+        original_pad = tokenizer_cls._pad\n+\n+        def patched_pad(self, *args, **kwargs):\n+            padding_side = kwargs.pop(\"padding_side\", None)\n+            if padding_side is None or padding_side == self.padding_side:\n+                return original_pad(self, *args, **kwargs)\n+            previous_padding_side = self.padding_side\n+            self.padding_side = padding_side\n+            try:\n+                return original_pad(self, *args, **kwargs)\n+            finally:\n+                self.padding_side = previous_padding_side\n+\n+        tokenizer_cls._original_pad = original_pad\n+        tokenizer_cls._pad = patched_pad\n+        setattr(tokenizer_cls, cls._PATCHED_FLAG, True)\n+\n+        return tokenizer\n+\n+\n class _SpecialTokensCachePatcher:\n     _PATCHED_FLAG = \"_sglang_special_tokens_patched\"\n     _CACHED_TOKENS_ATTR = \"_sglang_cached_special_tokens\"",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/fb9518efb31fe9e2d9350acde1d0c44a33dec683/python%2Fsglang%2Fsrt%2Futils%2Fpatch_tokenizer.py",
+      "sha": "610e610de67b92da137f70d2ba4071484ee8240f",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "set None here still reaches `tree_core.dec_lock_ref`, and `_assert_receipt_anchor` reads params.node_id. A normal node then raises AttributeError instead of the old TypeError. Handle params is None before calling tree_core.",
+      "created_at": "2026-10-08T07:26:07Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4216160915",
+      "line": 988,
+      "original_line": 980,
+      "path": "python/sglang/srt/mem_cache/unified_radix_cache.py",
+      "updated_at": "2026-10-08T07:31:17Z",
+      "user": {
+        "login": "mingfeima"
+      }
+    },
+    {
+      "body": "Dropping `padding_side` silently ignores a per-call override when it differs from the tokenizer default.\n\nPreserve the requested side or reject unsupported overrides explicitly, and cover both cases in a test.",
+      "created_at": "2026-10-08T07:26:56Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4216168324",
+      "line": null,
+      "original_line": 78,
+      "path": "python/sglang/srt/utils/patch_tokenizer.py",
+      "updated_at": "2026-10-08T07:31:17Z",
+      "user": {
+        "login": "mingfeima"
+      }
+    },
+    {
+      "body": "use_dpsk_v32_encoding does not need this wrap. A plain string used to return immediately, and the v32 branch later joins the text parts back into that same string. Keep the wrap only for content_format == \"openai\".",
+      "created_at": "2026-10-08T07:28:38Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4216183457",
+      "line": null,
+      "original_line": 212,
+      "path": "python/sglang/srt/parser/jinja_template_utils.py",
+      "updated_at": "2026-10-08T07:31:17Z",
+      "user": {
+        "login": "mingfeima"
+      }
+    },
+    {
+      "body": "ACk and Fixed in the latest update by normalizing the parameters to a proper DecLockRefParams() instance before passing them to the session or tree_core. Its node_id defaults to None, matching the sentinel expected by _assert_receipt_anchor.\n\nVerified that the original repro now succeeds and also validated accuracy for SmolVLM2-2.2B-Instruct.\n",
+      "created_at": "2026-10-09T06:59:49Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4227526997",
+      "line": 988,
+      "original_line": 980,
+      "path": "python/sglang/srt/mem_cache/unified_radix_cache.py",
+      "updated_at": "2026-10-09T06:59:49Z",
+      "user": {
+        "login": "vshekhawat-hlab"
+      }
+    },
+    {
+      "body": "ACK and changed as per review comment.",
+      "created_at": "2026-10-09T07:27:44Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4227727380",
+      "line": null,
+      "original_line": 212,
+      "path": "python/sglang/srt/parser/jinja_template_utils.py",
+      "updated_at": "2026-10-09T07:27:45Z",
+      "user": {
+        "login": "vshekhawat-hlab"
+      }
+    },
+    {
+      "body": "ACK. Fixed by applying the requested padding side to self.padding_side, which the legacy _pad() reads directly, and restoring the original value after the call instead of silently dropping the override.",
+      "created_at": "2026-10-09T07:37:49Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#discussion_r4227796403",
+      "line": null,
+      "original_line": 78,
+      "path": "python/sglang/srt/utils/patch_tokenizer.py",
+      "updated_at": "2026-10-09T07:37:49Z",
+      "user": {
+        "login": "vshekhawat-hlab"
+      }
+    }
+  ],
+  "issue_comments": [],
+  "number": 41213,
+  "refs": {
+    "base": {
+      "commit": "9e0b001db4955b2d183e8c73d8438c49ecafac95",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "fb9518efb31fe9e2d9350acde1d0c44a33dec683",
+      "repository": "vshekhawat-hlab/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5453162743",
+      "state": "CHANGES_REQUESTED",
+      "submitted_at": "2026-10-08T07:31:17Z",
+      "user": {
+        "login": "mingfeima"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5466870925",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-09T06:59:49Z",
+      "user": {
+        "login": "vshekhawat-hlab"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5467117258",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-09T07:27:45Z",
+      "user": {
+        "login": "vshekhawat-hlab"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/41213#pullrequestreview-5467202168",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-09T07:37:49Z",
+      "user": {
+        "login": "vshekhawat-hlab"
+      }
+    }
+  ]
+}

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
 path: docs/code-docs/source/inference-engine.rst
-raw_sha256: d149e9d5484fdf2c4804b820a49b4c8b1a2a92c8df2e2726903b220d8582c4bf
+raw_sha256: a04d8aeb7fd5b9641735e0eac6fb43d766a7b4a2387fb631c539c3973c97301d
 sources: []
-generated_body_sha256: 1f98ee7cfaf1e962f07bbc736b6b1be78f892548e0b0932657a1299f0861a82d
+generated_body_sha256: 7a02283cc4dfa315ea8f697e2b2679d192279915b7a96205b011e14e60ee8b6c
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/code-docs/source/inference-engine.rst
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/code-docs/source/inference-engine.rst)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/docs/code-docs/source/inference-engine.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -170,3 +170,32 @@ capacity-exhaustion fallback reclaims a dead prefix.
 active rows while preserving its static tensor addresses. This mirrors the
 scheduler/cache separation used by systems such as vLLM and SGLang without
 copying their backend-specific kernels.
+
+OPSD response-token utilities
+-----------------------------
+
+``ResponseTokenBatch.from_rollout`` derives causal training targets and a
+response-only loss mask from a ``RolloutBatch``. The mask excludes prompt and
+padding tokens while retaining an attended EOS token. Use
+``generalized_jsd_loss`` to compare aligned student and teacher logits on that
+mask:
+
+.. code-block:: python
+
+    from deepspeed.runtime.rollout import ResponseTokenBatch, generalized_jsd_loss
+
+    response_batch = ResponseTokenBatch.from_rollout(rollout_batch)
+    student_logits = response_batch.select_causal_logits(student_model(**model_inputs).logits)
+    teacher_logits = aligned_teacher_logits
+    loss_output = generalized_jsd_loss(
+        student_logits,
+        teacher_logits,
+        response_batch.response_mask,
+    )
+    loss = loss_output.loss
+
+The rollout supplies only the student on-policy trajectory. Construct the
+teacher inputs, including any privileged context, separately and align the
+teacher logits with the student causal-logit shape before calling the loss.
+``loss_sum`` and ``valid_token_count`` are available for callers that need
+explicit distributed loss normalization.

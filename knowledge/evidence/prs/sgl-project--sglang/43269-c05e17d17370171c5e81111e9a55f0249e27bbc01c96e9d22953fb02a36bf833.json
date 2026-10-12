@@ -1,0 +1,162 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "438df9a2a4645d39c87e33c4a27792e568ac2701",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\n`test_ipc_a2a_2_gpu.py` fails on main (reported on 2×H200, reproduced on 2×B200 NVLink at f6569bce4d9):\n\n```\nrank0 MISMATCH: ['AllToAll4D never took the IPC path (exchange count stayed at 6)']\nIPC_A2A_PARITY FAIL (staged keys=3)\n```\n\nAllToAll4D does still reach the IPC transport. None of the steps on that path changed after #31854 (checked with `git log -L` on `sequence_model_parallel_all_to_all_4D`, then `GroupCoordinator.all_to_all_4D`, `DeviceCommunicatorBase.all_to_all_4D`, `AllToAll4D.forward` and `_ipc_all_to_all_4d`). The other recent commits under `runtime/distributed/` (#37547, #39293, #41284, #40069) don't change it either.\n\nThe regression is #33317 (f829fb3ff7c). It made `ipc_a2a_ready` reset the transport whenever the caller passes a different ProcessGroup *object*, and the two entry points pass different objects for the same two ranks:\n\n- USP (`_ipc_ready_group`) passes `get_sp_group().ulysses_group`, which `set_seq_parallel_pg_by_sp_groups` creates.\n- AllToAll4D passes the SP coordinator's own `device_group`.\n\nSo every switch between the two entry points tears the transport down and rebuilds it. Lifecycle trace of the test on main, identical on both ranks:\n\n```\nINIT(ulysses_pg) | 6 exchanges | RESET(calls=6) | INIT(sp.device_group) | 6 exchanges | RESET(calls=6) | INIT(ulysses_pg) | 3 exchanges\n```\n\nThe reset sets `calls` back to 0. The 6 AllToAll4D exchanges then bring it back to exactly 6, which the test reports as \"never took the IPC path\". The second reset also puts `max_buffers` back to its default, so the eviction check in the test has not been testing eviction. If you remove only #33317's two-line reset from main, the test passes.\n\n**Impact.** Since #33923, wan-VSA (`UlyssesAttention_VSA`) is the only production model that calls AllToAll4D, and it never uses USP in the same process. So the models we ship today did not hit these resets (see the e2e below). A model that uses both entry points would rebuild the transport twice per layer, about 6.3 ms per switch on B200 (benchmark below). Each rebuild also drops staging buffers that kernels captured earlier in a CUDA graph may still point to.\n\n**Why CI missed it.** This file is listed in `STANDALONE_FILES[\"2-gpu\"]`, but the NVIDIA 2-GPU partition plans contain no standalone files (scheduled run 37768448360 has `standalone_files=[]` in all three partitions), and AMD skips the test because it needs CUDA. I'll follow up on that separately.\n\n## Modifications\n\n- `ipc_a2a.py`: the peer mappings depend on which two ranks are paired, not on which group object is passed. Store the pair's global ranks in `init`. In `ipc_a2a_ready`, reset only when a group over a *different* pair arrives; passing the same object still skips the check. `destroy_model_parallel()` still resets explicitly, so the topology-switch case #33317 fixed is unaffected.\n- `test_ipc_a2a_lifecycle.py`: parametrize the replaced-group test. `different_pair` must still reinitialize. `same_pair` must reuse the transport; it fails on main.\n- `test_ipc_a2a_2_gpu.py`: before reading the exchange count, check that the transport was not re-initialized (`IPC_A2A.flag` identity), so this failure now names its cause. Also update the comment: zimage and hunyuanvideo moved to USPAttention in #33923, and wan-VSA is the only AllToAll4D user left.\n\n## Accuracy Tests\n\nAll runs: 2×B200 (NV18), `lmsysorg/sglang:dev`, torch 2.14.1+cu130. No pair of H200s was free. The bug is in Python-level transport state, so it is the same on any NVLink pair.\n\n`pytest -v python/sglang/multimodal_gen/test/single_test_file/test_ipc_a2a_2_gpu.py`\n\n| tree | result |\n|---|---|\n| main f6569bce4d9 | FAIL, same output as the H200 report |\n| main with only #33317's identity reset removed | PASS |\n| this PR | PASS. Trace: one `INIT`, all AllToAll4D exchanges reuse the USP staging buffers, no `RESET` |\n| this PR's test file on main's `ipc_a2a.py` | FAIL: `AllToAll4D re-initialized the IPC transport USP set up` |\n\n`test_ipc_a2a_lifecycle.py`: 9 passed. With main's `ipc_a2a.py`, `[same_pair]` fails.\n\n**E2E on the only production AllToAll4D model.** Settings: FastVideo/FastWan2.1-T2V-1.3B-Diffusers, `--attention-backend video_sparse_attn` (`VSA_sparsity=0.8`), `--num-gpus 2 --ulysses-degree 2`, 480x832x61, 3 DMD steps, seed 42. There is no cookbook page for wan-VSA, so this is a test configuration, not a recommended deployment. Each run sends two requests. Worker log lines were added temporarily for this test and are not part of the PR.\n\n| run | IPC transport | exchanges in request 0 | frames sha256 |\n|---|---|---:|---|\n| this PR | initialized once on ranks [0, 1], no reset | 180 (30 layers × 2 × 3 steps) | `56d9347f…` |\n| this PR, `SGLANG_DIFFUSION_IPC_A2A=0` (NCCL) | not initialized | 0 | `56d9347f…` |\n| main | initialized once, no reset | 180 | `56d9347f…` |\n\nAll six outputs are bit-identical (0 differing values). wan-VSA only uses AllToAll4D, so it already took the IPC path on main, and its output does not change with this PR.\n\n## Speed Tests and Profiling\n\nNothing changes when only one entry point is used, because the identity check still short-circuits. The table below times a process that alternates the two entry points, using one FastWan-1.3B layer shape (12480 tokens per rank, 12 heads × 128) on 2×B200, averaged over 50 iterations:\n\n| | USP input A2A | AllToAll4D (qkvg) | alternating | overhead from alternating | resets |\n|---|---:|---:|---:|---:|---:|\n| main | 0.110 ms | 0.378 ms | 13.075 ms | +12.59 ms | 100 |\n| this PR | 0.110 ms | 0.380 ms | 0.480 ms | ~0 | 0 |\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (no user-facing change)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #37877536380](https://github.com/sgl-project/sglang/actions/runs/37877536380)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37877535990](https://github.com/sgl-project/sglang/actions/runs/37877535990)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37877536310](https://github.com/sgl-project/sglang/actions/runs/37877536310)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "mickqian"
+            },
+            "body": "/tag-and-rerun-ci",
+            "createdAt": "2026-10-09T03:51:30Z",
+            "updatedAt": "2026-10-09T03:51:30Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43269#issuecomment-6073899931"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWoIW5s=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "81069d549cc3d9fbc07f2d50c314c61c88425574",
+      "headRepository": {
+        "nameWithOwner": "mickqian/sglang"
+      },
+      "merged": true,
+      "number": 43269,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "MERGED",
+      "title": "[diffusion] fix: share the IPC all-to-all transport between AllToAll4D and USP",
+      "updatedAt": "2026-10-09T08:31:56Z",
+      "url": "https://github.com/sgl-project/sglang/pull/43269"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "438df9a2a4645d39c87e33c4a27792e568ac2701"
+    },
+    "body": "## Motivation\n\n`test_ipc_a2a_2_gpu.py` fails on main (reported on 2×H200, reproduced on 2×B200 NVLink at f6569bce4d9):\n\n```\nrank0 MISMATCH: ['AllToAll4D never took the IPC path (exchange count stayed at 6)']\nIPC_A2A_PARITY FAIL (staged keys=3)\n```\n\nAllToAll4D does still reach the IPC transport. None of the steps on that path changed after #31854 (checked with `git log -L` on `sequence_model_parallel_all_to_all_4D`, then `GroupCoordinator.all_to_all_4D`, `DeviceCommunicatorBase.all_to_all_4D`, `AllToAll4D.forward` and `_ipc_all_to_all_4d`). The other recent commits under `runtime/distributed/` (#37547, #39293, #41284, #40069) don't change it either.\n\nThe regression is #33317 (f829fb3ff7c). It made `ipc_a2a_ready` reset the transport whenever the caller passes a different ProcessGroup *object*, and the two entry points pass different objects for the same two ranks:\n\n- USP (`_ipc_ready_group`) passes `get_sp_group().ulysses_group`, which `set_seq_parallel_pg_by_sp_groups` creates.\n- AllToAll4D passes the SP coordinator's own `device_group`.\n\nSo every switch between the two entry points tears the transport down and rebuilds it. Lifecycle trace of the test on main, identical on both ranks:\n\n```\nINIT(ulysses_pg) | 6 exchanges | RESET(calls=6) | INIT(sp.device_group) | 6 exchanges | RESET(calls=6) | INIT(ulysses_pg) | 3 exchanges\n```\n\nThe reset sets `calls` back to 0. The 6 AllToAll4D exchanges then bring it back to exactly 6, which the test reports as \"never took the IPC path\". The second reset also puts `max_buffers` back to its default, so the eviction check in the test has not been testing eviction. If you remove only #33317's two-line reset from main, the test passes.\n\n**Impact.** Since #33923, wan-VSA (`UlyssesAttention_VSA`) is the only production model that calls AllToAll4D, and it never uses USP in the same process. So the models we ship today did not hit these resets (see the e2e below). A model that uses both entry points would rebuild the transport twice per layer, about 6.3 ms per switch on B200 (benchmark below). Each rebuild also drops staging buffers that kernels captured earlier in a CUDA graph may still point to.\n\n**Why CI missed it.** This file is listed in `STANDALONE_FILES[\"2-gpu\"]`, but the NVIDIA 2-GPU partition plans contain no standalone files (scheduled run 37768448360 has `standalone_files=[]` in all three partitions), and AMD skips the test because it needs CUDA. I'll follow up on that separately.\n\n## Modifications\n\n- `ipc_a2a.py`: the peer mappings depend on which two ranks are paired, not on which group object is passed. Store the pair's global ranks in `init`. In `ipc_a2a_ready`, reset only when a group over a *different* pair arrives; passing the same object still skips the check. `destroy_model_parallel()` still resets explicitly, so the topology-switch case #33317 fixed is unaffected.\n- `test_ipc_a2a_lifecycle.py`: parametrize the replaced-group test. `different_pair` must still reinitialize. `same_pair` must reuse the transport; it fails on main.\n- `test_ipc_a2a_2_gpu.py`: before reading the exchange count, check that the transport was not re-initialized (`IPC_A2A.flag` identity), so this failure now names its cause. Also update the comment: zimage and hunyuanvideo moved to USPAttention in #33923, and wan-VSA is the only AllToAll4D user left.\n\n## Accuracy Tests\n\nAll runs: 2×B200 (NV18), `lmsysorg/sglang:dev`, torch 2.14.1+cu130. No pair of H200s was free. The bug is in Python-level transport state, so it is the same on any NVLink pair.\n\n`pytest -v python/sglang/multimodal_gen/test/single_test_file/test_ipc_a2a_2_gpu.py`\n\n| tree | result |\n|---|---|\n| main f6569bce4d9 | FAIL, same output as the H200 report |\n| main with only #33317's identity reset removed | PASS |\n| this PR | PASS. Trace: one `INIT`, all AllToAll4D exchanges reuse the USP staging buffers, no `RESET` |\n| this PR's test file on main's `ipc_a2a.py` | FAIL: `AllToAll4D re-initialized the IPC transport USP set up` |\n\n`test_ipc_a2a_lifecycle.py`: 9 passed. With main's `ipc_a2a.py`, `[same_pair]` fails.\n\n**E2E on the only production AllToAll4D model.** Settings: FastVideo/FastWan2.1-T2V-1.3B-Diffusers, `--attention-backend video_sparse_attn` (`VSA_sparsity=0.8`), `--num-gpus 2 --ulysses-degree 2`, 480x832x61, 3 DMD steps, seed 42. There is no cookbook page for wan-VSA, so this is a test configuration, not a recommended deployment. Each run sends two requests. Worker log lines were added temporarily for this test and are not part of the PR.\n\n| run | IPC transport | exchanges in request 0 | frames sha256 |\n|---|---|---:|---|\n| this PR | initialized once on ranks [0, 1], no reset | 180 (30 layers × 2 × 3 steps) | `56d9347f…` |\n| this PR, `SGLANG_DIFFUSION_IPC_A2A=0` (NCCL) | not initialized | 0 | `56d9347f…` |\n| main | initialized once, no reset | 180 | `56d9347f…` |\n\nAll six outputs are bit-identical (0 differing values). wan-VSA only uses AllToAll4D, so it already took the IPC path on main, and its output does not change with this PR.\n\n## Speed Tests and Profiling\n\nNothing changes when only one entry point is used, because the identity check still short-circuits. The table below times a process that alternates the two entry points, using one FastWan-1.3B layer shape (12480 tokens per rank, 12 heads × 128) on 2×B200, averaged over 50 iterations:\n\n| | USP input A2A | AllToAll4D (qkvg) | alternating | overhead from alternating | resets |\n|---|---:|---:|---:|---:|---:|\n| main | 0.110 ms | 0.378 ms | 13.075 ms | +12.59 ms | 100 |\n| this PR | 0.110 ms | 0.380 ms | 0.480 ms | ~0 | 0 |\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (no user-facing change)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #37877536380](https://github.com/sgl-project/sglang/actions/runs/37877536380)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37877535990](https://github.com/sgl-project/sglang/actions/runs/37877535990)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37877536310](https://github.com/sgl-project/sglang/actions/runs/37877536310)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 3,
+    "head": {
+      "repo": {
+        "full_name": "mickqian/sglang"
+      },
+      "sha": "81069d549cc3d9fbc07f2d50c314c61c88425574"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/43269",
+    "merged": true,
+    "number": 43269,
+    "state": "closed",
+    "title": "[diffusion] fix: share the IPC all-to-all transport between AllToAll4D and USP",
+    "updated_at": "2026-10-09T08:31:56Z"
+  },
+  "files": [
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/81069d549cc3d9fbc07f2d50c314c61c88425574/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fdistributed%2Fdevice_communicators%2Fipc_a2a.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fdistributed%2Fdevice_communicators%2Fipc_a2a.py?ref=81069d549cc3d9fbc07f2d50c314c61c88425574",
+      "deletions": 1,
+      "filename": "python/sglang/multimodal_gen/runtime/distributed/device_communicators/ipc_a2a.py",
+      "patch": "@@ -78,6 +78,8 @@ def __init__(self):\n         self.calls = 0\n         self.rank = None\n         self.group = None\n+        # global ranks of the pair the peer mappings connect\n+        self.ranks = None\n         self.failed = False\n         self.inited = False\n \n@@ -135,6 +137,7 @@ def init(self, group):\n \n         self.rank = dist.get_rank(group=group)\n         self.group = group\n+        self.ranks = dist.get_process_group_ranks(group)\n         dev = torch.cuda.current_device()\n         peer_dev = _peer_cuda_device(group, self.rank, dev)\n         # Peer access alone also admits PCIe pairs, where this NVLink transport\n@@ -265,7 +268,13 @@ def ipc_a2a_ready(group) -> bool:\n \n     if not envs.SGLANG_DIFFUSION_IPC_A2A:\n         return False\n-    if IPC_A2A.group is not None and IPC_A2A.group is not group:\n+    # AllToAll4D passes the SP device group and USP the Ulysses group: distinct\n+    # handles over one pair, so only a different pair invalidates the mappings.\n+    if (\n+        IPC_A2A.group is not None\n+        and group is not IPC_A2A.group\n+        and dist.get_process_group_ranks(group) != IPC_A2A.ranks\n+    ):\n         IPC_A2A.reset()\n     if IPC_A2A.failed:\n         return False",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/81069d549cc3d9fbc07f2d50c314c61c88425574/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fdistributed%2Fdevice_communicators%2Fipc_a2a.py",
+      "sha": "08c08abba8d35356c08656b2eb87c08dd5066613",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/81069d549cc3d9fbc07f2d50c314c61c88425574/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Fsingle_test_file%2Ftest_ipc_a2a_2_gpu.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Fsingle_test_file%2Ftest_ipc_a2a_2_gpu.py?ref=81069d549cc3d9fbc07f2d50c314c61c88425574",
+      "deletions": 5,
+      "filename": "python/sglang/multimodal_gen/test/single_test_file/test_ipc_a2a_2_gpu.py",
+      "patch": "@@ -91,16 +91,17 @@ def both_paths(fn, arg, **kw):\n         if not torch.equal(nccl_out, ipc_out):\n             failures.append(f\"output a2a {(b, s_local, h_global, d)}\")\n \n-    # AllToAll4D is a second entry point (stacked-qkv UlyssesAttention: zimage's\n-    # secondary attention, wan-VSA, hunyuanvideo) and routes through the same\n-    # exchange, so it needs its own parity check.\n+    # AllToAll4D is a second entry point (stacked-qkv UlyssesAttention, used by\n+    # wan-VSA) and routes through the same exchange, so it needs its own parity\n+    # check.\n     from sglang.multimodal_gen.runtime.distributed.communication_op import (\n         sequence_model_parallel_all_to_all_4D as all_to_all_4D,\n     )\n \n     # count exchanges, not staging keys: the key is (n_local, n_peer, dtype),\n     # so these shapes reuse the buffers the earlier arms already allocated\n     calls_before_a2a4d = IPC_A2A.calls\n+    flag_before_a2a4d = IPC_A2A.flag\n     for b, s_local, h_global, d in shapes:\n         torch.manual_seed(4321)\n         for scatter_dim in (1, 2):\n@@ -133,8 +134,11 @@ def both_paths(fn, arg, **kw):\n                 )\n \n     # A parity check that never reached the IPC branch would pass while proving\n-    # nothing, so require that exchanges actually happened.\n-    if IPC_A2A.calls == calls_before_a2a4d:\n+    # nothing, so require that exchanges actually happened. A re-init restarts\n+    # the count, so rule it out first.\n+    if IPC_A2A.flag is not flag_before_a2a4d:\n+        failures.append(\"AllToAll4D re-initialized the IPC transport USP set up\")\n+    elif IPC_A2A.calls == calls_before_a2a4d:\n         failures.append(\n             f\"AllToAll4D never took the IPC path (exchange count stayed at \"\n             f\"{calls_before_a2a4d})\"",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/81069d549cc3d9fbc07f2d50c314c61c88425574/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Fsingle_test_file%2Ftest_ipc_a2a_2_gpu.py",
+      "sha": "8e24d4eb0417f882765b48e9e22a870e4a14f0ce",
+      "status": "modified"
+    },
+    {
+      "additions": 13,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/81069d549cc3d9fbc07f2d50c314c61c88425574/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Funit%2Ftest_ipc_a2a_lifecycle.py",
+      "changes": 17,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Funit%2Ftest_ipc_a2a_lifecycle.py?ref=81069d549cc3d9fbc07f2d50c314c61c88425574",
+      "deletions": 4,
+      "filename": "python/sglang/multimodal_gen/test/unit/test_ipc_a2a_lifecycle.py",
+      "patch": "@@ -19,6 +19,7 @@ def test_ipc_requires_nvlink_before_mapping_peer_memory(monkeypatch, rank, nvlin\n     state = IpcA2AState()\n     with (\n         patch(f\"{_IPC}.dist.get_rank\", return_value=rank),\n+        patch(f\"{_IPC}.dist.get_process_group_ranks\", return_value=[0, 1]),\n         patch(f\"{_IPC}.torch.cuda.current_device\", return_value=rank),\n         patch(f\"{_IPC}._peer_cuda_device\", return_value=1 - rank),\n         patch(\n@@ -46,12 +47,18 @@ def test_ipc_requires_nvlink_before_mapping_peer_memory(monkeypatch, rank, nvlin\n         topology.assert_called_once_with([1, 3])\n \n \n-def test_reinitializes_ipc_transport_for_replaced_process_group():\n+@pytest.mark.parametrize(\n+    \"new_ranks\", [[0, 2], [0, 1]], ids=[\"different_pair\", \"same_pair\"]\n+)\n+def test_ipc_transport_reinitializes_only_for_a_different_rank_pair(new_ranks):\n+    \"\"\"A second group handle over the same pair (the SP device group that\n+    AllToAll4D passes vs the Ulysses group USP passes) must reuse the transport.\"\"\"\n     state = IpcA2AState()\n     old_group = object()\n     new_group = object()\n     state.inited = True\n     state.group = old_group\n+    state.ranks = [0, 1]\n     state.calls = 7\n \n     def initialize(group):\n@@ -61,6 +68,7 @@ def initialize(group):\n     with (\n         patch(f\"{_IPC}.IPC_A2A\", state),\n         patch(f\"{_IPC}.envs.SGLANG_DIFFUSION_IPC_A2A\", True),\n+        patch(f\"{_IPC}.dist.get_process_group_ranks\", return_value=new_ranks),\n         patch(\n             \"sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda\",\n             return_value=True,\n@@ -74,9 +82,10 @@ def initialize(group):\n     ):\n         assert ipc_a2a_ready(new_group)\n \n-    init.assert_called_once_with(new_group)\n-    assert state.group is new_group\n-    assert state.calls == 0\n+    replaced = new_ranks != [0, 1]\n+    assert init.called == replaced\n+    assert state.group is (new_group if replaced else old_group)\n+    assert state.calls == (0 if replaced else 7)\n \n \n def test_peer_cuda_device_uses_the_ulysses_group_mapping():",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/81069d549cc3d9fbc07f2d50c314c61c88425574/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Funit%2Ftest_ipc_a2a_lifecycle.py",
+      "sha": "71c28af71834a11d0247528eea05f9f085be3a64",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/tag-and-rerun-ci",
+      "created_at": "2026-10-09T03:51:30Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43269#issuecomment-6073899931",
+      "updated_at": "2026-10-09T03:51:30Z",
+      "user": {
+        "login": "mickqian"
+      }
+    }
+  ],
+  "number": 43269,
+  "refs": {
+    "base": {
+      "commit": "438df9a2a4645d39c87e33c4a27792e568ac2701",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "81069d549cc3d9fbc07f2d50c314c61c88425574",
+      "repository": "mickqian/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": []
+}

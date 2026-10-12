@@ -1,0 +1,263 @@
+---
+id: doc-baidu-baige-loongforge-a0ffad4293b0d726deaa
+title: baidu-baige/LoongForge / docs/source/kunlun_tutorial/quick_start_llm_pretrain_p800.md
+engine: loongforge
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: baidu-baige/LoongForge
+commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+path: docs/source/kunlun_tutorial/quick_start_llm_pretrain_p800.md
+raw_sha256: 73a3ddf6b9a8ed2dfcff4ee74a0b7365967c8313d4676d1cde11f37cd2c9a0db
+sources: []
+generated_body_sha256: f5f8b8392e4537843988ccb7807ea33c8a55fed1d6e5b9521005ee19042b8c79
+source_state: current-scan
+---
+
+# baidu-baige/LoongForge / docs/source/kunlun_tutorial/quick_start_llm_pretrain_p800.md
+
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/kunlun_tutorial/quick_start_llm_pretrain_p800.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Quick Start: LLM Model Pretrain Training on Kunlunxin P800
+
+## Quick Start: LLM Model Pretrain Training
+
+This document guides you through the quick start process for pre-training Large-Language Models (LLM) using the LoongForge framework on P800.
+
+## 0. Resource Preparation
+
+Before starting, download the required model weights, tokenizer, and datasets.
+All downloads use HuggingFace. Install the CLI first:
+
+```bash
+pip install "huggingface_hub[cli]"
+```
+
+### 0.1 Download Model Weights
+
+```bash
+hf download Qwen/Qwen3-30B-A3B --local-dir ./Qwen3-30B-A3B
+```
+
+> **Note:** This model requires approximately **60 GB** of disk space (MoE architecture). Download may take a while depending on your network.
+
+### 0.2 Download Tokenizer
+
+The tokenizer is included in the model weights downloaded above (`./Qwen3-30B-A3B/`).
+
+### 0.3 Download Dataset
+
+For a quick demo, we use the WikiText-103-raw dataset (~180 MB). For real pretraining, prepare your own large-scale corpus.
+
+```bash
+hf download wikitext --repo-type dataset --include "wikitext-103-raw-v1*" --local-dir ./data/wikitext
+```
+
+The raw wikitext data must be converted to newline-delimited JSON before preprocessing. Run:
+
+```python
+from datasets import load_dataset
+import json
+
+ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+with open("./data/wikitext_train.jsonl", "w") as f:
+    for item in ds:
+        text = item["text"].strip()
+        if text:
+            f.write(json.dumps({"text": text}) + "\n")
+```
+
+## 1. Data Preparation & Checkpoint Conversion
+
+After downloading resources in Section 0, you need to preprocess the data and convert the checkpoint before training. These steps are the same as the GPU version:
+
+* **Data preprocessing**: Convert `wikitext_train.jsonl` (from Section 0.3) to Megatron binary format — see [Quick Start: LLM Pre-training](https://loongforge.readthedocs.io/en/latest/llm_tutorial/quick_start_llm_pretrain.html) Section 1.1.
+* **Checkpoint conversion**: Convert HF weights (from Section 0.1) to Megatron-Core format — see [Quick Start: LLM Pre-training](https://loongforge.readthedocs.io/en/latest/llm_tutorial/quick_start_llm_pretrain.html) Section 2.
+
+## 2. Pretrain Training Script
+
+LoongForge currently provides Pretrain training example scripts for various models. After entering the container, you can find relevant scripts in the `examples_xpu/{model}/pretrain/` directory. Below is an example Pretrain training script for `Qwen3-30B-A3B`. Please refer to the comments for the purpose of each script section:
+
+```bash
+#! /bin/bash
+# The script needs to be run on at least 2 nodes.
+
+set -x
+source /root/.bashrc
+#source activate && conda activate python310_torch25_cuda
+
+MEGATRON_PATH=${MEGATRON_PATH:-"/workspace/Loong-Megatron"}
+export LOONGFORGE_PATH=${LOONGFORGE_PATH:-"/workspace/LoongForge"}
+P800_DEMO_ROOT=${P800_DEMO_ROOT:-"/workspace/loongforge_p800_demo"}
+
+DATA_PATH=${DATA_PATH:-"${P800_DEMO_ROOT}/datasets/qwen3/pile_test/pile-qwen_text_document"}
+
+TOKENIZER_PATH=${TOKENIZER_PATH:-"${P800_DEMO_ROOT}/models/Qwen3-30B-A3B"}
+
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-"${P800_DEMO_ROOT}/checkpoints/qwen3/Qwen3_30B_A3B_mcore_tp2pp2ep4"}
+
+TENSORBOARD_PATH=${TENSORBOARD_PATH:-"${P800_DEMO_ROOT}/tensorboard/qwen3-30b-a3b"}
+
+mkdir -p ${TENSORBOARD_PATH}
+
+GPUS_PER_NODE=8
+
+export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+#export DIST_MULTI_STREAM=true # Enable multi-stream
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+###################### Kunlunxin P800 ######################
+# bf16 specific (megatron related variables refer to <Loong Megatron specific>)
+export XMLIR_ENABLE_FAST_FC=true         # Used in torch.nn.linear.py (LinearWithActFunction, etc.)
+export XMLIR_ENABLE_FAST_FC_FWD_OUT=true # forward
+export XMLIR_ENABLE_FAST_FC_BWD_DW=true  # backward dw
+export XMLIR_ENABLE_FAST_FC_BWD_DX=true  # backward dx
+export FORCE_DISABLE_INPLACE_BF16_CAST=false    # Default is false, needs to be enabled in special cases (async checkpoint)
+
+export BKCL_RDMA_VERBS=1
+export BKCL_RDMA_NICS="eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4" # Used in multi-node setup, adjust according to actual network connectivity
+export BKCL_SOCKET_IFNAME=eth0                  # Adjust according to actual environment, disabled by default, specify when network card not found
+export BKCL_TREE_THRESHOLD=0
+export BKCL_FORCE_L3_RDMA=0                     # Setting to 1 may cause OOM if space is insufficient
+export BKCL_ENABLE_XDR=1
+export BKCL_ALL_TO_ALL_OPT=1                    # Multi-node alltoall switch
+export BKCL_RING_HOSTID_USE_RANK=1              # Supported since version 1.2.11, will be default in future
+
+export XMLIR_PARALLEL_SAVE_MEMORY=false         # false: more memory usage but better performance; true: less memory but degraded performance
+export XMLIR_BATCH_PARALLEL=false               # Enable communication fusion operators, USE_CAST_FC_FUSION automatically disabled in bf16
+export SAVE_LOG_FILE_WITH_RANK_ID=false         # If true, training logs will be stored separately by rank_id
+export XMLIR_LOG_PATH="${P800_DEMO_ROOT}/logs"  # Specify training log storage directory
+export XMLIR_LOG_PREFIX="log-file-prefix"       # Specify training log file name prefix
+export P800_DEBUG=false                         # If true, training will save checkpoint and exit when grad norm becomes nan
+export P800_DUMP_DIR="ckpt-dump-dir-path"       # Specify dump directory for checkpoint and info when grad norm becomes nan
+export XMLIR_DIST_ASYNC_ISEND_IRECV=true        # true: send/recv uses async logic, default is sync
+export XMLIR_CUDNN_ENABLED=1                    # true: use cuDNN, supports conv3d, etc.; false: disable cuDNN
+
+# LINEAR switches
+export XMLIR_ENABLE_LINEAR_FC_FUSION=1          # Allow linear to bypass xblas fcfusion in certain scenarios, e.g., use addmm, default is 1
+export XDNN_FC_GEMM_DTYPE=int32_with_ll         # GEMM_DTYPE uses int32_with_ll, optional
+export XMLIR_MEGATRON_CORE_XPU_PLUGIN=1         # Enable xpu_plugin for better performance (recommended)
+
+XFLAGS --disable transformer_engine_1_7
+XFLAGS --disable transformer_engine_1_13
+######################################################
+
+# Change for multinode config
+MASTER_ADDR=${MASTER_ADDR:-"localhost"}
+MASTER_PORT=${MASTER_PORT:-"6000"}
+NNODES=${WORLD_SIZE:-"1"}
+NODE_RANK=${RANK:-"0"}
+
+DISTRIBUTED_ARGS=(
+    --nproc_per_node $GPUS_PER_NODE
+    --nnodes $NNODES
+    --node_rank $NODE_RANK
+    --master_addr $MASTER_ADDR
+    --master_port $MASTER_PORT
+)
+
+MODEL_ARGS=(
+    --model-name qwen3-30b-a3b
+    --rotary-base 1000000
+    --rotary-seq-len-interpolation-factor 1
+)
+
+DATA_ARGS=(
+    --tokenizer-type HFTokenizer
+    --hf-tokenizer-path $TOKENIZER_PATH
+    --data-path $DATA_PATH
+    --split 99,1,0
+)
+
+TRAINING_ARGS=(
+    --training-phase pretrain # options: pretrain, sft
+    --seq-length 4096
+    --max-position-embeddings 40960
+    --init-method-std 0.006
+    --micro-batch-size 1
+    --global-batch-size 1024
+    --lr 1.0e-5
+    --min-lr 1.0e-6
+    --clip-grad 1.0
+    --weight-decay 0.1
+    --optimizer adam
+    --adam-beta1 0.9
+    --adam-beta2 0.95
+    --adam-eps 1e-08
+    --norm-epsilon 1e-6
+    --train-iters 50000
+    --lr-decay-iters 50000
+    --lr-decay-style cosine
+    --lr-warmup-fraction 0.002
+    --initial-loss-scale 65536
+    --bf16
+    --load $CHECKPOINT_PATH
+    --save $CHECKPOINT_PATH
+    --save-interval 5000
+    --eval-interval 1000
+    --eval-iters 10
+    #--ckpt-step 0
+    #--no-load-optim
+    #--no-load-rng
+    #--num-workers 8
+)
+
+MOE_ARGS=(
+    --moe-router-load-balancing-type aux_loss
+    --moe-router-topk 8
+    --moe-router-dtype fp32
+    --moe-aux-loss-coeff 1e-2
+    #--moe-grouped-gemm
+)
+
+MODEL_PARALLEL_ARGS=(
+    --tensor-model-parallel-size 2
+    --pipeline-model-parallel-size 2
+    --expert-model-parallel-size 4
+    --moe-token-dispatcher-type alltoall
+    --use-distributed-optimizer
+    # --overlap-grad-reduce
+    # --overlap-param-gather
+    --distributed-backend nccl
+    --sequence-parallel
+    # --tp-comm-overlap
+    # --tp-comm-overlap-bootstrap-backend nccl # or: gloo, mpi
+)
+
+LOGGING_ARGS=(
+    --log-interval 1
+    --tensorboard-dir ${TENSORBOARD_PATH}
+    --log-timers-to-tensorboard
+)
+
+if [ -n "${WANDB_API_KEY}" ]; then
+    LOGGING_ARGS+=(
+        --wandb-project ${WANDB_PROJECT}
+        --wandb-exp-name ${WANDB_NAME}
+    )
+fi
+
+PYTHONPATH=$MEGATRON_PATH:$LOONGFORGE_PATH:$PYTHONPATH \
+    torchrun ${DISTRIBUTED_ARGS[@]} \
+    $LOONGFORGE_PATH/loongforge/train.py \
+    ${MODEL_ARGS[@]} \
+    ${DATA_ARGS[@]} \
+    ${TRAINING_ARGS[@]} \
+    ${MOE_ARGS[@]} \
+    ${MODEL_PARALLEL_ARGS[@]} \
+    ${LOGGING_ARGS[@]}
+```
+
+## Monitoring Logs
+
+By default, the script outputs TensorBoard logs to the directory specified by `TENSORBOARD_PATH`. You can view training curves through TensorBoard.
+
+Additionally, if wandb is installed, you can configure the `WANDB_API_KEY` to upload training metrics to wandb for online monitoring.

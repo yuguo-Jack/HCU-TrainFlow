@@ -132,7 +132,7 @@ flowchart TD
     SYS --> VERIFY["局部正确性 + profiler-off 对照测量<br/>依赖变化同步更新 ranks 和 shapes"]
     VERIFY -->|重采验证与重新归因| T
     K -->|集成候选后重评系统效果| VERIFY
-    H -.-> REF["Megatron / Bridge 官方指南与 dev PR<br/>AMD Primus、MindSpeed 系列、LoongForge<br/>HCU 工程及底层库对应分支"]
+    H -.-> REF["按问题联查官方教程、源码与 PR<br/>Megatron / TorchTitan / DeepSpeed / SFT / RL<br/>Primus、MindSpeed、LoongForge 与 HCU 对应分支"]
 ```
 
 并行布局须在显存、通信、流水空泡和吞吐之间权衡，不以“占满显存”为目标。改变微批、累积或并行度时保持训练语义可比；布局变化会改变热点与 shape，需要重新分析。具体指南见 [并行切分与显存调参](../knowledge/official-megatron-wiki/parallelism.md)。

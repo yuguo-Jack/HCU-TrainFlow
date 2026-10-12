@@ -1,0 +1,229 @@
+---
+id: doc-yuguo-jack-hyperloom-34ef42679b9f33ce1530
+title: yuguo-Jack/Hyperloom / docs/reference/operator-scripts.md
+engine: hyperloom
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: yuguo-Jack/Hyperloom
+commit: 0425bde3f6e76e1588400c37d056dfd3bb75ac11
+path: docs/reference/operator-scripts.md
+raw_sha256: c1edf2fbc5d7daed7b641480f9136d56b249a9ed29ab6277c72a8b14623cae8e
+sources: []
+generated_body_sha256: a115118a000ce6be902d621ec1bafc5af75506c5dfed71fef04dfb80e5112c19
+source_state: current-scan
+---
+
+# yuguo-Jack/Hyperloom / docs/reference/operator-scripts.md
+
+[Original at fixed commit](https://github.com/yuguo-Jack/Hyperloom/blob/0425bde3f6e76e1588400c37d056dfd3bb75ac11/docs/reference/operator-scripts.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+---
+myst:
+    html_meta:
+        "description": "Reference for Hyperloom operator scripts: dump_session_breakdown, dump_session_report, and event_counts. Use these utilities to inspect, export, and report on session data."
+        "keywords": "Hyperloom, operator scripts, session breakdown, session report, event counts, LLM inference, AMD GPU, ROCm, debugging, observability, operator tools"
+---
+# Hyperloom operator scripts
+
+A short reference for the operator-facing scripts under
+`src/hyperloom/inference_optimizer/tools/`. These are not part of the agent loop —
+they are utilities you run by hand against a finished or in-progress
+session directory.
+
+When no explicit `--session-dir` is given, scripts resolve the active session in
+two steps: `INFERENCE_OPTIMIZER_CURRENT_SESSION_DIR` when set, otherwise the
+workspace root (`USER_DATA_PATH`, falling back to `/workspace/hyperloom`). This
+does **not** auto-discover the latest `$USER_DATA_PATH/<model>/<ts>/` per-session
+subdir — under the per-model timestamp layout, pass `--session-dir` explicitly
+(or rely on `INFERENCE_OPTIMIZER_CURRENT_SESSION_DIR`, which the CLI sets during
+a run). See [Hyperloom authentication and credentials](authentication.md).
+
+---
+
+## `dump_session_breakdown.py`
+
+Produce a `session_breakdown.json` from a session directory. Same
+builder as the live Coordinator `session_breakdown` action and the
+`cli.py` finally-block safety net.
+
+Use this when:
+
+* You want to (re)produce the breakdown for a historical session on a shared
+  filesystem.
+* A live session crashed before reaching the closing phase and you
+  want the partial breakdown anyway.
+* You need to bulk-export breakdowns for downstream indexing.
+
+### Usage
+
+Use these commands to produce a session breakdown.
+
+```bash
+# Live session in the current sandbox (USER_DATA_PATH or /workspace/hyperloom)
+python -m hyperloom.inference_optimizer.tools.dump_session_breakdown
+
+# Historical session on a shared filesystem
+python -m hyperloom.inference_optimizer.tools.dump_session_breakdown \
+    --session-dir /shared/hyperloom-sessions/<user>/<sid>
+
+# Override output path (don't touch session_dir)
+python -m hyperloom.inference_optimizer.tools.dump_session_breakdown \
+    --session-dir <SD> --output /tmp/breakdown-<sid>.json
+
+# Bulk historical
+for d in /shared/hyperloom-sessions/*/*; do
+    [ -d "$d" ] || continue
+    python -m hyperloom.inference_optimizer.tools.dump_session_breakdown \
+        --session-dir "$d" > /dev/null
+done
+```
+
+The default output path is `<session_dir>/session_breakdown.json`
+(overwrites if present; the file is rebuilt deterministically from raw
+artifacts).
+
+### Output
+
+`session_breakdown.json` conforming to
+[`session_breakdown.json` integration in Hyperloom](session-breakdown.md).
+The script exits 0 on success, prints a one-line summary, and writes
+collector warnings to the `warnings[]` field rather than failing.
+
+---
+
+## `dump_session_report.py`
+
+Render a markdown session report from a `session_breakdown.json`.
+Deterministic by default; optionally large language model (LLM)-polished when an
+OpenAI-compatible endpoint is configured.
+
+Use this when:
+
+* You want a human-readable summary to paste into a PR, Slack, or
+  email.
+* You want to generate the same report for many sessions in bulk.
+
+### Usage
+
+Use the following commands to render a session report.
+
+```bash
+# Deterministic only (no LLM):
+python -m hyperloom.inference_optimizer.tools.dump_session_report \
+    --input  /shared/hyperloom-sessions/<user>/<sid>/session_breakdown.json \
+    --output /shared/hyperloom-sessions/<user>/<sid>/session_report.md
+
+# With LLM-polished prose (OpenAI-compatible endpoint):
+HYPERLOOM_REPORT_LLM_BACKEND=openai \
+OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1 \
+OPENAI_API_KEY=... \
+python -m hyperloom.inference_optimizer.tools.dump_session_report \
+    --input  /shared/hyperloom-sessions/<user>/<sid>/session_breakdown.json \
+    --output /shared/hyperloom-sessions/<user>/<sid>/session_report.md
+```
+
+When `--output` is omitted the report is written to
+`<session_dir>/session_report.md` next to the input file. The LLM
+user prompt and raw response (when used) are persisted alongside as
+`session_report_prompt.json` / `session_report_llm_raw.txt` so
+hallucinations can be audited after the fact.
+
+### LLM hardening
+
+The script applies the following safeguards when LLM polishing is enabled.
+
+* The deterministic skeleton (headline numbers, action_path,
+  kernel_lifecycle counts) is generated *without* the LLM; the LLM
+  only rewrites prose.
+* If the LLM call fails (timeout, 5xx, malformed response), the
+  script falls back to the deterministic report and exits 0.
+* If you do not want any LLM call, leave
+  `HYPERLOOM_REPORT_LLM_BACKEND` unset.
+
+---
+
+## `event_counts.py`
+
+Print recent action / proposal / kernel counts from a session's
+`coordinator.db`.
+
+Use this when:
+
+* You want a quick "is this session making progress?" check without
+  reading logs.
+* You are debugging an apparent stall and want to see what kind of
+  events are landing.
+
+### Usage
+
+Use the following commands to print event counts for a session.
+
+```bash
+python -m hyperloom.inference_optimizer.tools.event_counts            # default session_dir
+python -m hyperloom.inference_optimizer.tools.event_counts /path/to/session
+```
+
+Reads at most the last 500 events from
+`$SESSION_DIR/storage/coordinator.db` and emits a JSON object of
+`{category: count}`. Exit code 2 if the database (DB) is missing.
+
+### Example output
+
+The script emits a JSON object of event categories and counts.
+
+```json
+{
+  "delegated:kernel_optimization:succeeded": 7,
+  "delegated:tracelens_analysis:succeeded": 1,
+  "kernel_request:kernel_optimization": 7,
+  "kernel_request:tracelens_analysis": 1,
+  "kernel_response:kernel_optimization:KEEP": 3,
+  "kernel_response:kernel_optimization:NEEDS_REVIEW": 4,
+  "proposal:explore": 12,
+  "proposal:specialist": 4,
+  "proposal:kernel_opt": 5
+}
+```
+
+A long run with healthy progress has roughly proportional
+`proposal:*` and `delegated:*:succeeded` counts. A stuck run typically
+shows many `kernel_request:*` and few `kernel_response:*`.
+
+---
+
+## Additional operator tools
+
+The same tools package also contains smaller utilities that are useful during
+incident response or launch validation:
+
+* `backfill_langfuse.py`: replay one finished session's `reports/trace/` into
+  Langfuse after the fact:
+  `python -m hyperloom.inference_optimizer.tools.backfill_langfuse --session-dir <SD> [--dry-run]`.
+* `preflight_optimizer.py`: launcher-side local preflight for stale serving
+  processes, torch/ROCm device visibility, GPU VRAM occupancy (exits non-zero
+  when any card exceeds 1% of its total capacity), and model path existence:
+  `python src/hyperloom/inference_optimizer/tools/preflight_optimizer.py MODEL_PATH`.
+  A non-zero exit must abort the launch.
+* `read_optimizer_state.py`: concise `state.json` / lifecycle summary:
+  `python src/hyperloom/inference_optimizer/tools/read_optimizer_state.py SESSION_DIR`.
+* `robustness_monitor.sh.example`: shell example for polling robustness
+  findings around a session; copy/adapt it for local operator workflows.
+
+---
+
+## Related topics
+
+Use these resources for related reference information:
+
+* [`session_breakdown.json` integration in Hyperloom](session-breakdown.md): The schema produced by `dump_session_breakdown.py`.
+* [Hyperloom self-hosting and operations guide](operations.md): Retention recommendations, including which scripts' outputs to back up long-term.
+* [Troubleshooting Hyperloom](troubleshooting.md): Symptoms vs which script to reach for first.

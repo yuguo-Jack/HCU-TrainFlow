@@ -1,0 +1,78 @@
+---
+id: doc-ascend-mindspeed-bd40675742b903501aa5
+title: Ascend/MindSpeed / docs/zh/features/multi_parameter_pipeline.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/multi_parameter_pipeline.md
+raw_sha256: 2efa31067fd9ffd8a9632e45916408b0cac241c14bfd164ad2c5fb34ad65392a
+sources: []
+generated_body_sha256: 9c17d9ad9a8b247afe7924289b67a06306886e0e2206b58e8d7e301458e16494
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/multi_parameter_pipeline.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/multi_parameter_pipeline.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# PP支持多参数传递
+
+## 背景与挑战
+
+在深度学习的大模型分布式训练中，流水线并行（Pipeline Parallelism，PP）是一种将模型分割为多个阶段并在不同设备上并发执行以提高效率的技术。然而，在多模态场景下引入多参数传递支持时，PP面临特定的挑战：
+
+- 通信部分的设计：传统PP通常只涉及单一张量的传输，但在多参数传递的情况下，需要处理多个变量的传递。这不仅增加了通信复杂度，还要求对每个变量的shape、dtype等属性进行精确管理，这些属性往往与整体模型架构紧密相关，具有高度定制性。
+- 前向传播的变量传递：在前向计算过程中，不仅要根据定义的shape正确传递多个变量，还要确保每个阶段接收到的数据格式符合预期，这对数据流的设计提出了更高的要求。
+- 反向传播的运算扩展：对于反向传播，除了对首个输出进行梯度计算外，还需对其他所有输出进行相应的运算，确保整个训练过程的完整性和准确性。
+
+## 解决方案
+
+针对上述挑战，我们设计了以下解决方案，旨在使PP能够有效支持多参数传递：
+
+- 优化的通信机制：开发了一套高效的通信机制，支持多种类型和格式的数据传输。针对每个阶段的具体需求定制化配置传输参数。
+- 增强的梯度计算逻辑：改进了反向传播算法，使得系统可以自动识别并处理来自多个输出的梯度信息，保证每个输出都能参与到最终的权重更新中。
+
+## 使用场景
+
+本特性适用于需要处理大量多模态数据（如文本、图像、音频）的大型神经网络训练任务，并且流水线并行各个阶段传递多参数。
+
+## 使用方法
+
+> [!NOTE]
+>
+> - 用户需修改`mindspeed/features_manager/pipeline_parallel/multi_parameter.py`模块中`validate_args`函数里`args.pipeline_tensor_shapes`值，使其与实际模型流水线阶段的张量传输一致，包括张量维度（Shape）和数据类型（Dtype）。
+> - 暂不兼容--moe-fb-overlap和dualpipev特性。
+
+启用支持多参数传递，需要在训练脚本中加入以下参数：
+
+- 支持PP场景
+
+```shell
+# PP >= 2
+--pipeline-model-parallel-size ${PP} \
+--use-multiparameter-pipeline-model-parallel \
+```
+
+- 支持VPP场景
+
+```shell
+# PP >= 2, num-layers-per-virtual-pipeline-stage不为None
+--pipeline-model-parallel-size ${PP} \
+--num-layers-per-virtual-pipeline-stage 1 \
+--use-multiparameter-pipeline-model-parallel \
+```
+
+## 使用效果
+
+采用PP支持多参数传递后，用户可以在保持高通信效率的同时，更灵活地处理复杂的多模态数据。

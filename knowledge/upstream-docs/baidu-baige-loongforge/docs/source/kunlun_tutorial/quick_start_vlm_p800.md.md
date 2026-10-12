@@ -1,0 +1,262 @@
+---
+id: doc-baidu-baige-loongforge-2d6cef283e55741b52c7
+title: baidu-baige/LoongForge / docs/source/kunlun_tutorial/quick_start_vlm_p800.md
+engine: loongforge
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: baidu-baige/LoongForge
+commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+path: docs/source/kunlun_tutorial/quick_start_vlm_p800.md
+raw_sha256: 3c732e0372c15134204c773da27d0ab8076125d4bbc63ad90b1929b9da118bfa
+sources: []
+generated_body_sha256: 07e58004b91b3aefb73c7cd1f0b774009abb23e8eba00d25df1c49fc88d4601f
+source_state: current-scan
+---
+
+# baidu-baige/LoongForge / docs/source/kunlun_tutorial/quick_start_vlm_p800.md
+
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/kunlun_tutorial/quick_start_vlm_p800.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Quick Start: VLM Model SFT Training on Kunlunxin P800
+
+## Quick Start: VLM Model SFT Training
+
+This document guides you through the quick start process for fine-tuning Vision-Language Models (VLM) using the LoongForge framework on P800.
+
+## 0. Resource Preparation
+
+Before starting, download the required model weights, tokenizer, and datasets.
+All downloads use HuggingFace. Install the CLI first:
+
+```bash
+pip install "huggingface_hub[cli]"
+```
+
+### 0.1 Download Model Weights
+
+```bash
+hf download Qwen/Qwen3-VL-30B-A3B-Instruct --local-dir ./Qwen3-VL-30B-A3B-Instruct
+```
+
+> **Note:** This model requires approximately **62 GB** of disk space (13 safetensor shards). There is no non-Instruct base variant on HuggingFace; the Instruct variant is used for both pretrain and SFT.
+
+### 0.2 Download Tokenizer
+
+The tokenizer is included in the model weights downloaded above (`./Qwen3-VL-30B-A3B-Instruct/`).
+
+### 0.3 Download Dataset
+
+We use the LLaVA-Instruct-Mix-VSFT-Small dataset (~109 MB, 2,592 samples, multimodal image-text pairs in ShareGPT format) for VLM SFT.
+
+```bash
+hf download axolotl-ai-co/llava-instruct-mix-vsft-small --repo-type dataset --local-dir ./data/llava-instruct-mix-vsft-small
+```
+
+## 1. Data Preparation & Checkpoint Conversion
+
+After downloading resources in Section 0, you need to convert the dataset to WebDataset format and convert the checkpoint before training. These steps are the same as the GPU version:
+
+* **Dataset conversion**: Convert the downloaded dataset to Energon/WebDataset format — see [Quick Start: VLM SFT](https://loongforge.readthedocs.io/en/latest/vlm_tutorial/quick_start_vlm_sft.html) Section 1.3.
+* **Checkpoint conversion**: Convert HF VLM weights (language model, vision encoder, adapter) to Megatron-Core format — see [Quick Start: VLM Pre-training](https://loongforge.readthedocs.io/en/latest/vlm_tutorial/quick_start_vlm_pretrain.html) Section 2.
+
+## 2. SFT Training Script
+
+LoongForge currently provides SFT training example scripts for various models. After entering the container, you can find relevant scripts in the `examples_xpu/{model}/finetuning/` directory. Below is an example SFT training script for `Qwen3-VL-30B-A3B`. Please refer to the comments for the purpose of each script section:
+
+```bash
+#! /bin/bash
+# The script needs to be run on at least 2 nodes.
+source /root/.bashrc
+source activate && conda activate python310_torch25_cuda
+ 
+pkill -9 python || true
+ 
+function check_for_infer() {
+    /usr/local/xpu/tools/rw $1 0x300010B8 0
+    /usr/local/xpu/tools/rw $1 0x300410B8 0
+    /usr/local/xpu/tools/rw $1 0x300810B8 0
+    /usr/local/xpu/tools/rw $1 0x310010B8 0
+    /usr/local/xpu/tools/rw $1 0x310410B8 0
+    /usr/local/xpu/tools/rw $1 0x310810B8 0
+    /usr/local/xpu/tools/rw $1 0x320010B8 0
+    /usr/local/xpu/tools/rw $1 0x320410B8 0
+    /usr/local/xpu/tools/rw $1 0x320810B8 0
+    /usr/local/xpu/tools/rw $1 0x330010B8 0
+    /usr/local/xpu/tools/rw $1 0x330410B8 0
+    /usr/local/xpu/tools/rw $1 0x330810B8 0
+}
+for ((i=0; i<8; i++))
+do
+    check_for_infer $i
+done
+ 
+MEGATRON_PATH=${MEGATRON_PATH:-"/workspace/Loong-Megatron"}
+export LOONGFORGE_PATH=${LOONGFORGE_PATH:-"/workspace/LoongForge"}
+P800_DEMO_ROOT=${P800_DEMO_ROOT:-"/workspace/loongforge_p800_demo"}
+
+DATA_PATH=${DATA_PATH:-"${P800_DEMO_ROOT}/datasets/qwen3_vl_30b_a3b/data-path/LLaVA-Pretrain_202511180001/"}
+TOKENIZER_PATH=${TOKENIZER_PATH:-"${P800_DEMO_ROOT}/models/Qwen3-VL-30B-A3B-Instruct_202512180001/"}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-"${P800_DEMO_ROOT}/checkpoints/qwen3-vl/qwen3-vl-30b-tp4pp1ep8etp1-groupedgemm_202512180001/"}
+TENSORBOARD_PATH=${TENSORBOARD_PATH:-"${P800_DEMO_ROOT}/tensorboard/qwen3-vl-30b-tp4pp1ep8etp1-groupedgemm-save/"}
+ 
+GPUS_PER_NODE=8
+###################### Kunlunxin P800 ######################
+# bf16 specific (megatron related variables refer to <Loong Megatron specific>)
+export XMLIR_ENABLE_FAST_FC=true                # Used in torch.nn.linear.py (LinearWithActFunction, etc.)
+# export XMLIR_ENABLE_FAST_FC_FWD_OUT=true      # Used for forward output
+# export XMLIR_ENABLE_FAST_FC_BWD_DW=true       # Used for backward DW
+# export XMLIR_ENABLE_FAST_FC_BWD_DX=true       # Used for backward DX
+export FORCE_DISABLE_INPLACE_BF16_CAST=false    # Default is false, needs to be enabled in special cases (async checkpoint)
+ 
+export CUDA_DEVICE_MAX_CONNECTIONS=1            # Megatron framework setting, prevents disorder when tp>1
+ 
+export BKCL_RDMA_NICS="eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4" # Used in multi-node setup, adjust according to actual network connectivity
+export BKCL_SOCKET_IFNAME=eth0                  # Adjust according to actual environment, disabled by default, specify when network card not found
+export BKCL_TREE_THRESHOLD=0
+export BKCL_FORCE_L3_RDMA=0                     # Setting to 1 may cause OOM if space is insufficient
+export BKCL_ENABLE_XDR=1
+export BKCL_ALL_TO_ALL_OPT=1                    # Multi-node alltoall switch
+export BKCL_RING_HOSTID_USE_RANK=1              # Supported since version 1.2.11, will be default in future
+export BKCL_RDMA_VERBS=1                        # Used with BKCL_QPS_PER_CONNECTION, currently only needed for Hygon machines
+export XMLIR_PARALLEL_SAVE_MEMORY=false         # false: more memory usage but better performance; true: less memory but degraded performance
+export XMLIR_BATCH_PARALLEL=false               # Enable communication fusion operators, USE_CAST_FC_FUSION automatically disabled in bf16
+export SAVE_LOG_FILE_WITH_RANK_ID=false          # If true, training logs will be stored separately by rank_id
+export XMLIR_LOG_PATH="${P800_DEMO_ROOT}/logs"  # Specify training log storage directory
+export XMLIR_LOG_PREFIX="qwen3_vl_30b_sft"      # Specify training log file name prefix
+export P800_DEBUG=false                         # If true, training will save checkpoint and exit when grad norm becomes nan
+export P800_DUMP_DIR="ckpt-dump-dir-path"       # Specify dump directory for checkpoint and info when grad norm becomes nan
+export XMLIR_DIST_ASYNC_ISEND_IRECV=true        # true: send/recv uses async logic, default is sync
+export XMLIR_CUDNN_ENABLED=1                    # true: use cuDNN, supports conv3d, etc.; false: disable cuDNN
+ 
+# LINEAR switches
+export XMLIR_ENABLE_LINEAR_FC_FUSION=1          # Allow linear to bypass xblas fcfusion in certain scenarios, e.g., use addmm, default is 1
+export XDNN_FC_GEMM_DTYPE=int32_with_ll         # GEMM_DTYPE uses int32_with_ll, optional
+export XMLIR_MEGATRON_CORE_XPU_PLUGIN=1        # xpu_plugin, mock implementation for P800 characteristics, performance improvement recommended
+
+XFLAGS --disable transformer_engine_1_7         # legacy
+XFLAGS --disable transformer_engine_1_13        # legacy
+######################################################
+ 
+# Change for multinode config
+MASTER_ADDR=${MASTER_ADDR:-"localhost"}
+MASTER_PORT=${MASTER_PORT:-"6000"}
+NNODES=${WORLD_SIZE:-"1"}
+NODE_RANK=${RANK:-"0"}
+ 
+DISTRIBUTED_ARGS=(
+    --nproc_per_node $GPUS_PER_NODE
+    --nnodes $NNODES
+    --node_rank $NODE_RANK
+    --master_addr $MASTER_ADDR
+    --master_port $MASTER_PORT
+)
+ 
+MODEL_ARGS=(
+    --model-name qwen3_vl_30b_a3b
+)
+ 
+DATA_ARGS=(
+    --tokenizer-type HFTokenizer
+    --hf-tokenizer-path $TOKENIZER_PATH
+    --data-path $DATA_PATH
+    --dataloader-type external
+    --split 100,0,0
+    --num-workers 8
+    --chat-template qwen2-vl
+    --packing-sft-data
+    --packing-batch-size 1000
+    --max-packed-tokens 4096
+    --enable-discard-sample
+)
+ 
+TRAINING_ARGS=(
+    --seed 42
+    --norm-epsilon 1e-6
+    --training-phase sft
+    --trainable-modules language_model adapter vision_model
+    --seq-length 4096
+    --max-position-embeddings 262144
+    --init-method-std 0.02
+    --micro-batch-size 1
+    --global-batch-size 128
+    --lr 1e-5
+    --min-lr 0.
+    --clip-grad 1.0
+    --weight-decay 0.01
+    --optimizer adam
+    --adam-beta1 0.9
+    --adam-beta2 0.999
+    --adam-eps 1e-08
+    --train-iters 100
+    --lr-decay-style cosine
+    --lr-warmup-fraction 0.03
+    --initial-loss-scale 65536
+    --bf16
+    --load $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
+    --save-interval 10000
+    --ckpt-format torch
+    --dataloader-save ${CHECKPOINT_PATH}/dataloader
+    --no-rope-fusion
+    --no-bias-dropout-fusion
+    --no-bias-gelu-fusion
+    --no-gradient-accumulation-fusion
+    --exit-interval 500
+)
+ 
+MOE_ARGS=(
+    --moe-router-load-balancing-type aux_loss
+    --moe-grouped-gemm
+    --moe-token-dispatcher-type alltoall
+    # --moe-permute-fusion
+    --moe-router-dtype fp32
+    --moe-aux-loss-coeff 1e-3
+    --moe-router-topk 8
+    #--empty-unused-memory-level 2
+)
+ 
+MODEL_PARALLEL_ARGS=(
+    --attention-backend flash
+    --tensor-model-parallel-size 4
+    --pipeline-model-parallel-size 1
+    --expert-model-parallel-size 8
+    --expert-tensor-parallel-size 1
+    --sequence-parallel
+    --use-distributed-optimizer
+    #--overlap-grad-reduce
+    #--overlap-param-gather
+    --distributed-backend nccl
+)
+ 
+LOGGING_ARGS=(
+    --log-interval 1
+    --tensorboard-dir ${TENSORBOARD_PATH}
+    --log-timers-to-tensorboard
+)
+ 
+PYTHONPATH=$MEGATRON_PATH:$LOONGFORGE_PATH:$PYTHONPATH \
+    torchrun ${DISTRIBUTED_ARGS[@]} \
+    $LOONGFORGE_PATH/loongforge/train.py \
+    ${MODEL_ARGS[@]} \
+    ${MOE_ARGS[@]} \
+    ${DATA_ARGS[@]} \
+    ${TRAINING_ARGS[@]} \
+    ${MODEL_PARALLEL_ARGS[@]} \
+    ${LOGGING_ARGS[@]} \
+    model.image_encoder.apply_rope_fusion=False \
+```
+
+## Monitoring Logs
+
+By default, the script outputs TensorBoard logs to the directory specified by `TENSORBOARD_PATH`. You can view training curves through TensorBoard.
+
+Additionally, if wandb is installed, you can configure the `WANDB_API_KEY` to upload training metrics to wandb for online monitoring.

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: aedc21ec66ff03f329dcd4139945da8087e0d0e7
 path: docs/en/algorithms/grpo_series.md
-raw_sha256: 4c15604c2ee82bb834da428b2fddea020c3e62e31cfdf9c8f0c00658929f9b3c
+raw_sha256: 7a06093db48d8756ec95bf15e8a5d8a36cd71f21994ad2fc88a79d6c2ee11af8
 sources: []
-generated_body_sha256: 3a16b118745998c501c950aefc2bfe8c35f66de755c8fc97b7b996197665993c
+generated_body_sha256: 2e4f63577d1a94489f74606b9c17630a8c84d3eb454893be01f3cef8da00b95a
 source_state: current-scan
 ---
 
 # areal-project/AReaL / docs/en/algorithms/grpo_series.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/docs/en/algorithms/grpo_series.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/aedc21ec66ff03f329dcd4139945da8087e0d0e7/docs/en/algorithms/grpo_series.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -104,6 +104,34 @@ Note: Use `+` prefix when adding keys not present in the original YAML.
 
 All configurations are defined in `areal/api/cli_args.py` under `PPOActorConfig` and
 `NormConfig`. See [CLI configurations](../cli_reference.md) for full details.
+
+### Policy-gradient Loss Aggregation (`actor.loss_aggregation`)
+
+`token_mean` averages valid tokens, `seq_mean` averages per-response token means,
+`prompt_mean` averages per-prompt token means, and `constant` divides the token-loss
+sum by the active response count times `actor.loss_aggregation_divisor`.
+
+`prompt_mean` uses the same response-level optimizer schedule as the other
+modes. A physical prompt group can span optimizer steps and engine microbatches.
+Before splitting, loss preparation assigns weight $1/D_g$ to every original
+valid token in group $g$, where $D_g$ is the full group's valid-token count.
+These weights follow slicing and packing; later loss filtering changes only the
+numerator.
+
+For $G$ nonempty groups across data-parallel ranks and $K$ actual optimizer steps,
+each step's objective is $K/G$ times its weighted token-loss sum. At fixed
+parameters and masks, averaging these step objectives recovers the full-batch
+prompt mean, including its gradient. This does not imply identical optimizer
+trajectories for different schedules. Accumulation and objective metrics use each
+microbatch's response share within its step, so steps contribute equally to the
+reported average. Megatron's per-token path retains original token counts for
+auxiliary-gradient normalization and compensates the main objective separately.
+
+Empty groups contribute zero. A real step with no valid tokens retains its place
+in the schedule and contributes zero policy-gradient loss; an update with no
+valid tokens on any rank is rejected. Transport-only microbatches have zero
+accumulation weight. With the default packing granularity of one,
+`max_tokens_per_mb` only needs to fit individual responses.
 
 ### Reward and Advantage Normalization (`actor.reward_norm` and `actor.adv_norm`)
 

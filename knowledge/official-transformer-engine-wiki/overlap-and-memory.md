@@ -9,35 +9,35 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-12'
 sources:
 - source: nvidia-transformerengine
   path: examples/pytorch/comm_gemm_overlap/README.md
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 16d677ac34c025955d7afc08b89aa1d4ca620a888fbb351543fd6b45269dd936
 - source: nvidia-transformerengine
   path: examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 971222cfc38227dd6d9f2689e751722ea760447373c4058404a6fc536ad7e953
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 0139c7c5ce185869d733b92dddb3fea2020638a089f17a5ce088e82d733e4160
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/graph.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 8f795d0be87618100ab5b3c6bbb9d11bb1958c3428807ec656b62da5c89209b6
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/cpu_offload.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: a6c238518e1d8813bb665f956185b0dea936aee6d0938933b5539095669e26fd
 - source: nvidia-transformerengine
   path: docs/features/other_optimizations/cpu_offloading/cpu_offloading.rst
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: b0eb322d9da8de6d1c85f5af54b1b15bb5d0a37c72de5485e3710f5d4c4809bd
 - source: nvidia-transformerengine
   path: docs/examples/advanced_optimizations.ipynb
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 0d5d703679a7d3c16773112e8879879560a945600c168a95b27b22bc44f9a22a
 - source: nvidia-transformerengine-docs
   path: advanced-optimizations
@@ -46,7 +46,6 @@ sources:
   url: https://docs.nvidia.com/deeplearning/transformer-engine/examples/advanced_optimizations.html
   revision_kind: web-content-fingerprint
 ---
-
 # TE 并行与显存：Userbuffers、CP、Graph 和 Offload
 
 ## TP/SP 通信与计算重叠
@@ -71,13 +70,13 @@ HCU 侧先确认当前 TE 已支持的 overlap 路径、通信实现和 buffer �
 
 ## 来源与版本复核
 
-- [nvidia-transformerengine: examples/pytorch/comm_gemm_overlap/README.md](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/examples/pytorch/comm_gemm_overlap/README.md)
-- [nvidia-transformerengine: examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/graph.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/graph.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/cpu_offload.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/cpu_offload.py)
-- [nvidia-transformerengine: docs/features/other_optimizations/cpu_offloading/cpu_offloading.rst](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/docs/features/other_optimizations/cpu_offloading/cpu_offloading.rst)
-- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/docs/examples/advanced_optimizations.ipynb)
+- [nvidia-transformerengine: examples/pytorch/comm_gemm_overlap/README.md](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/examples/pytorch/comm_gemm_overlap/README.md)
+- [nvidia-transformerengine: examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/graph.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/graph.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/cpu_offload.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/cpu_offload.py)
+- [nvidia-transformerengine: docs/features/other_optimizations/cpu_offloading/cpu_offloading.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/features/other_optimizations/cpu_offloading/cpu_offloading.rst)
+- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/advanced_optimizations.ipynb)
 - [nvidia-transformerengine-docs: advanced-optimizations](https://docs.nvidia.com/deeplearning/transformer-engine/examples/advanced_optimizations.html)
 
-本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码 main、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。

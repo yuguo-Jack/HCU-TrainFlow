@@ -25,6 +25,8 @@ description: 检索 HCU-TrainFlow-Wiki 的官方资料、通用环境经验和�
 6. 跨主题按依赖连接：schedule→通信/TE→显存→数值→恢复，RL→rollout→weight sync→训练；对关键底层库追实际分支/锁定 SHA。大文件、目录级追查可拉固定源码到独立参考目录，开发/提 PR 使用独立工作 checkout，不能混用知识库缓存。
 7. 普通 search/read/code 只写私有缓存，不自动正式收录材料。确需补专题且当前任务包含知识维护时，移交 `$hcu-trainflow-wiki-skill-update`；纯搜索只报告缺口；正式 PR 来源页需显式 `wiki-pr ... --retain-project PROJECT --engine ENGINE`。必要时联查 HCU knowledge search/飞书，权限不足及时反馈，不顺带更新 HCU 大知识库。
 
+跨引擎参考按项目 `docs/optimization-reference-map.md` 选择，DeepSpeed、TorchTitan、Megatron 和第三方引擎都可提供机制证据；不因当前训练引擎不同而排除适用优化。需要系统了解某仓时读 `knowledge/COVERAGE.md` 的九项入口，避免只看较短总览。HCU 库的实际仓/分支和修改归属经 HCU-Knowledge 与加载版本确认，不能用上游 AMD/NVIDIA 同名库替代。
+
 **官方页面回退不局限于 PR。** 问题涉及发布状态、roadmap、模型支持或教程而本地内容不足时，按项目 `docs/wiki.md` 的“未收录的官方内容按需查证”，从 sources.json、官方仓库 README 和文档导航确认权威入口，使用宿主网页搜索/浏览能力查询官方 release notes、Releases/CHANGELOG、roadmap issue/discussion/project、模型列表、recipe/examples 和 backend 专题。`wiki-search-pr` 只查 PR，不能用它的空结果判定这些页面不存在。打开正文，核对日期、版本与状态，再追相关 PR、实际配置、调用方和底层源码；纯搜索证据只留私有缓存。无网络/权限或正文不可读时说明具体缺口，不保证所有来源均可访问，也不冒称已经收录或完成深度策展。
 
 底层库可用 `--engine transformer-engine` 或 `--engine cudnn-frontend` 定向搜索。TE 独立 Wiki 覆盖精度/权重缓存、attention、overlap/显存、融合与教程；cuDNN Frontend 覆盖 graph/plan、SDPA、open kernels、host 缓存与教程。跨 TE→cuDNN→HCU TE/Flash-Train 的问题分别检索并核对调用条件，不能把官方 NV 示例命令直接当成 HCU 配方。

@@ -1,0 +1,212 @@
+---
+id: doc-amd-agi-primus-49c1df4745aa839c6123
+title: AMD-AGI/Primus / docs/04-technical-guides/data-preparation.md
+engine: primus
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: AMD-AGI/Primus
+commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+path: docs/04-technical-guides/data-preparation.md
+raw_sha256: 5a91d20e10e58ff5d266016746b7b2022e2610dab658f5dba5d7c4327fb48045
+sources: []
+generated_body_sha256: cf147304aa53b7e45192bbd098e0d3502ac186fb5e34bd13cb72fb06aba44a9e
+source_state: current-scan
+---
+
+# AMD-AGI/Primus / docs/04-technical-guides/data-preparation.md
+
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/04-technical-guides/data-preparation.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Data preparation guide
+
+Primus routes training through **Megatron-LM**, **TorchTitan**, and **MaxText**. Each backend expects its own data format and preprocessing pipeline. This guide summarizes how to prepare data, how to use **mock** data for smoke tests, and which environment variables commonly apply.
+
+Scripts referenced below live under the Primus repository root, for example:
+
+- `examples/megatron/preprocess_data.py`
+- `examples/megatron/prepare_bookcorpus_megatron_dataset.py`
+- `runner/helpers/hooks/train/pretrain/megatron/prepare.py`
+- `runner/helpers/hooks/train/pretrain/torchtitan/prepare.py`
+
+The `prepare.py` scripts are launcher hooks: `primus-cli` runs them automatically before training, so you rarely invoke them by hand.
+
+---
+
+## 1. Overview
+
+| Backend | Format | Typical entry |
+|---------|--------|----------------|
+| Megatron | Indexed `.bin` + `.idx` datasets | `data_path`, `train_data_path`, tokenizer args |
+| TorchTitan | Hugging Face datasets + local assets | `training.dataset`, `training.dataset_path`, `model.hf_assets_path` |
+| MaxText | TFDS / Hugging Face / Grain / synthetic | `dataset_type`, paths per pipeline |
+
+All backends support **synthetic or mock** data for configuration and scaling tests without large downloads.
+
+---
+
+## 2. Mock data (testing)
+
+### Megatron
+
+Set in the trainer module:
+
+```yaml
+mock_data: true
+```
+
+Default in `primus/configs/modules/megatron/trainer_base.yaml` is `false`. When `true`, training uses generated data matching configured dimensions so you can validate YAML, parallelism, and throughput without real corpora.
+
+### TorchTitan
+
+```yaml
+training:
+  mock_data: true
+```
+
+Default in `primus/configs/modules/torchtitan/pre_trainer.yaml` is `true` (useful for quick runs; set `false` and supply real datasets for production).
+
+### MaxText
+
+Use `dataset_type: synthetic` (or other synthetic paths in MaxText configs). See `third_party/maxtext/src/maxtext/configs/base.yml` and model YAMLs under `third_party/maxtext/src/maxtext/configs/`.
+
+---
+
+## 3. Megatron data pipeline
+
+### Inputs
+
+- Raw **JSON** or **JSONL** text (one JSON object per line for JSONL).
+- Optional **sentence splitting** via NLTK when `--split-sentences` is used (requires NLTK data; see [Environment variables](#6-environment-variables-for-data)).
+
+### Preprocessing: `examples/megatron/preprocess_data.py`
+
+The script tokenizes input and writes **Megatron indexed datasets** (`.bin` + `.idx`). It uses `build_tokenizer` from Primus’s Megatron tokenizer integration and accepts tokenizer flags from `_add_tokenizer_args`.
+
+**Important arguments** (from the script’s argparse):
+
+| Argument | Description |
+|----------|-------------|
+| `--input` | Path to input JSON (required). |
+| `--json-keys` | Keys to read (default `text`). |
+| `--output-prefix` | Output path **without** suffix; produces `{prefix}_{key}_{document|sentence}.bin` and `.idx`. |
+| `--workers` | Number of worker processes (required). |
+| `--partitions` | Split input for parallel preprocessing (default `1`). |
+| `--split-sentences` | Run NLTK sentence splitting before encode. |
+| `--append-eod` | Append end-of-document token. |
+
+**Example** (mirrors the Megatron pretrain hook for BookCorpus-style flows):
+
+```bash
+python3 examples/megatron/preprocess_data.py \
+  --input /path/to/train.json \
+  --tokenizer-type HuggingFaceTokenizer \
+  --tokenizer-model /path/to/tokenizer \
+  --output-prefix /path/to/out/bookcorpus_train \
+  --workers "$(nproc)" \
+  --split-sentences \
+  --partitions 2
+```
+
+### Configuring training runs
+
+| Parameter | Notes |
+|-----------|--------|
+| `data_path` | Single path or **weighted blend**: `0.5 /path/a 0.5 /path/b` |
+| `train_data_path`, `valid_data_path`, `test_data_path` | Separate splits when used |
+| `split` | Train/valid/test ratio string, e.g. `"99,1,0"` (default in `trainer_base.yaml`) or `"98,2,0"` for train/valid/test |
+| `dataloader_type` | Megatron dataloader type; default in `trainer_base.yaml` is `null` (set explicitly in experiments as needed) |
+
+### BookCorpus example scripts
+
+- **`examples/megatron/prepare_bookcorpus_megatron_dataset.py`**—downloads BookCorpus to JSON via Hugging Face `datasets`, optional `--out-dir`.
+- **`runner/helpers/hooks/train/pretrain/megatron/prepare.py`**—orchestrates download and calls `preprocess_data.py` with tokenizer settings from the Primus config. `TOKENIZED_DATA_PATH`, `TOKENIZED_TRAIN_DATA_PATH`, and `TOKENIZED_EVAL_DATA_PATH` are final Megatron prefixes (omit `.bin`/`.idx`), and generated files are written to those exact prefixes.
+
+When evaluation is enabled (`eval_interval > 0` plus `eval_iters > 0` or
+`full_validation: true`) and the config does not already provide
+`valid_data_path`, the hook carves a held-out BookCorpus split. Raw split caches
+are keyed by both the split seed and `test_size`; tokenized validation outputs
+carry matching metadata, so changing either value regenerates train/eval outputs
+instead of silently reusing a different split.
+
+The split seed comes from `--split_seed` (default 42) and is **not** the Megatron
+`seed` training parameter. The two are deliberately separate: `primus-cli` hands
+the same argument list to the hook and to training, so while they shared a name,
+changing the training RNG seed also changed the split cache key and forced a
+BookCorpus re-download and full re-tokenization. Use `--split_seed` to reshape
+the split and `seed` to reseed training; a seed sweep now reuses one tokenized
+corpus.
+
+Only node rank 0 prepares data. It publishes atomic completion or failure
+markers next to the tokenized prefix; other node ranks wait up to
+`PRIMUS_DATA_PREP_TIMEOUT_SECONDS` (default 3600 seconds) and propagate rank 0
+failure. Therefore custom `TOKENIZED_*_DATA_PATH` locations must be writable by
+rank 0 and visible through storage shared by every training node.
+
+### Tokenizers
+
+Tokenizer type and model path are set on the model preset (for example `tokenizer_type`, `tokenizer_model` in `primus/configs/models/megatron/language_model.yaml` comments list `Llama2Tokenizer`, `HuggingFaceTokenizer`, etc.).
+
+---
+
+## 4. TorchTitan data pipeline
+
+TorchTitan uses **Hugging Face datasets** style identifiers and local paths.
+
+| Key | Default (`pre_trainer.yaml`) | Description |
+|-----|------------------------------|-------------|
+| `training.dataset` | `c4` | Dataset identifier for TorchTitan loaders. |
+| `training.dataset_path` | `null` | Local directory for dataset assets when needed. |
+
+Tokenizer and model assets are resolved from **`model.hf_assets_path`** (or equivalent in your model preset). The preparation hook **`runner/helpers/hooks/train/pretrain/torchtitan/prepare.py`**:
+
+- Resolves the TorchTitan checkout path.
+- Runs `scripts/download_hf_assets.py` inside TorchTitan to fetch tokenizer assets for a given `repo_id`.
+- Uses `HF_TOKEN` when the model or dataset is gated.
+
+---
+
+## 5. MaxText data pipeline
+
+MaxText configuration is defined in upstream YAML (for example `third_party/maxtext/src/maxtext/configs/base.yml`).
+
+| Parameter | Meaning |
+|-----------|---------|
+| `dataset_type` | One of `synthetic`, `hf`, `grain`, `tfds` (per `base.yml` comments). |
+| `hf_path`, `hf_data_dir`, `hf_train_files` | Hugging Face pipeline inputs when `dataset_type: hf`. |
+| `per_device_batch_size` | Batch sizing on each device. |
+| `packing` | Sequence packing for efficiency (default `True` in `base.yml`). |
+
+See MaxText’s data input documentation for Grain and TFDS specifics.
+
+---
+
+## 6. Environment variables for data
+
+| Variable | Usage |
+|----------|--------|
+| `TOKENIZED_DATA_PATH` | Final generated prefix for the whole-corpus flow; also the validation-flow training fallback. |
+| `TOKENIZED_TRAIN_DATA_PATH` / `TOKENIZED_EVAL_DATA_PATH` | Final generated train and eval/test prefixes when the hook creates a held-out split. |
+| `PRIMUS_TOKENIZED_DATA_PATH` | Existing training prefix interpolated by selected Megatron YAMLs; it does not control the hook's generated output. |
+| `PRIMUS_DATA_PREP_TIMEOUT_SECONDS` | Maximum nonzero-rank wait for rank 0 preparation; tokenized paths must use shared storage. |
+| `DATA_PATH` | General data root used in scripts and CI-style launches. |
+| `HF_TOKEN` | **Required** for gated Hugging Face models and some datasets (TorchTitan `prepare.py`, Megatron bookcorpus preparation). |
+| `HF_HOME` | Hugging Face cache directory (used by the Megatron pretrain hook). |
+| `NLTK_DATA` | NLTK tokenizer data directory for sentence splitting in `preprocess_data.py` when `NLTK_DATA` is set. |
+
+---
+
+## Summary
+
+1. Use **mock or synthetic** data to validate configs and performance before investing in large preprocessing jobs.
+2. For **Megatron**, convert JSON/JSONL to `.bin`/`.idx` with `preprocess_data.py` and point `data_path` or split paths at the outputs.
+3. For **TorchTitan**, set `training.dataset` / `dataset_path`; the launcher's TorchTitan pretrain hook fetches the tokenizer assets.
+4. For **MaxText**, configure `dataset_type` and `per_device_batch_size` per upstream `base.yml` and model YAMLs.

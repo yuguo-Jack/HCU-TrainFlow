@@ -1,0 +1,383 @@
+---
+id: doc-amd-agi-primus-53bb02cd178f2c3e90b9
+title: AMD-AGI/Primus / docs/02-user-guide/pretraining.md
+engine: primus
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: AMD-AGI/Primus
+commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+path: docs/02-user-guide/pretraining.md
+raw_sha256: b91a3379d1bcb8cb5b3f8d5f90e57031fef13c15e457f4e71b07a46fe72a3429
+sources: []
+generated_body_sha256: f1744a6ecaf24b19e4a1d2d6572f305953ed4d167e4080d966ecb247720386f2
+source_state: current-scan
+---
+
+# AMD-AGI/Primus / docs/02-user-guide/pretraining.md
+
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/02-user-guide/pretraining.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Pretraining workflows
+
+Primus is a YAML-driven training stack for AMD GPUs. You select a **backend** (Megatron-LM, TorchTitan, JAX MaxText, Megatron Bridge, SpecForge), point `train pretrain` at a **configuration YAML**, and launch Primus with the unified CLI (`runner/primus-cli`) in **direct**, **container**, or **Slurm** mode. See [CLI reference](cli-reference.md) and [Configuration system](configuration-system.md).
+
+This section helps you understand concepts related to the Primus workflow: how backends work, YAML structure and inheritance, parallelism vocabulary, the full per-backend configuration inventory, and so on. If you already understand the concepts and just need the specific commands to run your training with Primus, see [End-to-end training recipes](end-to-end-training-recipes.md).
+
+---
+
+## Overview
+
+The following table describes the backends supported by Primus and their typical uses.
+
+| Backend | Framework | Typical use |
+| --- | --- | --- |
+| Megatron-LM | `framework: megatron` | Large-scale transformer pretraining with Megatron-style parallelism (TP/PP/EP). |
+| TorchTitan | `framework: torchtitan` | PyTorch-native scaled training (FSDP / tensor / pipeline / expert parallelism per config). |
+| MaxText (JAX) | `framework: maxtext` | JAX/MaxText single- and multi-node runs; parallelism via MaxText `ici_*` / `dcn_*` settings. |
+| MaxDiffusion (JAX) | `framework: maxdiffusion` | JAX/MaxDiffusion diffusion pretraining (WAN 2.1, FLUX.1-dev). Source is vendored as the `third_party/maxdiffusion` submodule; deps installed by the `train/pretrain/maxdiffusion` prepare hooks. |
+| Megatron Bridge | `framework: megatron_bridge` | Bridge-oriented workflows (configure like other backends; see parameter reference). |
+| SpecForge | `framework: specforge` | `specforge_mode: capture`, or `train` with required `specforge_train_mode: offline` / `online` (Mooncake + SGLang), on a ROCm SGLang Primus image. YAML / env / CLI: [SpecForge configuration reference](../../examples/specforge/CONFIGURATION.md). |
+
+> Several setup steps apply to **all** backends (mock vs. real data, Hugging Face tokens, scaling to multiple nodes, and HipBLASLt autotuning). After you read the backend section that applies to you, see [Common patterns](#common-patterns) below.
+
+---
+
+## Megatron-LM pretraining
+
+### Quick start (container mode)
+
+From the root of the clone of the [Primus repository](https://github.com/AMD-AGI/Primus), with Docker or Podman available, the following command starts the training in container mode:
+
+```bash
+./runner/primus-cli container -- train pretrain \
+  --config examples/megatron/configs/MI300X/llama2_7B-BF16-pretrain.yaml
+```
+
+This uses the default image from `runner/.primus.yaml` (`rocm/primus:v26.8` unless overridden). The project tree is mounted into the container automatically by `runner/primus-cli-container.sh`.
+
+### Example configurations under `examples/megatron/configs/MI300X/`
+
+The following files ship in the repository (sorted by name). Parallelism columns are taken from `tensor_model_parallel_size` / `pipeline_model_parallel_size` / `expert_model_parallel_size` in each file (literals or `${PRIMUS_TP:…}` defaults).
+
+| Config | TP | PP | EP |
+| --- | --- | --- | --- |
+| `deepseek_v2-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:4}` | `${PRIMUS_EP:8}` |
+| `deepseek_v2-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:4}` | `${PRIMUS_EP:8}` |
+| `deepseek_v2_lite-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `deepseek_v2_lite-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `deepseek_v3-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `deepseek_v3-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `gpt_oss_20B-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `gpt_oss_20B-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `grok1-BF16-pretrain.yaml` | `1` | `4` | `8` |
+| `grok1-FP8-pretrain.yaml` | `1` | `4` | `8` |
+| `grok2-BF16-pretrain.yaml` | `1` | `4` | `8` |
+| `grok2-FP8-pretrain.yaml` | `1` | `4` | `8` |
+| `llama2_13B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama2_13B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama2_70B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama2_70B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama2_7B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama2_7B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.1_405B-BF16-pretrain.yaml` | `8` | `8` | `1` |
+| `llama3.1_405B-FP8-pretrain.yaml` | `8` | `8` | `1` |
+| `llama3.1_70B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.1_70B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.1_8B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.1_8B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.2_1B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.2_1B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.2_3B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.2_3B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.3_70B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3.3_70B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3_70B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3_70B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3_8B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `llama3_8B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `llama4_17B128E-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `llama4_17B128E-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `llama4_17B16E-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `llama4_17B16E-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `mamba_370M-pretrain.yaml` | `1` | `1` | `1` |
+| `mixtral_8x22B_v0.1-BF16-pretrain.yaml` | `1` | `4` | `8` |
+| `mixtral_8x22B_v0.1-FP8-pretrain.yaml` | `1` | `4` | `8` |
+| `mixtral_8x7B_v0.1-BF16-pretrain.yaml` | `1` | `1` | `8` |
+| `mixtral_8x7B_v0.1-FP8-pretrain.yaml` | `1` | `1` | `8` |
+| `qwen2.5_14B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_14B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_32B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_32B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_3B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_3B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_72B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_72B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_7B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen2.5_7B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_14B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_14B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_235B_A22B-BF16-pretrain.yaml` | `1` | `1` | `8` |
+| `qwen3_235B_A22B-FP8-pretrain.yaml` | `1` | `1` | `8` |
+| `qwen3_30B_A3B-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `qwen3_30B_A3B-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `qwen3_32B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_32B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_4B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_4B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_5_35B_A3B-BF16-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `qwen3_5_35B_A3B-FP8-pretrain.yaml` | `${PRIMUS_TP:1}` | `${PRIMUS_PP:1}` | `${PRIMUS_EP:8}` |
+| `qwen3_8B-BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `qwen3_8B-FP8-pretrain.yaml` | `1` | `1` | `1` |
+| `zebra_llama_mamba_1B_BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `zebra_llama_mamba_3B_BF16-pretrain.yaml` | `1` | `1` | `1` |
+| `zebra_llama_mamba_8B_BF16-pretrain.yaml` | `1` | `1` | `1` |
+
+### Sample YAML file (`llama2_7B-BF16-pretrain.yaml`) explained
+
+Path: `examples/megatron/configs/MI300X/llama2_7B-BF16-pretrain.yaml`
+
+| Section | Role |
+| --- | --- |
+| `work_group`, `user_name`, `exp_name`, `workspace` | Run identity and output root (supports `${VAR:default}` substitution). |
+| `modules.pre_trainer.framework` | `megatron` selects Megatron-LM integration. |
+| `config: pre_trainer.yaml` | Module preset under `primus/configs/modules/megatron/`. |
+| `model: llama2_7B.yaml` | Model preset under `primus/configs/models/megatron/` (extends `llama2_base.yaml` → …). |
+| `overrides` | Run-specific training knobs: iterations, batching, LR, **parallelism** (`tensor_model_parallel_size`, `pipeline_model_parallel_size`, `expert_model_parallel_size`), data paths, checkpoints, Primus Turbo flags, etc. |
+
+The sample sets `mock_data: true` and `train_data_path: null` so you can validate the stack without real corpora.
+
+### Mock data versus real data
+
+- **Mock data:** Set `mock_data: true` and leave `train_data_path` / `valid_data_path` empty (as in `llama2_7B-BF16-pretrain.yaml`).
+- **Real data:** Set `mock_data: false` and populate Megatron-compatible data paths (and tokenizer assets) in `overrides`. Use paths visible inside your container mounts.
+
+### Multi-node training with Slurm
+
+```bash
+./runner/primus-cli slurm srun -N 4 -p <partition> -- train pretrain \
+  --config examples/megatron/configs/MI300X/llama2_7B-BF16-pretrain.yaml
+```
+
+`runner/primus-cli-slurm-entry.sh` derives `MASTER_ADDR`, `NNODES`, and `NODE_RANK` from Slurm and forwards them into the container. Align `tensor_model_parallel_size`, `pipeline_model_parallel_size`, and `expert_model_parallel_size` with your cluster width and job size.
+
+---
+
+## TorchTitan pretraining
+
+### Quick start
+
+```bash
+./runner/primus-cli container -- train pretrain \
+  --config examples/torchtitan/configs/MI300X/llama3.1_8B-BF16-pretrain.yaml
+```
+
+### Example configurations under `examples/torchtitan/configs/MI300X/`
+
+| File |
+| --- |
+| `deepseek_v3_16b-BF16-pretrain.yaml` |
+| `deepseek_v3_16b-FP8-pretrain.yaml` |
+| `deepseek_v3_236b-BF16-pretrain.yaml` |
+| `deepseek_v3_236b-FP8-pretrain.yaml` |
+| `deepseek_v3_671b-pretrain.yaml` |
+| `llama3.1_405B-BF16-pretrain.yaml` |
+| `llama3.1_405B-FP8-pretrain.yaml` |
+| `llama3.1_70B-BF16-pretrain.yaml` |
+| `llama3.1_70B-FP8-pretrain.yaml` |
+| `llama3.1_8B-BF16-pretrain.yaml` |
+| `llama3.1_8B-FP8-pretrain.yaml` |
+| `llama4_17Bx128E-BF16-pretrain.yaml` |
+| `llama4_17Bx128E-FP8-pretrain.yaml` |
+| `llama4_17Bx16E-BF16-pretrain.yaml` |
+| `llama4_17Bx16E-FP8-pretrain.yaml` |
+| `qwen3_0.6B-pretrain.yaml` |
+| `qwen3_1.7B-pretrain.yaml` |
+| `qwen3_14B-pretrain.yaml` |
+| `qwen3_32B-pretrain.yaml` |
+| `qwen3_4B-pretrain.yaml` |
+| `qwen3_8B-pretrain.yaml` |
+
+### Sample YAML file (`llama3.1_8B-BF16-pretrain.yaml`) explained
+
+Path: `examples/torchtitan/configs/MI300X/llama3.1_8B-BF16-pretrain.yaml`
+
+| Section | Role |
+| --- | --- |
+| `framework: torchtitan` | Selects the TorchTitan integration. |
+| `config: pre_trainer.yaml` | Module preset under `primus/configs/modules/torchtitan/`. |
+| `model: llama3.1_8B.yaml` | Model preset under `primus/configs/models/torchtitan/`. |
+| `overrides.training`, `lr_scheduler`, `activation_checkpoint`, `primus_turbo` | Run-specific batching, steps, checkpointing, and Turbo options. |
+
+Some configurations omit an explicit `parallelism:` block; in that case the default values come from the **module and model presets** (`primus/configs/modules/torchtitan/pre_trainer.yaml` and the chosen model YAML). Other examples (for example DeepSeek and Qwen) set `parallelism:` inline with `tensor_parallel_degree`, `pipeline_parallel_degree`, `expert_parallel_degree`, etc.
+
+---
+
+## MaxText (JAX) pretraining
+
+### Quick start
+
+```bash
+./runner/primus-cli container -- train pretrain \
+  --config examples/maxtext/configs/MI300X/llama2_7B-bf16-pretrain.yaml
+```
+
+### JAX-specific requirements
+
+Install JAX/MaxText dependencies from the repository root:
+
+```bash
+pip install -r requirements-jax.txt
+```
+
+### Example configurations under `examples/maxtext/configs/MI300X/`
+
+| File | Key parallelism (`ici_*` intra-node, `dcn_*` inter-node) |
+| --- | --- |
+| `deepseek_v2_16B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 1`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `grok1-nanoo_fp8-pretrain.yaml` | `ici_fsdp_parallelism: 1`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `llama2_70B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 8`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `llama2_7B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 8`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `llama3.3_70B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 8`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `llama3_70B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 8`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `llama3_8B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 8`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `mixtral_8x7B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 1`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `qwen3_14B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 8`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+| `qwen3_30B_A3B-bf16-pretrain.yaml` | `ici_fsdp_parallelism: 1`, `ici_data_parallelism: 1`, `dcn_fsdp_parallelism: 1`, `dcn_data_parallelism: -1` |
+
+The `llama2_7B-bf16-pretrain.yaml` example also sets `dataset_type: "synthetic"` and `hf_access_token: ${HF_TOKEN:""}` for gated Hugging Face assets when you switch to real data.
+
+> **fp8 MoE (v26.6):** fp8 Mixture-of-Experts configs must set `pure_nnx_decoder: false` in their overrides; otherwise they crash at step 1 under the v26.6 pure-NNX decoder default. See [MaxText parameters → Precision and quantization](../03-configuration-reference/maxtext-parameters.md#7-precision-and-quantization). Dense fp8 and bf16 configs are unaffected.
+
+---
+
+## MaxDiffusion (JAX) pretraining
+
+The MaxDiffusion backend runs JAX diffusion pretraining (WAN 2.1, FLUX.1-dev). `primus-cli` sets up the environment through the `train/pretrain/maxdiffusion` prepare hooks, the same way it does for MaxText, Megatron and TorchTitan:
+
+- **Source** is vendored as the `third_party/maxdiffusion` submodule. `prepare.py` passes it to the adapter as `--backend_path` (override with `MAXDIFFUSION_PATH`); when no checkout exists, the adapter falls back to the `maxdiffusion` package already installed in the image.
+- **Dependencies** live in `requirements-maxdiffusion.txt` (kept separate from `requirements-jax.txt` so the MaxDiffusion pins never affect MaxText runs). `00_install_requirements.sh` installs them, installs torch/torchvision from the ROCm wheel source that matches the image when torch is missing, and applies two idempotent site-package fixes (Flax-T5 clip rename and the TransformerEngine empty context-parallel-axis fix).
+- **Runtime patches** (Shardy partitioner, TensorFlow preload before TransformerEngine) are applied in-process from `primus/backends/maxdiffusion/patches/`, so the vendored checkout is never edited.
+
+Set `PRIMUS_SKIP_PIP=1` to skip the dependency install on images that already ship the stack (e.g. the MAD `primus_maxdiffusion` image).
+
+### Prerequisites
+
+Initialize the vendored submodule (a plain clone will not populate it):
+
+```bash
+git submodule update --init third_party/maxdiffusion
+```
+
+Run on a JAX base image (for example `rocm/jax-training`) or a bare-metal JAX environment, and export `HF_TOKEN` for gated Hugging Face assets.
+
+### Quick start (run from a bare Primus checkout)
+
+Use `primus-cli direct` with `BACKEND=MaxDiffusion`. When `PRIMUS_SKIP_PIP` is unset, the prepare hooks install the dependencies for you, resolve the MaxDiffusion checkout and set `NVTE_FRAMEWORK=jax`, then launch:
+
+```bash
+BACKEND=MaxDiffusion ./primus-cli direct -- train pretrain \
+  --config examples/maxdiffusion/configs/MI355X/wan2.1_1.3b-pretrain.yaml
+```
+
+To run the dependency install once by itself (e.g. to warm an image or a shared venv), invoke the hook directly, then launch with `PRIMUS_SKIP_PIP=1`:
+
+```bash
+bash runner/helpers/hooks/train/pretrain/maxdiffusion/00_install_requirements.sh
+PRIMUS_SKIP_PIP=1 BACKEND=MaxDiffusion ./primus-cli direct -- train pretrain \
+  --config examples/maxdiffusion/configs/MI355X/flux_dev-pretrain.yaml
+```
+
+### Quick start (container mode)
+
+`primus-cli` bootstraps the same environment: the `train/pretrain/maxdiffusion` prepare hooks install the dependencies before training and select the plain-python launcher (JAX drives every GPU from one process, so `torchrun` is never used).
+
+```bash
+./primus-cli container -- train pretrain \
+  --config examples/maxdiffusion/configs/MI300X/wan2.1_1.3b-pretrain.yaml --max_train_steps 10
+```
+
+> Container launches start from a clean image each time, so the setup runs on every launch. Wheels are cached under `$DATA_PATH/pip_cache` inside the mounted checkout, so only the first run pays for downloads. Set `PRIMUS_SKIP_PIP=1` to skip the step entirely on images that already ship the stack.
+
+> Step counts use `--max_train_steps` (the MaxDiffusion field name). `--steps` belongs to MaxText and is silently ignored here.
+
+### Example configurations under `examples/maxdiffusion/configs/MI355X/`
+
+| File | Model | Status on MI355X (gfx950) |
+| --- | --- | --- |
+| `flux_dev-pretrain.yaml` | FLUX.1-dev | ✅ validated |
+| `wan2.1_1.3b-pretrain.yaml` | WAN 2.1 1.3B | ✅ validated |
+| `wan2.1_14b-pretrain.yaml` | WAN 2.1 14B | ✅ validated (requires `RCCL_WARP_SPEED_AUTO=0`, set in config) |
+
+---
+
+## Common patterns
+
+### Testing with mock data
+
+Set `mock_data: true` (Megatron/TorchTitan) or synthetic dataset settings (MaxText) to validate the configurations and infrastructure without I/O-heavy datasets.
+
+### Real training data
+
+- Megatron: Configure `train_data_path` / `valid_data_path` and tokenizer assets in `overrides` once `mock_data` is false.
+- For **all backends**, ensure host paths are mounted in **container** mode (`--volume` or `container.options.volume` in YAML).
+- TorchTitan/MaxText: Follow backend-specific dataset fields in the `overrides` and presets.
+
+### Scaling from single-node to multi-node
+
+- Use **Slurm** mode for allocation; keep the **container** entry if you want the same image on every node.
+- Set environment variables consistently (`NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT`, `GPUS_PER_NODE`); the Slurm entry script injects them when using `primus-cli slurm`.
+- Increase values in the parallelism fields (Megatron TP/PP/EP; TorchTitan `parallelism`; MaxText `ici_*` / `dcn_*`) to match topology.
+
+### Hugging Face token for gated models
+
+Export `HF_TOKEN` on the host before launching **container** mode; `runner/.primus.yaml` lists `HF_TOKEN` under `container.options.env` so it can be forwarded into the container. MaxText configurations may reference `${HF_TOKEN:""}` directly.
+
+### hipBLASLt autotuning (three stages)
+
+Controlled with `PRIMUS_HIPBLASLT_TUNING_STAGE` (see `examples/README.md`):
+
+| Stage | Purpose |
+| --- | --- |
+| 1 | Dump GEMM shapes seen during training (reduce `train_iters` for faster collection). |
+| 2 | Tune kernels from dumped shapes (offline tooling under `examples/megatron/guides/offline_tune`). |
+| 3 | Train using tuned kernel artifacts from `./output/tune_hipblaslt/...`. |
+
+Example (from in-repo docs):
+
+```bash
+export PRIMUS_HIPBLASLT_TUNING=1        # master switch (required; tuning is skipped without it)
+export PRIMUS_HIPBLASLT_TUNING_STAGE=1
+./runner/primus-cli direct -- train pretrain \
+  --config examples/megatron/configs/MI300X/llama2_7B-BF16-pretrain.yaml
+```
+
+---
+
+## Supported models
+
+The tables above in the Megatron, TorchTitan, and MaxText sections are curated MI300X examples from the [Primus repository](https://github.com/AMD-AGI/Primus). Use `examples/<backend>/configs/` in the repository as the authoritative inventory, as new presets and hardware-specific examples may be added there before this document is updated to reflect their additions.
+
+| Backend | Example region | Parallelism vocabulary |
+| --- | --- | --- |
+| Megatron-LM | `examples/megatron/configs/MI300X/` | `tensor_model_parallel_size`, `pipeline_model_parallel_size`, `expert_model_parallel_size` (and env-driven `${PRIMUS_TP:…}` variants). |
+| TorchTitan | `examples/torchtitan/configs/MI300X/` | `parallelism.*` (e.g. `tensor_parallel_degree`, `pipeline_parallel_degree`, `expert_parallel_degree`, FSDP shard settings). |
+| MaxText | `examples/maxtext/configs/MI300X/` | `ici_fsdp_parallelism`, `ici_data_parallelism`, `dcn_fsdp_parallelism`, `dcn_data_parallelism`. |
+
+`./runner/primus-cli` is the only entry point. The packaged launchers under `examples/megatron/guides/customer_package/` and `examples/megatron/guides/moe_package/` reach it through the shared helper `runner/helpers/launch/slurm_pretrain.sh`, which translates their `EXP` / `NNODES` / `DATA_PATH` environment contract into a `primus-cli slurm` invocation; call the CLI directly as shown above.
+
+---
+
+## Related documentation
+
+- [CLI reference](cli-reference.md): launcher usage
+- [Configuration system](configuration-system.md): YAML merge rules
+- Backend parameter references: [Megatron parameters](../03-configuration-reference/megatron-parameters.md), [TorchTitan parameters](../03-configuration-reference/torchtitan-parameters.md), [MaxText parameters](../03-configuration-reference/maxtext-parameters.md)

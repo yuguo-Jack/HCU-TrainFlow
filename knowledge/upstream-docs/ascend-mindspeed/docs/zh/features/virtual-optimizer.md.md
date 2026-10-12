@@ -1,0 +1,134 @@
+---
+id: doc-ascend-mindspeed-607cb41fca61797729fb
+title: Ascend/MindSpeed / docs/zh/features/virtual-optimizer.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/virtual-optimizer.md
+raw_sha256: 631698079018f2b58eac35db6826efc851d32bed86cae8babbaab2e6a0acd1fb
+sources: []
+generated_body_sha256: 1c0bae5ee1921ab839bbaa203b94257026db0e10a4faca364a6e584e96ea66c9
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/virtual-optimizer.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/virtual-optimizer.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# virtual-optimizer
+
+## 背景与挑战
+
+在大集群训练中，PP的增大会对前几个stage造成较大的显存压力。同时我们观察到，在增大梯度累积的情况下，优化器部分的一二阶动量显存swap的开销可忽略不计，因此可通过将优化器部分的显存swap到cpu上来节省整网显存，而当前分布式优化器逻辑复杂，并且与各种通信并行（如overlap-grad-reduce/overlap-param-gather等）相互耦合，因此实现一套Swap优化器显存的系统较为复杂。
+
+## 解决方案
+
+为避免引入复杂的Swap系统工程，和多流带来的额外显存与性能开销，借助昇腾驱动的虚拟内存原生能力，可以实现申请一个实际内存在Host侧，但内存地址可被映射在device上的张量，并且该张量可参与绝大多数NPU算子计算（除涉及随路计算的算子），基于此我们可以通过修改一行代码来实现优化器动量的Swap功能：
+
+```python
+
+# before
+state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+# after
+state['exp_avg'] = torch_npu.empty_with_swapped_memory(p.size(), device=p.device)
+state['exp_avg_sq'] = torch_npu.empty_with_swapped_memory(p.size(), device=p.device)
+```
+
+**与单纯swap对比**
+
+下图为图示对比说明：
+
+![virtual-optimizer](../figures/virtual-optimizer.png)
+
+**优势分析**
+
+- 虚拟内存能够节省两次UB与HBM的搬运时长，直接从硬件执行访问。
+- 基于虚拟内存的搬运可以利用算子本身的流水机制（MTE2/MTE3/Vector），与计算产生指令级的并行掩盖，避免引入额外的流同步性能与内存的开销（如Swap引入的多流）。
+
+**劣势说明**
+
+申请的Host虚拟内存无法实现随路计算（没有硬件随路计算单元）
+
+## 使用方法
+
+当需要对优化器部分的显存进行Swap时，有以下几种情况：
+
+- 希望Swap掉所有的一二阶动量，则可以采用`--virtual-optimizer all`指定。
+- 希望每一个PP Stage Swap同样大小的显存（希望每个Stage swap掉2GB的显存），则可以采用`--virtual-optimizer 2.0`指定。
+- 希望每一个PP Stage Swap不同的显存（假设有四个PP Stage，分别希望Swap掉6、5、4、3GB的显存），则可以采用`--virtual-optimizer 6 5 4 3`指定。
+
+推荐配置
+
+```bash
+export CPU_AFFINITY_CONF=1,lazy_bind:0
+```
+
+此配置启用粗粒度绑核模式，将任务绑定至NPU对应的NUMA CPU核心，可有效避免跨NUMA内存访问，减少调度开销，从而提升计算稳定性与性能。
+
+> [!NOTE]
+>
+> 由于驱动限制，申请为虚拟内存的张量无法被直接访问，因此也无法直接打印和保存，当需要保存或打印时可以借助如下函数访问虚拟内存的张量。当前优化器部分的保存与加载已经适配。
+
+```python
+def swap_tensor_copy_wrapper(func):
+    def wrapped(*args, **kwargs):
+        dst, src = args[0], args[1]
+        dst_swap, src_swap = is_swap_tensor(dst), is_swap_tensor(src)
+        if dst_swap or src_swap:
+            if dst.device == src.device:
+                dst.fill_(1).mul_(src)
+            elif dst_swap:
+                src_npu = src.to(dst.device)
+                dst.fill_(1).mul_(src_npu)
+            elif src_swap:
+                src_npu = torch.ones_like(src).mul(src)
+                dst.copy_(src_npu)
+            else:
+                raise TypeError
+        else:
+            func(*args, **kwargs) # copy_
+    return wrapped
+
+
+def swap_tensor_func_wrapper(org_func, func_type):
+    def wrapped(*args, **kwargs):
+        if is_swap_tensor(args[0]):
+            if func_type == "detach":
+                detach = org_func(*args, **kwargs)
+                setattr(detach, "swap_tensor", True)
+                setattr(detach.data, "swap_tensor", True)
+                return detach
+            src = torch.empty_like(args[0])
+            src.copy_(args[0])
+            if func_type == "cpu":
+                return src.cpu()
+            elif func_type == "npu" or func_type == "clone":
+                return src
+            else:
+                raise ValueError(f"func_type {func_type} not supported")
+        else:
+            return org_func(*args, **kwargs)
+    return wrapped
+
+p = torch.randn(100).npu()
+exp_avg_swap = torch_npu.empty_with_swapped_memory(p.size(), device=p.device)
+setattr(exp_avg_swap, "swap_tensor", True)
+
+torch.Tensor.copy_ = swap_tensor_copy_wrapper(torch.Tensor.copy_)
+torch.Tensor.cpu = swap_tensor_func_wrapper(torch.Tensor.cpu, "cpu")
+exp_avg_cpu = exp_avg_swap.cpu()
+print(f"exp_avg_cpu: {exp_avg_cpu}")
+```

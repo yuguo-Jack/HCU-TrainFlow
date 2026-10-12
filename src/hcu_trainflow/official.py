@@ -551,7 +551,12 @@ def update_source(store, project, source_id, token=None, max_prs=10, max_documen
     steps=([('inventory',lambda:inventory(store,project,source_id,token,True)),
             ('documents',lambda:sync_documents(store,project,source_id,token,max_documents)),
             ('prs',lambda:sync_prs(store,project,source_id,token,max_prs,since))] if source.get('kind')!='web' else [])
-    steps.append(('content',lambda:wiki.refresh_source(store,project,source_id,token)))
+    def refresh_content():
+        inventory_commit = result['stages'].get('inventory', {}).get('commit')
+        if inventory_commit:
+            return wiki.refresh_source(store,project,source_id,token,fixed_commit=inventory_commit)
+        return wiki.refresh_source(store,project,source_id,token)
+    steps.append(('content',refresh_content))
     steps.append(('catalog',lambda:catalog(project)))
     for name,action in steps:
         if name=='documents' and 'inventory' not in result['stages']:

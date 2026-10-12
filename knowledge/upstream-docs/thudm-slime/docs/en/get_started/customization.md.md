@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: docs/en/get_started/customization.md
-raw_sha256: 64b545f3f62ac75b12797b638f44c05c7ef039542e6bb4f60b631ff9c4e3ff4c
+raw_sha256: 06522ba42c2949b9c223113ffa3f1c4276760ba680fb25422111d5f69ccc805e
 sources: []
-generated_body_sha256: 56c8c6ecfc374adf601c026a17a3345ebe7eecd1a2dd87540d8ec9a5e5c892ee
+generated_body_sha256: f61130c20614e5f4b6e97008bd4afebf138c60efc1197aec698318c65a143bf9
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/get_started/customization.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/get_started/customization.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/get_started/customization.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -171,6 +171,7 @@ async def custom_generate(args, sample: Sample, sampling_params: dict) -> list[S
         s.response = segment.response
         s.response_length = segment.response_length
         s.loss_mask = segment.loss_mask
+        s.rollout_log_probs = segment.rollout_log_probs
         s.reward = segment.reward
         s.status = Sample.Status.COMPLETED
         s.rollout_id = rollout_id
@@ -178,7 +179,7 @@ async def custom_generate(args, sample: Sample, sampling_params: dict) -> list[S
     return samples
 ```
 
-If one full trajectory has a single total reward but is split into `K` training segments, a common pattern is to distribute that reward across the segments, for example by assigning `reward / K` to each segment, so the same rollout reward is not amplified.
+If one full trajectory has a single outcome reward, assign that same reward to every segment and preserve the original `group_index`. GRPO computes prompt-group statistics over distinct `rollout_id` values and copies each rollout's advantage to its segments. The loss reducer already averages over all unmasked tokens in the rollout, including across microbatches, so dividing the reward by the segment count would underweight trajectories with more segments. Shared generated prefixes must contribute loss only once.
 
 **Example**: See [examples/search-r1/generate_with_search.py](../../../examples/search-r1/generate_with_search.py) and [examples/multi_agent/rollout_with_multi_agents.py](../../../examples/multi_agent/rollout_with_multi_agents.py)
 

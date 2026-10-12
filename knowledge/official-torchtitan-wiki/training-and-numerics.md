@@ -15,37 +15,36 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/trainer.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e7a7162304a1741cfa86ef7969d7619f985f2263f9aace617bdc6955185c41f4
 - source: pytorch-torchtitan
   path: torchtitan/training_engine.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 9c6293218d8c0a6ea50e3e1ac060d8a78b6df8eae4156009f7868016f7b6cdfd
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/optim.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 64d864818e84d702cc4e517773cf153f2c4e74356d36987e40ae7a397b44845c
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/optimizer.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 8ab40fd78a9f1c8509db8bd71b418bd2aeba3a57ba0666f5ec4de89e4aee8f4b
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/BF16_OPTIMIZER_STATES.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 4f0d88ff7b4b6149e86988f451b2698b6446ebf57b22fcb27f45d4ef671ac549
 - source: pytorch-torchtitan
   path: torchtitan/distributed/fsdp.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 572effd3ae6d6d0e65c436cac17fbeecbd0927a1c41eaa166bb98884da0b6377
 - source: pytorch-torchtitan
   path: torchtitan/rl/BITWISE_PARITY.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e2d8599828473b3abd1f7beb8db39606d27870602bbcc21279c072175dac0144
 pr_sources:
 - pr-pytorch--torchtitan-5250
 - pr-pytorch--torchtitan-5137
 ---
-
 # TorchTitan 训练循环、有效 token、优化器与数值诊断
 
 ## 调用链与职责
@@ -96,13 +95,13 @@ BF16 optimizer states 将 Adam/AdamW moment 与模型计算精度解耦：参数
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/trainer.py)
-- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/training_engine.py)
-- [torchtitan/components/optim/optim.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/optim/optim.py)
-- [torchtitan/components/optim/optimizer.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/optim/optimizer.py)
-- [torchtitan/components/optim/BF16_OPTIMIZER_STATES.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/optim/BF16_OPTIMIZER_STATES.md)
-- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/fsdp.py)
-- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/BITWISE_PARITY.md)
+- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/trainer.py)
+- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/training_engine.py)
+- [torchtitan/components/optim/optim.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/optim.py)
+- [torchtitan/components/optim/optimizer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/optimizer.py)
+- [torchtitan/components/optim/BF16_OPTIMIZER_STATES.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/BF16_OPTIMIZER_STATES.md)
+- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/fsdp.py)
+- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/BITWISE_PARITY.md)
 
 - [PR #5250：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5250.md)
 - [PR #5137：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5137.md)

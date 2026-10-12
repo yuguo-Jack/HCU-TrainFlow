@@ -1,0 +1,72 @@
+---
+id: doc-ascend-mindspeed-2ce9bb370b05da6e541e
+title: Ascend/MindSpeed / docs/zh/user-guide/verl.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/user-guide/verl.md
+raw_sha256: c4e07015c5ef7b0b10e6edb9b13eca2711951194451b728f7700eaace8d82a38
+sources: []
+generated_body_sha256: 579ae487dfe2060fff1db4fa83f5b244d5e2c34db6f3d0118142167e8af7cbd5
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/user-guide/verl.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/user-guide/verl.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Verl 使用 MindSpeed 训练后端
+
+## 环境准备
+
+### 1. MindSpeed 安装
+
+按照 MindSpeed 文档，安装对应依赖。
+> 参见[MindSpeed安装指导](install_guide.md)
+
+### 2. Verl 安装
+
+按照 Verl 文档，安装对应依赖：
+> 参见[verl安装指导](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/zh/get_start/quick_start.rst)
+> 注：若使用的CANN版本高于8.3.RC1，vllm和vllm-ascend安装版本须大于等于0.9.1，0.9.1版本vllm安装可参考：<https://docs.vllm.ai/projects/vllm-ascend-cn/zh-cn/latest/installation.html>
+
+## 使能 MindSpeed 后端
+
+确认模型对应的 `strategy` 配置为 `megatron`，例如 `actor_rollout_ref.actor.strategy=megatron`，可以在 shell 脚本中或者 config 配置文档中设置。
+
+MindSpeed 自定义入参可通过 `override_transformer_config` 参数传入，例如对 `actor` 模型开启 FA 特性可使用 `+actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True`。
+
+## 特性支持列表
+
+| 特性名称     | 配置参数                                                     | 状态    |
+| ------------ | ------------------------------------------------------------ | ------- |
+| FA（必须开） | +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True | Preview |
+| TP           | actor_rollout_ref.actor.megatron.tensor_model_parallel_size  | Preview |
+| PP           | actor_rollout_ref.actor.megatron.pipeline_model_parallel_size | Preview |
+| EP           | actor_rollout_ref.actor.megatron.expert_model_parallel_size  | Preview |
+| ETP          | actor_rollout_ref.actor.megatron.expert_tensor_parallel_size | Preview |
+| SP           | actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel | Preview |
+| 分布式优化器 | actor_rollout_ref.actor.megatron.override_transformer_config.use_distributed_optimizer | Preview |
+| 重计算       | actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method<br>actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity<br>actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers | Preview |
+| CP           | actor_rollout_ref.actor.megatron.context_parallel_size<br>actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size | Preview |
+| mbridge           | actor_rollout_ref.actor.megatron.use_mbridge | Preview |
+| RoPE融合优化           | +actor_rollout_ref.actor.megatron.override_transformer_config.position_embedding_type=rope<br>+actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rotary_pos_emb=True | Preview |
+| SwiGLU融合优化   | +actor_rollout_ref.actor.megatron.override_transformer_config.swiglu=True<br>+actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_swiglu=True | Preview |
+| RMSNorm融合优化  | +actor_rollout_ref.actor.megatron.override_transformer_config.normalization=RMSNorm<br>+actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rmsnorm=True | Preview |
+| MoE Grouped GEMM  | +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True | Preview |
+| MoE Token Permute and Unpermute 融合优化  | +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_moe_token_permute_and_unpermute=True | Preview |
+
+其中，mbridge暂不支持同时开启VPP；同理VPP请在未开启mbridge时使用。
+
+注："Preview"状态表示预览非正式发布版本，"Released"状态表示正式发布版本，"Dev"状态表示正在开发中。

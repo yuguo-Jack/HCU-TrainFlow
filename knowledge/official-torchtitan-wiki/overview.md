@@ -15,34 +15,33 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: dd4941f16439ed538500a40fe13f02f49d87c51c7a7a419289bee3e3d3e3d9bb
 - source: pytorch-torchtitan
   path: RELEASE.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 8388a4b6b862d114c98eb7887ddf1700c9408c5e13991b62e2868a2be5add126
 - source: pytorch-torchtitan
   path: pyproject.toml
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 0341afacb518276f192c2c8a836c32426e80856bf8c5f0ff194c3028c221520d
 - source: pytorch-torchtitan
   path: torchtitan/train.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: ccdc21c169ecd6e16133a06ee17c9cce8587389c1b06b60bac798ef5571efb3b
 - source: pytorch-torchtitan
   path: torchtitan/trainer.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e7a7162304a1741cfa86ef7969d7619f985f2263f9aace617bdc6955185c41f4
 - source: pytorch-torchtitan
   path: torchtitan/training_engine.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 9c6293218d8c0a6ea50e3e1ac060d8a78b6df8eae4156009f7868016f7b6cdfd
 - source: pytorch-torchtitan
   path: torchtitan/rl/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
-  sha256: ccb29a904363f34a929b2cc28ca4ee423f638352f70ac4202f34f1c06e579d0a
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: d0cced32ef4222b2473689607eadcb749cbb4650e6da9da27df32353842908e6
 ---
-
 # TorchTitan 官方工程：定位、能力边界与阅读路线
 
 ## 在 TrainFlow 中的定位
@@ -85,10 +84,14 @@ TorchTitan 是 PyTorch 原生训练工程，围绕 DTensor、DeviceMesh、FSDP2 
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/README.md)
-- [RELEASE.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/RELEASE.md)
-- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/pyproject.toml)
-- [torchtitan/train.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/train.py)
-- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/trainer.py)
-- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/training_engine.py)
-- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/README.md)
+- [README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/README.md)
+- [RELEASE.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/RELEASE.md)
+- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/pyproject.toml)
+- [torchtitan/train.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/train.py)
+- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/trainer.py)
+- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/training_engine.py)
+- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/README.md)
+
+## 本轮机制更新入口
+
+[并行与显存](parallelism-and-memory.md)补充 EMA pinned CPU 初始化；[MoE 与低精度](moe-and-low-precision.md)补充全局 batch 辅助 loss 计数语义；[TitanRL](titanrl.md)补充单请求失败、会话路由释放与 engine loop 故障边界。实际配置、模型 loss 与生成权重版本仍按同一上下文验收。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: docs/en/advanced/low-precision.md
-raw_sha256: 14944bbcc53a9a8de3fadc4c2c629b382146d134de091f8546a397b473f7b31b
+raw_sha256: dfa5b830983f2425e95cc1cc03cccb8f743e2c2311841a2233d74fde64aa56aa
 sources: []
-generated_body_sha256: c38465f20922a601a6166112f2318b62ca4e6c588b0618c6ac037860fc35ea87
+generated_body_sha256: 101ccea183549c29ac1c396dff0e86c0df3415ad434474687cebfbccca654828
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/low-precision.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/low-precision.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/advanced/low-precision.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -39,7 +39,7 @@ Megatron keeps the trainable checkpoint in BF16/torch_dist format. SGLang serves
 | Feature | Status | Recommended Use |
 |---|---|---|
 | BF16 training + FP8 rollout/inference | Stable | Default path for large MoE RL recipes. Keeps training stable while reducing rollout memory and bandwidth. |
-| FP8 KV cache in SGLang rollout | Stable when supported by your SGLang version/GPU stack | Increase KV cache capacity for long-context or agentic rollout by passing `--sglang-kv-cache-dtype fp8_e4m3`. |
+| FP8 attention KV cache in SGLang rollout | Requires model, attention backend and GPU support | Increase attention KV capacity with `--sglang-kv-cache-dtype fp8_e4m3`; hybrid recurrent state is configured separately. |
 | INT4 rollout / INT4 QAT | Beta | Use when rollout memory/throughput pressure is high and the model path has been validated. |
 | FP8 training + FP8 rollout | Experimental | Useful for research on training/inference mismatch and throughput, but still has optimizer and checkpointing caveats. |
 
@@ -78,6 +78,8 @@ For long-context, multi-turn, or agentic workloads, KV cache capacity is often t
 ```
 
 This is a rollout-side setting. It does not change Megatron training precision; it increases effective SGLang KV cache capacity and can allow longer contexts or higher concurrency, subject to the accuracy/performance behavior of your SGLang version and GPU stack.
+
+For hybrid models such as Qwen3.8-27B and GLM-5.3-Flash, this flag applies only to attention-layer KV. Linear-attention recurrent state uses `--sglang-mamba-ssm-dtype`, while `--sglang-mamba-full-memory-ratio` controls the state-pool / attention-KV-pool memory ratio. FP8 KV does not imply FP8 recurrent or convolution state. The builder leaves these overrides unset by default, and offers FP32/BF16 recurrent state for Qwen3.8-27B. See [hybrid cache settings, architecture sources and memory derivation](rl-systems.md#hybrid-cache).
 
 ## FP8 Training with FP8 Rollout
 

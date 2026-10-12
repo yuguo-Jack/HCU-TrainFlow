@@ -1,0 +1,250 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "814301b26800a9d22a7d967a161aa07da4cbb5f2",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nOpt-in `--screened-lm-head`: when sampling only reads the top-k logits (greedy, or temperature with top-k <= 32 and optional top-p, e.g. Qwen's default `temperature=1.0, top_k=20, top_p=0.95`), compute them from an FP8 screen of the lm_head plus exact logits for the few rows the screen cannot rule out. Same tokens for the same seed, about half the lm_head bytes. Qwen3.8-Flash-Next on DGX Spark: +7.7% decode greedy, +6.2% at Qwen's default sampling (c=1, no speculative decoding).\n\n- An FP8 copy of the lm_head scores every row, with a rigorous per-row error bound (FP8 error plus fp32 accumulation error of both GEMMs, computed in fp64 at load).\n- A row more than one output ulp below the k-th best lower bound can neither enter nor tie the full head's top k. The rest (greedy: 15 rows per token on Flash-Next, top-20: about 1,200) get exact BF16 logits, the others `-inf`.\n- Three Triton kernels, no host sync. Other batches (logprobs, penalties, logit bias, min-p, structured outputs, top-k > 32) use the full head. Unsupported setups (quantized or TP-sharded lm_head, LoRA, custom samplers, `VLLM_BATCH_INVARIANT`, pre-SM89) raise at load.\n\n**Scope:** the gain needs the lm_head to be a large share of the step (DGX Spark, Jetson Thor, RTX). On GB200/GB300 it is neutral to slightly negative, so it is opt-in.\n\n## Results\n\nFlash-Next NVFP4, SPEED-Bench (11 domains, 352 prompts, 256 tokens), same-node stock/screened pairs, both arm orders:\n\n```\nGPU     sampling          config         c=1             c=4             GSM8K stock / ours\nGB10    greedy            plain decode   +8.0% / +7.4%   +5.9% / +5.8%   98.5 / 98.5\nGB10    greedy            MTP k=3        +3.9% / +3.1%   +2.9% / +2.4%   98.0 / 98.5\nGB10    T=1, k=20, p=.95  plain decode   +6.7% / +5.7%   +4.4% / +3.9%   98.0 / 97.0\nGB10    T=1, k=20, p=.95  MTP k=3        +3.1% / +1.9%   +3.9% / +2.3%   97.5 / 98.5\nGB200   greedy            plain decode   -0.4% / -2.0%   +0.4% / +0.8%   98.5 / 97.5\nGB200   greedy            MTP k=3        +1.3% / -0.8%   +0.4% / -3.2%   98.0 / 98.0\nGB300   greedy            plain decode   -1.6% / -1.5%   -1.2% / -3.0%   98.5 / 97.5\nGB300   greedy            MTP k=3        -0.7% / +0.6%   -2.7% / +1.0%   98.5 / 98.5\n```\n\nlm_head alone on GB10 (248320 x 2560, CUDA graphs): full BF16 5.4 to 7.3 ms; screened -62% at 1 token, -46% (greedy) / -43% (top-20) at 16 to 28 tokens. On GB200 the screen reaches 3.6 TB/s against 7.1 TB/s for the BF16 GEMM.\n\nExactness (both heads on the same hidden states):\n- Offline, 10,572 real Flash-Next rows at batch widths 1 to 64 plus 1,024 adversarial near-ties: 0 argmax mismatches; for top-20, 0 true top-20 rows screened out.\n- Live, 1.36M greedy and 353k sampled rows: 0 true top-k rows screened out. 12 greedy argmax flips, all sub-ulp ties on a BF16 rounding midpoint where the screened value was the correctly rounded one.\n- Kept logits differ from cuBLAS in 0.047% of entries, 99% of those by one BF16 ulp (summation order), as with any GEMM change.\n- `pytest tests/v1/worker/test_gpu_screened_head.py`: 21 passed on GB10 and GB200.\n\n<details><summary>Commands</summary>\n\n```bash\nVLLM_USE_V2_MODEL_RUNNER=1 vllm serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \\\n  --trust-remote-code --quantization modelopt_mixed --dtype bfloat16 --kv-cache-dtype fp8 \\\n  --engram-config '{\"cpu_offload\":false}' --cpu-offload-gb 0 --linear-backend auto \\\n  --moe-backend flashinfer_cutlass --mamba-cache-mode none --no-enable-prefix-caching \\\n  --enable-chunked-prefill --block-size 16 --kv-cache-memory-bytes 7G --max-model-len 49152 \\\n  --max-num-seqs 8 --max-num-batched-tokens 4096 --enable-flashinfer-autotune \\\n  --mm-processor-cache-gb 0 --language-model-only --gpu-memory-utilization 0.87 \\\n  --compilation-config '{\"pass_config\":{\"fuse_act_quant\":true},\"max_cudagraph_capture_size\":32}' \\\n  [--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"marlin\"}' \\\n   --kv-cache-dtype-skip-layers 48] \\\n  --screened-lm-head   # omitted in the stock arm\n# Requests: seed 1234, greedy or {\"temperature\": 1.0, \"top_k\": 20, \"top_p\": 0.95}.\npytest -v tests/v1/worker/test_gpu_screened_head.py tests/v1/worker/test_gpu_worker_weight_transfer.py\n```\n\n</details>\n\n## Details\n\n- Not the platform W8A16 kernels: the bound needs the screen's own arithmetic (fp32 accumulation of the stored FP8 values) fused with per-block maxima. A rank-256 SVD bound rules out almost nothing (flat spectrum); a fused select+exact kernel was 2% to 9% slower.\n- Weight updates (`reload_weights`, weight transfer including draft updates) rebuild the FP8 copy; it lives in the weights memory pool for sleep mode.\n- Memory: an FP8 copy of the lm_head (+0.64 GB on Flash-Next) plus `min(max_num_seqs * (k + 1), 64) x vocab x 8` bytes, allocated at load.\n- Stock Flash-Next is not deterministic run to run on this stack (32/352 identical texts between two stock runs), hence exactness on shared hidden states rather than output texts.\n\nNot a duplicate: #55494 packs the BF16 lm_head losslessly (0.77x bytes) for single-token decode and any sampling; this reads about 0.5x for greedy and top-k sampling and covers spec-decode verify widths.\n\nAI assistance (Claude) was used to write and test this change; I reviewed every line and ran the tests and benchmarks above.\n",
+      "changedFiles": 8,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @stecasta.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-11T04:50:45Z",
+            "updatedAt": "2026-10-11T04:50:45Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60566#issuecomment-6105582664"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWvrzEg=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "headRepository": {
+        "nameWithOwner": "stecasta/vllm"
+      },
+      "merged": false,
+      "number": 60566,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-08T06:48:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60566#pullrequestreview-5452721590"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wOFQwNjo0ODo0M1q0MjAyNi0xMC0wOFQwNjo0ODo0M1rPAAAAAUUB7bY=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[MRV2][Perf] Screened lm_head",
+      "updatedAt": "2026-10-11T04:50:46Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60566"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "814301b26800a9d22a7d967a161aa07da4cbb5f2"
+    },
+    "body": "## Purpose\n\nOpt-in `--screened-lm-head`: when sampling only reads the top-k logits (greedy, or temperature with top-k <= 32 and optional top-p, e.g. Qwen's default `temperature=1.0, top_k=20, top_p=0.95`), compute them from an FP8 screen of the lm_head plus exact logits for the few rows the screen cannot rule out. Same tokens for the same seed, about half the lm_head bytes. Qwen3.8-Flash-Next on DGX Spark: +7.7% decode greedy, +6.2% at Qwen's default sampling (c=1, no speculative decoding).\n\n- An FP8 copy of the lm_head scores every row, with a rigorous per-row error bound (FP8 error plus fp32 accumulation error of both GEMMs, computed in fp64 at load).\n- A row more than one output ulp below the k-th best lower bound can neither enter nor tie the full head's top k. The rest (greedy: 15 rows per token on Flash-Next, top-20: about 1,200) get exact BF16 logits, the others `-inf`.\n- Three Triton kernels, no host sync. Other batches (logprobs, penalties, logit bias, min-p, structured outputs, top-k > 32) use the full head. Unsupported setups (quantized or TP-sharded lm_head, LoRA, custom samplers, `VLLM_BATCH_INVARIANT`, pre-SM89) raise at load.\n\n**Scope:** the gain needs the lm_head to be a large share of the step (DGX Spark, Jetson Thor, RTX). On GB200/GB300 it is neutral to slightly negative, so it is opt-in.\n\n## Results\n\nFlash-Next NVFP4, SPEED-Bench (11 domains, 352 prompts, 256 tokens), same-node stock/screened pairs, both arm orders:\n\n```\nGPU     sampling          config         c=1             c=4             GSM8K stock / ours\nGB10    greedy            plain decode   +8.0% / +7.4%   +5.9% / +5.8%   98.5 / 98.5\nGB10    greedy            MTP k=3        +3.9% / +3.1%   +2.9% / +2.4%   98.0 / 98.5\nGB10    T=1, k=20, p=.95  plain decode   +6.7% / +5.7%   +4.4% / +3.9%   98.0 / 97.0\nGB10    T=1, k=20, p=.95  MTP k=3        +3.1% / +1.9%   +3.9% / +2.3%   97.5 / 98.5\nGB200   greedy            plain decode   -0.4% / -2.0%   +0.4% / +0.8%   98.5 / 97.5\nGB200   greedy            MTP k=3        +1.3% / -0.8%   +0.4% / -3.2%   98.0 / 98.0\nGB300   greedy            plain decode   -1.6% / -1.5%   -1.2% / -3.0%   98.5 / 97.5\nGB300   greedy            MTP k=3        -0.7% / +0.6%   -2.7% / +1.0%   98.5 / 98.5\n```\n\nlm_head alone on GB10 (248320 x 2560, CUDA graphs): full BF16 5.4 to 7.3 ms; screened -62% at 1 token, -46% (greedy) / -43% (top-20) at 16 to 28 tokens. On GB200 the screen reaches 3.6 TB/s against 7.1 TB/s for the BF16 GEMM.\n\nExactness (both heads on the same hidden states):\n- Offline, 10,572 real Flash-Next rows at batch widths 1 to 64 plus 1,024 adversarial near-ties: 0 argmax mismatches; for top-20, 0 true top-20 rows screened out.\n- Live, 1.36M greedy and 353k sampled rows: 0 true top-k rows screened out. 12 greedy argmax flips, all sub-ulp ties on a BF16 rounding midpoint where the screened value was the correctly rounded one.\n- Kept logits differ from cuBLAS in 0.047% of entries, 99% of those by one BF16 ulp (summation order), as with any GEMM change.\n- `pytest tests/v1/worker/test_gpu_screened_head.py`: 21 passed on GB10 and GB200.\n\n<details><summary>Commands</summary>\n\n```bash\nVLLM_USE_V2_MODEL_RUNNER=1 vllm serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \\\n  --trust-remote-code --quantization modelopt_mixed --dtype bfloat16 --kv-cache-dtype fp8 \\\n  --engram-config '{\"cpu_offload\":false}' --cpu-offload-gb 0 --linear-backend auto \\\n  --moe-backend flashinfer_cutlass --mamba-cache-mode none --no-enable-prefix-caching \\\n  --enable-chunked-prefill --block-size 16 --kv-cache-memory-bytes 7G --max-model-len 49152 \\\n  --max-num-seqs 8 --max-num-batched-tokens 4096 --enable-flashinfer-autotune \\\n  --mm-processor-cache-gb 0 --language-model-only --gpu-memory-utilization 0.87 \\\n  --compilation-config '{\"pass_config\":{\"fuse_act_quant\":true},\"max_cudagraph_capture_size\":32}' \\\n  [--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"marlin\"}' \\\n   --kv-cache-dtype-skip-layers 48] \\\n  --screened-lm-head   # omitted in the stock arm\n# Requests: seed 1234, greedy or {\"temperature\": 1.0, \"top_k\": 20, \"top_p\": 0.95}.\npytest -v tests/v1/worker/test_gpu_screened_head.py tests/v1/worker/test_gpu_worker_weight_transfer.py\n```\n\n</details>\n\n## Details\n\n- Not the platform W8A16 kernels: the bound needs the screen's own arithmetic (fp32 accumulation of the stored FP8 values) fused with per-block maxima. A rank-256 SVD bound rules out almost nothing (flat spectrum); a fused select+exact kernel was 2% to 9% slower.\n- Weight updates (`reload_weights`, weight transfer including draft updates) rebuild the FP8 copy; it lives in the weights memory pool for sleep mode.\n- Memory: an FP8 copy of the lm_head (+0.64 GB on Flash-Next) plus `min(max_num_seqs * (k + 1), 64) x vocab x 8` bytes, allocated at load.\n- Stock Flash-Next is not deterministic run to run on this stack (32/352 identical texts between two stock runs), hence exactness on shared hidden states rather than output texts.\n\nNot a duplicate: #55494 packs the BF16 lm_head losslessly (0.77x bytes) for single-token decode and any sampling; this reads about 0.5x for greedy and top-k sampling and covers spec-decode verify widths.\n\nAI assistance (Claude) was used to write and test this change; I reviewed every line and ran the tests and benchmarks above.\n",
+    "changed_files": 8,
+    "head": {
+      "repo": {
+        "full_name": "stecasta/vllm"
+      },
+      "sha": "fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60566",
+    "merged": false,
+    "number": 60566,
+    "state": "open",
+    "title": "[MRV2][Perf] Screened lm_head",
+    "updated_at": "2026-10-11T04:50:46Z"
+  },
+  "files": [
+    {
+      "additions": 149,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/tests%2Fv1%2Fworker%2Ftest_gpu_screened_head.py",
+      "changes": 149,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fworker%2Ftest_gpu_screened_head.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 0,
+      "filename": "tests/v1/worker/test_gpu_screened_head.py",
+      "patch": "@@ -0,0 +1,149 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\n+from types import SimpleNamespace\n+\n+import numpy as np\n+import pytest\n+import torch\n+import torch.nn.functional as F\n+\n+from vllm.platforms import current_platform\n+\n+if not (current_platform.is_cuda() and current_platform.has_device_capability(89)):\n+    pytest.skip(\n+        \"The FP8 screen needs CUDA with compute capability 8.9+\",\n+        allow_module_level=True,\n+    )\n+\n+from vllm.sampling_params import SamplingParams\n+from vllm.v1.worker.gpu.sample.sampler import Sampler\n+from vllm.v1.worker.gpu.sample.screened_head import ScreenedLMHead\n+from vllm.v1.worker.gpu.states import RequestState\n+\n+DEVICE = torch.device(\"cuda\")\n+VOCAB_SIZE = 4096\n+HIDDEN_SIZE = 512\n+MAX_TOKENS = ScreenedLMHead.MAX_TOKENS\n+MAX_TOP_K = ScreenedLMHead.MAX_TOP_K\n+\n+\n+def _make_sampler() -> Sampler:\n+    req_states = RequestState(\n+        max_num_reqs=4,\n+        max_model_len=64,\n+        max_num_batched_tokens=16,\n+        num_speculative_steps=1,\n+        vocab_size=VOCAB_SIZE,\n+        device=DEVICE,\n+    )\n+    return Sampler(\n+        vllm_config=SimpleNamespace(reasoning_config=None),\n+        max_num_reqs=4,\n+        vocab_size=VOCAB_SIZE,\n+        device=DEVICE,\n+        req_states=req_states,\n+    )\n+\n+\n+def _near_tie_inputs(weight: torch.Tensor, num_tokens: int) -> torch.Tensor:\n+    \"\"\"Hidden states whose two best rows are pulled close to a tie.\"\"\"\n+    x = torch.randn(num_tokens, weight.shape[1], device=DEVICE)\n+    logits = F.linear(x.to(weight.dtype), weight).float()\n+    top2 = logits.topk(2, dim=-1)\n+    diff = weight[top2.indices[:, 0]].float() - weight[top2.indices[:, 1]].float()\n+    gap = top2.values[:, 0] - top2.values[:, 1]\n+    shrink = torch.rand(num_tokens, 1, device=DEVICE)\n+    return (x - shrink * (gap / diff.norm(dim=-1).square())[:, None] * diff).to(\n+        weight.dtype\n+    )\n+\n+\n+@pytest.mark.parametrize(\"top_k\", [1, 20])\n+@pytest.mark.parametrize(\"dtype\", [torch.bfloat16, torch.float16])\n+@pytest.mark.parametrize(\"num_tokens\", [1, 7, 64])\n+def test_top_k_matches_full_head(dtype: torch.dtype, num_tokens: int, top_k: int):\n+    \"\"\"The screen keeps few rows, and the kept rows hold the full head's top k\n+    with the full head's logits, also when the best two nearly tie.\"\"\"\n+    torch.manual_seed(0)\n+    # Padded rows beyond the vocabulary must not be scored.\n+    weight = (torch.randn(VOCAB_SIZE + 64, HIDDEN_SIZE, device=DEVICE) * 0.02).to(dtype)\n+    head = ScreenedLMHead(weight, VOCAB_SIZE, _make_sampler(), MAX_TOKENS)\n+    x = _near_tie_inputs(weight[:VOCAB_SIZE], num_tokens)\n+\n+    logits = head(x, top_k)\n+    ref = F.linear(x, weight[:VOCAB_SIZE])\n+\n+    assert logits.shape == ref.shape and logits.dtype == ref.dtype\n+    torch.testing.assert_close(logits.argmax(dim=-1), ref.argmax(dim=-1))\n+    torch.testing.assert_close(\n+        logits.topk(top_k, dim=-1).values, ref.topk(top_k, dim=-1).values\n+    )\n+    kept = logits.isfinite()\n+    torch.testing.assert_close(logits[kept], ref[kept])\n+    assert kept.sum() < kept.numel() / 4\n+\n+\n+def test_refresh_tracks_weight_updates():\n+    \"\"\"After the lm_head is reloaded in place, refresh() re-screens against\n+    the new weights.\"\"\"\n+    torch.manual_seed(0)\n+    weight = (torch.randn(VOCAB_SIZE, HIDDEN_SIZE, device=DEVICE) * 0.02).bfloat16()\n+    head = ScreenedLMHead(weight, VOCAB_SIZE, _make_sampler(), MAX_TOKENS)\n+    weight.copy_(weight.flip(0))\n+    head.refresh()\n+    x = _near_tie_inputs(weight, 16)\n+\n+    torch.testing.assert_close(\n+        head(x).argmax(dim=-1), F.linear(x, weight).argmax(dim=-1)\n+    )\n+\n+\n+@pytest.mark.parametrize(\n+    (\"sampling_params\", \"num_tokens\", \"expected\"),\n+    [\n+        pytest.param(SamplingParams(temperature=0.0), 8, 1, id=\"greedy\"),\n+        pytest.param(\n+            SamplingParams(temperature=1.0, top_k=20, top_p=0.95),\n+            8,\n+            20,\n+            id=\"top-k-top-p\",\n+        ),\n+        pytest.param(SamplingParams(temperature=0.7), 8, None, id=\"no-top-k\"),\n+        pytest.param(\n+            SamplingParams(temperature=0.7, top_k=MAX_TOP_K + 1),\n+            8,\n+            None,\n+            id=\"large-top-k\",\n+        ),\n+        pytest.param(\n+            SamplingParams(temperature=0.7, top_k=20, min_p=0.1),\n+            8,\n+            None,\n+            id=\"min-p\",\n+        ),\n+        pytest.param(\n+            SamplingParams(temperature=0.0, logprobs=1), 8, None, id=\"logprobs\"\n+        ),\n+        pytest.param(\n+            SamplingParams(temperature=0.7, top_k=20, logit_bias={1: 1.0}),\n+            8,\n+            None,\n+            id=\"logit-bias\",\n+        ),\n+        pytest.param(\n+            SamplingParams(temperature=0.0), MAX_TOKENS + 1, None, id=\"large-batch\"\n+        ),\n+    ],\n+)\n+def test_required_top_k(\n+    sampling_params: SamplingParams, num_tokens: int, expected: int | None\n+):\n+    \"\"\"The screen serves a batch only when sampling reads just its top k.\"\"\"\n+    sampler = _make_sampler()\n+    sampler.add_request(0, SamplingParams(temperature=0.0))\n+    sampler.add_request(1, sampling_params)\n+    weight = torch.randn(VOCAB_SIZE, HIDDEN_SIZE, device=DEVICE).bfloat16()\n+    head = ScreenedLMHead(weight, VOCAB_SIZE, sampler, MAX_TOKENS)\n+\n+    assert head.required_top_k(np.array([0, 1]), num_tokens) == expected",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/tests%2Fv1%2Fworker%2Ftest_gpu_screened_head.py",
+      "sha": "14aa9718e5338ac9981a16e8b4e37630c30cc8d0",
+      "status": "added"
+    },
+    {
+      "additions": 27,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/tests%2Fv1%2Fworker%2Ftest_gpu_worker_weight_transfer.py",
+      "changes": 27,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fworker%2Ftest_gpu_worker_weight_transfer.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 0,
+      "filename": "tests/v1/worker/test_gpu_worker_weight_transfer.py",
+      "patch": "@@ -180,6 +180,33 @@ def test_finish_draft_session_keeps_lora_state():\n     assert worker.model_runner.reset_lora_calls == 0\n \n \n+class _RecordingScreenedHead:\n+    def __init__(self) -> None:\n+        self.refresh_calls = 0\n+\n+    def refresh(self) -> None:\n+        self.refresh_calls += 1\n+\n+\n+@pytest.mark.parametrize(\"is_draft\", [False, True])\n+def test_finish_refreshes_screened_lm_head(is_draft: bool):\n+    \"\"\"Weight transfer bypasses reload_weights, so the screened lm_head\n+    re-derives its FP8 copy; a draft update can share the target lm_head.\"\"\"\n+    engine = _RecordingEngine()\n+    engine.supports_draft_weight_update = True\n+    worker = _make_worker(engine)\n+    worker._set_draft_weight_update_target = lambda: None\n+    worker.model_runner.screened_head = _RecordingScreenedHead()\n+\n+    if is_draft:\n+        Worker.start_draft_weight_update(worker)\n+    else:\n+        Worker.start_weight_update(worker)\n+    Worker.finish_weight_update(worker)\n+\n+    assert worker.model_runner.screened_head.refresh_calls == 1\n+\n+\n def test_double_start_raises():\n     worker = _make_worker(_RecordingEngine())\n     Worker.start_weight_update(worker)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/tests%2Fv1%2Fworker%2Ftest_gpu_worker_weight_transfer.py",
+      "sha": "cf2e14bd8127881e3e48e2de753615c953403b68",
+      "status": "modified"
+    },
+    {
+      "additions": 12,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fconfig%2Fmodel.py",
+      "changes": 12,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fconfig%2Fmodel.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 0,
+      "filename": "vllm/config/model.py",
+      "patch": "@@ -305,6 +305,17 @@ class ModelConfig:\n     predetermined token sequence while still computing real logprobs. Reserved\n     for debugging and RL workflows: enabling it reserves a per-request trace\n     buffer, so it is off by default.\"\"\"\n+    screened_lm_head: bool = False\n+    \"\"\"Whether to compute the logits of batches that only read the top-k logits\n+    (greedy, or temperature with top-k <= 32 and optional top-p) from an FP8\n+    copy of the lm_head that screens out the rows that provably cannot be among\n+    them, plus exact logits for the rest. Sampled tokens match the full lm_head\n+    for the same seed (up to sub-ulp ties) while the step reads about half its\n+    bytes. Batches with logprobs, penalties, logit bias, min-p or structured\n+    outputs use the full lm_head. Requires an unquantized, unsharded lm_head and\n+    raises otherwise. Adds an FP8 copy of the lm_head to model memory. Gains\n+    are largest on GPUs where the lm_head is a large share of the step (e.g.\n+    DGX Spark); on HBM GPUs it can be slower than the full lm_head.\"\"\"\n     disable_sliding_window: bool = False\n     \"\"\"Whether to disable sliding window. If True, we will disable the sliding\n     window functionality of the model, capping to sliding window size. If the\n@@ -477,6 +488,7 @@ def compute_hash(self) -> str:\n             \"logprobs_mode\",\n             \"use_fp64_gumbel\",\n             \"enable_trace_replay\",\n+            \"screened_lm_head\",\n             \"disable_cascade_attn\",\n             \"skip_tokenizer_init\",\n             \"served_model_name\",",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fconfig%2Fmodel.py",
+      "sha": "fde1c459f3c28cafccf8756602356a42a80438ef",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fengine%2Farg_utils.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fengine%2Farg_utils.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 0,
+      "filename": "vllm/engine/arg_utils.py",
+      "patch": "@@ -602,6 +602,7 @@ class EngineArgs:\n     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode\n     use_fp64_gumbel: bool = ModelConfig.use_fp64_gumbel\n     enable_trace_replay: bool = ModelConfig.enable_trace_replay\n+    screened_lm_head: bool = ModelConfig.screened_lm_head\n     disable_log_stats: bool = False\n     aggregate_engine_logging: bool = False\n     revision: str | None = ModelConfig.revision\n@@ -979,6 +980,9 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:\n         model_group.add_argument(\n             \"--enable-trace-replay\", **model_kwargs[\"enable_trace_replay\"]\n         )\n+        model_group.add_argument(\n+            \"--screened-lm-head\", **model_kwargs[\"screened_lm_head\"]\n+        )\n         model_group.add_argument(\n             \"--disable-sliding-window\", **model_kwargs[\"disable_sliding_window\"]\n         )\n@@ -1963,6 +1967,7 @@ def create_model_config(self) -> ModelConfig:\n             logprobs_mode=self.logprobs_mode,\n             use_fp64_gumbel=self.use_fp64_gumbel,\n             enable_trace_replay=self.enable_trace_replay,\n+            screened_lm_head=self.screened_lm_head,\n             disable_sliding_window=self.disable_sliding_window,\n             disable_cascade_attn=self.disable_cascade_attn,\n             skip_tokenizer_init=self.skip_tokenizer_init,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fengine%2Farg_utils.py",
+      "sha": "a385477367b90b44554001fc74258857b5b1ca1a",
+      "status": "modified"
+    },
+    {
+      "additions": 21,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu%2Fmodel_runner.py",
+      "changes": 22,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fworker%2Fgpu%2Fmodel_runner.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 1,
+      "filename": "vllm/v1/worker/gpu/model_runner.py",
+      "patch": "@@ -146,6 +146,7 @@\n from vllm.v1.worker.gpu.sample.output import SamplerOutput\n from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker\n from vllm.v1.worker.gpu.sample.sampler import Sampler\n+from vllm.v1.worker.gpu.sample.screened_head import ScreenedLMHead\n from vllm.v1.worker.gpu.shutdown import free_before_shutdown\n from vllm.v1.worker.gpu.spec_decode import init_speculator\n from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (\n@@ -330,6 +331,7 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):\n         self.sampler: Sampler | None = None\n         self.rejection_sampler: RejectionSampler | None = None\n         self.batch_sharder: BatchSharder | None = None\n+        self.screened_head: ScreenedLMHead | None = None\n         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None\n         self.structured_outputs_worker: StructuredOutputsWorker | None = None\n         self.cudagraph_manager: ModelCudaGraphManager | None = None\n@@ -499,6 +501,13 @@ def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:\n                         self.vllm_config.watermark_config\n                     ),\n                 )\n+            if self.model_config.screened_lm_head:\n+                self.screened_head = ScreenedLMHead.from_model(\n+                    self.model,\n+                    self.sampler,\n+                    self.vocab_size,\n+                    self.max_num_reqs * self.decode_query_len,\n+                )\n             self.prompt_logprobs_worker = PromptLogprobsWorker(\n                 self.max_num_reqs,\n                 self.device,\n@@ -559,6 +568,8 @@ def reload_weights(self, *args, **kwargs) -> None:\n         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1\n \n         GPUModelRunnerV1.reload_weights(self, *args, **kwargs)  # type: ignore[arg-type]\n+        if self.screened_head is not None:\n+            self.screened_head.refresh()\n \n     def update_config(self, *args, **kwargs) -> None:\n         # TODO(Wentao): Use full version instead of import when fully migrated to v2\n@@ -1598,7 +1609,16 @@ def sample(\n             logits = logits[:, : self.vocab_size]\n         else:\n             sample_hidden_states = hidden_states[input_batch.logits_indices]\n-            logits = self.model.compute_logits(sample_hidden_states)\n+            top_k = None\n+            if self.screened_head is not None and grammar_output is None:\n+                top_k = self.screened_head.required_top_k(\n+                    input_batch.idx_mapping_np, sample_hidden_states.shape[0]\n+                )\n+            if top_k is not None:\n+                assert self.screened_head is not None\n+                logits = self.screened_head(sample_hidden_states, top_k)\n+            else:\n+                logits = self.model.compute_logits(sample_hidden_states)\n \n         invalid_drafts = None\n         # A diffusion prefill has no logit rows even when a bitmask row",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu%2Fmodel_runner.py",
+      "sha": "8a88bb75c13f15b45b96d39bd6981296873df49e",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu%2Fsample%2Fsampler.py",
+      "changes": 9,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fworker%2Fgpu%2Fsample%2Fsampler.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 3,
+      "filename": "vllm/v1/worker/gpu/sample/sampler.py",
+      "patch": "@@ -83,6 +83,8 @@ def __init__(\n             TraceReplayState(req_states) if enable_trace_replay else None\n         )\n         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)\n+        # Like needs_logits_processing, minus temperature, top-k, top-p, min-p.\n+        self.uses_logits_processors = np.zeros(max_num_reqs, dtype=bool)\n         self.num_speculative_tokens = num_speculative_tokens\n         self.return_sampling_mask = return_sampling_mask\n         self.use_flashinfer = (\n@@ -95,12 +97,13 @@ def __init__(\n \n     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:\n         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)\n-        needs_processing |= self.thinking_budget_state.add_request(\n+        uses_processors = self.thinking_budget_state.add_request(\n             req_idx, sampling_params\n         )\n         for processor in self.logits_processors:\n-            needs_processing |= processor.add_request(req_idx, sampling_params)\n-        self.needs_logits_processing[req_idx] = needs_processing\n+            uses_processors |= processor.add_request(req_idx, sampling_params)\n+        self.uses_logits_processors[req_idx] = uses_processors\n+        self.needs_logits_processing[req_idx] = needs_processing or uses_processors\n \n         self.logprob_token_ids_state.add_request(req_idx, sampling_params)\n         if self.trace_replay_state is not None:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu%2Fsample%2Fsampler.py",
+      "sha": "27efb93b4e611531b985ac3f18dfd74f7923f570",
+      "status": "modified"
+    },
+    {
+      "additions": 344,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu%2Fsample%2Fscreened_head.py",
+      "changes": 344,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fworker%2Fgpu%2Fsample%2Fscreened_head.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 0,
+      "filename": "vllm/v1/worker/gpu/sample/screened_head.py",
+      "patch": "@@ -0,0 +1,344 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Top-k logits from an FP8 screen of the lm_head plus exact logits.\n+\n+An FP8 copy of the lm_head scores every row j as s_j. Row j's logit as the full\n+head computes it before rounding, c_j, satisfies |c_j - s_j| <= ||x|| * err_j:\n+Cauchy-Schwarz on W_j - W8_j plus the fp32 accumulation error of both GEMMs.\n+Let t be the k-th largest per-block maximum of s_j - ||x|| err_j: at least k\n+rows have c_j >= t. A row whose upper bound is below t - 2 eps |t| sits more\n+than one output ulp below each of them, so it can neither enter nor tie the\n+full head's top k. The remaining rows get exact logits and every other row\n+-inf. Greedy sampling (k = 1) and top-k sampling only read the top k, so they\n+return the full head's token for the same seed (up to sub-ulp ties that depend\n+on summation order, as with any GEMM change). The screen reads half the bytes\n+of a BF16 head.\n+\"\"\"\n+\n+import numpy as np\n+import torch\n+\n+import vllm.envs as envs\n+from vllm import _custom_ops as ops\n+from vllm.model_executor.layers.linear import UnquantizedLinearMethod\n+from vllm.model_executor.layers.logits_processor import LogitsProcessor\n+from vllm.model_executor.layers.vocab_parallel_embedding import (\n+    UnquantizedEmbeddingMethod,\n+    VocabParallelEmbedding,\n+)\n+from vllm.platforms import current_platform\n+from vllm.triton_utils import tl, triton\n+from vllm.v1.worker.gpu.sample.sampler import Sampler\n+\n+_QUANT_CHUNK = 4096\n+\n+\n+@triton.jit\n+def _screen_kernel(\n+    x_ptr,\n+    w_ptr,\n+    scale_ptr,\n+    err_ptr,\n+    ub_ptr,\n+    block_max_ptr,\n+    num_tokens,\n+    vocab_size,\n+    hidden_size,\n+    BLOCK_N: tl.constexpr,\n+    BLOCK_V: tl.constexpr,\n+    BLOCK_H: tl.constexpr,\n+):\n+    block = tl.program_id(0)\n+    rows = block * BLOCK_V + tl.arange(0, BLOCK_V)\n+    toks = tl.arange(0, BLOCK_N)\n+    row_mask = rows < vocab_size\n+    tok_mask = toks < num_tokens\n+    acc = tl.zeros([BLOCK_N, BLOCK_V], dtype=tl.float32)\n+    sq = tl.zeros([BLOCK_N], dtype=tl.float32)\n+    for h0 in range(0, hidden_size, BLOCK_H):\n+        cols = h0 + tl.arange(0, BLOCK_H)\n+        col_mask = cols < hidden_size\n+        x = tl.load(\n+            x_ptr + toks[:, None] * hidden_size + cols[None, :],\n+            mask=tok_mask[:, None] & col_mask[None, :],\n+            other=0.0,\n+        )\n+        w = tl.load(\n+            w_ptr + rows[None, :].to(tl.int64) * hidden_size + cols[:, None],\n+            mask=row_mask[None, :] & col_mask[:, None],\n+            other=0.0,\n+        )\n+        acc = tl.dot(x, w.to(x.dtype), acc)\n+        xf = x.to(tl.float32)\n+        sq += tl.sum(xf * xf, axis=1)\n+    s = acc * tl.load(scale_ptr + rows, mask=row_mask, other=0.0)[None, :]\n+    bound = tl.sqrt(sq)[:, None] * tl.load(err_ptr + rows, mask=row_mask, other=0.0)\n+    mask = tok_mask[:, None] & row_mask[None, :]\n+    lb = tl.where(mask, s - bound, float(\"-inf\"))\n+    tl.store(\n+        block_max_ptr + toks * tl.num_programs(0) + block,\n+        tl.max(lb, axis=1),\n+        mask=tok_mask,\n+    )\n+    tl.store(\n+        ub_ptr + toks[:, None].to(tl.int64) * vocab_size + rows[None, :],\n+        s + bound,\n+        mask=mask,\n+    )\n+\n+\n+@triton.jit\n+def _select_kernel(\n+    ub_ptr,\n+    t_ptr,\n+    logits_ptr,\n+    cand_ptr,\n+    num_cand_ptr,\n+    vocab_size,\n+    TIE: tl.constexpr,\n+    BLOCK: tl.constexpr,\n+):\n+    tok = tl.program_id(0).to(tl.int64)\n+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)\n+    mask = cols < vocab_size\n+    t = tl.load(t_ptr + tok)\n+    ub = tl.load(ub_ptr + tok * vocab_size + cols, mask=mask, other=float(\"-inf\"))\n+    keep = mask & (ub >= t - TIE * tl.abs(t))\n+    tl.store(logits_ptr + tok * vocab_size + cols, float(\"-inf\"), mask=mask)\n+    num_keep = tl.sum(keep.to(tl.int32), axis=0)\n+    if num_keep > 0:\n+        base = tl.atomic_add(num_cand_ptr + tok, num_keep)\n+        offs = base + tl.cumsum(keep.to(tl.int32), axis=0) - 1\n+        tl.store(cand_ptr + tok * vocab_size + offs, cols, mask=keep)\n+\n+\n+@triton.jit\n+def _exact_kernel(\n+    x_ptr,\n+    w_ptr,\n+    cand_ptr,\n+    num_cand_ptr,\n+    logits_ptr,\n+    vocab_size,\n+    hidden_size,\n+    BLOCK_R: tl.constexpr,\n+    BLOCK_H: tl.constexpr,\n+):\n+    tok = tl.program_id(0).to(tl.int64)\n+    num_cand = tl.load(num_cand_ptr + tok)\n+    step = tl.num_programs(1) * BLOCK_R\n+    for start in range(tl.program_id(1) * BLOCK_R, num_cand, step):\n+        r = start + tl.arange(0, BLOCK_R)\n+        r_mask = r < num_cand\n+        rows = tl.load(cand_ptr + tok * vocab_size + r, mask=r_mask, other=0)\n+        rows = rows.to(tl.int64)\n+        acc = tl.zeros([BLOCK_R], dtype=tl.float32)\n+        for h0 in range(0, hidden_size, BLOCK_H):\n+            cols = h0 + tl.arange(0, BLOCK_H)\n+            col_mask = cols < hidden_size\n+            x = tl.load(x_ptr + tok * hidden_size + cols, mask=col_mask, other=0.0)\n+            w = tl.load(\n+                w_ptr + rows[:, None] * hidden_size + cols[None, :],\n+                mask=r_mask[:, None] & col_mask[None, :],\n+                other=0.0,\n+            )\n+            acc += tl.sum(w.to(tl.float32) * x.to(tl.float32)[None, :], axis=1)\n+        tl.store(\n+            logits_ptr + tok * vocab_size + rows,\n+            acc.to(logits_ptr.dtype.element_ty),\n+            mask=r_mask,\n+        )\n+\n+\n+class ScreenedLMHead:\n+    \"\"\"lm_head logits for batches that only read the top k, exact on every row\n+    that can be among them and -inf elsewhere.\"\"\"\n+\n+    # Tiles and caps were measured on GB10 (lm_head 248320 x 2560): greedy, the\n+    # screen beats the BF16 head by 39% at 64 tokens and loses beyond 96, where\n+    # the GEMM is no longer bandwidth bound; top-32 still wins by 23% at 64.\n+    MAX_TOKENS = 64\n+    MAX_TOP_K = 32\n+    BLOCK_V = 64\n+    BLOCK_H = 256\n+    SELECT_BLOCK = 4096\n+    EXACT_PROGRAMS = 64\n+\n+    def __init__(\n+        self,\n+        weight: torch.Tensor,\n+        vocab_size: int,\n+        sampler: Sampler,\n+        max_num_tokens: int,\n+    ):\n+        self.weight = weight[:vocab_size]\n+        self.sampler = sampler\n+        self.vocab_size, self.hidden_size = self.weight.shape\n+        self.max_num_tokens = min(max_num_tokens, self.MAX_TOKENS)\n+        # One output ulp is at most eps * |logit|; argmax ties resolve to the\n+        # lowest index.\n+        self.tie = 2 * torch.finfo(weight.dtype).eps\n+        self.w_fp8 = torch.empty_like(self.weight, dtype=torch.float8_e4m3fn)\n+        self.scale = torch.empty(self.vocab_size, device=weight.device)\n+        self.err = torch.empty(self.vocab_size, device=weight.device)\n+        self.ub = torch.empty(\n+            self.max_num_tokens, self.vocab_size, device=weight.device\n+        )\n+        self.cand = torch.empty_like(self.ub, dtype=torch.int32)\n+        self.block_max = torch.empty(\n+            self.max_num_tokens,\n+            triton.cdiv(self.vocab_size, self.BLOCK_V),\n+            device=weight.device,\n+        )\n+        self.refresh()\n+\n+    def refresh(self) -> None:\n+        \"\"\"Rebuild the FP8 copy and its error bounds from the lm_head weight.\"\"\"\n+        u = 2.0**-24\n+        # fp32 accumulation error over hidden_size terms, relative to\n+        # sum_i |x_i w_i| <= ||x|| ||w||.\n+        gamma = self.hidden_size * u / (1 - self.hidden_size * u)\n+        for start in range(0, self.vocab_size, _QUANT_CHUNK):\n+            rows = slice(start, start + _QUANT_CHUNK)\n+            _, scale = ops.scaled_fp8_quant(\n+                self.weight[rows],\n+                use_per_token_if_dynamic=True,\n+                output=self.w_fp8[rows],\n+            )\n+            self.scale[rows] = scale.view(-1)\n+            w = self.weight[rows].double()\n+            deq = self.w_fp8[rows].double() * scale.double()\n+            err = (\n+                (w - deq).norm(dim=1)\n+                + gamma * w.norm(dim=1)\n+                + (gamma + 2 * u) * deq.norm(dim=1)\n+            )\n+            # Slack for the fp32 norm of x and the fp32 bound arithmetic.\n+            self.err[rows] = err * (1 + 4 * gamma)\n+\n+    @classmethod\n+    def from_model(\n+        cls,\n+        model: torch.nn.Module,\n+        sampler: Sampler,\n+        vocab_size: int,\n+        max_num_tokens: int,\n+    ) -> \"ScreenedLMHead\":\n+        get_language_model = getattr(model, \"get_language_model\", None)\n+        language_model = get_language_model() if get_language_model else model\n+        lm_head = getattr(language_model, \"lm_head\", None)\n+        processor = getattr(language_model, \"logits_processor\", None)\n+        reason = None\n+        if not (\n+            current_platform.is_cuda() and current_platform.has_device_capability(89)\n+        ):\n+            reason = \"an FP8-capable CUDA GPU (compute capability 8.9+)\"\n+        elif envs.VLLM_BATCH_INVARIANT:\n+            # Whether a request is screened depends on the rest of its batch.\n+            reason = \"VLLM_BATCH_INVARIANT to be off\"\n+        elif (\n+            type(sampler) is not Sampler\n+            or sampler.compute_nans\n+            or sampler.trace_replay_state is not None\n+            or sampler.return_sampling_mask\n+        ):\n+            reason = \"the default sampler without NaN checks or trace replay\"\n+        elif not isinstance(lm_head, VocabParallelEmbedding) or not isinstance(\n+            lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)\n+        ):\n+            reason = \"an unquantized lm_head\"\n+        elif lm_head.tp_size > 1 or getattr(lm_head, \"bias\", None) is not None:\n+            reason = \"an lm_head without TP sharding or bias\"\n+        elif lm_head.weight.dtype not in (torch.bfloat16, torch.float16):\n+            reason = \"a BF16 or FP16 lm_head\"\n+        elif (\n+            not isinstance(processor, LogitsProcessor)\n+            or processor.logits_as_input\n+            or processor.soft_cap is not None\n+            or processor.scale != 1.0\n+            or processor.head_dtype not in (None, lm_head.weight.dtype)\n+        ):\n+            reason = \"logits that are the plain lm_head projection (no LoRA)\"\n+        if reason is not None:\n+            raise ValueError(f\"screened_lm_head requires {reason}.\")\n+        assert lm_head is not None\n+        weight = lm_head.weight.data\n+        head = cls(weight, vocab_size, sampler, max_num_tokens)\n+        # Compile the kernels now rather than on the first request.\n+        for num_tokens in (1, 17, 33):\n+            if num_tokens <= head.max_num_tokens:\n+                head(torch.randn_like(weight[:num_tokens]))\n+        return head\n+\n+    def required_top_k(self, idx_mapping_np: np.ndarray, num_tokens: int) -> int | None:\n+        \"\"\"How many top logits sampling the batch reads (1 when all greedy), or\n+        None when it needs more than the screen certifies.\"\"\"\n+        sampler = self.sampler\n+        states = sampler.sampling_states\n+        if (\n+            not 0 < num_tokens <= self.max_num_tokens\n+            or np.any(sampler.uses_logits_processors[idx_mapping_np])\n+            or sampler.get_logprobs_dims(idx_mapping_np) is not None\n+        ):\n+            return None\n+        sampled = idx_mapping_np[states.temperature.np[idx_mapping_np] != 0.0]\n+        if sampled.size == 0:\n+            return 1\n+        # Without top-k, top-p reads the whole distribution; min-p is applied\n+        # before top-k.\n+        top_k = int(states.top_k.np[sampled].max())\n+        if top_k > min(self.MAX_TOP_K, self.block_max.shape[1]) or np.any(\n+            states.min_p.np[sampled] != 0.0\n+        ):\n+            return None\n+        return top_k\n+\n+    def __call__(self, x: torch.Tensor, top_k: int = 1) -> torch.Tensor:\n+        num_tokens = x.shape[0]\n+        vocab_size = self.vocab_size\n+        assert num_tokens <= self.max_num_tokens\n+        x = x.contiguous()\n+        ub = self.ub[:num_tokens]\n+        cand = self.cand[:num_tokens]\n+        block_max = self.block_max[:num_tokens]\n+        # A single token block, so the FP8 weights are read once.\n+        block_n = max(16, triton.next_power_of_2(num_tokens))\n+        _screen_kernel[(triton.cdiv(vocab_size, self.BLOCK_V),)](\n+            x,\n+            self.w_fp8,\n+            self.scale,\n+            self.err,\n+            ub,\n+            block_max,\n+            num_tokens,\n+            vocab_size,\n+            self.hidden_size,\n+            BLOCK_N=block_n,\n+            BLOCK_V=self.BLOCK_V,\n+            BLOCK_H=self.BLOCK_H,\n+        )\n+        t = block_max.topk(top_k, dim=-1).values[:, -1].contiguous()\n+        logits = torch.empty(num_tokens, vocab_size, device=x.device, dtype=x.dtype)\n+        num_cand = torch.zeros(num_tokens, device=x.device, dtype=torch.int32)\n+        _select_kernel[(num_tokens, triton.cdiv(vocab_size, self.SELECT_BLOCK))](\n+            ub,\n+            t,\n+            logits,\n+            cand,\n+            num_cand,\n+            vocab_size,\n+            TIE=self.tie,\n+            BLOCK=self.SELECT_BLOCK,\n+        )\n+        _exact_kernel[(num_tokens, self.EXACT_PROGRAMS)](\n+            x,\n+            self.weight,\n+            cand,\n+            num_cand,\n+            logits,\n+            vocab_size,\n+            self.hidden_size,\n+            BLOCK_R=4,\n+            BLOCK_H=self.BLOCK_H,\n+        )\n+        return logits",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu%2Fsample%2Fscreened_head.py",
+      "sha": "f5beb2209f36fddde4612fb4dca97049ba83281b",
+      "status": "added"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu_worker.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fworker%2Fgpu_worker.py?ref=fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "deletions": 0,
+      "filename": "vllm/v1/worker/gpu_worker.py",
+      "patch": "@@ -1591,6 +1591,11 @@ def finish_weight_update(self) -> None:\n         # Weight transfer bypasses GPUModelRunner.reload_weights().\n         if not self._weight_update_is_draft:\n             self.model_runner.reset_lora_state()\n+        # A draft update can touch an lm_head shared with the target.\n+        if (\n+            screened_head := getattr(self.model_runner, \"screened_head\", None)\n+        ) is not None:\n+            screened_head.refresh()\n \n     def shutdown(self) -> None:\n         gc.unfreeze()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010/vllm%2Fv1%2Fworker%2Fgpu_worker.py",
+      "sha": "7605b36c49f267c04aeba1fe55a54585272412ca",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @stecasta.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-11T04:50:45Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60566#issuecomment-6105582664",
+      "updated_at": "2026-10-11T04:50:45Z",
+      "user": {
+        "login": "mergify"
+      }
+    }
+  ],
+  "number": 60566,
+  "refs": {
+    "base": {
+      "commit": "814301b26800a9d22a7d967a161aa07da4cbb5f2",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "fd0f9d3b7126f8c01d4706b62e33bcddd2ad5010",
+      "repository": "stecasta/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60566#pullrequestreview-5452721590",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-08T06:48:43Z",
+      "user": {
+        "login": "claude"
+      }
+    }
+  ]
+}

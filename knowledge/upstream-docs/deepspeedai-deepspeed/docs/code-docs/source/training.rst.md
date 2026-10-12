@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
 path: docs/code-docs/source/training.rst
-raw_sha256: 736b5d7621247fd0b666660af1c2ba8284ee0d2a36384342bb0329c165aeda94
+raw_sha256: eaab19b1588556cbe8e46a44fcdf66ca0f0c0971e7d89153a676c98d605f9a82
 sources: []
-generated_body_sha256: 9bd7883ab4efa7b7945bff753b30d63be8b9b80bb2f480c467670a07f3d8df69
+generated_body_sha256: 9aeaa02064fcff99f33b15d4956c9bd7d0041018350cb54c8cb2305cc66dd5ff
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/code-docs/source/training.rst
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/code-docs/source/training.rst)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/docs/code-docs/source/training.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -770,6 +770,8 @@ automatic sharding:
     )
 
 This serves as a hint to the compiler to know which inputs should be sharded across which dimension.
+``seq_dim`` applies to every prepared tensor, so use ``seq_dim=0`` for sequence-first ``[seq, batch]`` inputs.
+The compiler records it on the tagged inputs and shards along that dimension.
 
 Memory Optimization
 ~~~~~~~~~~~~~~~~~~~
@@ -787,3 +789,12 @@ Limitations
 AutoSP currently supports only ``torch.nn.functional.scaled_dot_product_attention``. Other attention patterns require additional pattern matching logic.
 
 AutoSP requires a fully connected computation graph without breaks. Graph breaks destroy the use-def chains across graphs and the compiler cannot propoaget sequence dimension sharding information.
+
+An ``attn_mask`` passed to ``scaled_dot_product_attention()`` may be built from the sharded sequence along its query
+dimension: AutoSP gathers the query rows across the sequence parallel group before attention. Its key dimension must
+cover the full sequence, for example by building it from the unsharded 2D padding ``attention_mask``. Masks whose key
+dimension comes from sharded tensors are rejected at compile time. The mask head dimension (the third-to-last
+dimension of a 3D or 4D mask) may be 1 or the number of query heads; a per-head mask is redistributed like the query,
+so each rank keeps the heads it attends with. Without sequence sharding (``sequence_parallel_size`` 1) the mask is
+used as is. Masks may
+require gradients, for example a learnable position bias.

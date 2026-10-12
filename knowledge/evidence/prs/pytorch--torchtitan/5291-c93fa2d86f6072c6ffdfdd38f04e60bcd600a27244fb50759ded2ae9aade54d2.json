@@ -1,0 +1,330 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "d4aa4c67fe14d23dbd8054b0c60d7acd795f62e1",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** On a busy controller the batcher waits on the GIL: one batch takes 3.7-5.4 s instead of 0.2 s (CPU benchmark). This PR moves the builder and the batcher into their own process (`BatcherActor`). Under the same load a batch takes 0.61-0.70 s: the batcher registers each batch as `RDMAMicrobatch`es and returns only those, trainer ranks read from its process, and the controller never touches the batch's bytes. Stacked on the trainer-pull PRs.\n\n**Problem**\n1. **One GIL.** `_batcher_loop` builds training samples and packs microbatches inside the controller process.\n2. **Busy loop.** On large runs, the controller's event loop holds that GIL most of the time, serving rollouts.\n3. **Build blocks.** `build_from_group` runs on the event loop, so every rollout waits for it.\n4. **Pack waits.** `add_training_samples` runs in `asyncio.to_thread` and, after each torch op, waits up to 5 ms (`sys.getswitchinterval()`) to get the GIL back.\n5. **How much.** A batch is thousands of small torch ops: 0.2 s alone, 3.7-5.4 s next to a busy loop.\n6. **At scale.** On a 10-node agentic run, the trainer idled 54% of each step: the batcher took 100-180 s per batch vs 80 s of forward/backward.\n\n```text\nbefore (controller process, one GIL)\n  event loop thread:  serve rollouts, ..., build_from_group        <- holds the GIL most of the time\n  to_thread worker:   add_training_samples, then register          <- every torch op: release, wait up to 5 ms\n```\n\n**Solution**\n1. **Own GIL.** Build and pack in a separate process, as the router already does.\n2. **`BatcherActor`** (`torchtitan/rl/distributed/monarch_actors/batcher.py`) owns the builder and the batcher. `add_group(rollout_group=...)` registers each finished batch's microbatches as `RDMAMicrobatch`es, keeps the tensors, and returns those.\n3. **Release.** After `forward_backward` (in a `finally`, so a failed step frees its batch too), the trainer loop calls `batcher.release_oldest_batch.broadcast()`, which drops the oldest batch's buffers. Not awaited, so it never waits behind an in-flight `add_group` (awaited, it waited p50 255 ms behind a pack); batches train in order through the one-batch queue.\n4. **The controller no longer registers or drops** (removed from the first PR's controller block). With `enable_rdma` False (the default), `BatcherActor.__init__` now turns ibverbs off for its own process, as the controller did.\n5. **Wiring.** `setup_async` spawns the actor on a one-process mesh on the controller host; the step reaches it with `broadcast`, like the release.\n6. **Unchanged:** `Batcher`, `TrainingSampleBuilder`, the batch order, the one-batch queue, and the trainer side (it reads as before, now from the batcher's process).\n\n```text\nafter\n  controller:       await batcher.add_group.call_one(rollout_group=group)          <- pickle a group, unpickle RDMAMicrobatches\n                    await trainer.forward_backward.call(packed.microbatches, ...)   <- RDMAMicrobatches\n                    batcher.release_oldest_batch.broadcast()\n  batcher process:  build_from_group + add_training_samples + register buffers (its own GIL; owns the tensors)\n  trainer ranks:    read their columns from the batcher process over RDMA\n```\n\n**Results**\n\nCPU benchmark, devserver CPU, torch 2.15 nightly, torchmonarch 0.6.0: 8 groups x 8 rollouts x 8 turns -> 1 batch of 32 microbatches, dp 4. A task on the controller's event loop burns CPU for <load> of every 10 ms. Wall time per batch:\n```text\n                 main (in the controller)   this PR\nloop idle        0.23-0.25 s                0.35-0.36 s\nloop 50% busy    0.39-0.41 s                0.36-0.45 s\nloop 100% busy   3.7-5.4 s                  0.61-0.70 s\n```\n\n- **Same batch:** the unit test spawns the actor; its batches, read from the test process as a trainer rank would, match the in-process builder + batcher's, every tensor exact.\n- **On an idle loop** this costs ~0.1 s more per batch, for pickling the groups and registering buffers.\n\nYou may ask:\n- **Why not a `ProcessPoolExecutor`?** Its pipe moves the batch in 64 KB reads, each one a GIL handoff: 26 s at 100% load.\n- **Why `async` endpoints?** Monarch rejects an actor that mixes sync and async endpoints, and the release awaits the buffer drops. They stay plain `@endpoint`, so groups are processed one at a time, in arrival order.\n- **Why FIFO release, not keyed by step?** The batcher doesn't know a batch's step when it packs it, and batches train in order. A lost broadcast only holds one extra batch; it never frees an unread one.\n- **Why not `sys.setswitchinterval(0.0005)`?** It cuts the busy-loop time 4x (3.2 s -> 0.75 s), but it's process-wide: the event loop gets preempted 10x more often.\n- **Why not fewer torch ops in the packer?** The cost is still ops x 5 ms, and it grows with the microbatch count.\n- **Why not move rollout serving out of the controller?** It removes the load at its source, but it's a larger change; the batcher should stay off the controller's GIL either way.\n\nNOTE:\n- **The input side remains.** Sending a group pickles it on the event loop: 0.02 s for 8 rollouts x 8 turns, 0.04-0.07 s for 8 rollouts x 40 turns (each turn stores its full prompt). Main's on-loop build took 0.003 s and 0.02 s for those groups; router replay and top-k add per-token data.\n- **Memory:** the batcher holds the batch being trained, the queued one, and one more if `_batcher_loop` is blocked on the queue: up to 3 at peak (~53 GB at 17.8 GB per batch with router replay), plus transient copies on the TCP fallback; the controller holds none. A released batch's memory goes back by the batcher's next call.\n- **CUDA context:** the context that silences Monarch's per-buffer log moves from the controller into the batcher process, which now registers the buffers (~256 MiB on GPU 0, 0 `[RdmaXcel]` lines in the GPU run vs 152 before). It's created at spawn, while trainer rank 0 starts on GPU 0; on exclusive-process GPUs one of them fails.\n- **Needs Monarch ≥ 0.7** (main pins it): its drop lock is reentrant, so the batcher keeps only the `RDMAMicrobatch`es. On 0.6 the batcher hangs within its first few steps.\n- **Reads don't slow down while the batcher works** (CPU probe, 4 readers, 81.7 MB microbatches): 115 ms per microbatch idle vs 105-117 ms while the batcher spins, packs or registers. The owner side of a read needs neither its GIL nor its actor loop.\n- **Spans:** `training_sample_builder` and `batcher_pack` move to a new `rl_batcher` structured log; the controller logs `batcher_add_group` around the call.\n- **Config errors** (e.g. `num_tokens_per_microbatch_per_dp_rank` not a multiple of `max_context_length`) now fail at actor spawn, with the `ValueError` in the batcher process's traceback.\n- **The 10-node run** was on a branch whose `TrainingSample`s hold tensors, which packs with many more torch ops: 0.1 s -> 18 s under the same benchmark, vs main's 0.2 s -> 3.6-4.1 s. This PR has not run at scale.\n- **Not tested:** multiple hosts, the RL GPU CI.\n\nFollow up:\n- [ ] Send only the fields the builder reads, or let rollouts reach the batcher directly, if group pickling shows up in `batcher_add_group`.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu` (from the repo root, Monarch 0.7): 438 passed, 5 skipped; the 2 failures (`test_verifiers_terminal_bench.py`, a config mismatch) fail on main too.\n- `tests/rl/unit_tests/cpu/test_batcher_actor.py`: spawns `BatcherActor` in its own process (TCP). 5 groups (one untrainable) make batches A and B; after releasing A, B still reads back to the in-process batch, every tensor exact (256-token microbatches: the int64 fields cross by ref, the token counts by value). A builder error surfaces at `call_one`.\n- GPU, Qwen3-0.6B, H100, batch invariant, lockstep, trainer DP 2 (3 GPUs), Monarch 0.7, 5 steps through the batcher process with `enable_rdma=True`: `loss/mean` bitwise equal to main's DP 2 at every step, 0 `[RdmaXcel]` lines. Over TCP (the default), the next PR's head matches too.\n\n",
+      "changedFiles": 7,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "felipemello1"
+            },
+            "body": "reply from claude:\n\nThanks! I pushed one commit:\n- **Your test:** the batcher makes batches A and B and releases A once; B still reads back exactly. A second actor on the same mesh with the threshold unset (the new default) returns both batches by value.\n- **Comments:**\n  - Why each held batch keeps its tensors: Monarch 0.6's drop deadlock.\n  - The batcher drops the buffers it owns itself, in `release_oldest_batch`, so the drop stays on the owner's host even if the batcher moves. The controller doesn't drop anything in this PR.\n- **Monarch 0.7:** I'm testing it in a separate PR. If it fixes the deadlock in our stress repro, I'll drop the delayed free and the held batches here.\n",
+            "createdAt": "2026-10-12T01:09:36Z",
+            "updatedAt": "2026-10-12T01:09:36Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5291#issuecomment-6115969923"
+          },
+          {
+            "author": {
+              "login": "felipemello1"
+            },
+            "body": "reply from claude:\r\n@pzhan9 \r\nMoved to Monarch 0.7 in one new commit. The batcher keeps only the `RDMAMicrobatch`es; the held `TrainerStepBatch` and the delayed free are gone. Both were only there for 0.6's drop deadlock, and 0.7's cache lock is reentrant.\r\n\r\n```text\r\nCPU, TCP fallback                0.6.0               0.7.0\r\nfree the tensors, then drop()    hangs at step 0     600 of 600 steps x 200 buffers\r\ndrop(), then free right away     3 of 18 runs hang   0 of 22 runs, 120K buffers each\r\n```\r\n\r\nYour A/B test now also covers this: B reads back exactly after the batcher has dropped its references to B's tensors. A stress run of the real `BatcherActor` in this order was clean over TCP and ibverbs. On GPU (Qwen3-0.6B, 5 steps through the batcher process), loss is bitwise equal with the fast path on and off. This needs the Monarch 0.7 floor, which lands first.\r\n",
+            "createdAt": "2026-10-12T03:18:13Z",
+            "updatedAt": "2026-10-12T03:21:16Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5291#issuecomment-6117117709"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWybzw0=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "merged": false,
+      "number": 5291,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "pzhan9"
+            },
+            "body": "over all lgtm. But we should move to 0.7 if possible, since it seems to fix the deadlock bug this PR tries to workaround.\n\nAlso please check if you need to add this test:\n\n> The main invariant isn't tested. test_batcher_actor.py only produces one batch. The PR relies on \"FIFO release never frees an\n     unread batch\", so a cheap extra case would help: produce batches A and B, call release_oldest_batch once, then confirm B's refs\n     still read back exactly.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "pzhan9"
+                  },
+                  "body": "We should add a comment saying it is important for `batcher_mesh` to collocate with controller, since controller needs to drop microbatch_refs, and the drop implementation assuming the caller is on the same host.  \n\nThis detail is important since we might consider distributed batcher in the future, e.g. colocate batcher with trainer DP ranks. ",
+                  "createdAt": "2026-10-11T21:01:23Z",
+                  "line": 603,
+                  "originalLine": 582,
+                  "path": "torchtitan/rl/controller.py",
+                  "updatedAt": "2026-10-12T00:57:52Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5291#discussion_r4243206214"
+                },
+                {
+                  "author": {
+                    "login": "pzhan9"
+                  },
+                  "body": "0.7 was cut yesterday. Let us use it now? https://github.com/meta-pytorch/monarch/releases/tag/v0.7.0",
+                  "createdAt": "2026-10-11T21:06:31Z",
+                  "line": null,
+                  "originalLine": 123,
+                  "path": "torchtitan/rl/distributed/monarch_actors/batcher.py",
+                  "updatedAt": "2026-10-12T00:57:52Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5291#discussion_r4243221843"
+                },
+                {
+                  "author": {
+                    "login": "pzhan9"
+                  },
+                  "body": "why do we need to keep `TrainerStepBatch` around? If it is due to a Monarch bug, it should say so in the comment.",
+                  "createdAt": "2026-10-12T00:55:59Z",
+                  "line": null,
+                  "originalLine": 79,
+                  "path": "torchtitan/rl/distributed/actors/batcher.py",
+                  "updatedAt": "2026-10-12T00:57:52Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5291#discussion_r4243951474"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xMlQwMDo1NTo1OVrO_PWPcg==",
+                "hasNextPage": false
+              },
+              "totalCount": 3
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-12T00:57:52Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5291#pullrequestreview-5484933689"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMlQwMDo1Nzo1Mlq0MjAyNi0xMC0xMVQyMTowMToyM1rPAAAAAUbtcjk=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[rl] Build and pack training batches in their own process",
+      "updatedAt": "2026-10-12T06:41:54Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5291"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "d4aa4c67fe14d23dbd8054b0c60d7acd795f62e1"
+    },
+    "body": "**TLDR:** On a busy controller the batcher waits on the GIL: one batch takes 3.7-5.4 s instead of 0.2 s (CPU benchmark). This PR moves the builder and the batcher into their own process (`BatcherActor`). Under the same load a batch takes 0.61-0.70 s: the batcher registers each batch as `RDMAMicrobatch`es and returns only those, trainer ranks read from its process, and the controller never touches the batch's bytes. Stacked on the trainer-pull PRs.\n\n**Problem**\n1. **One GIL.** `_batcher_loop` builds training samples and packs microbatches inside the controller process.\n2. **Busy loop.** On large runs, the controller's event loop holds that GIL most of the time, serving rollouts.\n3. **Build blocks.** `build_from_group` runs on the event loop, so every rollout waits for it.\n4. **Pack waits.** `add_training_samples` runs in `asyncio.to_thread` and, after each torch op, waits up to 5 ms (`sys.getswitchinterval()`) to get the GIL back.\n5. **How much.** A batch is thousands of small torch ops: 0.2 s alone, 3.7-5.4 s next to a busy loop.\n6. **At scale.** On a 10-node agentic run, the trainer idled 54% of each step: the batcher took 100-180 s per batch vs 80 s of forward/backward.\n\n```text\nbefore (controller process, one GIL)\n  event loop thread:  serve rollouts, ..., build_from_group        <- holds the GIL most of the time\n  to_thread worker:   add_training_samples, then register          <- every torch op: release, wait up to 5 ms\n```\n\n**Solution**\n1. **Own GIL.** Build and pack in a separate process, as the router already does.\n2. **`BatcherActor`** (`torchtitan/rl/distributed/monarch_actors/batcher.py`) owns the builder and the batcher. `add_group(rollout_group=...)` registers each finished batch's microbatches as `RDMAMicrobatch`es, keeps the tensors, and returns those.\n3. **Release.** After `forward_backward` (in a `finally`, so a failed step frees its batch too), the trainer loop calls `batcher.release_oldest_batch.broadcast()`, which drops the oldest batch's buffers. Not awaited, so it never waits behind an in-flight `add_group` (awaited, it waited p50 255 ms behind a pack); batches train in order through the one-batch queue.\n4. **The controller no longer registers or drops** (removed from the first PR's controller block). With `enable_rdma` False (the default), `BatcherActor.__init__` now turns ibverbs off for its own process, as the controller did.\n5. **Wiring.** `setup_async` spawns the actor on a one-process mesh on the controller host; the step reaches it with `broadcast`, like the release.\n6. **Unchanged:** `Batcher`, `TrainingSampleBuilder`, the batch order, the one-batch queue, and the trainer side (it reads as before, now from the batcher's process).\n\n```text\nafter\n  controller:       await batcher.add_group.call_one(rollout_group=group)          <- pickle a group, unpickle RDMAMicrobatches\n                    await trainer.forward_backward.call(packed.microbatches, ...)   <- RDMAMicrobatches\n                    batcher.release_oldest_batch.broadcast()\n  batcher process:  build_from_group + add_training_samples + register buffers (its own GIL; owns the tensors)\n  trainer ranks:    read their columns from the batcher process over RDMA\n```\n\n**Results**\n\nCPU benchmark, devserver CPU, torch 2.15 nightly, torchmonarch 0.6.0: 8 groups x 8 rollouts x 8 turns -> 1 batch of 32 microbatches, dp 4. A task on the controller's event loop burns CPU for <load> of every 10 ms. Wall time per batch:\n```text\n                 main (in the controller)   this PR\nloop idle        0.23-0.25 s                0.35-0.36 s\nloop 50% busy    0.39-0.41 s                0.36-0.45 s\nloop 100% busy   3.7-5.4 s                  0.61-0.70 s\n```\n\n- **Same batch:** the unit test spawns the actor; its batches, read from the test process as a trainer rank would, match the in-process builder + batcher's, every tensor exact.\n- **On an idle loop** this costs ~0.1 s more per batch, for pickling the groups and registering buffers.\n\nYou may ask:\n- **Why not a `ProcessPoolExecutor`?** Its pipe moves the batch in 64 KB reads, each one a GIL handoff: 26 s at 100% load.\n- **Why `async` endpoints?** Monarch rejects an actor that mixes sync and async endpoints, and the release awaits the buffer drops. They stay plain `@endpoint`, so groups are processed one at a time, in arrival order.\n- **Why FIFO release, not keyed by step?** The batcher doesn't know a batch's step when it packs it, and batches train in order. A lost broadcast only holds one extra batch; it never frees an unread one.\n- **Why not `sys.setswitchinterval(0.0005)`?** It cuts the busy-loop time 4x (3.2 s -> 0.75 s), but it's process-wide: the event loop gets preempted 10x more often.\n- **Why not fewer torch ops in the packer?** The cost is still ops x 5 ms, and it grows with the microbatch count.\n- **Why not move rollout serving out of the controller?** It removes the load at its source, but it's a larger change; the batcher should stay off the controller's GIL either way.\n\nNOTE:\n- **The input side remains.** Sending a group pickles it on the event loop: 0.02 s for 8 rollouts x 8 turns, 0.04-0.07 s for 8 rollouts x 40 turns (each turn stores its full prompt). Main's on-loop build took 0.003 s and 0.02 s for those groups; router replay and top-k add per-token data.\n- **Memory:** the batcher holds the batch being trained, the queued one, and one more if `_batcher_loop` is blocked on the queue: up to 3 at peak (~53 GB at 17.8 GB per batch with router replay), plus transient copies on the TCP fallback; the controller holds none. A released batch's memory goes back by the batcher's next call.\n- **CUDA context:** the context that silences Monarch's per-buffer log moves from the controller into the batcher process, which now registers the buffers (~256 MiB on GPU 0, 0 `[RdmaXcel]` lines in the GPU run vs 152 before). It's created at spawn, while trainer rank 0 starts on GPU 0; on exclusive-process GPUs one of them fails.\n- **Needs Monarch ≥ 0.7** (main pins it): its drop lock is reentrant, so the batcher keeps only the `RDMAMicrobatch`es. On 0.6 the batcher hangs within its first few steps.\n- **Reads don't slow down while the batcher works** (CPU probe, 4 readers, 81.7 MB microbatches): 115 ms per microbatch idle vs 105-117 ms while the batcher spins, packs or registers. The owner side of a read needs neither its GIL nor its actor loop.\n- **Spans:** `training_sample_builder` and `batcher_pack` move to a new `rl_batcher` structured log; the controller logs `batcher_add_group` around the call.\n- **Config errors** (e.g. `num_tokens_per_microbatch_per_dp_rank` not a multiple of `max_context_length`) now fail at actor spawn, with the `ValueError` in the batcher process's traceback.\n- **The 10-node run** was on a branch whose `TrainingSample`s hold tensors, which packs with many more torch ops: 0.1 s -> 18 s under the same benchmark, vs main's 0.2 s -> 3.6-4.1 s. This PR has not run at scale.\n- **Not tested:** multiple hosts, the RL GPU CI.\n\nFollow up:\n- [ ] Send only the fields the builder reads, or let rollouts reach the batcher directly, if group pickling shows up in `batcher_add_group`.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu` (from the repo root, Monarch 0.7): 438 passed, 5 skipped; the 2 failures (`test_verifiers_terminal_bench.py`, a config mismatch) fail on main too.\n- `tests/rl/unit_tests/cpu/test_batcher_actor.py`: spawns `BatcherActor` in its own process (TCP). 5 groups (one untrainable) make batches A and B; after releasing A, B still reads back to the in-process batch, every tensor exact (256-token microbatches: the int64 fields cross by ref, the token counts by value). A builder error surfaces at `call_one`.\n- GPU, Qwen3-0.6B, H100, batch invariant, lockstep, trainer DP 2 (3 GPUs), Monarch 0.7, 5 steps through the batcher process with `enable_rdma=True`: `loss/mean` bitwise equal to main's DP 2 at every step, 0 `[RdmaXcel]` lines. Over TCP (the default), the next PR's head matches too.\n\n",
+    "changed_files": 7,
+    "head": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "285d0dc18fd2d166cbcf672469e7fe1557caafd9"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5291",
+    "merged": false,
+    "number": 5291,
+    "state": "open",
+    "title": "[rl] Build and pack training batches in their own process",
+    "updated_at": "2026-10-12T06:41:54Z"
+  },
+  "files": [
+    {
+      "additions": 141,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/285d0dc18fd2d166cbcf672469e7fe1557caafd9/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py",
+      "changes": 141,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py?ref=285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "deletions": 0,
+      "filename": "tests/rl/unit_tests/cpu/test_batcher_actor.py",
+      "patch": "@@ -0,0 +1,141 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"BatcherActor, in its own process, returns the in-process builder + batcher's batch as RDMAMicrobatches.\"\"\"\n+\n+import asyncio\n+import dataclasses\n+\n+import pytest\n+import torch\n+from monarch.actor import ActorError, this_host\n+\n+from torchtitan.rl.components.batcher import Batcher\n+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder\n+from torchtitan.rl.distributed.monarch_actors.batcher import BatcherActor\n+from torchtitan.rl.distributed.rdma_microbatch import _TensorRef\n+from torchtitan.rl.rollout.types import (\n+    Rollout,\n+    RolloutGroup,\n+    RolloutStatus,\n+    RolloutTurn,\n+    RolloutTurnID,\n+)\n+\n+_BATCHER_KWARGS = dict(\n+    num_tokens_per_microbatch_per_dp_rank=256,\n+    max_context_length=16,\n+    num_prompts_per_train_step=2,\n+    dp_degree=2,\n+    pad_id=0,\n+    temperature=1.0,\n+)\n+\n+\n+def _group(group_id: int, rewards: list[float]) -> RolloutGroup:\n+    rollouts = [\n+        Rollout(\n+            group_id=group_id,\n+            rollout_id=rollout_id,\n+            turns=[\n+                RolloutTurn(\n+                    rollout_id=RolloutTurnID(\n+                        group_id=group_id, rollout_id=rollout_id, turn_id=0\n+                    ),\n+                    prompt_token_ids=[1, 2, 3],\n+                    completion_token_ids=[4 + rollout_id, 5],\n+                    completion_logprobs=[-0.5, -0.25],\n+                    min_policy_version=0,\n+                    max_policy_version=0,\n+                )\n+            ],\n+            status=RolloutStatus.COMPLETED,\n+            reward=reward,\n+            advantage=reward - sum(rewards) / len(rewards),\n+        )\n+        for rollout_id, reward in enumerate(rewards)\n+    ]\n+    return RolloutGroup(group_id=group_id, rollouts=rollouts)\n+\n+\n+def test_batcher_actor_returns_the_in_process_batch(tmp_path) -> None:\n+    # Batch A after group 2, batch B after group 4. Group 1 has zero reward spread, so the\n+    # builder drops it: it rides along but isn't trainable.\n+    groups = [\n+        _group(0, [0.0, 1.0]),\n+        _group(1, [1.0, 1.0]),\n+        _group(2, [1.0, 0.0]),\n+        _group(3, [0.0, 1.0]),\n+        _group(4, [1.0, 0.0]),\n+    ]\n+\n+    builder = TrainingSampleBuilder.Config().build()\n+    batcher = Batcher.Config().build(**_BATCHER_KWARGS)\n+    expected = [\n+        batcher.add_training_samples(\n+            training_sample_group=builder.build_from_group(rollout_group=group)\n+        )\n+        for group in groups\n+    ]\n+\n+    async def run() -> tuple[list, list]:\n+        mesh = this_host().spawn_procs(per_host={\"cpus\": 1})\n+        try:\n+            actor = mesh.spawn(\n+                \"batcher\",\n+                BatcherActor,\n+                training_sample_builder_config=TrainingSampleBuilder.Config(),\n+                batcher_config=Batcher.Config(),\n+                batcher_kwargs=_BATCHER_KWARGS,\n+                enable_rdma=False,\n+                output_dir=str(tmp_path),\n+                enable_structured_logging=False,\n+            )\n+            results = [\n+                await actor.add_group.call_one(rollout_group=group) for group in groups\n+            ]\n+            # Release A once: B, still held, must read back exactly, as a trainer rank reads it.\n+            await actor.release_oldest_batch.call_one()\n+            microbatches_b = [\n+                [await rdma_microbatch.read() for rdma_microbatch in row]\n+                for row in results[4][0].microbatches\n+            ]\n+            # A builder error surfaces at call_one.\n+            no_advantage = _group(5, [0.0, 1.0])\n+            no_advantage.rollouts[0].advantage = None\n+            with pytest.raises(ActorError, match=\"has no advantage\"):\n+                await actor.add_group.call_one(rollout_group=no_advantage)\n+            return results, microbatches_b\n+        finally:\n+            await mesh.stop()\n+\n+    results, microbatches_b = asyncio.run(run())\n+\n+    assert [(batch is None, trainable) for batch, trainable in results] == [\n+        (True, True),\n+        (True, False),\n+        (False, True),\n+        (True, True),\n+        (False, True),\n+    ]\n+    batch_b = results[4][0]\n+    assert [results[2][0].group_ids, batch_b.group_ids] == [[0, 1, 2], [3, 4]]\n+    # int64 fields (2 KiB) cross processes by ref; the token counts go by value.\n+    assert isinstance(batch_b.microbatches[0][0].fields[\"input\"], _TensorRef)\n+    assert isinstance(\n+        batch_b.microbatches[0][0].fields[\"loss_token_counts\"], torch.Tensor\n+    )\n+\n+    def comparable(batch) -> dict:\n+        # assert_close can't compare metric objects; every other field must match exactly.\n+        return dataclasses.asdict(dataclasses.replace(batch, metrics=[]))\n+\n+    torch.testing.assert_close(\n+        comparable(dataclasses.replace(batch_b, microbatches=microbatches_b)),\n+        comparable(expected[4][0]),\n+        rtol=0,\n+        atol=0,\n+    )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/285d0dc18fd2d166cbcf672469e7fe1557caafd9/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py",
+      "sha": "02298a50daaf8f7ff5ad7f145be97392f9e95a9f",
+      "status": "added"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/285d0dc18fd2d166cbcf672469e7fe1557caafd9/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py?ref=285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "deletions": 1,
+      "filename": "tests/rl/unit_tests/cpu/test_rdma_microbatch.py",
+      "patch": "@@ -27,7 +27,7 @@\n \n \n class _FakeRDMABuffer:\n-    \"\"\"Stands in for `monarch.rdma.RDMABuffer`: keeps the controller's byte view.\"\"\"\n+    \"\"\"Stands in for `monarch.rdma.RDMABuffer`: keeps the batcher's byte view.\"\"\"\n \n     def __init__(self, data: torch.Tensor) -> None:\n         self.data = data",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/285d0dc18fd2d166cbcf672469e7fe1557caafd9/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py",
+      "sha": "41c3fa058085e327b8349b572acea611d6306bee",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fcomponents%2Fbatcher.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fcomponents%2Fbatcher.py?ref=285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "deletions": 1,
+      "filename": "torchtitan/rl/components/batcher.py",
+      "patch": "@@ -13,6 +13,7 @@\n import logging\n import math\n from dataclasses import dataclass, replace\n+from typing import TYPE_CHECKING\n \n import torch\n \n@@ -26,6 +27,9 @@\n )\n from torchtitan.rl.observability import metrics as m\n \n+if TYPE_CHECKING:\n+    from torchtitan.rl.distributed.rdma_microbatch import RDMAMicrobatch\n+\n logger = logging.getLogger(__name__)\n \n \n@@ -67,7 +71,8 @@ class TrainerStepBatch:\n         # global_routing_token_counts = per-depth non-padding token counts\n     \"\"\"\n \n-    microbatches: list[list[TrainingMicrobatch]]  # [num_microbatches][dp_degree]\n+    # [num_microbatches][dp_degree]; RDMAMicrobatches once BatcherActor registers them\n+    microbatches: list[list[TrainingMicrobatch]] | list[list[\"RDMAMicrobatch\"]]\n     global_loss_token_counts: torch.Tensor\n     global_routing_token_counts: torch.Tensor\n     metrics: list[m.Metric]",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fcomponents%2Fbatcher.py",
+      "sha": "06b87e4ec5ebfec0688661014fbe389ba8f3ad19",
+      "status": "modified"
+    },
+    {
+      "additions": 50,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fcontroller.py",
+      "changes": 117,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fcontroller.py?ref=285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "deletions": 67,
+      "filename": "torchtitan/rl/controller.py",
+      "patch": "@@ -40,17 +40,16 @@\n                                                   v\n _batcher_loop\n +----------------------------------------------------------------------------------------+\n-| training_sample_group = training_sample_builder.build_from_group(rollout_group=group)  |\n+| batch, trainable = batcher.add_group.call_one(group)                                   |\n | if no trainable samples: group_buffer.release_active_groups(1, \"untrainable_group\")    |\n-| batch, trainable = batcher.add_training_samples(training_sample_group)                  |\n | training_batch_queue.put(TrainerStepBatch)                                             |\n +-----------------------+------------------------------+---------------------------------+\n                         |  ^                           |\n           add group     |  | maybe_training_batch      | put batch\n                         v  |                           v\n-Batcher                                              training_batch_queue\n+BatcherActor (own process)                           training_batch_queue\n +-------------------------------------------------+   +----------------------------------------------+\n-| accumulated TrainingSampleGroups                |   | size 1; holds TrainerStepBatch | None        |\n+| build_from_group -> add_training_samples        |   | size 1; holds TrainerStepBatch | None        |\n | pack at num_prompts_per_train_step               |   +---------------------+------------------------+\n +-------------------------------------------------+                         |\n                                                                          | packed = training_batch_queue.get()\n@@ -97,8 +96,6 @@\n import warnings\n from dataclasses import dataclass, field, replace\n \n-import monarch\n-\n # PYTORCH_CUDA_ALLOC_CONF is set in torchtitan/rl/__init__.py (before torch is imported)\n # and in train.py; see the note there.\n import torch  # noqa: F401\n@@ -116,12 +113,9 @@\n     RolloutGroupWork,\n     RolloutGroupWorkBuffer,\n )\n+from torchtitan.rl.distributed.monarch_actors.batcher import BatcherActor\n from torchtitan.rl.distributed.monarch_actors.generator import VLLMGeneratorActor\n from torchtitan.rl.distributed.monarch_actors.trainer import TrainerActor\n-from torchtitan.rl.distributed.rdma_microbatch import (\n-    create_cuda_context_to_silence_monarch_log,\n-    RDMAMicrobatch,\n-)\n from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter\n from torchtitan.rl.distributed.torch_elastic import setup_torch_elastic_env\n from torchtitan.rl.distributed.weight_sync import WeightSyncManager\n@@ -426,6 +420,7 @@ def __init__(self, config: Config):\n         config.maybe_log()\n         self.trainer: Trainer | None = None\n         self.generator_router: InterGeneratorRouter | None = None\n+        self.batcher: BatcherActor | None = None\n         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.\n         self.start_step = 0\n         self._proc_meshes = []\n@@ -603,8 +598,16 @@ async def setup_async(\n             # controller's process so routing does not contend with the training\n             # loop for the controller's GIL.\n             router_mesh = this_host().spawn_procs(per_host={\"cpus\": 1})\n+            # Same for the batcher: build + pack would contend for the controller's GIL.\n+            # It drops its own buffers (release_oldest_batch): Monarch's drop must run on the owner's host.\n+            batcher_mesh = this_host().spawn_procs(per_host={\"cpus\": 1})\n             # Store proc meshes for cleanup\n-            self._proc_meshes = [router_mesh, trainer_mesh, *generator_meshes]\n+            self._proc_meshes = [\n+                router_mesh,\n+                batcher_mesh,\n+                trainer_mesh,\n+                *generator_meshes,\n+            ]\n \n             await setup_torch_elastic_env(trainer_mesh)\n             for generator_mesh in generator_meshes:\n@@ -642,6 +645,25 @@ async def setup_async(\n                 config.generator_router,\n                 generators=generators,\n             )\n+            self.batcher = batcher_mesh.spawn(\n+                \"batcher\",\n+                BatcherActor,\n+                training_sample_builder_config=async_loop.training_sample_builder,\n+                batcher_config=async_loop.batcher,\n+                batcher_kwargs=dict(\n+                    num_tokens_per_microbatch_per_dp_rank=(\n+                        config.trainer.training.num_tokens_per_microbatch_per_dp_rank\n+                    ),\n+                    max_context_length=config.trainer.training.max_context_length,\n+                    num_prompts_per_train_step=async_loop.num_prompts_per_train_step,\n+                    dp_degree=self.trainer_dp_degree,\n+                    pad_id=self.tokenizer.eos_id,\n+                    temperature=self._sampling.temperature,\n+                ),\n+                enable_rdma=async_loop.enable_rdma,\n+                output_dir=config.dump_folder,\n+                enable_structured_logging=config.trainer.debug.enable_structured_logging,\n+            )\n \n             await self._rollouter.setup_async(\n                 tokenizer_config=config.tokenizer,\n@@ -692,11 +714,6 @@ async def setup_async(\n             )\n         if self.start_step > 0:\n             logger.info(f\"Resuming RL training from step {self.start_step}\")\n-        if not config.async_loop.enable_rdma:\n-            # Trainer ranks read this process's buffers over TCP. After spawning, so trainer and\n-            # generator processes keep ibverbs for weight sync; before the first buffer, or it's ignored.\n-            monarch.configure(rdma_disable_ibverbs=True)\n-        create_cuda_context_to_silence_monarch_log()\n \n         # Start each generator's engine loop on all ranks once, before any\n         # rank-0-only generate / pull (rank 0 drives the followers through this\n@@ -841,21 +858,6 @@ async def run(self) -> None:\n             num_prompts_per_train_step=async_loop.num_prompts_per_train_step,\n         )\n \n-        # training_sample_builder\n-        training_sample_builder = async_loop.training_sample_builder.build()\n-\n-        # batcher\n-        batcher = async_loop.batcher.build(\n-            num_tokens_per_microbatch_per_dp_rank=(\n-                self.config.trainer.training.num_tokens_per_microbatch_per_dp_rank\n-            ),\n-            max_context_length=self.config.trainer.training.max_context_length,\n-            num_prompts_per_train_step=async_loop.num_prompts_per_train_step,\n-            dp_degree=self.trainer_dp_degree,\n-            pad_id=self.tokenizer.eos_id,\n-            temperature=self._sampling.temperature,\n-        )\n-\n         # training_batch_queue\n         training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(\n             maxsize=1\n@@ -887,8 +889,7 @@ async def run(self) -> None:\n         batcher_task = asyncio.create_task(\n             self._batcher_loop(\n                 group_buffer=self._group_buffer,\n-                training_sample_builder=training_sample_builder,\n-                batcher=batcher,\n+                batcher=self.batcher,\n                 training_batch_queue=training_batch_queue,\n             ),\n             name=\"batcher\",\n@@ -1043,11 +1044,10 @@ async def _batcher_loop(\n         self,\n         *,\n         group_buffer: RolloutGroupWorkBuffer,\n-        training_sample_builder: TrainingSampleBuilder,\n-        batcher: Batcher,\n+        batcher: BatcherActor,\n         training_batch_queue: \"asyncio.Queue[TrainerStepBatch | None]\",\n     ) -> None:\n-        \"\"\"Take finalized groups, build training_samples, accumulate them, and queue each ready training batch.\n+        \"\"\"Send finalized groups to the batcher actor and queue each training batch it returns.\n \n         On a clean close/shutdown the group_buffer drains and returns None; we forward a `None` sentinel\n         so the trainer stops.\n@@ -1064,18 +1064,13 @@ async def _batcher_loop(\n             if rollout_group is None:  # closed and drained\n                 logger.info(\"Buffer drained; batcher loop stopping\")\n                 break\n-            with sl.log_trace_span(\"training_sample_builder\"):\n-                training_sample_group = training_sample_builder.build_from_group(\n-                    rollout_group=rollout_group\n-                )\n-\n             # We put a group in. We may get a batch back\n             # if there are enough accumulated trainable groups to return one.\n-            with sl.log_trace_span(\"batcher_pack\"):\n-                maybe_training_batch, group_is_trainable = await asyncio.to_thread(\n-                    batcher.add_training_samples,\n-                    training_sample_group=training_sample_group,\n-                )\n+            with sl.log_trace_span(\"batcher_add_group\"):\n+                (\n+                    maybe_training_batch,\n+                    group_is_trainable,\n+                ) = await batcher.add_group.call_one(rollout_group=rollout_group)\n             if not group_is_trainable:\n                 await group_buffer.release_active_groups(1, reason=\"untrainable_group\")\n             if maybe_training_batch is not None:\n@@ -1112,6 +1107,8 @@ async def _trainer_loop(\n             with sl.log_trace_span(\"sync_log_step\"):\n                 await self.trainer.sync_log_step.call(step)\n                 await self.generator_router.sync_log_step.call_one(step)\n+                # Not awaited: it would wait behind an in-flight add_group.\n+                self.batcher.sync_log_step.broadcast(step)\n                 await self._rollouter.sync_log_step(step)\n             step_timer = MetricsTimer()\n \n@@ -1148,35 +1145,21 @@ async def _trainer_loop(\n                     sl.log_trace_span(\"forward_backward\"),\n                     step_timer.record(\"timing/step/forward_backward\"),\n                 ):\n-                    # Each rank reads its column from this process. Register in a thread: at\n-                    # ~0.15 ms per tensor (0.3 s for 2,200), doing it here would stall the rollouts.\n-                    # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks\n-                    # over TCP). Register in _batcher_loop and send the refs to the trainer\n-                    # during the previous optim_step, so each rank reads microbatch 0 then.\n-                    rdma_microbatches = await asyncio.to_thread(\n-                        lambda rows: [\n-                            [RDMAMicrobatch.register(microbatch) for microbatch in row]\n-                            for row in rows\n-                        ],\n-                        packed.microbatches,\n-                    )\n+                    # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over\n+                    # TCP). Send the RDMAMicrobatches to the trainer during the previous optim_step,\n+                    # so each rank reads microbatch 0 then.\n                     try:\n                         fwd_bwd_metrics = self._get_rank_0_value(\n                             await self.trainer.forward_backward.call(\n-                                rdma_microbatches,\n+                                packed.microbatches,\n                                 packed.global_loss_token_counts,\n                                 packed.global_routing_token_counts,\n                             )\n                         )\n                     finally:\n-                        # Every rank has read its column, or the step failed.\n-                        await asyncio.gather(\n-                            *(\n-                                rdma_microbatch.drop()\n-                                for row in rdma_microbatches\n-                                for rdma_microbatch in row\n-                            )\n-                        )\n+                        # Every rank has read its column from the batcher, or the step failed.\n+                        # Not awaited: it would wait behind an in-flight add_group.\n+                        self.batcher.release_oldest_batch.broadcast()\n \n                     if not math.isfinite(fwd_bwd_metrics[\"loss/mean\"]):\n                         logger.error(\"Loss is NaN/Inf; training diverged\")",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fcontroller.py",
+      "sha": "ad0b0f0f90bc99d3c4dd5e5b3f710500c3d25c5e",
+      "status": "modified"
+    },
+    {
+      "additions": 142,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fdistributed%2Fmonarch_actors%2Fbatcher.py",
+      "changes": 142,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fdistributed%2Fmonarch_actors%2Fbatcher.py?ref=285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "deletions": 0,
+      "filename": "torchtitan/rl/distributed/monarch_actors/batcher.py",
+      "patch": "@@ -0,0 +1,142 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"Monarch actor that turns finished rollout groups into training batches.\"\"\"\n+\n+from __future__ import annotations\n+\n+import asyncio\n+import dataclasses\n+from collections import deque\n+from typing import Any\n+\n+import monarch\n+from monarch.actor import Actor, endpoint\n+\n+from torchtitan.observability import structured_logger as sl\n+from torchtitan.observability.logging import init_logger\n+from torchtitan.rl.components.batcher import Batcher, TrainerStepBatch\n+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder\n+from torchtitan.rl.distributed.rdma_microbatch import (\n+    create_cuda_context_to_silence_monarch_log,\n+    RDMAMicrobatch,\n+)\n+from torchtitan.rl.rollout.types import RolloutGroup\n+\n+\n+class BatcherActor(Actor):\n+    \"\"\"Turns finished rollout groups into training batches, in its own process.\n+\n+    Keeps each batch's tensors until `release_oldest_batch` and returns `RDMAMicrobatch`es, so\n+    trainer ranks read from this process.\n+\n+    Why not in the controller, whose busy event loop holds the GIL:\n+        build on the loop thread:     blocks every rollout while it runs\n+        pack in `asyncio.to_thread`:  each torch op waits up to 5 ms (the GIL switch interval)\n+\n+    Args:\n+        training_sample_builder_config: Built in this process.\n+        batcher_config: Built in this process with `batcher_kwargs`.\n+        batcher_kwargs: Runtime kwargs for `batcher_config.build`, e.g. `dp_degree` and `pad_id`.\n+        enable_rdma: See `AsyncLoopConfig.enable_rdma`.\n+        output_dir: Where the structured logger writes this process's spans.\n+        enable_structured_logging: Whether to write those spans.\n+\n+    Example:\n+        batcher = this_host().spawn_procs(per_host={\"cpus\": 1}).spawn(\n+            \"batcher\",\n+            BatcherActor,\n+            training_sample_builder_config=TrainingSampleBuilder.Config(),\n+            batcher_config=Batcher.Config(),\n+            batcher_kwargs=dict(num_prompts_per_train_step=2, dp_degree=1, ...),\n+            enable_rdma=False,\n+            output_dir=\"outputs\",\n+            enable_structured_logging=False,\n+        )\n+        await batcher.add_group.call_one(rollout_group=group0)  # -> (None, True)\n+        await batcher.add_group.call_one(rollout_group=group1)  # -> (TrainerStepBatch of RDMAMicrobatches, True)\n+        batcher.release_oldest_batch.broadcast()  # once every trainer rank has read group1's batch\n+    \"\"\"\n+\n+    def __init__(\n+        self,\n+        *,\n+        training_sample_builder_config: TrainingSampleBuilder.Config,\n+        batcher_config: Batcher.Config,\n+        batcher_kwargs: dict[str, Any],\n+        enable_rdma: bool,\n+        output_dir: str,\n+        enable_structured_logging: bool,\n+    ) -> None:\n+        init_logger()\n+        sl.init_structured_logger(\n+            source=\"rl_batcher\",\n+            output_dir=output_dir,\n+            rank=0,\n+            enable=enable_structured_logging,\n+        )\n+        self._training_sample_builder = training_sample_builder_config.build()\n+        self._batcher = batcher_config.build(**batcher_kwargs)\n+        if not enable_rdma:\n+            # Trainer ranks read this process's buffers over TCP; their own processes keep ibverbs.\n+            monarch.configure(rdma_disable_ibverbs=True)\n+        create_cuda_context_to_silence_monarch_log()\n+        # Batches trainer ranks may still read, oldest first. Each buffer keeps its tensor's\n+        # storage alive until drop().\n+        self._batches_being_read: deque[list[list[RDMAMicrobatch]]] = deque()\n+\n+    @endpoint\n+    async def add_group(\n+        self, *, rollout_group: RolloutGroup\n+    ) -> tuple[TrainerStepBatch | None, bool]:\n+        \"\"\"Build this group's training samples and add them; returns `(batch | None, group_is_trainable)`.\n+\n+        Plain `@endpoint`, not `@concurrent_endpoint` like the other actors: each call finishes\n+        before the next starts, so groups reach the stateful batcher in arrival order. `async`\n+        because Monarch rejects mixing sync and async endpoints, and `release_oldest_batch` awaits.\n+        \"\"\"\n+        with sl.log_trace_span(\"training_sample_builder\"):\n+            training_sample_group = self._training_sample_builder.build_from_group(\n+                rollout_group=rollout_group\n+            )\n+        with sl.log_trace_span(\"batcher_pack\"):\n+            batch, group_is_trainable = self._batcher.add_training_samples(\n+                training_sample_group=training_sample_group\n+            )\n+        if batch is None:\n+            return batch, group_is_trainable\n+        # The reply carries RDMAMicrobatches, not large tensors: trainer ranks read their columns here.\n+        with sl.log_trace_span(\"register_rdma_microbatches\"):\n+            rdma_microbatches = [\n+                [RDMAMicrobatch.register(microbatch) for microbatch in row]\n+                for row in batch.microbatches\n+            ]\n+        self._batches_being_read.append(rdma_microbatches)\n+        return (\n+            dataclasses.replace(batch, microbatches=rdma_microbatches),\n+            group_is_trainable,\n+        )\n+\n+    @endpoint\n+    async def release_oldest_batch(self) -> None:\n+        \"\"\"Free the oldest batch, once every trainer rank has read it.\n+\n+        Call once per trained batch, in training order, after `forward_backward` returns or raises.\n+        \"\"\"\n+        rdma_microbatches = self._batches_being_read.popleft()\n+        await asyncio.gather(\n+            *(\n+                rdma_microbatch.drop()\n+                for row in rdma_microbatches\n+                for rdma_microbatch in row\n+            )\n+        )\n+\n+    @endpoint\n+    async def sync_log_step(self, step: int) -> None:\n+        \"\"\"Plain `@endpoint` like `add_group`, so messages stay in order: the step is set before\n+        the next group's spans.\"\"\"\n+        sl.set_step(step)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fdistributed%2Fmonarch_actors%2Fbatcher.py",
+      "sha": "8e7028f8da86fa8b5ae8d8312d04afcec71f9cfe",
+      "status": "added"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fdistributed%2Frdma_microbatch.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fdistributed%2Frdma_microbatch.py?ref=285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "deletions": 5,
+      "filename": "torchtitan/rl/distributed/rdma_microbatch.py",
+      "patch": "@@ -39,12 +39,12 @@\n \n @dataclasses.dataclass(frozen=True, slots=True)\n class RDMAMicrobatch:\n-    \"\"\"A `TrainingMicrobatch` whose large tensors stay in the controller's memory, for trainer ranks to read over RDMA.\n+    \"\"\"A `TrainingMicrobatch` whose large tensors stay in the batcher's memory, for trainer ranks to read over RDMA.\n \n     Example:\n-        rdma_microbatch = RDMAMicrobatch.register(microbatch)  # controller\n+        rdma_microbatch = RDMAMicrobatch.register(microbatch)  # batcher\n         microbatch = await rdma_microbatch.read()  # trainer: one RDMA action reads every buffer\n-        await rdma_microbatch.drop()               # controller, after every rank has read it\n+        await rdma_microbatch.drop()               # batcher, after every rank has read it\n     \"\"\"\n \n     fields: dict[str, Any]\n@@ -92,7 +92,7 @@ async def drop(self) -> None:\n \n @dataclasses.dataclass(frozen=True, slots=True)\n class _TensorRef:\n-    \"\"\"A controller tensor as its RDMA buffer, plus the shape and dtype to rebuild it.\"\"\"\n+    \"\"\"A batcher tensor as its RDMA buffer, plus the shape and dtype to rebuild it.\"\"\"\n \n     buffer: RDMABuffer\n     shape: torch.Size\n@@ -155,7 +155,7 @@ def __iter__(self) -> Iterator[list[TrainingMicrobatch]]:\n             while reads:\n                 yield [_wait_for_microbatch(reads.popleft())]\n         finally:\n-            # On an error, cancel queued reads: with the controller gone, each would wait out\n+            # On an error, cancel queued reads: with the batcher gone, each would wait out\n             # the 60 s RDMA timeout.\n             pool.shutdown(cancel_futures=True)\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Fdistributed%2Frdma_microbatch.py",
+      "sha": "8753410c1ccef75f26b77a46cb8bb717f4bdb727",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Ftrainer.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer.py?ref=285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "deletions": 1,
+      "filename": "torchtitan/rl/trainer.py",
+      "patch": "@@ -269,7 +269,7 @@ async def forward_backward(\n             * self.config.training.num_tokens_per_microbatch_per_dp_rank\n         )\n         # TODO: the cp * tp ranks of a DP replica read the same column. Read it once per replica\n-        # and broadcast it, to cut the controller's reads by cp * tp. Needs a per-replica group.\n+        # and broadcast it, to cut the batcher's reads by cp * tp. Needs a per-replica group.\n         microbatch_groups = MicrobatchStream(\n             [rank_batches[self.dp_rank] for rank_batches in training_data]\n         )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/285d0dc18fd2d166cbcf672469e7fe1557caafd9/torchtitan%2Frl%2Ftrainer.py",
+      "sha": "ed41a31020cf7ca1823e5af7205449d5c40c8f62",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "We should add a comment saying it is important for `batcher_mesh` to collocate with controller, since controller needs to drop microbatch_refs, and the drop implementation assuming the caller is on the same host.  \n\nThis detail is important since we might consider distributed batcher in the future, e.g. colocate batcher with trainer DP ranks. ",
+      "created_at": "2026-10-11T21:01:23Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5291#discussion_r4243206214",
+      "line": 603,
+      "original_line": 582,
+      "path": "torchtitan/rl/controller.py",
+      "updated_at": "2026-10-12T00:57:52Z",
+      "user": {
+        "login": "pzhan9"
+      }
+    },
+    {
+      "body": "0.7 was cut yesterday. Let us use it now? https://github.com/meta-pytorch/monarch/releases/tag/v0.7.0",
+      "created_at": "2026-10-11T21:06:31Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5291#discussion_r4243221843",
+      "line": null,
+      "original_line": 123,
+      "path": "torchtitan/rl/distributed/monarch_actors/batcher.py",
+      "updated_at": "2026-10-12T00:57:52Z",
+      "user": {
+        "login": "pzhan9"
+      }
+    },
+    {
+      "body": "why do we need to keep `TrainerStepBatch` around? If it is due to a Monarch bug, it should say so in the comment.",
+      "created_at": "2026-10-12T00:55:59Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5291#discussion_r4243951474",
+      "line": null,
+      "original_line": 79,
+      "path": "torchtitan/rl/distributed/actors/batcher.py",
+      "updated_at": "2026-10-12T00:57:52Z",
+      "user": {
+        "login": "pzhan9"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "reply from claude:\n\nThanks! I pushed one commit:\n- **Your test:** the batcher makes batches A and B and releases A once; B still reads back exactly. A second actor on the same mesh with the threshold unset (the new default) returns both batches by value.\n- **Comments:**\n  - Why each held batch keeps its tensors: Monarch 0.6's drop deadlock.\n  - The batcher drops the buffers it owns itself, in `release_oldest_batch`, so the drop stays on the owner's host even if the batcher moves. The controller doesn't drop anything in this PR.\n- **Monarch 0.7:** I'm testing it in a separate PR. If it fixes the deadlock in our stress repro, I'll drop the delayed free and the held batches here.\n",
+      "created_at": "2026-10-12T01:09:36Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5291#issuecomment-6115969923",
+      "updated_at": "2026-10-12T01:09:36Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude:\r\n@pzhan9 \r\nMoved to Monarch 0.7 in one new commit. The batcher keeps only the `RDMAMicrobatch`es; the held `TrainerStepBatch` and the delayed free are gone. Both were only there for 0.6's drop deadlock, and 0.7's cache lock is reentrant.\r\n\r\n```text\r\nCPU, TCP fallback                0.6.0               0.7.0\r\nfree the tensors, then drop()    hangs at step 0     600 of 600 steps x 200 buffers\r\ndrop(), then free right away     3 of 18 runs hang   0 of 22 runs, 120K buffers each\r\n```\r\n\r\nYour A/B test now also covers this: B reads back exactly after the batcher has dropped its references to B's tensors. A stress run of the real `BatcherActor` in this order was clean over TCP and ibverbs. On GPU (Qwen3-0.6B, 5 steps through the batcher process), loss is bitwise equal with the fast path on and off. This needs the Monarch 0.7 floor, which lands first.\r\n",
+      "created_at": "2026-10-12T03:18:13Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5291#issuecomment-6117117709",
+      "updated_at": "2026-10-12T03:21:16Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5291,
+  "refs": {
+    "base": {
+      "commit": "d4aa4c67fe14d23dbd8054b0c60d7acd795f62e1",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "285d0dc18fd2d166cbcf672469e7fe1557caafd9",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "over all lgtm. But we should move to 0.7 if possible, since it seems to fix the deadlock bug this PR tries to workaround.\n\nAlso please check if you need to add this test:\n\n> The main invariant isn't tested. test_batcher_actor.py only produces one batch. The PR relies on \"FIFO release never frees an\n     unread batch\", so a cheap extra case would help: produce batches A and B, call release_oldest_batch once, then confirm B's refs\n     still read back exactly.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5291#pullrequestreview-5484933689",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-12T00:57:52Z",
+      "user": {
+        "login": "pzhan9"
+      }
+    }
+  ]
+}

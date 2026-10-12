@@ -1,6 +1,6 @@
 ---
 id: official-megatron-wiki/energon
-title: Megatron Energon：数据流水线、可恢复加载与训练空泡
+title: Megatron Energon：数据组织、Packing、吞吐与确定性恢复
 engine: energon
 kind: authored
 stages:
@@ -10,67 +10,135 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
-coverage: selected implementation chain, not all models or backends
+reviewed_on: '2026-10-12'
+coverage: selected source, official documentation and related PR reading; no HCU runtime
+  validation
 sources:
 - source: nvidia-megatron-energon
+  path: README.md
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: 6309cd798e11e2f2b47d770eb0d3ebc24a34c1dc474c4ab8d86c7e923bb50b63
+- source: nvidia-megatron-energon
+  path: pyproject.toml
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: d10e46393b937e078fd34e0eedae62368944639d8052854a1b90f1f015ae9fbc
+- source: nvidia-megatron-energon
+  path: docs/source/basic/quickstart.md
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: 59e78a090549aecec01aa86c5ae75ef37f56637a1045cf740446f6cc4c051a9f
+- source: nvidia-megatron-energon
+  path: docs/source/basic/task_encoder.md
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: 0f10499347e02b15f04fbcdac053bccb4640ae205b8951c8bcff718443850164
+- source: nvidia-megatron-energon
+  path: docs/source/basic/save_restore.md
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: b6db5d6072470133817e393d13330d758159c872cc6fcd22299104d8bdf87c61
+- source: nvidia-megatron-energon
+  path: docs/source/advanced/parallelism.md
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: 427aa86fba6a0bac1a9460255e46a93d7d67ec502a852d26105eccd313484f4e
+- source: nvidia-megatron-energon
   path: src/megatron/energon/loader.py
-  commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
-  sha256: aab81de16d65761bf00fc88a16c63c39e4f15118ef9044b4473b5aae913b279b
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: 00f4780c39c023c999acead866c3056128d4ff4b8c9678ead1ccb8f5d498d1f0
 - source: nvidia-megatron-energon
   path: src/megatron/energon/savable_loader.py
-  commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
-  sha256: b94cb91f8ae3d99e45c49303d1acbfb2b6a9f286df1974f74ac3b00fcf4b17c2
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: 8c1a5e58984cd33e41ec17fdc6a55ef1efd9b3a02e6d7606cfbef9da89f6865a
 - source: nvidia-megatron-energon
   path: src/megatron/energon/task_encoder/base.py
-  commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
   sha256: d4fce3a940e2a673d3e7a40376f7741799b6c687b1e6ddea7202d66c8e943706
+- source: nvidia-megatron-energon
+  path: tests/test_dataset.py
+  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  sha256: 1ec677b1de77c839ba1e7f4fbecce7eb786f9d09e0d6d506da755260dcf45694
+pr_sources:
+- pr-nvidia--megatron-energon-302
 ---
 
-# Megatron Energon：数据流水线、可恢复加载与训练空泡
+# Megatron Energon：数据组织、Packing、吞吐与确定性恢复
 
-## 定位与组织
+## 1. 定位与训练链路
 
-Energon 是训练数据加载与处理组件，不是 GPU 训练引擎。`loader.py` 提供普通与可恢复 loader，`savable_loader.py` 管可保存加载状态，`task_encoder/base.py` 负责样本编码和 batch 组织；flavors、wrappers、worker 等目录继续定义数据及并发行为。官方 docs 文档已逐页保留，数据格式和恢复路径要结合它们阅读。
+Energon是可独立使用的多模态数据加载/处理组件，负责数据混合、shard、随机顺序、编码、packing、batch及可恢复加载，不执行GPU模型训练或优化器。Megatron/Bridge等消费者负责mask/position/模型输入、loss与保存关联；GPU空泡可能来自本组件，但不能据此把它当kernel分析库。
 
-## 普通加载与可恢复加载
+本页固定develop `accdabc3983843665a34cd1578c0e82d2403e3a9`，官方README提示研究型API可能变化。实际HCU父仓锁定的Energon与此develop分别核对，不能自动用latest替掉训练依赖。
 
-`get_loader` 返回 BasicDataLoader；`get_savable_loader` 返回 SavableDataLoader，除了 prefetch/cache/watchdog，还接收内部 checkpoint 间隔、最小样本间隔及保留数量。源码说明内部 checkpoint 频度影响恢复耗时和读取开销，不存在对所有数据通用的最佳值。
+## 2. 目录与问题路径
 
-当前接口中 worker_config 应附在 dataset；继续给 loader 传入已弃用的 worker_config 不会用它重配 dataset，不匹配还会报错。更新 Skill 示例时必须检查这类“参数仍存在但语义已弃用”的情况。
-
-## TaskEncoder 与数据语义
-
-TaskEncoder 对样本进行编码、batch 和需要的处理。要记录 tokenizer/encoder revision、数据 split、混合比例、shuffle/seed、packing 与过滤规则，并把训练实际消耗位置与模型 checkpoint 关联。仅保存 global step 不能证明数据能无重复、无遗漏续跑。
-
-恢复验证应比较连续运行和中断恢复后的样本序列/ID、batch 内容、随机状态及有效 token 数。涉及 worker 数或 DP 变化时另做验证，不能假定一个进程布局下保存的状态可任意迁移。PR #301 涉及 loader close 后 dataset 是否仍能使用，提示对象所有权与资源关闭也是恢复契约。
-
-## 运行、测试与性能
-
-先用目标数据配方验证读取/编码/批处理，再接训练；采集数据读取吞吐、CPU 使用、解码耗时、队列水位、host 内存和 H2D。若 trace 显示 GPU 空泡，先对齐 batch ready 时间而不是立即改 kernel。增加 worker/prefetch 可能缓解等待，也可能造成主存、存储带宽或 pinned memory 压力。
-
-合成数据可以隔离模型计算上限，但必须标记，不能代替真实数据管道验收。加载器测试至少覆盖正常迭代、保存恢复、提前退出、资源关闭和异常样本；大规模共享存储行为仍待实际环境。
-
-## Watchdog 与故障边界
-
-loader 暴露 watchdog timeout、首次 timeout 和 fail_on_timeout。打印栈或停止加载器不等同于集群容错完成；训练侧仍应观察 step 是否推进并衔接唯一恢复 owner。处理数据卡住先查 worker 栈、I/O、损坏样本、队列和共享内存，再决定是否重启。经验库保留输入管线身份与故障位置，公开 Cookbook 只发布方法和可公开示例。
-
-## 固定源码与符号导航
-
-| 文件 | 本轮源码中可追查的入口（非全部符号） |
+| 路径 | 职责/继续阅读 |
 | --- | --- |
-| [src/megatron/energon/loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/src/megatron/energon/loader.py) | `get_savable_loader`, `get_loader` |
-| [src/megatron/energon/savable_loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/src/megatron/energon/savable_loader.py) | `SimpleSavableDatasetWrapper`, `SavableDatasetState`, `SavableCheckpoint`, `SavableDatasetCheckpoint`, `SavableDatasetWrapper`, `SavableDataLoaderState`, `SavableDataLoader`, `BasicDataLoader` |
-| [src/megatron/energon/task_encoder/base.py](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/src/megatron/energon/task_encoder/base.py) | `generic_batch`, `batch_stack`, `batch_pad_stack`, `batch_list`, `stateless`, `stateless`, `stateless`, `get_stateless` |
+| `src/megatron/energon/loader.py` | `get_loader`/`get_savable_loader`与默认prefetch/checkpoint/watchdog |
+| `savable_loader.py` | worker状态、periodic checkpoint/skip-forward、rank/global save/restore、close |
+| `worker.py`、`rng.py` | DP shard、worker身份、seed/group与日志，数据重复/偏移先查这里 |
+| `task_encoder/base.py` | encode、pack选择/聚合、batch、stateless与随机augmentation恢复 |
+| `flavors/` | WebDataset/JSONL等格式、reader/index/shard和storage接口 |
+| `wrappers/` | shuffle/mix/batch/map/watchdog等流水线与状态组合 |
+| `metadataset/`及配置模块 | 数据混合/关联/分split配置，按完整树选择实际类 |
+| `tools/`、CLI模块 | prepare/lint等数据预处理，不代替语义/模型验收 |
+| `tests/test_dataset.py`、`test_dataset_det.py`等 | 数据覆盖、生命周期、确定性/恢复；IO/平台条件单列 |
+| `docs/source/basic`、`advanced` | 使用、TaskEncoder、恢复、packing、并行、错误处理 |
 
-## 教程、PR 与继续搜索
+官方internals code_structure目前不是完整实现手册，以上路径来自固定树与实际源码；不能以空占位文档宣称全架构已解释。
 
-- [全仓目录和固定文件入口](../source-maps/nvidia-megatron-energon.md)：没有本地专题时按模块继续读源码。
-- [上游教程原文目录](../upstream-docs/nvidia-megatron-energon/)：保留来源内容，链接相对位置以原站为准。
-- [PR #301：Keep datasets usable after closing a loader](../prs/NVIDIA--Megatron-Energon/PR-301.md)：正文、review、diff 与 head/base 源码。
+## 3. 安装与依赖
 
-检索示例：`wiki-search "关键符号或问题" --engine energon`。本地结果不足，使用 `wiki-search-pr "简短英文问题词" --engine energon`，再 `wiki-pr OWNER/REPO NUMBER`、`wiki-code OWNER/REPO FULL_SHA PATH` 追实际调用者、被调底层库和测试。普通查阅只写私有缓存。
+当前包Python>=3.10、hatchling/hatch-vcs构建；torch、WebDataset、storage client、Pillow/PyYAML等构成基本依赖。video/audio decode、torchvision transforms和不同云存储有optional extras，按数据类型安装，不用`all`掩盖不需要的重量依赖。HCU保留已有Torch配对，确认实际`megatron.energon`import路径与版本，避免源码copy或namespace冲突。
 
-## 更新和验收边界
+官方提供stable PyPI与Git安装开发版，二者有区别；固定版本和数据schema/TaskEncoder code revision一起保存。单机CPU读取可先验，但不能推定共享存储、多机、video decoder和训练集成均通过。
 
-运行 `wiki-update PROJECT nvidia-megatron-energon` 检查完整目录、新文档、PR 讨论与已监测源码；分页或网络失败必须续采。变更后联动本页、同仓专题/案例、调用方与依赖；源码已 merge、软件已发布、HCU 已适配和当前任务已验证分别登记。本页为选定实现的代码阅读和操作建议，没有在 HCU 执行上述测试，也未覆盖所有模型。实际任务的版本、性能、显存、失败尝试和阶段 loss 记录进入私有经验 Wiki。
+## 4. 准备、运行与测试
+
+WebDataset先`energon prepare DATASET_ROOT`建立元数据，`energon lint DATASET_ROOT`检查格式/样本可加载；JSONL有对应支持及限制，按版本文档确认。prepared/lint成功不保证tokenization、mask/label或数据混合目标正确。
+
+library从WorkerConfig和TaskEncoder创建train/val dataset，再`get_loader`或`get_savable_loader`迭代。**WorkerConfig属于dataset**，继续传loader的旧worker_config参数已弃用，不会重配dataset，配置不一致会报错。dataset已包含batch/packing组织，不能让普通TorchDataLoader再重复batch。
+
+验证先少量样本/数据类型、ID/encoder输出与batch契约，再正常迭代→保存恢复→提前退出close→异常样本→多rank。相邻单测和确定性测试提供入口；本轮没有执行上游Python/GPU测试。成功标准是实际样本/有效token、复现性、资源释放和消费者数值，不能只看loader持续yield。
+
+## 5. 样本、数值与状态所有权
+
+固定dataset split/blend权重、shards/index、tokenizer/encoder、augmentation、seed、shuffle、packing与MB。global rank不直接等于数据DP rank；同一model-parallel replica可能各rank独立读取相同batch，也可能由一个rank读后广播，按消费者确定。
+
+TaskEncoder保证sample变换与packing/batch语义；training保证causal/segment mask、position、cu-seqlens、labels和loss分母。packing减少padding但不能允许不相关样本互相attention或改归一化。保存loader state包含worker/RNG/wrapper/消费offset，不只是globalstep；模型、optimizer和数据checkpoint要绑定同一训练时刻。
+
+## 6. 调用链
+
+storage reader→dataset factory/shard→shuffle/mix/wrapper→TaskEncoder.encode→packing buffer/select/pack→batch→loader worker/prefetch→训练消费者。SavableLoader周期保存worker状态，主进程记录实际消费位置，恢复回到相应checkpoint并重放偏移；close由loader统一停止workers/iterator并关闭dataset资源。
+
+`get_loader`为BasicDataLoader，`get_savable_loader`为SavableDataLoader；其内部checkpoint与训练持久checkpoint是不同层次。API默认不等于所有数据的最佳值。
+
+## 7. 两项深入机制
+
+- [TaskEncoder、Packing与确定性](topics/energon-encoding-packing.md)：减少padding的收益、buffer开销、stateless/restore_seeds及模型mask契约。
+- [加载吞吐、保存恢复与生命周期](topics/energon-recovery-throughput.md)：prefetch/worker/IO导致GPU空泡、snapshot+offset、缩扩限制、watchdog与资源关闭。
+
+## 8. 诊断、恢复和训练质量
+
+GPU等待数据先对齐batch-ready时间、worker栈、IO/decode/CPU、queue、hostRSS/FD与H2D，再用mock隔离模型计算；不能一见空泡就改kernel或无条件增加workers。默认普通错误可能log并skip样本，restore默认严格抛错；skip会改变数据分布/有效token，应计数告警，不能当健康训练。
+
+watchdog timeout会打印worker栈，只有相应fail_on_timeout策略才导致失败，均不等于集群容错。结合唯一恢复owner定位IO/损坏样本/队列，保留loader/data身份。连续与中断恢复比较样本ID、batch、随机状态和有效token，按消费者实际model-parallel读法在所有需要rank恢复。
+
+## 9. PR、文档与更新
+
+[官方教程](https://nvidia.github.io/Megatron-Energon/)、[Releases](https://github.com/NVIDIA/Megatron-Energon/releases)、[PR](https://github.com/NVIDIA/Megatron-Energon/pulls)、[全仓导航](../source-maps/nvidia-megatron-energon.md)、[原文目录](../upstream-docs/nvidia-megatron-energon/)分别补使用/版本/讨论/源码。没有独立本地roadmap则按官方Issue/Discussion继续查证，不从PR标题编造计划。
+
+[#301 close后dataset可复用](../prs/NVIDIA--Megatron-Energon/PR-301.md)提供对象所有权与资源清理讨论，本轮固定测试也覆盖dataset重用；[#302](../prs/NVIDIA--Megatron-Energon/PR-302.md)仍是open，iterator finalize细节不能据标题写为已落地。当前源码仍保留loader析构清理，不把PR描述每个提议直接当最终实现。
+
+`wiki-search-pr "restore packing/loader close" --engine energon`可补未收录问题，随后读固定代码/测试。更新loader/worker/TaskEncoder/wrappers与消费者Bridge的数据checkpoint同时复核本页和两专题；major版本、DP/worker数、encoding变化保留各自恢复范围。
+
+## 固定证据与复核范围
+
+- [README.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/README.md)
+- [pyproject.toml](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/pyproject.toml)
+- [docs/source/basic/quickstart.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/docs/source/basic/quickstart.md)
+- [docs/source/basic/task_encoder.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/docs/source/basic/task_encoder.md)
+- [docs/source/basic/save_restore.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/docs/source/basic/save_restore.md)
+- [docs/source/advanced/parallelism.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/docs/source/advanced/parallelism.md)
+- [src/megatron/energon/loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/src/megatron/energon/loader.py)
+- [src/megatron/energon/savable_loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/src/megatron/energon/savable_loader.py)
+- [src/megatron/energon/task_encoder/base.py](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/src/megatron/energon/task_encoder/base.py)
+- [tests/test_dataset.py](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/tests/test_dataset.py)
+
+本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

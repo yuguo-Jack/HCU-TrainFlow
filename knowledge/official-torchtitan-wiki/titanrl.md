@@ -14,43 +14,46 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
   all models, backends or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
-  path: torchtitan/rl/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
-  sha256: ccb29a904363f34a929b2cc28ca4ee423f638352f70ac4202f34f1c06e579d0a
-- source: pytorch-torchtitan
   path: torchtitan/rl/train.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 7a6ce29b3feccac7bd9b710b732266a7beab26079d04c8d8efc6701f0b88095e
 - source: pytorch-torchtitan
   path: torchtitan/rl/trainer.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 77eea0ae2d0db6b99c65a68db1db7b1844e38be0367d421f776eba2da92f82de
 - source: pytorch-torchtitan
-  path: torchtitan/rl/generator.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
-  sha256: 109291afc2d11a6a0ccc39cd93374c32b9809ba003c82eb9966b9633eb415569
-- source: pytorch-torchtitan
   path: torchtitan/rl/distributed/WEIGHT_SYNC.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: f04cf9beb18c900eab1c2aff5d079e1fe4fa4db03fda74286cf72ebd6ff3e669
 - source: pytorch-torchtitan
   path: torchtitan/rl/BITWISE_PARITY.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e2d8599828473b3abd1f7beb8db39606d27870602bbcc21279c072175dac0144
 - source: pytorch-torchtitan
   path: torchtitan_recipes/rl/model_configs.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 5ab4c39072e7b2b29addc5a7e5004520c8bfb886ce49e389a73a4810869653b4
 - source: pytorch-torchtitan
   path: torchtitan/rl/observability/metrics/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 11b5fd3963900a52094028d4b2e35ee4ce1761d4f45d19e902052d1e74e9e1d6
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator.py
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: 01fb62b560f65880b33d51135d2fe10a49d15a00cb153fc56f8ff9003b585155
+- source: pytorch-torchtitan
+  path: torchtitan/rl/controller.py
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: b6ee8ffe9b67f570bc45a6b74ae79822afa23c9740491ec311ccbb2dab270ea0
+- source: pytorch-torchtitan
+  path: torchtitan/rl/README.md
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: d0cced32ef4222b2473689607eadcb749cbb4650e6da9da27df32353842908e6
 pr_sources:
 - pr-pytorch--torchtitan-5107
 - pr-pytorch--torchtitan-5268
 - pr-pytorch--torchtitan-5280
 ---
-
 # TitanRL：训练生成协同、权重同步与精度边界
 
 ## 组件分工
@@ -106,14 +109,28 @@ optimizer N 完成
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
 - [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/README.md)
-- [torchtitan/rl/train.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/train.py)
-- [torchtitan/rl/trainer.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/trainer.py)
+- [torchtitan/rl/train.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/train.py)
+- [torchtitan/rl/trainer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/trainer.py)
 - [torchtitan/rl/generator.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/generator.py)
-- [torchtitan/rl/distributed/WEIGHT_SYNC.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/distributed/WEIGHT_SYNC.md)
-- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/BITWISE_PARITY.md)
-- [torchtitan_recipes/rl/model_configs.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan_recipes/rl/model_configs.py)
-- [torchtitan/rl/observability/metrics/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/observability/metrics/README.md)
+- [torchtitan/rl/distributed/WEIGHT_SYNC.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/distributed/WEIGHT_SYNC.md)
+- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/BITWISE_PARITY.md)
+- [torchtitan_recipes/rl/model_configs.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan_recipes/rl/model_configs.py)
+- [torchtitan/rl/observability/metrics/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/observability/metrics/README.md)
 
 - [PR #5107：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5107.md)
 - [PR #5268：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5268.md)
 - [PR #5280：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5280.md)
+
+## 当前主线补充：请求失败与模型版本等待
+
+主线 `b663c1673c00d97864bb32f18029ce5ec40442e2` 的 [PR #5182](https://github.com/pytorch/torchtitan/pull/5182) 区分“单个请求在 admission 被拒绝”和“generator engine loop 崩溃”。`process_rejected_requests` 由每个 TP 组的 rank 0 传回请求错误，rank 0 的 `_rank0_fail_generations` 结束对应 reply 并释放路由占用；其他正常请求不应因此整体失败。
+
+`wait_engine_loop` 暴露引擎循环异常，Controller 可及时观察，而不是一直把请求发往死亡 generator。仍需注意源码保留的限制：`_rank0_drain_results` 自身异常尚有 TODO，不应将新增等待接口解释为所有后台任务失败都已覆盖。
+
+[PR #5217](https://github.com/pytorch/torchtitan/pull/5217) / [#5218](https://github.com/pytorch/torchtitan/pull/5218) 涉及 rollout 结束后的 session affinity 释放和 drain 时等待原绑定 generator。排查权重同步停滞时区分请求等待、session pin、引擎崩溃和 collective；不要将合理版本等待当作死锁后任意重路由。
+
+当前启动输出参数为 `--output-dir`，不是旧示例的 `--dump-folder`；模型资产路径由 recipe 设置，不能假定所有 config 都能用任意 CLI 参数覆盖。升级后同时检查教程、train.py 参数解析与真实配方。以上是本次代码审查，未进行新的 RL 现场恢复实验。
+
+- [torchtitan/rl/generator.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/generator.py)
+- [torchtitan/rl/controller.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/controller.py)
+- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/README.md)

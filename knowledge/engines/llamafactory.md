@@ -1,6 +1,6 @@
 ---
 id: engines/llamafactory
-title: LlamaFactory：SFT 数据语义、后端与显存优化
+title: LlamaFactory：SFT 工程、两代训练入口与显存优化指南
 engine: llamafactory
 kind: authored
 stages:
@@ -10,85 +10,170 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
-coverage: selected implementation chain, not all models or backends
+reviewed_on: '2026-10-12'
+coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime
+  execution
 sources:
 - source: hiyouga-llama-factory
+  path: README.md
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 2d61d3ee9a0b7a099800b17b0be7a8ef034ed9b08f43cb32bdac17642cc823dd
+- source: hiyouga-llama-factory
+  path: pyproject.toml
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: d2d044de25f84d319338de30299437ee882650e2a998af50f617bfbb5964becf
+- source: hiyouga-llama-factory
+  path: examples/README.md
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 23e64b4732392b1f91106f588d0e0ab6f0a46fab5ce02f0a43e952091e208ab5
+- source: hiyouga-llama-factory
+  path: src/llamafactory/cli.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: d32b69e0b379718a9d0cf7bbf7032e6104f234cf53b13ad9e276a4a3fe7530d8
+- source: hiyouga-llama-factory
   path: src/llamafactory/launcher.py
-  commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
   sha256: 145a72df667f12b9fd59dc4e03cdc017a0e947ef6949fcf8b9bd545c572b43ec
 - source: hiyouga-llama-factory
+  path: src/llamafactory/train/tuner.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 192ba6c81096ac5fcd075d44ef9e79296558fc935cd941fc38c038432fe00711
+- source: hiyouga-llama-factory
   path: src/llamafactory/train/sft/workflow.py
-  commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
   sha256: aaa1f92b66c4985fe1c1d47a6c28831a1cd0b107d77e3819c2ea174e37a1384b
 - source: hiyouga-llama-factory
-  path: src/llamafactory/hparams/parser.py
-  commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
-  sha256: 35616c3337fab6a34d22caced28907bddb5e8d01891826f466fe8db1c3c8813f
-- source: hiyouga-llama-factory
   path: src/llamafactory/train/sft/trainer.py
-  commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
   sha256: 4016aa09576891d53f2f3ee8f0cd21cd0f5c80c8ee1f45ab964a00750253d7c9
 - source: hiyouga-llama-factory
-  path: tests/train/test_sft_trainer.py
-  commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
-  sha256: e49ad1ef3241eb34fd8bacad0273ab97279abdf44cf86a1b8f175f289fd16750
+  path: src/llamafactory/hparams/parser.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 35616c3337fab6a34d22caced28907bddb5e8d01891826f466fe8db1c3c8813f
 - source: hiyouga-llama-factory
-  path: examples/train_lora/qwen3_lora_sft_ds3.yaml
-  commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
-  sha256: b18c6f2a61e4251e01277aeff6949f32a0562e56c4a81c8bd1bf01ed08647d0e
+  path: src/llamafactory/data/processor/supervised.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: f1b4b8db32179f7471e7c0bf45806533f8cabe8ade98d3a6b427d80a94b959cf
 - source: hiyouga-llama-factory
-  path: src/llamafactory/train/tuner.py
-  commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
-  sha256: 192ba6c81096ac5fcd075d44ef9e79296558fc935cd941fc38c038432fe00711
+  path: src/llamafactory/data/collator.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: d9c0c4d5583001c9e2f9825de7dbf2f57cd7c724d0b3c70b4e9cd61cda08edb2
+- source: hiyouga-llama-factory
+  path: src/llamafactory/model/loader.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: ed132ebc37129345f88c882cb928e3ca5294954e4040d4eb7d64324f38022ae9
+- source: hiyouga-llama-factory
+  path: src/llamafactory/model/adapter.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 27889b4a7a4eaa6c45d96a8cc344aa0c7910ac748256fe9b2e7ca3d10f339834
+- source: hiyouga-llama-factory
+  path: src/llamafactory/v1/launcher.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: ef8b225d7dfa8c55db98bcaab9b698db069518b379fb5d84abe6c7a5c94f442d
+- source: hiyouga-llama-factory
+  path: src/llamafactory/v1/trainers/sft_trainer.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 9fe8f9fbde544a0440a836a5a0e7f252ec408671ea27dbe6dc7933200441b00c
+- source: hiyouga-llama-factory
+  path: src/llamafactory/v1/core/base_trainer.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 6c7102d5196274cfedf7e0137f885be43499a28bf80f3447c29ae8d3db26dc79
+- source: hiyouga-llama-factory
+  path: src/llamafactory/v1/plugins/trainer_plugins/distributed/deepspeed.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: a2ef30911f43fcdc48ded55a4047eb7e28cca29a70b7e76d797b8b68970208aa
+- source: hiyouga-llama-factory
+  path: src/llamafactory/v1/core/utils/checkpoint.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: 3b15e7bda28b6d1f4d87fbbadfec0d74ec73df01272eac5d6c44d013b981e33e
+- source: hiyouga-llama-factory
+  path: tests_v1/plugins/model_plugins/test_chunk_loss.py
+  commit: 1fded918ac4723ac9966363f51ed4500866c5d1d
+  sha256: ca9e673b2f6fc19c53bb76547e17fb24d6cc18d2f36167cee6fae55e8ef1a20e
 ---
 
-# LlamaFactory：SFT 数据语义、后端与显存优化
+# LlamaFactory：SFT 工程、两代训练入口与显存优化指南
 
-## 定位与目录
+## 定位与入口边界
 
-CLI 位于 `src/llamafactory/launcher.py`，参数解析在 `hparams`，训练阶段分派在 `train/tuner.py`，SFT 位于 `train/sft`。模型加载、模板和数据处理是独立层；`examples` 提供训练 YAML，`tests` 承担相应契约检查。官方仓已由 hiyouga/LLaMA-Factory 迁移到 hiyouga/LlamaFactory；旧引用保留历史意义，更新使用规范地址。
+LlamaFactory 将模型/tokenizer、数据格式与对话模板、SFT/偏好训练、LoRA/量化和分布式 backend 组织为可配置工程。官方规范仓为 `hiyouga/LlamaFactory`，旧 `hiyouga/LLaMA-Factory` 是别名。当前固定提交 `1fded918ac4723ac9966363f51ed4500866c5d1d` 同时包含 legacy 与 v1，二者的数据对象、trainer、插件和配置字段不同。
 
-## SFT 调用链与 loss 契约
+`llamafactory.cli:main` 以 **`USE_V1`** 选择 launcher。默认 legacy 链的 `train` 按 stage 分派；v1 的 `sft/train` 进入新 `SFTTrainer`。因此一篇 v1 优化 PR 不能自动证明 legacy YAML 已具有同样功能。先记录实际入口和源码路径，再讨论兼容或性能。
 
-`run_sft` 先加载 tokenizer、修正 template，再生成 dataset，随后加载 model。`SFTDataCollatorWith4DAttentionMask` 接收 loss padding、packing、block diagonal attention 与实际 attention implementation；最后构造 `CustomSeq2SeqTrainer`。这说明模板、标签掩码和 attention backend 会共同影响结果，不能只验证一个 attention kernel 的前向误差。
+深入专题：
 
-`ignore_pad_token_for_loss` 决定 label padding，`neat_packing` 和 attention mask 决定样本边界。吞吐要同时给 processed tokens 与 effective tokens，防止 padding 增多看起来更快。生成式评估与训练 loss 有不同代码路径；prediction 的 padding_side 切换不应混同训练行为。
+- [SFT 模板、packing 与 attention/位置契约](llamafactory/topics/sft-packing-and-multimodal.md)。
+- [v1 Ulysses CP 与 chunked linear-CE](llamafactory/topics/v1-cp-and-chunk-loss.md)。
 
-## 安装、启动与回归
+## 工程目录导航
 
-从当前 README/依赖配置确认 Transformers、PEFT、DeepSpeed、attention 扩展的组合，优先用 HCU 工程现成环境和启动 YAML。`examples/train_lora/qwen3_lora_sft_ds3.yaml` 是本轮保留的具体入口示例：用来核对字段及 backend 关系，不直接作为任意模型的可执行配方。实际启动前保存解析参数、数据模板、tokenizer、模型 revision 和 backend 选择。
+| 位置 | 职责 | 检索/排查入口 |
+| --- | --- | --- |
+| `cli.py`、`launcher.py`、`v1/launcher.py` | 双入口选择、torchrun/elastic 分派 | 启动到不同代码、rank、有效 env |
+| `hparams/`、`v1/config/` | 模型/数据/训练参数解析与组合检查 | stage、cutoff、packing、CP、backend |
+| `data/parser.py`、`converter.py`、`loader.py` | 数据集定义、字段转换、读取处理 | dataset_info、列映射、数据缺失 |
+| `data/template.py`、`processor/`、`collator.py` | 对话模板、监督 label、packing、VLM/mRoPE | loss mask、跨样本泄漏、RoPE 长度错误 |
+| `model/loader.py`、`adapter.py`、`model_utils/` | HF load、PEFT、attention、量化、checkpointing | trainable 参数、扩展选择、加载 OOM |
+| `train/sft`、`dpo`、`ppo`、`rm` 等 | legacy 各训练目标及 trainer | 目标函数、reference model、生成评估 |
+| `v1/core/{model_engine,data_engine,base_trainer}.py` | v1 渲染/数据、训练和状态 | 实际 batch、step、梯度与保存 |
+| `v1/plugins/model_plugins/` | CP、chunk loss、PEFT、kernel 等 | 模型改写的触发和数值/输出限制 |
+| `v1/plugins/trainer_plugins/distributed/` | DeepSpeed/FSDP2 等分布式封装 | optimizer step 所有权、参数分片/保存 |
+| `examples/`、`tests/`、`tests_v1/` | YAML、legacy/v1 分层回归 | 针对当前入口找配方与测试，避免混用 |
 
-`tests/train/test_sft_trainer.py` 在本轮快照覆盖包括数据 shuffle 的行为；它不是全套精度证明。任务回归应补 template/tokenization、collator mask、LoRA trainable 参数集合、单步更新、保存加载和阶段 loss。缩 layer 时保留 hidden/head/sequence 等其余模型结构条件，单独标记与完整模型的区别。
+更多文件见 [完整源码目录](../source-maps/hiyouga-llama-factory.md)。
 
-## 性能与内存方向
+## 安装与版本依赖
 
-按数据处理、H2D、attention、MLP、optimizer、保存分层归因。packing 的收益不能通过改变 label 有效范围取得；activation checkpointing 增加重算，ZeRO/offload 可能让计算等待主机。LoRA 还应计入基础权重、adapter、optimizer 和 merge/unmerge 的瞬时副本。官方 PR #10762 涉及 Ulysses CP 和 chunk loss，属于进一步读当前实现、测试与支持条件的入口，不表示旧版 CLI 已具备全部功能。
+当前 [pyproject.toml](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/pyproject.toml)要求 Python≥3.11，核心约束包含 PyTorch≥2.4、Transformers 4.55.0–5.8.0 且排除 4.57.0/5.6.0，以及 Accelerate/PEFT/TRL 区间。README 的推荐版本表和个别新模型说明可能不同；实际安装优先核对目标 commit 的依赖配置、模型实现要求及已验证 HCU 配方，不能随意用 DISABLE_VERSION_CHECK 代替兼容验收。
 
-## 常见问题和边界
+源码安装入口为 `python -m pip install -e .`，可选能力按 [README](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/README.md)的对应 requirements 安装。DeepSpeed、attention、量化和 fused kernel 是额外运行能力，导入包后仍需检查设备扩展与真实加载路径。训练场景不因安装了推理量化包就自动具有其训练后向支持。
 
-loss 异常先看模板、IGNORE_INDEX、label shift、packing 和有效 token 分母，再追 trainer 的 loss hook 和下游实现；OOM 要区分加载、训练、评估生成和保存阶段。不要仅通过关掉评估或减少序列长度消除问题后宣称同任务优化。仓内新旧实现可能并存，PR 的 v1 路径不能假定自动覆盖 legacy SFT 入口。
+启动器可根据设备数或 `FORCE_TORCHRUN` 转为 torchrun，多机字段为 `NNODES/NODE_RANK/NPROC_PER_NODE/MASTER_ADDR/MASTER_PORT`。v1 还支持 elastic rendezvous 参数；其 `env/version` 分支当前会报 NotImplementedError，不能在自检中把这些命令列成已实现工具。官方 launcher 默认调整 allocator/NCCL 相关 env，现场要与 HCU 分支/site 配方核对实际有效值。
 
-## 固定源码与符号导航
+## 模型、数据与运行配方
 
-| 文件 | 本轮源码中可追查的入口（非全部符号） |
+legacy 典型入口：`llamafactory-cli train path/to/model_recipe.yaml`；v1 使用 `USE_V1=1` 与 `sft`/对应新配置，或模块入口 `python -m llamafactory.v1.trainers.sft_trainer`。命令用于辨识官方路径，真实 HCU 执行先选兼容环境和已有模型脚本。
+
+配方要记录 model revision、tokenizer/processor、template、finetuning 类型、冻结参数、quantization、precision、cutoff、数据字段转换、`train_on_prompt/mask_history`、packing、batch/accumulation、backend 和 checkpoint。legacy 的 [Qwen3 LoRA ZeRO-3 示例](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/examples/train_lora/qwen3_lora_sft_ds3.yaml)只说明一组字段，不能作为任何模型/设备的默认。
+
+`SupervisedDatasetProcessor` 通过 template 编码多轮 prompt/response；`train_on_prompt` 与 `mask_history` 决定哪些 label 为 IGNORE_INDEX。多模态输入先由 mm plugin 替换/展开；长度截断也会改变实际监督目标。训练前打印一份 input/valid labels，确认处理后的数据，而不是只看原 JSON 字段。
+
+## 调用链与性能机制
+
+legacy：launcher → `run_exp`/参数解析 → `run_sft` → tokenizer/template → dataset → model/adapter → `SFTDataCollatorWith4DAttentionMask` → `CustomSeq2SeqTrainer.train`。attention implementation 与 neat-packing/block-diagonal 配置在 collator 相遇；生成式评估走另一条路径。
+
+v1：launcher → `run_sft` → `DistributedInterface` → `DataEngine/ModelEngine` → `SFTTrainer` → `BaseTrainer.fit`。chunk-loss 在 distributed wrapping 前安装；CP loss 的 shift/shard/汇总由模型插件处理，base loop 再按有效训练 token/DP 和累积窗口缩放。
+
+| 优化机制 | 值得用的情况 | 代价与限制 |
+| --- | --- | --- |
+| packing/neat packing | 短样本 padding 浪费较大 | 样本隔离、position/mRoPE、FA2/SDPA 路径不同；neat FA2 有 batch/model 限制 |
+| v1 CP/Ulysses | 长序列激活需要跨卡分摊 | attention Q/K/V all-to-all、mask 统一、encoder 仍复制；并非所有 tensor 按序列分片 |
+| chunked linear-CE | vocabulary logits 成为峰值显存热点 | token 分块重复 launch，FP32 head-grad 累积；要求 plain Linear 与原样 logits 输出 |
+| activation checkpointing、ZeRO/FSDP/offload | 权重/激活/optimizer 超限 | 重算/参数 gather/主机 copy，测保存和切换峰值 |
+| LoRA/量化 | 训练参数少或权重存储紧张 | 基础权重仍需驻留，merge/导出产生副本；实际 HCU 后端支持独立核验 |
+
+优化先按 trace 定位数据等待、attention、MLP、logits/CE、optimizer、通信或保存，再以原模型语义比较 step 吞吐/有效 token 和峰值显存。CP/chunk loss/梯度累积改变之后同时回归数值，不用更短序列或删评估阶段的吞吐与原任务混比。
+
+## 梯度、保存与恢复
+
+v1 DeepSpeed 通过 Accelerate 的 `DeepSpeedPlugin` 初始化。`backward` 在最后 microbatch 的 sync 边界可能已经调用 engine.step；base trainer 不能再额外执行 optimizer.step。`auto` ZeRO-3 bucket 可从 text config hidden size 填充，VLM 顶层缺 hidden_size 时不能随意猜值。
+
+v1 checkpoint coordinator 和 backend 保存 model/optimizer/trainer state；`save_model`/HF export 与 resume checkpoint 职责不同。DeepSpeed `save_checkpoint` 总保存 Accelerate 状态，按配置额外导出 HF；只留 HF 权重不能据此声明 optimizer/data/RNG 恢复。恢复前确认模型、adapter、分布式布局和当前保存方式兼容。
+
+## 诊断与分层回归
+
+| 症状 | 排查顺序 |
 | --- | --- |
-| [src/llamafactory/launcher.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/src/llamafactory/launcher.py) | `launch` |
-| [src/llamafactory/train/sft/workflow.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/src/llamafactory/train/sft/workflow.py) | `run_sft` |
-| [src/llamafactory/hparams/parser.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/src/llamafactory/hparams/parser.py) | `read_args`, `get_ray_args`, `get_train_args`, `get_infer_args`, `get_eval_args` |
-| [src/llamafactory/train/sft/trainer.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/src/llamafactory/train/sft/trainer.py) | `CustomSeq2SeqTrainer`, `create_optimizer`, `create_scheduler`, `compute_loss`, `prediction_step`, `save_predictions` |
-| [tests/train/test_sft_trainer.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/tests/train/test_sft_trainer.py) | `DataCollatorWithVerbose`, `test_shuffle` |
-| [examples/train_lora/qwen3_lora_sft_ds3.yaml](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/examples/train_lora/qwen3_lora_sft_ds3.yaml) |  |
-| [src/llamafactory/train/tuner.py](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/src/llamafactory/train/tuner.py) | `run_exp`, `export_model`, `Worker` |
+| loss 改变/监督目标减少 | 数据列/模板 → label mask/截断 → packing/shift → CP 或 trainer 分母 → 下游算子 |
+| RoPE 长度错误 | pad-to-multiple 与 position IDs 长度 → packed/VLM boundaries → 实际 attention backend |
+| CP collective 卡住 | 所有 rank mask 分支 → process group/sequence divisibility → all-to-all 与模型 hook |
+| 加载/保存 OOM | 权重物化与 adapter merge → ZeRO gather → 保存副本、host memory，而非仅 train peak |
+| 两次 optimizer update/梯度异常 | 实际 backend、Accelerate sync boundary、base loop 与 custom optimizer |
 
-## 教程、PR 与继续搜索
+回归从模板/processor/collator、单模型输出与梯度、目标 distributed backend、保存/恢复逐级进行。当前官方 [collator tests](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/tests/data/test_collator.py)、[packing tests](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/tests/model/model_utils/test_packing.py)、[v1 chunk loss tests](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/tests_v1/plugins/model_plugins/test_chunk_loss.py)和 [v1 Ulysses tests](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/tests_v1/plugins/model_plugins/test_ulysses_cp.py)给出对应契约；本轮未在 HCU 运行。
 
-- [全仓目录和固定文件入口](../source-maps/hiyouga-llama-factory.md)：没有本地专题时按模块继续读源码。
-- [上游教程原文目录](../upstream-docs/hiyouga-llama-factory/)：保留来源内容，链接相对位置以原站为准。
-- [PR #10762：[v1] Support multimodal Ulysses CP and memory-efficient chunk loss for SFT](../prs/hiyouga--LlamaFactory/PR-10762.md)：正文、review、diff 与 head/base 源码。
+## 教程、PR 与更新边界
 
-检索示例：`wiki-search "关键符号或问题" --engine llamafactory`。本地结果不足，使用 `wiki-search-pr "简短英文问题词" --engine llamafactory`，再 `wiki-pr OWNER/REPO NUMBER`、`wiki-code OWNER/REPO FULL_SHA PATH` 追实际调用者、被调底层库和测试。普通查阅只写私有缓存。
+官方入口：[教程](https://llamafactory.readthedocs.io/en/latest/)、[examples](https://github.com/hiyouga/LlamaFactory/blob/1fded918ac4723ac9966363f51ed4500866c5d1d/examples/README.md)、[Releases](https://github.com/hiyouga/LlamaFactory/releases)、[Issues/功能规划](https://github.com/hiyouga/LlamaFactory/issues)、[PR](https://github.com/hiyouga/LlamaFactory/pulls)。已收录 [PR #10762](../prs/hiyouga--LlamaFactory/PR-10762.md) 涉及 v1 multimodal Ulysses 与 chunk loss，必须和当前最终实现及 tests_v1 一起读。
 
-## 更新和验收边界
-
-运行 `wiki-update PROJECT hiyouga-llama-factory` 检查完整目录、新文档、PR 讨论与已监测源码；分页或网络失败必须续采。变更后联动本页、同仓专题/案例、调用方与依赖；源码已 merge、软件已发布、HCU 已适配和当前任务已验证分别登记。本页为选定实现的代码阅读和操作建议，没有在 HCU 执行上述测试，也未覆盖所有模型。实际任务的版本、性能、显存、失败尝试和阶段 loss 记录进入私有经验 Wiki。
+检索 `wiki-search "Ulysses chunk loss" --engine llamafactory`；本地不足时线上 PR→固定源码。`wiki-update PROJECT hiyouga-llama-factory` 联动 legacy 与 v1、入口 switch、模型/数据/分布式插件、两个专题和相关测试。main、release、HCU 分支与任务已测分别登记；README 的支持表不能代替当前模型/backend 的实际验证。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: ab1a28486b92adb3702f1289ff3a332cdb74294f
+commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
 path: megatron/core/transformer/moe/README.md
-raw_sha256: 504606107b2f31052b46872ca02c5955d8a0480bae10a7b0636875a2d42b2007
+raw_sha256: 14fa8855c7dfeab4e40bf704804affe4aa3b1ad00b2bb58b1fe1489cd1f29fec
 sources: []
-generated_body_sha256: 66618516a4c5af1f56d744c6ee02e61421c929fdc33481bfb8ab328de522d64e
+generated_body_sha256: cd76551fe8dd751b151d199cbc669efcf181f6ce4bf6f96eb23509964f0e3957
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / megatron/core/transformer/moe/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/ab1a28486b92adb3702f1289ff3a332cdb74294f/megatron/core/transformer/moe/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -336,6 +336,7 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 |------------|-------------|----------|--------|
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
+| **FlexDispatcher with [DeepEP v2](https://github.com/deepseek-ai/DeepEP) backend** | Uses the NCCL Gin-based `ElasticBuffer` dispatch/combine API | Expert parallelism with a DeepEP v2 container | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepepv2` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 

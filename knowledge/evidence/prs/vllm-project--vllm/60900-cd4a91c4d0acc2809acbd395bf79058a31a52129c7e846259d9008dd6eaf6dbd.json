@@ -1,0 +1,206 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "1a3a7a8f01a8c1a3184151b8185072efda11daab",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "\n\n## Overview\n\n`--all2all-backend deepep_low_latency` crashes at startup whenever `--max-num-batched-tokens` is set above a few hundred. This happens with an ordinary prefill-friendly config such as `--max-num-batched-tokens 4096`. The cause is that the per-rank dispatch capacity of the DeepEP LL buffers is taken directly from `max_num_batched_tokens`. This PR decouples the two: the LL buffers are sized for a fixed number of tokens per rank, and larger forward passes are split into several dispatch rounds that stay in sync across the DP ranks.\n\nRelated: #57894 / #57915 (draft). That PR adds a fail-fast error for the same 32 GiB limit, but the config still cannot run. This PR makes the config run.\n\n## Claims\n\n- DP8xEP8 `deepep_low_latency` with `--max-num-batched-tokens 4096` now starts and serves correctly with no `NVSHMEM_*` env tuning. Before this PR it crashed in `deep_ep.Buffer.__init__`.\n- The memory used by the LL RDMA buffer and the batched-expert workspaces no longer grows with `max_num_batched_tokens`.\n- A clear `ValueError` is raised when a user-set `NVSHMEM_QP_DEPTH` is too small. Previously this was a bare `AssertionError` deep inside DeepEP.\n- No behavior change for the default LL config: when `max_num_batched_tokens` is not set it already defaults to 256, so no chunking happens and the buffer size is unchanged.\n- No behavior change for other all2all backends. Chunking only triggers when a rank's batch exceeds `prepare_finalize.max_num_tokens_per_rank()`. Other prepare/finalize implementations report `max_num_batched_tokens` or `None` there, so they never trigger it.\n\n## Validation\n\nSetup: GLM-5.x Flash FP8 (hidden 4096, 288 routed experts, top-8, 45 MoE layers) on 1 node of 8xH100, using\n\n`--data-parallel-size 8 --enable-expert-parallel --all2all-backend deepep_low_latency --max-num-batched-tokens 4096 --max-num-seqs 64 --gpu-memory-utilization 0.92`\n\n| | Startup | GSM8K (5-shot, 1319 q, 3 runs) |\n|---|---|---|\n| main, `--max-num-batched-tokens 4096` | crash: `num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max()` | n/a |\n| this PR, `--max-num-batched-tokens 4096` (chunked rounds of 256) | OK | 0.896 / 0.894 / 0.902 |\n| control: this PR, `--max-num-batched-tokens 256` (no chunking, same LL buffer as on main) | OK | 0.904 / 0.898 |\n\nThe chunked and unchunked runs agree within run-to-run noise. Both sit about 1.5 points below this model's TP8 reference (0.914-0.919). That gap comes from the LL path itself (FP8 dispatch) and is present without chunking.\n\nThe end-to-end runs used a vLLM main build from a few days ago (`30d4032363`) with this diff applied. It applies cleanly; the files touched here differ from this branch's base only in unrelated hunks.\n\nServing benchmark (`vllm bench serve`, random, ISL 8192 / OSL 1024, after warmup), median values:\n\n| concurrency | TTFT (ms) | TPOT (ms) | output tok/s |\n|---|---|---|---|\n| 1 | 992 | 15.5 | 61 |\n| 16 | 2650 | 21.4 | 670 |\n| 64 | 4015 | 32.8 | 1755 |\n\nFor comparison, before this PR the only way to run LL here was `--max-num-batched-tokens 512` plus `NVSHMEM_QP_DEPTH=2048`:\n\n| concurrency | TTFT (ms) | TPOT (ms) | output tok/s |\n|---|---|---|---|\n| 1 | 2079 | 15.6 | 57 |\n| 16 | 3460 | 24.4 | 563 |\n| 64 | 5762 | 41.9 | 1216 |\n\nUnit tests:\n- `tests/kernels/moe/test_batched_moe.py::test_batched_experts_chunked_dispatch` (new) runs a 200-token batch through a 64-token batched prepare/finalize. It checks the output against the reference. In one case it also simulates a peer DP rank with 448 tokens, which forces 4 real rounds plus 3 dummy rounds.\n- `tests/kernels/moe/test_deepep_ll_dispatch_tokens.py` (new, hermetic, no GPU) covers how the per-rank dispatch size is chosen: the default cap, the bound from a user-set QP depth, the RDMA-size halving, and the error path.\n- On H100: `pytest tests/kernels/moe/test_batched_moe.py tests/kernels/moe/test_deepep_ll_dispatch_tokens.py` gives 408 passed, 384 skipped (all skips are pre-existing quantization-combination skips).\n\n## Details\n\n**Root cause.** `maybe_make_prepare_finalize` passes `moe.max_num_tokens` (= `max_num_batched_tokens`) as `num_max_dispatch_tokens_per_rank` to DeepEP LL. DeepEP has two hard limits on that value:\n\n1. **RDMA buffer limit.** `Buffer.get_low_latency_rdma_size_hint` grows linearly at about `num_experts * (2*hidden + hidden/32)` bytes per token. For this model on 8 ranks that is about 9.58 MB per token:\n\n   | tokens/rank | size hint |\n   |---|---|\n   | 256 | 2.45 GB |\n   | 512 | 4.91 GB |\n   | 3584 | 34.35 GB |\n   | 4096 | 39.26 GB |\n\n   DeepEP asserts `num_rdma_bytes / 16 < INT_MAX`, which caps the buffer at about 34.36 GB (32 GiB). So any value above 3584 crashes.\n2. **QP depth.** `deep_ep` asserts `NVSHMEM_QP_DEPTH >= 2 * (num_max_dispatch_tokens_per_rank + 1)`. `NVSHMEM_QP_DEPTH` defaults to 1024, so even `max_num_batched_tokens=512` crashes unless the user sets `NVSHMEM_QP_DEPTH`.\n\nThe same value also sizes the batched-expert workspaces, `(local_experts, tokens * num_ranks, max(N, K))`. So even when the limits are not hit, a large `max_num_batched_tokens` spends GPU memory that the KV cache needs. With `--max-num-batched-tokens 4096` and `gpu_memory_utilization=0.92`, the KV cache left for this model was:\n\n| LL capacity (tokens/rank) | KV cache memory | Result |\n|---|---|---|\n| 512 | 3.2 GiB | fails the `max_num_seqs=64` check |\n| 256 | 6.8 GiB | OK |\n\n**Fix.**\n- `DeepEPLLAll2AllManager.max_dispatch_tokens_per_rank` picks the LL capacity:\n  - By default it is `min(max_num_batched_tokens, 256)`. 256 is the existing `SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP`.\n  - If the user sets `NVSHMEM_QP_DEPTH`, it is `min(max_num_batched_tokens, NVSHMEM_QP_DEPTH // 2 - 1)`, so users can opt into larger rounds.\n  - It is then halved until the RDMA size hint fits DeepEP's limit.\n  - The user's `NVSHMEM_QP_DEPTH` is read once and cached. `deep_ep.Buffer.__init__` writes its default (1024) back into the environment, so re-reading it would make later MoE layers size their buffers differently.\n- `FusedMoEKernelModularImpl.apply` splits the batch into rounds of `prepare_finalize.max_num_tokens_per_rank()` tokens.\n  - Dispatch and combine are collectives, so every EP rank must run the same number of rounds. The round count is derived from `dp_metadata` (`num_tokens_across_dp_cpu`, or `local_sizes` under sequence parallelism).\n  - A rank that runs out of tokens processes a 1-token dummy round and discards its output. This mirrors the old `forward_impl_chunked`.\n  - Shared experts run once over the full input, in the first round.\n\n**Tradeoffs / limitations.**\n- Prefill-sized batches now take several LL rounds. In the example above, a 4096-token batch takes 16 rounds per layer. LL kernels are tuned for decode, so prefill-heavy workloads should still prefer `deepep_high_throughput` or the default all2all backends.\n- Deferred finalize (`UnfinalizedMoEOutput`, produced only by the FlashInfer deferred-GEMM2 path) is asserted to not occur in the chunked path.\n- Not exercised end to end: DBO/ubatching combined with chunking.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "headRepository": {
+        "nameWithOwner": "NickLucche/vllm"
+      },
+      "merged": false,
+      "number": 60900,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "itayalroy"
+            },
+            "body": "We can probably use the same path for NIXL EP as well with minimal changes, since NIXL EP is currently based on DeepEP LL. This is useful as it can enable zero-downtime Elastic EP (which currently requires NIXL EP) for prefill workloads until NIXL EP gets prefill-optimized kernels (https://github.com/ai-dynamo/nixl/issues/2383)",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-10T01:01:49Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60900#pullrequestreview-5476763020"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMFQwMTowMTo0OVq0MjAyNi0xMC0xMFQwMTowMTo0OVrPAAAAAUZwxYw=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Bugfix][MoE] Decouple DeepEP low-latency dispatch size from max_num_batched_tokens",
+      "updatedAt": "2026-10-11T12:04:37Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60900"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "1a3a7a8f01a8c1a3184151b8185072efda11daab"
+    },
+    "body": "\n\n## Overview\n\n`--all2all-backend deepep_low_latency` crashes at startup whenever `--max-num-batched-tokens` is set above a few hundred. This happens with an ordinary prefill-friendly config such as `--max-num-batched-tokens 4096`. The cause is that the per-rank dispatch capacity of the DeepEP LL buffers is taken directly from `max_num_batched_tokens`. This PR decouples the two: the LL buffers are sized for a fixed number of tokens per rank, and larger forward passes are split into several dispatch rounds that stay in sync across the DP ranks.\n\nRelated: #57894 / #57915 (draft). That PR adds a fail-fast error for the same 32 GiB limit, but the config still cannot run. This PR makes the config run.\n\n## Claims\n\n- DP8xEP8 `deepep_low_latency` with `--max-num-batched-tokens 4096` now starts and serves correctly with no `NVSHMEM_*` env tuning. Before this PR it crashed in `deep_ep.Buffer.__init__`.\n- The memory used by the LL RDMA buffer and the batched-expert workspaces no longer grows with `max_num_batched_tokens`.\n- A clear `ValueError` is raised when a user-set `NVSHMEM_QP_DEPTH` is too small. Previously this was a bare `AssertionError` deep inside DeepEP.\n- No behavior change for the default LL config: when `max_num_batched_tokens` is not set it already defaults to 256, so no chunking happens and the buffer size is unchanged.\n- No behavior change for other all2all backends. Chunking only triggers when a rank's batch exceeds `prepare_finalize.max_num_tokens_per_rank()`. Other prepare/finalize implementations report `max_num_batched_tokens` or `None` there, so they never trigger it.\n\n## Validation\n\nSetup: GLM-5.x Flash FP8 (hidden 4096, 288 routed experts, top-8, 45 MoE layers) on 1 node of 8xH100, using\n\n`--data-parallel-size 8 --enable-expert-parallel --all2all-backend deepep_low_latency --max-num-batched-tokens 4096 --max-num-seqs 64 --gpu-memory-utilization 0.92`\n\n| | Startup | GSM8K (5-shot, 1319 q, 3 runs) |\n|---|---|---|\n| main, `--max-num-batched-tokens 4096` | crash: `num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max()` | n/a |\n| this PR, `--max-num-batched-tokens 4096` (chunked rounds of 256) | OK | 0.896 / 0.894 / 0.902 |\n| control: this PR, `--max-num-batched-tokens 256` (no chunking, same LL buffer as on main) | OK | 0.904 / 0.898 |\n\nThe chunked and unchunked runs agree within run-to-run noise. Both sit about 1.5 points below this model's TP8 reference (0.914-0.919). That gap comes from the LL path itself (FP8 dispatch) and is present without chunking.\n\nThe end-to-end runs used a vLLM main build from a few days ago (`30d4032363`) with this diff applied. It applies cleanly; the files touched here differ from this branch's base only in unrelated hunks.\n\nServing benchmark (`vllm bench serve`, random, ISL 8192 / OSL 1024, after warmup), median values:\n\n| concurrency | TTFT (ms) | TPOT (ms) | output tok/s |\n|---|---|---|---|\n| 1 | 992 | 15.5 | 61 |\n| 16 | 2650 | 21.4 | 670 |\n| 64 | 4015 | 32.8 | 1755 |\n\nFor comparison, before this PR the only way to run LL here was `--max-num-batched-tokens 512` plus `NVSHMEM_QP_DEPTH=2048`:\n\n| concurrency | TTFT (ms) | TPOT (ms) | output tok/s |\n|---|---|---|---|\n| 1 | 2079 | 15.6 | 57 |\n| 16 | 3460 | 24.4 | 563 |\n| 64 | 5762 | 41.9 | 1216 |\n\nUnit tests:\n- `tests/kernels/moe/test_batched_moe.py::test_batched_experts_chunked_dispatch` (new) runs a 200-token batch through a 64-token batched prepare/finalize. It checks the output against the reference. In one case it also simulates a peer DP rank with 448 tokens, which forces 4 real rounds plus 3 dummy rounds.\n- `tests/kernels/moe/test_deepep_ll_dispatch_tokens.py` (new, hermetic, no GPU) covers how the per-rank dispatch size is chosen: the default cap, the bound from a user-set QP depth, the RDMA-size halving, and the error path.\n- On H100: `pytest tests/kernels/moe/test_batched_moe.py tests/kernels/moe/test_deepep_ll_dispatch_tokens.py` gives 408 passed, 384 skipped (all skips are pre-existing quantization-combination skips).\n\n## Details\n\n**Root cause.** `maybe_make_prepare_finalize` passes `moe.max_num_tokens` (= `max_num_batched_tokens`) as `num_max_dispatch_tokens_per_rank` to DeepEP LL. DeepEP has two hard limits on that value:\n\n1. **RDMA buffer limit.** `Buffer.get_low_latency_rdma_size_hint` grows linearly at about `num_experts * (2*hidden + hidden/32)` bytes per token. For this model on 8 ranks that is about 9.58 MB per token:\n\n   | tokens/rank | size hint |\n   |---|---|\n   | 256 | 2.45 GB |\n   | 512 | 4.91 GB |\n   | 3584 | 34.35 GB |\n   | 4096 | 39.26 GB |\n\n   DeepEP asserts `num_rdma_bytes / 16 < INT_MAX`, which caps the buffer at about 34.36 GB (32 GiB). So any value above 3584 crashes.\n2. **QP depth.** `deep_ep` asserts `NVSHMEM_QP_DEPTH >= 2 * (num_max_dispatch_tokens_per_rank + 1)`. `NVSHMEM_QP_DEPTH` defaults to 1024, so even `max_num_batched_tokens=512` crashes unless the user sets `NVSHMEM_QP_DEPTH`.\n\nThe same value also sizes the batched-expert workspaces, `(local_experts, tokens * num_ranks, max(N, K))`. So even when the limits are not hit, a large `max_num_batched_tokens` spends GPU memory that the KV cache needs. With `--max-num-batched-tokens 4096` and `gpu_memory_utilization=0.92`, the KV cache left for this model was:\n\n| LL capacity (tokens/rank) | KV cache memory | Result |\n|---|---|---|\n| 512 | 3.2 GiB | fails the `max_num_seqs=64` check |\n| 256 | 6.8 GiB | OK |\n\n**Fix.**\n- `DeepEPLLAll2AllManager.max_dispatch_tokens_per_rank` picks the LL capacity:\n  - By default it is `min(max_num_batched_tokens, 256)`. 256 is the existing `SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP`.\n  - If the user sets `NVSHMEM_QP_DEPTH`, it is `min(max_num_batched_tokens, NVSHMEM_QP_DEPTH // 2 - 1)`, so users can opt into larger rounds.\n  - It is then halved until the RDMA size hint fits DeepEP's limit.\n  - The user's `NVSHMEM_QP_DEPTH` is read once and cached. `deep_ep.Buffer.__init__` writes its default (1024) back into the environment, so re-reading it would make later MoE layers size their buffers differently.\n- `FusedMoEKernelModularImpl.apply` splits the batch into rounds of `prepare_finalize.max_num_tokens_per_rank()` tokens.\n  - Dispatch and combine are collectives, so every EP rank must run the same number of rounds. The round count is derived from `dp_metadata` (`num_tokens_across_dp_cpu`, or `local_sizes` under sequence parallelism).\n  - A rank that runs out of tokens processes a 1-token dummy round and discards its output. This mirrors the old `forward_impl_chunked`.\n  - Shared experts run once over the full input, in the first round.\n\n**Tradeoffs / limitations.**\n- Prefill-sized batches now take several LL rounds. In the example above, a 4096-token batch takes 16 rounds per layer. LL kernels are tuned for decode, so prefill-heavy workloads should still prefer `deepep_high_throughput` or the default all2all backends.\n- Deferred finalize (`UnfinalizedMoEOutput`, produced only by the FlashInfer deferred-GEMM2 path) is asserted to not occur in the chunked path.\n- Not exercised end to end: DBO/ubatching combined with chunking.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "NickLucche/vllm"
+      },
+      "sha": "5a2b7743d287000c0cacb903cc70f56900ef306f"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60900",
+    "merged": false,
+    "number": 60900,
+    "state": "open",
+    "title": "[Bugfix][MoE] Decouple DeepEP low-latency dispatch size from max_num_batched_tokens",
+    "updated_at": "2026-10-11T12:04:37Z"
+  },
+  "files": [
+    {
+      "additions": 42,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5a2b7743d287000c0cacb903cc70f56900ef306f/tests%2Fkernels%2Fmoe%2Ftest_batched_moe.py",
+      "changes": 42,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fmoe%2Ftest_batched_moe.py?ref=5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "deletions": 0,
+      "filename": "tests/kernels/moe/test_batched_moe.py",
+      "patch": "@@ -671,6 +671,48 @@ def test_batched_experts_end_to_end(m, n, k, e, topk):\n     torch.testing.assert_close(triton_output, baseline_output, atol=3e-2, rtol=2e-2)\n \n \n+@pytest.mark.parametrize(\"max_tokens_across_dp\", [None, 448])\n+def test_batched_experts_chunked_dispatch(max_tokens_across_dp: int | None):\n+    \"\"\"Batches larger than the prepare/finalize per-rank capacity are split into\n+    several dispatch rounds; the round count follows the largest DP rank, with\n+    dummy rounds once this rank runs out of tokens.\"\"\"\n+    from vllm.forward_context import (\n+        DPMetadata,\n+        create_forward_context,\n+        override_forward_context,\n+    )\n+    from vllm.v1.worker.workspace import init_workspace_manager\n+\n+    m, n, k, e, topk, max_num_tokens = 200, 512, 512, 8, 2, 64\n+    set_random_seed(7)\n+    device = current_platform.device_type\n+    init_workspace_manager(torch.device(f\"{device}:0\"))\n+\n+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16) / 10\n+    score = torch.randn((m, e), device=device, dtype=torch.bfloat16)\n+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=torch.bfloat16) / 15\n+    w2 = torch.randn((e, k, n), device=device, dtype=torch.bfloat16) / 15\n+\n+    dp_metadata = (\n+        None\n+        if max_tokens_across_dp is None\n+        else DPMetadata(torch.tensor([m, max_tokens_across_dp]))\n+    )\n+    with (\n+        set_current_vllm_config(vllm_config),\n+        override_forward_context(\n+            create_forward_context(None, vllm_config, dp_metadata=dp_metadata)\n+        ),\n+    ):\n+        topk_weight, topk_ids, _ = fused_topk(a, score, topk, False)\n+        baseline_output = torch_experts(a, w1, w2, topk_weight, topk_ids)\n+        triton_output = batched_moe(\n+            a, w1, w2, topk_weight, topk_ids, max_num_tokens=max_num_tokens\n+        )\n+\n+    torch.testing.assert_close(triton_output, baseline_output, atol=3e-2, rtol=2e-2)\n+\n+\n def test_batched_triton_backend_mapping():\n     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (\n         UnquantizedMoeBackend,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5a2b7743d287000c0cacb903cc70f56900ef306f/tests%2Fkernels%2Fmoe%2Ftest_batched_moe.py",
+      "sha": "02b8e495e6cd03bf6d0fcd7a96ab179ede34a945",
+      "status": "modified"
+    },
+    {
+      "additions": 84,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5a2b7743d287000c0cacb903cc70f56900ef306f/tests%2Fkernels%2Fmoe%2Ftest_deepep_ll_dispatch_tokens.py",
+      "changes": 84,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fmoe%2Ftest_deepep_ll_dispatch_tokens.py?ref=5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "deletions": 0,
+      "filename": "tests/kernels/moe/test_deepep_ll_dispatch_tokens.py",
+      "patch": "@@ -0,0 +1,84 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Sizing of the DeepEP low-latency per-rank dispatch buffer.\n+\n+Hermetic: deep_ep is replaced by a fake whose RDMA size hint is linear in the\n+number of tokens (~9.6 MB/token, which is what DeepEP reports for hidden=4096,\n+288 experts, 8 ranks).\n+\"\"\"\n+\n+import os\n+import sys\n+import types\n+\n+import pytest\n+\n+from vllm.distributed.device_communicators.all2all import (\n+    DEEPEP_LL_MAX_RDMA_BYTES,\n+    DeepEPLLAll2AllManager,\n+    _user_nvshmem_qp_depth,\n+)\n+\n+BYTES_PER_TOKEN = 9_584_640\n+HIDDEN, NUM_RANKS, NUM_EXPERTS = 4096, 8, 288\n+\n+\n+def _size_hint(num_tokens: int, hidden: int, num_ranks: int, num_experts: int) -> int:\n+    return num_tokens * BYTES_PER_TOKEN\n+\n+\n+@pytest.fixture(autouse=True)\n+def fake_deep_ep(monkeypatch: pytest.MonkeyPatch) -> None:\n+    buffer = types.SimpleNamespace(get_low_latency_rdma_size_hint=_size_hint)\n+    monkeypatch.setitem(sys.modules, \"deep_ep\", types.SimpleNamespace(Buffer=buffer))\n+    monkeypatch.delenv(\"NVSHMEM_QP_DEPTH\", raising=False)\n+    _user_nvshmem_qp_depth.cache_clear()\n+\n+\n+def _max_tokens(max_num_batched_tokens: int) -> int:\n+    return DeepEPLLAll2AllManager.max_dispatch_tokens_per_rank(\n+        max_num_batched_tokens, HIDDEN, NUM_RANKS, NUM_EXPERTS\n+    )\n+\n+\n+@pytest.mark.parametrize(\n+    \"max_num_batched_tokens, expected_tokens\",\n+    [(64, 64), (256, 256), (512, 256), (4096, 256)],\n+)\n+def test_default_caps_tokens(\n+    monkeypatch: pytest.MonkeyPatch, max_num_batched_tokens: int, expected_tokens: int\n+) -> None:\n+    assert _max_tokens(max_num_batched_tokens) == expected_tokens\n+    # deep_ep.Buffer writes its default QP depth into the environment. Later\n+    # MoE layers must not mistake it for a user override and size differently.\n+    monkeypatch.setenv(\"NVSHMEM_QP_DEPTH\", \"1024\")\n+    assert _max_tokens(max_num_batched_tokens) == expected_tokens\n+\n+\n+@pytest.mark.parametrize(\n+    \"qp_depth, max_num_batched_tokens, expected_tokens\",\n+    [\n+        (\"1024\", 4096, 511),\n+        (\"4096\", 1024, 1024),\n+        # Bounded by QP depth to 4095 tokens, then halved until the RDMA\n+        # buffer fits DeepEP's 32 GiB limit.\n+        (\"8192\", 16384, 2047),\n+    ],\n+)\n+def test_user_qp_depth(\n+    monkeypatch: pytest.MonkeyPatch,\n+    qp_depth: str,\n+    max_num_batched_tokens: int,\n+    expected_tokens: int,\n+) -> None:\n+    monkeypatch.setenv(\"NVSHMEM_QP_DEPTH\", qp_depth)\n+    num_tokens = _max_tokens(max_num_batched_tokens)\n+    assert num_tokens == expected_tokens\n+    assert num_tokens * BYTES_PER_TOKEN < DEEPEP_LL_MAX_RDMA_BYTES\n+    assert os.environ[\"NVSHMEM_QP_DEPTH\"] == qp_depth\n+\n+\n+def test_qp_depth_too_small(monkeypatch: pytest.MonkeyPatch) -> None:\n+    monkeypatch.setenv(\"NVSHMEM_QP_DEPTH\", \"2\")\n+    with pytest.raises(ValueError, match=\"NVSHMEM_QP_DEPTH=2 is too small\"):\n+        _max_tokens(4096)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5a2b7743d287000c0cacb903cc70f56900ef306f/tests%2Fkernels%2Fmoe%2Ftest_deepep_ll_dispatch_tokens.py",
+      "sha": "84a1d66e87ded2114ac695d52c8c7d2c8fe93c24",
+      "status": "added"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5a2b7743d287000c0cacb903cc70f56900ef306f/tests%2Fkernels%2Fmoe%2Futils.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fmoe%2Futils.py?ref=5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "deletions": 1,
+      "filename": "tests/kernels/moe/utils.py",
+      "patch": "@@ -131,8 +131,10 @@ def batched_moe(\n     per_act_token_quant: bool = False,\n     block_shape: list[int] | None = None,\n     moe_config: FusedMoEConfig | None = None,\n+    max_num_tokens: int | None = None,\n ) -> torch.Tensor:\n-    max_num_tokens = round_up(a.shape[0], 64)\n+    if max_num_tokens is None:\n+        max_num_tokens = round_up(a.shape[0], 64)\n \n     quant_config = FusedMoEQuantConfig.make(\n         quant_dtype,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5a2b7743d287000c0cacb903cc70f56900ef306f/tests%2Fkernels%2Fmoe%2Futils.py",
+      "sha": "41a2da4a6467a7d2b899a32be0ad36760a9eaaa3",
+      "status": "modified"
+    },
+    {
+      "additions": 60,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5a2b7743d287000c0cacb903cc70f56900ef306f/vllm%2Fdistributed%2Fdevice_communicators%2Fall2all.py",
+      "changes": 61,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fdevice_communicators%2Fall2all.py?ref=5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "deletions": 1,
+      "filename": "vllm/distributed/device_communicators/all2all.py",
+      "patch": "@@ -1,5 +1,6 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+import functools\n import os\n import threading\n from collections.abc import Iterator\n@@ -11,7 +12,7 @@\n import torch.distributed as dist\n \n import vllm.envs as envs\n-from vllm.config import get_current_vllm_config\n+from vllm.config import SchedulerConfig, get_current_vllm_config\n from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group\n from vllm.distributed.utils import StatelessProcessGroup\n from vllm.forward_context import get_forward_context\n@@ -322,6 +323,17 @@ def set_num_sms(self, num_sms: int):\n         deep_ep.Buffer.set_num_sms(num_sms)\n \n \n+# DeepEP asserts num_rdma_bytes / sizeof(int4) < INT_MAX.\n+DEEPEP_LL_MAX_RDMA_BYTES = 16 * (2**31 - 1)\n+\n+\n+@functools.cache\n+def _user_nvshmem_qp_depth() -> str | None:\n+    \"\"\"NVSHMEM_QP_DEPTH as set by the user. Cached because deep_ep.Buffer\n+    writes its default (1024) back into the environment on construction.\"\"\"\n+    return os.environ.get(\"NVSHMEM_QP_DEPTH\")\n+\n+\n class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):\n     \"\"\"All2All communication based on DeepEP Low-Latency kernels.\"\"\"\n \n@@ -378,6 +390,53 @@ def _make_all2all_kwargs(\n         )\n         return kwargs\n \n+    @staticmethod\n+    def max_dispatch_tokens_per_rank(\n+        max_num_batched_tokens: int, hidden: int, num_ranks: int, num_experts: int\n+    ) -> int:\n+        \"\"\"Per-rank dispatch capacity of the low-latency buffers.\n+\n+        Decoupled from max_num_batched_tokens: the RDMA buffer and the batched\n+        expert workspaces grow linearly with it, and larger forward passes are\n+        split into several dispatch rounds instead (see\n+        FusedMoEKernelModularImpl.apply). Defaults to the same 256 tokens used\n+        as max_num_batched_tokens for batched DP backends. Setting\n+        NVSHMEM_QP_DEPTH opts into larger rounds, bounded by DeepEP's\n+        NVSHMEM_QP_DEPTH >= 2 * (num_tokens + 1) requirement. Either way the\n+        result is reduced until the RDMA buffer fits DeepEP's size limit.\n+        \"\"\"\n+        import deep_ep  # type: ignore[import-not-found]\n+\n+        qp_depth = _user_nvshmem_qp_depth()\n+        if qp_depth is None:\n+            num_tokens = SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP\n+        else:\n+            num_tokens = int(qp_depth) // 2 - 1\n+        num_tokens = min(num_tokens, max_num_batched_tokens)\n+        if num_tokens < 1:\n+            raise ValueError(\n+                f\"NVSHMEM_QP_DEPTH={qp_depth} is too small for DeepEP \"\n+                \"low-latency kernels, which need NVSHMEM_QP_DEPTH >= \"\n+                \"2 * (max dispatch tokens per rank + 1).\"\n+            )\n+        while (\n+            num_tokens > 1\n+            and deep_ep.Buffer.get_low_latency_rdma_size_hint(\n+                num_tokens, hidden, num_ranks, num_experts\n+            )\n+            >= DEEPEP_LL_MAX_RDMA_BYTES\n+        ):\n+            num_tokens //= 2\n+        if num_tokens < max_num_batched_tokens:\n+            logger.info_once(\n+                \"DeepEP low-latency: dispatching at most %d tokens per rank at \"\n+                \"a time (max_num_batched_tokens=%d); larger batches are split \"\n+                \"into multiple dispatch rounds.\",\n+                num_tokens,\n+                max_num_batched_tokens,\n+            )\n+        return num_tokens\n+\n     def get_handle(self, kwargs):\n         \"\"\"The kwargs for DeepEPLLAll2AllManager is dictated by\n         _make_all2all_kwargs.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5a2b7743d287000c0cacb903cc70f56900ef306f/vllm%2Fdistributed%2Fdevice_communicators%2Fall2all.py",
+      "sha": "00bef0a260d2341c6f5701b4f4833ad1d31189fe",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5a2b7743d287000c0cacb903cc70f56900ef306f/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fall2all_utils.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fall2all_utils.py?ref=5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "deletions": 2,
+      "filename": "vllm/model_executor/layers/fused_moe/all2all_utils.py",
+      "patch": "@@ -248,8 +248,14 @@ def maybe_make_prepare_finalize(\n                 physical_to_global,\n                 local_expert_global_ids,\n             ) = routing_tables\n+        max_tokens_per_rank = all2all_manager.max_dispatch_tokens_per_rank(\n+            moe.max_num_tokens,\n+            moe.hidden_dim,\n+            all2all_manager.world_size,\n+            moe.num_experts,\n+        )\n         all_to_all_args = dict(\n-            max_num_tokens_per_dp_rank=moe.max_num_tokens,\n+            max_num_tokens_per_dp_rank=max_tokens_per_rank,\n             token_hidden_size=moe.hidden_dim,\n             num_ep_ranks=all2all_manager.world_size,\n             num_global_experts=moe.num_experts,\n@@ -266,7 +272,7 @@ def maybe_make_prepare_finalize(\n \n         prepare_finalize = DeepEPLLPrepareAndFinalize(\n             handle,\n-            max_tokens_per_rank=moe.max_num_tokens,\n+            max_tokens_per_rank=max_tokens_per_rank,\n             num_dispatchers=all2all_manager.world_size,\n             use_fp8_dispatch=use_fp8_dispatch,\n             global_to_physical=global_to_physical,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5a2b7743d287000c0cacb903cc70f56900ef306f/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fall2all_utils.py",
+      "sha": "513e1d5497573e5889cc2f375cdae0c721b8fdf9",
+      "status": "modified"
+    },
+    {
+      "additions": 92,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5a2b7743d287000c0cacb903cc70f56900ef306f/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fmodular_kernel.py",
+      "changes": 92,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fmodular_kernel.py?ref=5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "deletions": 0,
+      "filename": "vllm/model_executor/layers/fused_moe/modular_kernel.py",
+      "patch": "@@ -10,6 +10,7 @@\n import torch\n \n import vllm.envs as envs\n+from vllm.forward_context import get_forward_context, is_forward_context_available\n from vllm.logger import init_logger\n from vllm.model_executor.layers.fused_moe.activation import (\n     ApplyMoEActivationConfig,\n@@ -37,6 +38,7 @@\n     QuantKey,\n )\n from vllm.platforms import current_platform\n+from vllm.utils.math_utils import cdiv\n from vllm.utils.torch_utils import PIN_MEMORY\n from vllm.v1.worker.ubatching import (\n     dbo_enabled,\n@@ -1472,6 +1474,96 @@ def apply(\n         if global_num_experts == -1:\n             global_num_experts = local_num_experts\n \n+        num_chunks = self._num_dispatch_chunks(hidden_states.size(0))\n+        if num_chunks == 1:\n+            return self._apply_chunk(\n+                output,\n+                hidden_states,\n+                w1,\n+                w2,\n+                topk_ids,\n+                topk_weights,\n+                activation,\n+                global_num_experts,\n+                local_num_experts,\n+                expert_map,\n+                apply_router_weight_on_input,\n+                shared_experts,\n+                shared_experts_input,\n+            )\n+\n+        # Batched all2all kernels (e.g. DeepEP low-latency) cap the tokens per\n+        # dispatch. Every EP rank must issue the same number of collective\n+        # dispatch/combine calls, so ranks that run out of tokens process a\n+        # 1-token dummy chunk and discard its output.\n+        chunk_size = self.prepare_finalize.max_num_tokens_per_rank()\n+        assert chunk_size is not None\n+        num_tokens = hidden_states.size(0)\n+        assert num_tokens > 0\n+        for i in range(num_chunks):\n+            start = i * chunk_size\n+            is_dummy = start >= num_tokens\n+            if is_dummy:\n+                start = num_tokens - 1\n+            end = min(start + chunk_size, num_tokens)\n+            chunk_out = self._apply_chunk(\n+                torch.empty_like(output[start:end]) if is_dummy else output[start:end],\n+                hidden_states[start:end],\n+                w1,\n+                w2,\n+                topk_ids[start:end],\n+                topk_weights[start:end],\n+                activation,\n+                global_num_experts,\n+                local_num_experts,\n+                expert_map,\n+                apply_router_weight_on_input,\n+                # The shared experts run once, over all tokens.\n+                shared_experts if i == 0 else None,\n+                shared_experts_input if i == 0 else None,\n+            )\n+            assert not isinstance(chunk_out, UnfinalizedMoEOutput), (\n+                \"Deferred MoE finalize is not supported with chunked dispatch.\"\n+            )\n+        return output\n+\n+    def _num_dispatch_chunks(self, num_tokens: int) -> int:\n+        \"\"\"Number of dispatch rounds needed so that no EP rank sends more than\n+        `max_num_tokens_per_rank()` tokens per round. Uniform across ranks.\"\"\"\n+        chunk_size = self.prepare_finalize.max_num_tokens_per_rank()\n+        if chunk_size is None:\n+            return 1\n+        max_num_tokens = num_tokens\n+        dp_metadata = (\n+            get_forward_context().dp_metadata\n+            if is_forward_context_available()\n+            else None\n+        )\n+        if dp_metadata is not None:\n+            sizes = (\n+                dp_metadata.local_sizes\n+                if dp_metadata.local_sizes is not None\n+                else dp_metadata.num_tokens_across_dp_cpu.tolist()\n+            )\n+            max_num_tokens = max([max_num_tokens, *sizes])\n+        return max(1, cdiv(max_num_tokens, chunk_size))\n+\n+    def _apply_chunk(\n+        self,\n+        output: torch.Tensor,\n+        hidden_states: torch.Tensor,\n+        w1: torch.Tensor,\n+        w2: torch.Tensor,\n+        topk_ids: torch.Tensor,\n+        topk_weights: torch.Tensor,\n+        activation: MoEActivation,\n+        global_num_experts: int,\n+        local_num_experts: int,\n+        expert_map: torch.Tensor | None,\n+        apply_router_weight_on_input: bool,\n+        shared_experts: SharedExperts | None,\n+        shared_experts_input: torch.Tensor | None,\n+    ) -> torch.Tensor | UnfinalizedMoEOutput:\n         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(\n             hidden_states,\n             topk_weights,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5a2b7743d287000c0cacb903cc70f56900ef306f/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fmodular_kernel.py",
+      "sha": "95efe78b416905fa6866ca7c09aad5f0543b9d58",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [],
+  "number": 60900,
+  "refs": {
+    "base": {
+      "commit": "1a3a7a8f01a8c1a3184151b8185072efda11daab",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "5a2b7743d287000c0cacb903cc70f56900ef306f",
+      "repository": "NickLucche/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "We can probably use the same path for NIXL EP as well with minimal changes, since NIXL EP is currently based on DeepEP LL. This is useful as it can enable zero-downtime Elastic EP (which currently requires NIXL EP) for prefill workloads until NIXL EP gets prefill-optimized kernels (https://github.com/ai-dynamo/nixl/issues/2383)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60900#pullrequestreview-5476763020",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-10T01:01:49Z",
+      "user": {
+        "login": "itayalroy"
+      }
+    }
+  ]
+}

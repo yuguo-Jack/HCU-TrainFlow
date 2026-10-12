@@ -1,0 +1,172 @@
+---
+id: doc-baidu-baige-loongforge-09c32e369ea7704f0883
+title: baidu-baige/LoongForge / docs/source/kunlun_tutorial/install_p800.md
+engine: loongforge
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: baidu-baige/LoongForge
+commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+path: docs/source/kunlun_tutorial/install_p800.md
+raw_sha256: fe748a69fdb4ab1be6a77324b0a70d512b4b7226340d3ac30ee6c36f4fabe633
+sources: []
+generated_body_sha256: 8fc585a049bf5a8da9b25f3263c39d25efec5dc62c24ccdb228efd2580dc45a7
+source_state: current-scan
+---
+
+# baidu-baige/LoongForge / docs/source/kunlun_tutorial/install_p800.md
+
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/kunlun_tutorial/install_p800.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Installation on Kunlunxin P800
+
+This document describes how to build the LoongForge image that can run on Kunlunxin P800.
+
+## 1. Build & Run with Docker Image (Recommended)
+
+We provide a clean base image with required underlying dependencies installed.
+
+* UV environment (community Docker Hub): `loongforge/loongforge_kunlun:py310_torch25`
+* Conda environment (your registry mirror): `your-registry.example.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.33`
+
+Environment versions:
+* **OS**: Ubuntu 20.04
+* **Software**:
+    * Python 3.10
+    * PyTorch 2.5.1
+    * CUDA 11.7
+### 1.2 Build the docker image
+
+**Before building, clone the repository with submodules** so the Loong-Megatron
+source is included in the Docker build context:
+
+```bash
+git clone --recurse-submodules https://github.com/baidu-baige/LoongForge.git
+```
+
+Then build the image:
+
+```bash
+BASE_IMAGE=loongforge/loongforge_kunlun:py310_torch25
+DEFAULT_XPYTORCH_URL_ARG=https://baidu-kunlun-public.su.bcebos.com/baidu-kunlun-share/20260409/torch25/xpytorch-cp310-torch251-ubuntu2004-x64.run
+DEFAULT_KUNLUN_OPS_URL_ARG=https://baidu-kunlun-public.su.bcebos.com/baidu-kunlun-share/20260428/torch25/kunlun_ops-0.1.122%2Bb4984657-cp310-cp310-linux_x86_64.whl
+
+: "${COCOPOD_URL_ARG:?Set COCOPOD_URL_ARG to a reachable cocopod wheel URL}"
+: "${XSPEEDGATE_URL_ARG:?Set XSPEEDGATE_URL_ARG to a reachable xspeedgate wheel URL}"
+
+docker build  \
+    --build-arg BASE_IMAGE=${BASE_IMAGE} \
+    --build-arg XPYTORCH_URL_ARG="${DEFAULT_XPYTORCH_URL_ARG}" \
+    --build-arg COCOPOD_URL_ARG="${COCOPOD_URL_ARG}" \
+    --build-arg XSPEEDGATE_URL_ARG="${XSPEEDGATE_URL_ARG}" \
+    --build-arg KUNLUN_OPS_URL_ARG="${DEFAULT_KUNLUN_OPS_URL_ARG}" \
+    -t LoongForge-kunlun:latest -f LoongForge/docker/Dockerfile.xpu .
+```
+
+> **Note:** All model families (LLM / VLM / VLA / Diffusion) now share a single
+> Docker image. The `ENABLE_LEROBOT` build argument has been removed — there is
+> no longer a lerobot / non-lerobot distinction when building images.
+
+- `BASE_IMAGE` is the base image used for building. Options include:
+  * `loongforge/loongforge_kunlun:py310_torch25` (default) [available at Docker Hub]
+  * `your-registry.example.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.33` (example XMLIR image)
+- `XPYTORCH_URL_ARG` is the xpytorch installer url argument.
+- `COCOPOD_URL_ARG` and `XSPEEDGATE_URL_ARG` are required when building from a public checkout.
+- `KUNLUN_OPS_URL_ARG` can override the default public package URL.
+After building, you can verify the image:
+
+```bash
+docker images | grep LoongForge
+```
+
+---
+
+### 1.3 Run the docker container
+The example below starts a container and mounts the project code, data, etc.:
+
+```bash
+#!/bin/bash
+
+image_addr='LoongForge-kunlun:latest'
+DEFAULT_CONTAINER_NAME='loongforge-kunlun'
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    echo "Usage: $0 {start|exec|stop|rm} [container_name(default: ${DEFAULT_CONTAINER_NAME})]"
+    exit 1
+fi
+
+ACTION=$1
+CONTAINER_NAME=${2:-$DEFAULT_CONTAINER_NAME}
+
+case $ACTION in
+    start)
+        echo "Starting container: $CONTAINER_NAME"
+        docker run -itd \
+        --security-opt=seccomp=unconfined \
+        --cap-add=SYS_PTRACE \
+        --ulimit=memlock=-1 --ulimit=nofile=120000 --ulimit=stack=67108864 \
+        --shm-size=128G \
+        --privileged \
+        --net=host \
+        --name=${CONTAINER_NAME} \
+        -v /path/to/data:/workspace/data \
+        -w /workspace/ \
+        ${image_addr} bash
+
+        docker cp -L  $(which xpu-smi) $CONTAINER_NAME:/bin/xpu-smi || true
+        docker exec -it ${CONTAINER_NAME} bash
+        ;;
+    exec)
+        echo "Exec container: $CONTAINER_NAME"
+        docker exec -it ${CONTAINER_NAME} bash
+        ;;
+    stop)
+        echo "Stopping container: $CONTAINER_NAME"
+        docker stop $CONTAINER_NAME
+        ;;
+    rm)
+        echo "Removing container: $CONTAINER_NAME"
+        docker stop $CONTAINER_NAME && docker rm $CONTAINER_NAME
+        ;;
+    *)
+        echo "Invalid action specified. Use {start|stop|rm}."
+        exit 1
+        ;;
+esac
+```
+
+* Start container: `./docker_control.sh start`
+* Enter container: `./docker_control.sh exec`
+* Remove container: `./docker_control.sh rm`
+
+After entering the container:
+- For conda environment image: activate via `conda activate python310_torch25_cuda`
+- For UV image: activate via `source /opt/loongforge_kunlun/bin/activate`
+
+The virtual environment is activated by default. You can directly navigate to `/workspace/LoongForge/examples_xpu/` to run the corresponding training scripts.
+
+## 2. Install from Source
+
+If you already have a working Kunlun XPU + XPyTorch environment, you can
+install LoongForge directly:
+
+```bash
+git clone --recurse-submodules https://github.com/baidu-baige/LoongForge.git
+cd LoongForge
+uv venv .venv
+source .venv/bin/activate
+uv pip install -e ".[xpu]"
+```
+
+Note: TransformerEngine is **not** required for XPU. For additional XPU-specific
+dependencies (e.g. XPyTorch, DeepSpeed), refer to
+[`docker/Dockerfile.xpu`](https://github.com/baidu-baige/LoongForge/blob/master/docker/Dockerfile.xpu)
+for exact versions and build steps.

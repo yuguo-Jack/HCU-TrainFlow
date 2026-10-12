@@ -38,7 +38,7 @@ Markdown 链接不会自动将所有文档注入 Agent 上下文。主控在任�
 | [性能分析与优化](../skills/hcu-train-analyze-and-optimize/SKILL.md) | [证据驱动闭环](../skills/hcu-train-analyze-and-optimize/references/evidence-driven-loop.md)、[性能采集与分析](profiling.md)、[阶段执行契约](../skills/hcu-train-analyze-and-optimize/references/workflow.md) | 通信、Torch 原生、算子建模/同形状对照、数学库 tune 和底层库联动，按 Skill 对应步骤读专项；进入实现验证读 [验证与异常诊断](../skills/hcu-train-analyze-and-optimize/references/validation-diagnostics.md) 和 [状态验证](training-state-validation.md)。仅分析同样要解释热点与上限/未知，但不擅自运行优化实验 |
 | [规模扩展与长稳运行](../skills/hcu-train-scale-and-stability/SKILL.md) | 扩容/接管读 [阶段方法](../skills/hcu-train-scale-and-stability/references/workflow.md)、[训练观测](training-observation.md) 与 [状态验证](training-state-validation.md)；仅诊断先读 [故障诊断](../skills/hcu-train-scale-and-stability/references/diagnosis.md) | 按症状读诊断分支和 [知识与源码查证](../skills/hcu-train-scale-and-stability/references/evidence-sources.md)；部署守护再读对应部署契约；诊断不自动扩大为重启或故障注入 |
 | [HCU-TrainFlow-Wiki 搜索](../skills/hcu-trainflow-wiki-search/SKILL.md) | [查询方法](../skills/hcu-trainflow-wiki-search/references/workflow.md) 与 [Wiki 命令](wiki.md) 对应部分 | 先跨官方资料、通用环境经验和最终总结查询，再按适用条件筛选；本地证据不足时在线查 PR，再追最终源码；涉及 HCU 的事实按需联查大知识库，不更新它 |
-| [HCU-TrainFlow-Wiki 与 Skill 更新](../skills/hcu-trainflow-wiki-skill-update/SKILL.md) | [更新方法](../skills/hcu-trainflow-wiki-skill-update/references/workflow.md)、[Wiki 更新契约](wiki.md)、[知识归属与维护时机](knowledge-architecture.md)、[维护关联](../knowledge/maintenance.json) | 修订受影响的 overview/topic/case/Skill/解析器；收尾按 [本机同步](integrations.md#skills账号与升级)。依赖锁变化需另做对应依赖验证 |
+| [HCU-TrainFlow-Wiki 与 Skill 更新](../skills/hcu-trainflow-wiki-skill-update/SKILL.md) | [更新方法](../skills/hcu-trainflow-wiki-skill-update/references/workflow.md)、[Wiki 更新契约](wiki.md)、[知识归属与维护时机](knowledge-architecture.md)、[维护关联](../knowledge/maintenance.json) | 按 [统一 Wiki 标准](wiki-authoring-standard.md)检查各工程内容维度，修订受影响的 overview/topic/case/Skill/解析器；收尾按 [本机同步](integrations.md#skills账号与升级)。依赖锁变化需另做对应依赖验证 |
 
 每个阶段都有自身交付与复核责任；只有用户要求完整流程时才串起全部阶段。命令以当前 CLI 帮助、实际部署分支和授权为准。
 
@@ -52,3 +52,5 @@ Markdown 链接不会自动将所有文档注入 Agent 上下文。主控在任�
 - **程序落实**：[分析建模](../src/hcu_trainflow/analysis.py) 提供算力/带宽/延迟项与输入校验；其余方法由 Skill 引导执行并提交实际证据，不宣称所有文字方法都已变成自动判断程序。
 
 更新这些内容时同步核对维护关联、入口路由与安装副本。安装校验能发现缺文件、断开的本地文档链接、没有阅读入口的 references 和版本不一致；不能自动证明模型已理解每一条方法或实验已通过。
+
+跨引擎机制选择、HCU 修改归属统一见[优化参考表](optimization-reference-map.md)，在适配、分析优化及恢复诊断需要比较其他实现时按问题进入；不要求每次遍历全部参考工程。

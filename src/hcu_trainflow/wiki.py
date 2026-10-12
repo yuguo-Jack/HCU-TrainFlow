@@ -197,17 +197,24 @@ def pages(url, token=None, max_pages=100):
     return rows
 
 
-def refresh_source(store, project, source_id, token=None):
+def refresh_source(store, project, source_id, token=None, fixed_commit=None):
     safe_id(source_id)
     registry = read_json(Path(project) / "knowledge/sources.json")
     source = next((x for x in registry if x["id"] == source_id), None)
     if not source:
         raise FlowError("Source is not registered")
+    if fixed_commit is not None and (source.get('kind') == 'web' or not re.fullmatch(r'[0-9a-f]{40}', fixed_commit)):
+        raise FlowError('Fixed source acquisition requires a full Git commit')
     if source.get('kind') == 'web':
         sha, files, failures = collect_web_documents(store, source)
         ref = 'registered-official-pages'
     else:
-        sha, files, failures = collect_git_files(store, source, token)
+        # A coordinated update reads the same tree for inventory, documents and
+        # monitored code, even if the branch advances while PRs are collected.
+        acquisition_source = {**source, 'ref': fixed_commit} if fixed_commit else source
+        sha, files, failures = collect_git_files(store, acquisition_source, token)
+        if fixed_commit and sha != fixed_commit:
+            raise FlowError('Source changed during fixed commit acquisition')
         ref = source['ref']
     return stage_source_refresh(store, project, source, sha, files, failures, ref)
 
@@ -327,7 +334,7 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
     # An unchanged upstream must not erase a review invalidated by local edits/new topics.
     affected = [{'page': name, 'page_sha256': sha256, 'status': 'pending-content-review'}
                 for name, sha256 in page_hashes.items()
-                if changes or (reviewed_path.exists() and reviewed_hashes.get(name) != sha256)]
+                if changes or reviewed_hashes.get(name) != sha256]
     maintenance = []
     maintenance_path = Path(project) / "knowledge/maintenance.json"
     if maintenance_path.exists():

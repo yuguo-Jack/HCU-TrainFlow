@@ -9,24 +9,24 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-12'
 sources:
 - source: nvidia-cudnn-frontend
   path: docs/utilities/framework_integration_performance.md
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 5388a0c7c13fcf6f5471fc5d05b1ddcaac7b9f7fd366cd34ab9b71da9b49c476
 - source: nvidia-cudnn-frontend
   path: docs/utilities/dynamic-kernel-cache.md
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 37cc57df5fe3b0015647c345d072939e12202a9326aa898f9c93b5b11bf1ed60
 - source: nvidia-cudnn-frontend
   path: docs/utilities/cuda-graphs.md
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 60b3177f256d50028b2ca562ece2881693d9ee3f403f81c68d06b75cc2f88a42
 - source: nvidia-cudnn-frontend
   path: python/cudnn/_pygraph.py
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
-  sha256: 85e7e095a0e514931bbac6e71893d316495eeda415502669e43e3903abe25a46
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
+  sha256: 0a143dba0a0aed7eac3227547bfd6e6d362ff6ec6ca60772c440e92c62c556e5
 - source: nvidia-cudnn-frontend-docs
   path: framework-integration
   commit: e231f1ecf1c04ca05f5c5f66898be6f84da14a37fddd16491d733ebb95e321c1
@@ -34,7 +34,6 @@ sources:
   url: https://docs.nvidia.com/deeplearning/cudnn/latest/utilities/framework_integration_performance.html
   revision_kind: web-content-fingerprint
 ---
-
 # 案例：cuDNN Kernel 不慢，模型却被构图和 Host 调度拖慢
 
 ## 症状与假设
@@ -61,10 +60,10 @@ sources:
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: docs/utilities/framework_integration_performance.md](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/utilities/framework_integration_performance.md)
-- [nvidia-cudnn-frontend: docs/utilities/dynamic-kernel-cache.md](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/utilities/dynamic-kernel-cache.md)
-- [nvidia-cudnn-frontend: docs/utilities/cuda-graphs.md](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/utilities/cuda-graphs.md)
-- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/python/cudnn/_pygraph.py)
+- [nvidia-cudnn-frontend: docs/utilities/framework_integration_performance.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/utilities/framework_integration_performance.md)
+- [nvidia-cudnn-frontend: docs/utilities/dynamic-kernel-cache.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/utilities/dynamic-kernel-cache.md)
+- [nvidia-cudnn-frontend: docs/utilities/cuda-graphs.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/utilities/cuda-graphs.md)
+- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/python/cudnn/_pygraph.py)
 - [nvidia-cudnn-frontend-docs: framework-integration](https://docs.nvidia.com/deeplearning/cudnn/latest/utilities/framework_integration_performance.html)
 
-本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码 main、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。

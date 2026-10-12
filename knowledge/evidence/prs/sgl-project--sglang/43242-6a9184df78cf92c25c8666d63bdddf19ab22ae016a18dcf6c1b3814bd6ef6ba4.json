@@ -1,0 +1,418 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "20d1f3f56a4661b49eeec508580012370ca34176",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nPyTorch's flash SDPA forward picks split-KV when `batch * heads * ceil(query_len / 128)` is below 80% of the SM count (`num_splits_heuristic` in ATen's `flash_api.cpp`). Split-KV reorders the softmax sums. Tensor parallelism and Ulysses both reduce the number of heads each rank attends over. At short sequence lengths, that can push a head shard onto the split kernel while the unsharded layer stays unsplit. The result is that `--attention-backend torch_sdpa` runs differ between parallel and single-GPU execution even at the attention-operator level.\n\nThe default backends do not depend on the head count, and are unaffected:\n- sm100: cuDNN SDPA. Measured on B200: head shards are bit-identical.\n- sm90: sgl FA3, which runs with `num_splits=1`.\n\nAffected setups:\n- explicit `--attention-backend torch_sdpa`;\n- sm120, where torch SDPA is the default;\n- head dims that fall back to torch SDPA.\n\nThis came up while validating Ovis-Image (#43152), which carries a model-local version of this fix.\n\n## Modifications\n\n- **`SDPAImpl`** pads query rows past the split threshold when all of the following hold:\n  - the request asks for `quality=\"exact\"`;\n  - the call is a non-causal, unmasked fp16/bf16 CUDA call, without dropout and with head_dim ≤ 256;\n  - the local head count would split, but the unsharded layer's would not.\n\n  Query rows attend independently, so the real rows match the unsharded kernel bit for bit. The padding is sliced off afterwards.\n- **Gated on `exact`**: under the quality tiers, the default `lossless` tier already allows rounding-order changes. It keeps the faster split kernel and is unchanged by this PR.\n- **`USPAttention`** accepts `global_num_heads`, the layer's head count before TP sharding, and forwards it to the impl. It defaults to `num_heads`, which already covers Ulysses-only sharding.\n- **TP-sharding DiTs** pass their pre-TP head count: FLUX, FLUX.2, Qwen-Image, Anima, Wan, HunyuanVideo, Z-Image.\n- **Unchanged**: `CudnnSDPAImpl` / `DynamicCudnnSDPAImpl`, explicit cuDNN priority, masked/causal calls, FA varlen and ring paths.\n- **Tests**:\n  - `test/unit/test_sdpa_sharded_heads.py`: head shards vs the unsharded output, plus every case that must not pad.\n  - `test/single_test_file/test_usp_sdpa_sharded_heads_2_gpu.py`: real Ulysses2 `USPAttention` vs a single rank.\n\n## Accuracy Tests\n\n**Attention operator** (B200, bf16, head_dim 128, 24 global heads, exact tier). The table shows the fraction of output elements that differ from the unsharded 24-head flash SDPA:\n\n| local heads \\ query length | 1025 | 1536 | 2560 | 4608 |\n|---|---|---|---|---|\n| 12, before | 41% | exact | exact | exact |\n| 6, before | 41% | 35% | exact | exact |\n| 3, before | 41% | 41% | 35% | 42% |\n| any, with this PR | exact | exact | exact | exact |\n\n![op sweep](https://raw.githubusercontent.com/fusheng-ji/sglang/699cd5ab302193bec227cf4f22218aa8bb2a812f/op-sweep.png)\n\n**Real Ulysses2 `USPAttention` (2 × B200).** Compared against a single-rank SDPA on the full sequence:\n\n| heads / seq | before | with this PR |\n|---|---|---|\n| 24 / 1024 | about 619k elements differ (max 2.0e-3) | bit-identical |\n| 12 / 1536 | about 411k elements differ (max 9.8e-4) | bit-identical |\n\n**Same-input transformer forward, TP2 vs 1 GPU** (real weights, one step, torch SDPA, 1088-token joint sequence). Other TP effects, such as row-parallel reductions, dominate the remaining difference:\n\n| Model | max abs, before → after | differing elements, before → after |\n|---|---|---|\n| FLUX.1-dev | 0.031 → 0.031 | 43,617 → 43,375 |\n| Qwen-Image | 0.094 → 0.063 | 43,959 → 43,996 |\n\n**End-to-end images** (exact tier, torch SDPA). FLUX.1-dev at 384² / 28 steps and Qwen-Image at 512² / 30 steps, so that 2-way head shards cross the split threshold. Mean absolute pixel difference against 1 GPU, over seeds:\n\n| Model / topology | before (mean ± std) | with this PR (mean ± std) |\n|---|---|---|\n| FLUX.1-dev TP2 | 4.81 ± 0.60 | 4.26 ± 0.27 |\n| FLUX.1-dev Ulysses2 | 3.48 ± 0.88 | 4.44 ± 0.65 |\n| Qwen-Image TP2 | 2.10 ± 0.85 | 1.80 ± 0.50 |\n| Qwen-Image Ulysses2 | 2.19 ± 1.27 | 1.97 ± 1.02 |\n\nValues are mean absolute pixel difference on a 0–255 scale over 5 seeds (42, 1, 2, 3, 4). The figures show seed 42; the bottom rows are |diff| ×16.\n\n![FLUX.1-dev](https://raw.githubusercontent.com/fusheng-ji/sglang/699cd5ab302193bec227cf4f22218aa8bb2a812f/e2e-flux.jpg)\n\n![Qwen-Image](https://raw.githubusercontent.com/fusheng-ji/sglang/699cd5ab302193bec227cf4f22218aa8bb2a812f/e2e-qwen.jpg)\n\n**This PR does not claim an end-to-end improvement.** Every parallel image is visually equivalent to the single-GPU one, both before and after the change. The pixel differences come from many small rounding differences that the denoising loop amplifies, and they vary strongly between seeds. Over 5 seeds:\n- TP2 is slightly closer to 1 GPU.\n- Qwen-Image Ulysses2 is unchanged within noise.\n- FLUX.1-dev Ulysses2 is slightly further away; 4 of 5 seeds got worse.\n\nOther parallel effects, such as GEMM shapes and reductions, still separate the runs. What this PR guarantees is narrower: under the exact tier, the attention operator no longer changes with the head sharding.\n\nUnit tests: the new unit and 2-GPU tests fail without the change and pass with it; 146 related USP/attention unit tests pass.\n\n## Speed Tests and Profiling\n\nPadding only triggers for exact-tier requests at short sequence lengths with sharded heads. Single attention call, B200:\n\n| local heads / seq | padded to | before | exact tier with this PR |\n|---|---|---|---|\n| 12 / 1088 | 1280 | 58 µs | 61 µs |\n| 6 / 1088 | 2560 | 34 µs | 65 µs |\n| 6 / 1536 | 2560 | 39 µs | 118 µs |\n| 12 or 6 / 4608 | not padded | unchanged | unchanged |\n\nThe `lossless` (default) and `high` tiers are unaffected.\n\n## Not covered\n\n- sm120 and sm90 were not run on hardware. On sm90 the default FA3 path is unaffected by construction (`num_splits=1`); sm120 uses the same PyTorch flash heuristic with its own SM count.\n- The component-accuracy harness gives every rank the full token set under SP. Its Ulysses whole-model comparison against 1 GPU is therefore not like-for-like and is not reported. Ulysses is covered by the real 2-GPU test above.\n\n## Checklist\n\n- [x] Format code with pre-commit.\n- [x] Add unit tests.\n- [x] Update documentation (docstrings).\n- [x] Provide accuracy and speed benchmark results.\n- [x] Follow the SGLang code style guidance.\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #37867364368](https://github.com/sgl-project/sglang/actions/runs/37867364368)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37867364094](https://github.com/sgl-project/sglang/actions/runs/37867364094)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37867364410](https://github.com/sgl-project/sglang/actions/runs/37867364410)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 26,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "f1b26813018ca5f7051052760512843932a739c8",
+      "headRepository": {
+        "nameWithOwner": "fusheng-ji/sglang"
+      },
+      "merged": false,
+      "number": 43242,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[diffusion] keep TP/Ulysses head shards on the unsharded torch SDPA kernel",
+      "updatedAt": "2026-10-09T01:24:09Z",
+      "url": "https://github.com/sgl-project/sglang/pull/43242"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "20d1f3f56a4661b49eeec508580012370ca34176"
+    },
+    "body": "## Motivation\n\nPyTorch's flash SDPA forward picks split-KV when `batch * heads * ceil(query_len / 128)` is below 80% of the SM count (`num_splits_heuristic` in ATen's `flash_api.cpp`). Split-KV reorders the softmax sums. Tensor parallelism and Ulysses both reduce the number of heads each rank attends over. At short sequence lengths, that can push a head shard onto the split kernel while the unsharded layer stays unsplit. The result is that `--attention-backend torch_sdpa` runs differ between parallel and single-GPU execution even at the attention-operator level.\n\nThe default backends do not depend on the head count, and are unaffected:\n- sm100: cuDNN SDPA. Measured on B200: head shards are bit-identical.\n- sm90: sgl FA3, which runs with `num_splits=1`.\n\nAffected setups:\n- explicit `--attention-backend torch_sdpa`;\n- sm120, where torch SDPA is the default;\n- head dims that fall back to torch SDPA.\n\nThis came up while validating Ovis-Image (#43152), which carries a model-local version of this fix.\n\n## Modifications\n\n- **`SDPAImpl`** pads query rows past the split threshold when all of the following hold:\n  - the request asks for `quality=\"exact\"`;\n  - the call is a non-causal, unmasked fp16/bf16 CUDA call, without dropout and with head_dim ≤ 256;\n  - the local head count would split, but the unsharded layer's would not.\n\n  Query rows attend independently, so the real rows match the unsharded kernel bit for bit. The padding is sliced off afterwards.\n- **Gated on `exact`**: under the quality tiers, the default `lossless` tier already allows rounding-order changes. It keeps the faster split kernel and is unchanged by this PR.\n- **`USPAttention`** accepts `global_num_heads`, the layer's head count before TP sharding, and forwards it to the impl. It defaults to `num_heads`, which already covers Ulysses-only sharding.\n- **TP-sharding DiTs** pass their pre-TP head count: FLUX, FLUX.2, Qwen-Image, Anima, Wan, HunyuanVideo, Z-Image.\n- **Unchanged**: `CudnnSDPAImpl` / `DynamicCudnnSDPAImpl`, explicit cuDNN priority, masked/causal calls, FA varlen and ring paths.\n- **Tests**:\n  - `test/unit/test_sdpa_sharded_heads.py`: head shards vs the unsharded output, plus every case that must not pad.\n  - `test/single_test_file/test_usp_sdpa_sharded_heads_2_gpu.py`: real Ulysses2 `USPAttention` vs a single rank.\n\n## Accuracy Tests\n\n**Attention operator** (B200, bf16, head_dim 128, 24 global heads, exact tier). The table shows the fraction of output elements that differ from the unsharded 24-head flash SDPA:\n\n| local heads \\ query length | 1025 | 1536 | 2560 | 4608 |\n|---|---|---|---|---|\n| 12, before | 41% | exact | exact | exact |\n| 6, before | 41% | 35% | exact | exact |\n| 3, before | 41% | 41% | 35% | 42% |\n| any, with this PR | exact | exact | exact | exact |\n\n![op sweep](https://raw.githubusercontent.com/fusheng-ji/sglang/699cd5ab302193bec227cf4f22218aa8bb2a812f/op-sweep.png)\n\n**Real Ulysses2 `USPAttention` (2 × B200).** Compared against a single-rank SDPA on the full sequence:\n\n| heads / seq | before | with this PR |\n|---|---|---|\n| 24 / 1024 | about 619k elements differ (max 2.0e-3) | bit-identical |\n| 12 / 1536 | about 411k elements differ (max 9.8e-4) | bit-identical |\n\n**Same-input transformer forward, TP2 vs 1 GPU** (real weights, one step, torch SDPA, 1088-token joint sequence). Other TP effects, such as row-parallel reductions, dominate the remaining difference:\n\n| Model | max abs, before → after | differing elements, before → after |\n|---|---|---|\n| FLUX.1-dev | 0.031 → 0.031 | 43,617 → 43,375 |\n| Qwen-Image | 0.094 → 0.063 | 43,959 → 43,996 |\n\n**End-to-end images** (exact tier, torch SDPA). FLUX.1-dev at 384² / 28 steps and Qwen-Image at 512² / 30 steps, so that 2-way head shards cross the split threshold. Mean absolute pixel difference against 1 GPU, over seeds:\n\n| Model / topology | before (mean ± std) | with this PR (mean ± std) |\n|---|---|---|\n| FLUX.1-dev TP2 | 4.81 ± 0.60 | 4.26 ± 0.27 |\n| FLUX.1-dev Ulysses2 | 3.48 ± 0.88 | 4.44 ± 0.65 |\n| Qwen-Image TP2 | 2.10 ± 0.85 | 1.80 ± 0.50 |\n| Qwen-Image Ulysses2 | 2.19 ± 1.27 | 1.97 ± 1.02 |\n\nValues are mean absolute pixel difference on a 0–255 scale over 5 seeds (42, 1, 2, 3, 4). The figures show seed 42; the bottom rows are |diff| ×16.\n\n![FLUX.1-dev](https://raw.githubusercontent.com/fusheng-ji/sglang/699cd5ab302193bec227cf4f22218aa8bb2a812f/e2e-flux.jpg)\n\n![Qwen-Image](https://raw.githubusercontent.com/fusheng-ji/sglang/699cd5ab302193bec227cf4f22218aa8bb2a812f/e2e-qwen.jpg)\n\n**This PR does not claim an end-to-end improvement.** Every parallel image is visually equivalent to the single-GPU one, both before and after the change. The pixel differences come from many small rounding differences that the denoising loop amplifies, and they vary strongly between seeds. Over 5 seeds:\n- TP2 is slightly closer to 1 GPU.\n- Qwen-Image Ulysses2 is unchanged within noise.\n- FLUX.1-dev Ulysses2 is slightly further away; 4 of 5 seeds got worse.\n\nOther parallel effects, such as GEMM shapes and reductions, still separate the runs. What this PR guarantees is narrower: under the exact tier, the attention operator no longer changes with the head sharding.\n\nUnit tests: the new unit and 2-GPU tests fail without the change and pass with it; 146 related USP/attention unit tests pass.\n\n## Speed Tests and Profiling\n\nPadding only triggers for exact-tier requests at short sequence lengths with sharded heads. Single attention call, B200:\n\n| local heads / seq | padded to | before | exact tier with this PR |\n|---|---|---|---|\n| 12 / 1088 | 1280 | 58 µs | 61 µs |\n| 6 / 1088 | 2560 | 34 µs | 65 µs |\n| 6 / 1536 | 2560 | 39 µs | 118 µs |\n| 12 or 6 / 4608 | not padded | unchanged | unchanged |\n\nThe `lossless` (default) and `high` tiers are unaffected.\n\n## Not covered\n\n- sm120 and sm90 were not run on hardware. On sm90 the default FA3 path is unaffected by construction (`num_splits=1`); sm120 uses the same PyTorch flash heuristic with its own SM count.\n- The component-accuracy harness gives every rank the full token set under SP. Its Ulysses whole-model comparison against 1 GPU is therefore not like-for-like and is not reported. Ulysses is covered by the real 2-GPU test above.\n\n## Checklist\n\n- [x] Format code with pre-commit.\n- [x] Add unit tests.\n- [x] Update documentation (docstrings).\n- [x] Provide accuracy and speed benchmark results.\n- [x] Follow the SGLang code style guidance.\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #37867364368](https://github.com/sgl-project/sglang/actions/runs/37867364368)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37867364094](https://github.com/sgl-project/sglang/actions/runs/37867364094)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37867364410](https://github.com/sgl-project/sglang/actions/runs/37867364410)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 26,
+    "head": {
+      "repo": {
+        "full_name": "fusheng-ji/sglang"
+      },
+      "sha": "f1b26813018ca5f7051052760512843932a739c8"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/43242",
+    "merged": false,
+    "number": 43242,
+    "state": "open",
+    "title": "[diffusion] keep TP/Ulysses head shards on the unsharded torch SDPA kernel",
+    "updated_at": "2026-10-09T01:24:09Z"
+  },
+  "files": [
+    {
+      "additions": 81,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Flayers%2Fattention%2Fbackends%2Fsdpa.py",
+      "changes": 82,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Flayers%2Fattention%2Fbackends%2Fsdpa.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 1,
+      "filename": "python/sglang/multimodal_gen/runtime/layers/attention/backends/sdpa.py",
+      "patch": "@@ -2,6 +2,8 @@\n \n # SPDX-License-Identifier: Apache-2.0\n \n+import functools\n+import math\n from contextlib import nullcontext\n \n import torch\n@@ -17,6 +19,9 @@\n     AttentionImpl,\n     AttentionMetadata,\n )\n+from sglang.multimodal_gen.runtime.managers.forward_context import (\n+    get_forward_context_or_none,\n+)\n from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum\n from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger\n \n@@ -31,6 +36,28 @@\n \n _MPS_VARLEN_QUERY_CHUNK_SIZE = 128\n \n+# PyTorch's flash forward splits the keys across thread blocks when\n+# batch * heads * ceil(query_len / 128) falls below 80% of the SMs\n+# (num_splits_heuristic in ATen's flash_api.cpp); keys of at most 128 rows\n+# are never split. The block sizes are measured on sm100 (B200) for\n+# head_dim 64 and 128, where they reproduce every split boundary.\n+_FLASH_QUERY_BLOCK = 128\n+_FLASH_UNSPLIT_KEY_LEN = 128\n+_FLASH_SPLIT_OCCUPANCY = 0.8\n+\n+\n+@functools.cache\n+def _multi_processor_count(device_index: int) -> int:\n+    return torch.cuda.get_device_properties(device_index).multi_processor_count\n+\n+\n+def _request_quality_is_exact() -> bool:\n+    # Split versus unsplit flash only moves rounding, which \"lossless\" allows;\n+    # the slower unsplit kernel is reserved for \"exact\" requests.\n+    context = get_forward_context_or_none()\n+    batch = getattr(context, \"forward_batch\", None)\n+    return getattr(batch, \"quality\", None) == \"exact\"\n+\n \n class SDPABackend(AttentionBackend):\n     accept_output_buffer: bool = True\n@@ -53,6 +80,9 @@ def get_impl_cls() -> type[\"SDPAImpl\"]:\n \n \n class SDPAImpl(AttentionImpl):\n+    # cuDNN SDPA does not depend on the head count; only flash needs padding.\n+    _pad_flash_split_queries = True\n+\n     def __init__(\n         self,\n         num_heads: int,\n@@ -67,6 +97,41 @@ def __init__(\n         self.softmax_scale = softmax_scale\n         self.dropout = extra_impl_args.get(\"dropout_p\", 0.0)\n         self.allow_cudnn_sdp = bool(extra_impl_args.get(\"allow_cudnn_sdp\", False))\n+        # Heads of the unsharded layer; set when TP or Ulysses shards them.\n+        self.global_num_heads = extra_impl_args.get(\"global_num_heads\")\n+\n+    def _unsplit_query_len(self, query: torch.Tensor, key_len: int) -> int:\n+        \"\"\"Query length that keeps sharded heads on the full layer's kernel.\n+\n+        Fewer local heads can push a short sequence onto PyTorch's split-KV\n+        flash kernel while the unsharded layer is not split, which reorders\n+        the softmax sums. Query rows attend independently, so padding them\n+        past the split threshold restores the unsharded kernel exactly.\n+        Applies to \"exact\" quality requests only.\n+        ``query`` is [B, H, S, D]; ``key_len`` is the key sequence length.\n+        \"\"\"\n+        batch, heads, query_len, head_dim = query.shape\n+        if (\n+            not self._pad_flash_split_queries\n+            or self.allow_cudnn_sdp\n+            or self.global_num_heads is None\n+            or heads >= self.global_num_heads\n+            or self.dropout\n+            or not query.is_cuda\n+            or query.dtype not in (torch.float16, torch.bfloat16)\n+            or head_dim > 256\n+            or key_len <= _FLASH_UNSPLIT_KEY_LEN\n+            or not _request_quality_is_exact()\n+        ):\n+            return query_len\n+        threshold = _FLASH_SPLIT_OCCUPANCY * _multi_processor_count(query.device.index)\n+        blocks = math.ceil(query_len / _FLASH_QUERY_BLOCK)\n+        if (\n+            batch * heads * blocks >= threshold\n+            or batch * self.global_num_heads * blocks < threshold\n+        ):\n+            return query_len\n+        return math.ceil(threshold / (batch * heads)) * _FLASH_QUERY_BLOCK\n \n     def _sdpa_context(self, query: torch.Tensor):\n         if self.allow_cudnn_sdp and query.device.type == \"cuda\":\n@@ -106,11 +171,24 @@ def forward(\n         }\n         if query.shape[1] != key.shape[1]:\n             attn_kwargs[\"enable_gqa\"] = True\n+        query_len = query.shape[-2]\n+        if attn_mask is None and not is_causal:\n+            padded_len = self._unsplit_query_len(query, key.shape[-2])\n+            if padded_len > query_len:\n+                query = torch.cat(\n+                    [\n+                        query,\n+                        query.new_zeros(\n+                            *query.shape[:2], padded_len - query_len, query.shape[-1]\n+                        ),\n+                    ],\n+                    dim=2,\n+                )\n         with self._sdpa_context(query):\n             output = torch.nn.functional.scaled_dot_product_attention(\n                 query, key, value, **attn_kwargs\n             )\n-        output = output.transpose(1, 2)\n+        output = output[:, :, :query_len].transpose(1, 2)\n         return output\n \n     def forward_varlen(\n@@ -218,6 +296,8 @@ def get_impl_cls() -> type[\"CudnnSDPAImpl\"]:\n \n \n class CudnnSDPAImpl(SDPAImpl):\n+    _pad_flash_split_queries = False\n+\n     def _sdpa_context(self, query: torch.Tensor):\n         if query.device.type == \"cuda\":\n             return sdpa_kernel(SDPBackend.CUDNN_ATTENTION)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Flayers%2Fattention%2Fbackends%2Fsdpa.py",
+      "sha": "2df6081e9a2589c29e290e02c7b9c835a81c5959",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Flayers%2Fattention%2Flayer.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Flayers%2Fattention%2Flayer.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/layers/attention/layer.py",
+      "patch": "@@ -816,10 +816,17 @@ def __init__(\n         skip_sequence_parallel: bool = False,\n         enable_packed_qkv_input_a2a: bool = False,\n         is_cross_attention: bool = False,\n+        global_num_heads: int | None = None,\n         **extra_impl_args,\n     ) -> None:\n         \"\"\"\n         Args:\n+            global_num_heads:\n+              query heads of the layer before TP sharding. Lets the torch\n+              SDPA backend keep heads sharded by TP or Ulysses on the same\n+              flash kernel as the unsharded layer for \"exact\" quality\n+              requests. Defaults to ``num_heads``, which covers Ulysses\n+              sharding only.\n             skip_sequence_parallel:\n               when KV is replicated across all SP ranks (e.g. cross-attention to\n               text/image encoder outputs), the full USP pipeline is redundant:\n@@ -868,6 +875,7 @@ def __init__(\n             num_kv_heads=num_kv_heads,\n             prefix=f\"{prefix}.impl\",\n             is_cross_attention=is_cross_attention,\n+            global_num_heads=global_num_heads or num_heads,\n             **extra_impl_args,\n         )\n         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Flayers%2Fattention%2Flayer.py",
+      "sha": "c87ebb47ba4d11f95b0532d1071f7bdf6a0121ab",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fanima.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fanima.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/anima.py",
+      "patch": "@@ -228,6 +228,7 @@ def __init__(self, config, cross_attention, quant_config, prefix):\n         self.attn = USPAttention(\n             self.heads,\n             self.head_dim,\n+            global_num_heads=config.num_attention_heads,\n             is_cross_attention=cross_attention,\n             skip_sequence_parallel=cross_attention,\n             prefix=prefix,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fanima.py",
+      "sha": "fd4141831840a487008160c23f86cd2429877dd9",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fcosmos3video.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fcosmos3video.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/cosmos3video.py",
+      "patch": "@@ -778,6 +778,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_num_attention_heads,\n+            global_num_heads=num_attention_heads,\n             head_size=head_dim,\n             num_kv_heads=self.local_num_key_value_heads,\n             causal=False,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fcosmos3video.py",
+      "sha": "59d8b5c7f47af85d40374eb5661617eda9762745",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fernie_image.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fernie_image.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/ernie_image.py",
+      "patch": "@@ -273,6 +273,7 @@ def __init__(\n         # SP until the stream is sharded (sp_shard + num_replicated_suffix).\n         self.attn = USPAttention(\n             num_heads=self.num_local_heads,\n+            global_num_heads=num_heads,\n             head_size=head_dim,\n             prefix=f\"{prefix}.attn\",\n             skip_sequence_parallel=True,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fernie_image.py",
+      "sha": "a5bc74ec4444dca2668b29976f03d2fd213ba6f9",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/flux.py",
+      "patch": "@@ -672,6 +672,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_heads if self.shard_qkv else num_heads,\n+            global_num_heads=self.heads,\n             head_size=self.head_dim,\n             dropout_rate=0,\n             softmax_scale=None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux.py",
+      "sha": "ca2594486a07a731c6cea28eefd3c0e0bf67af43",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux3.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux3.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/flux3.py",
+      "patch": "@@ -502,6 +502,7 @@ def row_linear(name: str, in_features: int) -> RowParallelLinear:\n         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)\n         self.attn = USPAttention(\n             num_heads=self.local_heads,\n+            global_num_heads=num_heads,\n             head_size=self.head_dim,\n             causal=False,\n             supported_attention_backends=supported_attention_backends,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux3.py",
+      "sha": "c5bb5886409c4d80553088665ec6ca7f6b50803e",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux_2.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux_2.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/flux_2.py",
+      "patch": "@@ -694,6 +694,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_heads,\n+            global_num_heads=self.heads,\n             head_size=self.head_dim,\n             dropout_rate=0,\n             softmax_scale=None,\n@@ -952,6 +953,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_heads,\n+            global_num_heads=self.heads,\n             head_size=self.head_dim,\n             dropout_rate=0,\n             softmax_scale=None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fflux_2.py",
+      "sha": "fc54a2dbb8f35845c1fee731ea5366b3ad03acaa",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fglm_image.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fglm_image.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/glm_image.py",
+      "patch": "@@ -600,6 +600,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.num_local_heads,\n+            global_num_heads=self.heads,\n             head_size=dim_head,\n             num_kv_heads=self.num_local_kv_heads,\n             dropout_rate=0,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fglm_image.py",
+      "sha": "d83774f3ea4fe21980fb5303fb86d327bbd8da9c",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fhelios.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fhelios.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/helios.py",
+      "patch": "@@ -277,6 +277,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=num_heads,\n             head_size=self.head_dim,\n             causal=False,\n             is_cross_attention=False,\n@@ -390,6 +391,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=num_heads,\n             head_size=self.head_dim,\n             causal=False,\n             skip_sequence_parallel=True,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fhelios.py",
+      "sha": "1658bf03b833fc55e7bfe19063022212fb9f1a80",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fhunyuanvideo.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fhunyuanvideo.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/hunyuanvideo.py",
+      "patch": "@@ -359,6 +359,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_num_attention_heads,\n+            global_num_heads=num_attention_heads,\n             head_size=head_dim,\n             causal=False,\n             supported_attention_backends=supported_attention_backends,\n@@ -557,6 +558,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_num_attention_heads,\n+            global_num_heads=num_attention_heads,\n             head_size=head_dim,\n             causal=False,\n             supported_attention_backends=supported_attention_backends,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fhunyuanvideo.py",
+      "sha": "d73469f1ed9409c7fff3cdaec863e264cadcb982",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fideogram.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fideogram.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/ideogram.py",
+      "patch": "@@ -323,6 +323,7 @@ def __init__(\n         self.norm_k = Ideogram4RMSNorm(self.head_dim, eps=eps)\n         self.attn = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=num_heads,\n             head_size=self.head_dim,\n             dropout_rate=0,\n             softmax_scale=None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fideogram.py",
+      "sha": "a4481f652ebe2ee0576b3d63c824697a452571bf",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fjoy_image.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fjoy_image.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/joy_image.py",
+      "patch": "@@ -375,6 +375,7 @@ def __init__(\n         )\n         self.attn = USPAttention(\n             num_heads=self.local_heads_num,\n+            global_num_heads=self.heads_num,\n             head_size=self.head_dim,\n             causal=False,\n             supported_attention_backends=supported_attention_backends,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fjoy_image.py",
+      "sha": "147f3fe75fc62d25e87749a715bb02a5bc605064",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fkandinsky6.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fkandinsky6.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/kandinsky6.py",
+      "patch": "@@ -367,6 +367,7 @@ def __init__(\n         )\n         self.attention = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=self.num_heads,\n             head_size=head_dim,\n             causal=False,\n             supported_attention_backends=supported_attention_backends,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fkandinsky6.py",
+      "sha": "aa67fe5b9a2a2e27f5a76d648848cecfc6c03c21",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fkrea2.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fkrea2.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/krea2.py",
+      "patch": "@@ -321,6 +321,7 @@ def __init__(\n         # Native GQA flash via the platform backend; parameterless.\n         self.attn = USPAttention(\n             num_heads=self.local_heads,\n+            global_num_heads=self.heads,\n             head_size=self.headdim,\n             num_kv_heads=self.local_kvheads,\n             dropout_rate=0,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fkrea2.py",
+      "sha": "755a159bd558c00ee8908ec13585a9b034c04082",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flingbot_video_moe.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flingbot_video_moe.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/lingbot_video_moe.py",
+      "patch": "@@ -264,6 +264,7 @@ def __init__(\n         )\n         self.attn = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=num_heads,\n             head_size=self.head_dim,\n             dropout_rate=0,\n             softmax_scale=None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flingbot_video_moe.py",
+      "sha": "7be74cfc02c1f0841a3af7a75c07490c8fa91eb5",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flingbot_world.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flingbot_world.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/lingbot_world.py",
+      "patch": "@@ -428,6 +428,7 @@ def __init__(\n \n         self.attn1 = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=num_heads,\n             head_size=self.dim_head,\n             causal=False,\n             supported_attention_backends=supported_attention_backends,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flingbot_world.py",
+      "sha": "de41c87298e53485e3e4cfd648b1a41ed19cc82a",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flongcat_image.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flongcat_image.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/longcat_image.py",
+      "patch": "@@ -433,6 +433,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.num_local_heads,\n+            global_num_heads=num_attention_heads,\n             head_size=attention_head_dim,\n             causal=False,\n         )\n@@ -552,6 +553,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.num_local_heads,\n+            global_num_heads=num_attention_heads,\n             head_size=attention_head_dim,\n             causal=False,\n         )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Flongcat_image.py",
+      "sha": "22ec1ca67cfaffec7a2d53a04e7f0b99624d0e6f",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fltx_2.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fltx_2.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/ltx_2.py",
+      "patch": "@@ -858,6 +858,7 @@ def __init__(\n         else:\n             self.attn = USPAttention(\n                 num_heads=self.local_heads,\n+                global_num_heads=self.heads,\n                 head_size=self.dim_head,\n                 num_kv_heads=self.local_heads,\n                 dropout_rate=0,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fltx_2.py",
+      "sha": "c2841e26a28de85e5aaafb6c9039101f12307a7a",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fmova_video_dit.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fmova_video_dit.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/mova_video_dit.py",
+      "patch": "@@ -154,6 +154,7 @@ def __init__(\n         self.attn = USPAttention(\n             # Local heads per TP rank.\n             num_heads=self.num_heads_per_rank,\n+            global_num_heads=self.num_heads,\n             head_size=self.head_dim,\n             causal=False,\n             softmax_scale=None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fmova_video_dit.py",
+      "sha": "a829b405300c596a9ec5dfd0c4b2283802abdb88",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fqwen_image.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fqwen_image.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/qwen_image.py",
+      "patch": "@@ -915,6 +915,7 @@ def __init__(\n         # self-attention: Q/K/V are concatenated before the kernel call.\n         self.attn = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=self.num_heads,\n             head_size=self.head_dim,\n             dropout_rate=0,\n             softmax_scale=None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fqwen_image.py",
+      "sha": "bd64bf731495edf41e1dd94365d95ce7f48fd198",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fqwen_image21.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fqwen_image21.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 1,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py",
+      "patch": "@@ -365,7 +365,10 @@ def __init__(self, ac, quant_config, prefix):\n             self.heads, self.head_dim, supported_attention_backends=backends\n         )\n         self.target_attn = USPAttention(\n-            self.heads, self.head_dim, supported_attention_backends=backends\n+            self.heads,\n+            self.head_dim,\n+            supported_attention_backends=backends,\n+            global_num_heads=ac.num_attention_heads,\n         )\n \n     def pack_qkv_weights(self):",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fqwen_image21.py",
+      "sha": "6c6c3f5a1ecf186218be75387b87ce703d77a046",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fwanvideo.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fwanvideo.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py",
+      "patch": "@@ -243,6 +243,7 @@ def __init__(\n         # Scaled dot product attention\n         self.attn = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=num_heads,\n             head_size=self.head_dim,\n             dropout_rate=0,\n             softmax_scale=None,\n@@ -546,6 +547,7 @@ def __init__(\n \n             self.attn1 = USPAttention(\n                 num_heads=self.local_num_heads,\n+                global_num_heads=num_heads,\n                 head_size=dim // num_heads,\n                 causal=False,\n                 supported_attention_backends=self_attn_backends,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fwanvideo.py",
+      "sha": "b859a03abd214794dd8d16ddf19d5fc54ffa7166",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fzimage.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fzimage.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/runtime/models/dits/zimage.py",
+      "patch": "@@ -327,6 +327,7 @@ def __init__(\n \n         self.attn = USPAttention(\n             num_heads=self.local_num_heads,\n+            global_num_heads=num_heads,\n             head_size=self.head_dim,\n             num_kv_heads=self.local_num_kv_heads,\n             dropout_rate=0,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Fruntime%2Fmodels%2Fdits%2Fzimage.py",
+      "sha": "35d43978d2cdd70aaa5940e3f9c030b3ed2de1fb",
+      "status": "modified"
+    },
+    {
+      "additions": 157,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Fsingle_test_file%2Ftest_usp_sdpa_sharded_heads_2_gpu.py",
+      "changes": 157,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Fsingle_test_file%2Ftest_usp_sdpa_sharded_heads_2_gpu.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/test/single_test_file/test_usp_sdpa_sharded_heads_2_gpu.py",
+      "patch": "@@ -0,0 +1,157 @@\n+\"\"\"Ulysses torch SDPA must match a single rank bit for bit on short sequences.\n+\n+After the all-to-all each rank holds half the heads over the full sequence.\n+PyTorch's flash forward may then pick split-KV where the unsharded layer does\n+not; for \"exact\" requests the SDPA backend pads query rows to keep the\n+unsharded kernel.\n+\n+    pytest -v python/sglang/multimodal_gen/test/single_test_file/test_usp_sdpa_sharded_heads_2_gpu.py\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import os\n+import subprocess\n+import sys\n+import unittest\n+\n+import torch\n+\n+from sglang.multimodal_gen.runtime.platforms import current_platform\n+from sglang.test.test_utils import CustomTestCase\n+\n+_WORLD = 2\n+_ALL_SKIPPED = 77\n+# (heads, sequence): the unsharded layer stays unsplit, half the heads split.\n+_CASES = ((24, 1024), (12, 1536))\n+\n+\n+def _worker() -> int:\n+    from types import SimpleNamespace\n+\n+    import torch.nn.functional as F\n+\n+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (\n+        init_distributed_environment,\n+        initialize_model_parallel,\n+    )\n+    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum\n+    from sglang.multimodal_gen.runtime.server_args import set_global_server_args\n+\n+    rank = int(os.environ[\"RANK\"])\n+    world = int(os.environ[\"WORLD_SIZE\"])\n+    torch.cuda.set_device(rank)\n+    init_distributed_environment(world_size=world, rank=rank, local_rank=rank)\n+    initialize_model_parallel(\n+        sequence_parallel_degree=world, ulysses_degree=world, ring_degree=1\n+    )\n+\n+    import sglang.multimodal_gen.runtime.layers.attention.layer as L\n+    from sglang.multimodal_gen.runtime.managers.forward_context import (\n+        set_forward_context,\n+    )\n+\n+    set_global_server_args(\n+        SimpleNamespace(\n+            attention_backend=\"torch_sdpa\",\n+            attention_backend_config=None,\n+            kv_gather_degree=1,\n+            sp_split_auto=False,\n+        )\n+    )\n+    torch.set_default_dtype(torch.bfloat16)\n+\n+    request = set_forward_context(\n+        current_timestep=0,\n+        attn_metadata=None,\n+        forward_batch=SimpleNamespace(quality=\"exact\"),\n+    )\n+    request.__enter__()\n+\n+    D = 128\n+    scale = D**-0.5\n+    dev = torch.device(f\"cuda:{rank}\")\n+    failures = []\n+    checked = 0\n+    for heads, seq in _CASES:\n+        torch.manual_seed(heads + seq)\n+        qf, kf, vf = (\n+            torch.randn(1, seq, heads, D, device=dev, dtype=torch.bfloat16)\n+            for _ in range(3)\n+        )\n+        ref = F.scaled_dot_product_attention(\n+            qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2), scale=scale\n+        ).transpose(1, 2)\n+\n+        # global_num_heads defaults to num_heads, the Ulysses-only case.\n+        attn = L.USPAttention(\n+            num_heads=heads,\n+            head_size=D,\n+            causal=False,\n+            required_attention_backend=AttentionBackendEnum.TORCH_SDPA,\n+        )\n+        local = qf[:, :, : heads // world].transpose(1, 2)\n+        if attn.attn_impl._unsplit_query_len(local, seq) == seq:\n+            print(f\"SKIP: heads={heads} seq={seq} does not split here\", flush=True)\n+            continue\n+\n+        checked += 1\n+        shard = seq // world\n+        sl = slice(rank * shard, (rank + 1) * shard)\n+        out = attn.forward(qf[:, sl], kf[:, sl], vf[:, sl])\n+        if not torch.equal(out, ref[:, sl]):\n+            d = (out.float() - ref[:, sl].float()).abs()\n+            failures.append(\n+                f\"heads={heads} seq={seq} not bitwise: \"\n+                f\"mismatched={(d > 0).sum().item()} max={d.max():.3e}\"\n+            )\n+\n+    for f in failures:\n+        print(f\"FAILURE rank{rank}: {f}\", flush=True)\n+    if failures:\n+        return 1\n+    return 0 if checked else _ALL_SKIPPED\n+\n+\n+class TestUSPSDPAShardedHeads(CustomTestCase):\n+    def test_ulysses_sdpa_matches_single_rank(self):\n+        if not current_platform.is_cuda():\n+            self.skipTest(\"CUDA-only test\")\n+        if torch.cuda.device_count() < _WORLD:\n+            self.skipTest(f\"needs {_WORLD} GPUs\")\n+        from sglang.srt.utils.network import get_free_port_below_ephemeral\n+\n+        port = str(get_free_port_below_ephemeral())\n+        procs = []\n+        for rank in range(_WORLD):\n+            env = os.environ.copy()\n+            env.update(\n+                {\n+                    \"RANK\": str(rank),\n+                    \"LOCAL_RANK\": str(rank),\n+                    \"WORLD_SIZE\": str(_WORLD),\n+                    \"MASTER_ADDR\": \"127.0.0.1\",\n+                    \"MASTER_PORT\": port,\n+                }\n+            )\n+            procs.append(\n+                subprocess.Popen(\n+                    [sys.executable, __file__],\n+                    env=env,\n+                    stdout=subprocess.PIPE,\n+                    stderr=subprocess.STDOUT,\n+                    text=True,\n+                )\n+            )\n+        outputs = [p.communicate(timeout=300)[0] for p in procs]\n+        codes = [p.returncode for p in procs]\n+        if all(code == _ALL_SKIPPED for code in codes):\n+            self.skipTest(\"this GPU has enough SMs that no case splits\")\n+        if any(codes):\n+            self.fail(\"worker failed:\\n\" + \"\\n\".join(outputs))\n+\n+\n+if __name__ == \"__main__\":\n+    if \"RANK\" in os.environ:\n+        sys.exit(_worker())\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Fsingle_test_file%2Ftest_usp_sdpa_sharded_heads_2_gpu.py",
+      "sha": "6922919a10bb0040c07a14c2f3b76ed0d0d5effe",
+      "status": "added"
+    },
+    {
+      "additions": 148,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Funit%2Ftest_sdpa_sharded_heads.py",
+      "changes": 148,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Funit%2Ftest_sdpa_sharded_heads.py?ref=f1b26813018ca5f7051052760512843932a739c8",
+      "deletions": 0,
+      "filename": "python/sglang/multimodal_gen/test/unit/test_sdpa_sharded_heads.py",
+      "patch": "@@ -0,0 +1,148 @@\n+\"\"\"Heads sharded by TP or Ulysses must reproduce the unsharded torch SDPA.\n+\n+PyTorch's flash forward switches to split-KV when few heads cover a short\n+sequence, so a head shard can take a different kernel than the full layer.\n+``SDPAImpl`` pads query rows to keep the full layer's kernel; concatenating\n+the per-shard outputs must then equal the unsharded output bit for bit.\n+The padding serves \"exact\" quality requests only.\"\"\"\n+\n+import unittest\n+from types import SimpleNamespace\n+from unittest.mock import patch\n+\n+import torch\n+import torch.nn.functional as F\n+\n+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (\n+    CudnnSDPAImpl,\n+    SDPAImpl,\n+)\n+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context\n+from sglang.test.test_utils import CustomTestCase\n+\n+_GLOBAL_HEADS = 24\n+\n+\n+def _impl(cls=SDPAImpl, heads=_GLOBAL_HEADS, head_dim=128, **kwargs):\n+    return cls(\n+        num_heads=heads,\n+        head_size=head_dim,\n+        causal=kwargs.pop(\"causal\", False),\n+        softmax_scale=head_dim**-0.5,\n+        **kwargs,\n+    )\n+\n+\n+def _qkv(seq_len, head_dim, dtype=torch.bfloat16, heads=_GLOBAL_HEADS):\n+    generator = torch.Generator(device=\"cuda\").manual_seed(seq_len + head_dim)\n+    return tuple(\n+        torch.randn(\n+            1, seq_len, heads, head_dim, device=\"cuda\", dtype=dtype, generator=generator\n+        )\n+        for _ in range(3)\n+    )\n+\n+\n+def _request(quality=\"exact\"):\n+    return set_forward_context(\n+        current_timestep=0,\n+        attn_metadata=None,\n+        forward_batch=SimpleNamespace(quality=quality),\n+    )\n+\n+\n+@unittest.skipUnless(torch.cuda.is_available(), \"requires CUDA\")\n+class TestSDPAShardedHeads(CustomTestCase):\n+    def setUp(self):\n+        super().setUp()\n+        self._request = _request()\n+        self._request.__enter__()\n+\n+    def tearDown(self):\n+        self._request.__exit__(None, None, None)\n+        super().tearDown()\n+\n+    @torch.no_grad()\n+    def test_head_shards_match_unsharded_attention(self):\n+        probe = torch.empty(1, 3, 1025, 128, device=\"cuda\", dtype=torch.bfloat16)\n+        if _impl(heads=3, global_num_heads=24)._unsplit_query_len(probe, 1025) == 1025:\n+            self.skipTest(\"too few SMs for these shapes to split\")\n+        for head_dim in (64, 128):\n+            for seq_len in (1025, 1536, 4608):\n+                query, key, value = _qkv(seq_len, head_dim)\n+                expected = F.scaled_dot_product_attention(\n+                    *(x.transpose(1, 2) for x in (query, key, value)),\n+                    scale=head_dim**-0.5,\n+                ).transpose(1, 2)\n+                for local_heads in (24, 12, 6, 3):\n+                    with self.subTest(\n+                        head_dim=head_dim, seq_len=seq_len, local_heads=local_heads\n+                    ):\n+                        impl = _impl(\n+                            heads=local_heads,\n+                            head_dim=head_dim,\n+                            global_num_heads=_GLOBAL_HEADS,\n+                        )\n+                        actual = torch.cat(\n+                            [\n+                                impl.forward(q, k, v, None)\n+                                for q, k, v in zip(\n+                                    query.split(local_heads, dim=2),\n+                                    key.split(local_heads, dim=2),\n+                                    value.split(local_heads, dim=2),\n+                                )\n+                            ],\n+                            dim=2,\n+                        )\n+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)\n+\n+    def test_padding_only_when_the_shard_alone_would_split(self):\n+        query = torch.empty(1, 6, 1025, 128, device=\"cuda\", dtype=torch.bfloat16)\n+        padded = _impl(heads=6, global_num_heads=24)._unsplit_query_len(query, 1025)\n+        if padded == 1025:\n+            self.skipTest(\"too few SMs for these shapes to split\")\n+        # Unknown, unsharded, FP32, dropout and cuDNN keep the input length.\n+        cases = {\n+            \"unknown\": _impl(heads=6),\n+            \"unsharded\": _impl(heads=6, global_num_heads=6),\n+            \"dropout\": _impl(heads=6, global_num_heads=24, dropout_p=0.1),\n+            \"cudnn\": _impl(CudnnSDPAImpl, heads=6, global_num_heads=24),\n+            \"cudnn_priority\": _impl(heads=6, global_num_heads=24, allow_cudnn_sdp=True),\n+        }\n+        for name, impl in cases.items():\n+            with self.subTest(name):\n+                self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)\n+        with self.subTest(\"fp32\"):\n+            impl = _impl(heads=6, global_num_heads=24)\n+            self.assertEqual(impl._unsplit_query_len(query.float(), 1025), 1025)\n+        with self.subTest(\"lossless request\"), _request(\"lossless\"):\n+            impl = _impl(heads=6, global_num_heads=24)\n+            self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)\n+        with self.subTest(\"short keys never split\"):\n+            impl = _impl(heads=6, global_num_heads=24)\n+            self.assertEqual(impl._unsplit_query_len(query, 128), 1025)\n+        with self.subTest(\"full layer also splits\"):\n+            short = query[:, :, :64]\n+            self.assertEqual(\n+                _impl(heads=6, global_num_heads=24)._unsplit_query_len(short, 1025), 64\n+            )\n+\n+    @torch.no_grad()\n+    def test_causal_and_masked_calls_are_not_padded(self):\n+        impl = _impl(heads=6, global_num_heads=24, causal=True)\n+        query, key, value = _qkv(1025, 128, heads=6)\n+        shapes = []\n+        original = F.scaled_dot_product_attention\n+\n+        def record(q, *args, **kwargs):\n+            shapes.append(q.shape[-2])\n+            return original(q, *args, **kwargs)\n+\n+        with patch.object(F, \"scaled_dot_product_attention\", side_effect=record):\n+            impl.forward(query, key, value, None)\n+            impl.forward(query[:, :512], key, value, None)\n+        self.assertEqual(shapes, [1025, 512])\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/f1b26813018ca5f7051052760512843932a739c8/python%2Fsglang%2Fmultimodal_gen%2Ftest%2Funit%2Ftest_sdpa_sharded_heads.py",
+      "sha": "0aa78c81ff862231d5eae7cddb9639e7b5eace47",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [],
+  "number": 43242,
+  "refs": {
+    "base": {
+      "commit": "20d1f3f56a4661b49eeec508580012370ca34176",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "f1b26813018ca5f7051052760512843932a739c8",
+      "repository": "fusheng-ji/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": []
+}

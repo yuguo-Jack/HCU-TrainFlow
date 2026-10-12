@@ -9,20 +9,33 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-12'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/parallel_state.py
-  commit: a07014bbd47988608a05df23639c03441570e37b
+  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
   sha256: 414ecaf3b1891e8d621e5ec86a80af9d2d313d4393ac11e83832ff4bf7257dd2
 - source: nvidia-megatron-lm
   path: docs/user-guide/parallelism-guide.md
-  commit: a07014bbd47988608a05df23639c03441570e37b
+  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
   sha256: 8fe555b69e65abd543acc633c23f1b33491d6b0266a7b6c9848dd997222e674d
 - source: nvidia-megatron-lm
   path: megatron/core/pipeline_parallel/schedules.py
-  commit: a07014bbd47988608a05df23639c03441570e37b
+  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
   sha256: 3719d850b8822e221f30472881b8802b8f88ce02167856130fae97849d1d91ee
+- source: nvidia-megatron-lm
+  path: megatron/training/arguments.py
+  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/transformer_config.py
+  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+- source: nvidia-megatron-lm
+  path: docs/user-guide/features/pipeline_parallel_layout.md
+  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  sha256: a8f23d24f026a955abe527e45bd83fde707e967110a9ad868cc72c4a1e265c5f
+kind: authored
 ---
 
 # 并行域、微批与 rank 采样
@@ -48,14 +61,24 @@ TP、PP、DP、CP、EP 和 expert tensor parallel 不应只登记几个整数。
 
 PP 空泡由调度、微批和 stage 工作量共同决定；EP token 不均可能使最慢 rank 限制整个步。分别记录各 rank phase 的计算、通信和等待，先解释时间线，再决定改并行度还是算子实现。
 
+## 真实 group、batch 与 PP/VPP 约束
+
+`parallel_state.initialize_model_parallel` 分别构造普通 decoder 的 rank 生成器和 expert rank 生成器；普通 DP 和 expert DP 的成员/大小可能不同。标准、不启用 GTP-weight-remat 的 decoder 布局可先检查 `world_size = TP × PP × CP × DP`，专家布局另核对 expert TP/EP/expert DP；**不要把 EP 再乘进同一个 world size 公式**。新 GTP-remat 等轴开启后按源码的 `model_size`/rank 生成器计算，不能沿用简化式。
+
+固定长度、标准梯度累积下，`global_batch = micro_batch × DP × num_microbatches`；这里 DP 是本模型实际复制域，CP 拆序列而不直接增加独立样本数，EP 也不作为额外样本倍数。ramp-up、step batch schedule、GTP-remat、packing/SFT 和动态 token batching 分别追当前 calculator、实际消费计数与 loss 归一化。不能只让数字相等而改变有效 token 和学习率语义。
+
+PP 不只按层数均分：embedding、attention/MLP/MoE、MTP 和末端 loss 的时间/显存不同。官方 `--pipeline-model-parallel-layout` 用 `E/t/m/L` 表示这些阶段，`|` 分 stage、`*` 重复，并允许空 stage；它标为 experimental。读实际 layout 解析与 schedule，检查 VPP chunk、每轮 microbatch 组、P2P 和模块特殊处理，不能用简单 PP 数字解释所有空泡。
+
+先将能装下的布局与 worst-rank 峰值列出，再比较 profiler-off 有效吞吐和同域等待。`overlap_p2p_comm` 与批量 P2P 等组合有配置约束；改布局后回到 [overlap](overlap.md) 检查互斥项与 [loss](training-and-loss.md) 检查缩放。这里只解释固定官方机制，HCU 组合支持需独立验收。
+
 ## 验证
 
 改变拓扑后重新构造 context；旧 trace/环境检查/质量报告仍保留，但不能为新配置放行。DP/TP/EP collective 单测的数据量与 dtype 应来自真实模型，机内与机间测试不能互相替代。
 
 ## 固定源码与更新范围
 
-- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/a07014bbd47988608a05df23639c03441570e37b/megatron/core/parallel_state.py)
-- [docs/user-guide/parallelism-guide.md](https://github.com/NVIDIA/Megatron-LM/blob/a07014bbd47988608a05df23639c03441570e37b/docs/user-guide/parallelism-guide.md)
-- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/a07014bbd47988608a05df23639c03441570e37b/megatron/core/pipeline_parallel/schedules.py)
+- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/parallel_state.py)
+- [docs/user-guide/parallelism-guide.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/user-guide/parallelism-guide.md)
+- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/pipeline_parallel/schedules.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。

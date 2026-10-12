@@ -1,0 +1,190 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "f6c848c882ba8b60a80518b38088046e0bc5ce03",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nAt TP4, MiniMax-M3's dense layers (64 q / 4 KV heads, head_dim 128) and its EAGLE3 draft\n(`LlamaForCausalLMEagle3`, same shape, 1 layer) put **16 query heads on one TP-local KV head**. Main already has a\ngrouped-head split-KV kernel for that shape (`verify_shared_kv_fwd`, #34517), but\n`_should_use_verify_shared_kv` enables it only for Kimi-K3, dspark and Qwen3.5. On main, M3 runs per-head\nkernels that read the prefix KV once per query head:\n\n| call (M3 TP4 + EAGLE3, topk 1) | main | this PR |\n|---|---|---|\n| target verify (dense layers 0-2) | `verify_splitkv_fwd` (per-head) | `verify_shared_kv_fwd` |\n| draft extend (`DRAFT_EXTEND_V2`) | `extend_attention_fwd` | `verify_shared_kv_fwd` |\n| draft decode | `decode_attention_fwd`, standard kernel | `decode_attention_fwd`, Lean kernel (main's) |\n\nEnabling the gate alone fixes only target verify, and with the default 4-head block config the kernel is still\n1.94 ms vs 0.45 ms at 24 x 195K. So the PR also routes the draft's extend, adds the head_dim-128 block config,\nand turns on main's existing Lean decode for M3 speculative decoding on ROCm.\n\n## Modifications\n\n\"Shared KV\" here is main's grouped-head kernel: the 16 query heads that share one TP-local KV head are\nprocessed in one block, so each K/V tile is read once instead of once per query head.\n\n- **Gate** (`_should_use_verify_shared_kv`): the GQA allowlist becomes\n  `is_qwen3_5 or is_minimax_sparse or is_llama_eagle3_draft`, keyed on the runner's own config, the same way\n  main keys dspark on `is_dspark_draft`. `is_llama_eagle3_draft` sits next to `is_dspark_draft` in\n  `configs/model_config.py`. The existing conditions still apply (gfx95, topk 1, exactly one TP-local KV head,\n  `SGLANG_ENABLE_SPLITKV_VERIFY`), and `can_handle` falls back for anything the kernel does not cover.\n  Scope: this also turns on for other Llama EAGLE3 drafts with one TP-local KV head on gfx95 at topk 1; results\n  stay exact there, but only M3's draft shape is benchmarked.\n- **Draft extend**: the existing verify fast path in `forward_extend` also takes `DRAFT_EXTEND_V2` for a Llama\n  EAGLE3 draft (same constant-length chain over a prefix-only `kv_indices`; ragged eager batches fail\n  `can_handle` and fall back).\n- **Draft decode**: no new kernel. M3's model override sets `enable_lean_attention=True` on HIP when\n  speculative decoding is on and the user left the flag unset (`enable_lean_attention` becomes\n  `resolvable=True`). Without it the draft's 16-q / 1-KV layer always replays the standard decode kernel, because\n  Lean's capture policy never bakes a layer with fewer than 4 head tiles.\n- **Kernel** (`verify_mla.py`):\n  - `_BLOCK_CONFIG[128] = (16, 128, 4)`: one 16-head block per KV head. This carries the speedup.\n  - Empty-prefix guards in stage 1 and the stage-2 merge: weight 0 instead of NaN. Padded draft-extend graph\n    rows have `kv_lens == 0`.\n\nWithout speculation the gate is off and nothing changes. The target's 57 sparse layers use the MiniMax sparse\nbackend and are untouched; this PR covers the three dense layers in target verify and the EAGLE3 draft.\n\n## Accuracy Tests\n\n`test/registered/attention/test_verify_shared_kv.py` gains M3 verify parity against `extend_attention_fwd`\n(bf16 with prefixes 0, 1, 77, 4,099, 70,001 and 199,999, so a padded empty-prefix row is covered; and fp8 with\nk/v scales over 24 requests) and gate assertions for M3 and its EAGLE3 draft. `test_model_overrides.py` gains\n`test_m3_rocm_speculative_decode_uses_lean`. Removing either empty-prefix guard fails the M3 parity test.\n\nOn gfx950 (MI355X), merged with main `f6c848c882`:\n\n```\npytest test/registered/attention/test_verify_shared_kv.py test/registered/attention/test_verify_splitkv.py \\\n  test/registered/unit/layers/attention/test_triton_verify_metadata.py \\\n  test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py test/registered/unit/test_model_overrides.py\n145 passed, 2 skipped, 6 failed\n```\n\nThe 6 failures are `TestGoldenModelOverrides` cases (deepseek_v4, dllm, minimax_m2 sm10x, moe_runner_quant, ...)\nthat fail identically on main alone in this ROCm image.\n\nDraft-decode numerics (M3 draft shape, fp8 KV, 24 requests up to 195K), mean abs error against an fp32\nreference: Lean matches main's standard decode to bf16 rounding (max abs difference 1.3e-2) at every context\nlength. Draft decode only changes what the draft proposes; target verify decides the output and is the same\nkernel either way.\n\n## Speed Tests and Profiling\n\nKernel time per call (ms), CUDA-graph replay, fp8 KV, M3 TP4 shape, MI350X:\n\n| C | bs | verify: main / this PR | draft extend: main / this PR |\n|---|---:|---:|---:|\n| 195K | 8 | 1.51 / **0.21** | 9.10 / **0.21** |\n| 195K | 24 | 4.89 / **0.45** | 14.09 / **0.45** |\n| 195K | 32 | 6.26 / **0.56** | 14.54 / **0.56** |\n| 20K | 24 | 0.73 / **0.06** | 1.84 / **0.06** |\n\nDraft decode (16 q / 1 KV head), standard kernel vs Lean, ms per call:\n\n| ctx x bs | standard (main default) | Lean (this PR) |\n|---|---:|---:|\n| 195K x 24 | 1.605 | **0.513** |\n| 195K x 32 | 1.672 | **0.689** |\n| 100K x 24 | 0.827 | **0.276** |\n| 20K x 24 | 0.126 | **0.087** |\n| 2K x 24 | 0.022 | 0.054 |\n\nLean has a fixed cost of about 0.05-0.09 ms, so below about 8K it is slower than the standard kernel; there are\ntwo draft-decode calls per spec step. A dedicated grouped-head decode would be about 20% faster than Lean at\n195K; end to end it measured no different (below), so this PR uses main's kernel.\n\nEnd to end, AgentX agentic traces (SemiAnalysis AIPerf, seed 42), c=24, 900 s, MiniMax-M3 MXFP4\n(`amd/MiniMax-M3-MXFP4`) TP4, EAGLE3 (`Inferact/MiniMax-M3-EAGLE3-GQA`, 3 steps / 4 draft tokens, real\nacceptance), fp8 KV, `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1`, indexer CP on.\n\nMI350X, base vs a grouped-head draft decode (same verify and draft extend as this PR). Base is main\n`ba77d30256` + #41845 + #42614:\n\n| | base | grouped-head verify / extend / decode | change |\n|---|---:|---:|---:|\n| total tok/s/GPU | 17,937 | **25,770** | **+43.7%** |\n| ITL p50 / p90 | 27.4 / 41.1 ms | **13.3 / 21.5 ms** | -51% / -48% |\n| EAGLE3 accept length (mean) | 2.744 | 2.680 | unchanged |\n\nMI355X, same 4 GPUs, fresh server per run, order A1-B1-B2-A2, on main `f6c848c882`.\nA = grouped-head draft decode, B = this PR (Lean draft decode):\n\n| | A1 (grouped-head decode) | B1 (this PR) |\n|---|---:|---:|\n| total tok/s/GPU | 28,249 | **28,270** (+0.07%) |\n| output tok/s/GPU | 224 | 226 |\n| ITL p50 / p90 | 12.0 / 19.5 ms | **11.7 / 19.1 ms** |\n| TTFT p50 / p90 | 444 / 1,660 ms | 443 / 1,456 ms |\n| p90 interactivity (tok/s/user) | 51 | 52 |\n| EAGLE3 accept length (mean, `/metrics`) | 2.617 | 2.724 |\n| GSM8K-500 5-shot | 0.852 | 0.874 |\n| requests / errors | 1,060 / 0 | 1,066 / 0 |\n\nOne run per arm: the B2 and A2 repeats did not complete because the node throttled all eight GPUs during\nthose runs (bf16 GEMM 51 vs 1,431 TFLOP/s, launch latency 37-127 us vs 4.7 us), so the run-to-run noise on\nthis setup is not measured. The accept-length gap is in Lean's favor and is not explained by the decode\nkernel, whose outputs match main's standard decode to bf16 rounding; GSM8K moves about +-3 points between\nserver instances of the same build.\n\n## Risks\n\n- The draft gate keys on the draft's own architecture, so it also applies to other Llama EAGLE3 drafts with\n  one TP-local KV head on gfx95 at topk 1. `can_handle` keeps results exact; only M3's draft is benchmarked.\n- The Lean default applies only to M3 with speculative decoding on ROCm, and only when the user did not set\n  `--enable-lean-attention`.\n- No new env var: verify and draft extend stay behind main's `SGLANG_ENABLE_SPLITKV_VERIFY`.\n\n## Checklist\n\n- [x] Format your code according to the Format code with pre-commit.\n- [x] Add unit tests according to the Run and add unit tests.\n- [ ] Update documentation -- not applicable; no user-facing interface change.\n- [x] Provide accuracy and speed benchmark results.\n- [x] Follow the SGLang code style guidance.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:hourglass_flowing_sand: [Run #38221385928](https://github.com/sgl-project/sglang/actions/runs/38221385928)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38221385426](https://github.com/sgl-project/sglang/actions/runs/38221385426)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38221385884](https://github.com/sgl-project/sglang/actions/runs/38221385884)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+      "changedFiles": 7,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "headRepository": {
+        "nameWithOwner": "kevin-mii/sglang"
+      },
+      "merged": false,
+      "number": 43020,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[AMD] MiniMax-M3: grouped-head shared-KV Triton verify and draft extend, plus Lean draft decode",
+      "updatedAt": "2026-10-12T10:47:35Z",
+      "url": "https://github.com/sgl-project/sglang/pull/43020"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "f6c848c882ba8b60a80518b38088046e0bc5ce03"
+    },
+    "body": "## Motivation\n\nAt TP4, MiniMax-M3's dense layers (64 q / 4 KV heads, head_dim 128) and its EAGLE3 draft\n(`LlamaForCausalLMEagle3`, same shape, 1 layer) put **16 query heads on one TP-local KV head**. Main already has a\ngrouped-head split-KV kernel for that shape (`verify_shared_kv_fwd`, #34517), but\n`_should_use_verify_shared_kv` enables it only for Kimi-K3, dspark and Qwen3.5. On main, M3 runs per-head\nkernels that read the prefix KV once per query head:\n\n| call (M3 TP4 + EAGLE3, topk 1) | main | this PR |\n|---|---|---|\n| target verify (dense layers 0-2) | `verify_splitkv_fwd` (per-head) | `verify_shared_kv_fwd` |\n| draft extend (`DRAFT_EXTEND_V2`) | `extend_attention_fwd` | `verify_shared_kv_fwd` |\n| draft decode | `decode_attention_fwd`, standard kernel | `decode_attention_fwd`, Lean kernel (main's) |\n\nEnabling the gate alone fixes only target verify, and with the default 4-head block config the kernel is still\n1.94 ms vs 0.45 ms at 24 x 195K. So the PR also routes the draft's extend, adds the head_dim-128 block config,\nand turns on main's existing Lean decode for M3 speculative decoding on ROCm.\n\n## Modifications\n\n\"Shared KV\" here is main's grouped-head kernel: the 16 query heads that share one TP-local KV head are\nprocessed in one block, so each K/V tile is read once instead of once per query head.\n\n- **Gate** (`_should_use_verify_shared_kv`): the GQA allowlist becomes\n  `is_qwen3_5 or is_minimax_sparse or is_llama_eagle3_draft`, keyed on the runner's own config, the same way\n  main keys dspark on `is_dspark_draft`. `is_llama_eagle3_draft` sits next to `is_dspark_draft` in\n  `configs/model_config.py`. The existing conditions still apply (gfx95, topk 1, exactly one TP-local KV head,\n  `SGLANG_ENABLE_SPLITKV_VERIFY`), and `can_handle` falls back for anything the kernel does not cover.\n  Scope: this also turns on for other Llama EAGLE3 drafts with one TP-local KV head on gfx95 at topk 1; results\n  stay exact there, but only M3's draft shape is benchmarked.\n- **Draft extend**: the existing verify fast path in `forward_extend` also takes `DRAFT_EXTEND_V2` for a Llama\n  EAGLE3 draft (same constant-length chain over a prefix-only `kv_indices`; ragged eager batches fail\n  `can_handle` and fall back).\n- **Draft decode**: no new kernel. M3's model override sets `enable_lean_attention=True` on HIP when\n  speculative decoding is on and the user left the flag unset (`enable_lean_attention` becomes\n  `resolvable=True`). Without it the draft's 16-q / 1-KV layer always replays the standard decode kernel, because\n  Lean's capture policy never bakes a layer with fewer than 4 head tiles.\n- **Kernel** (`verify_mla.py`):\n  - `_BLOCK_CONFIG[128] = (16, 128, 4)`: one 16-head block per KV head. This carries the speedup.\n  - Empty-prefix guards in stage 1 and the stage-2 merge: weight 0 instead of NaN. Padded draft-extend graph\n    rows have `kv_lens == 0`.\n\nWithout speculation the gate is off and nothing changes. The target's 57 sparse layers use the MiniMax sparse\nbackend and are untouched; this PR covers the three dense layers in target verify and the EAGLE3 draft.\n\n## Accuracy Tests\n\n`test/registered/attention/test_verify_shared_kv.py` gains M3 verify parity against `extend_attention_fwd`\n(bf16 with prefixes 0, 1, 77, 4,099, 70,001 and 199,999, so a padded empty-prefix row is covered; and fp8 with\nk/v scales over 24 requests) and gate assertions for M3 and its EAGLE3 draft. `test_model_overrides.py` gains\n`test_m3_rocm_speculative_decode_uses_lean`. Removing either empty-prefix guard fails the M3 parity test.\n\nOn gfx950 (MI355X), merged with main `f6c848c882`:\n\n```\npytest test/registered/attention/test_verify_shared_kv.py test/registered/attention/test_verify_splitkv.py \\\n  test/registered/unit/layers/attention/test_triton_verify_metadata.py \\\n  test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py test/registered/unit/test_model_overrides.py\n145 passed, 2 skipped, 6 failed\n```\n\nThe 6 failures are `TestGoldenModelOverrides` cases (deepseek_v4, dllm, minimax_m2 sm10x, moe_runner_quant, ...)\nthat fail identically on main alone in this ROCm image.\n\nDraft-decode numerics (M3 draft shape, fp8 KV, 24 requests up to 195K), mean abs error against an fp32\nreference: Lean matches main's standard decode to bf16 rounding (max abs difference 1.3e-2) at every context\nlength. Draft decode only changes what the draft proposes; target verify decides the output and is the same\nkernel either way.\n\n## Speed Tests and Profiling\n\nKernel time per call (ms), CUDA-graph replay, fp8 KV, M3 TP4 shape, MI350X:\n\n| C | bs | verify: main / this PR | draft extend: main / this PR |\n|---|---:|---:|---:|\n| 195K | 8 | 1.51 / **0.21** | 9.10 / **0.21** |\n| 195K | 24 | 4.89 / **0.45** | 14.09 / **0.45** |\n| 195K | 32 | 6.26 / **0.56** | 14.54 / **0.56** |\n| 20K | 24 | 0.73 / **0.06** | 1.84 / **0.06** |\n\nDraft decode (16 q / 1 KV head), standard kernel vs Lean, ms per call:\n\n| ctx x bs | standard (main default) | Lean (this PR) |\n|---|---:|---:|\n| 195K x 24 | 1.605 | **0.513** |\n| 195K x 32 | 1.672 | **0.689** |\n| 100K x 24 | 0.827 | **0.276** |\n| 20K x 24 | 0.126 | **0.087** |\n| 2K x 24 | 0.022 | 0.054 |\n\nLean has a fixed cost of about 0.05-0.09 ms, so below about 8K it is slower than the standard kernel; there are\ntwo draft-decode calls per spec step. A dedicated grouped-head decode would be about 20% faster than Lean at\n195K; end to end it measured no different (below), so this PR uses main's kernel.\n\nEnd to end, AgentX agentic traces (SemiAnalysis AIPerf, seed 42), c=24, 900 s, MiniMax-M3 MXFP4\n(`amd/MiniMax-M3-MXFP4`) TP4, EAGLE3 (`Inferact/MiniMax-M3-EAGLE3-GQA`, 3 steps / 4 draft tokens, real\nacceptance), fp8 KV, `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1`, indexer CP on.\n\nMI350X, base vs a grouped-head draft decode (same verify and draft extend as this PR). Base is main\n`ba77d30256` + #41845 + #42614:\n\n| | base | grouped-head verify / extend / decode | change |\n|---|---:|---:|---:|\n| total tok/s/GPU | 17,937 | **25,770** | **+43.7%** |\n| ITL p50 / p90 | 27.4 / 41.1 ms | **13.3 / 21.5 ms** | -51% / -48% |\n| EAGLE3 accept length (mean) | 2.744 | 2.680 | unchanged |\n\nMI355X, same 4 GPUs, fresh server per run, order A1-B1-B2-A2, on main `f6c848c882`.\nA = grouped-head draft decode, B = this PR (Lean draft decode):\n\n| | A1 (grouped-head decode) | B1 (this PR) |\n|---|---:|---:|\n| total tok/s/GPU | 28,249 | **28,270** (+0.07%) |\n| output tok/s/GPU | 224 | 226 |\n| ITL p50 / p90 | 12.0 / 19.5 ms | **11.7 / 19.1 ms** |\n| TTFT p50 / p90 | 444 / 1,660 ms | 443 / 1,456 ms |\n| p90 interactivity (tok/s/user) | 51 | 52 |\n| EAGLE3 accept length (mean, `/metrics`) | 2.617 | 2.724 |\n| GSM8K-500 5-shot | 0.852 | 0.874 |\n| requests / errors | 1,060 / 0 | 1,066 / 0 |\n\nOne run per arm: the B2 and A2 repeats did not complete because the node throttled all eight GPUs during\nthose runs (bf16 GEMM 51 vs 1,431 TFLOP/s, launch latency 37-127 us vs 4.7 us), so the run-to-run noise on\nthis setup is not measured. The accept-length gap is in Lean's favor and is not explained by the decode\nkernel, whose outputs match main's standard decode to bf16 rounding; GSM8K moves about +-3 points between\nserver instances of the same build.\n\n## Risks\n\n- The draft gate keys on the draft's own architecture, so it also applies to other Llama EAGLE3 drafts with\n  one TP-local KV head on gfx95 at topk 1. `can_handle` keeps results exact; only M3's draft is benchmarked.\n- The Lean default applies only to M3 with speculative decoding on ROCm, and only when the user did not set\n  `--enable-lean-attention`.\n- No new env var: verify and draft extend stay behind main's `SGLANG_ENABLE_SPLITKV_VERIFY`.\n\n## Checklist\n\n- [x] Format your code according to the Format code with pre-commit.\n- [x] Add unit tests according to the Run and add unit tests.\n- [ ] Update documentation -- not applicable; no user-facing interface change.\n- [x] Provide accuracy and speed benchmark results.\n- [x] Follow the SGLang code style guidance.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:hourglass_flowing_sand: [Run #38221385928](https://github.com/sgl-project/sglang/actions/runs/38221385928)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38221385426](https://github.com/sgl-project/sglang/actions/runs/38221385426)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38221385884](https://github.com/sgl-project/sglang/actions/runs/38221385884)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+    "changed_files": 7,
+    "head": {
+      "repo": {
+        "full_name": "kevin-mii/sglang"
+      },
+      "sha": "472f795d581016af55d8f1aaad0bfd32f03f619e"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/43020",
+    "merged": false,
+    "number": 43020,
+    "state": "open",
+    "title": "[AMD] MiniMax-M3: grouped-head shared-KV Triton verify and draft extend, plus Lean draft decode",
+    "updated_at": "2026-10-12T10:47:35Z"
+  },
+  "files": [
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fverify_mla.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fverify_mla.py?ref=472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "deletions": 4,
+      "filename": "python/sglang/kernels/ops/attention/verify_mla.py",
+      "patch": "@@ -29,6 +29,8 @@\n _BLOCK_CONFIG = {\n     # head_dim: (BLOCK_H, BLOCK_N, num_warps)\n     256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8\n+    # MiniMax-M3 dense / EAGLE3 draft TP4: one 16-head block per KV head\n+    128: (16, 128, 4),\n     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)\n     64: (4, 256, 4),  # K3 GQA (dspark draft attention)\n }\n@@ -210,7 +212,9 @@ def _verify_mla_prefix_stage1(\n         )\n         tl.store(\n             Att_Out + o_row[:, None] + offs_dv[None, :],\n-            (acc / e_sum[:, None]).to(Att_Out.dtype.element_ty),\n+            (acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None]).to(\n+                Att_Out.dtype.element_ty\n+            ),\n             mask=row_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),\n         )\n         lse_row = tl.reshape(\n@@ -305,12 +309,14 @@ def _verify_mla_combine_stage2(\n             other=0.0,\n         ).to(tl.float32)\n         new_m = tl.maximum(m, lse_s)\n-        alpha = tl.exp(m - new_m)\n-        beta = tl.exp(lse_s - new_m)\n+        # an empty prefix leaves every split at -inf: weight 0 instead of NaN\n+        safe_m = tl.where(new_m == float(\"-inf\"), 0.0, new_m)\n+        alpha = tl.exp(m - safe_m)\n+        beta = tl.exp(lse_s - safe_m)\n         acc = acc * alpha[:, None] + o_s * beta[:, None]\n         l_acc = l_acc * alpha + beta\n         m = new_m\n-    o_prefix = acc / l_acc[:, None]\n+    o_prefix = acc / tl.where(l_acc > 0, l_acc, 1.0)[:, None]\n     lse_prefix = m + tl.log(l_acc)\n \n     # ---- (b) draft-draft causal attention (L_EXT x L_EXT) -----------------",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fverify_mla.py",
+      "sha": "56c67aeaf211d2ba51212cd95d4160af5a0be4bb",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fexec_.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fexec_.py?ref=472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "deletions": 1,
+      "filename": "python/sglang/srt/arg_groups/fields/exec_.py",
+      "patch": "@@ -141,7 +141,10 @@ class ExecKernel(msgspec.Struct):\n     ] = None\n     enable_lean_attention: A[\n         Optional[bool],\n-        \"Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.\",\n+        Arg(\n+            help=\"Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.\",\n+            resolvable=True,\n+        ),\n     ] = None\n     prefill_attention_backend: A[\n         Optional[str],",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fexec_.py",
+      "sha": "4e39cb2cd09f6f0e78a7e5d50018973b2e799b27",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Farg_groups%2Fmodel_overrides%2Fminimax_m3.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Fmodel_overrides%2Fminimax_m3.py?ref=472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "deletions": 0,
+      "filename": "python/sglang/srt/arg_groups/model_overrides/minimax_m3.py",
+      "patch": "@@ -34,6 +34,10 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:\n     if get_platform().is_hip:\n         if is_attention_backend_not_set(cfg):\n             overrides[\"attention_backend\"] = \"triton\"\n+        # the EAGLE3 draft decodes 16 query heads on one KV head over the whole\n+        # context, which Lean's capture policy never bakes (head tiles < 4)\n+        if cfg.speculative_algorithm is not None and cfg.enable_lean_attention is None:\n+            overrides[\"enable_lean_attention\"] = True\n         if cfg.moe_runner_backend == \"auto\" and quant_resolved == \"mxfp8\":\n             overrides[\"moe_runner_backend\"] = \"triton\"\n         if not envs.USE_ROCM_AITER_ROPE_BACKEND.is_set():",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Farg_groups%2Fmodel_overrides%2Fminimax_m3.py",
+      "sha": "fcd4e4ed4247062a3658195fa0a257d0131ea86b",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Fconfigs%2Fmodel_config.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fconfigs%2Fmodel_config.py?ref=472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "deletions": 0,
+      "filename": "python/sglang/srt/configs/model_config.py",
+      "patch": "@@ -255,6 +255,10 @@ def is_dspark_draft(config) -> bool:\n     return _hf_arch(config) == \"DSparkDraftModel\"\n \n \n+def is_llama_eagle3_draft(config) -> bool:\n+    return _hf_arch(config) == \"LlamaForCausalLMEagle3\"\n+\n+\n # The decision_config.json attention mode whose full-attention layers read the whole prompt.\n NONCAUSAL_FULL_ATTENTION = \"noncausal_full_attention\"\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Fconfigs%2Fmodel_config.py",
+      "sha": "de9433180109f4d0d5b80125d299da3df40799d7",
+      "status": "modified"
+    },
+    {
+      "additions": 21,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Ftriton_backend.py",
+      "changes": 25,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Ftriton_backend.py?ref=472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "deletions": 4,
+      "filename": "python/sglang/srt/layers/attention/triton_backend.py",
+      "patch": "@@ -15,6 +15,8 @@\n     AttentionArch,\n     is_dspark_draft,\n     is_kimi_k3,\n+    is_llama_eagle3_draft,\n+    is_minimax_sparse,\n     is_qwen3_5,\n )\n from sglang.srt.distributed.device_communicators.pynccl_allocator import (\n@@ -96,7 +98,11 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv\n         return use_verify_splitkv\n     return (\n         use_verify_splitkv\n-        and is_qwen3_5(model_config.hf_config)\n+        and (\n+            is_qwen3_5(model_config.hf_config)\n+            or is_minimax_sparse(model_config.hf_config)\n+            or is_llama_eagle3_draft(model_config.hf_config)\n+        )\n         and model_config.get_num_kv_heads(\n             get_parallel().attn_tp_size, get_parallel().attn_dcp_size\n         )\n@@ -231,14 +237,19 @@ def __init__(\n             and self.topk == 1\n         )\n         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA\n-        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5\n-        # GQA with exactly one TP-local KV head.\n+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and GQA with\n+        # exactly one TP-local KV head (Qwen3.5, MiniMax-M3, Llama EAGLE3 drafts).\n         self.use_verify_shared_kv = _should_use_verify_shared_kv(\n             model_runner.model_config,\n             self.topk,\n             self.use_mla,\n             self.use_verify_splitkv,\n         )\n+        # A Llama EAGLE3 draft's v2 draft extend is the same constant-length chain\n+        self.use_shared_kv_for_draft_extend = (\n+            self.use_verify_shared_kv\n+            and is_llama_eagle3_draft(model_runner.model_config.hf_config)\n+        )\n         # TODO: this logic should be fixed in non-hip platform\n         self.is_hip_dspark_draft = (\n             _is_hip\n@@ -1763,7 +1774,13 @@ def forward_extend(\n         if (\n             verify_fwd is not None\n             and score_mod is None\n-            and forward_batch.forward_mode.is_target_verify()\n+            and (\n+                forward_batch.forward_mode.is_target_verify()\n+                or (\n+                    self.use_shared_kv_for_draft_extend\n+                    and forward_batch.forward_mode.is_draft_extend_v2()\n+                )\n+            )\n             and verify_fwd(\n                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),\n                 k.contiguous(),",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/472f795d581016af55d8f1aaad0bfd32f03f619e/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Ftriton_backend.py",
+      "sha": "f4b1300e59691ccd70201ed312339664466ebf55",
+      "status": "modified"
+    },
+    {
+      "additions": 44,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/472f795d581016af55d8f1aaad0bfd32f03f619e/test%2Fregistered%2Fattention%2Ftest_verify_shared_kv.py",
+      "changes": 45,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fattention%2Ftest_verify_shared_kv.py?ref=472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "deletions": 1,
+      "filename": "test/registered/attention/test_verify_shared_kv.py",
+      "patch": "@@ -72,9 +72,10 @@ def _run_parity(\n         l_ext=4,\n         atol=BF16_ATOL,\n         rtol=BF16_RTOL,\n+        prefix_lens=(512, 2048),\n     ):\n         inputs = _build_inputs(\n-            prefix_lens=[512, 2048],\n+            prefix_lens=list(prefix_lens),\n             l_ext=l_ext,\n             h_q=h_q,\n             h_kv=h_kv,\n@@ -159,6 +160,35 @@ def test_qwen3_5_fp8_kv_cache(self):\n             rtol=FP8_RTOL,\n         )\n \n+    def test_minimax_m3_tp4_shape(self):\n+        # MiniMax-M3 dense layers and its EAGLE3 draft at TP4: 16 local query\n+        # heads on one KV head, head_dim 128, uneven long prefixes. A padded\n+        # draft-extend graph row has an empty prefix.\n+        self._run_parity(\n+            head_dim=128,\n+            v_head_dim=128,\n+            h_q=16,\n+            prefix_lens=(0, 1, 77, 4099, 70001, 199999),\n+        )\n+\n+    @unittest.skipIf(\n+        get_hip_version()[:2] == (7, 0),\n+        \"Triton 3.4 on ROCm 7.0 aborts gfx950 fp8 KV tl.dot \"\n+        \"(triton-lang/triton#8278). Remove once the image uses Triton >= 3.6.\",\n+    )\n+    def test_minimax_m3_fp8_kv_cache(self):\n+        self._run_parity(\n+            head_dim=128,\n+            v_head_dim=128,\n+            h_q=16,\n+            cache_dtype=torch.float8_e4m3fn,\n+            k_scale=0.5,\n+            v_scale=0.25,\n+            atol=FP8_ATOL,\n+            rtol=FP8_RTOL,\n+            prefix_lens=[3000 + 37 * i for i in range(24)],\n+        )\n+\n     def test_kimi_k3_absorbed_mla_shape(self):\n         self._run_parity(head_dim=576, v_head_dim=512)\n \n@@ -236,6 +266,19 @@ def model_config(architecture, local_kv_heads=1):\n                 model_config(\"LlamaForCausalLM\"), 1, False, True\n             )\n         )\n+        self.assertTrue(\n+            _should_use_verify_shared_kv(\n+                model_config(\"MiniMaxM3SparseForConditionalGeneration\"),\n+                1,\n+                False,\n+                True,\n+            )\n+        )\n+        self.assertTrue(\n+            _should_use_verify_shared_kv(\n+                model_config(\"LlamaForCausalLMEagle3\"), 1, False, True\n+            )\n+        )\n         self.assertTrue(\n             _should_use_verify_shared_kv(\n                 model_config(\"KimiK3ForConditionalGeneration\"), 1, True, False",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/472f795d581016af55d8f1aaad0bfd32f03f619e/test%2Fregistered%2Fattention%2Ftest_verify_shared_kv.py",
+      "sha": "2a44335bf0dfba4daaf19728fb5b6afc8df4e7c4",
+      "status": "modified"
+    },
+    {
+      "additions": 37,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/472f795d581016af55d8f1aaad0bfd32f03f619e/test%2Fregistered%2Funit%2Ftest_model_overrides.py",
+      "changes": 37,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Ftest_model_overrides.py?ref=472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "deletions": 0,
+      "filename": "test/registered/unit/test_model_overrides.py",
+      "patch": "@@ -212,6 +212,7 @@ def test_server_args_whitelist_is_exactly_the_migrated_fields(self):\n                     \"disable_aiter_allreduce_fusion_in_prefill\",\n                     \"disable_aiter_allreduce_fusion_in_decode\",\n                     \"enable_symm_mem\",\n+                    \"enable_lean_attention\",\n                     \"speculative_attention_mode\",\n                     \"speculative_draft_attention_backend\",\n                     \"prefill_decode_interval\",\n@@ -3229,6 +3230,42 @@ def _m3_args(**kw):\n             self.assertEqual(ov[\"attention_backend\"], \"fa4\")\n             self.assertEqual(ov[\"page_size\"], 128)\n \n+    def test_m3_rocm_speculative_decode_uses_lean(self):\n+        \"\"\"Lean's capture policy skips the 1-KV-head EAGLE3 draft, so M3 forces it on.\"\"\"\n+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (\n+            _minimax_m3_overrides,\n+        )\n+\n+        def _overrides(**kw):\n+            args = dict(\n+                quantization=None,\n+                _quantization_explicitly_unset=True,\n+                attention_backend=None,\n+                prefill_attention_backend=None,\n+                decode_attention_backend=None,\n+                moe_runner_backend=\"auto\",\n+                kv_cache_dtype=\"auto\",\n+                ep_size=1,\n+                moe_a2a_backend=\"none\",\n+                enable_aiter_allreduce_fusion=False,\n+                speculative_algorithm=\"EAGLE3\",\n+                enable_lean_attention=None,\n+            )\n+            args.update(kw)\n+            return _minimax_m3_overrides(SimpleNamespace(**args), SimpleNamespace())\n+\n+        with (\n+            override_platform(is_hip=True),\n+            envs.USE_ROCM_AITER_ROPE_BACKEND.override(\"0\"),\n+        ):\n+            self.assertTrue(_overrides()[\"enable_lean_attention\"])\n+            self.assertNotIn(\n+                \"enable_lean_attention\", _overrides(speculative_algorithm=None)\n+            )\n+            self.assertNotIn(\n+                \"enable_lean_attention\", _overrides(enable_lean_attention=False)\n+            )\n+\n     def test_page_constraint_passes_at_callable_level(self):\n         from sglang.srt.arg_groups.overrides import (\n             ResolvedView,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/472f795d581016af55d8f1aaad0bfd32f03f619e/test%2Fregistered%2Funit%2Ftest_model_overrides.py",
+      "sha": "0a899f45112a52f050195c84d244a5fc55407649",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [],
+  "number": 43020,
+  "refs": {
+    "base": {
+      "commit": "f6c848c882ba8b60a80518b38088046e0bc5ce03",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "472f795d581016af55d8f1aaad0bfd32f03f619e",
+      "repository": "kevin-mii/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": []
+}

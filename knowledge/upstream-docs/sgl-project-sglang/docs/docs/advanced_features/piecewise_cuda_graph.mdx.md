@@ -15,7 +15,7 @@ path: docs/docs/advanced_features/piecewise_cuda_graph.mdx
 raw_sha256: 4328b8d405dc974734fd1fad77585a15ef48dc16bb364d1eb6f2ead7787e80d2
 sources: []
 generated_body_sha256: 55646c562b41f898c83205813ee42ac1949d0ec67db1bf8b7a9c6275b9465ef6
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/piecewise_cuda_graph.mdx

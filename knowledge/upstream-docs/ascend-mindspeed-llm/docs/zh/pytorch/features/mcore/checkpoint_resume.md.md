@@ -1,0 +1,136 @@
+---
+id: doc-ascend-mindspeed-llm-ba44355a4c0ed0bacbb8
+title: Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/checkpoint_resume.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed-LLM
+commit: 2fed626696175480ae1ab3342a94017301a25209
+path: docs/zh/pytorch/features/mcore/checkpoint_resume.md
+raw_sha256: 8ab9d85f2993daace112c276bde54608799e1ba876557d38ead37c938906c44c
+sources: []
+generated_body_sha256: fdf78408dbc1c4aba7fd28b2191406f54e9b8e34cd5df4443834a8b57ab39a8d
+source_state: current-scan
+---
+
+# Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/checkpoint_resume.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/features/mcore/checkpoint_resume.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# 断点续训
+
+## 使用场景
+
+在大规模模型预训练过程中，训练可能因硬件故障、资源调度等原因中断。为支持从中断处恢复训练，系统提供了 **断点续训（Checkpoint Resume Training）** 功能。本文档简要说明如何配置和使用该功能。
+
+---
+
+## 使用方法
+
+### 1. 断点续训的前提条件
+
+为了支持断点续训，需在启动预训练脚本时正确设置相关参数，确保优化器状态、模型参数和训练进度均被完整保存。
+
+请正确设置 `pretrain` 脚本参数，关键参数说明如下：
+
+| 参数                            | 说明                             |
+|-------------------------------|--------------------------------|
+| `--use-distributed-optimizer` | 必须开启，使优化器状态也按数据并行方式分布保存，便于后续恢复 |
+| `--finetune`                  | ❌ 不可设置，否则会跳过优化器状态加载            |
+| `--no-load-optim`             | ❌ 不可设置，否则不会恢复优化器状态（如学习率、动量等）   |
+| `--no-load-rng`               | ❌ 不可设置，否则不会恢复随机状态              |
+
+> [!NOTE]
+> 若设置了 `--finetune`、`--no-load-optim` 或 `--no-load-rng`，系统将不恢复优化器状态和随机状态，导致无法真正“续训”。
+
+---
+
+### 2. 保存训练权重
+
+当训练运行时，只要配置了 `--save $SAVE_PATH` 和保存频率（如 `--save-interval`），系统会自动定期保存完整检查点，包括：
+
+- 模型权重（model weights）
+- 优化器状态（optimizer states）
+- 训练步数（iteration）
+- 随机状态（random states）等
+
+示例：
+
+```bash
+--save /your/checkpoint/path \
+--save-interval 500   # 每 500 步保存一次
+```
+
+每次保存生成如下结构：
+
+```shell
+/your/checkpoint/path/
+├── latest_checkpointed_iteration.txt
+├── iter_0000001/
+│   ├── mp_rank_00_000/
+│   │   ├── distrib_optim.pt
+│   │   └── model_optim_rng.pt
+│   └── ...
+└── iter_0000500/
+    ├── mp_rank_00_000/
+    │   ├── distrib_optim.pt
+    │   └── model_optim_rng.pt
+    └── ...
+```
+
+关键参数说明：
+
+| 参数                            | 说明                             |
+|-------------------------------|--------------------------------|
+| `--use-distributed-optimizer` | 必须开启，使优化器状态也按数据并行方式分布保存，便于后续恢复 |
+| `--no-save-optim`             | ❌ 不可设置，否则不会保存优化器状态（如学习率、动量等）   |
+| `--no-save-rng`               | ❌ 不可设置，否则不会保存随机状态              |
+
+---
+
+### 3. 加载权重恢复训练
+
+要从中断处继续训练，在预训练脚本中的启动命令中指定 `--load` 为之前的保存路径。以下为参数片段，请将其合入完整预训练命令中：
+
+```text
+CHECKPOINT_PATH=/your/checkpoint/path
+
+--use-distributed-optimizer  # 使用分布式优化器（必选）
+--load ${CHECKPOINT_PATH}
+```
+
+> 系统会自动读取 `latest_checkpointed_iteration.txt` 文件，找到最新的迭代步数，并恢复模型和优化器状态。
+
+### 4. 确认续训结果
+
+自动恢复内容包括
+
+- 模型参数
+- 优化器状态（Adam momentum, variance 等）
+- 学习率调度器状态
+- 已完成的训练步数（避免重复训练）
+
+恢复后训练将继续从断点开始，打印如下日志内容
+
+```shell
+successfully loaded checkpoint from xx at iteration x
+(min, max) time across ranks:
+load-checkpoint ....................:(9289.88, 9288.22)
+```
+
+---
+
+## 使用约束
+
+1. **文件完整性**：确保 `$CHECKPOINT_PATH` 下的检查点文件完整无损。
+2. **训练配置一致性**：恢复训练时，batch size、模型结构、训练步数、优化器类型等应与保存时一致。
+3. **分布式环境匹配**：NPU 数量和并行策略（TP/DP）要保持不变，否则会导致加载失败。

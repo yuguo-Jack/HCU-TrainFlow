@@ -1,0 +1,168 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "e78177360432f7a88fcd2f0249cca2188bb69234",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** DeepSeek-V3 attention's q/k split + RoPE + cat becomes the `mla_qk` region: 16k step -7.5%, attention glue 9.67 -> 3.62 ms per layer.\n\n**Problem**\n1. **q today.** Split, apply RoPE to one part, cat back.\n2. **k today.** Split, expand the rope part to 128 heads, cat back.\n3. **Slow copies.** Those cats and their split backwards run as non-vectorized `CatArrayBatchedCopy` on `[T, 128, 192]`.\n4. **Cost.** 13.2 ms per 2 layers at 16k.\n\n**Solution**\n1. **Region.** `mla_qk` wraps the q and k assembly; Inductor fuses the cats and splits.\n2. **Dense v under compile.** A strided `v` view got its gradient from flex in another layout, and AOTAutograd copied it (556 us) before the region backward. Returning v dense avoids the copy.\n3. **Enabled** in the DSv3 model config.\n4. **Unchanged.** Recipes with the `fused_mla` override replace this code and are not affected.\n\n```text\nbefore:  q: split -> rope -> cat       k: split -> expand(128 heads) -> cat     (eager CatArrayBatchedCopy)\nafter:   mla_qk region: same math, fused; v returned dense under compile\n```\n\n**Results**\n```text\nDSv3 671B layers 2-3, flex attention, fwd+bwd wall, 1x GB300 (shared), median [range] of 3 fresh processes, no AC\n16k            173.80 [173.29-173.99] -> 160.75 [160.25-160.76] ms  (-7.5%)\npeak             40.3 -> 39.2 GB\nattention module alone (layer 2, 16k, 1 process): 59.33 -> 53.48 ms; glue 9.67 -> 3.62 ms\n\nfused_mla instead of mla_qk, whole stack (n=2 at 16k)\n16k   159.74 -> 156.94 ms\n4k     39.28 ->  38.63 ms\n32k   300.44 -> 298.14 ms\nSAC   179.97 -> 176.48 ms\n\ncorrectness: bf16 output and all 27 grads bitwise identical to eager (2 layers, 4k)\ngraphs: mla_qk 3 per method (static T, dynamic T, no_grad), shared across attention instances\n```\n\nYou may ask:\n- Why not `fused_mla` everywhere? It is ~1.5-2% faster, but it is an opt-in Triton kernel; this region is default-on and kernel-free. Enabling `fused_mla` in the base recipe is the owners' call.\n- Why not real-arithmetic RoPE? With ConcatKernel it ties complex RoPE inside the region (53.35 vs 53.48 ms per attention module).\n\nNOTE:\n- With #5196 (RoPE in real arithmetic under compile), this region also needs plain cat lowering (`max_pointwise_cat_inputs=0`, second commit): 16k layer fwd+bwd 46.34 -> 45.85 ms, bitwise vs eager. Alone, the option is neutral (46.37 ms).\n- Reaches recipes using the stock DSv3 `Attention` (deepseek_v3_671b with flex, Kimi K2.x).\n- Not tested: TP/SP (regions are disallowed under SPMD type checking), GraphTrainer, varlen attention, loss curve, H100.\n\n**Test plan**\n`pytest tests/unit_tests/cpu/test_deepseek_v3_mla_compile.py` (fp32; fails before, passes after)\n\n<details><summary>Stack summary (same in every PR)</summary>\n\n```text\nDeepSeek-V3 671B layers 2 (dense) + 3 (MoE), native dims, 128 local experts (one EP2 rank), local dispatcher\nflex attention, fwd+bwd wall, 1x GB300 (shared), upstream main 2154d68a9, median of 3 fresh processes\n\nupstream regions -> stack   16k no AC   184.49 -> 159.58 ms  (-13.5%)\n  with fused_mla instead of mla_qk      184.49 -> 156.24 ms  (-15.3%)\nEP>1 only (op level): EP permutes -5.3 ms per MoE layer at 16k\n\nstack (biggest first; per-PR deltas measured one base earlier, same code)\n1 moe_dispatch_combine      -6.4%\n2 mla_qk                    -7.5%   <- this PR\n3 EP permute gathers        EP>1 only\n4 router region             -0.2% (EP2 width; -0.65 ms per MoE layer at 256 experts)\n5 int16 sort keys           within noise (bitwise, 4 lines)\nMade with the local_compile_perf skill: https://github.com/pytorch/torchtitan/pull/5155\n```\n</details>\n\nStack: 2 of 5.\n\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "SherlockNoMad"
+            },
+            "body": "Would be fun to compare the perf with the handwritten FusedMLA",
+            "createdAt": "2026-10-08T16:54:26Z",
+            "updatedAt": "2026-10-08T16:54:26Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5161#issuecomment-6064841820"
+          },
+          {
+            "author": {
+              "login": "felipemello1"
+            },
+            "body": "@SherlockNoMad FusedMLA is ~2.6% faster than this PR's region at 16k (45.10 vs 46.34 ms per attention fwd+bwd). Two small changes get the region to 45.48 ms. CUDA graphs don't change the picture: one attention layer at these sizes is GPU-bound.\n\n```text\nDeepSeek-V3 671B attention (one layer), packed 4k-token docs, bf16, fwd+bwd, 1x GB300, 3 fresh processes\n                          T=4k     T=16k    T=16k CUDA graph\neager glue               13.33    52.18    52.26 ms\nmla_qk (this PR)         11.84    46.34    46.42\n+ real-arithmetic RoPE   11.72    45.85    45.96\n+ V as a view of kv      11.62    45.48    45.59\nFusedMLA                 11.49    45.10    45.22\nall bitwise identical to eager, with and without graphs\n```\n\n- **RoPE (0.5 ms):** Inductor can't codegen complex multiply, so `q_pe * freqs_cis` stays an ATen kernel inside the region. Real arithmetic (the `complex_rope` PR, #5196) plus `max_pointwise_cat_inputs=0` (second commit here) fixes it.\n- **V (0.3 ms):** a dense V costs a clone and a slower attention fwd; returning the view from a region makes AOTAutograd copy its grad. An `autograd.Function` around two regions returns the view, like FusedMLA. ~35 lines for ~0.6% of the layer, so not in this PR.\n- **Left (0.4 ms):** mostly FusedMLA rotating `grad_q` in place, which a compiled region can't do.\n- **One or the other:** FusedMLA replaces `Attention.forward` and is opt-in per recipe; without it, every DeepSeek-V3 config gets `mla_qk`.\n\n<details><summary>Repro (eager, mla_qk, FusedMLA rows): <code>PYTHONPATH=. python compare_mla.py 2>/dev/null</code> on this branch, 1 GPU</summary>\n\n```python\n\"\"\"DeepSeek-V3 671B MLA attention, fwd+bwd: eager q/k glue vs the mla_qk region vs FusedMLA,\nwithout and with CUDA graphs.\n\nusage (from the repo root, 1 GPU): PYTHONPATH=. python compare_mla.py 2>/dev/null\n(stderr carries flex attention's autotuning log)\n\"\"\"\n\nimport torch\nfrom torch.nn.attention.flex_attention import and_masks\n\nfrom torchtitan.distributed.local_compile import apply_local_compile\nfrom torchtitan.models.common.attention import (\n    create_attention_mask,\n    get_causal_mask_mod,\n    get_efficient_causal_mask_mod_for_packed_document,\n)\nfrom torchtitan.models.deepseek_v3.flavors import build_model_config\nfrom torchtitan_recipes.overrides.fused_mla import fused_mla\n\nDOC_LEN = 4096  # packed documents of 4k tokens\nattn_config = build_model_config(\"671B\").layers[3].attention\n\n\ndef build(config):\n    torch.manual_seed(0)\n    with torch.device(\"cuda\"):\n        attn = config.build()\n        attn.init_states(buffer_device=torch.device(\"cuda\"))\n    return attn.bfloat16()\n\n\nstock = build(attn_config)\nfused = build(fused_mla(attn_config))\nfused.load_state_dict(stock.state_dict())\n\n\ndef step(attn, x, mask, positions):\n    \"\"\"One fwd+bwd. Grads are overwritten, not accumulated, so a captured step replays exactly.\"\"\"\n    for p in [x, *attn.parameters()]:\n        p.grad = None\n    out = attn(x, mask, positions)\n    out.float().square().mean().backward()\n    return out\n\n\ndef time_ms(fn, iters=10):\n    for _ in range(3):\n        fn()\n    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)\n    start.record()\n    for _ in range(iters):\n        fn()\n    end.record()\n    torch.cuda.synchronize()\n    return start.elapsed_time(end) / iters\n\n\ndef capture(attn, x, mask, positions):\n    \"\"\"Warm up on a side stream, then record one fwd+bwd into a CUDA graph.\"\"\"\n    side = torch.cuda.Stream()\n    side.wait_stream(torch.cuda.current_stream())\n    with torch.cuda.stream(side):\n        for _ in range(3):\n            step(attn, x, mask, positions)\n    torch.cuda.current_stream().wait_stream(side)\n    graph = torch.cuda.CUDAGraph()\n    with torch.cuda.graph(graph):\n        out = step(attn, x, mask, positions)\n    return graph, out\n\n\ndef rel_l2(a, b):\n    return ((a.float() - b.float()).norm() / b.float().norm()).item()\n\n\nfor num_tokens in (4096, 16384):\n    torch._dynamo.reset()  # training runs one T; a second T would recompile flex with a symbolic T\n    positions = torch.arange(num_tokens, device=\"cuda\") % DOC_LEN\n    mask_mod = and_masks(\n        get_causal_mask_mod(), get_efficient_causal_mask_mod_for_packed_document(positions)\n    )\n    mask = create_attention_mask(\n        mask_mod, 1, None, num_tokens, num_tokens, device=\"cuda\", BLOCK_SIZE=128\n    )\n    x = torch.randn(num_tokens, 7168, device=\"cuda\", dtype=torch.bfloat16, requires_grad=True)\n\n    eager_ms, graph_ms, results = {}, {}, {}\n    for name, attn, regions in [\n        (\"eager-glue\", stock, []),\n        (\"mla_qk\", stock, [\"mla_qk\"]),\n        (\"FusedMLA\", fused, []),\n    ]:\n        apply_local_compile(regions)\n        eager_ms[name] = time_ms(lambda: step(attn, x, mask, positions))\n        out = step(attn, x, mask, positions).detach()\n        results[name] = (out, x.grad.clone())\n\n        graph, graph_out = capture(attn, x, mask, positions)\n        graph_ms[name] = time_ms(graph.replay)\n        graph.replay()\n        torch.cuda.synchronize()\n        replay_match = torch.equal(graph_out, out) and torch.equal(x.grad, results[name][1])\n        print(f\"T={num_tokens // 1024}k {name}: replay bitwise equal to eager run: {replay_match}\")\n        del graph, graph_out\n\n    for label, ms in [(\"no graphs\", eager_ms), (\"CUDA graph\", graph_ms)]:\n        row = \" | \".join(f\"{k} {v:.2f} ms\" for k, v in ms.items())\n        print(f\"T={num_tokens // 1024}k {label:10s} {row}\")\n    ref_out, ref_grad = results[\"eager-glue\"]\n    for name in (\"mla_qk\", \"FusedMLA\"):\n        out, grad = results[name]\n        print(f\"       {name} vs eager-glue: out {rel_l2(out, ref_out):.1e}, x.grad {rel_l2(grad, ref_grad):.1e}\")\n```\n</details>\n",
+            "createdAt": "2026-10-09T04:45:15Z",
+            "updatedAt": "2026-10-09T06:01:55Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5161#issuecomment-6074440834"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWoQnII=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "merged": false,
+      "number": 5161,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[dsv3][perf] Compile MLA q/k RoPE and concat glue as a local region",
+      "updatedAt": "2026-10-09T17:18:09Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5161"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "e78177360432f7a88fcd2f0249cca2188bb69234"
+    },
+    "body": "**TLDR:** DeepSeek-V3 attention's q/k split + RoPE + cat becomes the `mla_qk` region: 16k step -7.5%, attention glue 9.67 -> 3.62 ms per layer.\n\n**Problem**\n1. **q today.** Split, apply RoPE to one part, cat back.\n2. **k today.** Split, expand the rope part to 128 heads, cat back.\n3. **Slow copies.** Those cats and their split backwards run as non-vectorized `CatArrayBatchedCopy` on `[T, 128, 192]`.\n4. **Cost.** 13.2 ms per 2 layers at 16k.\n\n**Solution**\n1. **Region.** `mla_qk` wraps the q and k assembly; Inductor fuses the cats and splits.\n2. **Dense v under compile.** A strided `v` view got its gradient from flex in another layout, and AOTAutograd copied it (556 us) before the region backward. Returning v dense avoids the copy.\n3. **Enabled** in the DSv3 model config.\n4. **Unchanged.** Recipes with the `fused_mla` override replace this code and are not affected.\n\n```text\nbefore:  q: split -> rope -> cat       k: split -> expand(128 heads) -> cat     (eager CatArrayBatchedCopy)\nafter:   mla_qk region: same math, fused; v returned dense under compile\n```\n\n**Results**\n```text\nDSv3 671B layers 2-3, flex attention, fwd+bwd wall, 1x GB300 (shared), median [range] of 3 fresh processes, no AC\n16k            173.80 [173.29-173.99] -> 160.75 [160.25-160.76] ms  (-7.5%)\npeak             40.3 -> 39.2 GB\nattention module alone (layer 2, 16k, 1 process): 59.33 -> 53.48 ms; glue 9.67 -> 3.62 ms\n\nfused_mla instead of mla_qk, whole stack (n=2 at 16k)\n16k   159.74 -> 156.94 ms\n4k     39.28 ->  38.63 ms\n32k   300.44 -> 298.14 ms\nSAC   179.97 -> 176.48 ms\n\ncorrectness: bf16 output and all 27 grads bitwise identical to eager (2 layers, 4k)\ngraphs: mla_qk 3 per method (static T, dynamic T, no_grad), shared across attention instances\n```\n\nYou may ask:\n- Why not `fused_mla` everywhere? It is ~1.5-2% faster, but it is an opt-in Triton kernel; this region is default-on and kernel-free. Enabling `fused_mla` in the base recipe is the owners' call.\n- Why not real-arithmetic RoPE? With ConcatKernel it ties complex RoPE inside the region (53.35 vs 53.48 ms per attention module).\n\nNOTE:\n- With #5196 (RoPE in real arithmetic under compile), this region also needs plain cat lowering (`max_pointwise_cat_inputs=0`, second commit): 16k layer fwd+bwd 46.34 -> 45.85 ms, bitwise vs eager. Alone, the option is neutral (46.37 ms).\n- Reaches recipes using the stock DSv3 `Attention` (deepseek_v3_671b with flex, Kimi K2.x).\n- Not tested: TP/SP (regions are disallowed under SPMD type checking), GraphTrainer, varlen attention, loss curve, H100.\n\n**Test plan**\n`pytest tests/unit_tests/cpu/test_deepseek_v3_mla_compile.py` (fp32; fails before, passes after)\n\n<details><summary>Stack summary (same in every PR)</summary>\n\n```text\nDeepSeek-V3 671B layers 2 (dense) + 3 (MoE), native dims, 128 local experts (one EP2 rank), local dispatcher\nflex attention, fwd+bwd wall, 1x GB300 (shared), upstream main 2154d68a9, median of 3 fresh processes\n\nupstream regions -> stack   16k no AC   184.49 -> 159.58 ms  (-13.5%)\n  with fused_mla instead of mla_qk      184.49 -> 156.24 ms  (-15.3%)\nEP>1 only (op level): EP permutes -5.3 ms per MoE layer at 16k\n\nstack (biggest first; per-PR deltas measured one base earlier, same code)\n1 moe_dispatch_combine      -6.4%\n2 mla_qk                    -7.5%   <- this PR\n3 EP permute gathers        EP>1 only\n4 router region             -0.2% (EP2 width; -0.65 ms per MoE layer at 256 experts)\n5 int16 sort keys           within noise (bitwise, 4 lines)\nMade with the local_compile_perf skill: https://github.com/pytorch/torchtitan/pull/5155\n```\n</details>\n\nStack: 2 of 5.\n\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5161",
+    "merged": false,
+    "number": 5161,
+    "state": "open",
+    "title": "[dsv3][perf] Compile MLA q/k RoPE and concat glue as a local region",
+    "updated_at": "2026-10-09T17:18:09Z"
+  },
+  "files": [
+    {
+      "additions": 52,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca/tests%2Funit_tests%2Fcpu%2Ftest_deepseek_v3_mla_compile.py",
+      "changes": 52,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Ftest_deepseek_v3_mla_compile.py?ref=c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/test_deepseek_v3_mla_compile.py",
+      "patch": "@@ -0,0 +1,52 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import pytest\n+import torch\n+\n+from torchtitan.distributed.local_compile import apply_local_compile\n+from torchtitan.models.deepseek_v3 import build_model_config\n+\n+\n+@pytest.fixture(autouse=True)\n+def reset_local_compile():\n+    apply_local_compile([])\n+    torch._dynamo.reset()\n+    yield\n+    apply_local_compile([])\n+\n+\n+def test_compiled_mla_qk_matches_eager() -> None:\n+    torch.manual_seed(0)\n+    attention = build_model_config(\"debugmodel\").layers[0].attention.build()\n+    attention.init_states()\n+    num_tokens = 32\n+    num_heads = attention.n_heads\n+    q = torch.randn(num_tokens, num_heads, attention.qk_head_dim)\n+    k_pe = torch.randn(num_tokens, attention.qk_rope_head_dim)\n+    kv = torch.randn(\n+        num_tokens, num_heads, attention.qk_nope_head_dim + attention.v_head_dim\n+    )\n+    positions = torch.arange(num_tokens) % 10\n+    grad_q, grad_k, grad_v = (\n+        torch.randn_like(q),\n+        torch.randn(num_tokens, num_heads, attention.qk_head_dim),\n+        torch.randn(num_tokens, num_heads, attention.v_head_dim),\n+    )\n+\n+    results = []\n+    for regions in ([], [\"mla_qk\"]):\n+        apply_local_compile(regions)\n+        inputs = [t.clone().requires_grad_(True) for t in (q, k_pe, kv)]\n+        rotated_q, rotated_k_pe = attention._apply_rope_to_q_and_k_pe(\n+            inputs[0], inputs[1], positions\n+        )\n+        k, v = attention._split_kv_and_build_k(inputs[2], rotated_k_pe)\n+        torch.autograd.backward((rotated_q, k, v), (grad_q, grad_k, grad_v))\n+        results.append((rotated_q, k, v, *(t.grad for t in inputs)))\n+\n+    for eager, compiled in zip(*results, strict=True):\n+        torch.testing.assert_close(compiled, eager)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca/tests%2Funit_tests%2Fcpu%2Ftest_deepseek_v3_mla_compile.py",
+      "sha": "4ba3167a5af8c7e4e7b880d729a7f70a03355709",
+      "status": "added"
+    },
+    {
+      "additions": 62,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "changes": 74,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py?ref=c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca",
+      "deletions": 12,
+      "filename": "torchtitan/models/deepseek_v3/model.py",
+      "patch": "@@ -14,6 +14,7 @@\n from torch import nn\n \n from torchtitan.config.parallelism import ParallelismConfig\n+from torchtitan.distributed.local_compile import local_compile\n from torchtitan.models.common.attention import (\n     BaseAttention,\n     FlexAttentionMetadata,\n@@ -131,32 +132,24 @@ def forward(\n                     spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\", None),\n                 )\n \n-        q_nope, q_pe = torch.split(\n-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1\n-        )\n-\n         # Key-value projection\n         kv = self.wkv_a(x)\n         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)\n \n         # rope, the query concat, and kv_norm read the query and wkv_a projection\n         # outputs with bare ops.\n-        remat.recompute_needs_tensor(q_nope, q_pe, kv, k_pe)\n-        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(1), positions)\n-        q = torch.cat([q_nope, q_pe], dim=-1)\n+        remat.recompute_needs_tensor(q, kv, k_pe)\n+        q, k_pe = self._apply_rope_to_q_and_k_pe(q, k_pe, positions)\n \n         kv = self.wkv_b(self.kv_norm(kv))\n \n         with (\n             spmd.local()\n         ):  # QKV even shard unflatten, but the expand is truly local SPMD\n             kv = kv.view(num_tokens, -1, self.qk_nope_head_dim + self.v_head_dim)\n-            k_nope, v = torch.split(\n-                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1\n-            )\n             # The key concat reads the wkv_b projection output with bare ops.\n-            remat.recompute_needs_tensor(k_nope)\n-            k = torch.cat([k_nope, k_pe.expand(-1, k_nope.size(1), -1)], dim=-1)\n+            remat.recompute_needs_tensor(kv)\n+            k, v = self._split_kv_and_build_k(kv, k_pe)\n             if spmd.is_type_checking() and not torch.compiler.is_compiling():\n                 for t in [k, v]:\n                     spmd.assert_type(\n@@ -175,6 +168,62 @@ def forward(\n         output = output.contiguous().view(num_tokens, -1)\n         return self.wo(output)\n \n+    # With RoPE in real arithmetic under compile (complex_rope), Inductor's default\n+    # pointwise-cat lowering turns the q_nope/q_pe concat into masked loads, which\n+    # are slower than a plain cat kernel.\n+    @local_compile(\n+        \"mla_qk\",\n+        batch_invariant=True,\n+        options={\"max_pointwise_cat_inputs\": 0, \"max_complex_pointwise_cat_inputs\": 0},\n+    )\n+    def _apply_rope_to_q_and_k_pe(\n+        self,\n+        q: torch.Tensor,\n+        k_pe: torch.Tensor,\n+        positions: torch.Tensor | None,\n+    ) -> tuple[torch.Tensor, torch.Tensor]:\n+        \"\"\"Rotate the rope dims of ``q`` and ``k_pe``.\n+\n+        Args:\n+            q: ``[T, H, qk_nope_head_dim + qk_rope_head_dim]`` query.\n+            k_pe: ``[T, qk_rope_head_dim]`` key rope dims, shared by all heads.\n+\n+        Returns:\n+            The rotated query, same shape as ``q``, and the rotated ``k_pe`` as\n+            ``[T, 1, qk_rope_head_dim]``.\n+        \"\"\"\n+        q_nope, q_pe = torch.split(\n+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1\n+        )\n+        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(1), positions)\n+        return torch.cat([q_nope, q_pe], dim=-1), k_pe\n+\n+    @local_compile(\"mla_qk\", batch_invariant=True)\n+    def _split_kv_and_build_k(\n+        self,\n+        kv: torch.Tensor,\n+        k_pe: torch.Tensor,\n+    ) -> tuple[torch.Tensor, torch.Tensor]:\n+        \"\"\"Build the key from ``kv``'s nope dims and the shared ``k_pe``.\n+\n+        Args:\n+            kv: ``[T, H, qk_nope_head_dim + v_head_dim]`` packed key nope dims\n+                and value.\n+            k_pe: ``[T, 1, qk_rope_head_dim]`` rotated key rope dims.\n+\n+        Returns:\n+            Key ``[T, H, qk_nope_head_dim + qk_rope_head_dim]`` and value\n+            ``[T, H, v_head_dim]``.\n+        \"\"\"\n+        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)\n+        k = torch.cat([k_nope, k_pe.expand(-1, k_nope.size(1), -1)], dim=-1)\n+        if torch.compiler.is_compiling():\n+            # A strided value view gets a gradient from attention in another\n+            # layout, which the compiled backward copies before using it. A\n+            # dense value avoids that copy and fuses into the key's kernel.\n+            v = v.contiguous()\n+        return k, v\n+\n \n class DeepSeekV3TransformerBlock(TransformerBlock):\n     \"\"\"\n@@ -279,6 +328,7 @@ class Config(MTPDecoder.Config):\n                 \"fused_binary_activation\",\n                 \"fp32_to_bf16_split\",\n                 \"moe_dispatch_combine\",\n+                \"mla_qk\",\n             ]\n         )\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "sha": "042f938b5889d96fb312588aab2533b613bac65e",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Would be fun to compare the perf with the handwritten FusedMLA",
+      "created_at": "2026-10-08T16:54:26Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5161#issuecomment-6064841820",
+      "updated_at": "2026-10-08T16:54:26Z",
+      "user": {
+        "login": "SherlockNoMad"
+      }
+    },
+    {
+      "body": "@SherlockNoMad FusedMLA is ~2.6% faster than this PR's region at 16k (45.10 vs 46.34 ms per attention fwd+bwd). Two small changes get the region to 45.48 ms. CUDA graphs don't change the picture: one attention layer at these sizes is GPU-bound.\n\n```text\nDeepSeek-V3 671B attention (one layer), packed 4k-token docs, bf16, fwd+bwd, 1x GB300, 3 fresh processes\n                          T=4k     T=16k    T=16k CUDA graph\neager glue               13.33    52.18    52.26 ms\nmla_qk (this PR)         11.84    46.34    46.42\n+ real-arithmetic RoPE   11.72    45.85    45.96\n+ V as a view of kv      11.62    45.48    45.59\nFusedMLA                 11.49    45.10    45.22\nall bitwise identical to eager, with and without graphs\n```\n\n- **RoPE (0.5 ms):** Inductor can't codegen complex multiply, so `q_pe * freqs_cis` stays an ATen kernel inside the region. Real arithmetic (the `complex_rope` PR, #5196) plus `max_pointwise_cat_inputs=0` (second commit here) fixes it.\n- **V (0.3 ms):** a dense V costs a clone and a slower attention fwd; returning the view from a region makes AOTAutograd copy its grad. An `autograd.Function` around two regions returns the view, like FusedMLA. ~35 lines for ~0.6% of the layer, so not in this PR.\n- **Left (0.4 ms):** mostly FusedMLA rotating `grad_q` in place, which a compiled region can't do.\n- **One or the other:** FusedMLA replaces `Attention.forward` and is opt-in per recipe; without it, every DeepSeek-V3 config gets `mla_qk`.\n\n<details><summary>Repro (eager, mla_qk, FusedMLA rows): <code>PYTHONPATH=. python compare_mla.py 2>/dev/null</code> on this branch, 1 GPU</summary>\n\n```python\n\"\"\"DeepSeek-V3 671B MLA attention, fwd+bwd: eager q/k glue vs the mla_qk region vs FusedMLA,\nwithout and with CUDA graphs.\n\nusage (from the repo root, 1 GPU): PYTHONPATH=. python compare_mla.py 2>/dev/null\n(stderr carries flex attention's autotuning log)\n\"\"\"\n\nimport torch\nfrom torch.nn.attention.flex_attention import and_masks\n\nfrom torchtitan.distributed.local_compile import apply_local_compile\nfrom torchtitan.models.common.attention import (\n    create_attention_mask,\n    get_causal_mask_mod,\n    get_efficient_causal_mask_mod_for_packed_document,\n)\nfrom torchtitan.models.deepseek_v3.flavors import build_model_config\nfrom torchtitan_recipes.overrides.fused_mla import fused_mla\n\nDOC_LEN = 4096  # packed documents of 4k tokens\nattn_config = build_model_config(\"671B\").layers[3].attention\n\n\ndef build(config):\n    torch.manual_seed(0)\n    with torch.device(\"cuda\"):\n        attn = config.build()\n        attn.init_states(buffer_device=torch.device(\"cuda\"))\n    return attn.bfloat16()\n\n\nstock = build(attn_config)\nfused = build(fused_mla(attn_config))\nfused.load_state_dict(stock.state_dict())\n\n\ndef step(attn, x, mask, positions):\n    \"\"\"One fwd+bwd. Grads are overwritten, not accumulated, so a captured step replays exactly.\"\"\"\n    for p in [x, *attn.parameters()]:\n        p.grad = None\n    out = attn(x, mask, positions)\n    out.float().square().mean().backward()\n    return out\n\n\ndef time_ms(fn, iters=10):\n    for _ in range(3):\n        fn()\n    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)\n    start.record()\n    for _ in range(iters):\n        fn()\n    end.record()\n    torch.cuda.synchronize()\n    return start.elapsed_time(end) / iters\n\n\ndef capture(attn, x, mask, positions):\n    \"\"\"Warm up on a side stream, then record one fwd+bwd into a CUDA graph.\"\"\"\n    side = torch.cuda.Stream()\n    side.wait_stream(torch.cuda.current_stream())\n    with torch.cuda.stream(side):\n        for _ in range(3):\n            step(attn, x, mask, positions)\n    torch.cuda.current_stream().wait_stream(side)\n    graph = torch.cuda.CUDAGraph()\n    with torch.cuda.graph(graph):\n        out = step(attn, x, mask, positions)\n    return graph, out\n\n\ndef rel_l2(a, b):\n    return ((a.float() - b.float()).norm() / b.float().norm()).item()\n\n\nfor num_tokens in (4096, 16384):\n    torch._dynamo.reset()  # training runs one T; a second T would recompile flex with a symbolic T\n    positions = torch.arange(num_tokens, device=\"cuda\") % DOC_LEN\n    mask_mod = and_masks(\n        get_causal_mask_mod(), get_efficient_causal_mask_mod_for_packed_document(positions)\n    )\n    mask = create_attention_mask(\n        mask_mod, 1, None, num_tokens, num_tokens, device=\"cuda\", BLOCK_SIZE=128\n    )\n    x = torch.randn(num_tokens, 7168, device=\"cuda\", dtype=torch.bfloat16, requires_grad=True)\n\n    eager_ms, graph_ms, results = {}, {}, {}\n    for name, attn, regions in [\n        (\"eager-glue\", stock, []),\n        (\"mla_qk\", stock, [\"mla_qk\"]),\n        (\"FusedMLA\", fused, []),\n    ]:\n        apply_local_compile(regions)\n        eager_ms[name] = time_ms(lambda: step(attn, x, mask, positions))\n        out = step(attn, x, mask, positions).detach()\n        results[name] = (out, x.grad.clone())\n\n        graph, graph_out = capture(attn, x, mask, positions)\n        graph_ms[name] = time_ms(graph.replay)\n        graph.replay()\n        torch.cuda.synchronize()\n        replay_match = torch.equal(graph_out, out) and torch.equal(x.grad, results[name][1])\n        print(f\"T={num_tokens // 1024}k {name}: replay bitwise equal to eager run: {replay_match}\")\n        del graph, graph_out\n\n    for label, ms in [(\"no graphs\", eager_ms), (\"CUDA graph\", graph_ms)]:\n        row = \" | \".join(f\"{k} {v:.2f} ms\" for k, v in ms.items())\n        print(f\"T={num_tokens // 1024}k {label:10s} {row}\")\n    ref_out, ref_grad = results[\"eager-glue\"]\n    for name in (\"mla_qk\", \"FusedMLA\"):\n        out, grad = results[name]\n        print(f\"       {name} vs eager-glue: out {rel_l2(out, ref_out):.1e}, x.grad {rel_l2(grad, ref_grad):.1e}\")\n```\n</details>\n",
+      "created_at": "2026-10-09T04:45:15Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5161#issuecomment-6074440834",
+      "updated_at": "2026-10-09T06:01:55Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5161,
+  "refs": {
+    "base": {
+      "commit": "e78177360432f7a88fcd2f0249cca2188bb69234",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "c37f1e4f6ed6fc9e1498b1a429453ed71678d6ca",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": []
+}

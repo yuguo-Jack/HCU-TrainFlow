@@ -15,50 +15,57 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: pyproject.toml
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 0341afacb518276f192c2c8a836c32426e80856bf8c5f0ff194c3028c221520d
 - source: pytorch-torchtitan
   path: .ci/docker/requirements.txt
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 2c5535dbc6350c655d158ed14adeb8ceea69853bea625781fe32f77a2d389e1d
 - source: pytorch-torchtitan
   path: .ci/docker/requirements-rl.txt
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 1ab5e0be999db70997ace51b9413fc398e651048f063fdd7ca6c272ef28559d9
 - source: pytorch-torchtitan
   path: run_train.sh
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: f88bd97eff8c7a4b8623dae59ed03a94d80bf7fb9b7941e376f7caddd74863ee
 - source: pytorch-torchtitan
   path: torchtitan/config/loader.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 8e943af9319c881efa76598de21def00662a024a98093d175ccc5dc2bfef48f2
 - source: pytorch-torchtitan
   path: torchtitan/config/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e62e3776a4dd1c2179b3643d9e611f5a6f53fc972ac16de4588ee96a99a06b9b
 - source: pytorch-torchtitan
   path: torchtitan_recipes/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: a72fb9eab9eb7f376a50622327954f614694ed6aea5bb782aae51035e9c9157a
 - source: pytorch-torchtitan
   path: torchtitan_recipes/tests/models/llama3.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: f2e6289611a2da2009bf947a2dbeae60a98432741e0100b19877e483c3c976d6
 - source: pytorch-torchtitan
   path: tests/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 0872f733f18e85e085802fff3813cd1ee359ec1cc10b8d5929642e62d4c4e712
 - source: pytorch-torchtitan
   path: docs/debugging.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 0938badc6722b624d4c07d6e2a620c02fa9cf4bb0e7b26b9d5de77c8b0586b0a
+- source: pytorch-torchtitan
+  path: torchtitan/models/flux/README.md
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: 63090efd1c71ea0b10f0b4ed318959ab7eaf37336276997f712b9aa662175ca6
+- source: pytorch-torchtitan
+  path: torchtitan/rl/README.md
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: d0cced32ef4222b2473689607eadcb749cbb4650e6da9da27df32353842908e6
 pr_sources:
 - pr-pytorch--torchtitan-5277
 - pr-pytorch--torchtitan-5280
 - pr-pytorch--torchtitan-5288
 ---
-
 # TorchTitan 安装、Python 配方、启动与分层测试
 
 ## 1. 先锁提交和环境
@@ -115,17 +122,24 @@ Fake PG 仍需它使用的 GPU 算子和依赖，不是纯 CPU 模拟器。PP �
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/pyproject.toml)
-- [.ci/docker/requirements.txt](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/.ci/docker/requirements.txt)
-- [.ci/docker/requirements-rl.txt](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/.ci/docker/requirements-rl.txt)
-- [run_train.sh](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/run_train.sh)
-- [torchtitan/config/loader.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/loader.py)
-- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/README.md)
-- [torchtitan_recipes/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan_recipes/README.md)
-- [torchtitan_recipes/tests/models/llama3.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan_recipes/tests/models/llama3.py)
-- [tests/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/tests/README.md)
-- [docs/debugging.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/docs/debugging.md)
+- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/pyproject.toml)
+- [.ci/docker/requirements.txt](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/.ci/docker/requirements.txt)
+- [.ci/docker/requirements-rl.txt](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/.ci/docker/requirements-rl.txt)
+- [run_train.sh](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/run_train.sh)
+- [torchtitan/config/loader.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/loader.py)
+- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/README.md)
+- [torchtitan_recipes/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan_recipes/README.md)
+- [torchtitan_recipes/tests/models/llama3.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan_recipes/tests/models/llama3.py)
+- [tests/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/tests/README.md)
+- [docs/debugging.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/docs/debugging.md)
 
 - [PR #5277：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5277.md)
 - [PR #5280：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5280.md)
 - [PR #5288：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5288.md)
+
+## 当前文档命令修正
+
+主线 [PR #5311](https://github.com/pytorch/torchtitan/pull/5311) 修复不可解析的示例命令。FLUX 依赖文件为 `.ci/docker/requirements-flux.txt`；RL 的输出目录用 `--output-dir`，资产路径先核对 Python recipe 的赋值与 train.py 接受的参数。知识库的运行示例也须跟源码参数解析一致，不能因旧 README 有某个 flag 就强行传入。旧版本回放仍使用其自己的配置和接口。
+
+- [torchtitan/models/flux/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/flux/README.md)
+- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/README.md)

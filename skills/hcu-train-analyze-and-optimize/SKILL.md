@@ -62,7 +62,7 @@ TraceLens 使用 thirdparty 清单锁定的 HCU fork，保留上游完整模块�
 
 TE 精度、权重缓存、attention backend、userbuffers 和融合查 `knowledge/official-transformer-engine-wiki/`；cuDNN graph/plan、SDPA fwd/bwd、open-kernel 融合和 host 缓存查 `knowledge/official-cudnn-frontend-wiki/`。先读 Wiki 再定位目标版本源码与教程，保留 NV/HCU 实现边界和实际 dispatch 证据。
 
-AMD Primus、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 与官方开发分支都是一级机制参考。先比较补丁基线/gitlink、触发条件、测试和回退；官方能力真正进入当前 HCU 分支且回归等价后再退役旧 patch。
+按项目 [优化参考选择表](../../docs/optimization-reference-map.md)联查 Megatron、TorchTitan、DeepSpeed、Primus、MindSpeed/MindSpeed-LLM、LoongForge 与相关 SFT/RL/推理依赖，不按厂商或引擎名称固定排序；各入口都可追官方教程、PR 和源码。先比较补丁基线/gitlink、触发条件、测试和回退；官方能力真正进入当前 HCU 分支且回归等价后再退役旧 patch。
 
 ## 可并行的分析与实施
 

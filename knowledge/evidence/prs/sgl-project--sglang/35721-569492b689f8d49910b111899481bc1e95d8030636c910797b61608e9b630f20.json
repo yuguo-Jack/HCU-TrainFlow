@@ -1,0 +1,358 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "e4b423256ef1df8b7e9a44536759a89522a869a2",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nGeneration health checks (`HEALTH_CHECK_*`) are intentionally skipped by the scheduler while normal inference is already making progress. Under DP serving, however, the request passes through `DataParallelController` before that scheduler-side skip.\n\nWith `round_robin`, a generation health request can advance the same dispatch state used by user requests. For load-aware methods, it can also participate in the user load-budget refresh/update path. A health request that is later discarded can therefore still perturb user-request ownership across DP ranks.\n\nThe canonical runtime evidence now localizes the failure chain as:\n\n```text\ngeneration health request\n  -> shared user LB state is mutated\n  -> user dispatch across DP ranks becomes skewed\n  -> per-rank effective batch diverges / running work inventory drops\n  -> Input TPS collapses and TTFT tail inflates\n```\n\nDP Attention, long chunked prefill, and PrefillDelayer expose or amplify the resulting ownership skew; they are not the source of the health request mutating DPC routing state.\n\nThe root-cause investigation is tracked in #35241.\n\n## Modifications\n\nThis PR isolates generation-health dispatch state from user load-balancing state in `DataParallelController`:\n\n- Detect generation health requests before normal user LB dispatch.\n- Use an independent round-robin counter for health requests.\n- Do not refresh or mutate the user `DPBudget` for health-only dispatches.\n- For batch generate, refresh the user load budget only when the batch contains a user request.\n- Preserve explicit `routed_dp_rank` behavior.\n- Preserve `FOLLOW_BOOTSTRAP_ROOM` semantics for PD/disaggregated serving, since that path uses request-specific routing rather than shared mutable user LB state.\n\nThis PR does **not** change DP Attention, PrefillDelayer, scheduler busy-health skip behavior, or the health endpoint semantics.\n\n## Regression Tests\n\nAdded CPU unit coverage for:\n\n- independent user-RR and health-RR state;\n- health dispatch using only active workers;\n- explicit `routed_dp_rank` not advancing health RR state;\n- health dispatch bypassing user load-budget refresh;\n- health-only batch dispatch not refreshing user load state;\n- `FOLLOW_BOOTSTRAP_ROOM` health routing compatibility.\n\n```text\npython3 -m pytest test/registered/unit/managers/test_data_parallel_controller.py -q\n30 passed\n\ngit diff --check\nclean\n\npre-commit run --files \\\n  python/sglang/srt/managers/data_parallel_controller.py \\\n  test/registered/unit/managers/test_data_parallel_controller.py\nall passed\n```\n\n### Current-main verification (2026-10-10)\n\nRebased onto `main` at `16423cb6d2f9ab365f4361cce3572b38890aaf68`, preserving the current load-budget refresh throttle and adapting the test helpers to `num_dp_ranks`. The PR remains scoped to the same two files.\n\nThe targeted CPU test file passes **30 tests** on this rebased tree. Targeted pre-commit checks and `git diff --check` also pass. The B300 runtime evidence below was collected previously on the documented release configurations; GPU performance was not re-measured during this rebase.\n\n## Runtime Validation\n\nValidated on 8x NVIDIA B300 with DeepSeek-V4-Pro, TP8/DP8, DP Attention, MegaMoE, PrefillDelayer, round-robin routing, 8k effective prefill chunk, C16/N160, 60k input / 1 output.\n\nThe canonical 2x2 campaign used fresh servers per round and held the workload/configuration fixed while varying only `(DPC patch, generation health)`:\n\n| Configuration | Result | Input TPS | HEALTH@DPC | user dispatch std | per-rank BS |\n|---|---|---:|---:|---:|---|\n| Original + generation health ON | 2/8 LOW | LOW: 68,403 / 82,883 | 48-61 | LOW: 1.12 / 0.71 | LOW rounds diverged |\n| Original + generation health OFF | 4/4 GOOD | 94,783-94,847 | 0 | 0.00 | uniform |\n| Patched + generation health ON | 4/4 GOOD | 94,558-94,699 | 49-50 | 0.00 | uniform |\n| Patched + generation health OFF | 4/4 GOOD | 94,850-94,934 | 0 | 0.00 | uniform |\n\nThree canonical rounds make the mechanism especially clear:\n\n```text\nOriginal + HEALTH ON, LOW:\n  TPS=68,403, HEALTH@DPC=61, user dispatch=29.0+-1.12,\n  per-rank BS mean=3.71..7.12\n\nOriginal + HEALTH OFF, GOOD:\n  TPS=94,847, HEALTH@DPC=0, user dispatch=29.0+-0.00,\n  per-rank BS mean=10.0 x 8\n\nPatched + HEALTH ON, GOOD:\n  TPS=94,583, HEALTH@DPC=50, user dispatch=29.0+-0.00,\n  per-rank BS mean=10.0 x 8\n```\n\nThe important invariant is that generation-health traffic remains present at DPC after the patch, but it no longer perturbs user routing state.\n\n### Runtime reproduction\n\nThe validation matrix keeps the server/client workload fixed and varies only generation-health state and whether this DPC patch is applied. The relevant runtime knobs are:\n\n```bash\n# server-side topology / scheduler configuration\n--tp 8 \\\n--dp 8 \\\n--enable-dp-attention \\\n--enable-prefill-delayer \\\n--moe-a2a-backend megamoe \\\n--chunked-prefill-size 65536 \\\n--load-balance-method round_robin\n\n# generation-health control\nSGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1  # HEALTH ON\nSGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0  # HEALTH OFF\n```\n\nWorkload shape:\n\n```text\ninput length    = 60000\noutput length   = 1\nmax concurrency = 16\nnum prompts     = 160\nseed            = 1\n```\n\nWith DP Attention, `--chunked-prefill-size 65536` corresponds to an 8k effective chunk per DP rank. Each arm is run from a fresh server process; external `/health` polling remains enabled in all arms so `HEALTH OFF` isolates generation-health request creation rather than HTTP polling overhead.\n\nThe exact benchmark wrapper used for these B300 runs is environment-specific, so the PR records the model-independent server knobs, workload shape, and controlled variables needed to reproduce the failure family rather than claiming a portable one-command benchmark across environments.\n\n### Signal interpretation\n\nThe expanded evidence also corrected two earlier intermediate-mechanism assumptions:\n\n- `IDLE-while-EXTEND` was **0 across all 27 analyzed rounds**, including severe LOW cases, so it is not used as a required link in the canonical causal chain.\n- `wait_timeout > 0` is **not** a LOW-state discriminator: patched HEALTH-ON runs remained GOOD with 12-24 timeouts. PrefillDelayer `mixed` / timeout activity is treated as downstream scheduler activity or an amplifier, not the root trigger.\n- `fill%` and queue depth also overlap between GOOD and LOW rounds and are not state discriminators.\n\nAll canonical runs completed 160/160 requests with no fatal errors. The patch removes the user-ownership skew while preserving generation-health dispatch.\n\nThis is a scoped validation for the tested failure family; it is not intended to claim that generation health is the cause of every low-throughput state.\n\nA separate 16k-effective-chunk follow-up with generation health ON also completed 4/4 GOOD after patching, supporting the same invariant across both tested chunk configurations.\n\n## Limitations\n\n- Runtime validation is scoped to the tested DeepSeek-V4-Pro, 8x B300, TP8/DP8 DP-Attention serving configuration; it does not establish the incidence rate of this failure across all models, hardware, or DP topologies.\n- The controlled experiments establish that generation-health traffic mutating shared DPC user-routing state is causal for this reproduced failure family. Downstream scheduler symptoms such as PrefillDelayer timeouts, queue depth, or aggregate request-count skew are not individually necessary or sufficient failure indicators.\n- The patch intentionally isolates routing state rather than redesigning the configured user load-balancing policy. Policy-specific performance differences remain outside the scope of this fix.\n\n## Scope\n\nThe intended invariant is:\n\n> Generation health traffic must not mutate the load-balancing state used by user requests when it is routed through DP serving.\n\nThis PR does not make round-robin load-aware and does not change the configured load-balancing policy.\n\nRelated: #35241\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #38103975233](https://github.com/sgl-project/sglang/actions/runs/38103975233)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38103975098](https://github.com/sgl-project/sglang/actions/runs/38103975098)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38103975231](https://github.com/sgl-project/sglang/actions/runs/38103975231)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "@Ying1123  @hnyls2002  @merrymercy  @xiezhq-hermann \r\nHi maintainers – this PR is currently merge-blocked and waiting for a code owner review.\r\nWe've validated it with multiple fresh-server rounds under both 8k and 16k chunk configs; the fix consistently eliminates the performance regression caused by health-check traffic polluting the user routing state. The change is minimal, scoped only to data_parallel_controller.py, and all CPU unit tests pass.\r\nWould appreciate a review when you have a moment – happy to address any feedback. Thanks!",
+            "createdAt": "2026-08-21T04:14:22Z",
+            "updatedAt": "2026-08-21T04:14:22Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5365114488"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "## Source-history check and extended runtime validation\n\nI traced the bug back through the endpoint and dispatch history. This supports fixing the problem at the DPC dispatch boundary, rather than changing PrefillDelayer.\n\n### Historical source\n\n- Before [#8444](https://github.com/sgl-project/sglang/pull/8444), `GET /health` returned 200 without entering inference; only `/health_generate` created a `HEALTH_CHECK_*` request.\n- [#8444](https://github.com/sgl-project/sglang/pull/8444) (commit [6f9baf1](https://github.com/sgl-project/sglang/commit/6f9baf100298636174188d845ee6d6493b29ca0c), 2025-08-03) merged the routes, so ordinary `/health` polling began creating generation requests.\n- At that revision, every `TokenizedGenerateReqInput` was first dispatched through the configured `DataParallelController` load balancer. The health-specific busy skip happened later in `Scheduler.process_input_requests()`.\n- Thus “ignored while busy” meant no model execution, but did **not** mean no mutation of user load-balancing state.\n- [#13320](https://github.com/sgl-project/sglang/pull/13320) later added `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` with default `True`; [#13961](https://github.com/sgl-project/sglang/pull/13961) fixed its lookup but did not isolate dispatch state.\n\nThis history identifies the bug as an interaction between two individually reasonable behaviors:\n\n```text\ngeneration-based health semantics\n+\nnormal DPC routing before the scheduler-side health skip\n```\n\nDP Attention, long chunked prefill, and PrefillDelayer expose/amplify the resulting ownership skew; they are not the source of the health request mutating RR state.\n\n### Release-status correction\n\n[v0.5.14](https://github.com/sgl-project/sglang/releases/tag/v0.5.14) (2026-06-26, `49e384ce...`) and [v0.5.17](https://github.com/sgl-project/sglang/releases/tag/v0.5.17) (2026-08-08, `29481685...`) both retain the harmful ordering.\n\nThis PR was opened on 2026-08-20 and is currently unmerged, so it was **not included in v0.5.17**. All v0.5.17 runtime numbers below mean v0.5.17 plus this patch applied locally.\n\n### 16k effective-chunk follow-up\n\nGeneration health remained ON for all runs:\n\n| Run | Input TPS | avgRun | fill | HEALTH@DPC | Success | Fatal |\n|---|---:|---:|---:|---:|---:|---:|\n| r1 | 92,568.7 | 8.28 | 91.02% | 43 | 160/160 | 0 |\n| r2 | 95,146.5 | 8.45 | 92.10% | 40 | 160/160 | 0 |\n| r3 | 95,010.5 | 8.50 | 93.35% | 39 | 160/160 | 0 |\n| r4 | 94,928.6 | 8.24 | 89.95% | 36 | 160/160 | 0 |\n\nEnvironment: 8x B300, DeepSeek-V4-Pro, TP8/DP8, DP Attention, MegaMoE, PrefillDelayer, effective 16k chunk, C16/N160, 60k input / 1 output, seed=1.\n\nAll four rounds were GOOD; mean Input TPS was **94,413.6**. The nonzero `HEALTH@DPC` counts are important: the patch preserves generation-health traffic and removes only its mutation of user routing state.\n\nTogether with the existing patched 8k 4/4 validation, this shows that the invariant holds across both tested chunk configurations:\n\n> Health requests may still be dispatched and answered, but they do not advance or refresh the load-balancing state used by user requests.",
+            "createdAt": "2026-08-21T04:37:04Z",
+            "updatedAt": "2026-08-21T04:37:04Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5365253701"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "@Ying1123 @merrymercy @xiezhq-hermann @hnyls2002\n\nI checked the current CI gate configuration:\n\n- Base and AMD ROCm 7.2 use the default gate and require `run-ci`.\n- Extra explicitly requires both `run-ci` and `run-ci-extra`.\n- The current failures all stop at `call-gate / pr-gate`; no actual test matrix ran.\n- These gate-only failures do not count as consumed CI runs for the cooldown check.\n\nCould an authorized maintainer please run:\n\n`/tag-and-rerun-ci extra`\n\nThis adds both required labels and reruns the failed/skipped workflows for the current commit.\n\nValidation already completed: 23/23 targeted CPU unit tests, pre-commit, and `git diff --check` passed; 8×B300 runtime validation passed 4/4 at both effective 8k and 16k prefill chunks, with 160/160 successful requests per run and no ownership holes, PrefillDelayer timeouts, or fatal errors.",
+            "createdAt": "2026-08-24T03:27:10Z",
+            "updatedAt": "2026-08-24T03:27:10Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5390359896"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "Additional validation note: I also verified the same health-routing isolation semantics against both the v0.5.14 and v0.5.17 `DataParallelController` source shapes. The release backport preserves the same invariant as this PR: generation-health requests use separate routing state, do not refresh user `DPBudget`, explicit `routed_dp_rank` remains authoritative, and `FOLLOW_BOOTSTRAP_ROOM` keeps its existing PD/disaggregation routing contract. The v0.5.17 path also follows the existing active-worker/bounded-routing behavior. This was kept as downstream release-backport validation rather than adding image-build-specific patching logic to the upstream PR.",
+            "createdAt": "2026-08-25T06:40:09Z",
+            "updatedAt": "2026-08-25T06:40:09Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5406537082"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "## Additional 2×2 runtime validation: generation ON/OFF × patched/unpatched\n\nI completed a same-image v0.5.17 2×2 follow-up to isolate the generation-health trigger from the DPC fix. External `/health` polling remained active in every arm.\n\nEnvironment: 8×B300, DeepSeek-V4-Pro, TP8/DP8, DP Attention, MegaMoE, PrefillDelayer, effective 8k chunk, C16/N160, 60k input / 1 output, seed=1.\n\n| DPC | health generation | HEALTH@DPC | Result |\n|---|---:|---:|---|\n| unpatched | ON | 48–61/run | 1 severe LOW + 1 mild degraded + 6 GOOD |\n| unpatched | OFF | 0 | 4/4 GOOD, 94.78–94.85k TPS |\n| patched | ON | 49–50/run | 4/4 GOOD, 94.56–94.70k TPS |\n| patched | OFF | 0 | 4/4 GOOD, 94.85–94.93k TPS |\n\nThe severe unpatched+ON hit reached 68,403 Input TPS, avgRun 5.07 and p99 TTFT 32.1s. Its active-segment global scheduler running-request BS p50 fell to 48 (healthy runs typically 72–80), and user dispatch across the 8 DP ranks became uneven (`[30,30,28,31,28,29,28,28]`, std 1.12).\n\nThe important control is patched+ON: generation-health traffic was still present at DPC (~50 requests/run), but all four runs stayed GOOD and user dispatch stayed balanced. This directly supports the PR invariant that the fix isolates mutable health dispatch state from user load-balancing state rather than disabling health generation.\n\nOne refinement from this follow-up: PrefillDelayer timeout counters alone are not a sufficient failure discriminator; patched+ON runs can remain healthy while timeout events are still observed. The severe failure signature is better characterized by user-dispatch skew together with scheduler running-request/avgRun collapse and TPS/tail-latency degradation.\n\nSo the runtime interaction is now:\n\n```text\ngeneration health + unpatched shared DPC state -> probabilistic LOW\ngeneration health + isolated DPC state          -> stable GOOD\n```\n\nThis complements the existing 8k/16k patched validation with a controlled trigger-isolation experiment.",
+            "createdAt": "2026-08-26T07:34:56Z",
+            "updatedAt": "2026-08-26T07:34:56Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5422097740"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "## Canonical evidence update / correction\n\nI updated the PR body to reflect the completed 2x2 evidence campaign and to tighten the causal chain around the DPC routing-state invariant.\n\nOne correction to my earlier CI/review comment: I previously summarized the patched runs as having no PrefillDelayer timeouts. The canonical data shows patched HEALTH-ON GOOD runs did record `wait_timeout=12-24`. Those timeouts did **not** correlate with LOW state, so `wait_timeout > 0` is not used as a failure discriminator.\n\nLikewise, `IDLE-while-EXTEND` was 0 across all 27 analyzed rounds, including severe LOW cases. The canonical runtime chain is therefore now stated as:\n\n```text\ngeneration health\n  -> shared user LB state mutated\n  -> DPC user-dispatch skew\n  -> per-rank effective-batch divergence / reduced running work\n  -> TPS collapse + TTFT-tail inflation\n```\n\nThe key isolation result remains unchanged and is now supported more directly: patched HEALTH-ON keeps `HEALTH@DPC` nonzero (49-50) while restoring user dispatch to exact balance (`29.0+-0.00`) and keeping all four runs GOOD.",
+            "createdAt": "2026-09-01T04:03:28Z",
+            "updatedAt": "2026-09-01T04:03:28Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5488711907"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "## Closed-loop benchmark interpretation\n\nA small clarification on the runtime signals: the validation workload is fixed-concurrency **closed-loop**, so client refill is driven by request completion rather than by an independent offered QPS.\n\nIn the post-fix 60k/1 concurrency sweep, raw `perf.json` request throughput reaches ~1.57 req/s at C16 and stays essentially flat through C24/C32/C64, while median TTFT grows roughly with concurrency. This identifies C16 as the closed-loop saturation knee.\n\nThat benchmark model also explains why `avg_queue_req` does not need to spike in the pathological LOW state. When the routing bug lowers service capacity (~1.58 -> ~1.14 req/s in the canonical comparison), the client refill rate falls with completions, providing backpressure. Queue depth can therefore remain similar even while running width collapses and TTFT tail worsens.\n\nThis is only a signal-interpretation note; it does not change the PR's causal claim. The direct mechanism remains:\n\n```text\ngeneration health\n  -> shared DPC user LB state mutation\n  -> user dispatch skew\n  -> per-rank running-batch divergence / work-supply loss\n  -> TPS and TTFT degradation\n```\n\nThe ~1.57 req/s saturation value is not a production SLO-capacity claim; that would require a separate fixed-rate/open-loop QPS sweep.",
+            "createdAt": "2026-09-01T07:04:19Z",
+            "updatedAt": "2026-09-01T07:04:19Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5490195856"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "## Follow-up: `total_requests` does not replace health/user LB-state isolation\n\nI ran a new control to test whether switching away from round-robin is sufficient to avoid the LOW state without this patch.\n\nEnvironment was held fixed: v0.5.17 unpatched, generation health ON, TP8/DP8, DP Attention, DP LM Head, MegaMoE, PrefillDelayer, effective 8k/rank chunk, C16/N160, 60k input / 1 output. The only policy change was:\n\n```text\n--load-balance-method total_requests\n```\n\nResults:\n\n| Run | Input TPS | median TTFT | p99 TTFT | HEALTH@DPC | Result |\n|---|---:|---:|---:|---:|---|\n| r01 | 94,511.6 | 10.30 s | 11.21 s | 52 | GOOD |\n| r02 | 90,597.0 | 10.42 s | 14.43 s | 55 | LOW |\n| r03 | 90,713.8 | 10.38 s | 14.44 s | 50 | LOW |\n| r04 | 88,454.8 | 9.59 s | 18.07 s | 54 | LOW |\n\nSo this arm was only **1/4 GOOD**, with mean Input TPS **91.07k**. All 640/640 requests completed and there were no server fatals.\n\nThe useful part is that coarse request-count balance was often already good. For example, rank-local admission reconstruction for r02 was:\n\n```text\n[55, 55, 54, 54, 54, 54, 53, 53]  (432/432 observed)\n```\n\nwhile the run was still LOW at 90.6k TPS. r04 was similarly close to even at `[55, 53, 53, 55, 54, 55, 53, 53]` (431/432 observed) but was the slowest run at 88.5k TPS.\n\nThis refines the downstream mechanism: persistent **aggregate request-count skew is not required**. A better description is:\n\n```text\ngeneration health\n  -> mutates shared user LB state / dispatch dynamics\n  -> perturbs rank-local arrival/refill timing and work supply\n  -> per-rank effective running/batch formation diverges\n  -> TPS drops and TTFT tail inflates\n```\n\n`total_requests` can reduce coarse ownership imbalance, but in the unpatched path health requests still participate in the same user load-budget refresh/update machinery. It therefore acts, at best, as an unstable partial mitigation; it does not restore the invariant that health traffic must not mutate user-routing state.\n\nOne instrumentation caveat: the current DPC trace does not expose `selected_dp_rank` for the `total_requests` path, so the ownership vectors above are reconstructed from rank-local admission traces rather than direct DPC selected-rank counters. r02 is the cleanest example because all 432 observed user admissions were reconstructed.\n\nI will treat a future patched + `total_requests` run only as a load-balancing policy/performance comparison; the correctness requirement addressed by this PR remains independent of the selected user LB policy.",
+            "createdAt": "2026-09-02T09:24:49Z",
+            "updatedAt": "2026-09-02T09:24:49Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5507388653"
+          },
+          {
+            "author": {
+              "login": "xiezhq-hermann"
+            },
+            "body": "@alphabetc1 can you help take a look, seems related to a line of work you have done about idleness check",
+            "createdAt": "2026-09-22T01:06:12Z",
+            "updatedAt": "2026-09-22T01:06:12Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5769786448"
+          },
+          {
+            "author": {
+              "login": "alphabetc1"
+            },
+            "body": "/tag-and-rerun-ci",
+            "createdAt": "2026-10-10T08:43:41Z",
+            "updatedAt": "2026-10-10T08:43:41Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-6095791141"
+          },
+          {
+            "author": {
+              "login": "Phoenix3334"
+            },
+            "body": "Thanks @alphabetc1! Simplified the tests in 902559f (8 → 6, 28 fewer lines), retaining the key regression coverage. Could you take another look and help rerun CI if needed?",
+            "createdAt": "2026-10-10T15:51:06Z",
+            "updatedAt": "2026-10-10T15:51:06Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-6099333123"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWuMcAM=",
+          "hasNextPage": false
+        },
+        "totalCount": 11
+      },
+      "headRefOid": "bf0783a37a8fe2128c6c613b253093970815bf3c",
+      "headRepository": {
+        "nameWithOwner": "Phoenix3334/sglang"
+      },
+      "merged": true,
+      "number": 35721,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "alphabetc1"
+            },
+            "body": "Overall lgtm\nnon-blocking: can we simplify the test? I think there are too many lines of test code, and a lot of them are unnecessary.\n\n",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-10-10T09:51:28Z",
+            "url": "https://github.com/sgl-project/sglang/pull/35721#pullrequestreview-5478523118"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMFQwOTo1MToyOFq0MjAyNi0xMC0xMFQwOTo1MToyOFrPAAAAAUaLoO4=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "MERGED",
+      "title": "[BugFix][DP] Prevent health checks from perturbing user request routing",
+      "updatedAt": "2026-10-12T09:41:26Z",
+      "url": "https://github.com/sgl-project/sglang/pull/35721"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "e4b423256ef1df8b7e9a44536759a89522a869a2"
+    },
+    "body": "## Motivation\n\nGeneration health checks (`HEALTH_CHECK_*`) are intentionally skipped by the scheduler while normal inference is already making progress. Under DP serving, however, the request passes through `DataParallelController` before that scheduler-side skip.\n\nWith `round_robin`, a generation health request can advance the same dispatch state used by user requests. For load-aware methods, it can also participate in the user load-budget refresh/update path. A health request that is later discarded can therefore still perturb user-request ownership across DP ranks.\n\nThe canonical runtime evidence now localizes the failure chain as:\n\n```text\ngeneration health request\n  -> shared user LB state is mutated\n  -> user dispatch across DP ranks becomes skewed\n  -> per-rank effective batch diverges / running work inventory drops\n  -> Input TPS collapses and TTFT tail inflates\n```\n\nDP Attention, long chunked prefill, and PrefillDelayer expose or amplify the resulting ownership skew; they are not the source of the health request mutating DPC routing state.\n\nThe root-cause investigation is tracked in #35241.\n\n## Modifications\n\nThis PR isolates generation-health dispatch state from user load-balancing state in `DataParallelController`:\n\n- Detect generation health requests before normal user LB dispatch.\n- Use an independent round-robin counter for health requests.\n- Do not refresh or mutate the user `DPBudget` for health-only dispatches.\n- For batch generate, refresh the user load budget only when the batch contains a user request.\n- Preserve explicit `routed_dp_rank` behavior.\n- Preserve `FOLLOW_BOOTSTRAP_ROOM` semantics for PD/disaggregated serving, since that path uses request-specific routing rather than shared mutable user LB state.\n\nThis PR does **not** change DP Attention, PrefillDelayer, scheduler busy-health skip behavior, or the health endpoint semantics.\n\n## Regression Tests\n\nAdded CPU unit coverage for:\n\n- independent user-RR and health-RR state;\n- health dispatch using only active workers;\n- explicit `routed_dp_rank` not advancing health RR state;\n- health dispatch bypassing user load-budget refresh;\n- health-only batch dispatch not refreshing user load state;\n- `FOLLOW_BOOTSTRAP_ROOM` health routing compatibility.\n\n```text\npython3 -m pytest test/registered/unit/managers/test_data_parallel_controller.py -q\n30 passed\n\ngit diff --check\nclean\n\npre-commit run --files \\\n  python/sglang/srt/managers/data_parallel_controller.py \\\n  test/registered/unit/managers/test_data_parallel_controller.py\nall passed\n```\n\n### Current-main verification (2026-10-10)\n\nRebased onto `main` at `16423cb6d2f9ab365f4361cce3572b38890aaf68`, preserving the current load-budget refresh throttle and adapting the test helpers to `num_dp_ranks`. The PR remains scoped to the same two files.\n\nThe targeted CPU test file passes **30 tests** on this rebased tree. Targeted pre-commit checks and `git diff --check` also pass. The B300 runtime evidence below was collected previously on the documented release configurations; GPU performance was not re-measured during this rebase.\n\n## Runtime Validation\n\nValidated on 8x NVIDIA B300 with DeepSeek-V4-Pro, TP8/DP8, DP Attention, MegaMoE, PrefillDelayer, round-robin routing, 8k effective prefill chunk, C16/N160, 60k input / 1 output.\n\nThe canonical 2x2 campaign used fresh servers per round and held the workload/configuration fixed while varying only `(DPC patch, generation health)`:\n\n| Configuration | Result | Input TPS | HEALTH@DPC | user dispatch std | per-rank BS |\n|---|---|---:|---:|---:|---|\n| Original + generation health ON | 2/8 LOW | LOW: 68,403 / 82,883 | 48-61 | LOW: 1.12 / 0.71 | LOW rounds diverged |\n| Original + generation health OFF | 4/4 GOOD | 94,783-94,847 | 0 | 0.00 | uniform |\n| Patched + generation health ON | 4/4 GOOD | 94,558-94,699 | 49-50 | 0.00 | uniform |\n| Patched + generation health OFF | 4/4 GOOD | 94,850-94,934 | 0 | 0.00 | uniform |\n\nThree canonical rounds make the mechanism especially clear:\n\n```text\nOriginal + HEALTH ON, LOW:\n  TPS=68,403, HEALTH@DPC=61, user dispatch=29.0+-1.12,\n  per-rank BS mean=3.71..7.12\n\nOriginal + HEALTH OFF, GOOD:\n  TPS=94,847, HEALTH@DPC=0, user dispatch=29.0+-0.00,\n  per-rank BS mean=10.0 x 8\n\nPatched + HEALTH ON, GOOD:\n  TPS=94,583, HEALTH@DPC=50, user dispatch=29.0+-0.00,\n  per-rank BS mean=10.0 x 8\n```\n\nThe important invariant is that generation-health traffic remains present at DPC after the patch, but it no longer perturbs user routing state.\n\n### Runtime reproduction\n\nThe validation matrix keeps the server/client workload fixed and varies only generation-health state and whether this DPC patch is applied. The relevant runtime knobs are:\n\n```bash\n# server-side topology / scheduler configuration\n--tp 8 \\\n--dp 8 \\\n--enable-dp-attention \\\n--enable-prefill-delayer \\\n--moe-a2a-backend megamoe \\\n--chunked-prefill-size 65536 \\\n--load-balance-method round_robin\n\n# generation-health control\nSGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1  # HEALTH ON\nSGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0  # HEALTH OFF\n```\n\nWorkload shape:\n\n```text\ninput length    = 60000\noutput length   = 1\nmax concurrency = 16\nnum prompts     = 160\nseed            = 1\n```\n\nWith DP Attention, `--chunked-prefill-size 65536` corresponds to an 8k effective chunk per DP rank. Each arm is run from a fresh server process; external `/health` polling remains enabled in all arms so `HEALTH OFF` isolates generation-health request creation rather than HTTP polling overhead.\n\nThe exact benchmark wrapper used for these B300 runs is environment-specific, so the PR records the model-independent server knobs, workload shape, and controlled variables needed to reproduce the failure family rather than claiming a portable one-command benchmark across environments.\n\n### Signal interpretation\n\nThe expanded evidence also corrected two earlier intermediate-mechanism assumptions:\n\n- `IDLE-while-EXTEND` was **0 across all 27 analyzed rounds**, including severe LOW cases, so it is not used as a required link in the canonical causal chain.\n- `wait_timeout > 0` is **not** a LOW-state discriminator: patched HEALTH-ON runs remained GOOD with 12-24 timeouts. PrefillDelayer `mixed` / timeout activity is treated as downstream scheduler activity or an amplifier, not the root trigger.\n- `fill%` and queue depth also overlap between GOOD and LOW rounds and are not state discriminators.\n\nAll canonical runs completed 160/160 requests with no fatal errors. The patch removes the user-ownership skew while preserving generation-health dispatch.\n\nThis is a scoped validation for the tested failure family; it is not intended to claim that generation health is the cause of every low-throughput state.\n\nA separate 16k-effective-chunk follow-up with generation health ON also completed 4/4 GOOD after patching, supporting the same invariant across both tested chunk configurations.\n\n## Limitations\n\n- Runtime validation is scoped to the tested DeepSeek-V4-Pro, 8x B300, TP8/DP8 DP-Attention serving configuration; it does not establish the incidence rate of this failure across all models, hardware, or DP topologies.\n- The controlled experiments establish that generation-health traffic mutating shared DPC user-routing state is causal for this reproduced failure family. Downstream scheduler symptoms such as PrefillDelayer timeouts, queue depth, or aggregate request-count skew are not individually necessary or sufficient failure indicators.\n- The patch intentionally isolates routing state rather than redesigning the configured user load-balancing policy. Policy-specific performance differences remain outside the scope of this fix.\n\n## Scope\n\nThe intended invariant is:\n\n> Generation health traffic must not mutate the load-balancing state used by user requests when it is routed through DP serving.\n\nThis PR does not make round-robin load-aware and does not change the configured load-balancing policy.\n\nRelated: #35241\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #38103975233](https://github.com/sgl-project/sglang/actions/runs/38103975233)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38103975098](https://github.com/sgl-project/sglang/actions/runs/38103975098)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38103975231](https://github.com/sgl-project/sglang/actions/runs/38103975231)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "Phoenix3334/sglang"
+      },
+      "sha": "bf0783a37a8fe2128c6c613b253093970815bf3c"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/35721",
+    "merged": true,
+    "number": 35721,
+    "state": "closed",
+    "title": "[BugFix][DP] Prevent health checks from perturbing user request routing",
+    "updated_at": "2026-10-12T09:41:26Z"
+  },
+  "files": [
+    {
+      "additions": 36,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/bf0783a37a8fe2128c6c613b253093970815bf3c/python%2Fsglang%2Fsrt%2Fmanagers%2Fdata_parallel_controller.py",
+      "changes": 39,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fdata_parallel_controller.py?ref=bf0783a37a8fe2128c6c613b253093970815bf3c",
+      "deletions": 3,
+      "filename": "python/sglang/srt/managers/data_parallel_controller.py",
+      "patch": "@@ -46,6 +46,7 @@\n from sglang.srt.managers.load_snapshot import create_load_snapshot_reader\n from sglang.srt.managers.schedule_batch import Req\n from sglang.srt.managers.scheduler import run_scheduler_process\n+from sglang.srt.managers.utils import is_health_check_generate_req\n from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread\n from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats\n from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times\n@@ -169,6 +170,7 @@ def __init__(\n \n         # Dispatch method\n         self.round_robin_counter = 0\n+        self.health_round_robin_counter = 0\n         dispatch_lookup = {\n             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,\n             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,\n@@ -332,7 +334,12 @@ def refresh_load_budget(self):\n         self.dp_budget.update_budget(self.load_snapshot_reader.read_all())\n \n     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):\n-        if refresh_load_budget and self.refresh_load_budget_on_dispatch:\n+        is_health_check = is_health_check_generate_req(req)\n+        if (\n+            not is_health_check\n+            and refresh_load_budget\n+            and self.refresh_load_budget_on_dispatch\n+        ):\n             self.refresh_load_budget()\n \n         time_stats = DPControllerReqTimeStats.new_from_obj(\n@@ -341,12 +348,18 @@ def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):\n \n         time_stats.set_dp_dispatch_time()\n         req.time_stats = wrap_as_pickle(time_stats)\n-        self.dispatching(req)\n+        if is_health_check:\n+            self.dispatch_health_check(req)\n+        else:\n+            self.dispatching(req)\n         req.time_stats = time_stats\n         req.time_stats.set_dp_dispatch_finish_time()\n \n     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):\n-        if self.refresh_load_budget_on_dispatch:\n+        has_user_request = any(\n+            not is_health_check_generate_req(req) for req in batch_req\n+        )\n+        if has_user_request and self.refresh_load_budget_on_dispatch:\n             self.refresh_load_budget()\n         for req in batch_req:\n             self.dispatching_with_trace(req, refresh_load_budget=False)\n@@ -751,6 +764,26 @@ def launch_tensor_parallel_group(\n             info.get(\"startup_time\") for info in scheduler_info\n         )\n \n+    def dispatch_health_check(self, req: Req) -> None:\n+        # This policy routes by request metadata, not shared load-balancing state.\n+        if self.load_balance_method == LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM:\n+            self.follow_bootstrap_room_scheduler(req)\n+            return\n+\n+        if self.maybe_external_dp_rank_routing(req):\n+            return\n+\n+        active = self._active_workers\n+        if not active:\n+            raise RuntimeError(\"No active DP workers are available for health checks.\")\n+\n+        slot = active[self.health_round_robin_counter % len(active)]\n+        self.health_round_robin_counter = (self.health_round_robin_counter + 1) % len(\n+            active\n+        )\n+        logger.debug(f\"Choose worker {slot} for health check\")\n+        sock_send(self.workers[slot], req)\n+\n     def maybe_external_dp_rank_routing(self, req: Req):\n         if req.routed_dp_rank is not None:\n             rank = req.routed_dp_rank",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/bf0783a37a8fe2128c6c613b253093970815bf3c/python%2Fsglang%2Fsrt%2Fmanagers%2Fdata_parallel_controller.py",
+      "sha": "dc948a16e8064cd62f95d447396992f4789a4d83",
+      "status": "modified"
+    },
+    {
+      "additions": 94,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/bf0783a37a8fe2128c6c613b253093970815bf3c/test%2Fregistered%2Funit%2Fmanagers%2Ftest_data_parallel_controller.py",
+      "changes": 96,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmanagers%2Ftest_data_parallel_controller.py?ref=bf0783a37a8fe2128c6c613b253093970815bf3c",
+      "deletions": 2,
+      "filename": "test/registered/unit/managers/test_data_parallel_controller.py",
+      "patch": "@@ -16,7 +16,7 @@\n import unittest\n from contextlib import nullcontext\n from types import SimpleNamespace\n-from unittest.mock import MagicMock, patch\n+from unittest.mock import MagicMock, call, patch\n \n import msgspec.structs\n \n@@ -53,14 +53,24 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:\n     ctl.workers = [MagicMock(name=f\"worker_{i}\") for i in range(num_dp_ranks)]\n     ctl.status = [True] * num_dp_ranks\n     ctl._active_workers = list(range(num_dp_ranks))\n+    ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN\n     ctl.round_robin_counter = 0\n+    ctl.health_round_robin_counter = 0\n     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)\n     return ctl\n \n \n-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):\n+def _req(\n+    routed_dp_rank=None,\n+    bootstrap_room=None,\n+    input_ids=None,\n+    rid=\"USER\",\n+    time_stats=None,\n+):\n     \"\"\"Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema.\"\"\"\n     return SimpleNamespace(\n+        time_stats=time_stats,\n+        rid=rid,\n         routed_dp_rank=routed_dp_rank,\n         bootstrap_room=bootstrap_room,\n         input_ids=input_ids or [],\n@@ -305,6 +315,88 @@ def test_routed_dp_rank_bypasses_counter(self):\n         ctl.workers[0].send_pyobj.assert_called_once()\n \n \n+class TestDispatchingWithTrace(CustomTestCase):\n+    def _make_traced_controller(self) -> DataParallelController:\n+        ctl = _make_controller(num_dp_ranks=4)\n+        ctl.refresh_load_budget_on_dispatch = True\n+        ctl.refresh_load_budget = MagicMock()\n+        ctl.dispatching = MagicMock()\n+        ctl.dispatch_health_check = MagicMock()\n+        return ctl\n+\n+    def test_health_and_user_dispatch_use_separate_state(self):\n+        for rid, is_health in [(\"HEALTH_CHECK_dispatch\", True), (\"user\", False)]:\n+            with self.subTest(rid=rid):\n+                ctl = self._make_traced_controller()\n+                req = _req(rid=rid)\n+                ctl.dispatching_with_trace(req)\n+                self.assertEqual(ctl.refresh_load_budget.call_count, int(not is_health))\n+                self.assertEqual(\n+                    ctl.dispatching.call_args_list, [] if is_health else [call(req)]\n+                )\n+                self.assertEqual(\n+                    ctl.dispatch_health_check.call_args_list,\n+                    [call(req)] if is_health else [],\n+                )\n+\n+    def test_batch_refreshes_budget_only_for_user_requests(self):\n+        for rids, refreshes in [\n+            ([\"HEALTH_CHECK_batch\"], 0),\n+            ([\"HEALTH_CHECK_batch\", \"user\"], 1),\n+        ]:\n+            with self.subTest(rids=rids):\n+                ctl = self._make_traced_controller()\n+                ctl.dispatching_with_trace = MagicMock()\n+                reqs = [_req(rid=rid) for rid in rids]\n+                ctl.dispatch_batch_generate(reqs)\n+                self.assertEqual(ctl.refresh_load_budget.call_count, refreshes)\n+                self.assertEqual(\n+                    ctl.dispatching_with_trace.call_args_list,\n+                    [call(req, refresh_load_budget=False) for req in reqs],\n+                )\n+\n+\n+class TestHealthCheckScheduler(CustomTestCase):\n+    def test_health_and_user_round_robin_state_are_independent(self):\n+        ctl = _make_controller(num_dp_ranks=4)\n+        ctl.round_robin_scheduler(_req())\n+        self.assertEqual(ctl.health_round_robin_counter, 0)\n+        ctl.dispatch_health_check(_req(rid=\"HEALTH_CHECK\"))\n+        self.assertEqual(ctl.round_robin_counter, 1)\n+        self.assertEqual(ctl.health_round_robin_counter, 1)\n+        ctl.round_robin_scheduler(_req())\n+        self.assertEqual(ctl.round_robin_counter, 2)\n+        self.assertEqual(ctl.health_round_robin_counter, 1)\n+\n+    def test_health_round_robin_uses_only_active_workers(self):\n+        ctl = _make_controller(num_dp_ranks=4)\n+        ctl._active_workers = [1, 3]\n+        for _ in range(4):\n+            ctl.dispatch_health_check(_req(rid=\"HEALTH_CHECK_active\"))\n+        ctl.workers[0].send_pyobj.assert_not_called()\n+        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 2)\n+        ctl.workers[2].send_pyobj.assert_not_called()\n+        self.assertEqual(ctl.workers[3].send_pyobj.call_count, 2)\n+\n+    def test_external_routing_does_not_advance_health_counter(self):\n+        ctl = _make_controller(num_dp_ranks=4)\n+        req = _req(routed_dp_rank=2, rid=\"HEALTH_CHECK_routed\")\n+        ctl.dispatch_health_check(req)\n+        ctl.workers[2].send_pyobj.assert_called_once()\n+        self.assertEqual(ctl.health_round_robin_counter, 0)\n+\n+    def test_health_preserves_follow_bootstrap_room_routing(self):\n+        ctl = _make_controller(num_dp_ranks=4)\n+        ctl.load_balance_method = LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM\n+\n+        req = _req(rid=\"HEALTH_CHECK_pd\", bootstrap_room=3)\n+\n+        ctl.dispatch_health_check(req)\n+\n+        ctl.workers[3].send_pyobj.assert_called_once()\n+        self.assertEqual(ctl.health_round_robin_counter, 0)\n+\n+\n class TestFollowBootstrapRoomScheduler(CustomTestCase):\n     def test_dispatches_by_bootstrap_room_modulo(self):\n         ctl = _make_controller(num_dp_ranks=4)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/bf0783a37a8fe2128c6c613b253093970815bf3c/test%2Fregistered%2Funit%2Fmanagers%2Ftest_data_parallel_controller.py",
+      "sha": "a513cf872e95bf6e49532f7312f52b822b9f2d0b",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "@Ying1123  @hnyls2002  @merrymercy  @xiezhq-hermann \r\nHi maintainers – this PR is currently merge-blocked and waiting for a code owner review.\r\nWe've validated it with multiple fresh-server rounds under both 8k and 16k chunk configs; the fix consistently eliminates the performance regression caused by health-check traffic polluting the user routing state. The change is minimal, scoped only to data_parallel_controller.py, and all CPU unit tests pass.\r\nWould appreciate a review when you have a moment – happy to address any feedback. Thanks!",
+      "created_at": "2026-08-21T04:14:22Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5365114488",
+      "updated_at": "2026-08-21T04:14:22Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "## Source-history check and extended runtime validation\n\nI traced the bug back through the endpoint and dispatch history. This supports fixing the problem at the DPC dispatch boundary, rather than changing PrefillDelayer.\n\n### Historical source\n\n- Before [#8444](https://github.com/sgl-project/sglang/pull/8444), `GET /health` returned 200 without entering inference; only `/health_generate` created a `HEALTH_CHECK_*` request.\n- [#8444](https://github.com/sgl-project/sglang/pull/8444) (commit [6f9baf1](https://github.com/sgl-project/sglang/commit/6f9baf100298636174188d845ee6d6493b29ca0c), 2025-08-03) merged the routes, so ordinary `/health` polling began creating generation requests.\n- At that revision, every `TokenizedGenerateReqInput` was first dispatched through the configured `DataParallelController` load balancer. The health-specific busy skip happened later in `Scheduler.process_input_requests()`.\n- Thus “ignored while busy” meant no model execution, but did **not** mean no mutation of user load-balancing state.\n- [#13320](https://github.com/sgl-project/sglang/pull/13320) later added `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` with default `True`; [#13961](https://github.com/sgl-project/sglang/pull/13961) fixed its lookup but did not isolate dispatch state.\n\nThis history identifies the bug as an interaction between two individually reasonable behaviors:\n\n```text\ngeneration-based health semantics\n+\nnormal DPC routing before the scheduler-side health skip\n```\n\nDP Attention, long chunked prefill, and PrefillDelayer expose/amplify the resulting ownership skew; they are not the source of the health request mutating RR state.\n\n### Release-status correction\n\n[v0.5.14](https://github.com/sgl-project/sglang/releases/tag/v0.5.14) (2026-06-26, `49e384ce...`) and [v0.5.17](https://github.com/sgl-project/sglang/releases/tag/v0.5.17) (2026-08-08, `29481685...`) both retain the harmful ordering.\n\nThis PR was opened on 2026-08-20 and is currently unmerged, so it was **not included in v0.5.17**. All v0.5.17 runtime numbers below mean v0.5.17 plus this patch applied locally.\n\n### 16k effective-chunk follow-up\n\nGeneration health remained ON for all runs:\n\n| Run | Input TPS | avgRun | fill | HEALTH@DPC | Success | Fatal |\n|---|---:|---:|---:|---:|---:|---:|\n| r1 | 92,568.7 | 8.28 | 91.02% | 43 | 160/160 | 0 |\n| r2 | 95,146.5 | 8.45 | 92.10% | 40 | 160/160 | 0 |\n| r3 | 95,010.5 | 8.50 | 93.35% | 39 | 160/160 | 0 |\n| r4 | 94,928.6 | 8.24 | 89.95% | 36 | 160/160 | 0 |\n\nEnvironment: 8x B300, DeepSeek-V4-Pro, TP8/DP8, DP Attention, MegaMoE, PrefillDelayer, effective 16k chunk, C16/N160, 60k input / 1 output, seed=1.\n\nAll four rounds were GOOD; mean Input TPS was **94,413.6**. The nonzero `HEALTH@DPC` counts are important: the patch preserves generation-health traffic and removes only its mutation of user routing state.\n\nTogether with the existing patched 8k 4/4 validation, this shows that the invariant holds across both tested chunk configurations:\n\n> Health requests may still be dispatched and answered, but they do not advance or refresh the load-balancing state used by user requests.",
+      "created_at": "2026-08-21T04:37:04Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5365253701",
+      "updated_at": "2026-08-21T04:37:04Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "@Ying1123 @merrymercy @xiezhq-hermann @hnyls2002\n\nI checked the current CI gate configuration:\n\n- Base and AMD ROCm 7.2 use the default gate and require `run-ci`.\n- Extra explicitly requires both `run-ci` and `run-ci-extra`.\n- The current failures all stop at `call-gate / pr-gate`; no actual test matrix ran.\n- These gate-only failures do not count as consumed CI runs for the cooldown check.\n\nCould an authorized maintainer please run:\n\n`/tag-and-rerun-ci extra`\n\nThis adds both required labels and reruns the failed/skipped workflows for the current commit.\n\nValidation already completed: 23/23 targeted CPU unit tests, pre-commit, and `git diff --check` passed; 8×B300 runtime validation passed 4/4 at both effective 8k and 16k prefill chunks, with 160/160 successful requests per run and no ownership holes, PrefillDelayer timeouts, or fatal errors.",
+      "created_at": "2026-08-24T03:27:10Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5390359896",
+      "updated_at": "2026-08-24T03:27:10Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "Additional validation note: I also verified the same health-routing isolation semantics against both the v0.5.14 and v0.5.17 `DataParallelController` source shapes. The release backport preserves the same invariant as this PR: generation-health requests use separate routing state, do not refresh user `DPBudget`, explicit `routed_dp_rank` remains authoritative, and `FOLLOW_BOOTSTRAP_ROOM` keeps its existing PD/disaggregation routing contract. The v0.5.17 path also follows the existing active-worker/bounded-routing behavior. This was kept as downstream release-backport validation rather than adding image-build-specific patching logic to the upstream PR.",
+      "created_at": "2026-08-25T06:40:09Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5406537082",
+      "updated_at": "2026-08-25T06:40:09Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "## Additional 2×2 runtime validation: generation ON/OFF × patched/unpatched\n\nI completed a same-image v0.5.17 2×2 follow-up to isolate the generation-health trigger from the DPC fix. External `/health` polling remained active in every arm.\n\nEnvironment: 8×B300, DeepSeek-V4-Pro, TP8/DP8, DP Attention, MegaMoE, PrefillDelayer, effective 8k chunk, C16/N160, 60k input / 1 output, seed=1.\n\n| DPC | health generation | HEALTH@DPC | Result |\n|---|---:|---:|---|\n| unpatched | ON | 48–61/run | 1 severe LOW + 1 mild degraded + 6 GOOD |\n| unpatched | OFF | 0 | 4/4 GOOD, 94.78–94.85k TPS |\n| patched | ON | 49–50/run | 4/4 GOOD, 94.56–94.70k TPS |\n| patched | OFF | 0 | 4/4 GOOD, 94.85–94.93k TPS |\n\nThe severe unpatched+ON hit reached 68,403 Input TPS, avgRun 5.07 and p99 TTFT 32.1s. Its active-segment global scheduler running-request BS p50 fell to 48 (healthy runs typically 72–80), and user dispatch across the 8 DP ranks became uneven (`[30,30,28,31,28,29,28,28]`, std 1.12).\n\nThe important control is patched+ON: generation-health traffic was still present at DPC (~50 requests/run), but all four runs stayed GOOD and user dispatch stayed balanced. This directly supports the PR invariant that the fix isolates mutable health dispatch state from user load-balancing state rather than disabling health generation.\n\nOne refinement from this follow-up: PrefillDelayer timeout counters alone are not a sufficient failure discriminator; patched+ON runs can remain healthy while timeout events are still observed. The severe failure signature is better characterized by user-dispatch skew together with scheduler running-request/avgRun collapse and TPS/tail-latency degradation.\n\nSo the runtime interaction is now:\n\n```text\ngeneration health + unpatched shared DPC state -> probabilistic LOW\ngeneration health + isolated DPC state          -> stable GOOD\n```\n\nThis complements the existing 8k/16k patched validation with a controlled trigger-isolation experiment.",
+      "created_at": "2026-08-26T07:34:56Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5422097740",
+      "updated_at": "2026-08-26T07:34:56Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "## Canonical evidence update / correction\n\nI updated the PR body to reflect the completed 2x2 evidence campaign and to tighten the causal chain around the DPC routing-state invariant.\n\nOne correction to my earlier CI/review comment: I previously summarized the patched runs as having no PrefillDelayer timeouts. The canonical data shows patched HEALTH-ON GOOD runs did record `wait_timeout=12-24`. Those timeouts did **not** correlate with LOW state, so `wait_timeout > 0` is not used as a failure discriminator.\n\nLikewise, `IDLE-while-EXTEND` was 0 across all 27 analyzed rounds, including severe LOW cases. The canonical runtime chain is therefore now stated as:\n\n```text\ngeneration health\n  -> shared user LB state mutated\n  -> DPC user-dispatch skew\n  -> per-rank effective-batch divergence / reduced running work\n  -> TPS collapse + TTFT-tail inflation\n```\n\nThe key isolation result remains unchanged and is now supported more directly: patched HEALTH-ON keeps `HEALTH@DPC` nonzero (49-50) while restoring user dispatch to exact balance (`29.0+-0.00`) and keeping all four runs GOOD.",
+      "created_at": "2026-09-01T04:03:28Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5488711907",
+      "updated_at": "2026-09-01T04:03:28Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "## Closed-loop benchmark interpretation\n\nA small clarification on the runtime signals: the validation workload is fixed-concurrency **closed-loop**, so client refill is driven by request completion rather than by an independent offered QPS.\n\nIn the post-fix 60k/1 concurrency sweep, raw `perf.json` request throughput reaches ~1.57 req/s at C16 and stays essentially flat through C24/C32/C64, while median TTFT grows roughly with concurrency. This identifies C16 as the closed-loop saturation knee.\n\nThat benchmark model also explains why `avg_queue_req` does not need to spike in the pathological LOW state. When the routing bug lowers service capacity (~1.58 -> ~1.14 req/s in the canonical comparison), the client refill rate falls with completions, providing backpressure. Queue depth can therefore remain similar even while running width collapses and TTFT tail worsens.\n\nThis is only a signal-interpretation note; it does not change the PR's causal claim. The direct mechanism remains:\n\n```text\ngeneration health\n  -> shared DPC user LB state mutation\n  -> user dispatch skew\n  -> per-rank running-batch divergence / work-supply loss\n  -> TPS and TTFT degradation\n```\n\nThe ~1.57 req/s saturation value is not a production SLO-capacity claim; that would require a separate fixed-rate/open-loop QPS sweep.",
+      "created_at": "2026-09-01T07:04:19Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5490195856",
+      "updated_at": "2026-09-01T07:04:19Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "## Follow-up: `total_requests` does not replace health/user LB-state isolation\n\nI ran a new control to test whether switching away from round-robin is sufficient to avoid the LOW state without this patch.\n\nEnvironment was held fixed: v0.5.17 unpatched, generation health ON, TP8/DP8, DP Attention, DP LM Head, MegaMoE, PrefillDelayer, effective 8k/rank chunk, C16/N160, 60k input / 1 output. The only policy change was:\n\n```text\n--load-balance-method total_requests\n```\n\nResults:\n\n| Run | Input TPS | median TTFT | p99 TTFT | HEALTH@DPC | Result |\n|---|---:|---:|---:|---:|---|\n| r01 | 94,511.6 | 10.30 s | 11.21 s | 52 | GOOD |\n| r02 | 90,597.0 | 10.42 s | 14.43 s | 55 | LOW |\n| r03 | 90,713.8 | 10.38 s | 14.44 s | 50 | LOW |\n| r04 | 88,454.8 | 9.59 s | 18.07 s | 54 | LOW |\n\nSo this arm was only **1/4 GOOD**, with mean Input TPS **91.07k**. All 640/640 requests completed and there were no server fatals.\n\nThe useful part is that coarse request-count balance was often already good. For example, rank-local admission reconstruction for r02 was:\n\n```text\n[55, 55, 54, 54, 54, 54, 53, 53]  (432/432 observed)\n```\n\nwhile the run was still LOW at 90.6k TPS. r04 was similarly close to even at `[55, 53, 53, 55, 54, 55, 53, 53]` (431/432 observed) but was the slowest run at 88.5k TPS.\n\nThis refines the downstream mechanism: persistent **aggregate request-count skew is not required**. A better description is:\n\n```text\ngeneration health\n  -> mutates shared user LB state / dispatch dynamics\n  -> perturbs rank-local arrival/refill timing and work supply\n  -> per-rank effective running/batch formation diverges\n  -> TPS drops and TTFT tail inflates\n```\n\n`total_requests` can reduce coarse ownership imbalance, but in the unpatched path health requests still participate in the same user load-budget refresh/update machinery. It therefore acts, at best, as an unstable partial mitigation; it does not restore the invariant that health traffic must not mutate user-routing state.\n\nOne instrumentation caveat: the current DPC trace does not expose `selected_dp_rank` for the `total_requests` path, so the ownership vectors above are reconstructed from rank-local admission traces rather than direct DPC selected-rank counters. r02 is the cleanest example because all 432 observed user admissions were reconstructed.\n\nI will treat a future patched + `total_requests` run only as a load-balancing policy/performance comparison; the correctness requirement addressed by this PR remains independent of the selected user LB policy.",
+      "created_at": "2026-09-02T09:24:49Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5507388653",
+      "updated_at": "2026-09-02T09:24:49Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    },
+    {
+      "body": "@alphabetc1 can you help take a look, seems related to a line of work you have done about idleness check",
+      "created_at": "2026-09-22T01:06:12Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-5769786448",
+      "updated_at": "2026-09-22T01:06:12Z",
+      "user": {
+        "login": "xiezhq-hermann"
+      }
+    },
+    {
+      "body": "/tag-and-rerun-ci",
+      "created_at": "2026-10-10T08:43:41Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-6095791141",
+      "updated_at": "2026-10-10T08:43:41Z",
+      "user": {
+        "login": "alphabetc1"
+      }
+    },
+    {
+      "body": "Thanks @alphabetc1! Simplified the tests in 902559f (8 → 6, 28 fewer lines), retaining the key regression coverage. Could you take another look and help rerun CI if needed?",
+      "created_at": "2026-10-10T15:51:06Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#issuecomment-6099333123",
+      "updated_at": "2026-10-10T15:51:06Z",
+      "user": {
+        "login": "Phoenix3334"
+      }
+    }
+  ],
+  "number": 35721,
+  "refs": {
+    "base": {
+      "commit": "e4b423256ef1df8b7e9a44536759a89522a869a2",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "bf0783a37a8fe2128c6c613b253093970815bf3c",
+      "repository": "Phoenix3334/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "Overall lgtm\nnon-blocking: can we simplify the test? I think there are too many lines of test code, and a lot of them are unnecessary.\n\n",
+      "html_url": "https://github.com/sgl-project/sglang/pull/35721#pullrequestreview-5478523118",
+      "state": "APPROVED",
+      "submitted_at": "2026-10-10T09:51:28Z",
+      "user": {
+        "login": "alphabetc1"
+      }
+    }
+  ]
+}

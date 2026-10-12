@@ -15,37 +15,44 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/models/common/dist_moe/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: ae08f8c77d5c44d937b0c82513998e441f534eed53b4b91110656fcb38eee658
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/dist_moe.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 76e0ff6a67e72f6fc711ba23d565c435d9f7b837bd3058a0163dfbd275ba271f
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/token_dispatcher.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 4031eec7b291f9a955600f931cc22a97152fbefe1978f16ddcc0f5b982fc4baf
 - source: pytorch-torchtitan
   path: torchtitan/quantization/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: c83d0b237d478207891164a49972280f065b7bbd9026ad8fc91cf8aa91d587c9
 - source: pytorch-torchtitan
   path: torchtitan/quantization/mxfp8/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 629ffa3730098c8b956e5da4e693e9ce4639fb9f9b544befd201427a0b69b9c7
 - source: pytorch-torchtitan
   path: torchtitan/quantization/nvfp4/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 64d5f937a3bc2a280cb7249592fe31521c7dba37d364aa4870b9430f359b8680
 - source: pytorch-torchtitan
   path: torchtitan/distributed/REMAT.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 330408f54575d08657fae75ece3890f6f5329eeced1b1d07d43d7f1e9868328b
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/moe.py
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: 6cbf29e9670551c5dacc83881bd244ce6b7ac8080533623e8e525325e8fce3ee
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/aux_loss.py
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: dd2c94fab5210f05537b6eb2449dfd24a969495b0bc8ac22c19ad997ef61ac42
 pr_sources:
 - pr-pytorch--torchtitan-5263
 - pr-pytorch--torchtitan-5250
 ---
-
 # TorchTitan MoE 路由、通信内存与低精度权重生命周期
 
 ## 先看 MoE 的完整链路
@@ -88,13 +95,24 @@ NVFP4 依赖 TorchAO prototype 与 Blackwell/CUDA；当前说明要求切分后�
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/models/common/dist_moe/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/common/dist_moe/README.md)
-- [torchtitan/config/transform/dist_moe.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/transform/dist_moe.py)
-- [torchtitan/config/transform/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/transform/token_dispatcher.py)
-- [torchtitan/quantization/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/quantization/README.md)
-- [torchtitan/quantization/mxfp8/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/quantization/mxfp8/README.md)
-- [torchtitan/quantization/nvfp4/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/quantization/nvfp4/README.md)
-- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/REMAT.md)
+- [torchtitan/models/common/dist_moe/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/common/dist_moe/README.md)
+- [torchtitan/config/transform/dist_moe.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/transform/dist_moe.py)
+- [torchtitan/config/transform/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/transform/token_dispatcher.py)
+- [torchtitan/quantization/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/quantization/README.md)
+- [torchtitan/quantization/mxfp8/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/quantization/mxfp8/README.md)
+- [torchtitan/quantization/nvfp4/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/quantization/nvfp4/README.md)
+- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/REMAT.md)
 
 - [PR #5263：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5263.md)
 - [PR #5250：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5250.md)
+
+## 当前主线补充：global batch 辅助 loss 与重算副作用
+
+[PR #4772](https://github.com/pytorch/torchtitan/pull/4772) 增加 global batch-wise MoE 辅助 loss。`moe.py` 中 batch-wise 实现跨 DP 和 token-sharding 轴汇总 expert counts，normalized-score 的规约范围不同：DP 的可微贡献仍会由梯度规约组合，不能将两条路径都无区别 all-reduce。
+
+滚动 counts 在各 microbatch 前向累积，保留该次前向的快照，防止后续 microbatch 已运行后 checkpoint replay 读取新的统计。`aux_loss.py` 使用 retained `torch_remat` region，避免重算重复计数/重复通信；optimizer pre-hook 负责 step 边界的累积与清零，metric 再按其 reduce_mesh 和层数归并。
+
+调整 gradient accumulation、PP、CP/EP 或重算时，需要同时核对 routed-token 分母、aux coefficient、主 loss 和梯度，不把统计口径变化当性能回归或收敛改善。global-batch、microbatch-wise 与 aux-loss-free bias 更新是不同机制；模型配方选哪条就验证哪条，不能随意替换。
+
+- [torchtitan/models/common/moe.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/common/moe.py)
+- [torchtitan/models/common/aux_loss.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/common/aux_loss.py)

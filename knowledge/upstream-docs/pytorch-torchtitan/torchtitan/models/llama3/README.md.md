@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: b663c1673c00d97864bb32f18029ce5ec40442e2
 path: torchtitan/models/llama3/README.md
-raw_sha256: 18494f66902ecc4c2e7e08b63ae0a26abe02dd366d2d536b8d9697a5e91c7b2d
+raw_sha256: 7399af448d81366eb3b759d23f58dac99e4873d255ab8415b58ee5ab6059d74d
 sources: []
-generated_body_sha256: e934b40657311b5695b6cf23468c3d72fa123dc01932fee19abf4225026045a1
+generated_body_sha256: 41e587bacb55da78d0b752540a2a6b458aefd53e32297a48c9663ab6260b3c64
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/llama3/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/llama3/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/llama3/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -71,7 +71,7 @@ Coverage below matches the sharding set in [`flavors.py`](./flavors.py),
 | DDP | Including DDP+CP |
 | Activation checkpointing | Selective and full |
 | `torch.compile` | 1D and multi-dimensional jobs |
-| MXFP8 | Eager recipe `llama3_8b_mxfp8`; GraphTrainer recipes `graph_trainer_llama3_debugmodel_mxfp8` and `graph_trainer_llama3_8b_mxfp8` |
+| MXFP8 | Eager `llama3_8b_mxfp8` in `torchtitan_recipes.tests.models.llama3`; GraphTrainer `graph_trainer_llama3_debugmodel_mxfp8` in `torchtitan_recipes.tests.graph_trainer.llama3` |
 
 ## Numerical checks
 

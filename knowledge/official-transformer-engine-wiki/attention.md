@@ -9,31 +9,31 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-12'
 sources:
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 967c475fa391f5d7748a9ea8f8cb5da7a109ed5efdb291174cd10ab63a55b201
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/attention/dot_product_attention/utils.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 0e80d5f14a933de26e564e823eb86c1000221425f30832f0e4967ae95e2d48ed
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/attention/dot_product_attention/backends.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 97f332b619f1c710e84ec8799561da8eb0e8ddff34d608d6504c513718168492
 - source: nvidia-transformerengine
   path: transformer_engine/common/fused_attn/fused_attn_f16_arbitrary_seqlen.cu
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 7b75f80511848e748e593182fd5f370915683399e60c79b53b4df62d7e81e600
 - source: nvidia-transformerengine
   path: tests/pytorch/attention/test_attention_backend_selection.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: e0ee6f26e308ab0481f6bb7a12f88b1a1ffdf4a4a19f9e294ace495cab2de252
 - source: nvidia-transformerengine
   path: docs/examples/attention/attention.ipynb
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 055093bf03f8b79cbfc84abad66d282b4de86ab4672ffc402f1c927d2c2b065a
 - source: nvidia-transformerengine-docs
   path: attention
@@ -42,7 +42,6 @@ sources:
   url: https://docs.nvidia.com/deeplearning/transformer-engine/examples/attention/attention.html
   revision_kind: web-content-fingerprint
 ---
-
 # TE Attention：后端选择、cuDNN 调用与训练精度契约
 
 ## 调用链与选择条件
@@ -69,12 +68,12 @@ HCU TE 能承接的接口先复用或补齐该仓；通用编译/cuDNN Frontend 
 
 ## 来源与版本复核
 
-- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/utils.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/attention/dot_product_attention/utils.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/backends.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/pytorch/attention/dot_product_attention/backends.py)
-- [nvidia-transformerengine: transformer_engine/common/fused_attn/fused_attn_f16_arbitrary_seqlen.cu](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/transformer_engine/common/fused_attn/fused_attn_f16_arbitrary_seqlen.cu)
-- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/tests/pytorch/attention/test_attention_backend_selection.py)
-- [nvidia-transformerengine: docs/examples/attention/attention.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/docs/examples/attention/attention.ipynb)
+- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/utils.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/attention/dot_product_attention/utils.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/attention/dot_product_attention/backends.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/attention/dot_product_attention/backends.py)
+- [nvidia-transformerengine: transformer_engine/common/fused_attn/fused_attn_f16_arbitrary_seqlen.cu](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/common/fused_attn/fused_attn_f16_arbitrary_seqlen.cu)
+- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/pytorch/attention/test_attention_backend_selection.py)
+- [nvidia-transformerengine: docs/examples/attention/attention.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/attention/attention.ipynb)
 - [nvidia-transformerengine-docs: attention](https://docs.nvidia.com/deeplearning/transformer-engine/examples/attention/attention.html)
 
-本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码 main、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。

@@ -1,0 +1,74 @@
+---
+id: doc-ascend-mindspeed-f1fdf0e0311dd1be7524
+title: Ascend/MindSpeed / docs/zh/features/ring-attention-context-parallel.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/ring-attention-context-parallel.md
+raw_sha256: 2161c989f9c1e1b49d453c1737012167750fb7796b4112d81c452d866e5c23c7
+sources: []
+generated_body_sha256: de883703e1d1db6200c5248bebe50d14a9a7d772293a57d2c0e7beeacebc0960
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/ring-attention-context-parallel.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/ring-attention-context-parallel.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Ring Attention长序列并行
+
+## 背景与挑战
+
+从生成式AI到科研模型，长序列训练正在变得非常重要。在生成式AI领域，会话式AI、长文档摘要和视频生成等任务都需要在空间和时间层面对长上下文进行推理。同样，章节和书籍级别的摘要（数万甚至数十万字）在会话式AI和摘要任务中也非常重要。现有的数据、张量和流水线等并行方法无法在序列维度进行切分。当序列维度(S)增长时，训练内存开销会以$O$($S^2$)的速度增长。因此需要针对长序列场景进行特定的优化来解决长训练场景的训练需求。
+
+## 解决方案
+
+支持Ring Attention长序列并行方案，以此解决序列维度扩展问题。具体细节请参见原文[Ring Attention with Blockwise Transformers for Near-Infinite Context](<https://arxiv.org/pdf/2310.01889>)。
+
+Ring Attention借鉴了分块Softmax原理，在不需要获取整个序列的完整矩阵情况下进行分块attention计算。因此作者提出以分块方式执行自注意力和前馈网络计算，跨多个设备分布序列维度。具体地，该方法在进程之间构建注意力计算块的环状通信结构（Ring），每个进程具有一个切分后的本地QKV块。在计算完本地的attention后，通过向后发送和向前获取KV块，遍历进程设备环，以逐块的方式进行注意力和前馈网络计算。同时，本地的attention计算和KV块的通信理想情况下可以互相掩盖，从而消除了额外引入的通信开销。另外该方案在计算attention的过程中全程不需要数据拼接，支持的序列长度理论上可以无限拓展。
+
+## 使用场景
+
+Ring Attention长序列并行方案适用以下几种典型场景：
+
+- 当使用GPT类模型进行训练，且输入数据经过MoE层，实际序列长度超过8k时。
+
+- 不同于Ulysses方案，该方案不需要确保head size被CP size整除，具有更高的灵活性。
+
+- 可兼容FlashAttention，且FlashAttention已默认开启。
+
+- 如果想要使得计算和通信可以互相掩盖，理论上需要确保每个计算块分到的序列长度$c \geq F/B$。其中F是每个device的FLOPS，B是每个device间的带宽。具体推导过程参见原文。在实践中，需要确保每个计算块分到的序列长度足够大，才能较好掩盖。
+
+## 使用方法
+
+| 重要参数       | 参数说明         | 是否必选      | 默认值                         |
+|----------------|------------------|-------------------|----------------------|
+| --context-parallel-size [int]            | 开启CP对应的数量，根据用户需求配置。      | 否          | 1          |
+| --seq-length [int]                       | 输入序列的长度。    | 是            | /     |
+| --use-cp-send-recv-overlap               | 建议开启，开启后支持send receive overlap功能。   | 否         | True    |
+| --attention-mask-type         | 设置Mask计算的类型，默认是causal（倒三角）Mask计算，设置general代表全量计算。 | 否      | causal |
+| --context-parallel-algo   | 长序列并行算法选项：<ul><li>ulysses_cp_algo：开启Ulysses长序列并行</li><li>hybrid_cp_algo：开启Hybrid长序列并行</li><li><b>megatron_cp_algo</b>：开启Ring Attention长序列并行</li></ul>  | 否  | megatron_cp_algo |
+| --megatron-cp-in-bnsd                    | 开启后，FA使用BNSD计算。                 | 否    | True  |
+| --cp-window-size [int]                   | 控制双层Ring Attention的内层窗口大小。值为1时使用原始Ring Attention算法，值大于1时使用Double Ring Attention算法，优化原始性能。要求cp_size必须能被该参数整除。| 否   | 1     |
+
+## 使用效果
+
+利用多个计算设备对输入序列进行并行切分，降低了单设备的内存消耗。相比不开启序列并行，单步耗时增加，但相比重计算，计算效率得到提升。
+
+> [!NOTE]
+>
+> - 开启Context Parallel时需要同时开启Flash Attention特性，否则特性不支持。
+> - 在使用GPT类模型进行训练的场景下，建议`--attention-mask-type`设置为`causal`。
+> - 在8k的序列长度情况下，由于计算的时间缩短，cp功能分割之后的send receive的时间反而会长于计算时间，造成性能的下降，所以建议配置seq-length / context-parallel-size大于8k以获取最佳效果。具体公式参考：S/(T\*alpha) >= 1/(W\*beta)，其中，S = seq-length / context-parallel-size，T表示芯片的理论算力，alpha表示计算效率，W表示理论通信带宽，beta表示带宽利用率。
+> - 内层窗口`--cp-window-size`增大时，通信与计算并发程度更高，但是计算、通信并发时可能由于片上内存带宽抢占，整体效率下降，需要结合实际场景进行调试，例如Llama2裁剪模型32k序列长度，cp为16且无其他并行切分时，实测内层窗口大小为2时性能最优。

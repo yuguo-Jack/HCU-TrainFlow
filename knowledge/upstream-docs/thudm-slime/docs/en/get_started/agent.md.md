@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: docs/en/get_started/agent.md
-raw_sha256: 811586191ab35be417e66734a48bca51c8fa683df8d11c049919c8869c5c1eda
+raw_sha256: 24b94a8bcdb58c1a4ea2fea481eba9a6696598737f050f0997666f3675304055
 sources: []
-generated_body_sha256: b8e5e663acddbf61b38d3049d415a8a093939d5733bac2ea6c6244f9051c71c3
+generated_body_sha256: b29c73ebc13557ab8346ca3f9d5687084eca2dfc000403173430cbb5358a779d
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/get_started/agent.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/get_started/agent.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/get_started/agent.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -36,8 +36,8 @@ This page is a roadmap: use it to decide which docs and examples to read when pl
 
 | Goal | Recommended entry point |
 | :--- | :--- |
-| Run a custom agent loop, tool calls, RAG, browser/terminal/sandbox interaction for each sample | [`--custom-generate-function-path`](customization.md#--custom-generate-function-path), [writing a custom generation function](quick_start.md#writing-custom-generation-function) |
-| Implement verifier rewards, test-based rewards, environment success checks, or an external reward service | [`--custom-rm-path`](customization.md#--custom-rm-path), [writing a custom reward function](quick_start.md#writing-custom-reward-function) |
+| Run a custom agent loop, tool calls, RAG, browser/terminal/sandbox interaction for each sample | [Writing a custom generation function](customization.md#--custom-generate-function-path) (`--custom-generate-function-path`) |
+| Implement verifier rewards, test-based rewards, environment success checks, or an external reward service | [Writing a custom reward function](customization.md#--custom-rm-path) (`--custom-rm-path`) |
 | Return multiple training samples from one prompt, such as subagent, multi-agent, or context-compaction segments | [fan-out return from custom generate](customization.md#returning-multiple-training-samples-for-one-prompt), [`examples/multi_agent`](../_examples_synced/multi_agent/README.md) |
 | Avoid blocking training on long-tail agent rollouts | [`examples/fully_async`](../_examples_synced/fully_async/README.md) |
 | Study a full end-to-end agent example with sandboxing, real code edits, and test-based grading | [`examples/coding_agent_rl`](../_examples_synced/coding_agent_rl/README.md) |

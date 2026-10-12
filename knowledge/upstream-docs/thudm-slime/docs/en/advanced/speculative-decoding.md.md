@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: docs/en/advanced/speculative-decoding.md
-raw_sha256: 5024a96a16ae128c9b1efe1c9af7245f97a245850cd3fa0d704af299bcc9f02b
+raw_sha256: 303ae3ccdaaec7db0bfae8257ec23a8f1655e3059c9f8cc72455ee00967074bd
 sources: []
-generated_body_sha256: 5fea2ca55f3872b21a4f25d875a33bcee83192ad1241ef587f52c96cc6ea5cdf
+generated_body_sha256: db15d5e44fedccf5e3a2e8ed6a2f28176f29e98b2a5d04157c5637344035fef1
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/speculative-decoding.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/speculative-decoding.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/advanced/speculative-decoding.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -48,6 +48,42 @@ If you want to use a separately trained draft model (e.g., one trained with [Spe
 ```
 
 For detailed parameter meanings and configuration, see SGLang’s speculative decoding [documentation](https://docs.sglang.ai/advanced_features/speculative_decoding.html).
+
+## Configure EAGLE in the interactive builder
+
+In the homepage's **Serving** step, enable **EAGLE · Speculative decoding**. Choose the checkpoint's built-in MTP head where supported, or **Separate EAGLE head** and enter its checkpoint directory or Hugging Face model ID. The separate head must be compatible with the target model; an arbitrary smaller language model is not an EAGLE head. Make its weights accessible to every serving host.
+
+The builder uses `EAGLE`, fixes `speculative-eagle-topk` to 1, and lets you choose the drafting depth. For depth $\gamma$, it exports `speculative-num-steps = γ` and `speculative-num-draft-tokens = γ + 1`. The default depth is 3 (4 for the GLM-5.3 recipe). These are starting settings, not measured optimal values. GLM-5.3's built-in MTP path also uses the recipe's `nsa` draft attention backend; selecting a separate head leaves its backend selection to SGLang.
+
+The **Your little RL world** diagram shows all eight PD / HiCache / EAGLE combinations. PD separates prefill and decode engine pools and adds cache transfer. HiCache adds a CPU cache tier; in this recipe, PD attaches it only to prefill. EAGLE adds a draft head, candidate tokens, target verification and committed output. With EAGLE off, the target decodes one token per step. **Play a round** highlights these stages in order; the acceptance example is illustrative.
+
+Managed deployments receive `--sglang-speculative-*` arguments in `experiment.sh`. External deployments must apply the corresponding `--speculative-*` arguments from `serving-reference.sh` when launching their engines. Training-side flags also enable slime's speculation metrics; they cannot reconfigure a running external engine. The draft path is retained locally and in the downloaded configuration, but omitted from share links. Switching target models clears it so a head is not accidentally reused for another target.
+
+The builder configures inference. It does not enable online MTP or separate-head training. As the target changes during RL, monitor `spec_accept_rate`, `spec_accept_length` and rollout latency. Extra draft weights, verification buffers and hybrid recurrent-state snapshots also consume memory.
+
+## Why verification is needed
+
+[EAGLE](https://arxiv.org/abs/2401.15077) uses a lightweight head to propose candidates using target-model features. The target then verifies them. The probability argument below is the standard single-path rejection-sampling construction from [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318); it describes the ideal sampler, not a claim that every backend uses identical kernels.
+
+At a fixed prefix, let $p(a)$ be the target distribution and $q(a)$ the draft distribution. For a proposed $a\sim q$, accept with probability
+
+$$\alpha(a)=\min\left(1,\frac{p(a)}{q(a)}\right).$$
+
+The accepted probability mass for token $a$ is $q(a)\alpha(a)=\min(p(a),q(a))$. Total rejection probability is
+
+$$Z=1-\sum_a\min(p(a),q(a))=\sum_a[p(a)-q(a)]_+.$$
+
+After rejection, draw a correction from $r(a)=[p(a)-q(a)]_+/Z$. Combining accepted and corrected mass gives
+
+$$\Pr(\text{output}=a)=\min(p(a),q(a))+Zr(a)=p(a).$$
+
+When $Z=0$, rejection never occurs. Apply the construction at successive accepted prefixes; after the first rejection, discard the remaining candidates and continue from the corrected prefix. If all candidates pass, an additional target token can be emitted. Thus the diagram marks an accepted prefix and a correction, rather than training directly on unchecked draft tokens.
+
+For a simple cost model, let $A$ be the number of accepted draft tokens, $t_d$ the per-step draft cost, $t_v$ the batched target verification cost, and $t_o$ cache/scheduling overhead. If an ordinary target step costs $t_t$,
+
+$$\text{speedup}\approx\frac{(\mathbb E[A]+1)t_t}{\gamma t_d+t_v+t_o}.$$
+
+More draft steps help only when the additional accepted tokens repay the extra work. This is why the builder exposes depth and acceptance metrics rather than promising a fixed speedup.
 
 ## Online SFT for the Draft Model
 

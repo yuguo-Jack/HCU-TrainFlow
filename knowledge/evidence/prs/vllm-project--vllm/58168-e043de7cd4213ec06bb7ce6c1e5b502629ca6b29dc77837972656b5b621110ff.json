@@ -1,0 +1,785 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "b49c921a27083c25c16f308be1326055dbc87bbf",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nTwo things, in priority order.\n\n**1. Expose exclusive access to an `OffloadingManager` as a public API.** `lock()` / `unlock()`, plus a `locked()` helper, guard a manager's whole state subtree: the manager, the tiers it composes, and any front-end state those tiers own. Manager methods never acquire it themselves, so a caller holds it across as many operations as its own invariants need. That property is the point — several manager operations only make sense in sequence. `prepare_load()` documents that its keys are offloaded, a fact `lookup()` established one hook earlier, so a caller has to be able to span both. Internal per-method locking cannot offer that.\n\n**2. Use it for the first case that needs it** (#55179). The `p2p` secondary tier answers a remote peer, which the engine does not drive, so its control plane only advanced from `on_schedule_end`. A peer's lookup or fetch therefore waited for a model-step boundary — seconds on a saturated rank, gating a transfer of well under one. Tiers now opt in with `needs_control_plane_thread`, and `TieringOffloadingManager` runs one thread that polls them and lets them serve between steps.\n\n## Not a duplicate of the open PRs on #55179\n\nThis overlaps open work and I want that on the record rather than buried.\n\n| PR | Author | Driver | Locking |\n|---|---|---|---|\n| **this** | me | thread owned by `TieringOffloadingManager` | **public `lock()`/`unlock()` on `OffloadingManager`, held by callers** |\n| #58113 | me | same thread, same sweep | private `_enter_step`/`_exit_step`/`_observation_lock` + `*_unlocked` variants |\n| #57165 | @nilig | `EngineCore` poller thread | new `KVConnectorBase_V1.poll_pending_work` |\n| #55962 | @Etelis | `EngineCore` + connector base API + executor changes | new base-API hook |\n| #57139 | me | — | the separate async peer-registration half, not this |\n\n**This supersedes my own #58113, which I will close.** The difference is not cosmetic:\n\n- **#58113 does not expose an API.** It takes the lock inside the manager's public methods, which forces a `*_unlocked` variant of every method `_SecondaryTierFacingParent` can re-enter (`lookup`, `on_new_request`, `create_store_job`, `on_request_finished`, `reset_cache`) because the parent handle's caller already holds it. That duplication is most of its `+393` lines in `manager.py`, and it is precisely what prevents an outside caller from saying \"hold this across several operations.\" Moving the lock to the caller removes every one of those variants.\n- **#58113 releases at `on_schedule_end`, which is not the end of the step.** `build_connector_meta` called `on_schedule_end` ~40 lines early, before `_build_store_jobs` → `prepare_store` (which evicts) and before `on_request_finished`. So its `prepare_store` re-acquired via `_enter_step()` and nothing released it: on every step that builds store jobs — the common case under load — the lock was held across `future.result()`, starving the control thread in exactly the window the change exists to exploit. That plausibly explains #58113's own \"parity-within-noise\" result, which was measured through the bug, and that conclusion should be re-tested.\n\nRelative to #57165 / #55962: same goal, but no new `KVConnectorBase_V1` hook and no `EngineCore` or executor changes. In #55179 @nilig asked for a read on \"a thread touching the connector from inside `EngineCore`, even phase-exclusive, versus a control thread owned by the tier\" — this is a working implementation of the second option, offered as input to that question. If maintainers prefer either existing PR, close this one.\n\n## Changes\n\nCommit 1, **`on_schedule_end` runs last** — independent of all locking, reviewable on its own. Its docstring already claimed \"called once at the end of each scheduler step\"; it was called ~40 lines early. Moving it makes the contract true and gives callers a sound release point. Two ordering consequences, both handled: `prepare_store`'s poll becomes unconditional (the per-step gate was previously reset mid-`build_connector_meta`, which is where its fresh completion data came from — without this, eviction decisions would run on data up to a step stale), and `_flush_pending_cascades` now re-parks keys this step parked, which is safe because `_maybe_finalize_request` holds off while `pending_cascade_keys` is non-empty.\n\nCommit 2, **the API and its consumer**.\n\n`OffloadingConnectorScheduler` holds one region per engine step, opened by the first manager-touching hook and closed at the end of `build_connector_meta`, so the manager is free while the engine runs the model. Hooks outside `schedule()` take a short region.\n\nTwo placements are load-bearing and easy to get wrong:\n\n- **`has_pending_push_work` must use the short region.** `EngineCore.step()` returns early at `core.py:597` when `has_requests()` is false, so a step-scoped acquire there would never reach the release and would hold the manager for good — the state an idle engine settles into. It does still need the lock: `has_pending_work()` iterates `_req_state` while the control thread may insert or delete via `parent.on_new_request` / `on_request_finished`.\n- **`take_events` drains inside the region.** `manager.take_events()` is a generator whose backing list is cleared once exhausted, so iterating it lazily both pinned the manager for the consumer's duration and discarded events a concurrent `complete_write` appended, unpublished. It stays a generator so the caller's truthiness check at `sched/scheduler.py` is unchanged.\n\nThe thread yields unconditionally *after* `unlock()`, which is what bounds the scheduler's wait to one round — Python locks are not fair, so a release-then-reacquire loop could starve it. A failed round is logged, not fatal, and `on_schedule_end` still serves every tier, so the fallback is per-step servicing. `_process_finished_jobs` takes a tier filter so a round does not drag tiers that expect the scheduler thread. `shutdown()` stops and joins the thread before any tier teardown, since closing a transport under a live round can end the process rather than raise.\n\nConfig: `control_plane_interval_s` in `kv_connector_extra_config`, default 1 ms, `0` disables the thread and restores per-step servicing.\n\nDocstrings that claimed single-threaded tier access are corrected, including the eviction-race argument in `_pin_and_register_hits` — which still holds, now because `serve_external_requests` runs inside one hold of the lock. `async_lookup.py`'s \"owned exclusively by the scheduler thread\" claim was outright false once `parent.lookup` can fan out to `fs.lookup` from the control thread.\n\n## Test results\n\n```\npytest tests/v1/kv_offload/tiering/ tests/v1/kv_connector/unit/offloading_connector/ -q\n  901 passed, 12 skipped in 295s      (baseline on this tree: 889 passed, 12 skipped)\n\npytest tests/v1/kv_offload/tiering/p2p/ -q\n  217 passed in 66s                   (subset of the above; re-run on its own)\n\npre-commit: all hooks pass, including ruff, ruff-format, mypy, and check-test-tethering.\n```\n\nNote for reviewers: a whole-directory run of `tests/v1/kv_offload/` produces a large number of CUDA IMA errors that are **pre-existing and unrelated** (`tests/v1/kv_offload/cpu/` poisons the rest of the session). Run the subdirectories separately.\n\n12 new tests. The two that matter most were both verified to fail without the change, not just to pass with it:\n\n- `test_on_schedule_end_is_the_last_manager_call_of_a_step` — without the reorder it observes `['on_schedule_end', 'prepare_store']`. This is the check #58113's suite lacks, because its `_step()` helper drives `on_schedule_end` with no following `prepare_store`.\n- `test_control_thread_and_scheduler_never_overlap` — with `lock()`/`unlock()` stubbed to no-ops it detects 86 overlaps. It also asserts both threads made progress, so neither a thread that never runs nor one that starves the scheduler passes it.\n\nI wrote and then **deleted** a third test (\"no eviction between a served lookup and its pin\") after finding it still passed with the lock neutered: LRU keeps evicting the fresh keys rather than the constantly-looked-up hit keys, so it could never fail. The overlap test is the real guard for that property, and a test that cannot fail is worse than no test.\n\n## Model evaluation — the 4-case matrix from #55179\n\nRun on two H200 pods, Llama-3.2-1B, `--enforce-eager`, `--block-size 16`, 96 GiB CPU\nprimary tier, `secondary_tiers: [{\"type\": \"p2p\"}]`, `max-model-len 32768`.\n\n**Topology.** Source = the pod holding the KV in its CPU offload tier. Consumer = the\nother pod, which probes the source over P2P (`remote_kv_source`) and fetches. Every\nmeasured fetch uses a freshly generated ~27k-token prompt that is populated on the source\nfirst, so nothing hits a GPU prefix cache and the fetch is real work: each one moved\n**~1720 chunks** (`kv_offload_tiering_chunk_hits` delta), i.e. the full prefix.\n\n**Busy** = source saturated with 8 concurrent ~27k-token prefills. That took its\nrequest latency from **0.018 s idle to 1.40 s**, so the control plane really is gated\nbehind ~1.4 s of model work — the same regime as the issue's report.\n\n**Cold** = no P2P session yet. A session lives as long as the engine, so only the first\nfetch after a restart is genuinely cold; both pods were restarted between every phase and\nthe cold fetch measured first.\n\n**Signal** = the consumer's `vllm:kv_offload_lookup_async_delay_seconds` delta for the\nmeasured request (one observation per fetch). Warm figures are the mean of 3 reps.\n\n| case | A: baseline (`7b077f36a8`) | B: #58113 | C: this PR |\n|---|---|---|---|\n| idle, cold | 0.177 s | — | **0.133 s** |\n| idle, warm | 0.0455 s | — | **0.0457 s** |\n| busy, cold | 0.440 s | 0.289 s | **0.155 s** |\n| busy, warm | 0.220 s | 0.129 s | **0.0534 s** |\n\n**The per-step gating penalty, which is what this PR removes:**\n\n| arm | idle-warm | busy-warm | penalty |\n|---|---|---|---|\n| A: baseline | 0.0455 s | 0.2196 s | **4.83x** |\n| C: this PR | 0.0457 s | 0.0534 s | **1.17x** |\n\nSaturating the source costs baseline 4.8x on the consumer's lookup delay. With the control\nthread it costs 1.17x — the stall is essentially gone, and a busy source now behaves like\nan idle one.\n\nSupporting numbers on busy-warm: per-chunk tiering delay\n(`kv_offload_tiering_lookup_async_delay_seconds`) 0.100 s → 0.0174 s (5.8x), and end-to-end\nTTFT for the fetch 0.310 s → 0.144 s (2.2x). Idle is parity within noise in every metric,\nas expected — there is no model step to hide behind.\n\nPer-rep spread, busy-warm: baseline `0.1929 / 0.2532 / 0.2127`, this PR\n`0.0388 / 0.0427 / 0.0786`. The distributions do not overlap — the worst rep here is still\nbetter than the best baseline rep.\n\n**No source-side slowdown.** The concern that holding the manager lock slows the scheduler\ndoes not show up: on the busy source, request latency was 1.4174 s (baseline) vs 1.4039 s\n(this PR), and the populate-request mean 1.7056 s vs 1.7100 s. The background load\ngenerator completed 158 vs 153 requests over comparable windows, a ~3% difference that is\nwithin single-run noise and not corroborated by either latency measure. A dedicated\n`vllm bench serve` throughput comparison is still worth running before merge; I did not\nrun one.\n\n### On #58113\n\nArm B is #58113 at `b8ea135c71`, measured on the same pods in the same session. It lands\n**between** baseline and this PR: busy-warm 0.129 s vs baseline 0.220 s vs 0.0534 s here.\n\nThat is what the release-point bug predicts. #58113's thread is not dead — on steps that\nbuild no store jobs the lock is released normally, so it recovers some of the win (1.7x\nover baseline). But on any step that does build store jobs, `prepare_store` re-acquires\nafter `on_schedule_end` released and nothing releases it again, so the lock is held across\n`future.result()` and the thread is shut out for exactly that step. Under load most steps\nbuild store jobs, which is why it recovers only about a third of what is available (4.1x\nover baseline here, 2.4x over #58113).\n\nI am reporting this as *consistent with* the bug rather than as direct proof of the\nmechanism; the mechanism itself is demonstrated by the unit test, which observes the call\norder `['on_schedule_end', 'prepare_store']` without the reorder in commit 1.\n\n### Caveat on absolute magnitudes\n\nThese numbers are much smaller than the issue's 13.6 s, and deliberately so: this is\nLlama-3.2-1B on a single H200 per side, not GLM-5.2-FP8 on DP8. What reproduces here is the\n**mechanism and its scaling** — the consumer's lookup delay is proportional to the source's\nstep time under baseline, and roughly independent of it with the control thread. The issue's\n13.6 s came from a far slower source; the ratio, not the absolute, is what transfers.\n\nRaw per-rep JSON for all six runs is available on request.\n\n## NIXL thread-safety: checked, and it holds\n\nChecked against the **NIXL 1.4.1** sources (`ai-dynamo/nixl` at tag `v1.4.1`), which is the\ndeployed version. **This corrects an earlier version of this description**, which said\n`NIXL_THREAD_SYNC_RW` does not exist and that the config offers no way to request a sync\nmode. Both statements were true of 0.6.0, which is what I had installed; neither is true of\n1.4.1.\n\n**Serialized use from a second thread is supported.** `makeMtType`\n(`src/plugins/ucx/ucx_utils.cpp:383-392`) returns only `WORKER` or `SINGLE`, never\n`CONTEXT` -- and `mt_mode_t::CONTEXT` is the only value that maps to\n`UCS_THREAD_MODE_SINGLE` (`ucx_utils.cpp:476-492`), the one UCX mode with creator-thread\naffinity. Grepping confirms `CONTEXT` never appears as a produced value, only in switch\narms. So the weakest mode NIXL ever requests is `UCS_THREAD_MODE_SERIALIZED`, which UCX\ndocuments as *\"Multiple threads can access, but only one at a time\"* -- precisely this\ndesign. And because `enable_prog_thread` defaults on for this transport, it actually gets\n`UCS_THREAD_MODE_MULTI`, with a hard library-support check that throws if unavailable.\n\n**The manager lock is load-bearing, not redundant.** With `syncMode = NONE` -- which is what\nthis transport gets, since it sets neither `enable_listen` nor `sync_mode` -- NIXL's internal\nagent lock compiles to no-ops (`src/core/sync.h:36-39`), leaving ~23 agent entry points\nunguarded over shared, non-atomic containers. The external mutex is therefore the only\nprotection, and it must cover every entry point plus the lifetime of handles passed between\ncalls. It does.\n\nTwo caveats worth recording:\n\n- NIXL binds a shared UCX worker per calling thread (`tlsSharedWorkerMap`,\n  `ucx_backend.cpp:821-825`). That is harmless only while there is exactly one shared\n  worker, which holds for this configuration (`num_workers` unset ⇒ `numSharedWorkers_ == 1`,\n  so every thread maps to worker 0) but would not if a `num_workers` UCX backend param were\n  ever set. The chosen worker also travels on the request handle rather than being\n  re-derived per call, so a transfer prepped on one thread and polled on another still uses\n  the same worker.\n- 1.4.1 *does* accept an explicit `sync_mode` (including `NIXL_THREAD_SYNC_RW`, value 2),\n  which would make NIXL's own locking real as belt-and-braces, and is what every upstream\n  multi-threaded test uses. I have not added it, because the parameter does not exist on\n  0.6.0 and passing it unconditionally would break older environments; it needs the same\n  kind of version gate `capture_telemetry` already needs. Worth a follow-up.\n\nHonest limit: `~/nixl` is a 1.4.1 source checkout, not a build, and only 0.6.0 is installed\nlocally, so every 1.4.1 claim above is static source reading rather than runtime\nintrospection. A runtime confirmation (log the thread mode `ucp_worker_query` actually\ngrants, or run the two-thread pattern under TSan) would close the remaining gap. The\nend-to-end matrix above ran on the deployed 1.4.1 across ~14k P2P chunk fetches with no\ntransfer failures, which is evidence but not a substitute.\n\npyzmq is fine under strict serialization: libzmq permits migrating a socket between threads\ngiven a full memory barrier, which lock acquire/release provides, and nothing is bound\nthread-locally at socket creation. The one hazard is `zmq_ctx_destroy` racing a socket call,\nwhich the shutdown ordering handles.\n\n## AI assistance\n\nAI assistance was used for this change (Claude Code): the code-path analysis, the implementation, and the tests. I am reviewing every changed line. The two items that were blocking this leaving draft are now done: the 4-case matrix has been run on H200 hardware (results above) and the NIXL question has been checked against 1.4.1. What remains before undraft is a dedicated throughput comparison and a human pass over the diff.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 16,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--58168.org.readthedocs.build/en/58168/",
+            "createdAt": "2026-09-22T15:10:28Z",
+            "updatedAt": "2026-09-22T15:10:28Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#issuecomment-5778977996"
+          },
+          {
+            "author": {
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @liranschour.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-07T07:56:20Z",
+            "updatedAt": "2026-10-07T07:56:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#issuecomment-6033574413"
+          },
+          {
+            "author": {
+              "login": "nilig"
+            },
+            "body": "On my reproducer this PR fixes #55179: with a busy source rank the P2P lookup delay goes from 2.8-2.9 s to 0.6-0.7 s, the same value as with an idle source, and nothing else in the run got worse.\n\nI ran this PR against the #55179 reproducer on a current nightly (`e9757321`, nixl 1.4.1), with the PR's files at 2fdfd08acd applied on top of the same image for the second arm; the current head 271f52e299 only merges main and carries the same PR diff (an earlier run at a4616025a7 gave the same busy-row numbers). Cell: GLM-5.2-FP8, two prefill pods and two decode pods, DP=8 per pod, 8 x H200 each, CPU offload tier 64 GiB per rank, P2P tier over UCX. Each case seeds a prefix on one prefill rank, then sends a follow-up to a different prefill rank that pulls it over P2P; \"busy\" means three 115,200-token requests were submitted to the source rank (the one that serves the lookup) 8 s before the follow-up; the source gauge showed two running when the follow-up was sent. The number is the destination rank's `kv_offload_lookup_async_delay_seconds_sum` delta for that one follow-up.\n\n| case | nightly | nightly + this PR |\n|---|---|---|\n| first P2P pull after boot, idle source | 25.52 s (TTFT 33.5 s) | 25.17 s (TTFT 33.2 s) |\n| idle, warm pair x2 | 0.61 / 0.63 s | 0.71 / 0.68 s |\n| busy, warm pair x2 | 2.88 / 2.83 s | 0.68 / 0.75 s |\n| busy, cold pair | 2.89 s | 0.77 s |\n| idle, cold pair | 0.84 s | 0.72 s |\n\nThe busy rows land in the idle band with the PR, and it matches what I measured for the poller approach in #57165, so I think #57165 can be closed in favor of this one. Decode-side TPOT on the probed decode rank (`request_time_per_output_token_seconds` sum/count delta, 5 requests of 256 output tokens per arm) was 22.60 ms without and 22.17 ms with the PR (23.48 ms in the earlier run); at n=5 I would not read that as either equal or a regression, only as nothing gross. Every prefill engine logged `KV offload control-plane thread started for tier(s) ['p2p'], interval 0.001s`, so the thread was active during the cases.\n\nThe first pull after boot is a different problem (#57133: the destination rank's own first dummy batch JIT) and this PR does not change it: 25.5 s without, 25.2 s with, both on fresh nodes.\n\nOne row I cannot interpret yet: a gateway-routed follow-up with all eight source ranks loaded waited 9.7 s on its lookup with the PR (TTFT 11.8 s, 102K tokens pulled). n=1, no counterpart without the PR on this nightly, no JIT on the destination at that time, no lock-timeout warning from the control-plane thread. I will look at it separately; the direct-injection rows above do not show it.\n\nOne note on the setup, in case it matters for reproducing: prefill ran with `--compilation-config '{\"cudagraph_mode\":\"NONE\"}'` on both arms because this nightly captures CUDA graphs for `deepep_high_throughput` when breakable graphs are auto-enabled and crashes at startup (same early return as #53030).\n",
+            "createdAt": "2026-10-09T16:38:34Z",
+            "updatedAt": "2026-10-09T16:38:34Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#issuecomment-6085130791"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWqzuic=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "271f52e299704e5c73b245cc6597c91baca90a34",
+      "headRepository": {
+        "nameWithOwner": "liranschour/vllm"
+      },
+      "merged": false,
+      "number": 58168,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "orozery"
+            },
+            "body": "cc @mkhazraee wdyt?\nThis should help kvcr tier as well.\nThe purpose is to assure `serve_external_requests` is called more frequently (e.g. 1ms).\nToday it is only called from the main thread, which may get to every O(s) if the model runner is busy.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "orozery"
+                  },
+                  "body": "Let's replace lock/unlock/locked with a single `lock` context manager property.",
+                  "createdAt": "2026-09-24T08:40:25Z",
+                  "line": null,
+                  "originalLine": 274,
+                  "path": "vllm/v1/kv_offload/base.py",
+                  "updatedAt": "2026-09-24T11:29:03Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091587909"
+                },
+                {
+                  "author": {
+                    "login": "orozery"
+                  },
+                  "body": "I think we should remove this.\nThe default should be no lock.\nThe CPU tier will implement its own threading lock.",
+                  "createdAt": "2026-09-24T08:41:21Z",
+                  "line": null,
+                  "originalLine": 246,
+                  "path": "vllm/v1/kv_offload/base.py",
+                  "updatedAt": "2026-09-24T11:29:03Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091595859"
+                },
+                {
+                  "author": {
+                    "login": "orozery"
+                  },
+                  "body": "spec.py imports this, and it's a user-facing default.\nSo it should be public.\nWe should check if this is the best place here.",
+                  "createdAt": "2026-09-24T08:43:36Z",
+                  "line": null,
+                  "originalLine": 66,
+                  "path": "vllm/v1/kv_offload/tiering/manager.py",
+                  "updatedAt": "2026-09-24T11:29:03Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091612881"
+                },
+                {
+                  "author": {
+                    "login": "orozery"
+                  },
+                  "body": "How about we rename `serve_control_plane` / `_control_plane_interval_s` to `poll_tiers()` / `tier_poll_interval_s`?",
+                  "createdAt": "2026-09-24T09:19:08Z",
+                  "line": null,
+                  "originalLine": 362,
+                  "path": "vllm/v1/kv_offload/tiering/manager.py",
+                  "updatedAt": "2026-09-24T11:29:03Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091940973"
+                },
+                {
+                  "author": {
+                    "login": "orozery"
+                  },
+                  "body": "how about `serves_external_requests`?",
+                  "createdAt": "2026-09-24T11:26:40Z",
+                  "line": null,
+                  "originalLine": 213,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/manager.py",
+                  "updatedAt": "2026-09-24T11:29:03Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4093051896"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0yNFQxMToyNjo0MFrO8_cD-A==",
+                "hasNextPage": false
+              },
+              "totalCount": 5
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-24T11:29:02Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5301911001"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "liranschour"
+                  },
+                  "body": "Done",
+                  "createdAt": "2026-10-01T07:31:53Z",
+                  "line": null,
+                  "originalLine": 274,
+                  "path": "vllm/v1/kv_offload/base.py",
+                  "updatedAt": "2026-10-01T07:31:53Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4152901820"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wMVQwNzozMTo1M1rO94hAvA==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-01T07:31:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376243699"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "liranschour"
+                  },
+                  "body": "Done",
+                  "createdAt": "2026-10-01T07:31:56Z",
+                  "line": null,
+                  "originalLine": 246,
+                  "path": "vllm/v1/kv_offload/base.py",
+                  "updatedAt": "2026-10-01T07:31:56Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4152902293"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wMVQwNzozMTo1NlrO94hClQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-01T07:31:56Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376244358"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "liranschour"
+                  },
+                  "body": "Made it public as DEFAULT_TIER_POLL_INTERVAL_S.\r\nspec.py imports it from there as the fallback for the user-facing tier_poll_interval_s key.",
+                  "createdAt": "2026-10-01T07:46:27Z",
+                  "line": null,
+                  "originalLine": 66,
+                  "path": "vllm/v1/kv_offload/tiering/manager.py",
+                  "updatedAt": "2026-10-01T07:46:27Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4153023741"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wMVQwNzo0NjoyN1rO94oc_Q==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-01T07:46:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376410902"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "liranschour"
+                  },
+                  "body": "Done",
+                  "createdAt": "2026-10-01T07:46:36Z",
+                  "line": null,
+                  "originalLine": 362,
+                  "path": "vllm/v1/kv_offload/tiering/manager.py",
+                  "updatedAt": "2026-10-01T07:46:37Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4153024941"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wMVQwNzo0NjozNlrO94ohrQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-01T07:46:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376412638"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "liranschour"
+                  },
+                  "body": "Renamed",
+                  "createdAt": "2026-10-01T08:02:30Z",
+                  "line": null,
+                  "originalLine": 213,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/manager.py",
+                  "updatedAt": "2026-10-01T08:02:30Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4153150128"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0wMVQwODowMjozMFrO94wKsA==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-01T08:02:30Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376566380"
+          },
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-01T08:25:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376783051"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wMVQwODoyNTo0Nlq0MjAyNi0xMC0wMVQwODoyNTo0NlrPAAAAAUB7Mss=",
+          "hasNextPage": false
+        },
+        "totalCount": 7
+      },
+      "state": "OPEN",
+      "title": "[KV Offload] Expose OffloadingManager.lock()/unlock() and service the tiering control plane off the scheduler thread",
+      "updatedAt": "2026-10-09T16:38:34Z",
+      "url": "https://github.com/vllm-project/vllm/pull/58168"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "b49c921a27083c25c16f308be1326055dbc87bbf"
+    },
+    "body": "## Purpose\n\nTwo things, in priority order.\n\n**1. Expose exclusive access to an `OffloadingManager` as a public API.** `lock()` / `unlock()`, plus a `locked()` helper, guard a manager's whole state subtree: the manager, the tiers it composes, and any front-end state those tiers own. Manager methods never acquire it themselves, so a caller holds it across as many operations as its own invariants need. That property is the point — several manager operations only make sense in sequence. `prepare_load()` documents that its keys are offloaded, a fact `lookup()` established one hook earlier, so a caller has to be able to span both. Internal per-method locking cannot offer that.\n\n**2. Use it for the first case that needs it** (#55179). The `p2p` secondary tier answers a remote peer, which the engine does not drive, so its control plane only advanced from `on_schedule_end`. A peer's lookup or fetch therefore waited for a model-step boundary — seconds on a saturated rank, gating a transfer of well under one. Tiers now opt in with `needs_control_plane_thread`, and `TieringOffloadingManager` runs one thread that polls them and lets them serve between steps.\n\n## Not a duplicate of the open PRs on #55179\n\nThis overlaps open work and I want that on the record rather than buried.\n\n| PR | Author | Driver | Locking |\n|---|---|---|---|\n| **this** | me | thread owned by `TieringOffloadingManager` | **public `lock()`/`unlock()` on `OffloadingManager`, held by callers** |\n| #58113 | me | same thread, same sweep | private `_enter_step`/`_exit_step`/`_observation_lock` + `*_unlocked` variants |\n| #57165 | @nilig | `EngineCore` poller thread | new `KVConnectorBase_V1.poll_pending_work` |\n| #55962 | @Etelis | `EngineCore` + connector base API + executor changes | new base-API hook |\n| #57139 | me | — | the separate async peer-registration half, not this |\n\n**This supersedes my own #58113, which I will close.** The difference is not cosmetic:\n\n- **#58113 does not expose an API.** It takes the lock inside the manager's public methods, which forces a `*_unlocked` variant of every method `_SecondaryTierFacingParent` can re-enter (`lookup`, `on_new_request`, `create_store_job`, `on_request_finished`, `reset_cache`) because the parent handle's caller already holds it. That duplication is most of its `+393` lines in `manager.py`, and it is precisely what prevents an outside caller from saying \"hold this across several operations.\" Moving the lock to the caller removes every one of those variants.\n- **#58113 releases at `on_schedule_end`, which is not the end of the step.** `build_connector_meta` called `on_schedule_end` ~40 lines early, before `_build_store_jobs` → `prepare_store` (which evicts) and before `on_request_finished`. So its `prepare_store` re-acquired via `_enter_step()` and nothing released it: on every step that builds store jobs — the common case under load — the lock was held across `future.result()`, starving the control thread in exactly the window the change exists to exploit. That plausibly explains #58113's own \"parity-within-noise\" result, which was measured through the bug, and that conclusion should be re-tested.\n\nRelative to #57165 / #55962: same goal, but no new `KVConnectorBase_V1` hook and no `EngineCore` or executor changes. In #55179 @nilig asked for a read on \"a thread touching the connector from inside `EngineCore`, even phase-exclusive, versus a control thread owned by the tier\" — this is a working implementation of the second option, offered as input to that question. If maintainers prefer either existing PR, close this one.\n\n## Changes\n\nCommit 1, **`on_schedule_end` runs last** — independent of all locking, reviewable on its own. Its docstring already claimed \"called once at the end of each scheduler step\"; it was called ~40 lines early. Moving it makes the contract true and gives callers a sound release point. Two ordering consequences, both handled: `prepare_store`'s poll becomes unconditional (the per-step gate was previously reset mid-`build_connector_meta`, which is where its fresh completion data came from — without this, eviction decisions would run on data up to a step stale), and `_flush_pending_cascades` now re-parks keys this step parked, which is safe because `_maybe_finalize_request` holds off while `pending_cascade_keys` is non-empty.\n\nCommit 2, **the API and its consumer**.\n\n`OffloadingConnectorScheduler` holds one region per engine step, opened by the first manager-touching hook and closed at the end of `build_connector_meta`, so the manager is free while the engine runs the model. Hooks outside `schedule()` take a short region.\n\nTwo placements are load-bearing and easy to get wrong:\n\n- **`has_pending_push_work` must use the short region.** `EngineCore.step()` returns early at `core.py:597` when `has_requests()` is false, so a step-scoped acquire there would never reach the release and would hold the manager for good — the state an idle engine settles into. It does still need the lock: `has_pending_work()` iterates `_req_state` while the control thread may insert or delete via `parent.on_new_request` / `on_request_finished`.\n- **`take_events` drains inside the region.** `manager.take_events()` is a generator whose backing list is cleared once exhausted, so iterating it lazily both pinned the manager for the consumer's duration and discarded events a concurrent `complete_write` appended, unpublished. It stays a generator so the caller's truthiness check at `sched/scheduler.py` is unchanged.\n\nThe thread yields unconditionally *after* `unlock()`, which is what bounds the scheduler's wait to one round — Python locks are not fair, so a release-then-reacquire loop could starve it. A failed round is logged, not fatal, and `on_schedule_end` still serves every tier, so the fallback is per-step servicing. `_process_finished_jobs` takes a tier filter so a round does not drag tiers that expect the scheduler thread. `shutdown()` stops and joins the thread before any tier teardown, since closing a transport under a live round can end the process rather than raise.\n\nConfig: `control_plane_interval_s` in `kv_connector_extra_config`, default 1 ms, `0` disables the thread and restores per-step servicing.\n\nDocstrings that claimed single-threaded tier access are corrected, including the eviction-race argument in `_pin_and_register_hits` — which still holds, now because `serve_external_requests` runs inside one hold of the lock. `async_lookup.py`'s \"owned exclusively by the scheduler thread\" claim was outright false once `parent.lookup` can fan out to `fs.lookup` from the control thread.\n\n## Test results\n\n```\npytest tests/v1/kv_offload/tiering/ tests/v1/kv_connector/unit/offloading_connector/ -q\n  901 passed, 12 skipped in 295s      (baseline on this tree: 889 passed, 12 skipped)\n\npytest tests/v1/kv_offload/tiering/p2p/ -q\n  217 passed in 66s                   (subset of the above; re-run on its own)\n\npre-commit: all hooks pass, including ruff, ruff-format, mypy, and check-test-tethering.\n```\n\nNote for reviewers: a whole-directory run of `tests/v1/kv_offload/` produces a large number of CUDA IMA errors that are **pre-existing and unrelated** (`tests/v1/kv_offload/cpu/` poisons the rest of the session). Run the subdirectories separately.\n\n12 new tests. The two that matter most were both verified to fail without the change, not just to pass with it:\n\n- `test_on_schedule_end_is_the_last_manager_call_of_a_step` — without the reorder it observes `['on_schedule_end', 'prepare_store']`. This is the check #58113's suite lacks, because its `_step()` helper drives `on_schedule_end` with no following `prepare_store`.\n- `test_control_thread_and_scheduler_never_overlap` — with `lock()`/`unlock()` stubbed to no-ops it detects 86 overlaps. It also asserts both threads made progress, so neither a thread that never runs nor one that starves the scheduler passes it.\n\nI wrote and then **deleted** a third test (\"no eviction between a served lookup and its pin\") after finding it still passed with the lock neutered: LRU keeps evicting the fresh keys rather than the constantly-looked-up hit keys, so it could never fail. The overlap test is the real guard for that property, and a test that cannot fail is worse than no test.\n\n## Model evaluation — the 4-case matrix from #55179\n\nRun on two H200 pods, Llama-3.2-1B, `--enforce-eager`, `--block-size 16`, 96 GiB CPU\nprimary tier, `secondary_tiers: [{\"type\": \"p2p\"}]`, `max-model-len 32768`.\n\n**Topology.** Source = the pod holding the KV in its CPU offload tier. Consumer = the\nother pod, which probes the source over P2P (`remote_kv_source`) and fetches. Every\nmeasured fetch uses a freshly generated ~27k-token prompt that is populated on the source\nfirst, so nothing hits a GPU prefix cache and the fetch is real work: each one moved\n**~1720 chunks** (`kv_offload_tiering_chunk_hits` delta), i.e. the full prefix.\n\n**Busy** = source saturated with 8 concurrent ~27k-token prefills. That took its\nrequest latency from **0.018 s idle to 1.40 s**, so the control plane really is gated\nbehind ~1.4 s of model work — the same regime as the issue's report.\n\n**Cold** = no P2P session yet. A session lives as long as the engine, so only the first\nfetch after a restart is genuinely cold; both pods were restarted between every phase and\nthe cold fetch measured first.\n\n**Signal** = the consumer's `vllm:kv_offload_lookup_async_delay_seconds` delta for the\nmeasured request (one observation per fetch). Warm figures are the mean of 3 reps.\n\n| case | A: baseline (`7b077f36a8`) | B: #58113 | C: this PR |\n|---|---|---|---|\n| idle, cold | 0.177 s | — | **0.133 s** |\n| idle, warm | 0.0455 s | — | **0.0457 s** |\n| busy, cold | 0.440 s | 0.289 s | **0.155 s** |\n| busy, warm | 0.220 s | 0.129 s | **0.0534 s** |\n\n**The per-step gating penalty, which is what this PR removes:**\n\n| arm | idle-warm | busy-warm | penalty |\n|---|---|---|---|\n| A: baseline | 0.0455 s | 0.2196 s | **4.83x** |\n| C: this PR | 0.0457 s | 0.0534 s | **1.17x** |\n\nSaturating the source costs baseline 4.8x on the consumer's lookup delay. With the control\nthread it costs 1.17x — the stall is essentially gone, and a busy source now behaves like\nan idle one.\n\nSupporting numbers on busy-warm: per-chunk tiering delay\n(`kv_offload_tiering_lookup_async_delay_seconds`) 0.100 s → 0.0174 s (5.8x), and end-to-end\nTTFT for the fetch 0.310 s → 0.144 s (2.2x). Idle is parity within noise in every metric,\nas expected — there is no model step to hide behind.\n\nPer-rep spread, busy-warm: baseline `0.1929 / 0.2532 / 0.2127`, this PR\n`0.0388 / 0.0427 / 0.0786`. The distributions do not overlap — the worst rep here is still\nbetter than the best baseline rep.\n\n**No source-side slowdown.** The concern that holding the manager lock slows the scheduler\ndoes not show up: on the busy source, request latency was 1.4174 s (baseline) vs 1.4039 s\n(this PR), and the populate-request mean 1.7056 s vs 1.7100 s. The background load\ngenerator completed 158 vs 153 requests over comparable windows, a ~3% difference that is\nwithin single-run noise and not corroborated by either latency measure. A dedicated\n`vllm bench serve` throughput comparison is still worth running before merge; I did not\nrun one.\n\n### On #58113\n\nArm B is #58113 at `b8ea135c71`, measured on the same pods in the same session. It lands\n**between** baseline and this PR: busy-warm 0.129 s vs baseline 0.220 s vs 0.0534 s here.\n\nThat is what the release-point bug predicts. #58113's thread is not dead — on steps that\nbuild no store jobs the lock is released normally, so it recovers some of the win (1.7x\nover baseline). But on any step that does build store jobs, `prepare_store` re-acquires\nafter `on_schedule_end` released and nothing releases it again, so the lock is held across\n`future.result()` and the thread is shut out for exactly that step. Under load most steps\nbuild store jobs, which is why it recovers only about a third of what is available (4.1x\nover baseline here, 2.4x over #58113).\n\nI am reporting this as *consistent with* the bug rather than as direct proof of the\nmechanism; the mechanism itself is demonstrated by the unit test, which observes the call\norder `['on_schedule_end', 'prepare_store']` without the reorder in commit 1.\n\n### Caveat on absolute magnitudes\n\nThese numbers are much smaller than the issue's 13.6 s, and deliberately so: this is\nLlama-3.2-1B on a single H200 per side, not GLM-5.2-FP8 on DP8. What reproduces here is the\n**mechanism and its scaling** — the consumer's lookup delay is proportional to the source's\nstep time under baseline, and roughly independent of it with the control thread. The issue's\n13.6 s came from a far slower source; the ratio, not the absolute, is what transfers.\n\nRaw per-rep JSON for all six runs is available on request.\n\n## NIXL thread-safety: checked, and it holds\n\nChecked against the **NIXL 1.4.1** sources (`ai-dynamo/nixl` at tag `v1.4.1`), which is the\ndeployed version. **This corrects an earlier version of this description**, which said\n`NIXL_THREAD_SYNC_RW` does not exist and that the config offers no way to request a sync\nmode. Both statements were true of 0.6.0, which is what I had installed; neither is true of\n1.4.1.\n\n**Serialized use from a second thread is supported.** `makeMtType`\n(`src/plugins/ucx/ucx_utils.cpp:383-392`) returns only `WORKER` or `SINGLE`, never\n`CONTEXT` -- and `mt_mode_t::CONTEXT` is the only value that maps to\n`UCS_THREAD_MODE_SINGLE` (`ucx_utils.cpp:476-492`), the one UCX mode with creator-thread\naffinity. Grepping confirms `CONTEXT` never appears as a produced value, only in switch\narms. So the weakest mode NIXL ever requests is `UCS_THREAD_MODE_SERIALIZED`, which UCX\ndocuments as *\"Multiple threads can access, but only one at a time\"* -- precisely this\ndesign. And because `enable_prog_thread` defaults on for this transport, it actually gets\n`UCS_THREAD_MODE_MULTI`, with a hard library-support check that throws if unavailable.\n\n**The manager lock is load-bearing, not redundant.** With `syncMode = NONE` -- which is what\nthis transport gets, since it sets neither `enable_listen` nor `sync_mode` -- NIXL's internal\nagent lock compiles to no-ops (`src/core/sync.h:36-39`), leaving ~23 agent entry points\nunguarded over shared, non-atomic containers. The external mutex is therefore the only\nprotection, and it must cover every entry point plus the lifetime of handles passed between\ncalls. It does.\n\nTwo caveats worth recording:\n\n- NIXL binds a shared UCX worker per calling thread (`tlsSharedWorkerMap`,\n  `ucx_backend.cpp:821-825`). That is harmless only while there is exactly one shared\n  worker, which holds for this configuration (`num_workers` unset ⇒ `numSharedWorkers_ == 1`,\n  so every thread maps to worker 0) but would not if a `num_workers` UCX backend param were\n  ever set. The chosen worker also travels on the request handle rather than being\n  re-derived per call, so a transfer prepped on one thread and polled on another still uses\n  the same worker.\n- 1.4.1 *does* accept an explicit `sync_mode` (including `NIXL_THREAD_SYNC_RW`, value 2),\n  which would make NIXL's own locking real as belt-and-braces, and is what every upstream\n  multi-threaded test uses. I have not added it, because the parameter does not exist on\n  0.6.0 and passing it unconditionally would break older environments; it needs the same\n  kind of version gate `capture_telemetry` already needs. Worth a follow-up.\n\nHonest limit: `~/nixl` is a 1.4.1 source checkout, not a build, and only 0.6.0 is installed\nlocally, so every 1.4.1 claim above is static source reading rather than runtime\nintrospection. A runtime confirmation (log the thread mode `ucp_worker_query` actually\ngrants, or run the two-thread pattern under TSan) would close the remaining gap. The\nend-to-end matrix above ran on the deployed 1.4.1 across ~14k P2P chunk fetches with no\ntransfer failures, which is evidence but not a substitute.\n\npyzmq is fine under strict serialization: libzmq permits migrating a socket between threads\ngiven a full memory barrier, which lock acquire/release provides, and nothing is bound\nthread-locally at socket creation. The one hazard is `zmq_ctx_destroy` racing a socket call,\nwhich the shutdown ordering handles.\n\n## AI assistance\n\nAI assistance was used for this change (Claude Code): the code-path analysis, the implementation, and the tests. I am reviewing every changed line. The two items that were blocking this leaving draft are now done: the 4-case matrix has been run on H200 hardware (results above) and the NIXL question has been checked against 1.4.1. What remains before undraft is a dedicated throughput comparison and a human pass over the diff.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 16,
+    "head": {
+      "repo": {
+        "full_name": "liranschour/vllm"
+      },
+      "sha": "271f52e299704e5c73b245cc6597c91baca90a34"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/58168",
+    "merged": false,
+    "number": 58168,
+    "state": "open",
+    "title": "[KV Offload] Expose OffloadingManager.lock()/unlock() and service the tiering control plane off the scheduler thread",
+    "updated_at": "2026-10-09T16:38:34Z"
+  },
+  "files": [
+    {
+      "additions": 14,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/docs%2Ffeatures%2Fkv_offloading_usage.md",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/docs%2Ffeatures%2Fkv_offloading_usage.md?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 0,
+      "filename": "docs/features/kv_offloading_usage.md",
+      "patch": "@@ -108,6 +108,7 @@ vllm serve <model> \\\n | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |\n | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |\n | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |\n+| `tier_poll_interval_s` | no | `0.001` | multi-tier | Pause between control-plane rounds for tiers that must be serviced between engine steps (currently `p2p`). See [Threading model](#threading-model). Set to `0` to disable the thread and service those tiers once per engine step instead. |\n | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |\n | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |\n | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |\n@@ -150,6 +151,19 @@ The filesystem and object-store tiers can publish hash-only `BlockStored` KV eve\n \n Set the optional `locality` tier field to `LOCAL` or `REMOTE` to describe the tier's storage location relative to the publishing vLLM instance. `LOCAL` marks storage local to that instance, while `REMOTE` marks storage that is not local to it. When the setting is omitted, locality is unspecified. vLLM does not infer it from the tier type, so an `obj` tier is not implicitly `REMOTE`. A KV event includes `locality` only when the tier explicitly configures it. This metadata describes the tier property without implying that a consumer can already route requests to its blocks.\n \n+### Threading model\n+\n+Tier methods run in the scheduler process, under the tiering manager's lock, so they are never entered concurrently. They are not always called from the same thread, though.\n+\n+Most tiers only ever see the scheduler thread, which holds the lock for the length of one engine step. A tier whose counterpart is not driven by the engine — the `p2p` tier, answering a remote peer — needs servicing while the engine is busy running the model, because otherwise a peer's lookup or fetch waits for the next step boundary. On a saturated rank that wait can be seconds, dwarfing the transfer it gates. Such tiers set `serves_external_requests`, and the tiering manager runs one thread that, once per `tier_poll_interval_s`, polls them for finished jobs and lets them serve external requests. A tier that implements `serve_external_requests()` without setting the flag is served once per engine step only.\n+\n+Two consequences worth knowing:\n+\n+- Any tier can be reached from that thread indirectly, because serving a peer looks keys up through the tiering manager, which fans out to the other tiers. Tier state must therefore not assume a particular thread, only that the manager lock is held.\n+- Work the thread deliberately leaves alone is batched per step: a promotion it initiates is submitted at the next `on_schedule_end()`, not immediately.\n+\n+Setting `tier_poll_interval_s` to `0` disables the thread; opted-in tiers then get serviced once per engine step, as they were before it existed.\n+\n ### Filesystem (FS)\n \n The filesystem tier (`type: \"fs\"`) writes blocks to a filesystem directory.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/docs%2Ffeatures%2Fkv_offloading_usage.md",
+      "sha": "5b72abf762c191f5229765062427e36aec02f699",
+      "status": "modified"
+    },
+    {
+      "additions": 123,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/tests%2Fv1%2Fkv_connector%2Funit%2Foffloading_connector%2Ftest_scheduler.py",
+      "changes": 123,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Foffloading_connector%2Ftest_scheduler.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py",
+      "patch": "@@ -1017,6 +1017,129 @@ def test_scheduler_reports_lookup_sync_delay(request_runner):\n     assert reduced[f\"{_ConnectorMetricName.LOOKUP_SYNC_DELAY}_sum\"] > 0\n \n \n+def test_on_schedule_end_is_the_last_manager_call_of_a_step(request_runner):\n+    \"\"\"on_schedule_end must run after every other manager call of the step.\n+\n+    Callers bound a step's exclusive access to the manager by releasing at\n+    on_schedule_end, so anything issued after it — notably prepare_store, which\n+    evicts — would fall outside that window.\n+    \"\"\"\n+    block_size = 4\n+    runner = request_runner(\n+        block_size=block_size,\n+        num_gpu_blocks=8,\n+        async_scheduling=False,\n+    )\n+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (\n+        generate_store_output([])\n+    )\n+\n+    connector_scheduler = runner.connector_scheduler\n+    build_meta = connector_scheduler.build_connector_meta\n+    windows: list[list[str]] = []\n+\n+    def spy(scheduler_output):\n+        first = len(runner.manager.mock_calls)\n+        meta = build_meta(scheduler_output)\n+        # Entering and exiting manager.lock brackets the step; only the state\n+        # operations it guards are ordered relative to on_schedule_end.\n+        windows.append(\n+            [\n+                name\n+                for name, _, _ in runner.manager.mock_calls[first:]\n+                if not name.startswith(\"lock.\")\n+            ]\n+        )\n+        return meta\n+\n+    connector_scheduler.build_connector_meta = spy\n+\n+    runner.new_request(token_ids=[0] * (block_size * 2))\n+    runner.run(decoded_tokens=[EOS_TOKEN_ID])\n+\n+    assert windows, \"build_connector_meta was never called\"\n+    assert any(\"prepare_store\" in w for w in windows), (\n+        \"step must exercise the calls that follow on_schedule_end today\"\n+    )\n+    assert any(\"on_request_finished\" in w for w in windows)\n+    for names in windows:\n+        assert names[-1] == \"on_schedule_end\", (\n+            f\"on_schedule_end must be the last manager call of a step, got {names}\"\n+        )\n+\n+\n+def test_step_releases_the_manager_before_the_model_runs(request_runner):\n+    \"\"\"The step-scoped region must close when build_connector_meta returns.\n+\n+    Everything after it -- the model future above all -- runs with the manager\n+    free, which is the only window another thread has to use it.\n+    \"\"\"\n+    runner = request_runner(\n+        block_size=4,\n+        num_gpu_blocks=10,\n+        async_scheduling=False,\n+    )\n+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (\n+        generate_store_output([])\n+    )\n+\n+    runner.new_request(token_ids=[1] * 4)\n+    runner.run(decoded_tokens=[EOS_TOKEN_ID])\n+\n+    scheduler = runner.connector_scheduler\n+    assert scheduler._step_region is None\n+    lock = runner.manager.lock\n+    assert lock.__enter__.call_count > 0\n+    assert lock.__enter__.call_count == lock.__exit__.call_count\n+\n+\n+def test_has_pending_push_work_does_not_open_the_step_region(request_runner):\n+    \"\"\"It must take a short region, never the step-scoped one.\n+\n+    The engine asks this before schedule() and returns early when the answer is\n+    False, so a step-scoped acquire here would never reach the release in\n+    build_connector_meta and would hold the manager for good.\n+    \"\"\"\n+    runner = request_runner(\n+        block_size=4,\n+        num_gpu_blocks=10,\n+        async_scheduling=False,\n+    )\n+    scheduler = runner.connector_scheduler\n+    runner.manager.has_pending_work.return_value = False\n+\n+    assert scheduler.has_pending_push_work() is False\n+    assert scheduler._step_region is None\n+    lock = runner.manager.lock\n+    assert lock.__enter__.call_count == lock.__exit__.call_count\n+\n+\n+def test_take_events_drains_the_manager_inside_the_region(request_runner):\n+    \"\"\"take_events must not hold the manager across its own iteration.\n+\n+    manager.take_events() is a generator whose backing list is cleared once\n+    exhausted, so draining it lazily would both pin the manager for as long as\n+    the consumer takes and lose events appended in the meantime.\n+    \"\"\"\n+    runner = request_runner(\n+        block_size=4,\n+        num_gpu_blocks=10,\n+        async_scheduling=False,\n+    )\n+    scheduler = runner.connector_scheduler\n+    runner.manager.take_events.return_value = iter(())\n+    runner.manager.reset_mock()\n+\n+    events = list(scheduler.take_events())\n+\n+    assert events == []\n+    assert runner.manager.take_events.call_count == 1\n+    assert scheduler._step_region is None\n+    lock = runner.manager.lock\n+    assert lock.__enter__.call_count == 1\n+    assert lock.__exit__.call_count == 1\n+\n+\n def test_scheduler_reports_lookup_async_delay_on_resolve(request_runner):\n     \"\"\"A deferred lookup reports its async delay once it resolves.\"\"\"\n     runner = request_runner(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/tests%2Fv1%2Fkv_connector%2Funit%2Foffloading_connector%2Ftest_scheduler.py",
+      "sha": "48b6982d76fd595e5d9c74a9833e7cee332d0b49",
+      "status": "modified"
+    },
+    {
+      "additions": 406,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/tests%2Fv1%2Fkv_offload%2Ftiering%2Ftest_control_plane_thread.py",
+      "changes": 406,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Ftiering%2Ftest_control_plane_thread.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 0,
+      "filename": "tests/v1/kv_offload/tiering/test_control_plane_thread.py",
+      "patch": "@@ -0,0 +1,406 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Tests for OffloadingManager.lock and the tiering control-plane thread.\n+\n+The control plane of a tier that answers something the engine does not drive --\n+a remote peer, say -- used to advance only from on_schedule_end(), so a peer's\n+request waited for a model-step boundary. These tests cover the thread that\n+services such tiers between steps and the exclusion that makes it safe.\n+\"\"\"\n+\n+import threading\n+import time\n+from collections.abc import Iterable\n+from contextlib import nullcontext\n+from typing import ClassVar\n+from unittest.mock import MagicMock\n+\n+import pytest\n+\n+from vllm.v1.kv_offload.base import (\n+    LookupResult,\n+    Medium,\n+    OffloadingManager,\n+    OffloadKey,\n+    ReqContext,\n+    RequestOffloadingContext,\n+    ScheduleEndContext,\n+)\n+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager\n+from vllm.v1.kv_offload.tiering.base import (\n+    JobResult,\n+    ParentManager,\n+    SecondaryTierManager,\n+    TransferJob,\n+)\n+from vllm.v1.kv_offload.tiering.manager import (\n+    CPUPrimaryTierOffloadingManager,\n+    TieringOffloadingManager,\n+)\n+\n+from .test_tiering_offloading import _mock_mmap_region\n+\n+_CTX = ReqContext(req_id=\"test\")\n+_EMPTY_SCHEDULE_END = ScheduleEndContext(new_req_ids=(), preempted_req_ids=())\n+\n+# Long enough that a 1ms-interval thread gets many rounds, short enough to keep\n+# the suite quick.\n+_SETTLE_S = 0.5\n+\n+\n+class _FakeTier(SecondaryTierManager):\n+    \"\"\"Tier that records which thread serviced it, and when.\"\"\"\n+\n+    medium: ClassVar[Medium] = Medium.CPU\n+    serves_external_requests: ClassVar[bool] = True\n+\n+    def __init__(self, *args, **kwargs):\n+        super().__init__(*args, **kwargs)\n+        # Counters are only ever incremented, and int writes are atomic under\n+        # the GIL, so the test thread may read them without the manager lock.\n+        self.serves = 0\n+        self.polls = 0\n+        self.serve_threads: set[int] = set()\n+        self.served = threading.Event()\n+        self.shutdown_saw_live_thread: bool | None = None\n+        self.on_serve = None\n+\n+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:\n+        return LookupResult.MISS\n+\n+    def submit_store(self, job_metadata: TransferJob) -> None:\n+        pass\n+\n+    def submit_load(self, job_metadata: TransferJob) -> None:\n+        pass\n+\n+    def get_finished_jobs(self) -> Iterable[JobResult]:\n+        self.polls += 1\n+        return ()\n+\n+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:\n+        return RequestOffloadingContext()\n+\n+    def drain_jobs(self) -> None:\n+        pass\n+\n+    def serve_external_requests(self, parent: ParentManager) -> None:\n+        self.serves += 1\n+        self.serve_threads.add(threading.get_ident())\n+        if self.on_serve is not None:\n+            self.on_serve(parent)\n+        self.served.set()\n+\n+    def shutdown(self) -> None:\n+        self.shutdown_saw_live_thread = any(\n+            t.name == \"vllm_offload_control_plane\" and t.is_alive()\n+            for t in threading.enumerate()\n+        )\n+\n+\n+class _QuietTier(_FakeTier):\n+    \"\"\"Tier that does not want servicing between steps.\"\"\"\n+\n+    serves_external_requests: ClassVar[bool] = False\n+\n+\n+def _make_manager(tier_cls=_FakeTier, num_chunks: int = 8, **kwargs):\n+    primary = CPUPrimaryTierOffloadingManager(\n+        num_chunks=num_chunks,\n+        mmap_region=_mock_mmap_region(num_chunks),\n+    )\n+    tier = tier_cls(\n+        offloading_spec=MagicMock(),\n+        primary_kv_view=primary.get_kv_memoryview(),\n+        tier_type=\"fake\",\n+    )\n+    manager = TieringOffloadingManager(\n+        primary_tier=primary,\n+        secondary_tiers=[tier],\n+        **kwargs,\n+    )\n+    return manager, tier\n+\n+\n+@pytest.fixture\n+def manager_and_tier(request):\n+    kwargs = getattr(request, \"param\", {})\n+    manager, tier = _make_manager(**kwargs)\n+    try:\n+        yield manager, tier\n+    finally:\n+        manager.shutdown()\n+\n+\n+def _live_control_threads() -> list[threading.Thread]:\n+    return [\n+        t\n+        for t in threading.enumerate()\n+        if t.name == \"vllm_offload_control_plane\" and t.is_alive()\n+    ]\n+\n+\n+def test_control_thread_and_scheduler_never_overlap(manager_and_tier):\n+    \"\"\"The lock must keep the two threads out of the manager at the same time.\n+\n+    Both sides must also make progress: a thread that never runs would pass a\n+    mutual-exclusion check trivially, and so would one that starves the\n+    scheduler.\n+    \"\"\"\n+    manager, tier = manager_and_tier\n+    state = {\"inside\": False, \"overlaps\": 0}\n+\n+    def critical_section():\n+        if state[\"inside\"]:\n+            state[\"overlaps\"] += 1\n+        state[\"inside\"] = True\n+        time.sleep(0.002)\n+        state[\"inside\"] = False\n+\n+    tier.on_serve = lambda parent: critical_section()\n+\n+    steps = 0\n+    deadline = time.monotonic() + _SETTLE_S\n+    while time.monotonic() < deadline:\n+        with manager.lock:\n+            critical_section()\n+        steps += 1\n+\n+    assert state[\"overlaps\"] == 0\n+    assert steps > 0, \"scheduler thread was starved by the control thread\"\n+    assert tier.serves > 0, \"control thread never ran\"\n+\n+\n+def test_serves_while_the_scheduler_is_outside_the_lock(manager_and_tier):\n+    \"\"\"The point of the thread: serve during the model-execution window.\n+\n+    The engine releases the manager at the end of a step and then blocks on the\n+    model future. Here the \"scheduler\" does the same -- one step, then a sleep\n+    with the lock free -- and the tier must be serviced during that sleep.\n+    \"\"\"\n+    manager, tier = manager_and_tier\n+\n+    with manager.lock:\n+        manager.on_schedule_end(_EMPTY_SCHEDULE_END)\n+\n+    tier.served.clear()\n+    serves_before = tier.serves\n+\n+    # Stand in for future.result(): the engine thread is blocked, holding\n+    # nothing.\n+    assert tier.served.wait(_SETTLE_S), (\n+        \"tier was not serviced while the scheduler held no lock\"\n+    )\n+    assert tier.serves > serves_before\n+    assert tier.polls > 0\n+\n+    scheduler_thread_id = threading.get_ident()\n+    assert scheduler_thread_id not in tier.serve_threads or len(tier.serve_threads) > 1\n+\n+\n+@pytest.mark.parametrize(\n+    \"manager_and_tier\", [{\"tier_poll_interval_s\": 0.0}], indirect=True\n+)\n+def test_zero_interval_disables_the_thread(manager_and_tier):\n+    \"\"\"The escape hatch back to per-step servicing.\n+\n+    Without the thread the tier is serviced only by on_schedule_end, which is\n+    the behaviour the control plane had before it existed.\n+    \"\"\"\n+    manager, tier = manager_and_tier\n+\n+    assert not _live_control_threads()\n+    assert not tier.served.wait(0.05)\n+    assert tier.serves == 0\n+\n+    with manager.lock:\n+        manager.on_schedule_end(_EMPTY_SCHEDULE_END)\n+\n+    assert tier.serves == 1\n+\n+\n+def test_no_thread_when_no_tier_asks_for_one():\n+    \"\"\"A tier that does not opt in must not cost a thread.\"\"\"\n+    manager, tier = _make_manager(tier_cls=_QuietTier)\n+    try:\n+        assert not _live_control_threads()\n+    finally:\n+        manager.shutdown()\n+\n+\n+def test_tier_that_did_not_opt_in_is_not_serviced_off_thread():\n+    \"\"\"Only opted-in tiers are polled and served by the control thread.\n+\n+    A tier that expects the scheduler thread must not be dragged onto another\n+    one just because it shares a manager with a tier that opted in. Fan-out\n+    through ParentManager (lookup, on_new_request, on_request_finished) can\n+    still reach it from that thread; that is the documented exception.\n+    \"\"\"\n+    num_chunks = 8\n+    primary = CPUPrimaryTierOffloadingManager(\n+        num_chunks=num_chunks,\n+        mmap_region=_mock_mmap_region(num_chunks),\n+    )\n+    common = {\n+        \"offloading_spec\": MagicMock(),\n+        \"primary_kv_view\": primary.get_kv_memoryview(),\n+    }\n+    opted_in = _FakeTier(tier_type=\"fake\", **common)\n+    quiet = _QuietTier(tier_type=\"quiet\", **common)\n+    manager = TieringOffloadingManager(\n+        primary_tier=primary,\n+        secondary_tiers=[opted_in, quiet],\n+    )\n+    try:\n+        assert opted_in.served.wait(_SETTLE_S)\n+        assert quiet.serves == 0\n+        assert quiet.polls == 0\n+\n+        with manager.lock:\n+            manager.on_schedule_end(_EMPTY_SCHEDULE_END)\n+\n+        # on_schedule_end still serves every tier, so the thread dying degrades\n+        # to per-step servicing rather than to none.\n+        assert quiet.serves == 1\n+    finally:\n+        manager.shutdown()\n+\n+\n+def test_per_step_gate_is_not_touched_by_the_control_thread(manager_and_tier):\n+    \"\"\"_processed_jobs_this_step stays owned by the scheduler thread.\n+\n+    Sharing it would let a fast step skip a poll it would otherwise do, pushing\n+    a completion out by a whole step.\n+    \"\"\"\n+    manager, tier = manager_and_tier\n+\n+    assert tier.served.wait(_SETTLE_S)\n+    polls_after_rounds = tier.polls\n+    assert polls_after_rounds > 0\n+    assert manager._processed_jobs_this_step is False\n+\n+\n+class _LookingUpTier(_FakeTier):\n+    \"\"\"Opted-in tier that looks keys up through its parent while serving.\n+\n+    That is what the p2p server role does with a peer's lookup, and the parent\n+    lookup lands in TieringOffloadingManager.lookup(), which polls tiers for\n+    finished jobs.\n+    \"\"\"\n+\n+    def __init__(self, *args, **kwargs):\n+        super().__init__(*args, **kwargs)\n+        self.in_serve = False\n+        self.nested_polls = 0\n+        self.on_serve = self._look_up\n+\n+    def _look_up(self, parent: ParentManager) -> None:\n+        self.in_serve = True\n+        try:\n+            parent.lookup(OffloadKey(b\"\\x01\" * 8), ReqContext(req_id=\"peer\"))\n+        finally:\n+            self.in_serve = False\n+\n+    def get_finished_jobs(self) -> Iterable[JobResult]:\n+        if self.in_serve:\n+            self.nested_polls += 1\n+        return super().get_finished_jobs()\n+\n+\n+def test_parent_lookup_while_serving_keeps_the_round_contained():\n+    \"\"\"A lookup issued while serving must not escape the control round.\n+\n+    Before the fix it ran the step's once-per-step poll from the control\n+    thread: every tier got polled off-thread, the opted-in tier re-entrantly\n+    from inside its own serve, and the gate was left set, so the next step\n+    skipped its poll.\n+    \"\"\"\n+    num_chunks = 8\n+    primary = CPUPrimaryTierOffloadingManager(\n+        num_chunks=num_chunks,\n+        mmap_region=_mock_mmap_region(num_chunks),\n+    )\n+    common = {\n+        \"offloading_spec\": MagicMock(),\n+        \"primary_kv_view\": primary.get_kv_memoryview(),\n+    }\n+    opted_in = _LookingUpTier(tier_type=\"fake\", **common)\n+    quiet = _QuietTier(tier_type=\"quiet\", **common)\n+    manager = TieringOffloadingManager(\n+        primary_tier=primary,\n+        secondary_tiers=[opted_in, quiet],\n+    )\n+    try:\n+        # Several rounds, each issuing a parent lookup between steps.\n+        deadline = time.monotonic() + _SETTLE_S\n+        while opted_in.serves < 3 and time.monotonic() < deadline:\n+            time.sleep(0.01)\n+        assert opted_in.serves >= 3, \"control thread never served\"\n+\n+        with manager.lock:\n+            assert manager._processed_jobs_this_step is False\n+            assert opted_in.nested_polls == 0\n+            assert quiet.polls == 0, \"quiet tier was polled off-thread\"\n+\n+            # The next step's first lookup still does its poll.\n+            manager.lookup(OffloadKey(b\"\\x02\" * 8), _CTX)\n+            assert quiet.polls == 1\n+    finally:\n+        manager.shutdown()\n+\n+\n+def test_shutdown_joins_the_control_thread_before_tier_teardown(manager_and_tier):\n+    \"\"\"The thread drives tier transports, so it must be stopped first.\n+\n+    Closing a transport under a running round can take the process down rather\n+    than raise.\n+    \"\"\"\n+    manager, tier = manager_and_tier\n+    assert tier.served.wait(_SETTLE_S)\n+    assert _live_control_threads()\n+\n+    manager.shutdown()\n+\n+    assert tier.shutdown_saw_live_thread is False\n+    assert not _live_control_threads()\n+\n+\n+def test_lock_releases_on_error(manager_and_tier):\n+    \"\"\"Leaving a with-block on an exception must not leak the lock.\"\"\"\n+    manager, _ = manager_and_tier\n+\n+    with pytest.raises(RuntimeError), manager.lock:\n+        raise RuntimeError(\"boom\")\n+\n+    assert manager.lock.acquire(timeout=0.5), \"lock leaked after an error\"\n+    manager.lock.release()\n+\n+\n+def test_lock_excludes_other_threads(manager_and_tier):\n+    \"\"\"While one thread holds the lock, another cannot take it.\"\"\"\n+    manager, _ = manager_and_tier\n+\n+    with manager.lock:\n+        acquired: list[bool] = []\n+        t = threading.Thread(\n+            target=lambda: acquired.append(manager.lock.acquire(timeout=0.01))\n+        )\n+        t.start()\n+        t.join(timeout=5.0)\n+        assert acquired == [False]\n+\n+\n+def test_lock_defaults_to_no_op():\n+    \"\"\"Managers entered from one thread only pay nothing for the lock.\n+\n+    The base default must be a no-op context manager, while the CPU manager,\n+    which runs under the plain offloading connector, keeps a real one.\n+    \"\"\"\n+    base_lock = OffloadingManager.lock.fget(MagicMock())\n+    assert isinstance(base_lock, nullcontext)\n+    with base_lock, base_lock:\n+        pass\n+\n+    cpu = CPUOffloadingManager(num_chunks=4)\n+    with cpu.lock:\n+        assert not cpu.lock.acquire(blocking=False)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/tests%2Fv1%2Fkv_offload%2Ftiering%2Ftest_control_plane_thread.py",
+      "sha": "7358565f53e9d4708c0c2e7bd796838cfb93ef4d",
+      "status": "added"
+    },
+    {
+      "additions": 131,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Foffloading%2Fscheduler.py",
+      "changes": 139,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Foffloading%2Fscheduler.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 8,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py",
+      "patch": "@@ -2,7 +2,8 @@\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n import time\n from collections import Counter\n-from collections.abc import Iterable, Sequence\n+from collections.abc import Iterable, Iterator, Sequence\n+from contextlib import ExitStack, contextmanager\n from dataclasses import dataclass, field, replace\n from itertools import chain, islice\n from typing import Any, NamedTuple\n@@ -636,6 +637,71 @@ def _sliding_window_sort_key(i: int) -> int:\n \n         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)\n \n+    # Holds the manager lock for the current schedule(), or None between steps.\n+    # Read and written only by the scheduler thread, so it needs no\n+    # synchronization of its own. Declared on the class so an instance built\n+    # without __init__ still reads None rather than raising.\n+    _step_region: ExitStack | None = None\n+\n+    # ------------------------------------------------------------------\n+    # Manager exclusion\n+    #\n+    # The manager is entered from the scheduler thread and, for managers that\n+    # run one, from a control-plane thread. Manager methods never take their\n+    # own lock, so the exclusion boundary lives here. manager.lock may be a\n+    # no-op for a manager that needs no exclusion; it is entered regardless.\n+    #\n+    # schedule() holds one region for the whole step: opened by the first\n+    # manager-touching hook and closed at the end of build_connector_meta.\n+    # That span is required, not tidiness -- get_num_new_matched_tokens\n+    # establishes lookup() HITs that update_state_after_alloc later pins with\n+    # prepare_load(), and prepare_store() evicts after both. Releasing between\n+    # them would let another thread evict a block the step already treated as\n+    # present.\n+    #\n+    # Hooks outside schedule() use a short region instead, so the manager is\n+    # free while the engine runs the model.\n+    #\n+    # The step region outlives any single call, so it cannot be a with-block;\n+    # an ExitStack carries the entered lock from open to close instead.\n+    # ------------------------------------------------------------------\n+\n+    def _acquire_step(self) -> None:\n+        \"\"\"Open the step-scoped region. Idempotent within a step.\"\"\"\n+        if self._step_region is not None:\n+            return\n+        region = ExitStack()\n+        region.enter_context(self.manager.lock)\n+        self._step_region = region\n+\n+    def _release_step(self) -> None:\n+        \"\"\"Close the step-scoped region, letting other threads in.\"\"\"\n+        region = self._step_region\n+        if region is None:\n+            return\n+        self._step_region = None\n+        region.close()\n+\n+    @contextmanager\n+    def _manager_locked(self) -> Iterator[None]:\n+        \"\"\"Hold the manager for the duration of one hook outside schedule().\n+\n+        None of these hooks can legitimately run inside the step-scoped region:\n+        on_new_request comes from add_request, has_pending_push_work from the\n+        engine's liveness check before schedule(), the rest from output\n+        processing or a client RPC. So finding the region open here means a\n+        previous schedule() raised between _acquire_step() and the release in\n+        build_connector_meta. Recover instead of deadlocking.\n+        \"\"\"\n+        if self._step_region is not None:\n+            logger.error(\n+                \"Offloading manager lock was left held by a previous \"\n+                \"schedule(); releasing it before continuing.\"\n+            )\n+            self._release_step()\n+        with self.manager.lock:\n+            yield\n+\n     def _maybe_observe_lookup_async_delay(\n         self, req_status: RequestOffloadState\n     ) -> None:\n@@ -1027,7 +1093,8 @@ def _lookup(\n     def on_new_request(self, request: Request) -> None:\n         \"\"\"Called when a new request is added to the scheduler.\"\"\"\n         req_context = _create_req_context(request)\n-        offloading_context = self.manager.on_new_request(req_context)\n+        with self._manager_locked():\n+            offloading_context = self.manager.on_new_request(req_context)\n         req_status = RequestOffloadState(\n             config=self.config,\n             req=request,\n@@ -1063,6 +1130,10 @@ def get_num_new_matched_tokens(\n                   (between scheduler steps).\n \n         \"\"\"\n+        # First manager-touching hook of a step: opens the step-scoped region,\n+        # closed at the end of build_connector_meta.\n+        self._acquire_step()\n+\n         req_status = self._req_status[request.request_id]\n         for group_state in req_status.group_states:\n             group_state.block_ids.clear()\n@@ -1149,6 +1220,10 @@ def update_state_after_alloc(\n         if num_external_tokens == 0:\n             return\n \n+        # prepare_load() below pins keys that get_num_new_matched_tokens()\n+        # already saw as HIT, so both must sit inside the same region.\n+        self._acquire_step()\n+\n         req_status = self._req_status[request.request_id]\n \n         num_locally_computed_tokens = req_status.num_locally_computed_tokens\n@@ -1845,13 +1920,24 @@ def _build_store_jobs(\n \n     def build_connector_meta(\n         self, scheduler_output: SchedulerOutput\n+    ) -> KVConnectorMetadata:\n+        # A step that scheduled nothing reaches build_connector_meta without\n+        # any earlier manager touch, so open the region here too.\n+        self._acquire_step()\n+        try:\n+            return self._build_connector_meta(scheduler_output)\n+        finally:\n+            # The step is over: hand the manager back.\n+            self._release_step()\n+\n+    def _build_connector_meta(\n+        self, scheduler_output: SchedulerOutput\n     ) -> KVConnectorMetadata:\n         self._update_req_states(scheduler_output)\n         schedule_end_context = ScheduleEndContext(\n             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],\n             preempted_req_ids=scheduler_output.preempted_req_ids or (),\n         )\n-        self.manager.on_schedule_end(schedule_end_context)\n \n         # Flush jobs for preempted requests.\n         for req_id in scheduler_output.preempted_req_ids or ():\n@@ -1897,15 +1983,30 @@ def build_connector_meta(\n         self._current_batch_load_jobs = {}\n         self._current_batch_jobs_to_flush = set()\n         self._current_batch_allocated_block_ids = set()\n+\n+        # Last manager call of the step, after every prepare_store and\n+        # on_request_finished above. on_schedule_end is documented as running at\n+        # the end of the step, and callers rely on that to bound the step's\n+        # exclusive access to the manager.\n+        self.manager.on_schedule_end(schedule_end_context)\n         return meta\n \n     def has_pending_push_work(self) -> bool:\n         \"\"\"Whether the engine must keep stepping.\n \n         While True, build_connector_meta() and update_connector_output()\n         continue to be called even when no requests are scheduled.\n+\n+        Must use a short region, never the step-scoped one. The engine asks this\n+        before schedule() and returns early when the answer is False, so a\n+        step-scoped acquire here would never reach build_connector_meta's\n+        release and would hold the manager for good -- which is precisely the\n+        state an idle engine settles into.\n         \"\"\"\n-        return bool(self._jobs) or self.manager.has_pending_work()\n+        if self._jobs:\n+            return True\n+        with self._manager_locked():\n+            return self.manager.has_pending_work()\n \n     def update_connector_output(self, connector_output: KVConnectorOutput):\n         \"\"\"Update KVConnector state from worker-side connectors output.\n@@ -1915,6 +2016,10 @@ def update_connector_output(self, connector_output: KVConnectorOutput):\n                 connectors output.\n \n         \"\"\"\n+        with self._manager_locked():\n+            self._update_connector_output(connector_output)\n+\n+    def _update_connector_output(self, connector_output: KVConnectorOutput):\n         meta = connector_output.kv_connector_worker_meta\n         if not isinstance(meta, OffloadingWorkerMetadata):\n             assert meta is None\n@@ -1993,7 +2098,8 @@ def get_stats(self) -> OffloadingConnectorStats | None:\n             stats = self._connector_stats\n             self._connector_stats = OffloadingConnectorStats()\n \n-        manager_stats = self.manager.get_stats()\n+        with self._manager_locked():\n+            manager_stats = self.manager.get_stats()\n         if manager_stats is not None:\n             if stats is None:\n                 stats = manager_stats\n@@ -2022,8 +2128,9 @@ def request_finished(\n             # Untracked request (offloading never started): no in-flight jobs,\n             # nothing was deferred, so finalize immediately.\n             req_context = _create_req_context(request)\n-            self.manager.on_new_request(req_context)\n-            self.manager.on_request_finished(req_context)\n+            with self._manager_locked():\n+                self.manager.on_new_request(req_context)\n+                self.manager.on_request_finished(req_context)\n             return False, None\n \n         self._maybe_observe_lookup_async_delay(req_status)\n@@ -2055,7 +2162,16 @@ def take_events(self) -> Iterable[KVCacheEvent]:\n             the underlying :class:`OffloadingEvent` stream.\n \n         \"\"\"\n-        yield from self._events_tracker.take_events(self.manager.take_events())\n+        # Drain the manager eagerly, inside the region. manager.take_events() is\n+        # itself a generator whose backing list is cleared once exhausted, so\n+        # iterating it lazily would both hold the manager for as long as the\n+        # consumer takes and let a concurrent writer append events that the\n+        # clear then discards unpublished.\n+        with self._manager_locked():\n+            manager_events = list(self.manager.take_events())\n+        # Still a generator, so callers testing the result for truthiness keep\n+        # seeing a non-empty object the way they do today.\n+        yield from self._events_tracker.take_events(manager_events)\n \n     def reset_cache(self) -> None:\n         \"\"\"Reset the offloading manager cache, evicting all stored chunks.\"\"\"\n@@ -2064,6 +2180,13 @@ def reset_cache(self) -> None:\n         assert not self._current_batch_jobs_to_flush\n         assert not self._current_batch_allocated_block_ids\n \n+        # Held for the whole reset. manager.reset_cache() drains tiers by\n+        # polling them itself, so a control-plane thread locked out here loses\n+        # nothing; it simply skips rounds until the reset completes.\n+        with self._manager_locked():\n+            self._reset_cache()\n+\n+    def _reset_cache(self) -> None:\n         # Flush all in-flight jobs\n         self._current_batch_jobs_to_flush.update(self._jobs.keys())\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Foffloading%2Fscheduler.py",
+      "sha": "8b3ad7f2b3f1209af9745625b5eea239a79a081a",
+      "status": "modified"
+    },
+    {
+      "additions": 35,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Fbase.py",
+      "changes": 35,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Fbase.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 0,
+      "filename": "vllm/v1/kv_offload/base.py",
+      "patch": "@@ -4,6 +4,7 @@\n \n from abc import ABC, abstractmethod\n from collections.abc import Collection, Iterable, Sequence\n+from contextlib import AbstractContextManager, nullcontext\n from dataclasses import dataclass, field\n from enum import Enum, auto\n from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NewType, TypeVar\n@@ -198,6 +199,16 @@ class OffloadingEvent:\n         as well as a list of blocks that were evicted as a result.\n     complete_store() - marks a previous store as completed.\n         Following this call, the given blocks will become loadable.\n+\n+Exclusion:\n+    lock is a context manager guarding a manager's whole state subtree: the\n+    manager itself, every tier it composes, and any front-end state those\n+    tiers own. Manager methods never take the lock themselves, so a caller\n+    holds it across as many operations as its invariants need -- notably a\n+    lookup() HIT and the prepare_load() that pins the result, which must not\n+    be separated by another thread's eviction. The default is a no-op;\n+    managers that can be entered from more than one thread supply a real\n+    lock.\n \"\"\"\n \n \n@@ -233,6 +244,26 @@ class OffloadingKVEventsConfig:\n \n \n class OffloadingManager(ABC):\n+    @property\n+    def lock(self) -> AbstractContextManager[Any]:\n+        \"\"\"Context manager granting exclusive access to this manager's state.\n+\n+        Scope is the manager, every tier it composes, and any front-end state\n+        those tiers own (e.g. a tier's async lookup front end). Every caller of\n+        an OffloadingManager method must hold it. Manager methods never enter\n+        it themselves, so a caller may hold it across an arbitrary sequence of\n+        operations -- which is required wherever one call establishes a fact a\n+        later call relies on, such as a lookup() HIT followed by the\n+        prepare_load() that pins it.\n+\n+        The default is a no-op, for managers that are only ever entered from\n+        one thread. A manager that may be entered from another thread -- its\n+        own background thread, say -- returns a real lock instead. Callers must\n+        not assume either: always enter it, and never re-enter it while held,\n+        since a real lock need not be reentrant.\n+        \"\"\"\n+        return nullcontext()\n+\n     @abstractmethod\n     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:\n         \"\"\"Checks whether a single block is offloaded and ready to be read.\n@@ -395,6 +426,10 @@ def take_events(self) -> Iterable[OffloadingEvent]:\n     def on_schedule_end(self, context: ScheduleEndContext) -> None:\n         \"\"\"Called once at the end of each scheduler step.\n \n+        This is the last manager call of a step: every lookup(), prepare_load(),\n+        prepare_store() and on_request_finished() for the step has already been\n+        issued.\n+\n         Managers may override this to flush deferred work accumulated\n         during the step (e.g., batched promotions).\n         \"\"\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Fbase.py",
+      "sha": "54178bb0f09142372540d640885f2792e839b33b",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Fcpu%2Fmanager.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Fcpu%2Fmanager.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 0,
+      "filename": "vllm/v1/kv_offload/cpu/manager.py",
+      "patch": "@@ -1,5 +1,6 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+import threading\n from collections import OrderedDict\n from collections.abc import Collection, Iterable\n from dataclasses import dataclass, field\n@@ -64,6 +65,7 @@ def __init__(\n         store_threshold: int = 1,\n         max_tracker_size: int = 64_000,\n     ):\n+        self._lock = threading.Lock()\n         self.medium: Medium = Medium.CPU\n         self._num_chunks: int = num_chunks\n         self._num_allocated_chunks: int = 0\n@@ -89,6 +91,11 @@ def __init__(\n             OrderedDict() if store_threshold >= 2 else None\n         )\n \n+    @property\n+    @override\n+    def lock(self) -> threading.Lock:\n+        return self._lock\n+\n     # --- chunk pool ---\n \n     def _get_num_free_chunks(self) -> int:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Fcpu%2Fmanager.py",
+      "sha": "f2acf1d76ef74237d8bb41e71a9f7e9c27362034",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fasync_lookup.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fasync_lookup.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 2,
+      "filename": "vllm/v1/kv_offload/tiering/async_lookup.py",
+      "patch": "@@ -11,8 +11,12 @@\n --------------\n There is no explicit lock.  Thread safety is achieved by ownership:\n \n-* _lookup_state and _lookup_batch are owned exclusively by the scheduler\n-  thread.  lookup(), flush(), and cleanup() read and write them directly.\n+* _lookup_state and _lookup_batch are owned by whichever thread holds the\n+  OffloadingManager lock.  lookup(), flush(), and cleanup() read and write\n+  them directly.  That is usually the scheduler thread, but a tier reached\n+  through ParentManager -- a peer lookup fanning out from another tier, say --\n+  can arrive on the tiering manager's control-plane thread instead.  Both hold\n+  the manager lock, so the accesses stay serialized.\n \n * _lookup_queue is written by the scheduler (flush → put_nowait, one item\n   per step) and read by the background thread (get).  queue.Queue is",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fasync_lookup.py",
+      "sha": "e57fb36bab5ec037ebf31bd0ee2ec8e414922957",
+      "status": "modified"
+    },
+    {
+      "additions": 30,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fbase.py",
+      "changes": 33,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fbase.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 3,
+      "filename": "vllm/v1/kv_offload/tiering/base.py",
+      "patch": "@@ -139,6 +139,12 @@ class SecondaryTierManager(ABC):\n     IMPORTANT: All methods run in the Scheduler process and must be\n     lightweight and non-blocking. submit_load() and submit_store() submit\n     async jobs; get_finished_jobs() polls for completion.\n+\n+    Methods are called under the tiering manager's lock, so they are never\n+    entered concurrently -- but not always from the same thread. A tier that\n+    sets serves_external_requests is also serviced from the manager's\n+    control-plane thread, and any tier can be reached from there via\n+    ParentManager fan-out. Keep per-thread assumptions out of tier state.\n     \"\"\"\n \n     medium: ClassVar[Medium | None] = None\n@@ -154,6 +160,16 @@ def __init_subclass__(cls, **kwargs: Any) -> None:\n                 Medium.STORAGE: CacheHitSource.DISK,\n             }[cls.medium]\n \n+    # Whether this tier answers a counterpart the engine does not drive -- a\n+    # remote peer, say -- whose requests would otherwise wait for a step\n+    # boundary. The tiering manager then services the tier between engine\n+    # steps too, not only from on_schedule_end(): on its polling thread, it\n+    # calls both get_finished_jobs() and serve_external_requests(); see\n+    # poll_tiers(). Overriding serve_external_requests() alone does not opt\n+    # in: setting this asserts the tier tolerates those calls off the\n+    # scheduler thread.\n+    serves_external_requests: ClassVar[bool] = False\n+\n     def __init__(\n         self,\n         offloading_spec: \"OffloadingSpec\",\n@@ -324,9 +340,20 @@ def on_request_finished(self, req_context: ReqContext) -> None:\n     def serve_external_requests(self, parent: ParentManager) -> None:\n         \"\"\"Process remotely-originated requests using the parent manager.\n \n-        Called once per scheduler step, BEFORE _flush_pending_promotions().\n-        The parent handle is valid only for the duration of this call.\n-        Tiers that don't serve external requests leave this as a no-op.\n+        Called once per scheduler step, BEFORE _flush_pending_promotions(), and\n+        additionally once per control-plane round for tiers that set\n+        serves_external_requests. The _flush_pending_promotions() ordering\n+        holds only for the per-step call: a promotion this method initiates from\n+        a control-plane round is submitted at the next on_schedule_end().\n+\n+        The parent handle is valid only for the duration of this call, and the\n+        caller holds the manager lock throughout it -- so a lookup() HIT taken\n+        here stays valid until this call pins it. An implementation must not\n+        release that lock partway through.\n+\n+        Tiers that don't serve external requests leave this as a no-op. A tier\n+        that overrides it without setting serves_external_requests is served\n+        once per step only.\n         \"\"\"\n         return\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fbase.py",
+      "sha": "e827d8232b199f893bdd0a35e81ffec5dcc3838a",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fkvcr%2Fmanager.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fkvcr%2Fmanager.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 1,
+      "filename": "vllm/v1/kv_offload/tiering/kvcr/manager.py",
+      "patch": "@@ -9,7 +9,7 @@\n import uuid\n from collections.abc import Collection, Iterable\n from pathlib import Path\n-from typing import TYPE_CHECKING, Any, cast\n+from typing import TYPE_CHECKING, Any, ClassVar, cast\n \n import msgspec\n from kvcr import (\n@@ -265,6 +265,12 @@ def decode(self, key: BlockKey) -> int | bytes:\n class KVCRSecondaryTierManager(SecondaryTierManager):\n     \"\"\"Secondary tier wrapper around the KVCR KV P2P API.\"\"\"\n \n+    # Serves framework pin requests from serve_external_requests(), but only\n+    # once per step for now: opting in would also poll the KVCR library from\n+    # the tiering manager's polling thread, which it is not yet verified to\n+    # tolerate.\n+    serves_external_requests: ClassVar[bool] = False\n+\n     @classmethod\n     @override\n     def build_metric_definitions(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fkvcr%2Fmanager.py",
+      "sha": "f5d30c916cdc7f7a9eb1b9a510e98ee7907a25e7",
+      "status": "modified"
+    },
+    {
+      "additions": 211,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fmanager.py",
+      "changes": 220,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fmanager.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 9,
+      "filename": "vllm/v1/kv_offload/tiering/manager.py",
+      "patch": "@@ -19,6 +19,7 @@\n    protecting chunks from eviction until complete_read() is called\n \"\"\"\n \n+import threading\n import time\n from collections.abc import Collection, Iterable, Sequence\n from dataclasses import dataclass, field\n@@ -59,6 +60,26 @@\n logger = init_logger(__name__)\n \n \n+# Default pause between control-plane rounds; the user-facing default of the\n+# ``tier_poll_interval_s`` extra-config key. A round is a non-blocking sweep, so\n+# this sets how long a peer's request can sit unserved; 1 ms is three orders of\n+# magnitude below the model step it hides, and matches the pause the p2p tier's\n+# own drain loops and EngineCoreProc's GIL-yield sleep already use.\n+DEFAULT_TIER_POLL_INTERVAL_S = 0.001\n+# How long a round waits for the manager lock before giving up and retrying.\n+# Bounded so the thread stays responsive to shutdown even if a caller holds the\n+# lock for a long time, or leaked it.\n+_CONTROL_PLANE_LOCK_TIMEOUT_S = 1.0\n+# Warn after this much continuous failure to acquire the lock. Above the 5 s\n+# warning drain_jobs() emits, so a slow reset_cache() does not warn twice.\n+_CONTROL_PLANE_STALL_WARN_S = 30.0\n+# Give up after this many consecutive failed rounds. on_schedule_end() still\n+# serves the tiers, so the fallback is per-step servicing rather than none.\n+_CONTROL_PLANE_MAX_CONSECUTIVE_ERRORS = 100\n+# How long shutdown() waits for the thread to finish its round.\n+_CONTROL_PLANE_JOIN_TIMEOUT_S = 5.0\n+\n+\n @dataclass\n class PendingPromotion:\n     \"\"\"Accumulator for chunks awaiting submit_load() for one (tier, request).\"\"\"\n@@ -192,15 +213,24 @@ def __init__(\n         self,\n         primary_tier: CPUPrimaryTierOffloadingManager,\n         secondary_tiers: list[SecondaryTierManager] | None = None,\n+        tier_poll_interval_s: float = DEFAULT_TIER_POLL_INTERVAL_S,\n     ):\n         \"\"\"Initialize the TieringOffloadingManager.\n \n         Args:\n             primary_tier: The primary tier manager (CPU-based).\n             secondary_tiers: List of secondary tier managers (e.g., Storage,\n                             Network). Can be None or empty list.\n+            tier_poll_interval_s: Pause between control-plane rounds for\n+                tiers that set serves_external_requests. Zero or negative\n+                disables the thread, leaving those tiers serviced once per\n+                engine step as before.\n \n         \"\"\"\n+        # Guards this manager and every tier it composes, the primary tier\n+        # included; the primary's own lock is not used underneath it. A real\n+        # lock because the control-plane thread enters the manager too.\n+        self._lock = threading.Lock()\n         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier\n         self.secondary_tiers = secondary_tiers or []\n \n@@ -248,6 +278,136 @@ def __init__(\n             tier: i for i, tier in enumerate(self.secondary_tiers)\n         }\n \n+        # Tiers that serve external requests, and so must also be serviced\n+        # between engine steps.\n+        self._external_serving_tiers: list[tuple[int, SecondaryTierManager]] = [\n+            (i, tier)\n+            for i, tier in enumerate(self.secondary_tiers)\n+            if tier.serves_external_requests\n+        ]\n+        self._tier_poll_interval_s = tier_poll_interval_s\n+        self._control_plane_stop = threading.Event()\n+        self._control_plane_thread: threading.Thread | None = None\n+        self._start_control_plane()\n+\n+    @property\n+    @override\n+    def lock(self) -> threading.Lock:\n+        return self._lock\n+\n+    # ------------------------------------------------------------------\n+    # Control plane\n+    # ------------------------------------------------------------------\n+\n+    def _start_control_plane(self) -> None:\n+        \"\"\"Start the control-plane thread, if any tier asked for one.\"\"\"\n+        if not self._external_serving_tiers or self._tier_poll_interval_s <= 0:\n+            return\n+        self._control_plane_thread = threading.Thread(\n+            target=self._control_plane_loop,\n+            name=\"vllm_offload_control_plane\",\n+            daemon=True,\n+        )\n+        self._control_plane_thread.start()\n+        logger.info(\n+            \"KV offload control-plane thread started for tier(s) %s, interval %.3fs\",\n+            [tier.tier_type for _, tier in self._external_serving_tiers],\n+            self._tier_poll_interval_s,\n+        )\n+\n+    def _stop_control_plane(self) -> None:\n+        \"\"\"Stop and join the control-plane thread.\n+\n+        Must run before any tier teardown: the thread drives tier transports,\n+        and closing one underneath it can crash the process rather than raise.\n+        \"\"\"\n+        self._control_plane_stop.set()\n+        thread = self._control_plane_thread\n+        if thread is None:\n+            return\n+        thread.join(timeout=_CONTROL_PLANE_JOIN_TIMEOUT_S)\n+        if thread.is_alive():\n+            logger.error(\n+                \"KV offload control-plane thread did not exit within %.1fs\",\n+                _CONTROL_PLANE_JOIN_TIMEOUT_S,\n+            )\n+        else:\n+            self._control_plane_thread = None\n+\n+    def _control_plane_loop(self) -> None:\n+        stalled_since: float | None = None\n+        errors = 0\n+        while not self._control_plane_stop.is_set():\n+            if not self._lock.acquire(timeout=_CONTROL_PLANE_LOCK_TIMEOUT_S):\n+                now = time.monotonic()\n+                if stalled_since is None:\n+                    stalled_since = now\n+                elif now - stalled_since > _CONTROL_PLANE_STALL_WARN_S:\n+                    logger.warning(\n+                        \"KV offload control-plane thread has not acquired the \"\n+                        \"manager lock for %.0fs; peer requests are only being \"\n+                        \"served at engine-step boundaries.\",\n+                        now - stalled_since,\n+                    )\n+                    stalled_since = None\n+                continue\n+            stalled_since = None\n+            try:\n+                self.poll_tiers()\n+                errors = 0\n+            except Exception:\n+                # Never let a round kill the thread silently: on_schedule_end()\n+                # still serves these tiers, so persistent failure degrades to\n+                # per-step servicing instead of stopping the control plane.\n+                errors += 1\n+                logger.exception(\"KV offload control-plane round failed\")\n+            finally:\n+                self._lock.release()\n+            if errors >= _CONTROL_PLANE_MAX_CONSECUTIVE_ERRORS:\n+                logger.error(\n+                    \"KV offload control-plane thread stopping after %d \"\n+                    \"consecutive failures; falling back to per-step servicing.\",\n+                    errors,\n+                )\n+                return\n+            # Yield unconditionally, and only after release(). Python locks are\n+            # not fair, so a release-then-reacquire loop could starve the\n+            # scheduler thread; this pause is what bounds its wait to one round.\n+            self._control_plane_stop.wait(self._tier_poll_interval_s)\n+\n+    def poll_tiers(self) -> None:\n+        \"\"\"Advance the control plane of tiers that cannot wait for a step.\n+\n+        Polls those tiers for finished jobs and lets them serve whatever their\n+        counterpart has asked for -- the same two steps on_schedule_end() runs,\n+        narrowed to the tiers that opted in.\n+\n+        Excludes _flush_pending_promotions() and _flush_pending_cascades() by\n+        design: both are per-step batching points, and running them here would\n+        fragment batches the scheduler thread accumulated during schedule(). A\n+        promotion that a lookup() from this path initiates therefore waits for\n+        the next on_schedule_end() to be submitted.\n+\n+        The caller must hold self.lock for the whole call. serve_external_requests()\n+        relies on that: it establishes lookup() HITs and then pins them, and the\n+        two must not be separated by an eviction.\n+\n+        Serving can look keys up through the parent, and lookup() runs the\n+        step's once-per-step poll. From here that poll would reach every tier\n+        off-thread, re-enter the serving tier's get_finished_jobs() from inside\n+        its own serve, and leave the gate set so the next step skips its poll.\n+        The round has just polled its tiers itself, so it holds the gate shut\n+        for its duration and then puts it back untouched.\n+        \"\"\"\n+        gate = self._processed_jobs_this_step\n+        self._processed_jobs_this_step = True\n+        try:\n+            self._process_finished_jobs(self._external_serving_tiers)\n+            for _, tier in self._external_serving_tiers:\n+                tier.serve_external_requests(self._tier_parents[tier])\n+        finally:\n+            self._processed_jobs_this_step = gate\n+\n     @property\n     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:\n         return self._jobs\n@@ -319,17 +479,27 @@ def _complete_promotion(\n                 False,\n             )\n \n-    def _process_finished_jobs(self):\n-        \"\"\"Unconditionally poll all secondary tiers for completed jobs.\n+    def _process_finished_jobs(\n+        self,\n+        tiers: Sequence[tuple[int, SecondaryTierManager]] | None = None,\n+    ):\n+        \"\"\"Unconditionally poll secondary tiers for completed jobs.\n \n         This method:\n         1. Calls get_finished_jobs() on each secondary tier\n         2. For completed stores (primary→secondary): calls primary.complete_read()\n            to decrement ref_cnt\n         3. For completed loads (secondary→primary): calls primary.complete_write()\n            to make chunks available\n+\n+        Args:\n+            tiers: (index, tier) pairs to poll. Defaults to every secondary\n+                tier. Pass a subset to poll only the tiers a caller is\n+                responsible for, so a tier that expects to be polled on the\n+                scheduler thread is not dragged elsewhere.\n+\n         \"\"\"\n-        for i, tier in enumerate(self.secondary_tiers):\n+        for i, tier in tiers if tiers is not None else enumerate(self.secondary_tiers):\n             for completed_job in tier.get_finished_jobs():\n                 job_id = completed_job.job_id\n                 job_metadata = self._pop_job(job_id)\n@@ -620,9 +790,9 @@ def prepare_store(\n     ) -> PrepareStoreOutput | None:\n         \"\"\"Prepare chunks to be stored from GPU to primary tier.\n \n-        CRITICAL: This method calls _maybe_process_finished_jobs() FIRST to ensure\n-        that any completed async transfers have their ref_cnt decremented\n-        before the primary tier makes eviction decisions.\n+        CRITICAL: This method polls for finished jobs FIRST to ensure that any\n+        completed async transfers have their ref_cnt decremented before the\n+        primary tier makes eviction decisions.\n \n         For request-level tiers, chunks already present in the primary tier\n         are immediately cascaded via submit_store().\n@@ -646,7 +816,12 @@ def prepare_store(\n         #    not-yet-ready chunk's ref_cnt from -1 to 0 via complete_write(),\n         #    making it evictable for the first time.\n         # Both must be accounted for before the eviction decision below.\n-        self._maybe_process_finished_jobs()\n+        # Unconditional, not _maybe_process_finished_jobs(): eviction must see\n+        # the freshest completions, and on_schedule_end now runs at the very end\n+        # of the step, so the once-per-step gate would otherwise still be set by\n+        # this step's first lookup() and skip the poll.\n+        self._processed_jobs_this_step = True\n+        self._process_finished_jobs()\n \n         # Step 2: Store to primary tier (new chunks only).\n         # Cascading of these newly-stored chunks to ALL secondary tiers\n@@ -882,8 +1057,8 @@ def on_schedule_end(self, context: ScheduleEndContext) -> None:\n         \"\"\"End-of-schedule hook: process finished jobs, flush deferred\n         promotions, and reset the per-step gate.\n \n-        Called once per scheduler step from\n-        OffloadingConnectorScheduler.build_connector_meta().\n+        Called once per scheduler step, as the last manager call of the step,\n+        from OffloadingConnectorScheduler.build_connector_meta().\n         \"\"\"\n         # Catch-all poll: guarantees jobs are processed even on steps where\n         # lookup()/prepare_store() were never called (e.g. no requests\n@@ -898,6 +1073,10 @@ def on_schedule_end(self, context: ScheduleEndContext) -> None:\n         self._processed_jobs_this_step = False\n \n         self._flush_pending_promotions()\n+        # Keys parked by this step's prepare_store cannot have completed yet, so\n+        # they are simply re-parked here and retried on the next step. That is\n+        # safe: _maybe_finalize_request() holds off while pending_cascade_keys is\n+        # non-empty, so nothing finalizes early and the list still drains.\n         self._flush_pending_cascades()\n         for tier in self.secondary_tiers:\n             tier.on_schedule_end(context)\n@@ -1011,9 +1190,32 @@ def get_stats(self) -> OffloadingConnectorStats | None:\n     def shutdown(self) -> None:\n         \"\"\"Shut down secondary tiers before releasing primary resources.\n \n+        Stops the control-plane thread first: it drives tier transports, and\n+        tearing one down underneath it (closing a socket, destroying a ZMQ\n+        context) can take the process down rather than raise. If the thread\n+        will not exit, hold the manager lock across tier teardown so it cannot\n+        be mid-round, and skip teardown entirely if even that is unavailable --\n+        a lingering daemon thread in an exiting process beats a crash.\n+\n         Every secondary tier is given a shutdown attempt. If any shutdown\n         fails, preserve the primary mmap because a failed tier may still use it.\n         \"\"\"\n+        self._stop_control_plane()\n+        if self._control_plane_thread is not None:\n+            if not self._lock.acquire(timeout=_CONTROL_PLANE_JOIN_TIMEOUT_S):\n+                logger.error(\n+                    \"KV offload control-plane thread is still running and the \"\n+                    \"manager lock is unavailable; skipping tier shutdown.\"\n+                )\n+                return\n+            try:\n+                self._shutdown_tiers()\n+            finally:\n+                self._lock.release()\n+            return\n+        self._shutdown_tiers()\n+\n+    def _shutdown_tiers(self) -> None:\n         shutdown_error: Exception | None = None\n         for tier_idx, tier in enumerate(self.secondary_tiers):\n             try:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fmanager.py",
+      "sha": "b136ebb11c656689751d58afbf78811d69acb05e",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fcontrol%2Fbase.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fcontrol%2Fbase.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 2,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/control/base.py",
+      "patch": "@@ -20,8 +20,11 @@\n         ├── mark_dead() — signal that the peer is gone\n         └── close()     — tear down the connection\n \n-Threading model: all I/O is driven by the caller invoking poll().\n-No background threads. poll() must be called periodically to:\n+Threading model: all I/O is driven by the caller invoking poll(). No background\n+threads of its own. More than one caller thread may drive poll() over a\n+transport's lifetime, but never concurrently -- callers serialize themselves\n+(the tiering manager does so with its lock), because sockets here are not\n+thread-safe. poll() must be called periodically to:\n   - receive messages (buffered per-connection)\n   - accept new inbound peers\n   - detect disconnections",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fcontrol%2Fbase.py",
+      "sha": "890bc16b244129504744e71aab13968e821155cb",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 1,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/data/base.py",
+      "patch": "@@ -66,7 +66,11 @@\n - close() releases all resources (memory registrations, handles).\n   After close(), no other methods may be called.\n \n-Threading model: no background threads. All I/O driven by poll().\n+Threading model: no background Python threads. All I/O driven by poll(). More\n+than one caller thread may drive a transport over its lifetime, but never\n+concurrently -- callers serialize themselves (the tiering manager does so with\n+its lock). Note that serialization alone is not obviously sufficient for a\n+backend that binds state to the thread that created it; see NixlTransport.\n \"\"\"\n \n from __future__ import annotations",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py",
+      "sha": "866450bf04a2be8cdb0d1e675e0c2cb9ee350407",
+      "status": "modified"
+    },
+    {
+      "additions": 32,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py",
+      "changes": 33,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 1,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "patch": "@@ -1,6 +1,37 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n-\"\"\"NixlTransport: Data-plane transport for RDMA-based KV block transfers via NIXL.\"\"\"\n+\"\"\"NixlTransport: Data-plane transport for RDMA-based KV block transfers via NIXL.\n+\n+Threading: the agent is reached from the scheduler thread and, when the tiering\n+manager runs one, from its control-plane thread. The manager's lock serializes\n+them strictly -- one Python thread inside any agent call at a time, with a full\n+memory barrier between.\n+\n+That lock is the only protection, not a belt over NIXL's own. nixl_agent picks\n+NIXL_THREAD_SYNC_STRICT only when ``enable_listen`` is set, which this transport\n+does not set, so the agent runs with NIXL_THREAD_SYNC_NONE -- under which NIXL's\n+internal agent lock compiles down to no-ops, leaving every agent entry point\n+unguarded. So the manager lock must cover all of them, and the lifetime of every\n+handle passed between calls. The exception is peer registration moved onto a\n+worker thread, as NixlConnector's handshake executor does: it runs outside the\n+lock and relies, like that connector, on NIXL tolerating it beside transfers.\n+\n+Serialized use from a second thread is supported (checked against NIXL 1.4.1\n+sources): NIXL never creates its UCX worker in UCS_THREAD_MODE_SINGLE, the only\n+creator-thread-affine mode. The weakest mode it ever requests is\n+UCS_THREAD_MODE_SERIALIZED, documented as \"multiple threads can access, but only\n+one at a time\", and because ``enable_prog_thread`` defaults on here it actually\n+requests UCS_THREAD_MODE_MULTI and fails construction if the UCX build cannot\n+provide it.\n+\n+Two caveats. NIXL binds a shared UCX worker per calling thread\n+(``tlsSharedWorkerMap``), which is harmless only while there is exactly one\n+shared worker -- true here, but it would stop being true if a ``num_workers``\n+UCX backend param were ever set. And NIXL 1.4.1 does accept an explicit\n+``sync_mode`` (including NIXL_THREAD_SYNC_RW), which would make its own locking\n+real; that parameter does not exist before 1.x, so passing it would need a\n+version gate, the way ``capture_telemetry`` does.\n+\"\"\"\n \n from __future__ import annotations\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py",
+      "sha": "2c79acd52929e9c2049febc366e698843cbe7cdf",
+      "status": "modified"
+    },
+    {
+      "additions": 13,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fmanager.py",
+      "changes": 19,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fmanager.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 6,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/manager.py",
+      "patch": "@@ -201,13 +201,18 @@ class P2PSecondaryTierManager(SecondaryTierManager):\n     blocks from the peer) and server-role (serving blocks to the peer)\n     over the same control connection.\n \n-    Single-threaded: every public method runs on the scheduler thread, and\n-    the engine drives polling via ``get_finished_jobs()`` once per step.\n+    Never entered concurrently: every public method runs under the tiering\n+    manager's ``lock``, held either by the scheduler thread for the length of\n+    a step or by the control-plane thread for the length of one round. Peers are\n+    not driven by the engine, so this tier sets ``serves_external_requests``\n+    to opt into that thread; without it a peer's lookup or fetch waits\n+    for a step boundary, which on a saturated rank can be seconds.\n     ``has_pending_work()`` keeps the engine ticking so the control transport\n     and existing sessions are polled even when no requests are scheduled.\n     \"\"\"\n \n     cache_hit_source: ClassVar[CacheHitSource] = CacheHitSource.P2P\n+    serves_external_requests: ClassVar[bool] = True\n \n     def __init__(\n         self,\n@@ -607,9 +612,10 @@ def submit_load(self, job_metadata: TransferJob) -> None:\n \n     @override\n     def get_finished_jobs(self) -> Iterable[JobResult]:\n-        # Drive one polling sweep on the scheduler thread, then hand off\n-        # whatever has accumulated. The engine calls this once per step\n-        # (and keeps stepping while has_pending_work() is True).\n+        # Drive one polling sweep, then hand off whatever has accumulated. The\n+        # engine calls this once per step (and keeps stepping while\n+        # has_pending_work() is True); the control-plane thread calls it between\n+        # steps, so a peer is not left waiting for a step boundary.\n         self._poll_once()\n         result = self._finished_jobs\n         self._finished_jobs = []\n@@ -836,7 +842,8 @@ def _poll_once(self) -> None:\n \n         Drains the control transport, polls every session, accumulates\n         their results into ``_finished_jobs``, and reaps any dead sessions.\n-        Runs on the scheduler thread.\n+        Runs under the tiering manager's lock, on the scheduler thread or on\n+        the control-plane thread.\n         \"\"\"\n         new_connections = self._control.poll()\n         if new_connections:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fmanager.py",
+      "sha": "0c2220c1f8712461c1183a8a44cdbafe210a07b9",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fserver.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fserver.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 4,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/session/server.py",
+      "patch": "@@ -584,10 +584,13 @@ def _pin_and_register_hits(\n         \"\"\"Pin primary slots for HIT keys and park them as the lookup's\n         round supply via ``add_stored_blocks``.\n \n-        Caller has already confirmed every key is HIT (single-threaded\n-        scheduler ⇒ no eviction race), so the JobMetadata returned by\n-        ``parent.create_store_job`` carries parallel ``keys``/``block_ids``\n-        of length ``len(keys)``.\n+        Caller has already confirmed every key is HIT, so the JobMetadata\n+        returned by ``parent.create_store_job`` carries parallel\n+        ``keys``/``block_ids`` of length ``len(keys)``. Nothing can evict\n+        between that confirmation and the pin because the whole\n+        ``serve_external_requests`` call runs inside one hold of the tiering\n+        manager's lock -- which is why that call must never release it\n+        partway through.\n         \"\"\"\n         meta = parent.create_store_job(keys, lookup.ctx)\n         self.add_stored_blocks(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fserver.py",
+      "sha": "d0a193c568799b3d3cd7feb232d47fcf17fc6067",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fspec.py",
+      "changes": 9,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fspec.py?ref=271f52e299704e5c73b245cc6597c91baca90a34",
+      "deletions": 0,
+      "filename": "vllm/v1/kv_offload/tiering/spec.py",
+      "patch": "@@ -73,6 +73,7 @@\n from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics\n from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory\n from vllm.v1.kv_offload.tiering.manager import (\n+    DEFAULT_TIER_POLL_INTERVAL_S,\n     CPUPrimaryTierOffloadingManager,\n     TieringOffloadingManager,\n )\n@@ -287,6 +288,13 @@ def __init__(self, config: OffloadingConfig):\n         if not isinstance(self.secondary_tier_configs, list):\n             raise ValueError(\"secondary_tiers must be a list of tier configurations\")\n \n+        # Pause between control-plane rounds for tiers that need servicing\n+        # between engine steps. Zero or negative disables the thread, which\n+        # restores per-step servicing.\n+        self.tier_poll_interval_s = float(\n+            self.extra_config.get(\"tier_poll_interval_s\", DEFAULT_TIER_POLL_INTERVAL_S)\n+        )\n+\n         # Backpressure config is merged field-by-field in priority order\n         # (highest first):\n         #   1. Per-tier ``backpressure`` dict in the tier config\n@@ -387,6 +395,7 @@ def get_manager(self) -> OffloadingManager:\n                 tiering_manager = TieringOffloadingManager(\n                     primary_tier=primary_tier,\n                     secondary_tiers=secondary_tiers,\n+                    tier_poll_interval_s=self.tier_poll_interval_s,\n                 )\n                 self._manager = tiering_manager\n             except Exception:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/271f52e299704e5c73b245cc6597c91baca90a34/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fspec.py",
+      "sha": "73921f44757130941beec3a946fe7688afd0dd3f",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "Let's replace lock/unlock/locked with a single `lock` context manager property.",
+      "created_at": "2026-09-24T08:40:25Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091587909",
+      "line": null,
+      "original_line": 274,
+      "path": "vllm/v1/kv_offload/base.py",
+      "updated_at": "2026-09-24T11:29:03Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "I think we should remove this.\nThe default should be no lock.\nThe CPU tier will implement its own threading lock.",
+      "created_at": "2026-09-24T08:41:21Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091595859",
+      "line": null,
+      "original_line": 246,
+      "path": "vllm/v1/kv_offload/base.py",
+      "updated_at": "2026-09-24T11:29:03Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "spec.py imports this, and it's a user-facing default.\nSo it should be public.\nWe should check if this is the best place here.",
+      "created_at": "2026-09-24T08:43:36Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091612881",
+      "line": null,
+      "original_line": 66,
+      "path": "vllm/v1/kv_offload/tiering/manager.py",
+      "updated_at": "2026-09-24T11:29:03Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "How about we rename `serve_control_plane` / `_control_plane_interval_s` to `poll_tiers()` / `tier_poll_interval_s`?",
+      "created_at": "2026-09-24T09:19:08Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4091940973",
+      "line": null,
+      "original_line": 362,
+      "path": "vllm/v1/kv_offload/tiering/manager.py",
+      "updated_at": "2026-09-24T11:29:03Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "how about `serves_external_requests`?",
+      "created_at": "2026-09-24T11:26:40Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4093051896",
+      "line": null,
+      "original_line": 213,
+      "path": "vllm/v1/kv_offload/tiering/p2p/manager.py",
+      "updated_at": "2026-09-24T11:29:03Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "Done",
+      "created_at": "2026-10-01T07:31:53Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4152901820",
+      "line": null,
+      "original_line": 274,
+      "path": "vllm/v1/kv_offload/base.py",
+      "updated_at": "2026-10-01T07:31:53Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "Done",
+      "created_at": "2026-10-01T07:31:56Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4152902293",
+      "line": null,
+      "original_line": 246,
+      "path": "vllm/v1/kv_offload/base.py",
+      "updated_at": "2026-10-01T07:31:56Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "Made it public as DEFAULT_TIER_POLL_INTERVAL_S.\r\nspec.py imports it from there as the fallback for the user-facing tier_poll_interval_s key.",
+      "created_at": "2026-10-01T07:46:27Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4153023741",
+      "line": null,
+      "original_line": 66,
+      "path": "vllm/v1/kv_offload/tiering/manager.py",
+      "updated_at": "2026-10-01T07:46:27Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "Done",
+      "created_at": "2026-10-01T07:46:36Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4153024941",
+      "line": null,
+      "original_line": 362,
+      "path": "vllm/v1/kv_offload/tiering/manager.py",
+      "updated_at": "2026-10-01T07:46:37Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "Renamed",
+      "created_at": "2026-10-01T08:02:30Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#discussion_r4153150128",
+      "line": null,
+      "original_line": 213,
+      "path": "vllm/v1/kv_offload/tiering/p2p/manager.py",
+      "updated_at": "2026-10-01T08:02:30Z",
+      "user": {
+        "login": "liranschour"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Documentation preview: https://vllm--58168.org.readthedocs.build/en/58168/",
+      "created_at": "2026-09-22T15:10:28Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#issuecomment-5778977996",
+      "updated_at": "2026-09-22T15:10:28Z",
+      "user": {
+        "login": "mergify"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @liranschour.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-07T07:56:20Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#issuecomment-6033574413",
+      "updated_at": "2026-10-07T07:56:20Z",
+      "user": {
+        "login": "mergify"
+      }
+    },
+    {
+      "body": "On my reproducer this PR fixes #55179: with a busy source rank the P2P lookup delay goes from 2.8-2.9 s to 0.6-0.7 s, the same value as with an idle source, and nothing else in the run got worse.\n\nI ran this PR against the #55179 reproducer on a current nightly (`e9757321`, nixl 1.4.1), with the PR's files at 2fdfd08acd applied on top of the same image for the second arm; the current head 271f52e299 only merges main and carries the same PR diff (an earlier run at a4616025a7 gave the same busy-row numbers). Cell: GLM-5.2-FP8, two prefill pods and two decode pods, DP=8 per pod, 8 x H200 each, CPU offload tier 64 GiB per rank, P2P tier over UCX. Each case seeds a prefix on one prefill rank, then sends a follow-up to a different prefill rank that pulls it over P2P; \"busy\" means three 115,200-token requests were submitted to the source rank (the one that serves the lookup) 8 s before the follow-up; the source gauge showed two running when the follow-up was sent. The number is the destination rank's `kv_offload_lookup_async_delay_seconds_sum` delta for that one follow-up.\n\n| case | nightly | nightly + this PR |\n|---|---|---|\n| first P2P pull after boot, idle source | 25.52 s (TTFT 33.5 s) | 25.17 s (TTFT 33.2 s) |\n| idle, warm pair x2 | 0.61 / 0.63 s | 0.71 / 0.68 s |\n| busy, warm pair x2 | 2.88 / 2.83 s | 0.68 / 0.75 s |\n| busy, cold pair | 2.89 s | 0.77 s |\n| idle, cold pair | 0.84 s | 0.72 s |\n\nThe busy rows land in the idle band with the PR, and it matches what I measured for the poller approach in #57165, so I think #57165 can be closed in favor of this one. Decode-side TPOT on the probed decode rank (`request_time_per_output_token_seconds` sum/count delta, 5 requests of 256 output tokens per arm) was 22.60 ms without and 22.17 ms with the PR (23.48 ms in the earlier run); at n=5 I would not read that as either equal or a regression, only as nothing gross. Every prefill engine logged `KV offload control-plane thread started for tier(s) ['p2p'], interval 0.001s`, so the thread was active during the cases.\n\nThe first pull after boot is a different problem (#57133: the destination rank's own first dummy batch JIT) and this PR does not change it: 25.5 s without, 25.2 s with, both on fresh nodes.\n\nOne row I cannot interpret yet: a gateway-routed follow-up with all eight source ranks loaded waited 9.7 s on its lookup with the PR (TTFT 11.8 s, 102K tokens pulled). n=1, no counterpart without the PR on this nightly, no JIT on the destination at that time, no lock-timeout warning from the control-plane thread. I will look at it separately; the direct-injection rows above do not show it.\n\nOne note on the setup, in case it matters for reproducing: prefill ran with `--compilation-config '{\"cudagraph_mode\":\"NONE\"}'` on both arms because this nightly captures CUDA graphs for `deepep_high_throughput` when breakable graphs are auto-enabled and crashes at startup (same early return as #53030).\n",
+      "created_at": "2026-10-09T16:38:34Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#issuecomment-6085130791",
+      "updated_at": "2026-10-09T16:38:34Z",
+      "user": {
+        "login": "nilig"
+      }
+    }
+  ],
+  "number": 58168,
+  "refs": {
+    "base": {
+      "commit": "b49c921a27083c25c16f308be1326055dbc87bbf",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "271f52e299704e5c73b245cc6597c91baca90a34",
+      "repository": "liranschour/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "cc @mkhazraee wdyt?\nThis should help kvcr tier as well.\nThe purpose is to assure `serve_external_requests` is called more frequently (e.g. 1ms).\nToday it is only called from the main thread, which may get to every O(s) if the model runner is busy.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5301911001",
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-24T11:29:02Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376243699",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-01T07:31:53Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376244358",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-01T07:31:56Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376410902",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-01T07:46:27Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376412638",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-01T07:46:36Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376566380",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-01T08:02:30Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58168#pullrequestreview-5376783051",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-01T08:25:46Z",
+      "user": {
+        "login": "claude"
+      }
+    }
+  ]
+}

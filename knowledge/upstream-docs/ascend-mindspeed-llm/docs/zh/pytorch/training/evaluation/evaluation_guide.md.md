@@ -1,0 +1,103 @@
+---
+id: doc-ascend-mindspeed-llm-8a1a33e3ff3f9f5eff43
+title: Ascend/MindSpeed-LLM / docs/zh/pytorch/training/evaluation/evaluation_guide.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed-LLM
+commit: 2fed626696175480ae1ab3342a94017301a25209
+path: docs/zh/pytorch/training/evaluation/evaluation_guide.md
+raw_sha256: 7e291ad8032d91693752f610afba94a525e3be6f5ac5be1ca7595f8c96f419df
+sources: []
+generated_body_sha256: 8c345d9925ca3e8a7c4b5eec4a94740a5063fab4396ffe44d6c773f1b1b92c02
+source_state: current-scan
+---
+
+# Ascend/MindSpeed-LLM / docs/zh/pytorch/training/evaluation/evaluation_guide.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/evaluation/evaluation_guide.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# 评估指导手册
+
+MindSpeed-LLM 支持大模型在公开基准数据集上进行准确率评估，当前支持的 Benchmark
+ 详细统计信息可参考[models_evaluation.md](./models_evaluation.md)。
+
+## 环境变量
+
+脚本中的环境变量配置可参考[环境变量说明](../../features/mcore/environment_variable.md)。
+
+## 大模型分布式评估使用介绍
+
+### 1. 基准评估
+
+MindSpeed-LLM 基准评估脚本命名风格及启动方法为：
+
+```shell
+# 命名及启动：examples/mcore/model_name/evaluate_xxx.sh
+# 脚本内容参考：https://gitcode.com/Ascend/MindSpeed-LLM/blob/26.0.0/examples/mcore/llama2/evaluate_llama2_7b_mmlu_ptd.sh
+bash examples/mcore/llama2/evaluate_llama2_7b_mmlu_ptd.sh
+```
+
+```shell
+# 修改模型参数路径和词表路径
+TOKENIZER_PATH="./model_from_hf/llama-2-7b-hf/"  #词表路径
+CHECKPOINT="./model_weights/llama-2-7b-mcore"    #权重路径
+# 配置任务和数据集路径
+DATA_PATH="./mmlu/data/test/"
+TASK="mmlu"  # 支持 mmlu、ceval、agieval、bbh、boolq、human_eval
+
+# 启动评估脚本
+# 脚本内容参考：https://gitcode.com/Ascend/MindSpeed-LLM/blob/26.0.0/examples/mcore/llama2/evaluate_llama2_7b_mmlu_ptd.sh
+bash examples/mcore/llama2/evaluate_llama2_7b_mmlu_ptd.sh
+```
+
+【--max-new-tokens】
+
+表示模型输出的生成长度，多项选择问题的输出长度会比编码任务的输出长度小，该参数很大程度上影响了模型的评估性能
+
+【--evaluation-batch-size】
+
+可以设置多 batch 推理，提升模型评估性能
+
+【--broadcast】
+
+在开启 Expert Parallel 时，需启用该参数进行评估
+
+### 2. 指令微调评估
+
+使用指令微调后权重的评估脚本命名风格及启动方法为：
+
+```shell
+# 脚本内容参考：https://gitcode.com/Ascend/MindSpeed-LLM/blob/26.0.0/examples/mcore/llama2/evaluate_llama2_7b_full_mmlu_ptd.sh
+bash examples/mcore/llama2/evaluate_llama2_7b_full_mmlu_ptd.sh
+```
+
+【--prompt-type】
+
+模型对话模板，用于选择模型对应的对话模板进行评估
+
+【--hf-chat-template】
+
+如果模型的 tokenizer 已经具备 `chat_template` 属性，则可以选择通过添加 `--hf-chat-template` 来使用模型内置的对话模板进行评估
+
+【--eval-language】
+
+根据评估数据集语言来确定，默认为`en`，如果评估数据集为中文数据集，则应设置为`zh`
+
+### 3. LoRA权重评估
+
+使用LoRA权重的评估脚本命名风格及启动方法为：
+
+```shell
+# 需要加载LoRA权重启动评估脚本，命名风格及启动方法为：
+bash examples/mcore/codellama/evaluate_codellama_34b_lora_ptd.sh
+```

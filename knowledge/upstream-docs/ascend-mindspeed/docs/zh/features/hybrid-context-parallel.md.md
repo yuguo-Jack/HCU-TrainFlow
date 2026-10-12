@@ -1,0 +1,99 @@
+---
+id: doc-ascend-mindspeed-5df054d28f6dad86f7f2
+title: Ascend/MindSpeed / docs/zh/features/hybrid-context-parallel.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/hybrid-context-parallel.md
+raw_sha256: c2fef79495bec2e558a883f493f92e495d4dcaa5645a244e48d42ff07a2ed704
+sources: []
+generated_body_sha256: 7db626f4fe0c9817650ebad2115e3261a6f02ff8bb0e42a31a7d2c3d13672f01
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/hybrid-context-parallel.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/hybrid-context-parallel.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# 混合长序列并行
+
+## 背景与挑战
+
+从生成式AI到科研模型，长序列训练正在变得非常重要。在生成式AI领域，会话式AI、长文档摘要和视频生成等任务都需要在空间和时间层面对长上下文进行推理。 同样，章节和书籍级别的摘要（数万甚至数十万字）在会话式AI和摘要任务中也受到重视。现有的数据、张量和流水线等并行方法无法在序列维度进行切分。当序列维度(S)增长时，训练内存开销会以$O$($S^2$)的速度增长。因此需要针对长序列场景进行特定的优化，以解决长训练场景的训练需求。
+
+目前流行的序列并行方案，Ulysses和Ring Attention存在各自的局限性。
+
+Ulysses需要确保attention head数可以被序列并行维度整除，在GQA、MQA场景下序列并行的大小有限制，导致序列长度的扩展有限。
+
+Ring Attention的并行维度不受attention head数限制，因此理论上序列长度可以无限拓展。但相比于Ulysses，Ring Attention不能充分利用通信和计算带宽，在序列块大小较低时性能劣于Ulysses。
+
+## 解决方案
+
+对Ulysses和Ring Attention做融合，实现混合序列并行，以此解决两个方案各自缺陷。具体细节请参见文献[USP: A Unified Sequence Parallelism Approach for Long Context Generative AI](https://arxiv.org/abs/2405.07719)。
+
+## 使用场景
+
+混合长序列并行方案适用以下几种典型场景：
+
+- 可兼容FlashAttention，目前已默认开启FlashAttention。
+
+- 序列并行维度被分为Ulysses维度和Ring Attention维度，Ulysses维度和Ring Attention维度乘积即为序列并行维度。
+
+## 使用方法
+
+<table>
+ <thead>
+    <tr>
+      <th width='200'>重要参数</th>
+      <th>参数说明</th>
+      <th>是否必选</th>
+      <th>默认值</th>
+    </tr>
+  </thead>
+ <tbody>
+  <tr>
+    <td> --context-parallel-size [int]</td>
+    <td>设置长序列并行大小，默认为1，根据用户需求配置。</td>
+    <td>否</td>
+    <td>1</td>
+  </tr>
+  <tr>
+    <td> --ulysses-degree-in-cp [int]</td>
+    <td>该参数需大于1，且--context-parallel-size可以被该参数整除。例如当设置--context-parallel-size为8时，可以设置--ulysses-degree-in-cp为2或--ulysses-degree-in-cp为4。
+    <br>同时需要确保--num-attention-heads可以被--ulysses-degree-in-cp * --tensor-model-parallel-size的乘积整除。
+    </td>
+    <td>/</td>
+    <td>/</td>
+  </tr>
+  <tr>
+    <td> --context-parallel-algo</td>
+      <td>
+        长序列并行算法选项：
+        <ul>
+          <li>ulysses_cp_algo：开启Ulysses长序列并行</li>
+          <li><b>hybrid_cp_algo</b>：开启Hybrid长序列并行</li>
+          <li>megatron_cp_algo：开启Ring Attention长序列并行</li>
+        </ul>
+      </td>
+    <td>否</td>
+    <td>megatron_cp_algo</td>
+  </tr>
+  </tbody>
+</table>
+
+混合长序列并行支持Ring Attention长序列并行相关特性，包括send receive overlap功能、Mask计算类型配置。
+
+## 使用效果
+
+利用多个计算设备对输入序列进行并行切分，降低单设备的内存消耗，相比不开启序列并行单步耗时增加，相比重计算计算效率提升。

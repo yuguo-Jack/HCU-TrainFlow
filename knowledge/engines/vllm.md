@@ -1,6 +1,6 @@
 ---
 id: engines/vllm
-title: vLLM：训练权重传输、物化范围与服务端验证
+title: vLLM：RL 权重同步、生成与显存交接的工程地图
 engine: vllm
 kind: authored
 stages:
@@ -10,77 +10,130 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
-coverage: selected implementation chain, not all models or backends
+reviewed_on: '2026-10-12'
+coverage: reviewed implementation chains and official guides; not all models, backends
+  or HCU runtime qualification
 sources:
 - source: vllm-project-vllm
-  path: vllm/distributed/weight_transfer/base.py
-  commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
-  sha256: dd7c13e80b9607399bcd0c99c90e47682997fff018f68dd8e672e40a7bf5502b
+  path: README.md
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: 4dc7399323b9660117f8cc1226afb7a81cdbb912dbb4ae74b66d89052417d11c
 - source: vllm-project-vllm
-  path: vllm/distributed/weight_transfer/factory.py
-  commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
-  sha256: f94d93413002061cfeeea79af68745d589b9b6adbc14b1c08a0525166d010426
+  path: pyproject.toml
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: eaa19cba70f13234be4acdc1eeb2126b937c6f0892fd1af29863db5a62bee95b
+- source: vllm-project-vllm
+  path: setup.py
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: b2ce0549ef12e33c1db846c417235f4e4d104673a09ba29333694f283440347c
+- source: vllm-project-vllm
+  path: docs/getting_started/installation/gpu.rocm.inc.md
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: 2df1b0495fd6b39d75451a29dd97f9c19d5926d74b41fbe129121e5a18b14b5a
+- source: vllm-project-vllm
+  path: docs/models/supported_models.md
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: bd5879be29836d74b2e974d107f1a9fe50706ba5f9a0d854edc497981d98fb94
+- source: vllm-project-vllm
+  path: docs/training/rlhf.md
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: b523c750e27aabd2c342609a6eb042a2d97a5d37aff6db56e48164d23442e290
+- source: vllm-project-vllm
+  path: docs/training/weight_transfer/README.md
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: 0667bf0764bba25629a931ad8c81801517cfc4a478d4b57286cdeb5591e40518
+- source: vllm-project-vllm
+  path: docs/features/sleep_mode.md
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: 85bd01f925e1ad92c80ac023214ec1a1dd7d431fc8ae03ba4ee214cfb8ab13de
 - source: vllm-project-vllm
   path: vllm/v1/worker/gpu_worker.py
-  commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
-  sha256: 836b0de5f89cb5f1fd81f7797040af515fc0ccdc0b277e8bda3541626eb640c7
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: e970aa29a738aa15cd963d9f9202ca6d3d504e98fd344959fd998e940472a5a0
 - source: vllm-project-vllm
-  path: vllm/distributed/weight_transfer/nccl_engine.py
-  commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
-  sha256: f2dc18d8dc1d0ae0dcd33c4f827f8804ebd691afa63c13db52bad752202b5d17
+  path: vllm/v1/core/sched/scheduler.py
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: d546a324891860fbaeb2d82a85b2a7970825972cac7c8f7327d84632fa53d04d
+- source: vllm-project-vllm
+  path: examples/rl/rlhf_async_new_apis.py
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: b422474b8ae8d7d6b5e7fb52fb5e7ba50bbd48c79be76f1b856502cfe0fe1fae
 - source: vllm-project-vllm
   path: tests/v1/worker/test_gpu_worker_weight_transfer.py
-  commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
-  sha256: c64123bd7c4fbb8efefeea583f9ddc6f897047190b3b12498e4abb0255c02b90
+  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  sha256: aa88face06df5f7e7313211e22845474670e1437218ec99165efce40b25a1a67
 ---
 
-# vLLM：训练权重传输、物化范围与服务端验证
+# vLLM：RL 权重同步、生成与显存交接的工程地图
 
-## 定位与目录
+## 训练职责和阅读路线
 
-RL 训练使用 vLLM 时应同时阅读训练框架适配器与 vLLM 接收侧。`vllm/distributed/weight_transfer` 定义协议、factory 和具体 engine，`vllm/v1/worker/gpu_worker.py` 在设备 worker 接入；`tests/v1/worker/test_gpu_worker_weight_transfer.py` 是相关测试入口。docs/training 与 sleep mode 文档作为独立来源页保留。
+vLLM在RL中提供高吞吐rollout、eval及训练后的权重安装，负责推理调度/KV/模型执行；训练optimizer、优势估计、loss和checkpoint由consumer负责。每个问题同时查verl/AReaL等adapter与vLLM接口、训练端export和实际HCU fork。
 
-## WeightSource 与物化代价
+[权重同步专题](vllm/weight-transfer.md)说明sender、gather和每轮start/update/finish；[显存与KV专题](vllm/memory-and-scheduling.md)说明sleep、分tag恢复、调度/混合KV及数值。不要把服务吞吐优化与RL策略更新正确性分开验收。
 
-`base.py` 的 WeightSource 分离 metadata 与可重复迭代的实际权重。`materialize_full_tensor` 对支持 full_tensor 的对象发起完整张量物化，例如 FSDP 的 collective allgather；普通 tensor 直接返回。metadata 不应意外多做一次完整物化，跨 rank 的迭代顺序必须一致。
+## 工程目录和调用链
 
-`layerwise_groups` 按参数名最外层数字索引组织 decoder layer，保证同层 MoE experts 不被拆散；未索引的 pre/post 参数与各 stack 顺序单独处理。若全部权重误落到一个组，原计划的逐层内存上限会退化为整模型大小。因此模型命名规则、Bridge export 顺序和接收端分组都属于性能契约。
+| 目录/文件 | 职责 | 问题入口 |
+| --- | --- | --- |
+| `pyproject.toml`、`setup.py`、`docs/getting_started/installation/` | 构建、平台wheel/扩展和依赖 | Torch ABI、目标平台、包与源码身份 |
+| `vllm/config/` | 模型、并行、scheduler、weight-transfer等配置 | 一个参数到底落在哪一层 |
+| `vllm/entrypoints/` | Python/HTTP控制和请求入口 | 暂停、权重操作、状态报告 |
+| `vllm/v1/core/sched/` | 请求状态与token/KV预算 | 等待、抢占、异步在途、吞吐尾延迟 |
+| `vllm/v1/core/kv_cache_manager.py` | KV分配/命中/释放协调 | 长上下文、滑窗、prefix、混合模型 |
+| `vllm/v1/worker/gpu_worker.py` | 设备初始化、模型运行、sleep/refit | 内存handoff、候选路径、底层执行 |
+| `vllm/distributed/weight_transfer/` | source、client、factory、transport | 训练分片物化、跨副本更新、逐层buffer |
+| `vllm/device_allocator/` | sleep backend/allocator | 物理内存恢复、graph/communicator状态 |
+| `vllm/model_executor/`、`vllm/attention/`、`csrc/` | 模型、quantization、attention与扩展 | 参数名/分片、kernel分发和算子性能 |
+| `examples/rl/`、`tests/distributed/`、`tests/v1/worker/` | RL例子、transport/worker回归 | 同步、IPC/训推分离、失败状态验证 |
 
-## 安装、运行和测试
+一次rollout为consumer→generation入口→engine-core/scheduler→executor/worker/model-runner→模型kernel→outputs；一次policy同步另走training WeightSource→client/transport→worker→load/post-load→版本提交。两个链路在pause、KV和weight-version相交，不能只读其中一个。
 
-先确认训练端使用的 transfer backend、vLLM 版本和 worker 架构；factory 能找到 engine 不等于实际 transport 可用。采用 HCU fork 的安装和服务脚本，锁定 TP、dtype/quantization、权重布局与网络组。完整验收是：初始化传输→更新参数→完成同步→固定输入生成→第二次更新→保存/恢复关联。
+## 安装与实际运行
 
-官方 weight transfer 测试应按实际依赖裁剪并记录 skip；缺 transport 库不可标通过。PR #59772 是 CI ModelExpress 处理修复，不是一个已验证提升训练吞吐的优化案例；用于追测试矩阵，真正优化还需检索相关实现 PR。
+当前固定pyproject声明Python ≥3.11且<3.15，build依赖指定Torch；源码setup依据目标平台构建扩展，ROCm官方指南与HCU镜像配方应分别阅读。遵循实际HCU fork支持的Torch/DTK/编译器/通信版本，记录wheel来源、source SHA、扩展路径和backend日志；`vllm.__version__`不是动态库加载证据。
 
-## 性能和数值检查
+从HCU消费者既有rollout脚本选择serve或嵌入式LLM/AsyncLLM；固定模型config/tokenizer、TP/PP/DP/EP、attention/quantization、max-model-len、scheduler预算和memory配置。训练main与推理main各自latest并不保证兼容，wire params、loader格式和控制端必须成组锁定。
 
-分开测 gather/materialize、序列化/packing、发送、接收/load、quantization scale 更新、恢复 KV 和生成。比较同数据量单测与训练中表现，记录中间 full tensor、副本和 pinned host buffer 的峰值。调小 group/bucket 可能降低内存但增加消息数，必须按实际模型 shapes 评估。
+## 模型、数据和运行验收
 
-对接 LoRA、FP8、tied embedding 时，核对“线上发送的 dtype/shape”与模型真正使用的参数及 scale；只有参数拷贝完成仍不足以证明 logits 正确。阶段 loss 与 RL 策略指标由训练任务验证，vLLM 单测仅证明局部接口。
+官方supported-models按实现/任务列入口；新HF架构名称、视觉/SSM/滑窗/MLA、MoE和draft支持需追对应model与平台backend。训练分片参数需转换为模型真正使用的名字、shape/layout、dtype/scales；MoE专家与tied weights特别核对。
 
-## 故障与更新
+验收顺序：导入与候选backend确认→固定tokenprompt生成→两次权重更新→每副本权重/版本与logits验证→pause/sleep/wake→请求恢复→消费者RL小跑。`tests/v1/worker/test_gpu_worker_weight_transfer.py`覆盖worker委派和非法状态，sleep-backend/tensor-ownership测试覆盖部分资源生命周期；有模型、transport、设备的集成测试才能证明真实通信，不能把mock测试覆盖当现场通过。
 
-卡在 weight transfer 时检查所有训练 rank 是否参与同序 collective、接收端是否处于可更新状态、factory 选中了哪个实现。OOM 首先检查逐层分组是否退化、发送/接收副本是否重叠、sleep/onload 的释放顺序。更新时将 transfer base、具体 engine、worker、测试和训练框架适配器视为同一接口链，而不是各自独立升级。
+每批rollout记录policy version、输入token、sampling和stop/mask/logprob定义。推理logprob是否temperature调整或来自哪个distribution需与consumer训练定义对齐；允许随机生成差异，但量化、stale权重/KV和不一致rank不是采样噪声。
 
-## 固定源码与符号导航
+## 性能、故障与恢复
 
-| 文件 | 本轮源码中可追查的入口（非全部符号） |
-| --- | --- |
-| [vllm/distributed/weight_transfer/base.py](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/vllm/distributed/weight_transfer/base.py) | `layerwise_groups`, `materialize_full_tensor`, `ParamMeta`, `WeightSource`, `ModuleSource`, `WeightTransferInitInfo`, `TrainerInitInfo`, `WeightTransferUpdateInfo` |
-| [vllm/distributed/weight_transfer/factory.py](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/vllm/distributed/weight_transfer/factory.py) | `WeightTransferEngineFactory`, `WeightTransferTrainerFactory`, `register_engine`, `create_engine`, `register_engine`, `trainer_init`, `loader`, `loader` |
-| [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/vllm/v1/worker/gpu_worker.py) | `maybe_rocm_profiling_fallback`, `AsyncIntermediateTensors`, `Worker`, `init_worker_distributed_environment`, `wait_for_comm`, `sleep_mode_backend`, `sleep`, `wake_up` |
-| [vllm/distributed/weight_transfer/nccl_engine.py](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/vllm/distributed/weight_transfer/nccl_engine.py) | `NCCLTrainerInitInfo`, `NCCLWeightTransferUpdateInfo`, `NCCLWeightTransferEngine`, `NCCLTrainerWeightTransferEngine`, `init_transfer_engine`, `start_weight_update`, `finish_weight_update`, `receive_weights` |
-| [tests/v1/worker/test_gpu_worker_weight_transfer.py](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/tests/v1/worker/test_gpu_worker_weight_transfer.py) | `test_reload_weights_sets_current_config`, `test_reload_parameter_lookup_preserves_lora_module_names`, `test_start_update_finish_delegates_to_engine`, `test_rank_local_update_selects_worker_payload`, `test_rank_local_update_uses_data_parallel_index_after_reconfigure`, `test_finish_draft_session_keeps_lora_state`, `test_double_start_raises`, `test_update_without_start_raises` |
+以RL迭代计时分账：training gather/export、weight transfer、postprocess、sleep/wake、重新prefill、生成/排队。优先看最慢replica/rank和真实token长度分布；对照独立同shapeattention/GEMM/通信与训练并发时的争用。机制与代价见两专题。
 
-## 教程、PR 与继续搜索
+同步卡住先确认所有训练rank是否按metadata同序materialize、所有rolloutworker是否进入receive；OOM先看逐层group是否退化、weight/KV恢复是否同时峰值、host backup是否重叠。失败同步不消费新policy样本；明确可信版本、所有worker结果和更新状态后再恢复。服务重启不代替consumer checkpoint/RNG/样本游标恢复。
 
-- [全仓目录和固定文件入口](../source-maps/vllm-project-vllm.md)：没有本地专题时按模块继续读源码。
-- [上游教程原文目录](../upstream-docs/vllm-project-vllm/)：保留来源内容，链接相对位置以原站为准。
-- [PR #59772：[CI] Fix ModelExpress handling in weight transfer tests](../prs/vllm-project--vllm/PR-59772.md)：正文、review、diff 与 head/base 源码。
+## Release、规划、PR 与维护
 
-检索示例：`wiki-search "关键符号或问题" --engine vllm`。本地结果不足，使用 `wiki-search-pr "简短英文问题词" --engine vllm`，再 `wiki-pr OWNER/REPO NUMBER`、`wiki-code OWNER/REPO FULL_SHA PATH` 追实际调用者、被调底层库和测试。普通查阅只写私有缓存。
+本页固定官方main `8d7b93fec2eb72ce01f2217472ac1f51b9bce600`；2026-10-12最近可见正式release为[v0.31.0](https://github.com/vllm-project/vllm/releases/tag/v0.31.0)。[Releases](https://github.com/vllm-project/vllm/releases)、[官方文档](https://docs.vllm.ai/)、[Issues/RFC](https://github.com/vllm-project/vllm/issues)、[PR](https://github.com/vllm-project/vllm/pulls)共同核对规划、合入和发布。sleep-backend源码引用RFC #34303是扩展动机，不证明所有durable/CRIU backend已实现。
 
-## 更新和验收边界
+保留[PR #59772](../prs/vllm-project--vllm/PR-59772.md)作为可选ModelExpress依赖/CI测试约束的历史入口；它修测试发现与skip，不能称为训练传权性能提升。相关实现PR需按问题继续`wiki-search-pr "weight transfer layerwise" --engine vllm`，再追head/base和真实调用。
 
-运行 `wiki-update PROJECT vllm-project-vllm` 检查完整目录、新文档、PR 讨论与已监测源码；分页或网络失败必须续采。变更后联动本页、同仓专题/案例、调用方与依赖；源码已 merge、软件已发布、HCU 已适配和当前任务已验证分别登记。本页为选定实现的代码阅读和操作建议，没有在 HCU 执行上述测试，也未覆盖所有模型。实际任务的版本、性能、显存、失败尝试和阶段 loss 记录进入私有经验 Wiki。
+`wiki-update PROJECT vllm-project-vllm`同步[全仓目录](../source-maps/vllm-project-vllm.md)、[原文](../upstream-docs/vllm-project-vllm/)及讨论；source/factory/transport/worker、模型loader、tests和consumer的train-export必须交叉复核。原文同步完成不等于所有模型或HCU后端验证完成。
+
+## HCU 使用前的独立核对
+
+HCU 侧若通过 vLLM 插件接入，基础包、插件及算子扩展是不同版本；先确认实际 entry points、兼容性 gate、doctor/启动日志、worker 与 model-runner 加载链。稳定参考与活跃开发分支分别核对，不能把官方 main 的新 weight-transfer/sleep API 自动视为较早 HCU 包已支持。HCU-Knowledge 提供当前仓/分支、模型与优化案例；据其固定证据和现场基础包版本继续读实际源码，避免用旧整体 fork 的安装/patch 方式覆盖新插件。
+
+## 固定证据与验证范围
+
+- [README.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/README.md)
+- [pyproject.toml](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/pyproject.toml)
+- [setup.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/setup.py)
+- [docs/getting_started/installation/gpu.rocm.inc.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/getting_started/installation/gpu.rocm.inc.md)
+- [docs/models/supported_models.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/models/supported_models.md)
+- [docs/training/rlhf.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/training/rlhf.md)
+- [docs/training/weight_transfer/README.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/training/weight_transfer/README.md)
+- [docs/features/sleep_mode.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/features/sleep_mode.md)
+- [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/vllm/v1/worker/gpu_worker.py)
+- [vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/vllm/v1/core/sched/scheduler.py)
+- [examples/rl/rlhf_async_new_apis.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/examples/rl/rlhf_async_new_apis.py)
+- [tests/v1/worker/test_gpu_worker_weight_transfer.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/tests/v1/worker/test_gpu_worker_weight_transfer.py)
+
+本页在 2026-10-12 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。

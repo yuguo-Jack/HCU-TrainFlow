@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: README.md
-raw_sha256: 3a25c6f3f688196fa509b0deb3addceddb50b3fcfed487d09a83cf8663123324
+raw_sha256: f26cc2aec04657f27d2560bf576f357262f138f763561a911f818474ce11dd1f
 sources: []
-generated_body_sha256: 0e044aa0827427969bbd13bcd881cf8d53485a527c5e7ec0e554d3b299a6509d
+generated_body_sha256: 4ee050c2055d8946e4c2ccd0b8994eb5550057fbfe07b9a0c32995f7fa7438a4
 source_state: current-scan
 ---
 
 # THUDM/slime / README.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/README.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -34,9 +34,14 @@ Upstream source document; original commands, claims and links require their stat
 [![CI](https://img.shields.io/github/actions/workflow/status/THUDM/slime/pr-test.yml?branch=main&event=push&label=CI&logo=github)](https://github.com/THUDM/slime/actions/workflows/pr-test.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/THUDM/slime)
 
-**slime** is an LLM post-training framework for RL scaling. It combines Megatron training with SGLang rollout and exposes custom interfaces for data generation and rewards.
+**slime** is an LLM post-training framework for RL scaling, providing two core capabilities:
 
-Training, rollout, the data buffer, and environment feedback share one dataflow. This supports math, code, search, tool use, and long-horizon agent workflows within the same training loop.
+1.  **High-Performance Training**: Supports efficient training in various modes by connecting Megatron with SGLang;
+2.  **Flexible Data Generation**: Enables arbitrary training data generation workflows through custom data generation interfaces and server-based engines.
+
+slime's design goal is to make these two capabilities reinforce each other without turning the system into a heavy stack of disconnected trainers, rollout services, and agent frameworks. Megatron training, SGLang rollout, custom data generation, reward computation, verifier feedback, and environment interaction all flow through the same training / rollout / Data Buffer path.
+
+This makes slime one of the most battle-tested open RL post-training frameworks: small enough to understand and extend, but validated through complete training loops behind SOTA-level model releases.
 
 ## Why This Design Matters
 
@@ -47,7 +52,7 @@ Training, rollout, the data buffer, and environment feedback share one dataflow.
 
 ## Supported Models
 
-Alongside the GLM family, slime supports Qwen (Qwen3.6, Qwen3.5, Qwen3-Next, Qwen3 MoE, Qwen3, Qwen2.5), DeepSeek (V3, V3.1, R1), and Llama 3. See the model configurations in [scripts/models](scripts/models/) and the [training examples](https://thudm.github.io/slime/).
+Alongside the GLM family, slime supports Qwen (Qwen3.8, Qwen3.6, Qwen3.5, Qwen3-Next, Qwen3 MoE, Qwen3, Qwen2.5), DeepSeek (V3, V3.1, R1), and Llama 3. See the model configurations in [scripts/models](scripts/models/) and the [training examples](https://thudm.github.io/slime/).
 
 ## Engine Configuration and Deployment
 
@@ -107,7 +112,7 @@ These agentic RL examples use the standard rollout and data buffer interfaces:
 - [`examples/multi_agent`](examples/multi_agent/README.md): Multi-agent generation via `--custom-generate-function-path` inside the standard rollout loop.
 - [`examples/search-r1`](examples/search-r1/): Search/RAG-style multi-turn generation via `--custom-generate-function-path`.
 - [`examples/fully_async`](examples/fully_async/README.md): Fully-async rollout, useful for long-tail agentic generation where some samples take much longer than others.
-- [`examples/coding_agent_rl`](examples/coding_agent_rl/README.md): End-to-end SWE coding-agent RL with sandboxed tool use, test-based rewards, and token-correct trajectory segments via `--custom-generate-function-path`.
+- [`examples/coding_agent_rl`](examples/coding_agent_rl/README.md): Qwen3.8-27B coding-agent RL on Xiaomi MiMo SWE data, using sunabako sandboxes, official test rewards, and token-correct trajectories.
 
 See the [Customization Guide](docs/en/get_started/customization.md) for which interface to use for a given agentic workflow.
 

@@ -9,40 +9,40 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-12'
 sources:
 - source: nvidia-cudnn-frontend
   path: docs/quickstart.mdx
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 93ed00e9f0f26ad5a4f31971b226ffaef47477e435e61cc66e4f9f9b47c456ea
 - source: nvidia-cudnn-frontend
   path: docs/operations/Attention.md
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
-  sha256: a74721673ec44fe42148d955bb23c7fadf99f25e7f1efc32317211a09323e872
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
+  sha256: 2e795d0087be6c124802c09ecda29066ce12c2273b33244c3bda37020ee2523e
 - source: nvidia-cudnn-frontend
   path: samples/python/50_sdpa_forward.ipynb
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 5269e5e9a40a4646ec36eaaee478eef6a79cbf252f107c77af8575bc58175f93
 - source: nvidia-cudnn-frontend
   path: samples/python/51_sdpa_backward.ipynb
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: e530a489347cc811a7cf67319c48e479e100f32304abca90b6d0777f09032950
 - source: nvidia-cudnn-frontend
   path: samples/python/29_rmsnorm.ipynb
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 4f7a127401a32e819c5b0d11b31579f7a7b6480e4cbd056e55cd8d3a7231ee62
 - source: nvidia-cudnn-frontend
   path: samples/frost/gemm/06_moe_grouped_matmul_fwd_swiglu.py
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 8fb058957f1f11d2fbc602dc30263fd10deed955b20f2a1f754d0109a86e6b5f
 - source: nvidia-cudnn-frontend
   path: docs/utilities/python_graph_and_execution_backends.md
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
-  sha256: de73a4ce7f5532c8aff2f590c5f74200a09b167e18e3c38982fa108a40fe842f
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
+  sha256: f53cf07d3f1f5c4c85eeccb722eb573994351854d6ed4a8f27ac90f1bd2483f7
 - source: nvidia-cudnn-frontend
   path: docs/fe-oss-apis/overview.md
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
-  sha256: fe44382f85fcc487b15acc31eb2d8d5685cd3f7e3657ffedb0753dba22738a02
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
+  sha256: f73c6109c01248eab4257db24eb2f8074f8d4f0a61c7c934c18d15a5870cd012
 - source: nvidia-cudnn-frontend-docs
   path: quickstart
   commit: e231f1ecf1c04ca05f5c5f66898be6f84da14a37fddd16491d733ebb95e321c1
@@ -62,7 +62,6 @@ sources:
   url: https://docs.nvidia.com/deeplearning/cudnn/latest/fe-oss-apis/overview.html
   revision_kind: web-content-fingerprint
 ---
-
 # cuDNN Frontend 官方教程、源码实例与更新索引
 
 ## 任务到教程的导航
@@ -88,16 +87,20 @@ Graph/plan 变化联动安装和性能案例；SDPA 变化同时复核 TE attent
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/quickstart.mdx)
-- [nvidia-cudnn-frontend: docs/operations/Attention.md](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/operations/Attention.md)
-- [nvidia-cudnn-frontend: samples/python/50_sdpa_forward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/samples/python/50_sdpa_forward.ipynb)
-- [nvidia-cudnn-frontend: samples/python/51_sdpa_backward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/samples/python/51_sdpa_backward.ipynb)
-- [nvidia-cudnn-frontend: samples/python/29_rmsnorm.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/samples/python/29_rmsnorm.ipynb)
-- [nvidia-cudnn-frontend: samples/frost/gemm/06_moe_grouped_matmul_fwd_swiglu.py](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/samples/frost/gemm/06_moe_grouped_matmul_fwd_swiglu.py)
-- [nvidia-cudnn-frontend: docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/utilities/python_graph_and_execution_backends.md)
-- [nvidia-cudnn-frontend: docs/fe-oss-apis/overview.md](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/fe-oss-apis/overview.md)
+- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/quickstart.mdx)
+- [nvidia-cudnn-frontend: docs/operations/Attention.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/operations/Attention.md)
+- [nvidia-cudnn-frontend: samples/python/50_sdpa_forward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/python/50_sdpa_forward.ipynb)
+- [nvidia-cudnn-frontend: samples/python/51_sdpa_backward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/python/51_sdpa_backward.ipynb)
+- [nvidia-cudnn-frontend: samples/python/29_rmsnorm.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/python/29_rmsnorm.ipynb)
+- [nvidia-cudnn-frontend: samples/frost/gemm/06_moe_grouped_matmul_fwd_swiglu.py](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/frost/gemm/06_moe_grouped_matmul_fwd_swiglu.py)
+- [nvidia-cudnn-frontend: docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/utilities/python_graph_and_execution_backends.md)
+- [nvidia-cudnn-frontend: docs/fe-oss-apis/overview.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/fe-oss-apis/overview.md)
 - [nvidia-cudnn-frontend-docs: quickstart](https://docs.nvidia.com/deeplearning/cudnn/latest/quickstart.html)
 - [nvidia-cudnn-frontend-docs: attention](https://docs.nvidia.com/deeplearning/cudnn/latest/operations/Attention.html)
 - [nvidia-cudnn-frontend-docs: open-kernels](https://docs.nvidia.com/deeplearning/cudnn/latest/fe-oss-apis/overview.html)
 
-本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码 main、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+
+## 持续跟踪两条版本线
+
+本 Wiki 的新机制基线选择官方 develop，发布兼容性继续查 [Releases](https://github.com/NVIDIA/cudnn-frontend/releases)、main 与部署包。遇到分支切换、reset 或已引用提交不在默认分支祖先链时，先做 compare/版本确认，不能自动把较旧默认分支当作更“新”的事实。网页 latest 另有内容指纹，网页与源码冲突时并列说明适用版本。

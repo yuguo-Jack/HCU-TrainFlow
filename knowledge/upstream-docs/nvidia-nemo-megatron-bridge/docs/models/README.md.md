@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA-NeMo/Megatron-Bridge
-commit: 34ddd53b0e023d93f107f29b7dc61f9c5dd76a57
+commit: 53681c1aa264b54a1afa320830738382ee2a44f4
 path: docs/models/README.md
-raw_sha256: 4c3b9ec4ed45420a3e17c18d4b71dd5d2ef5d1f25a6e39eac773722f0a94d86d
+raw_sha256: 950d624e1d37f4af9ebc3ea94db07cc7acb2217b2707267bfb6352bae65c2dfe
 sources: []
-generated_body_sha256: 33294b8afe612bfc2f3a8becb3ffc73043b18f03d7504dd0d4fe76303fd8a630
+generated_body_sha256: 9d80d69709d21f60cef50a8cde01ce4540e821ce1fb43fd58ff1052f901e8487
 source_state: current-scan
 ---
 
 # NVIDIA-NeMo/Megatron-Bridge / docs/models/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/34ddd53b0e023d93f107f29b7dc61f9c5dd76a57/docs/models/README.md)
+[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/docs/models/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -32,7 +32,7 @@ Upstream source document; original commands, claims and links require their stat
 
 Choose a model to open its interactive import/export and training configurations. Every option comes directly from an authoritative YAML verification card; independent fields are never combined into synthetic commands.
 
-Current inventory: **28 model cards** and **400 concrete configurations**.
+Current inventory: **26 model cards** and **365 concrete configurations**.
 
 Each model page lets you select import/export, pretraining, benchmarking, SFT, LoRA, or long-context SFT and immediately see the exact command and expected result for the recorded precision and GPU.
 
@@ -140,13 +140,9 @@ Choose a model to inspect its recorded import/export, training, and precision co
   <section class="verification-provider-card">
     <header class="verification-provider-heading">
       <strong>NVIDIA</strong>
-      <span>8 models</span>
+      <span>6 models</span>
     </header>
     <div class="verification-provider-models">
-      <a class="verification-model-link" href="nemotron/nemotron-3-omni.html#verified-nemotron-3-nano-omni-30b-a3b-reasoning">
-        <strong title="nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16">Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16</strong>
-        <span class="verification-status verification-status--partial" title="Partial">◐ Partial</span>
-      </a>
       <a class="verification-model-link" href="nemotron/nemotron3-nano.html#verified-nemotron-3-nano-30b-a3b">
         <strong title="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16">NVIDIA-Nemotron-3-Nano-30B-A3B-BF16</strong>
         <span class="verification-status verification-status--partial" title="Partial">◐ Partial</span>
@@ -154,6 +150,10 @@ Choose a model to inspect its recorded import/export, training, and precision co
       <a class="verification-model-link" href="nemotron/nemotron3-nano-4b.html#verified-nemotron-3-nano-4b">
         <strong title="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16">NVIDIA-Nemotron-3-Nano-4B-BF16</strong>
         <span class="verification-status verification-status--verified" title="Verified">✓ Verified</span>
+      </a>
+      <a class="verification-model-link" href="nemotron/nemotron-3-omni.html#verified-nemotron-3-nano-omni-30b-a3b-reasoning">
+        <strong title="nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16">Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16</strong>
+        <span class="verification-status verification-status--partial" title="Partial">◐ Partial</span>
       </a>
       <a class="verification-model-link" href="nemotron/nemotron3-super.html#verified-nemotron-3-super-120b-a12b">
         <strong title="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16">NVIDIA-Nemotron-3-Super-120B-A12B-BF16</strong> <!-- pragma: allowlist secret -->
@@ -166,14 +166,6 @@ Choose a model to inspect its recorded import/export, training, and precision co
       <a class="verification-model-link" href="nemotron/nemotron3.5-lightning.html#verified-nemotron-3.5-lightning">
         <strong title="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16">NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16</strong>
         <span class="verification-status verification-status--verified" title="Verified">✓ Verified</span>
-      </a>
-      <a class="verification-model-link" href="nemotron/nemotron3.5-super-vl.html#verified-nemotron-3.5-super-vl-120b-a12b">
-        <strong title="nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16">NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16</strong>
-        <span class="verification-status verification-status--partial" title="Partial">◐ Partial</span>
-      </a>
-      <a class="verification-model-link" href="nemotron/nemotron3.5-super-vl-text-only.html#verified-nemotron-3.5-super-vl-120b-a12b-text-only">
-        <strong title="nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16">NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16</strong>
-        <span class="verification-status verification-status--partial" title="Partial">◐ Partial</span>
       </a>
     </div>
   </section>

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
 path: docs/docs/advanced_features/dcp.mdx
-raw_sha256: ac6effeaf4a55f92f16ea6013c3c1655c44e450273643b76250866f213ccf465
+raw_sha256: a81264a697248c3804f942ab22d5bc667ae08e3c2e8d67b9570ce68e178506dd
 sources: []
-generated_body_sha256: cd494ace4f570495d54e511b90e433776d37e1ddb1184f96db6bb6d2639f8980
+generated_body_sha256: eb74f60c1a22b07e0e59081d0b50e11738502cba5935ceea030f5281944cec6c
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/dcp.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/dcp.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/docs/docs/advanced_features/dcp.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -43,7 +43,7 @@ On Kimi K3, DCP applies only to MLA layers. Request-indexed KDA state is unchang
 | Setting | Behavior |
 | --- | --- |
 | `--dcp-size N` | Enables DCP and widens virtual capacity and page size by `N`. Alias: `--decode-context-parallel-size`. |
-| `--dcp-comm-backend` | Selects the MLA partial-output merge: `ag_rs`, `a2a`, or `fi_a2a`. Unset resolves to `fi_a2a` where the DCP group shares an MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm. |
+| `--dcp-comm-backend` | Selects the decode partial-output merge (MLA on CUDA/ROCm, MHA on Intel XPU): `ag_rs`, `a2a`, or `fi_a2a`. Unset resolves to `fi_a2a` where the DCP group shares an MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm/XPU. |
 | `--dcp-replicate-q-proj` | Removes the query all-gather for supported MLA weights. Use `--no-dcp-replicate-q-proj` to disable a model-specific default. |
 | `--attn-dp-size N` | Composes only when DCP groups nest inside attention TP. |
 
@@ -162,7 +162,7 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 | `a2a`, replicated Q | One packed NCCL A2A | Canonical low-latency path |
 | `fi_a2a`, replicated Q | One FlashInfer MNNVL A2A | Requires Blackwell and a DCP group inside one MNNVL domain (GB200/GB300 fabric, or a single node) |
 
-When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `fi_a2a` where the DCP group shares one MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm, and `ag_rs` only on platforms without the a2a path. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
+When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `fi_a2a` where the DCP group shares one MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm/XPU, and `ag_rs` only on platforms without the a2a path. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
 
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
 

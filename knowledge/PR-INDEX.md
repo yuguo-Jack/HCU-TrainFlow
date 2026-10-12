@@ -12,6 +12,7 @@ sources: []
 
 ## areal
 
+- [AReaL #1546：按目标聚合 loss 与 engine 归一化](prs/areal-project--AReaL/PR-1546.md)；[packing、prompt 分组和梯度分母精读](engines/areal/topics/loss-aggregation-and-packing.md)。
 - [areal-project/AReaL #1679：fix(dataset): align VLM SFT loss masks with responses](prs/areal-project--AReaL/PR-1679.md)
 - [areal-project/AReaL #1697：perf: reduce VLM CPU broadcast and microbatch memory overhead](prs/areal-project--AReaL/PR-1697.md)
 ## bridge
@@ -29,6 +30,7 @@ sources: []
 ## energon
 
 - [NVIDIA/Megatron-Energon #301：Keep datasets usable after closing a loader](prs/NVIDIA--Megatron-Energon/PR-301.md)
+- [#302：迭代器 finalize 的后续讨论](prs/NVIDIA--Megatron-Energon/PR-302.md)；[当前恢复与吞吐机制](official-megatron-wiki/topics/energon-recovery-throughput.md)，未合入提议不当作已实现能力。
 ## llamafactory
 
 - [hiyouga/LlamaFactory #10762：[v1] Support multimodal Ulysses CP and memory-efficient chunk loss for SFT](prs/hiyouga--LlamaFactory/PR-10762.md)
@@ -40,6 +42,7 @@ sources: []
 - [NVIDIA/Megatron-LM #7942：Declare the residual on the pre-MLP norm of the fused MLA spec](prs/NVIDIA--Megatron-LM/PR-7942.md)
 ## sglang
 
+- [#43758：权重装载成功后 flush 失败的状态](prs/sgl-project--sglang/PR-43758.md)、[#42561：部分 runner 更新提议](prs/sgl-project--sglang/PR-42561.md)；[权重与 KV 生命周期](engines/sglang/weight-update.md)。
 - [sgl-project/sglang #39265：[sglang-miles] Allocate packed weight receive buffers directly from metadata](prs/sgl-project--sglang/PR-39265.md)
 ## slime
 
@@ -59,6 +62,8 @@ sources: []
 
 ## transformer-engine
 
+- [#3657：RMSNorm 与 MXFP8 量化融合](prs/NVIDIA--TransformerEngine/PR-3657.md)；[调用、布局与数值案例](official-transformer-engine-wiki/cases/rmsnorm-mxfp8-fusion.md)。
+- [#3662：单 group NVFP4 MLP 权重视图](prs/NVIDIA--TransformerEngine/PR-3662.md)；[前后向格式案例](official-transformer-engine-wiki/cases/grouped-mlp-weight-layout.md)。
 - [NVIDIA/TransformerEngine #3517：[PyTorch] Support distributed weights in GroupedLinear's grouped-tensor path](prs/NVIDIA--TransformerEngine/PR-3517.md)
 - [NVIDIA/TransformerEngine #3546：[PyTorch] Enable LayerNormLinear UB AG overlap under no_grad](prs/NVIDIA--TransformerEngine/PR-3546.md)
 ## verl

@@ -1,0 +1,799 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "e30d863a6d82a3c45f2d71355dc73fbf5610967b",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [x] I, the PR author, have personally reviewed every line of this PR.\n\n> Main-branch counterpart of dev PR NVIDIA/Megatron-LM#6311.\n>\n> **This supersedes and fully covers NVIDIA/Megatron-LM#5920** (the main-branch\n> port of the older, model-chunk-granularity design). #5920 can be closed in\n> favour of this PR — everything it added to `main` is contained here, with the\n> recompute unit changed from *VPP stage* to *layer segment*.\n\n# What does this PR do ?\n\nAdds full activation recompute support for the EP A2A overlap path\n(`--overlap-moe-expert-parallel-comm`), which currently hard-asserts\n`recompute_granularity=full` off.\n\nRecompute is applied at **layer-segment** granularity: a segment's layers drop\ntheir activations as soon as that segment has finished forwarding, and the\nsegment is replayed with grad enabled immediately before its own backward (whose\nnodes release again as they backward). So only one segment's activations are\nmaterialized at a time, and only each segment's input tensor survives the\nforward→backward gap.\n\n## Issue tracking\n\nLinked issue: <!-- internal NVIDIA contribution; add issue link if required -->\n\n## Semantics\n\n`recompute_method` / `recompute_num_layers` mean exactly the same thing with and\nwithout `--overlap-moe-expert-parallel-comm`, mirroring\n`megatron.core.recompute.checkpointed_forward` (decoder) and\n`MultiTokenPredictionLayer._checkpointed_forward` (MTP):\n\n* `uniform`: decoder layers in groups of `recompute_num_layers`; one segment per\n  MTP layer (`recompute_num_layers` must be 1 when MTP is present, as upstream).\n* `block`: the first `recompute_num_layers` decoder layers, one segment each;\n  trailing decoder layers stay eager.\n\nBoth flags are therefore **required** on this path, exactly as on the non-overlap\npath — no validation exemption is introduced. (#5920 did add such an exemption,\nbecause it recomputed the whole model chunk as a single unit; that is gone here.)\n\n## Design\n\n* The initial forward of a recomputed layer's nodes runs under `no_grad`\n  (`ScheduleNode.forward_no_grad`), so no autograd graph / saved activation is\n  retained. `pre_process` / `post_process` keep their graphs.\n* `RecomputeSegment` captures, at the head layer's forward: the segment input\n  tensor, an RNG snapshot, and a snapshot of the mutable `ModelChunkState`\n  fields (`input_ids` / `position_ids` / `padding_mask` / `mtp_hidden_states`) —\n  these are mutated in place during the forward (MTP rolls the tokens), so by\n  backward time they hold end-of-chunk values rather than what the segment saw.\n* At the tail layer's backward, `RecomputeSegment.recompute()` replays the\n  segment by re-invoking the **same** `ScheduleNode` objects in forward order, so\n  each node repopulates its own `inputs` / `output` / `detached` / `layer_state`.\n  The activation→node mapping is therefore implicit and needs no bookkeeping.\n* `RecomputeSegment.release_activations()` unsets the segment's nodes'\n  `inputs` / `output` / `detached` as soon as its tail layer has forwarded,\n  rather than at the end of the chunk forward — otherwise each recomputed layer\n  would keep one set of boundary tensors pinned for the remainder of the forward.\n  Only the references are dropped; the storages are deliberately left intact,\n  since the replay rebuilds the autograd graph on top of those very tensors and\n  resizing them (the trick `ScheduleNode`'s `free_input` path and\n  `tensor_parallel.random.checkpoint` use) corrupts it. On the way back,\n  `ScheduleNode._release_state()` already frees each replayed node as it\n  backwards.\n* The A2A issued by a replay is **exposed** (not overlapped) by design; the\n  normal forward and normal backward A2A overlap is fully preserved.\n\n### Why a segment object rather than a `checkpoint()` wrapper\n\nThe non-overlap path can wrap a layer in `tensor_parallel.random.checkpoint`\nbecause a layer is an opaque callable there. Under EP A2A overlap a layer is\ndecomposed into `ScheduleNode`s (`pre_dispatch_computation` / `moe_dispatch` /\n`mlp` / `moe_combine` / `mtp_post_process`) that the 1F1B scheduler interleaves\nwith *other microbatches'* nodes — which is the whole point of the overlap path.\n`checkpoint()` needs its region to run as one contiguous autograd call and to\nbackward as one contiguous unit, so the replay has to be driven by the scheduler\nat segment-backward time instead.\n\n`mtp_post_process` is inside the recompute scope: it builds a\n`torch.cat(mtp_hidden_states)` over the MTP `pre_dispatch_computation` node's\ndetached input, so excluding it would anchor that `cat` on a `no_grad` leaf and\nsilently drop the decoder's gradient through MTP.\n\n## Constraints (asserted)\n\nUnder `overlap_moe_expert_parallel_comm` + `recompute_granularity=full`:\n\n* `distribute_saved_activations` must be off — the replay is hand-rolled rather\n  than a checkpoint primitive, so the retained segment input is not TP-sharded.\n* `attention_dropout == 0` and `hidden_dropout == 0` — the forward RNG stream is\n  interleaved across microbatches in the 1F1B schedule and cannot yet be\n  faithfully replayed for nonzero dropout.\n* Delayed-scaling FP8 (`fp8` set and `fp8_recipe='delayed'`) is rejected — the\n  amax history is persistent across microbatches, and this path does not enter\n  TE's `recompute_phase` machinery that `te_checkpoint` uses to snapshot and\n  restore FP8 metadata, so the replayed forward would update `amax_history` a\n  second time and silently diverge. The current-scaling recipes (`tensorwise` /\n  `mxfp8` / `blockwise`) re-derive their scales from the current tensor each\n  pass, so the replay reproduces them exactly; those are the recipes the parity\n  tests sweep. The assert is gated on `fp8` being set, because `fp8_recipe`\n  defaults to `'delayed'` in BF16 configs where no FP8 autocast runs at all.\n* Not yet supported (asserted off, left as follow-up): Megatron FSDP, CUDA graphs\n  (`cuda_graph_impl != \"none\"`), `moe_paged_stash`, and\n  `fine_grained_activation_offloading` (the offload manager pairs a\n  forward-pushed group with the backward that pops it; the replay pushes its\n  groups immediately before its own backward, which does not fit that pairing).\n\nThe last one is main-only — `dev` has no fine-grained activation offloading, so\nit has no counterpart in #6311.\n\n## Differences from the dev PR (#6311)\n\n* Node naming: the attention node is `pre_dispatch_computation` on `main`\n  (`attn` on `dev`), and `TransformerLayerNode` lives in\n  `megatron/core/models/common/utils.py`.\n* `main` has no multi-hyper-connection (mHC) support, so the `mhc_multistream`\n  detach-bridge gradient carry-over from #6311 has no counterpart here and is\n  omitted.\n* `main`'s token dispatchers have no `reset_transient_forward_state()` (that\n  arrived on `dev` via #5869), so the per-layer dispatcher routing metadata is\n  not additionally freed across the gap. This is a memory refinement only —\n  the replay repopulates it unconditionally — and is left as a follow-up.\n* Adds the `fine_grained_activation_offloading` assert described above.\n* Releases each segment's activations at its own tail-layer forward rather than\n  at the end of the chunk forward, and adds the four-microbatch parity case.\n  #6311 still does both at chunk granularity / one microbatch; it will be\n  brought in line separately.\n\n## Test results\n\nUnit tests, 8×H100 (EOS), CI container (`docker/Dockerfile.ci.dev`, `--target\nmain`) via the same `tests/unit_tests/run_ci_test.sh` entry point CI uses:\n\n`tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py` — **156 passed,\n40 skipped, 0 failed** (9m35s).\n\nWhole-directory regression (the change touches shared code: `ScheduleNode`, the\nlayer schedule plan), bucket `tests/unit_tests/a2a_overlap/**/*.py` —\n**251 passed, 41 skipped, 2 deselected, 0 failed** (19m00s), covering\n`test_schedule_chunk_1f1b.py`, `test_schedule_layer_1f1b.py`,\n`test_delay_wgrad_compute.py` and `test_fsdp_1f1b_overlap.py`.\n\nThe new cases are\n`TestA2AOverlap::test_1f1b_schedule_model_chunk_full_recompute` and\n`..._full_recompute_multi_microbatch`, which compare gradients from\n`TransformerModelChunkSchedulePlan.run` against the non-overlap\n`gpt_model.forward` reference under the *same* recompute config, parametrized\nover `mtp_layers` 0/1, `get_valid_dispatcher_configs()` and\n`get_valid_fp8_flags()`. The first sweeps the full segmentation matrix\n(`(uniform,1) (uniform,2) (block,1) (block,3)`) at one microbatch; the second\nruns four microbatches over `(uniform,1)` and `(block,1)`, so the same modules\ngo through forward → recompute → backward repeatedly as in a real 1F1B steady\nstate and grads accumulate across the four rounds on both paths before the\nbitwise compare. One microbatch cannot catch state the replay leaves behind for\nthe next round to read (FP8 scaling metadata, a segment's RNG snapshot, a node\nwhose `forward_no_grad` was not restored). The 40 skips are the\nMTP × non-`(uniform,1)` combinations, where the non-overlap reference warns and\nskips MTP recompute and the two paths are not comparable.\n\nBeyond gradient parity the tests also assert the feature actually happened:\nafter each chunk forward, every recomputed node has `inputs is None` and\n`output is None` while its segment's input tensor is retained. Recompute is\nnumerically transparent, so a segment that quietly kept its graph would still\ncompare equal.\n\nThe whole file carries `pytestmark = pytest.mark.flaky_in_dev`, so these runs\nused `--environment lts` (marker `not flaky`) to actually execute them; under\n`--environment dev` the file is deselected wholesale.\n\nThe two pre-existing tests in the file were refactored onto a shared\n`run_two_chunk_parity()` helper (no behavioural change) so the new test reuses\nthe same 1F1B pattern.\n\nFor the algorithm's bitwise E2E evidence (DeepSeek-V3-Lite deterministic recipe:\nBF16 / blockwise-FP8 / MXFP8, with and without MTP, overlap vs non-overlap\n100/100 bitwise-identical) see the dev PR NVIDIA/Megatron-LM#6311, which\nimplements the same segmentation and replay.\n\n## Benchmark: this recompute path against the non-overlap one\n\nThe question this section answers is narrow on purpose: **with full recompute\nenabled, is the EP A2A overlap schedule still faster than the non-overlap path\nit has to compete with?** The exposed replay A2A is a real cost, so it is worth\nshowing that it does not eat the overlap gain.\n\nThree arms, all on this branch, 64×H100 (8 nodes). DeepSeek-V3 shape at 14\nlayers with the real 256-expert MoE and MTP 1, TP1 / PP4 / EP16, pipeline layout\n`Ett|(tt|)*6mL`, alltoall dispatcher, seq 2048, MBS 1, GBS 256 (16 microbatches),\nBF16, 30 iterations with the first 5 dropped as warmup. `recompute` means\n`recompute_granularity=full`, `recompute_method=uniform`,\n`recompute_num_layers=1`.\n\n| | TFLOP/s/GPU (median) | iter (ms, mean) | peak allocated | peak reserved | device memory used |\n|---|---|---|---|---|---|\n| B. **this path** — overlap on, recompute on | **199.5** | 2839 | 60,378 MB | 68,392 MB | 74,803 MB |\n| C. non-overlap baseline — overlap off, recompute on | 185.2 | 3044 | 60,154 MB | 62,570 MB | 68,973 MB |\n| A. overlap on, recompute off (context) | 32.8 | 16985 | 70,279 MB | 75,594 MB | 79,677 MB |\n\n### B vs C — the result this PR rests on\n\n**+7.7 % throughput** (199.5 vs 185.2 TFLOP/s/GPU) at the same recompute\nsetting. The segment replay's exposed A2A does not cancel the overlap gain, so\nenabling full recompute on the overlap path leaves it ahead of the non-overlap\npath rather than behind it.\n\nThe two arms reach the same *allocated* peak (60,378 vs 60,154 MB, +0.4 %):\nrecompute drops the same activations either way, and the segment inputs the\nreplay retains are small next to what is dropped. That equality is also a useful\ncheck on the feature — the segmentation is not quietly retaining more than the\nnon-overlap checkpoint path does. The overlap arm's cost shows up in *reserved*\nmemory (+5.8 GB), which is the schedule's own multi-stream working set rather\nthan anything recompute adds.\n\nOne methodological caveat: `CUDA_DEVICE_MAX_CONNECTIONS` is 32 on the overlap\narms and 1 on the non-overlap arm. `moe/README.md` lists `> 1` as a requirement\nof EP A2A overlap, so running the overlap arm at 1 would measure a configuration\nthe feature does not support; 1 is the baseline recipe's value for everything\nelse. B vs C is therefore a best-configuration comparison rather than a\nsingle-variable one.\n\n### Arm A is context, not a result\n\nArm A is included only to show why recompute is on at all here. Without it this\nconfiguration reaches 79.7 GB of device memory on the heaviest PP stage — 98 %\nof the 80 GB card — and throughput collapses to a memory-bound 32 TFLOP/s/GPU,\nflat across all 30 iterations. That reproduced exactly on a second run on a\ndisjoint node set (peak allocated identical to the MB), so it is the allocator\nworking against a full card rather than a fluke.\n\n**The 6× gap between A and B is a memory-pressure effect and should not be read\nas \"recompute makes training 6× faster.\"** What it does establish is that at\nthis scale the configuration does not practically run without recompute.\nIsolating the replay A2A's own cost would need a configuration where the\nrecompute-off arm fits comfortably; that measurement is not included here.\n\n## Contribution process\n\n### Pre-checks\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] I have added proper typing to my code\n- [x] I have added relevant documentation (inline comments / docstrings)\n- [x] I have run the autoformatter.sh on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+      "changedFiles": 8,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "copy-pr-bot"
+            },
+            "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+            "createdAt": "2026-08-11T02:53:22Z",
+            "updatedAt": "2026-08-11T02:53:22Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5248458738"
+          },
+          {
+            "author": {
+              "login": "zhongbozhu"
+            },
+            "body": "https://github.com/NVIDIA/Megatron-LM/commit/74dc1b570330d430d3c2a0b87dba2cefd7e630b8 changed API of 1f1b, please rebase accordingly, thanks~",
+            "createdAt": "2026-09-10T07:59:31Z",
+            "updatedAt": "2026-09-10T07:59:31Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5615175308"
+          },
+          {
+            "author": {
+              "login": "zhongbozhu"
+            },
+            "body": "/ok to test b9382e2ad1b720dd24c7539bb26832680a2f2e0f",
+            "createdAt": "2026-09-14T21:41:43Z",
+            "updatedAt": "2026-09-14T21:41:43Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5671197057"
+          },
+          {
+            "author": {
+              "login": "zhongbozhu"
+            },
+            "body": "/ok to test 96bad83454f90fd7e21bcb91ca47c8d4a1af632e",
+            "createdAt": "2026-09-28T17:16:32Z",
+            "updatedAt": "2026-09-28T17:16:32Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5874973964"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test fb50e16a1da5ed404840997eac06a723aa394704\n",
+            "createdAt": "2026-09-29T02:33:48Z",
+            "updatedAt": "2026-09-29T02:33:48Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5882544643"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test [62b1938](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/62b19383e178563e34b711e946d9fed09956a7d4)",
+            "createdAt": "2026-09-30T01:57:47Z",
+            "updatedAt": "2026-09-30T01:57:47Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5902558945"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test [5a24f27](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/5a24f27b55dffa6f9f166196a1c2e04ff46769db)",
+            "createdAt": "2026-09-30T06:39:41Z",
+            "updatedAt": "2026-09-30T06:39:41Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5905628160"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test 9c751562c6327c653ff7a4e98c7a9e0b7be9a88b\n",
+            "createdAt": "2026-09-30T15:03:31Z",
+            "updatedAt": "2026-09-30T15:03:31Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5913956369"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test 5559e53ee2db313a632add9b39b1c568ae49341e\n",
+            "createdAt": "2026-10-04T00:42:52Z",
+            "updatedAt": "2026-10-04T00:42:52Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5975086932"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test e8ae14b52f4184d38574db78bc6121663862297e\n",
+            "createdAt": "2026-10-04T11:28:42Z",
+            "updatedAt": "2026-10-04T11:28:42Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5979458887"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test [84b49e6](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/84b49e60b6509f97bb5c474d1a242c5b07fe70ff)",
+            "createdAt": "2026-10-08T01:00:19Z",
+            "updatedAt": "2026-10-08T01:00:19Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-6049976489"
+          },
+          {
+            "author": {
+              "login": "balasaajay"
+            },
+            "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/14c7398a288c6f74257f48f43a884f9bba1e8c7c",
+            "createdAt": "2026-10-08T20:34:17Z",
+            "updatedAt": "2026-10-08T20:34:17Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-6068547409"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "/ok to test [2c26256](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/2c26256f96a3c064fe4f665754aaeddb22df3299)",
+            "createdAt": "2026-10-12T03:52:02Z",
+            "updatedAt": "2026-10-12T03:52:02Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-6117421653"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWygclU=",
+          "hasNextPage": false
+        },
+        "totalCount": 13
+      },
+      "headRefOid": "2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "headRepository": {
+        "nameWithOwner": "Wohox/Megatron-LM"
+      },
+      "merged": false,
+      "number": 6429,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "zhongbozhu"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "zhongbozhu"
+                  },
+                  "body": "can you share why this is not playing well with cuda graph? ",
+                  "createdAt": "2026-08-13T07:20:33Z",
+                  "line": null,
+                  "originalLine": 2783,
+                  "path": "megatron/core/transformer/transformer_config.py",
+                  "updatedAt": "2026-08-13T07:20:33Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3773244169"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOC0xM1QwNzoyMDozM1rO4OcjCQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-13T07:20:33Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4924432657"
+          },
+          {
+            "author": {
+              "login": "zhongbozhu"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "zhongbozhu"
+                  },
+                  "body": "same comment as above ",
+                  "createdAt": "2026-08-13T07:20:55Z",
+                  "line": null,
+                  "originalLine": 2789,
+                  "path": "megatron/core/transformer/transformer_config.py",
+                  "updatedAt": "2026-08-13T07:20:55Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3773246550"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOC0xM1QwNzoyMDo1NVrO4OcsVg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-13T07:20:55Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4924435834"
+          },
+          {
+            "author": {
+              "login": "zhongbozhu"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "zhongbozhu"
+                  },
+                  "body": "can you explain the asserts under this else? ",
+                  "createdAt": "2026-08-13T07:24:50Z",
+                  "line": 3697,
+                  "originalLine": 2801,
+                  "path": "megatron/core/transformer/transformer_config.py",
+                  "updatedAt": "2026-08-13T07:24:50Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3773269623"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOC0xM1QwNzoyNDo1MFrO4OeGdw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-13T07:24:50Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4924464907"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "Wohox"
+                  },
+                  "body": "Recompute method and recompute_num_layers shouldn't be assigned when disabling full recomupte.",
+                  "createdAt": "2026-08-18T13:42:22Z",
+                  "line": 3697,
+                  "originalLine": 2801,
+                  "path": "megatron/core/transformer/transformer_config.py",
+                  "updatedAt": "2026-08-18T13:42:23Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3804597339"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOC0xOFQxMzo0MjoyMlrO4sWMWw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-18T13:42:22Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4961682292"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "Wohox"
+                  },
+                  "body": "Good catch, this is a slop, current implementation should work with full-iteration cuda graph + paged stash, but doesn't work with partial cuda graph(same as EP overlap=False case).\n\nRemoved this assertion in 3ffbe326e",
+                  "createdAt": "2026-08-18T13:45:36Z",
+                  "line": null,
+                  "originalLine": 2783,
+                  "path": "megatron/core/transformer/transformer_config.py",
+                  "updatedAt": "2026-08-18T13:45:36Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3804626498"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOC0xOFQxMzo0NTozNlrO4sX-Qg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-18T13:45:36Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4961717598"
+          },
+          {
+            "author": {
+              "login": "Wohox"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "Wohox"
+                  },
+                  "body": "Removed in 3ffbe326e. same reason as above~",
+                  "createdAt": "2026-08-18T13:45:47Z",
+                  "line": null,
+                  "originalLine": 2789,
+                  "path": "megatron/core/transformer/transformer_config.py",
+                  "updatedAt": "2026-08-18T13:45:47Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3804628513"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOC0xOFQxMzo0NTo0N1rO4sYGIQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-18T13:45:47Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4961719830"
+          },
+          {
+            "author": {
+              "login": "zhongbozhu"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-09-14T17:11:56Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-5200662604"
+          },
+          {
+            "author": {
+              "login": "Phlip79"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-09-17T22:59:51Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-5242243932"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wOS0xN1QyMjo1OTo1MVq0MjAyNi0wOS0xN1QyMjo1OTo1MVrPAAAAATh2S1w=",
+          "hasNextPage": false
+        },
+        "totalCount": 8
+      },
+      "state": "OPEN",
+      "title": "[Main] Recompute EP A2A overlap activations per layer segment (supersedes #5920)",
+      "updatedAt": "2026-10-12T03:52:02Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/6429"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "NVIDIA/Megatron-LM"
+      },
+      "sha": "e30d863a6d82a3c45f2d71355dc73fbf5610967b"
+    },
+    "body": "- [x] I, the PR author, have personally reviewed every line of this PR.\n\n> Main-branch counterpart of dev PR NVIDIA/Megatron-LM#6311.\n>\n> **This supersedes and fully covers NVIDIA/Megatron-LM#5920** (the main-branch\n> port of the older, model-chunk-granularity design). #5920 can be closed in\n> favour of this PR — everything it added to `main` is contained here, with the\n> recompute unit changed from *VPP stage* to *layer segment*.\n\n# What does this PR do ?\n\nAdds full activation recompute support for the EP A2A overlap path\n(`--overlap-moe-expert-parallel-comm`), which currently hard-asserts\n`recompute_granularity=full` off.\n\nRecompute is applied at **layer-segment** granularity: a segment's layers drop\ntheir activations as soon as that segment has finished forwarding, and the\nsegment is replayed with grad enabled immediately before its own backward (whose\nnodes release again as they backward). So only one segment's activations are\nmaterialized at a time, and only each segment's input tensor survives the\nforward→backward gap.\n\n## Issue tracking\n\nLinked issue: <!-- internal NVIDIA contribution; add issue link if required -->\n\n## Semantics\n\n`recompute_method` / `recompute_num_layers` mean exactly the same thing with and\nwithout `--overlap-moe-expert-parallel-comm`, mirroring\n`megatron.core.recompute.checkpointed_forward` (decoder) and\n`MultiTokenPredictionLayer._checkpointed_forward` (MTP):\n\n* `uniform`: decoder layers in groups of `recompute_num_layers`; one segment per\n  MTP layer (`recompute_num_layers` must be 1 when MTP is present, as upstream).\n* `block`: the first `recompute_num_layers` decoder layers, one segment each;\n  trailing decoder layers stay eager.\n\nBoth flags are therefore **required** on this path, exactly as on the non-overlap\npath — no validation exemption is introduced. (#5920 did add such an exemption,\nbecause it recomputed the whole model chunk as a single unit; that is gone here.)\n\n## Design\n\n* The initial forward of a recomputed layer's nodes runs under `no_grad`\n  (`ScheduleNode.forward_no_grad`), so no autograd graph / saved activation is\n  retained. `pre_process` / `post_process` keep their graphs.\n* `RecomputeSegment` captures, at the head layer's forward: the segment input\n  tensor, an RNG snapshot, and a snapshot of the mutable `ModelChunkState`\n  fields (`input_ids` / `position_ids` / `padding_mask` / `mtp_hidden_states`) —\n  these are mutated in place during the forward (MTP rolls the tokens), so by\n  backward time they hold end-of-chunk values rather than what the segment saw.\n* At the tail layer's backward, `RecomputeSegment.recompute()` replays the\n  segment by re-invoking the **same** `ScheduleNode` objects in forward order, so\n  each node repopulates its own `inputs` / `output` / `detached` / `layer_state`.\n  The activation→node mapping is therefore implicit and needs no bookkeeping.\n* `RecomputeSegment.release_activations()` unsets the segment's nodes'\n  `inputs` / `output` / `detached` as soon as its tail layer has forwarded,\n  rather than at the end of the chunk forward — otherwise each recomputed layer\n  would keep one set of boundary tensors pinned for the remainder of the forward.\n  Only the references are dropped; the storages are deliberately left intact,\n  since the replay rebuilds the autograd graph on top of those very tensors and\n  resizing them (the trick `ScheduleNode`'s `free_input` path and\n  `tensor_parallel.random.checkpoint` use) corrupts it. On the way back,\n  `ScheduleNode._release_state()` already frees each replayed node as it\n  backwards.\n* The A2A issued by a replay is **exposed** (not overlapped) by design; the\n  normal forward and normal backward A2A overlap is fully preserved.\n\n### Why a segment object rather than a `checkpoint()` wrapper\n\nThe non-overlap path can wrap a layer in `tensor_parallel.random.checkpoint`\nbecause a layer is an opaque callable there. Under EP A2A overlap a layer is\ndecomposed into `ScheduleNode`s (`pre_dispatch_computation` / `moe_dispatch` /\n`mlp` / `moe_combine` / `mtp_post_process`) that the 1F1B scheduler interleaves\nwith *other microbatches'* nodes — which is the whole point of the overlap path.\n`checkpoint()` needs its region to run as one contiguous autograd call and to\nbackward as one contiguous unit, so the replay has to be driven by the scheduler\nat segment-backward time instead.\n\n`mtp_post_process` is inside the recompute scope: it builds a\n`torch.cat(mtp_hidden_states)` over the MTP `pre_dispatch_computation` node's\ndetached input, so excluding it would anchor that `cat` on a `no_grad` leaf and\nsilently drop the decoder's gradient through MTP.\n\n## Constraints (asserted)\n\nUnder `overlap_moe_expert_parallel_comm` + `recompute_granularity=full`:\n\n* `distribute_saved_activations` must be off — the replay is hand-rolled rather\n  than a checkpoint primitive, so the retained segment input is not TP-sharded.\n* `attention_dropout == 0` and `hidden_dropout == 0` — the forward RNG stream is\n  interleaved across microbatches in the 1F1B schedule and cannot yet be\n  faithfully replayed for nonzero dropout.\n* Delayed-scaling FP8 (`fp8` set and `fp8_recipe='delayed'`) is rejected — the\n  amax history is persistent across microbatches, and this path does not enter\n  TE's `recompute_phase` machinery that `te_checkpoint` uses to snapshot and\n  restore FP8 metadata, so the replayed forward would update `amax_history` a\n  second time and silently diverge. The current-scaling recipes (`tensorwise` /\n  `mxfp8` / `blockwise`) re-derive their scales from the current tensor each\n  pass, so the replay reproduces them exactly; those are the recipes the parity\n  tests sweep. The assert is gated on `fp8` being set, because `fp8_recipe`\n  defaults to `'delayed'` in BF16 configs where no FP8 autocast runs at all.\n* Not yet supported (asserted off, left as follow-up): Megatron FSDP, CUDA graphs\n  (`cuda_graph_impl != \"none\"`), `moe_paged_stash`, and\n  `fine_grained_activation_offloading` (the offload manager pairs a\n  forward-pushed group with the backward that pops it; the replay pushes its\n  groups immediately before its own backward, which does not fit that pairing).\n\nThe last one is main-only — `dev` has no fine-grained activation offloading, so\nit has no counterpart in #6311.\n\n## Differences from the dev PR (#6311)\n\n* Node naming: the attention node is `pre_dispatch_computation` on `main`\n  (`attn` on `dev`), and `TransformerLayerNode` lives in\n  `megatron/core/models/common/utils.py`.\n* `main` has no multi-hyper-connection (mHC) support, so the `mhc_multistream`\n  detach-bridge gradient carry-over from #6311 has no counterpart here and is\n  omitted.\n* `main`'s token dispatchers have no `reset_transient_forward_state()` (that\n  arrived on `dev` via #5869), so the per-layer dispatcher routing metadata is\n  not additionally freed across the gap. This is a memory refinement only —\n  the replay repopulates it unconditionally — and is left as a follow-up.\n* Adds the `fine_grained_activation_offloading` assert described above.\n* Releases each segment's activations at its own tail-layer forward rather than\n  at the end of the chunk forward, and adds the four-microbatch parity case.\n  #6311 still does both at chunk granularity / one microbatch; it will be\n  brought in line separately.\n\n## Test results\n\nUnit tests, 8×H100 (EOS), CI container (`docker/Dockerfile.ci.dev`, `--target\nmain`) via the same `tests/unit_tests/run_ci_test.sh` entry point CI uses:\n\n`tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py` — **156 passed,\n40 skipped, 0 failed** (9m35s).\n\nWhole-directory regression (the change touches shared code: `ScheduleNode`, the\nlayer schedule plan), bucket `tests/unit_tests/a2a_overlap/**/*.py` —\n**251 passed, 41 skipped, 2 deselected, 0 failed** (19m00s), covering\n`test_schedule_chunk_1f1b.py`, `test_schedule_layer_1f1b.py`,\n`test_delay_wgrad_compute.py` and `test_fsdp_1f1b_overlap.py`.\n\nThe new cases are\n`TestA2AOverlap::test_1f1b_schedule_model_chunk_full_recompute` and\n`..._full_recompute_multi_microbatch`, which compare gradients from\n`TransformerModelChunkSchedulePlan.run` against the non-overlap\n`gpt_model.forward` reference under the *same* recompute config, parametrized\nover `mtp_layers` 0/1, `get_valid_dispatcher_configs()` and\n`get_valid_fp8_flags()`. The first sweeps the full segmentation matrix\n(`(uniform,1) (uniform,2) (block,1) (block,3)`) at one microbatch; the second\nruns four microbatches over `(uniform,1)` and `(block,1)`, so the same modules\ngo through forward → recompute → backward repeatedly as in a real 1F1B steady\nstate and grads accumulate across the four rounds on both paths before the\nbitwise compare. One microbatch cannot catch state the replay leaves behind for\nthe next round to read (FP8 scaling metadata, a segment's RNG snapshot, a node\nwhose `forward_no_grad` was not restored). The 40 skips are the\nMTP × non-`(uniform,1)` combinations, where the non-overlap reference warns and\nskips MTP recompute and the two paths are not comparable.\n\nBeyond gradient parity the tests also assert the feature actually happened:\nafter each chunk forward, every recomputed node has `inputs is None` and\n`output is None` while its segment's input tensor is retained. Recompute is\nnumerically transparent, so a segment that quietly kept its graph would still\ncompare equal.\n\nThe whole file carries `pytestmark = pytest.mark.flaky_in_dev`, so these runs\nused `--environment lts` (marker `not flaky`) to actually execute them; under\n`--environment dev` the file is deselected wholesale.\n\nThe two pre-existing tests in the file were refactored onto a shared\n`run_two_chunk_parity()` helper (no behavioural change) so the new test reuses\nthe same 1F1B pattern.\n\nFor the algorithm's bitwise E2E evidence (DeepSeek-V3-Lite deterministic recipe:\nBF16 / blockwise-FP8 / MXFP8, with and without MTP, overlap vs non-overlap\n100/100 bitwise-identical) see the dev PR NVIDIA/Megatron-LM#6311, which\nimplements the same segmentation and replay.\n\n## Benchmark: this recompute path against the non-overlap one\n\nThe question this section answers is narrow on purpose: **with full recompute\nenabled, is the EP A2A overlap schedule still faster than the non-overlap path\nit has to compete with?** The exposed replay A2A is a real cost, so it is worth\nshowing that it does not eat the overlap gain.\n\nThree arms, all on this branch, 64×H100 (8 nodes). DeepSeek-V3 shape at 14\nlayers with the real 256-expert MoE and MTP 1, TP1 / PP4 / EP16, pipeline layout\n`Ett|(tt|)*6mL`, alltoall dispatcher, seq 2048, MBS 1, GBS 256 (16 microbatches),\nBF16, 30 iterations with the first 5 dropped as warmup. `recompute` means\n`recompute_granularity=full`, `recompute_method=uniform`,\n`recompute_num_layers=1`.\n\n| | TFLOP/s/GPU (median) | iter (ms, mean) | peak allocated | peak reserved | device memory used |\n|---|---|---|---|---|---|\n| B. **this path** — overlap on, recompute on | **199.5** | 2839 | 60,378 MB | 68,392 MB | 74,803 MB |\n| C. non-overlap baseline — overlap off, recompute on | 185.2 | 3044 | 60,154 MB | 62,570 MB | 68,973 MB |\n| A. overlap on, recompute off (context) | 32.8 | 16985 | 70,279 MB | 75,594 MB | 79,677 MB |\n\n### B vs C — the result this PR rests on\n\n**+7.7 % throughput** (199.5 vs 185.2 TFLOP/s/GPU) at the same recompute\nsetting. The segment replay's exposed A2A does not cancel the overlap gain, so\nenabling full recompute on the overlap path leaves it ahead of the non-overlap\npath rather than behind it.\n\nThe two arms reach the same *allocated* peak (60,378 vs 60,154 MB, +0.4 %):\nrecompute drops the same activations either way, and the segment inputs the\nreplay retains are small next to what is dropped. That equality is also a useful\ncheck on the feature — the segmentation is not quietly retaining more than the\nnon-overlap checkpoint path does. The overlap arm's cost shows up in *reserved*\nmemory (+5.8 GB), which is the schedule's own multi-stream working set rather\nthan anything recompute adds.\n\nOne methodological caveat: `CUDA_DEVICE_MAX_CONNECTIONS` is 32 on the overlap\narms and 1 on the non-overlap arm. `moe/README.md` lists `> 1` as a requirement\nof EP A2A overlap, so running the overlap arm at 1 would measure a configuration\nthe feature does not support; 1 is the baseline recipe's value for everything\nelse. B vs C is therefore a best-configuration comparison rather than a\nsingle-variable one.\n\n### Arm A is context, not a result\n\nArm A is included only to show why recompute is on at all here. Without it this\nconfiguration reaches 79.7 GB of device memory on the heaviest PP stage — 98 %\nof the 80 GB card — and throughput collapses to a memory-bound 32 TFLOP/s/GPU,\nflat across all 30 iterations. That reproduced exactly on a second run on a\ndisjoint node set (peak allocated identical to the MB), so it is the allocator\nworking against a full card rather than a fluke.\n\n**The 6× gap between A and B is a memory-pressure effect and should not be read\nas \"recompute makes training 6× faster.\"** What it does establish is that at\nthis scale the configuration does not practically run without recompute.\nIsolating the replay A2A's own cost would need a configuration where the\nrecompute-off arm fits comfortably; that measurement is not included here.\n\n## Contribution process\n\n### Pre-checks\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] I have added proper typing to my code\n- [x] I have added relevant documentation (inline comments / docstrings)\n- [x] I have run the autoformatter.sh on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+    "changed_files": 8,
+    "head": {
+      "repo": {
+        "full_name": "Wohox/Megatron-LM"
+      },
+      "sha": "2c26256f96a3c064fe4f665754aaeddb22df3299"
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429",
+    "merged": false,
+    "number": 6429,
+    "state": "open",
+    "title": "[Main] Recompute EP A2A overlap activations per layer segment (supersedes #5920)",
+    "updated_at": "2026-10-12T03:52:02Z"
+  },
+  "files": [
+    {
+      "additions": 293,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fmodels%2Fcommon%2Fmodel_chunk_schedule_plan.py",
+      "changes": 295,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Fmodels%2Fcommon%2Fmodel_chunk_schedule_plan.py?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 2,
+      "filename": "megatron/core/models/common/model_chunk_schedule_plan.py",
+      "patch": "@@ -1,6 +1,6 @@\n-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.\n+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n \n-from typing import Any, Callable, Optional\n+from typing import Any, Callable, List, Optional\n \n import torch\n from torch import Tensor\n@@ -10,6 +10,7 @@\n from megatron.core.pipeline_parallel.utils import (\n     AbstractSchedulePlan,\n     NoopScheduleNode,\n+    ScheduleNode,\n     get_comm_stream,\n     get_comp_stream,\n )\n@@ -26,6 +27,146 @@ class ModelChunkState:\n     pass\n \n \n+# ModelChunkState fields the layer forwards mutate in place; each segment snapshots them\n+# so its backward-time replay sees the pre-segment values instead of end-of-chunk ones.\n+#\n+# ``mtp_input_mask`` belongs here for the same reason as ``input_ids``: MTP's\n+# ``_get_embeddings`` rolls the two together (one concatenated roll, so CP does a single\n+# boundary exchange) and writes both back to the chunk state. Leaving it out would let a\n+# replay roll an already-rolled mask, shifting it one position against ``input_ids``, and\n+# the mask drives ``torch.where(valid, decoder_input, decoder_input.detach())`` — so the\n+# embedding rows detached would be the wrong ones and the MTP/embedding gradients would be\n+# silently wrong rather than failing loudly.\n+_MUTABLE_CHUNK_STATE_FIELDS = (\n+    \"input_ids\",\n+    \"position_ids\",\n+    \"padding_mask\",\n+    \"mtp_input_mask\",\n+    \"mtp_hidden_states\",\n+)\n+\n+\n+def _copy_chunk_state_value(value: Any) -> Any:\n+    \"\"\"Copy list-valued chunk state so a later in-place append cannot corrupt a snapshot.\"\"\"\n+    return list(value) if isinstance(value, list) else value\n+\n+\n+class RecomputeSegment:\n+    \"\"\"A contiguous group of layers recomputed as one unit.\n+\n+    The initial forward runs under ``no_grad`` and is replayed with grad enabled at the\n+    start of the segment's own backward. A segment drops its layers' activations as soon\n+    as its own forward is done (``release_activations``) and the replayed ones as each\n+    node backwards (``ScheduleNode._release_state``), so only one segment's activations\n+    are live at a time and what crosses the forward->backward gap is the segment's input\n+    tensor plus the ``_MUTABLE_CHUNK_STATE_FIELDS`` snapshot. Layers left eager under\n+    ``block`` keep their activations throughout. The A2A issued by a replay is exposed by\n+    design; normal fwd/bwd A2A overlap is preserved.\n+\n+    ``start_index`` is the segment's first layer index within the chunk, for NVTX labels.\n+    \"\"\"\n+\n+    def __init__(\n+        self,\n+        layers: List[\"TransformerLayerSchedulePlan\"],\n+        chunk_state: ModelChunkState,\n+        start_index: int,\n+    ):\n+        assert len(layers) > 0, \"a recompute segment must contain at least one layer\"\n+        self.layers = layers\n+        self.chunk_state = chunk_state\n+        self.start_index = start_index\n+        # Captured at the start of the segment's initial forward.\n+        self.input_tensor = None\n+        self.state_snapshot = None\n+        self.rng_states = None\n+        for layer in layers:\n+            layer.recompute_segment = self\n+            # The initial forward retains no autograd graph for these layers.\n+            layer.set_forward_no_grad(True)\n+\n+    def capture(self, layer: \"TransformerLayerSchedulePlan\", f_input: Tensor) -> None:\n+        \"\"\"When the head layer starts its forward, snapshot what the replay needs:\n+        input tensor, mutable chunk state, RNG.\"\"\"\n+        if layer is not self.layers[0]:\n+            return\n+        from megatron.core.tensor_parallel.random import _get_all_rng_states\n+\n+        self.input_tensor = f_input\n+        cs = self.chunk_state\n+        self.state_snapshot = {\n+            name: _copy_chunk_state_value(getattr(cs, name)) for name in _MUTABLE_CHUNK_STATE_FIELDS\n+        }\n+        self.rng_states = _get_all_rng_states()\n+\n+    def release_activations(self, layer: \"TransformerLayerSchedulePlan\") -> None:\n+        \"\"\"Drop this segment's forward activations once its tail layer has forwarded.\n+\n+        Runs while the chunk forward is still going, not at the end of it: the nodes hold\n+        their boundary tensors in ``inputs`` / ``output`` / ``detached`` until something\n+        unsets them, so deferring this to the end of the chunk would keep one such set\n+        alive per recomputed layer for the rest of the forward. The tail layer's output is\n+        the caller's ``f_input`` and is what the next segment captures, so it survives.\n+\n+        Only the Python references are dropped. Resizing the storages (what\n+        ``ScheduleNode``'s ``free_input`` path and ``tensor_parallel.random.checkpoint``\n+        do) is not usable here: the replay rebuilds the graph on top of these very\n+        tensors, and freeing their storage corrupts it.\n+        \"\"\"\n+        if layer is not self.layers[-1]:\n+            return\n+        for seg_layer in self.layers:\n+            seg_layer.reset_for_recompute()\n+\n+    def release_input(self, layer: \"TransformerLayerSchedulePlan\") -> None:\n+        \"\"\"Drop the retained input once the head layer has finished its backward.\"\"\"\n+        if layer is not self.layers[0]:\n+            return\n+        self.input_tensor = None\n+        self.state_snapshot = None\n+\n+    def recompute(self, layer: \"TransformerLayerSchedulePlan\") -> None:\n+        \"\"\"Replay the segment with grad enabled when its tail layer enters the backward.\n+\n+        Must run before any of that layer's nodes backwards: ``mtp_post_process`` is in the\n+        recompute scope, so its graph does not exist until the replay has run. Re-running\n+        the same nodes in the same order repopulates each node's ``inputs`` / ``output`` /\n+        ``detached`` / ``layer_state`` as in the initial forward.\n+        \"\"\"\n+        if layer is not self.layers[-1]:\n+            return\n+        from megatron.core.tensor_parallel.random import _fork_rng, _set_all_rng_states\n+\n+        assert self.input_tensor is not None, (\n+            \"layer-level full recompute requires the retained segment input tensor, \"\n+            \"but it is missing.\"\n+        )\n+        cs = self.chunk_state\n+\n+        for name, value in self.state_snapshot.items():\n+            setattr(cs, name, _copy_chunk_state_value(value))\n+\n+        # The replayed nodes read inputs[i].grad to reach the previous segment, so the\n+        # retained input has to be a grad-tracking leaf.\n+        segment_input = self.input_tensor\n+        if not segment_input.requires_grad:\n+            segment_input.requires_grad_(True)\n+\n+        for seg_layer in self.layers:\n+            seg_layer.set_forward_no_grad(False)\n+\n+        # Replay the forward RNG stream so rng-forked ops reproduce the initial forward.\n+        with _fork_rng():\n+            _set_all_rng_states(*self.rng_states)\n+            f_input = segment_input\n+            for i, seg_layer in enumerate(self.layers):\n+                nvtx_msg = f\"recompute_layer_{self.start_index + i}\"\n+                nvtx_range_push(nvtx_msg)\n+                f_input = seg_layer.recompute_forward(f_input)\n+                nvtx_range_pop(nvtx_msg)\n+        self.rng_states = None\n+\n+\n class TransformerLayerSchedulePlan:\n     \"\"\"Schedule the executing plan of the nodes in a transformer/mtp layer.\n \n@@ -82,11 +223,15 @@ def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_ar\n         self.comp_stream = comp_stream\n         self.comm_stream = comm_stream\n \n+        # Set by _build_recompute_segments(); None means this layer keeps its graph.\n+        self.recompute_segment = None\n+\n         # get callable nodes for transformer/mtp layer\n         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)\n \n     def release_state(self):\n         \"\"\"Release reference, this helps avoid memory leak.\"\"\"\n+        self.recompute_segment = None\n         if hasattr(self, 'pre_dispatch_computation') and self.pre_dispatch_computation is not None:\n             del self.pre_dispatch_computation\n             self.pre_dispatch_computation = None\n@@ -218,6 +363,62 @@ def set_fsdp_reshard_hooks(self, post_forward_hook, post_backward_hook):\n         # After the last forward op, release forward-pass params.\n         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))\n \n+    def _iter_layer_nodes(self):\n+        \"\"\"Yield this layer's nodes in forward order, NoopScheduleNodes included.\n+\n+        Single definition of the sequence for recompute_forward/set_forward_no_grad/\n+        reset_for_recompute; run() issues the same order inline (it interleaves each node\n+        with the backward layer's), so a new node must be added in both places.\n+\n+        This is also the full-recompute scope. mtp_post_process must stay in it: it builds\n+        a torch.cat over the MTP pre_dispatch node's detached input, so leaving it outside\n+        would anchor that cat on a no_grad leaf and drop the decoder's gradient via MTP.\n+        \"\"\"\n+        yield self.pre_dispatch_computation\n+        yield self.moe_dispatch\n+        yield self.mlp\n+        yield self.moe_combine\n+        yield self.mtp_post_process\n+\n+    def _iter_recomputed_nodes(self):\n+        \"\"\"Yield the real ScheduleNodes (skips NoopScheduleNode, which holds no state).\n+\n+        Only for state toggling; the forward helpers walk _iter_layer_nodes, since a Noop\n+        still passes the tensor through and still consumes a low-precision context in run().\n+        \"\"\"\n+        for node in self._iter_layer_nodes():\n+            if isinstance(node, ScheduleNode):\n+                yield node\n+\n+    def set_forward_no_grad(self, no_grad: bool):\n+        \"\"\"Toggle no-grad forward for this layer's recomputed nodes.\n+\n+        The initial forward runs with ``no_grad=True`` (no autograd graph retained);\n+        the backward-time recompute runs with ``no_grad=False`` to rebuild the graph.\n+        \"\"\"\n+        for node in self._iter_recomputed_nodes():\n+            node.forward_no_grad = no_grad\n+\n+    def recompute_forward(self, f_input: Tensor) -> Tensor:\n+        \"\"\"Re-run this layer with grad enabled and return its output.\n+\n+        One low-precision context per node, matching run()'s forward half node for node.\n+        \"\"\"\n+        for node in self._iter_layer_nodes():\n+            with self.get_low_precision_context():\n+                f_input = node.forward(f_input)\n+        return f_input\n+\n+    def reset_for_recompute(self):\n+        \"\"\"Free the retained forward activations of this layer, keeping the nodes\n+        reusable for a recompute forward. Also clears the per-layer shared state.\"\"\"\n+        for node in self._iter_recomputed_nodes():\n+            node.reset_for_recompute()\n+        if getattr(self, 'layer_state', None) is not None:\n+            # Nodes hold a reference to this same layer_state object, so clear it\n+            # in place rather than replacing it.\n+            self.layer_state.__dict__.clear()\n+\n     def get_low_precision_context(self):\n         \"\"\"Get the low-precision context for the transformer layer.\"\"\"\n         return self.layer.get_inner_quantization_context()\n@@ -249,10 +450,16 @@ def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False)\n         \"\"\"\n \n         if b_layer is not None:\n+            # Full recompute: rebuild this layer's segment graph before its backward.\n+            if b_layer.recompute_segment is not None:\n+                b_layer.recompute_segment.recompute(b_layer)\n             b_grad = b_layer.mtp_post_process.backward(b_grad)\n             b_grad = b_layer.moe_combine.backward(b_grad)\n \n         if f_layer is not None:\n+            # Full recompute: retain this segment's input for the backward-time replay.\n+            if f_layer.recompute_segment is not None:\n+                f_layer.recompute_segment.capture(f_layer, f_input)\n             with f_layer.get_low_precision_context():\n                 f_input = f_layer.pre_dispatch_computation.forward(f_input)\n \n@@ -284,12 +491,27 @@ def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False)\n         if f_layer is not None:\n             with f_layer.get_low_precision_context():\n                 f_input = f_layer.mtp_post_process.forward(f_input)\n+            segment = f_layer.recompute_segment\n+            if segment is not None and f_layer is segment.layers[-1]:\n+                # The segment ran under no_grad, so its output can be a plain leaf.\n+                # Whatever consumes it - the next segment, an eager layer under\n+                # recompute_method='block', or post_process - reads a gradient off it to\n+                # reach back into this segment, which needs a grad-tracking leaf.\n+                if not f_input.requires_grad:\n+                    f_input.requires_grad_(True)\n+                # The segment is done forwarding and holds no graph; free its nodes now\n+                # rather than at the end of the chunk forward.\n+                segment.release_activations(f_layer)\n \n         # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad\n         # of the first layer) for overlapping with the p2p comm.\n         if b_layer is not None and not is_last_layer_in_bwd:\n             b_layer.pre_dispatch_computation.backward_dw()\n \n+        if b_layer is not None and b_layer.recompute_segment is not None:\n+            # The replay has run and its gradient is past this layer; drop the input.\n+            b_layer.recompute_segment.release_input(b_layer)\n+\n         return f_input, b_grad\n \n \n@@ -386,6 +608,13 @@ def __init__(\n         self.post_process = None\n         self.vp_stage = model.vp_stage\n \n+        # Full activation recompute; see RecomputeSegment. This plan is only built for\n+        # the EP A2A overlap scheduler, so recompute_granularity alone decides (not\n+        # re-checking overlap_moe_expert_parallel_comm keeps the schedule unit-testable).\n+        self.recompute_full = model.config.recompute_granularity == 'full'\n+        self._recompute_segments = []\n+        self._num_decoder_layers = 0\n+\n         # save the inputs of model.forward() to ModelChunkState\n         self._model_chunk_state.input_ids = input_ids\n         self._model_chunk_state.position_ids = position_ids\n@@ -415,6 +644,8 @@ def __init__(\n         # The methods to obtain layers are different for MTP so we need the other build plan for\n         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.\n         self._build_layer_schedule_plan(model.decoder, get_comp_stream, get_comm_stream)\n+        # Segmentation applies different rules to the decoder and MTP; mark the split.\n+        self._num_decoder_layers = len(self._transformer_layers)\n         self._build_layer_schedule_plan(\n             getattr(model, \"mtp\", None), get_comp_stream, get_comm_stream\n         )\n@@ -443,6 +674,58 @@ def __init__(\n                 # enclosing plan.\n                 layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)\n \n+        # Split into segments; pre_process and post_process keep their graphs.\n+        self._build_recompute_segments(model.config)\n+\n+    def _build_recompute_segments(self, config):\n+        \"\"\"Split this chunk's layers into full-recompute segments.\n+\n+        Decoder segmentation mirrors megatron.core.recompute.checkpointed_forward, so\n+        recompute_method / recompute_num_layers mean the same thing with and without\n+        --overlap-moe-expert-parallel-comm: 'uniform' groups every decoder layer by\n+        recompute_num_layers, 'block' recomputes the first recompute_num_layers decoder\n+        layers one per segment. MTP gets one segment per depth under both methods.\n+\n+        Unlike the non-overlap 'block' branch there is no recompute_skip_num_layers\n+        window under fp8/fp4: no checkpoint primitive is involved, since the replay marks\n+        the retained segment input grad-tracking itself.\n+        \"\"\"\n+        if not self.recompute_full:\n+            return\n+\n+        method = config.recompute_method\n+        num_layers = config.recompute_num_layers\n+        # TransformerConfig owns the user-facing validation; re-check here because\n+        # build_schedule_plan() is reachable directly and 'block' with num_layers=None\n+        # would slice [:None] and silently recompute every decoder layer.\n+        if method not in (\"uniform\", \"block\"):\n+            raise ValueError(f\"Invalid activation recompute method: {method}.\")\n+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:\n+            raise ValueError(f\"recompute_num_layers must be a positive integer, got {num_layers}.\")\n+\n+        def add_segment(layers, start_index):\n+            self._recompute_segments.append(\n+                RecomputeSegment(layers, self._model_chunk_state, start_index)\n+            )\n+\n+        decoder_layers = self._transformer_layers[: self._num_decoder_layers]\n+        mtp_layers = self._transformer_layers[self._num_decoder_layers :]\n+\n+        if method == \"uniform\":\n+            for start in range(0, len(decoder_layers), num_layers):\n+                add_segment(decoder_layers[start : start + num_layers], start)\n+        else:\n+            for start, layer in enumerate(decoder_layers[:num_layers]):\n+                add_segment([layer], start)\n+        # MTP is one segment per depth under both methods. overlap_moe_expert_parallel_comm\n+        # only supports mtp_num_layers == 1, so the MTP side of the config is identical\n+        # either way. MultiTokenPredictionLayer._checkpointed_forward leaves MTP eager\n+        # under 'block' (its own TODO), which is safe there because the decoder block goes\n+        # through tensor_parallel.checkpoint and keeps an autograd edge into MTP. This\n+        # path's replay has no such edge, so an eager MTP would strand the hand-off.\n+        for i, layer in enumerate(mtp_layers):\n+            add_segment([layer], self._num_decoder_layers + i)\n+\n     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):\n         if module is None:\n             return\n@@ -503,6 +786,7 @@ def state(self):\n \n     def release_state(self):\n         \"\"\"Release reference, this helps avoid memory leak.\"\"\"\n+        self._recompute_segments = []\n         self._model_chunk_state.model = None\n         self.pre_process.model_chunk_state = None\n         self.pre_process = None\n@@ -563,6 +847,9 @@ def run(\n                 pre_backward(b_schedule_plan.vp_stage)\n                 b_schedule_plan.record_current_stream()\n \n+            # Before any layer backward: post_process keeps its own graph and detaches\n+            # its input, and releasing it first avoids co-materializing a large vocab\n+            # graph with a recomputed segment on the last PP stage.\n             if b_schedule_plan.post_process is not None:\n                 b_grad = b_schedule_plan.post_process.backward(b_grad)\n \n@@ -630,6 +917,10 @@ def run(\n \n         # post process forward\n         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:\n+            if f_schedule_plan.recompute_full and f_input is not None and not f_input.requires_grad:\n+                # The last layer ran under no_grad, so post_process needs a grad-tracking\n+                # leaf to seed the replayed last segment's backward.\n+                f_input.requires_grad_(True)\n             f_input = f_schedule_plan.post_process.forward(f_input)\n         # pre process backward\n         if b_schedule_plan is not None:",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fmodels%2Fcommon%2Fmodel_chunk_schedule_plan.py",
+      "sha": "cbff0e802b30f68febc8bb0214fc5dd3f89f65ef",
+      "status": "modified"
+    },
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fmodels%2Fcommon%2Futils.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Fmodels%2Fcommon%2Futils.py?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 1,
+      "filename": "megatron/core/models/common/utils.py",
+      "patch": "@@ -1,4 +1,4 @@\n-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n \n \"\"\"Schedule-plan helpers shared by GPTModel and HybridModel.\n \n@@ -283,6 +283,22 @@ def _resolve_free_input(name, is_moe, config, num_local_experts):\n         \"\"\"Free-input policy hook. Subclasses override to specialize.\"\"\"\n         return should_free_input(name, is_moe, config, num_local_experts)\n \n+    def reset_for_recompute(self):\n+        \"\"\"Release this node's forward activations, keeping it reusable for a replay.\n+\n+        Called as soon as the node's recompute segment has finished forwarding, so a\n+        recomputed layer's boundary tensors do not stay pinned for the rest of the chunk\n+        forward; the same node is later re-run with grad enabled to rebuild its state.\n+\n+        Only the references are dropped. The storages are deliberately left intact: the\n+        replay rebuilds the autograd graph on top of these tensors, so resizing them the\n+        way ``ScheduleNode``'s ``free_input`` path does corrupts that graph.\n+        \"\"\"\n+        self.inputs = None\n+        self.output = None\n+        self.detached = tuple()\n+        self.before_detached = tuple()\n+\n     def detach(self, t):\n         \"\"\"Detach a tensor and remember it for backward through the schedule node.\"\"\"\n         detached = make_viewless(t).detach()",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fmodels%2Fcommon%2Futils.py",
+      "sha": "0cb0db8789b69d0c50f0849408f80948c17b870f",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fpipeline_parallel%2Fcombined_1f1b.py",
+      "changes": 9,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Fpipeline_parallel%2Fcombined_1f1b.py?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 0,
+      "filename": "megatron/core/pipeline_parallel/combined_1f1b.py",
+      "patch": "@@ -398,6 +398,15 @@ def forward_backward_step():\n         # may apply to expert parameters only. The release callbacks skip any parameter\n         # whose weights are not sharded.\n         forward_fsdp_wrapper = find_megatron_fsdp(f_model)\n+        # Full recompute re-runs each layer segment's forward at backward time, which\n+        # needs the (sharded) parameters to be all-gathered again. That interaction\n+        # with the FSDP reshard hooks is not yet supported.\n+        assert not (\n+            forward_fsdp_wrapper is not None and getattr(f_schedule_plan, \"recompute_full\", False)\n+        ), (\n+            \"overlap_moe_expert_parallel_comm full recompute (recompute_granularity=full) \"\n+            \"is not yet supported together with Megatron FSDP.\"\n+        )\n         if forward_fsdp_wrapper is not None and any_sharding_strategy_in(\n             forward_fsdp_wrapper.ddp_config, [\"optim_grads_params\"]\n         ):",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fpipeline_parallel%2Fcombined_1f1b.py",
+      "sha": "6056ef373cf84039c2c5bc7a1457d2b543811ca9",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fpipeline_parallel%2Futils.py",
+      "changes": 12,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Fpipeline_parallel%2Futils.py?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 3,
+      "filename": "megatron/core/pipeline_parallel/utils.py",
+      "patch": "@@ -1,8 +1,8 @@\n-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.\n+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n \n import logging\n from abc import ABC, abstractmethod\n-from contextlib import contextmanager\n+from contextlib import contextmanager, nullcontext\n from typing import Callable, Optional\n \n import torch\n@@ -221,6 +221,9 @@ def __init__(\n         self.ncclep_zero_copy = ncclep_zero_copy\n         self.inputs = None\n         self.outputs = None\n+        # When True, the forward runs under torch.no_grad() so no autograd graph is\n+        # retained; the layer-level full recompute path replays it with grad at backward.\n+        self.forward_no_grad = False\n \n     def default_backward_func(self, outputs, output_grad):\n         \"\"\"Default backward function\"\"\"\n@@ -252,7 +255,10 @@ def _forward(self, *inputs):\n                     input.requires_grad = inputs[i].requires_grad\n \n             data = tuple(self.inputs)\n-            data = self.forward_func(*data)\n+            # Full recompute: skip the graph now, rebuild it by re-running at backward.\n+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()\n+            with grad_ctx:\n+                data = self.forward_func(*data)\n \n             if not isinstance(data, tuple):\n                 data = make_viewless(data)",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Fpipeline_parallel%2Futils.py",
+      "sha": "e0b9154e687ed6b4d0583b8778617b914fc697c9",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Ftransformer%2Fmoe%2FREADME.md",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftransformer%2Fmoe%2FREADME.md?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 0,
+      "filename": "megatron/core/transformer/moe/README.md",
+      "patch": "@@ -437,6 +437,8 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe\n \n > **Requirements for EP A2A Overlap**: `expert_model_parallel_size > 1`, CUDA_DEVICE_MAX_CONNECTIONS > 1.\n \n+> **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment, so `--recompute-method` and `--recompute-num-layers` carry exactly the same meaning as without `--overlap-moe-expert-parallel-comm`. Both flags are required. This overlap recompute path requires `--cuda-graph-impl none`; CUDA Graph execution, including `full_iteration`, is not supported.\n+\n ### Compute Optimization\n \n Fine-grained MoE produces many small operations that can underutilize GPU resources. These optimizations reduce kernel launch overhead and improve GPU utilization.",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Ftransformer%2Fmoe%2FREADME.md",
+      "sha": "f63ee23a0819b305fe078e3004bd8c9fcefcb2e6",
+      "status": "modified"
+    },
+    {
+      "additions": 67,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Ftransformer%2Ftransformer_config.py",
+      "changes": 76,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftransformer%2Ftransformer_config.py?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 9,
+      "filename": "megatron/core/transformer/transformer_config.py",
+      "patch": "@@ -3635,15 +3635,73 @@ def _scope_to_str(s):\n                 'flex',\n             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'\n \n-            assert (\n-                self.recompute_granularity != 'full'\n-            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'\n-            assert (\n-                self.recompute_method is None\n-            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'\n-            assert (\n-                self.recompute_num_layers is None\n-            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'\n+            if self.recompute_granularity == 'full':\n+                # Full recompute runs per layer segment; recompute_method /\n+                # recompute_num_layers keep their non-overlap meaning and are validated\n+                # by the shared checks in __post_init__. See\n+                # megatron/core/models/common/model_chunk_schedule_plan.py.\n+                # Segment replay is currently supported only in eager execution,\n+                # including when the generic full-iteration graph checks allow recompute.\n+                assert self.cuda_graph_impl == \"none\", (\n+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '\n+                    'together with CUDA graphs (cuda_graph_impl != \"none\").'\n+                )\n+                # The replay is hand-rolled rather than a checkpoint primitive, so it\n+                # cannot shard the retained segment input across TP ranks.\n+                assert not self.distribute_saved_activations, (\n+                    'overlap_moe_expert_parallel_comm full recompute does not support '\n+                    'distribute_saved_activations: the segment replay does not go through '\n+                    'a checkpoint primitive, so the retained input is not sharded.'\n+                )\n+                # MTP is segmented under both methods here, so unlike\n+                # MultiTokenPredictionLayer._checkpointed_forward there is no 'block'\n+                # exemption. The 'uniform' restriction below is config parity with that\n+                # function's own assert, not a constraint of this schedule - multi-layer\n+                # decoder segments hand the MTP bridge over correctly.\n+                if self.mtp_num_layers and self.recompute_method == 'uniform':\n+                    assert (\n+                        self.recompute_num_layers == 1\n+                    ), 'recompute_num_layers must be 1 for MTP recompute'\n+                # With dropout the forward RNG stream is interleaved across microbatches\n+                # in the 1F1B schedule and cannot yet be faithfully replayed.\n+                assert self.attention_dropout == 0.0 and self.hidden_dropout == 0.0, (\n+                    'overlap_moe_expert_parallel_comm full recompute currently requires '\n+                    'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '\n+                    'interleaved 1F1B schedule is not yet supported for nonzero dropout)'\n+                )\n+                # Delayed-scaling FP8 accumulates amax into a persistent amax_history\n+                # across microbatches. Both the initial no_grad forward and the\n+                # backward-time recompute run under the delayed FP8 autocast, and this\n+                # path does not enter TE's activation-recompute (recompute_phase)\n+                # machinery that te_checkpoint uses to snapshot and restore FP8 metadata,\n+                # so the recompute would update amax_history a second time and silently\n+                # diverge. Current-scaling recipes (tensorwise / mxfp8 / blockwise) derive\n+                # scales from the current tensor each pass, so the replayed forward\n+                # re-derives identical scales; only delayed scaling is rejected here.\n+                # self.fp8 is checked because fp8_recipe defaults to 'delayed' in BF16\n+                # configs, where no FP8 autocast runs at all.\n+                assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.delayed), (\n+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '\n+                    'with delayed-scaling FP8 (fp8_recipe=\"delayed\"): the backward-time '\n+                    'recompute would double-update the persistent amax_history. Use a '\n+                    'current-scaling recipe (tensorwise / mxfp8 / blockwise) instead.'\n+                )\n+                # The offload manager pairs a forward-pushed group with the backward that\n+                # pops it. Under full recompute the initial forward saves nothing and the\n+                # replay pushes its groups immediately before its own backward, which does\n+                # not fit that pairing.\n+                assert not self.fine_grained_activation_offloading, (\n+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '\n+                    'together with fine_grained_activation_offloading.'\n+                )\n+            else:\n+                assert self.recompute_method is None, (\n+                    'disable recomputation method when enabling ' 'overlap_moe_expert_parallel_comm'\n+                )\n+                assert self.recompute_num_layers is None, (\n+                    'recompute_num_layers must be None when enabling '\n+                    'overlap_moe_expert_parallel_comm'\n+                )\n             assert (\n                 \"moe\" not in self.recompute_modules\n             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/megatron%2Fcore%2Ftransformer%2Ftransformer_config.py",
+      "sha": "dabcc12abb3f4284c8430b05fe88c4ab76a862c1",
+      "status": "modified"
+    },
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/tests%2FREADME.md",
+      "changes": 17,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2FREADME.md?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 0,
+      "filename": "tests/README.md",
+      "patch": "@@ -1,5 +1,22 @@\n # Megatron-LM Tests\n \n+## A2A Overlap Test Isolation\n+\n+The two-chunk schedule tests in `unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py`\n+reuse one parallel topology per class (and per TP size for padding-mask tests).\n+This bounds communicator and HybridEP initialization across the parameter matrix.\n+MCore's `destroy_model_parallel()` clears NCCL group references without unregistering those\n+groups from PyTorch, so each topology scope explicitly destroys the groups it\n+creates. The fixture preserves the default group and pre-existing groups,\n+and finalizes NCCL EP before destroying its borrowed communicator. Cached flex buffers\n+are also released before their groups. A per-case fixture collects model/plan cycles\n+after the test helpers return and releases the NCCL EP context and zero-copy buffers.\n+NCCL EP caches the dispatch alignment process-wide, so BF16 and FP8 cases must not\n+reuse that context even when their parallel topology matches. Topology teardown\n+checks that no new registered groups remain. This keeps\n+communication memory bounded across the full dispatcher, precision, MTP, and\n+recompute matrix.\n+\n ## Updating Functional Test Golden Values\n \n When adding new functional tests, it may be necessary to update the golden values used to verify if the test is",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/tests%2FREADME.md",
+      "sha": "ff11b7d12db4ddb6321792d78bc9ef4e0f043b7a",
+      "status": "modified"
+    },
+    {
+      "additions": 465,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2c26256f96a3c064fe4f665754aaeddb22df3299/tests%2Funit_tests%2Fa2a_overlap%2Ftest_schedule_chunk_1f1b.py",
+      "changes": 640,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fa2a_overlap%2Ftest_schedule_chunk_1f1b.py?ref=2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "deletions": 175,
+      "filename": "tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py",
+      "patch": "@@ -1,5 +1,6 @@\n-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.\n+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n import gc\n+from contextlib import contextmanager\n \n import pytest\n import torch\n@@ -12,6 +13,9 @@\n from megatron.core.models.gpt.gpt_model import GPTModel\n from megatron.core.pipeline_parallel.utils import set_streams\n from megatron.core.transformer.module import float16_to_fp32\n+from megatron.core.transformer.moe import fused_a2a\n+from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context\n+from megatron.core.transformer.transformer_config import TransformerConfig\n from megatron.core.utils import is_te_min_version\n from tests.unit_tests.a2a_overlap.utils import (\n     apply_flex_backend_kwargs,\n@@ -24,7 +28,7 @@\n from tests.unit_tests.test_utilities import Utils\n \n \n-def build_model(config, use_padding_mask=False):\n+def build_model(config, use_padding_mask=False, use_mtp_input_mask=False):\n     seq_len = 32\n     max_seq_len = 300\n     # ids = random.sample([i for i in range(max_seq_len)], seq_len)\n@@ -46,6 +50,18 @@ def build_model(config, use_padding_mask=False):\n         padding_mask[0, -8:] = True\n         data[\"padding_mask\"] = padding_mask\n \n+    # Optionally add mtp_input_mask, with False holes away from both ends. MTP rolls this\n+    # mask together with input_ids and then uses it to pick which embedding rows keep a\n+    # gradient, so the holes must not be symmetric under a one-position shift — otherwise a\n+    # mask that is rolled one time too many still selects the same rows and the test passes\n+    # for the wrong reason.\n+    if use_mtp_input_mask:\n+        mtp_input_mask = torch.ones((1, seq_len), dtype=torch.bool).cuda()\n+        mtp_input_mask[0, 5] = False\n+        mtp_input_mask[0, 11:14] = False\n+        mtp_input_mask[0, 20] = False\n+        data[\"mtp_input_mask\"] = mtp_input_mask\n+\n     # build layer spec\n     transformer_layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)\n     mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec.layer_specs[-1], True)\n@@ -64,24 +80,271 @@ def build_model(config, use_padding_mask=False):\n     return gpt_model, f_schedule_plan, data\n \n \n-class TestA2AOverlap:\n+def run_two_chunk_parity(\n+    layers,\n+    extra_kwargs,\n+    microbatches=1,\n+    use_padding_mask=False,\n+    use_mtp_input_mask=False,\n+    on_plans_built=None,\n+    on_forward_done=None,\n+):\n+    \"\"\"Assert the a2a overlap schedule and the reference forward give the same grads.\n+\n+    Builds one model per entry in ``layers``, captures reference grads from\n+    GPTModel.forward/backward, then replays the same inputs through the 1F1B pattern\n+    (chunk0 fwd -> chunk1 fwd + chunk0 bwd -> chunk1 bwd). ``on_plans_built`` is an\n+    optional hook for asserting schedule-plan invariants before the overlap run;\n+    ``on_forward_done`` runs on chunk 0's plan right after its forward-only pass, once per\n+    microbatch. With ``microbatches > 1`` both paths accumulate grads over that many\n+    identical microbatches and the plans are rebuilt each round, as in a real 1F1B step.\n     \"\"\"\n-    Test class for all-to-all overlap optimization in transformer models.\n+    assert len(layers) == 2, \"the 1F1B pattern below is written for exactly two chunks\"\n \n-    This class contains tests to verify that the all-to-all overlap optimization\n-    produces the same results as the reference implementation.\n+    gpt_models = []\n+    schedule_plans = []\n+    ref_captures = []\n+    datas = []\n+\n+    with deterministic_mode():\n+        for layer_num in layers:\n+            output_tensors = []\n+            # build config\n+            config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)\n+            # build model\n+            gpt_model, schedule_plan, data = build_model(\n+                config, use_padding_mask=use_padding_mask, use_mtp_input_mask=use_mtp_input_mask\n+            )\n+            gpt_model.cuda()\n+            gpt_models.append(gpt_model)\n+            datas.append(data)\n+            schedule_plans.append(schedule_plan)\n+\n+            # run reference\n+            for _ in range(microbatches):\n+                loss = gpt_model.forward(**data)\n+                loss = float16_to_fp32(loss)\n+                loss.backward(torch.ones_like(loss))\n+                output_tensors.append(loss)\n+\n+            capture = {\"outputs\": output_tensors}\n+            for name, param in gpt_model.named_parameters():\n+                capture[name] = param.grad\n+            ref_captures.append(capture)\n+            gpt_model.zero_grad()\n+        assert gpt_models[0].embedding is not None\n+        assert gpt_models[1].embedding is not None\n+        if on_plans_built is not None:\n+            on_plans_built(schedule_plans)\n+        # run a2a overlap\n+        capture_0 = {\"outputs\": []}\n+        capture_1 = {\"outputs\": []}\n+        a2a_captures = [capture_0, capture_1]\n+        for i in range(microbatches):\n+            # 1st forward\n+            if i > 0:\n+                assert (\n+                    schedule_plans[0].pre_process is None\n+                ), \"pre_process should be released after backward\"\n+                schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])\n+                schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])\n+            f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)\n+            if on_forward_done is not None:\n+                on_forward_done(schedule_plans[0])\n+            capture_0[\"outputs\"].append(f_input_0)\n+            # overlap\n+            f_input_1 = TransformerModelChunkSchedulePlan.run(\n+                schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)\n+            )\n+            capture_1[\"outputs\"].append(f_input_1)\n+            # last backward\n+            TransformerModelChunkSchedulePlan.run(\n+                None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)\n+            )\n+        for i in range(len(gpt_models)):\n+            for name, param in gpt_models[i].named_parameters():\n+                a2a_captures[i][name] = param.grad\n+\n+        # compare results\n+        for i in range(len(ref_captures)):\n+            comp_res = compare_captures(ref_captures[i], a2a_captures[i], True, True)\n+            assert comp_res[0], f\"[rank {torch.distributed.get_rank()}] {comp_res[1]}\"\n+\n+        # release resources is necessary, otherwise later testcases will oom\n+        for i in range(len(schedule_plans)):\n+            schedule_plans[i] = None\n+            ref_captures[i] = None\n+            a2a_captures[i] = None\n+            for k in datas[i]:\n+                datas[i][k] = None\n+            datas[i] = None\n+            gpt_models[i].zero_grad()\n+            gpt_models[i] = None\n+        gc.collect()\n+        torch.cuda.empty_cache()\n+\n+\n+def capture_overlap_grads(layers, extra_kwargs, use_mtp_input_mask=False):\n+    \"\"\"Run the two-chunk 1F1B overlap pattern once; return one grad dict per chunk.\n+\n+    Unlike ``run_two_chunk_parity`` this does not involve ``GPTModel.forward`` at all, so\n+    both sides of a comparison built on it travel the identical schedule. That matters for\n+    the embedding parameters: overlap-vs-reference does not agree on their gradients even\n+    with the feature under test disabled (which is why ``run_two_chunk_parity`` passes\n+    ``skip_embedding=True``), so a reference-based test cannot say anything about them.\n+    Overlap-vs-overlap can.\n     \"\"\"\n+    with deterministic_mode():\n+        gpt_models, schedule_plans, datas = [], [], []\n+        for layer_num in layers:\n+            config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)\n+            gpt_model, schedule_plan, data = build_model(\n+                config, use_mtp_input_mask=use_mtp_input_mask\n+            )\n+            gpt_model.cuda()\n+            gpt_models.append(gpt_model)\n+            schedule_plans.append(schedule_plan)\n+            datas.append(data)\n+\n+        f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)\n+        f_input_1 = TransformerModelChunkSchedulePlan.run(\n+            schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)\n+        )\n+        TransformerModelChunkSchedulePlan.run(\n+            None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)\n+        )\n+\n+        captures = []\n+        for gpt_model in gpt_models:\n+            captures.append(\n+                {\n+                    name: (param.grad.clone() if param.grad is not None else None)\n+                    for name, param in gpt_model.named_parameters()\n+                }\n+            )\n+\n+        for i in range(len(gpt_models)):\n+            schedule_plans[i] = None\n+            for k in datas[i]:\n+                datas[i][k] = None\n+            datas[i] = None\n+            gpt_models[i].zero_grad()\n+            gpt_models[i] = None\n+        gc.collect()\n+        torch.cuda.empty_cache()\n+    return captures\n \n-    def setup_method(self, method):\n+\n+@pytest.mark.parametrize(\"recompute_method\", [\"uniform\", \"block\"])\n+@pytest.mark.parametrize(\n+    \"overlap_enabled,cuda_graph_impl,error_match\",\n+    [\n+        (True, \"none\", None),\n+        (True, \"local\", \"full recompute is only supported with full iteration CUDA graph\"),\n+        (\n+            True,\n+            \"transformer_engine\",\n+            \"full recompute is only supported with full iteration CUDA graph\",\n+        ),\n+        (\n+            True,\n+            \"full_iteration\",\n+            \"overlap_moe_expert_parallel_comm full recompute is not yet supported \"\n+            \"together with CUDA graphs\",\n+        ),\n+        (False, \"full_iteration\", None),\n+    ],\n+)\n+def test_ep_a2a_full_recompute_cuda_graph_compatibility(\n+    recompute_method, overlap_enabled, cuda_graph_impl, error_match\n+):\n+    kwargs = dict(\n+        num_layers=1,\n+        hidden_size=128,\n+        num_attention_heads=4,\n+        num_moe_experts=2,\n+        expert_model_parallel_size=2,\n+        moe_token_dispatcher_type=\"alltoall\",\n+        overlap_moe_expert_parallel_comm=overlap_enabled,\n+        bf16=True,\n+        attention_dropout=0.0,\n+        hidden_dropout=0.0,\n+        recompute_granularity=\"full\",\n+        recompute_method=recompute_method,\n+        recompute_num_layers=1,\n+        cuda_graph_impl=cuda_graph_impl,\n+    )\n+    if error_match is not None:\n+        with pytest.raises(AssertionError, match=error_match):\n+            TransformerConfig(**kwargs)\n+    else:\n+        config = TransformerConfig(**kwargs)\n+        assert config.cuda_graph_impl == cuda_graph_impl\n+        assert config.overlap_moe_expert_parallel_comm == overlap_enabled\n+\n+\n+@contextmanager\n+def model_parallel_context(tp_size=1):\n+    \"\"\"Own a fixed parallel topology and its backend buffers for a test scope.\"\"\"\n+    Utils.initialize_distributed()\n+    torch.cuda.synchronize()\n+    # Own NCCL EP state within this file; no preceding topology's buffers may survive.\n+    nccl_ep_release_context()\n+    fused_a2a.reset_hybrid_ep_buffer()\n+    fused_a2a._buffer = None\n+    # MCore clears NCCL references without unregistering groups from c10d. Own only\n+    # the groups created here so WORLD and groups from other test scopes survive.\n+    pg_map = torch.distributed.distributed_c10d._world.pg_map\n+    existing_groups = set(pg_map)\n+    try:\n         Utils.initialize_model_parallel(\n-            tensor_model_parallel_size=1,\n+            tensor_model_parallel_size=tp_size,\n             pipeline_model_parallel_size=1,\n             expert_model_parallel_size=4,\n+            expert_tensor_parallel_size=1,\n         )\n         set_streams()\n-\n-    def teardown_method(self, method):\n+        yield\n+    finally:\n+        torch.cuda.synchronize()\n+        gc.collect()\n+        fused_a2a.reset_hybrid_ep_buffer()\n+        fused_a2a._buffer = None\n+        nccl_ep_release_context()\n         Utils.destroy_model_parallel()\n+        for group in reversed(list(pg_map)):\n+            if group not in existing_groups:\n+                torch.distributed.destroy_process_group(group)\n+        gc.collect()\n+        torch.cuda.empty_cache()\n+        assert set(pg_map) <= existing_groups, \"test scope leaked distributed process groups\"\n+\n+\n+class TestA2AOverlap:\n+    \"\"\"\n+    Test class for all-to-all overlap optimization in transformer models.\n+\n+    This class contains tests to verify that the all-to-all overlap optimization\n+    produces the same results as the reference implementation.\n+    \"\"\"\n+\n+    @pytest.fixture(scope=\"class\", autouse=True)\n+    def model_parallel(self):\n+        # All parity cases use the same TP=1/EP=4 topology. Keep its process groups\n+        # and HybridEP runtime alive instead of rebuilding them for every case.\n+        with model_parallel_context():\n+            yield\n+\n+    @pytest.fixture(autouse=True)\n+    def release_models(self):\n+        yield\n+        # Helpers have returned, so their last model/plan locals no longer pin cycles.\n+        torch.cuda.synchronize()\n+        gc.collect()\n+        # NCCL EP caches layer alignment process-wide: BF16 uses 0, FP8 uses 16/32.\n+        # Each case must bootstrap its own layout, even while its process groups persist.\n+        nccl_ep_release_context()\n+        torch.cuda.empty_cache()\n \n     @pytest.mark.skipif(not is_te_min_version(\"1.9.0.dev0\"), reason=\"Requires TE >= 1.9.0.dev0\")\n     @pytest.mark.parametrize(\"mtp_layers\", [0, 1])\n@@ -95,13 +358,6 @@ def test_1f1b_schedule_model_chunk(\n         Verifies all-to-all overlap optimization in transformer layer produces\n         the same results as the reference implementation.\n         \"\"\"\n-        microbatches = 1\n-\n-        gpt_models = []\n-        schedule_plans = []\n-        ref_captures = []\n-        datas = []\n-\n         # create TransformerConfig\n         extra_kwargs = {}\n         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)\n@@ -111,175 +367,209 @@ def test_1f1b_schedule_model_chunk(\n         if mtp_layers > 0:\n             extra_kwargs[\"mtp_num_layers\"] = mtp_layers\n             extra_kwargs[\"mtp_loss_scaling_factor\"] = 1.1\n-        with deterministic_mode():\n-            for layer_num in layers:\n-                output_tensors = []\n-                # build config\n-                config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)\n-                # build model\n-                gpt_model, schedule_plan, data = build_model(config)\n-                gpt_model.cuda()\n-                gpt_models.append(gpt_model)\n-                datas.append(data)\n-                schedule_plans.append(schedule_plan)\n-\n-                # run reference\n-                for _ in range(microbatches):\n-                    loss = gpt_model.forward(**data)\n-                    loss = float16_to_fp32(loss)\n-                    loss.backward(torch.ones_like(loss))\n-                    output_tensors.append(loss)\n-\n-                capture = {\"outputs\": output_tensors}\n-                for name, param in gpt_model.named_parameters():\n-                    capture[name] = param.grad\n-                ref_captures.append(capture)\n-                gpt_model.zero_grad()\n-            assert gpt_models[0].embedding is not None\n-            assert gpt_models[1].embedding is not None\n-            # run a2a overlap\n-            capture_0 = {\"outputs\": []}\n-            capture_1 = {\"outputs\": []}\n-            a2a_captures = [capture_0, capture_1]\n-            for i in range(microbatches):\n-                # 1st forward\n-                if i > 0:\n-                    assert (\n-                        schedule_plans[0].pre_process is None\n-                    ), \"pre_process should be released after backward\"\n-                    schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])\n-                    schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])\n-                f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)\n-                capture_0[\"outputs\"].append(f_input_0)\n-                # overlap\n-                f_input_1 = TransformerModelChunkSchedulePlan.run(\n-                    schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)\n-                )\n-                capture_1[\"outputs\"].append(f_input_1)\n-                # last backward\n-                TransformerModelChunkSchedulePlan.run(\n-                    None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)\n-                )\n-            for i in range(len(gpt_models)):\n-                for name, param in gpt_models[i].named_parameters():\n-                    a2a_captures[i][name] = param.grad\n-\n-            # compare results\n-            for i in range(len(ref_captures)):\n-                comp_res = compare_captures(ref_captures[i], a2a_captures[i], True, True)\n-                assert comp_res[0], f\"[rank {torch.distributed.get_rank()}] {comp_res[1]}\"\n-\n-            # release resources is necessary, otherwise later testcases will oom\n-            for i in range(len(schedule_plans)):\n-                schedule_plans[i] = None\n-                ref_captures[i] = None\n-                a2a_captures[i] = None\n-                for k in datas[i]:\n-                    datas[i][k] = None\n-                datas[i] = None\n-                gpt_models[i].zero_grad()\n-                gpt_models[i] = None\n-            gc.collect()\n-            torch.cuda.empty_cache()\n+        run_two_chunk_parity(layers, extra_kwargs)\n+\n+    def _run_full_recompute_parity(\n+        self,\n+        mtp_layers,\n+        dispatcher_type,\n+        flex_backend,\n+        fp8_flag,\n+        recompute_method,\n+        recompute_num_layers,\n+        microbatches=1,\n+    ):\n+        \"\"\"Layer-level full recompute matches the non-overlap reference, which checkpoints\n+        through checkpointed_forward / MTP _checkpointed_forward with the same config.\n+        \"\"\"\n+        if mtp_layers > 0 and not (recompute_method == \"uniform\" and recompute_num_layers == 1):\n+            # Otherwise the non-overlap reference warns and skips MTP recompute, so the\n+            # two paths are not comparable.\n+            pytest.skip(\"MTP recompute requires recompute_method='uniform' with num_layers=1\")\n+\n+        extra_kwargs = {\n+            \"recompute_granularity\": \"full\",\n+            \"recompute_method\": recompute_method,\n+            \"recompute_num_layers\": recompute_num_layers,\n+        }\n+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)\n+        if fp8_flag is not None:\n+            extra_kwargs[\"fp8\"] = fp8_flag[0]\n+            extra_kwargs[\"fp8_recipe\"] = fp8_flag[1]\n+        if mtp_layers > 0:\n+            extra_kwargs[\"mtp_num_layers\"] = mtp_layers\n+            extra_kwargs[\"mtp_loss_scaling_factor\"] = 1.1\n+\n+        def assert_segments_were_built(schedule_plans):\n+            # Guard against degrading into the plain overlap test.\n+            for plan in schedule_plans:\n+                assert len(plan._recompute_segments) > 0, \"no recompute segments were built\"\n+\n+        def assert_activations_were_released(plan):\n+            # The point of the feature: after the chunk forward a recomputed layer holds\n+            # no activation and only its segment's input survives. Gradient parity alone\n+            # cannot catch a regression here - recompute is numerically transparent, so a\n+            # segment that quietly kept its graph would still compare equal. Re-checked\n+            # every microbatch, since the plans are rebuilt each round.\n+            assert len(plan._recompute_segments) > 0, \"no recompute segments were built\"\n+            for segment in plan._recompute_segments:\n+                assert segment.input_tensor is not None, \"segment input was not retained\"\n+                for layer in segment.layers:\n+                    for node in layer._iter_recomputed_nodes():\n+                        assert node.output is None, f\"{node.name} kept its forward output\"\n+                        assert node.inputs is None, f\"{node.name} kept its forward inputs\"\n+\n+        run_two_chunk_parity(\n+            [3, 2],\n+            extra_kwargs,\n+            microbatches=microbatches,\n+            on_plans_built=assert_segments_were_built,\n+            on_forward_done=assert_activations_were_released,\n+        )\n+\n+    @pytest.mark.skipif(not is_te_min_version(\"1.9.0.dev0\"), reason=\"Requires TE >= 1.9.0.dev0\")\n+    @pytest.mark.parametrize(\"mtp_layers\", [0, 1])\n+    @pytest.mark.parametrize(\"dispatcher_type,flex_backend\", get_valid_dispatcher_configs())\n+    @pytest.mark.parametrize(\"fp8_flag\", get_valid_fp8_flags())\n+    @pytest.mark.parametrize(\n+        \"recompute_method,recompute_num_layers\",\n+        [\n+            (\"uniform\", 1),\n+            (\"uniform\", 2),\n+            # 'block' leaves trailing layers eager, pinning the recomputed -> eager\n+            # hand-off: n=1 keeps layers 1.. eager, n=3 recomputes the whole decoder.\n+            (\"block\", 1),\n+            (\"block\", 3),\n+        ],\n+    )\n+    def test_1f1b_schedule_model_chunk_full_recompute(\n+        self,\n+        mtp_layers,\n+        dispatcher_type,\n+        flex_backend,\n+        fp8_flag,\n+        recompute_method,\n+        recompute_num_layers,\n+    ):\n+        \"\"\"Full segmentation matrix, one microbatch.\"\"\"\n+        self._run_full_recompute_parity(\n+            mtp_layers,\n+            dispatcher_type,\n+            flex_backend,\n+            fp8_flag,\n+            recompute_method,\n+            recompute_num_layers,\n+        )\n+\n+    @pytest.mark.skipif(not is_te_min_version(\"1.9.0.dev0\"), reason=\"Requires TE >= 1.9.0.dev0\")\n+    @pytest.mark.parametrize(\"mtp_layers\", [0, 1])\n+    @pytest.mark.parametrize(\"dispatcher_type,flex_backend\", get_valid_dispatcher_configs())\n+    @pytest.mark.parametrize(\"fp8_flag\", get_valid_fp8_flags())\n+    @pytest.mark.parametrize(\n+        \"recompute_method,recompute_num_layers\", [(\"uniform\", 1), (\"block\", 1)]\n+    )\n+    def test_1f1b_schedule_model_chunk_full_recompute_multi_microbatch(\n+        self,\n+        mtp_layers,\n+        dispatcher_type,\n+        flex_backend,\n+        fp8_flag,\n+        recompute_method,\n+        recompute_num_layers,\n+    ):\n+        \"\"\"Same parity, but over four microbatches, as in a real 1F1B steady state.\n+\n+        One microbatch never runs the same modules through forward -> recompute ->\n+        backward twice, so it cannot catch state that the replay leaves behind and the\n+        next microbatch then reads: FP8 scaling metadata, the segments' RNG snapshots, or\n+        a node whose ``forward_no_grad`` was not restored. Grads are accumulated across\n+        the four microbatches on both paths and compared bitwise, so any per-round drift\n+        shows up. The segmentation axis is trimmed to one segment-per-layer case and one\n+        recomputed -> eager hand-off case; the matrix above covers the rest at\n+        ``microbatches=1``.\n+        \"\"\"\n+        self._run_full_recompute_parity(\n+            mtp_layers,\n+            dispatcher_type,\n+            flex_backend,\n+            fp8_flag,\n+            recompute_method,\n+            recompute_num_layers,\n+            microbatches=4,\n+        )\n+\n+    @pytest.mark.skipif(not is_te_min_version(\"1.9.0.dev0\"), reason=\"Requires TE >= 1.9.0.dev0\")\n+    @pytest.mark.parametrize(\"dispatcher_type,flex_backend\", get_valid_dispatcher_configs())\n+    def test_full_recompute_preserves_mtp_input_mask(self, dispatcher_type, flex_backend):\n+        \"\"\"Full recompute is transparent to MTP's input mask.\n+\n+        ``mtp_input_mask`` is a mutable chunk-state field: MTP's ``_get_embeddings`` rolls\n+        it together with ``input_ids`` (one concatenated roll, so CP does a single boundary\n+        exchange) and writes both back. A segment snapshot that omits it lets the replay\n+        roll an already-rolled mask, shifting it one position against ``input_ids``, and the\n+        mask then drives\n+        ``torch.where(valid, decoder_input, decoder_input.detach())`` -- so the detached\n+        embedding rows are the wrong ones.\n+\n+        That damage is confined to the embedding gradients: masking never changes a forward\n+        value, so outputs and every non-embedding parameter still agree. The comparison is\n+        therefore overlap-with-recompute against overlap-without-recompute, both through\n+        ``capture_overlap_grads``, rather than against ``GPTModel.forward`` -- the reference\n+        path does not agree with the overlap path on embedding gradients even without\n+        recompute, so it cannot arbitrate this.\n+\n+        The mask's False holes are deliberately not symmetric under a one-position shift;\n+        otherwise an over-rolled mask would still select the same rows and pass.\n+        \"\"\"\n+        base_kwargs = {\"mtp_num_layers\": 1, \"mtp_loss_scaling_factor\": 1.1}\n+        apply_flex_backend_kwargs(base_kwargs, dispatcher_type, flex_backend)\n+        recompute_kwargs = dict(\n+            base_kwargs,\n+            recompute_granularity=\"full\",\n+            recompute_method=\"uniform\",\n+            recompute_num_layers=1,\n+        )\n+\n+        eager = capture_overlap_grads([2, 1], base_kwargs, use_mtp_input_mask=True)\n+        recomputed = capture_overlap_grads([2, 1], recompute_kwargs, use_mtp_input_mask=True)\n+\n+        for i in range(len(eager)):\n+            assert \"embedding.word_embeddings.weight\" in eager[i], \"embedding grad not captured\"\n+            comp_res = compare_captures(eager[i], recomputed[i], True, False)\n+            assert comp_res[0], f\"[rank {torch.distributed.get_rank()}] chunk {i}: {comp_res[1]}\"\n+\n+\n+class TestA2AOverlapPaddingMask:\n+    \"\"\"Padding-mask parity owns its topology because this matrix varies TP size.\"\"\"\n+\n+    @pytest.fixture(scope=\"class\", params=[1, 2, 4, 8])\n+    def tp_size(self, request):\n+        return request.param\n+\n+    @pytest.fixture(scope=\"class\", autouse=True)\n+    def model_parallel(self, tp_size):\n+        with model_parallel_context(tp_size):\n+            yield\n+\n+    @pytest.fixture(autouse=True)\n+    def release_models(self):\n+        yield\n+        torch.cuda.synchronize()\n+        gc.collect()\n+        nccl_ep_release_context()\n+        torch.cuda.empty_cache()\n \n     @pytest.mark.skipif(not is_te_min_version(\"1.9.0.dev0\"), reason=\"Requires TE >= 1.9.0.dev0\")\n     @pytest.mark.parametrize(\"dispatcher_type,flex_backend\", get_valid_dispatcher_configs())\n     @pytest.mark.parametrize(\"layers\", [[2, 1], [1, 1]])\n-    @pytest.mark.parametrize(\"tp_size\", [1, 2, 4, 8])\n     def test_1f1b_schedule_model_chunk_with_padding_mask(\n         self, dispatcher_type, flex_backend, layers, tp_size\n     ):\n         \"\"\"\n         Verifies all-to-all overlap optimization with padding_mask produces\n         the same results as the reference implementation with various TP/EP/CP combinations.\n         \"\"\"\n-        # Re-initialize model parallel with the specified configuration\n-        Utils.destroy_model_parallel()\n-        Utils.initialize_model_parallel(\n-            tensor_model_parallel_size=tp_size,\n-            pipeline_model_parallel_size=1,\n-            expert_model_parallel_size=4,\n-            expert_tensor_parallel_size=1,\n-        )\n-        set_streams()\n-\n-        microbatches = 1\n-\n-        gpt_models = []\n-        schedule_plans = []\n-        ref_captures = []\n-        datas = []\n-\n         # create TransformerConfig\n         extra_kwargs = {\"tensor_model_parallel_size\": tp_size, \"sequence_parallel\": tp_size > 1}\n         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)\n-        with deterministic_mode():\n-            for layer_num in layers:\n-                output_tensors = []\n-                # build config\n-                config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)\n-                # build model with padding_mask\n-                gpt_model, schedule_plan, data = build_model(config, use_padding_mask=True)\n-                gpt_model.cuda()\n-                gpt_models.append(gpt_model)\n-                datas.append(data)\n-                schedule_plans.append(schedule_plan)\n-\n-                # run reference\n-                for _ in range(microbatches):\n-                    loss = gpt_model.forward(**data)\n-                    loss = float16_to_fp32(loss)\n-                    loss.backward(torch.ones_like(loss))\n-                    output_tensors.append(loss)\n-\n-                capture = {\"outputs\": output_tensors}\n-                for name, param in gpt_model.named_parameters():\n-                    capture[name] = param.grad\n-                ref_captures.append(capture)\n-                gpt_model.zero_grad()\n-            assert gpt_models[0].embedding is not None\n-            assert gpt_models[1].embedding is not None\n-            # run a2a overlap\n-            capture_0 = {\"outputs\": []}\n-            capture_1 = {\"outputs\": []}\n-            a2a_captures = [capture_0, capture_1]\n-            for i in range(microbatches):\n-                # 1st forward\n-                if i > 0:\n-                    assert (\n-                        schedule_plans[0].pre_process is None\n-                    ), \"pre_process should be released after backward\"\n-                    schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])\n-                    schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])\n-                f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)\n-                capture_0[\"outputs\"].append(f_input_0)\n-                # overlap\n-                f_input_1 = TransformerModelChunkSchedulePlan.run(\n-                    schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)\n-                )\n-                capture_1[\"outputs\"].append(f_input_1)\n-                # last backward\n-                TransformerModelChunkSchedulePlan.run(\n-                    None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)\n-                )\n-            for i in range(len(gpt_models)):\n-                for name, param in gpt_models[i].named_parameters():\n-                    a2a_captures[i][name] = param.grad\n-\n-            # compare results\n-            for i in range(len(ref_captures)):\n-                comp_res = compare_captures(ref_captures[i], a2a_captures[i], True, True)\n-                assert comp_res[0], f\"[rank {torch.distributed.get_rank()}] {comp_res[1]}\"\n-\n-            # release resources is necessary, otherwise later testcases will oom\n-            for i in range(len(schedule_plans)):\n-                schedule_plans[i] = None\n-                ref_captures[i] = None\n-                a2a_captures[i] = None\n-                for k in datas[i]:\n-                    datas[i][k] = None\n-                datas[i] = None\n-                gpt_models[i].zero_grad()\n-                gpt_models[i] = None\n-            gc.collect()\n-            torch.cuda.empty_cache()\n+        run_two_chunk_parity(layers, extra_kwargs, use_padding_mask=True)",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2c26256f96a3c064fe4f665754aaeddb22df3299/tests%2Funit_tests%2Fa2a_overlap%2Ftest_schedule_chunk_1f1b.py",
+      "sha": "5f34c52bbfea29950fa4f816ee67278652213713",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "can you share why this is not playing well with cuda graph? ",
+      "created_at": "2026-08-13T07:20:33Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3773244169",
+      "line": null,
+      "original_line": 2783,
+      "path": "megatron/core/transformer/transformer_config.py",
+      "updated_at": "2026-08-13T07:20:33Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "same comment as above ",
+      "created_at": "2026-08-13T07:20:55Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3773246550",
+      "line": null,
+      "original_line": 2789,
+      "path": "megatron/core/transformer/transformer_config.py",
+      "updated_at": "2026-08-13T07:20:55Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "can you explain the asserts under this else? ",
+      "created_at": "2026-08-13T07:24:50Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3773269623",
+      "line": 3697,
+      "original_line": 2801,
+      "path": "megatron/core/transformer/transformer_config.py",
+      "updated_at": "2026-08-13T07:24:50Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "Recompute method and recompute_num_layers shouldn't be assigned when disabling full recomupte.",
+      "created_at": "2026-08-18T13:42:22Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3804597339",
+      "line": 3697,
+      "original_line": 2801,
+      "path": "megatron/core/transformer/transformer_config.py",
+      "updated_at": "2026-08-18T13:42:23Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "Good catch, this is a slop, current implementation should work with full-iteration cuda graph + paged stash, but doesn't work with partial cuda graph(same as EP overlap=False case).\n\nRemoved this assertion in 3ffbe326e",
+      "created_at": "2026-08-18T13:45:36Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3804626498",
+      "line": null,
+      "original_line": 2783,
+      "path": "megatron/core/transformer/transformer_config.py",
+      "updated_at": "2026-08-18T13:45:36Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "Removed in 3ffbe326e. same reason as above~",
+      "created_at": "2026-08-18T13:45:47Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#discussion_r3804628513",
+      "line": null,
+      "original_line": 2789,
+      "path": "megatron/core/transformer/transformer_config.py",
+      "updated_at": "2026-08-18T13:45:47Z",
+      "user": {
+        "login": "Wohox"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+      "created_at": "2026-08-11T02:53:22Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5248458738",
+      "updated_at": "2026-08-11T02:53:22Z",
+      "user": {
+        "login": "copy-pr-bot"
+      }
+    },
+    {
+      "body": "https://github.com/NVIDIA/Megatron-LM/commit/74dc1b570330d430d3c2a0b87dba2cefd7e630b8 changed API of 1f1b, please rebase accordingly, thanks~",
+      "created_at": "2026-09-10T07:59:31Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5615175308",
+      "updated_at": "2026-09-10T07:59:31Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "/ok to test b9382e2ad1b720dd24c7539bb26832680a2f2e0f",
+      "created_at": "2026-09-14T21:41:43Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5671197057",
+      "updated_at": "2026-09-14T21:41:43Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "/ok to test 96bad83454f90fd7e21bcb91ca47c8d4a1af632e",
+      "created_at": "2026-09-28T17:16:32Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5874973964",
+      "updated_at": "2026-09-28T17:16:32Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "/ok to test fb50e16a1da5ed404840997eac06a723aa394704\n",
+      "created_at": "2026-09-29T02:33:48Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5882544643",
+      "updated_at": "2026-09-29T02:33:48Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "/ok to test [62b1938](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/62b19383e178563e34b711e946d9fed09956a7d4)",
+      "created_at": "2026-09-30T01:57:47Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5902558945",
+      "updated_at": "2026-09-30T01:57:47Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "/ok to test [5a24f27](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/5a24f27b55dffa6f9f166196a1c2e04ff46769db)",
+      "created_at": "2026-09-30T06:39:41Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5905628160",
+      "updated_at": "2026-09-30T06:39:41Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "/ok to test 9c751562c6327c653ff7a4e98c7a9e0b7be9a88b\n",
+      "created_at": "2026-09-30T15:03:31Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5913956369",
+      "updated_at": "2026-09-30T15:03:31Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "/ok to test 5559e53ee2db313a632add9b39b1c568ae49341e\n",
+      "created_at": "2026-10-04T00:42:52Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5975086932",
+      "updated_at": "2026-10-04T00:42:52Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "/ok to test e8ae14b52f4184d38574db78bc6121663862297e\n",
+      "created_at": "2026-10-04T11:28:42Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-5979458887",
+      "updated_at": "2026-10-04T11:28:42Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "/ok to test [84b49e6](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/84b49e60b6509f97bb5c474d1a242c5b07fe70ff)",
+      "created_at": "2026-10-08T01:00:19Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-6049976489",
+      "updated_at": "2026-10-08T01:00:19Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/14c7398a288c6f74257f48f43a884f9bba1e8c7c",
+      "created_at": "2026-10-08T20:34:17Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-6068547409",
+      "updated_at": "2026-10-08T20:34:17Z",
+      "user": {
+        "login": "balasaajay"
+      }
+    },
+    {
+      "body": "/ok to test [2c26256](https://github.com/NVIDIA/Megatron-LM/pull/6429/commits/2c26256f96a3c064fe4f665754aaeddb22df3299)",
+      "created_at": "2026-10-12T03:52:02Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#issuecomment-6117421653",
+      "updated_at": "2026-10-12T03:52:02Z",
+      "user": {
+        "login": "Wohox"
+      }
+    }
+  ],
+  "number": 6429,
+  "refs": {
+    "base": {
+      "commit": "e30d863a6d82a3c45f2d71355dc73fbf5610967b",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "2c26256f96a3c064fe4f665754aaeddb22df3299",
+      "repository": "Wohox/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4924432657",
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-13T07:20:33Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4924435834",
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-13T07:20:55Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4924464907",
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-13T07:24:50Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4961682292",
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-18T13:42:22Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4961717598",
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-18T13:45:36Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-4961719830",
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-18T13:45:47Z",
+      "user": {
+        "login": "Wohox"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-5200662604",
+      "state": "APPROVED",
+      "submitted_at": "2026-09-14T17:11:56Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6429#pullrequestreview-5242243932",
+      "state": "APPROVED",
+      "submitted_at": "2026-09-17T22:59:51Z",
+      "user": {
+        "login": "Phlip79"
+      }
+    }
+  ]
+}

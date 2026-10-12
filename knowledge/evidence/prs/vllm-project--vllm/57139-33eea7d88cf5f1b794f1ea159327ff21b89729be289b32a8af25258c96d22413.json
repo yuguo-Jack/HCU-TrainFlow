@@ -1,0 +1,558 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "a33d46b47193e3273dc38f980abbf55459f3c77f",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "Addresses #55179.\n\n## Problem\n\n`P2PSession._on_connect` called `NixlTransport.add_remote_peer` inline before replying with `ConnectAckMsg`. Registration is `add_remote_agent` plus a `prep_xfer_dlist` over every block of the peer's region — 19,599 blocks per rank for the 64 GiB CPU tier in the reported deployment — so a cold handshake ran that work inside a scheduling iteration on **both** peers, and the lookup queued behind the acknowledgement waited for it.\n\n## Scope: registration only, not the per-step gating\n\nThe issue proposes two independent changes. This PR implements only the first, because the reported numbers point at registration as the dominant term.\n\nWithin one scheduler step, `TieringManager.on_schedule_end` runs `get_finished_jobs()` → `_poll_once()` (drain + dispatch) **before** `serve_external_requests(parent)`, so receive-and-answer collapse into a single tick. The busy source's critical path is therefore about four ticks: `ConnectMsg` → ack, `LookupMsg` → `LookupRespMsg`, `FetchMsg` → `write_blocks`, and NIXL completion → `TransferDoneMsg`. The destination was idle in the measurement, so its ticks are effectively free.\n\nThat gives `13.6 s ≈ 2·T_reg + 4·T_step`. At the issue's own stated ~1 s/step, per-step gating accounts for ~4 s, leaving ~9.6 s for two registrations. For gating alone to explain 13.6 s you would need ~3.4 s/step, which contradicts the same description. Per-step gating is real as a mechanism but is the minority term here, so it is deliberately left out of this PR and should be justified by its own measurement.\n\n## Change\n\n- `DataTransport.add_remote_peer_async` — new method whose default implementation runs `add_remote_peer` inline and returns an already-resolved future. Transports with cheap registration are unaffected and need no override.\n- `NixlTransport` overrides it with a single-worker `ThreadPoolExecutor`, mirroring the NIXL connector's `_handshake_initiation_executor`. `add_remote_peer` is split into `_build_peer_handles` (the expensive agent wireup plus per-block descriptors, run **unlocked** — holding a lock across it would stall the scheduler thread for exactly as long as the work being moved off it) and `_publish_peer` (the atomic install).\n- `P2PSession` starts the registration in `_on_connect` and sends `ConnectAckMsg` from `poll()` once the future resolves; a failed registration marks the connection dead so the manager reaps the session.\n\n### The acknowledgement is the safety barrier\n\n`ConnectAckMsg` is what clears the peer's `_send_ready` gate, so the peer cannot send a `FetchMsg` until it arrives. Gating the ack on registration completion preserves the invariant that **any peer permitted to fetch is a peer already registered here**, so `write_blocks` can never observe an unregistered peer as a result of this change. The wire protocol is unchanged.\n\n### Generation guard\n\nRegistrations carry a per-peer generation, bumped on every add and every remove. A worker that finishes building handles under a stale generation releases them instead of publishing. This closes the reap race: `_reap_dead_sessions` calls `session.close()` and then `_data.remove_remote_peer(pid)`, and without the guard a registration landing after that would leave a registered peer with no session plus leaked NIXL handles. A pending registration also counts as session pending work, so the engine keeps ticking until the acknowledgement goes out.\n\n### No `NIXL_THREAD_SYNC_STRICT`\n\nThe issue suggests opening the agent with `NIXL_THREAD_SYNC_STRICT` or `_RW`. That is not reachable through `nixl_agent_config`: the Python wrapper hard-codes `agent_config.syncMode`, selecting `STRICT` only when `enable_listen` is true, which would additionally start a listener thread and bind a port that this tier does not use.\n\nIt is also unnecessary. `NixlConnector` already runs `add_remote_agent`, `get_xfer_descs` and `prep_xfer_dlist` on its single-worker handshake executor concurrently with transfer submission on the main thread, with the default `syncMode=NONE`. This PR adopts the threading model vLLM already ships rather than introducing a new one, which also removes the need to measure STRICT's cost on the transfer path.\n\n## Why this does not duplicate an existing PR\n\nDraft #55962 covers this ground as part of a larger change that also services the control plane during model steps, and does so by adding a `poll_pending_work` hook to `KVConnectorBase_V1` plus changes to `EngineCore` and both executors.\n\nThis PR is materially different in approach and scope:\n\n- **No new connector API.** Nothing is added to `KVConnectorBase_V1`. The audit behind this is that only `ServerRole.serve_external_requests` and its four helpers need the `ParentManager` handle — the whole client role, the entire message-dispatch table, and all NIXL submit/poll/cancel work are already parent-free, and `on_lookup` already defers resolution to the existing `serve_external_requests` window. No fresh scheduler-thread window is required.\n- **Registration only.** It does not attempt the per-step gating change, for the reasons in the scope section above.\n- **Different files.** It touches none of `vllm/v1/engine/core.py`, `vllm/v1/executor/{abstract,uniproc_executor,multiproc_executor}.py`, `kv_connector/v1/base.py`, `multi_connector.py`, or `offloading_connector.py`.\n- **No STRICT sync mode**, per the section above.\n\nLanding this first also makes #55962's remaining half measurable on its own terms: with registration off the critical path, whatever delay is left on a busy source is the per-step gating component.\n\n## Tests\n\nRun from `venv/` (this checkout's working environment):\n\n```\npython -m pytest tests/v1/kv_offload/tiering/ -q\n  → 377 passed, 11 skipped\n  (baseline on the untouched tree: 371 passed, 11 skipped; +6 new tests)\n\npython -m pytest tests/v1/kv_offload/tiering/p2p/ -q\n  → 220 passed\n\npre-commit run --files <6 changed files>          → all hooks pass (incl. DCO sign-off)\npre-commit run mypy-3.12 --files <3 source files> --hook-stage manual → passed\n```\n\nNew tests, one behavior each:\n\n- `ConnectAckMsg` is withheld while registration is in flight, and sent once it resolves.\n- A pending registration counts as pending work — without this nothing drives the acknowledgement out.\n- A failed registration rejects the peer instead of acknowledging it.\n- A duplicate `ConnectMsg` mid-registration is a protocol error.\n- Registration provably runs off the caller thread.\n- A registration landing after `remove_remote_peer` is discarded and its handles released.\n\nThe session test fake gained a `defer_registration` mode so the acknowledgement gating is exercised deterministically rather than relying on thread timing.\n\n## Model evaluation\n\nNo eval was run, because this change cannot affect model output: it reorders when a control-plane acknowledgement is sent and moves NIXL registration to another thread. Which blocks are transferred, and their contents, are untouched, and the wire protocol is unchanged.\n\n**Performance validation is still outstanding.** The change targets a timing property that unit tests cannot measure, and no multi-pod deploy has been run yet. The measurement that validates it is TTFT on a busy source with a cold peer versus a warm peer: if cold-peer TTFT drops toward warm-peer, registration was the dominant cost. This PR stays in draft until that result is in.\n\n## AI assistance\n\nAI assistance (Claude Code) was used for the analysis, implementation and tests in this PR. The submitting human is reviewing every changed line and is running the hardware validation described above before marking it ready for review.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "nilig"
+            },
+            "body": "I ran this PR on the same cell and case chain I used for #55962, to check whether registration alone covers #55179.\n\nSetup: GLM-5.2-FP8, two prefill pods (DP8/TP1, 8xH200 each) and a decode pair, `MultiConnector(NixlConnector, OffloadingConnector)` with a 64 GiB CPU tier per rank and the P2P secondary tier, NIXL 1.4.1. Image = my `6f91edf9` hotfix stack plus a clean backport of this PR at `7b077f36a`, nothing else. The metric is the destination's `kv_offload_lookup_async_delay_seconds`: time from the first deferred lookup until the scheduler observes a resolved result. The busy cases load the source rank with three 115K-token prefills before the pull. One boot, n=1 per case.\n\n| case | baseline (no patch) | #55962 as first submitted (async registration active, wait callback inert) | this PR | #55962 + `c5bfb39d3` (wait callback active) |\n|---|---|---|---|---|\n| first pull, cold destination | 10.5-10.7 s | 10.63 s | 10.56 s | 10.74 s |\n| idle-warm 1 | 0.63 s | 0.63 s | 0.58 s | 0.57 s |\n| idle-warm 2 | 0.94 s | 0.94 s | 0.59 s | 0.91 s |\n| busy-warm 1 | 2.46 s | 2.47 s | 1.96 s | 0.65 s |\n| busy-warm 2 | 2.88 s | 2.05 s | 2.17 s | 0.60 s |\n| busy-cold | 0.99-3.19 s | 3.19 s | 3.69 s | 0.88 s |\n\nThe busy rows stay in the baseline band with this PR, the same as the registration-only #55962 arm, and drop to 0.6-0.9 s only once the control plane is serviced during the model wait. Idle rows are the same on every tree.\n\nOn the model in the description: I measured registration directly with trace stamps on both peers in an earlier round, and `add_remote_agent` plus `prep_xfer_dlist` for 19,599 blocks took 14-40 ms per side, not seconds. The 13.6 s in the issue is the cold first pull, and that turned out to be the destination rank's first `execute_dummy_batch()` compiling kernels (#57133); it is the same ~10.5 s on every tree here, this PR included, and no control-plane change can remove it. What #55179's busy stall is made of, per the same trace, is step waits on the source: the `LookupMsg` sits in the server queue until the next step (0.55-0.61 s), the `FetchMsg` is dispatched at the next step (0.45-0.50 s), and each handshake hop costs a step while the source is busy. That is why moving registration off the thread leaves the busy numbers where they were.\n\nSo I would keep this change (the reap-race generation guard is worth having on its own), but not as the fix for #55179: that needs the per-step gating addressed.",
+            "createdAt": "2026-09-16T10:48:46Z",
+            "updatedAt": "2026-09-16T10:48:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-5696245596"
+          },
+          {
+            "author": {
+              "login": "Etelis"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-07T19:24:07Z",
+            "updatedAt": "2026-10-07T19:24:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045186671"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93394](https://buildkite.com/vllm/ci/builds/93394) for commit `f8c18ce0147b`.",
+            "createdAt": "2026-10-07T19:26:49Z",
+            "updatedAt": "2026-10-07T19:26:49Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045231666"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ @liranschour, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-10-07T19:27:57Z",
+            "updatedAt": "2026-10-07T19:27:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045249852"
+          },
+          {
+            "author": {
+              "login": "vllm-agent"
+            },
+            "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 1 test steps (1 jobs) instead of 62 (78 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 62 (78) | 1 (1) | 61 (77) | 0 (0) |\n| AMD mirrors | 54 (65) | 1 (1) | 53 (64) | 0 (0) |\n\n<details><summary>Selector would run (1)</summary>\n\n- `v1-kv-offload`\n</details>\n\n<details><summary>Would skip (today's rules run them) (61)</summary>\n\n- `ascend-npu-test`\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-test-other-cpu`\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `benchmarks-cli-test`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `cpu-multimodal-config`\n- `cpu-params-env-tokenizers-parser`\n- `cpu-reasoning-renderers`\n- `cpu-tool-parsers`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `kv-offload-large`\n- `kv-offload-medium`\n- `kv-offload-small`\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `metrics-tracing-2-gpus`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `multi-modal-processor-cpu` ×4\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `regression`\n- `rl-entrypoints-tests`\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-others-cpu`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (0)</summary>\n\nnone\n</details>\n\n<details><summary>AMD mirrors: would skip (53)</summary>\n\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `benchmarks-cli-test`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `kv-offload-large`\n- `kv-offload-medium`\n- `kv-offload-small`\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `metrics-tracing-2-gpus`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `platform-tests`\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `regression`\n- `rl-entrypoints-tests`\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>AMD mirrors: would add (0)</summary>\n\nnone\n</details>\n\n<sub>6 changed files · base `a33d46b471` · head `92330057da` · Python record: build 93039 at `1e5d0ea888` · kernel record: table f26d9f432c (build 94096), map f26d9f432c · not counted: 11 build steps, 5 A100 steps the generator no longer emits, 7 optional steps the selector would also run</sub>\n",
+            "createdAt": "2026-10-07T20:02:03Z",
+            "updatedAt": "2026-10-12T09:35:40Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045805864"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-08T11:00:56Z",
+            "updatedAt": "2026-10-08T11:00:56Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6058410873"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "❌ This PR is 14 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:6058410873 -->",
+            "createdAt": "2026-10-08T11:01:16Z",
+            "updatedAt": "2026-10-08T11:01:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6058416435"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-10T18:06:34Z",
+            "updatedAt": "2026-10-10T18:06:34Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6100588763"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94025](https://buildkite.com/vllm/ci/builds/94025) for commit `1128deede723`.",
+            "createdAt": "2026-10-10T18:06:54Z",
+            "updatedAt": "2026-10-10T18:06:54Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6100591559"
+          },
+          {
+            "author": {
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @liranschour.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-11T16:17:22Z",
+            "updatedAt": "2026-10-11T16:17:22Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6111049526"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-11T17:16:53Z",
+            "updatedAt": "2026-10-11T17:16:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6111602842"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94086](https://buildkite.com/vllm/ci/builds/94086) for commit `711707391fd1`.",
+            "createdAt": "2026-10-11T17:17:18Z",
+            "updatedAt": "2026-10-11T17:17:18Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6111606690"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-12T06:38:48Z",
+            "updatedAt": "2026-10-12T06:38:48Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119111092"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94130](https://buildkite.com/vllm/ci/builds/94130) for commit `8514e0f4a7a4`.",
+            "createdAt": "2026-10-12T06:40:00Z",
+            "updatedAt": "2026-10-12T06:40:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119124716"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-12T07:45:58Z",
+            "updatedAt": "2026-10-12T07:45:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119977324"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ CI is already running for this commit: https://buildkite.com/vllm/ci/builds/94130",
+            "createdAt": "2026-10-12T07:46:15Z",
+            "updatedAt": "2026-10-12T07:46:15Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119981117"
+          },
+          {
+            "author": {
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-12T09:16:06Z",
+            "updatedAt": "2026-10-12T09:16:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6121286993"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94160](https://buildkite.com/vllm/ci/builds/94160) for commit `92330057da49`.",
+            "createdAt": "2026-10-12T09:16:26Z",
+            "updatedAt": "2026-10-12T09:16:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6121292358"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWzbgkY=",
+          "hasNextPage": false
+        },
+        "totalCount": 18
+      },
+      "headRefOid": "92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "headRepository": {
+        "nameWithOwner": "liranschour/vllm"
+      },
+      "merged": false,
+      "number": 57139,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-01T08:38:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#pullrequestreview-5376904099"
+          },
+          {
+            "author": {
+              "login": "Etelis"
+            },
+            "body": "LGTM",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-10-07T19:22:15Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57139#pullrequestreview-5447229904"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wN1QxOToyMjoxNVq0MjAyNi0xMC0wN1QxOToyMjoxNVrPAAAAAUSuIdA=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "OPEN",
+      "title": "[KVConnector][P2P] Register peers off the scheduler thread",
+      "updatedAt": "2026-10-12T09:35:40Z",
+      "url": "https://github.com/vllm-project/vllm/pull/57139"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "a33d46b47193e3273dc38f980abbf55459f3c77f"
+    },
+    "body": "Addresses #55179.\n\n## Problem\n\n`P2PSession._on_connect` called `NixlTransport.add_remote_peer` inline before replying with `ConnectAckMsg`. Registration is `add_remote_agent` plus a `prep_xfer_dlist` over every block of the peer's region — 19,599 blocks per rank for the 64 GiB CPU tier in the reported deployment — so a cold handshake ran that work inside a scheduling iteration on **both** peers, and the lookup queued behind the acknowledgement waited for it.\n\n## Scope: registration only, not the per-step gating\n\nThe issue proposes two independent changes. This PR implements only the first, because the reported numbers point at registration as the dominant term.\n\nWithin one scheduler step, `TieringManager.on_schedule_end` runs `get_finished_jobs()` → `_poll_once()` (drain + dispatch) **before** `serve_external_requests(parent)`, so receive-and-answer collapse into a single tick. The busy source's critical path is therefore about four ticks: `ConnectMsg` → ack, `LookupMsg` → `LookupRespMsg`, `FetchMsg` → `write_blocks`, and NIXL completion → `TransferDoneMsg`. The destination was idle in the measurement, so its ticks are effectively free.\n\nThat gives `13.6 s ≈ 2·T_reg + 4·T_step`. At the issue's own stated ~1 s/step, per-step gating accounts for ~4 s, leaving ~9.6 s for two registrations. For gating alone to explain 13.6 s you would need ~3.4 s/step, which contradicts the same description. Per-step gating is real as a mechanism but is the minority term here, so it is deliberately left out of this PR and should be justified by its own measurement.\n\n## Change\n\n- `DataTransport.add_remote_peer_async` — new method whose default implementation runs `add_remote_peer` inline and returns an already-resolved future. Transports with cheap registration are unaffected and need no override.\n- `NixlTransport` overrides it with a single-worker `ThreadPoolExecutor`, mirroring the NIXL connector's `_handshake_initiation_executor`. `add_remote_peer` is split into `_build_peer_handles` (the expensive agent wireup plus per-block descriptors, run **unlocked** — holding a lock across it would stall the scheduler thread for exactly as long as the work being moved off it) and `_publish_peer` (the atomic install).\n- `P2PSession` starts the registration in `_on_connect` and sends `ConnectAckMsg` from `poll()` once the future resolves; a failed registration marks the connection dead so the manager reaps the session.\n\n### The acknowledgement is the safety barrier\n\n`ConnectAckMsg` is what clears the peer's `_send_ready` gate, so the peer cannot send a `FetchMsg` until it arrives. Gating the ack on registration completion preserves the invariant that **any peer permitted to fetch is a peer already registered here**, so `write_blocks` can never observe an unregistered peer as a result of this change. The wire protocol is unchanged.\n\n### Generation guard\n\nRegistrations carry a per-peer generation, bumped on every add and every remove. A worker that finishes building handles under a stale generation releases them instead of publishing. This closes the reap race: `_reap_dead_sessions` calls `session.close()` and then `_data.remove_remote_peer(pid)`, and without the guard a registration landing after that would leave a registered peer with no session plus leaked NIXL handles. A pending registration also counts as session pending work, so the engine keeps ticking until the acknowledgement goes out.\n\n### No `NIXL_THREAD_SYNC_STRICT`\n\nThe issue suggests opening the agent with `NIXL_THREAD_SYNC_STRICT` or `_RW`. That is not reachable through `nixl_agent_config`: the Python wrapper hard-codes `agent_config.syncMode`, selecting `STRICT` only when `enable_listen` is true, which would additionally start a listener thread and bind a port that this tier does not use.\n\nIt is also unnecessary. `NixlConnector` already runs `add_remote_agent`, `get_xfer_descs` and `prep_xfer_dlist` on its single-worker handshake executor concurrently with transfer submission on the main thread, with the default `syncMode=NONE`. This PR adopts the threading model vLLM already ships rather than introducing a new one, which also removes the need to measure STRICT's cost on the transfer path.\n\n## Why this does not duplicate an existing PR\n\nDraft #55962 covers this ground as part of a larger change that also services the control plane during model steps, and does so by adding a `poll_pending_work` hook to `KVConnectorBase_V1` plus changes to `EngineCore` and both executors.\n\nThis PR is materially different in approach and scope:\n\n- **No new connector API.** Nothing is added to `KVConnectorBase_V1`. The audit behind this is that only `ServerRole.serve_external_requests` and its four helpers need the `ParentManager` handle — the whole client role, the entire message-dispatch table, and all NIXL submit/poll/cancel work are already parent-free, and `on_lookup` already defers resolution to the existing `serve_external_requests` window. No fresh scheduler-thread window is required.\n- **Registration only.** It does not attempt the per-step gating change, for the reasons in the scope section above.\n- **Different files.** It touches none of `vllm/v1/engine/core.py`, `vllm/v1/executor/{abstract,uniproc_executor,multiproc_executor}.py`, `kv_connector/v1/base.py`, `multi_connector.py`, or `offloading_connector.py`.\n- **No STRICT sync mode**, per the section above.\n\nLanding this first also makes #55962's remaining half measurable on its own terms: with registration off the critical path, whatever delay is left on a busy source is the per-step gating component.\n\n## Tests\n\nRun from `venv/` (this checkout's working environment):\n\n```\npython -m pytest tests/v1/kv_offload/tiering/ -q\n  → 377 passed, 11 skipped\n  (baseline on the untouched tree: 371 passed, 11 skipped; +6 new tests)\n\npython -m pytest tests/v1/kv_offload/tiering/p2p/ -q\n  → 220 passed\n\npre-commit run --files <6 changed files>          → all hooks pass (incl. DCO sign-off)\npre-commit run mypy-3.12 --files <3 source files> --hook-stage manual → passed\n```\n\nNew tests, one behavior each:\n\n- `ConnectAckMsg` is withheld while registration is in flight, and sent once it resolves.\n- A pending registration counts as pending work — without this nothing drives the acknowledgement out.\n- A failed registration rejects the peer instead of acknowledging it.\n- A duplicate `ConnectMsg` mid-registration is a protocol error.\n- Registration provably runs off the caller thread.\n- A registration landing after `remove_remote_peer` is discarded and its handles released.\n\nThe session test fake gained a `defer_registration` mode so the acknowledgement gating is exercised deterministically rather than relying on thread timing.\n\n## Model evaluation\n\nNo eval was run, because this change cannot affect model output: it reorders when a control-plane acknowledgement is sent and moves NIXL registration to another thread. Which blocks are transferred, and their contents, are untouched, and the wire protocol is unchanged.\n\n**Performance validation is still outstanding.** The change targets a timing property that unit tests cannot measure, and no multi-pod deploy has been run yet. The measurement that validates it is TTFT on a busy source with a cold peer versus a warm peer: if cold-peer TTFT drops toward warm-peer, registration was the dominant cost. This PR stays in draft until that result is in.\n\n## AI assistance\n\nAI assistance (Claude Code) was used for the analysis, implementation and tests in this PR. The submitting human is reviewing every changed line and is running the hardware validation described above before marking it ready for review.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "liranschour/vllm"
+      },
+      "sha": "92330057da49c1ff08b1bbb04c806b970ed6fbc2"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/57139",
+    "merged": false,
+    "number": 57139,
+    "state": "open",
+    "title": "[KVConnector][P2P] Register peers off the scheduler thread",
+    "updated_at": "2026-10-12T09:35:40Z"
+  },
+  "files": [
+    {
+      "additions": 55,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/92330057da49c1ff08b1bbb04c806b970ed6fbc2/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_data_transport.py",
+      "changes": 55,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_data_transport.py?ref=92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "deletions": 0,
+      "filename": "tests/v1/kv_offload/tiering/p2p/test_data_transport.py",
+      "patch": "@@ -5,9 +5,11 @@\n from __future__ import annotations\n \n import ctypes\n+import threading\n from unittest.mock import MagicMock, patch\n \n import numpy as np\n+import pytest\n \n from vllm.v1.kv_offload.tiering.p2p.data.base import PollResult\n from vllm.v1.kv_offload.tiering.p2p.data.nixl import NixlTransport\n@@ -107,6 +109,59 @@ def test_get_agent_metadata(self):\n         transport = self._make_transport()\n         assert transport.get_agent_metadata() == b\"test-metadata\"\n \n+    def test_add_remote_peer_async_registers_off_the_caller_thread(self):\n+        \"\"\"The O(num_blocks) registration must not run on the caller thread.\n+\n+        This is the whole point of the async path: the scheduler thread\n+        hands the work off rather than paying prep_xfer_dlist inline.\n+        \"\"\"\n+        transport = self._make_transport()\n+        caller = threading.get_ident()\n+        worker_threads: list[int] = []\n+\n+        def record_thread(*args, **kwargs):\n+            worker_threads.append(threading.get_ident())\n+            return MagicMock(name=\"remote_dlist\")\n+\n+        transport._agent.prep_xfer_dlist.side_effect = record_thread\n+\n+        future = transport.add_remote_peer_async(\"peer:1\", b\"meta\", 0x1000, 8, 1024)\n+        future.result(timeout=5)\n+\n+        assert worker_threads and caller not in worker_threads\n+        assert transport.write_blocks(\"peer:1\", [0], [1]) is not None\n+\n+    def test_registration_landing_after_remove_is_discarded(self):\n+        \"\"\"A late registration must not revive a peer that was reaped.\n+\n+        The session is torn down and remove_remote_peer runs while the\n+        worker is still building descriptors; publishing afterwards would\n+        leave a registered peer with no session and leak its handles.\n+        \"\"\"\n+        transport = self._make_transport()\n+        building = threading.Event()\n+        release = threading.Event()\n+\n+        def blocking_prep(*args, **kwargs):\n+            building.set()\n+            release.wait(timeout=5)\n+            return MagicMock(name=\"remote_dlist\")\n+\n+        transport._agent.prep_xfer_dlist.side_effect = blocking_prep\n+\n+        future = transport.add_remote_peer_async(\"peer:1\", b\"meta\", 0x1000, 8, 1024)\n+        assert building.wait(timeout=5)\n+        transport.remove_remote_peer(\"peer:1\")\n+        release.set()\n+\n+        with pytest.raises(RuntimeError, match=\"superseded\"):\n+            future.result(timeout=5)\n+        assert \"peer:1\" not in transport._remote_dlists\n+        assert transport.write_blocks(\"peer:1\", [0], [1]) is None\n+        # The handles the worker built were released rather than leaked.\n+        assert transport._agent.release_dlist_handle.called\n+        assert transport._agent.remove_remote_agent.called\n+\n     def test_write_blocks_returns_none_for_unknown_peer(self):\n         \"\"\"write_blocks returns None if peer not registered.\"\"\"\n         transport = self._make_transport()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/92330057da49c1ff08b1bbb04c806b970ed6fbc2/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_data_transport.py",
+      "sha": "60830a34bb38a11c7d41216e0a82928e1981b965",
+      "status": "modified"
+    },
+    {
+      "additions": 14,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/92330057da49c1ff08b1bbb04c806b970ed6fbc2/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_manager.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_manager.py?ref=92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "deletions": 0,
+      "filename": "tests/v1/kv_offload/tiering/p2p/test_manager.py",
+      "patch": "@@ -10,6 +10,7 @@\n \n import time\n import uuid\n+from concurrent.futures import Future\n from types import SimpleNamespace\n \n import numpy as np\n@@ -1111,6 +1112,14 @@ def add_remote_peer(\n             \"block_len\": block_len,\n         }\n \n+    def add_remote_peer_async(\n+        self, peer_id, agent_metadata, base_addr, num_blocks, block_len\n+    ):\n+        future: Future[None] = Future()\n+        self.add_remote_peer(peer_id, agent_metadata, base_addr, num_blocks, block_len)\n+        future.set_result(None)\n+        return future\n+\n     def remove_remote_peer(self, peer_id: str) -> None:\n         self._remote_peers.pop(peer_id, None)\n \n@@ -1368,6 +1377,11 @@ def get_agent_metadata(self):\n             def add_remote_peer(self, *args, **kwargs):\n                 pass\n \n+            def add_remote_peer_async(self, *args, **kwargs):\n+                future: Future[None] = Future()\n+                future.set_result(None)\n+                return future\n+\n         mgr = _make_manager()\n         mgr._data = FakeData()\n         peer_id = \"10.0.0.1:8000\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/92330057da49c1ff08b1bbb04c806b970ed6fbc2/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_manager.py",
+      "sha": "0ca2735005475719cdcd35abb1511b721da5b61b",
+      "status": "modified"
+    },
+    {
+      "additions": 101,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/92330057da49c1ff08b1bbb04c806b970ed6fbc2/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_sessions.py",
+      "changes": 102,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_sessions.py?ref=92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "deletions": 1,
+      "filename": "tests/v1/kv_offload/tiering/p2p/test_sessions.py",
+      "patch": "@@ -13,7 +13,8 @@\n from __future__ import annotations\n \n import time\n-from collections.abc import Sequence\n+from collections.abc import Callable, Sequence\n+from concurrent.futures import Future\n \n import numpy as np\n import pytest\n@@ -74,7 +75,13 @@ def __init__(\n         num_blocks: int = 16,\n         block_len: int = 4096,\n         config_fingerprint: str = \"\",\n+        defer_registration: bool = False,\n     ) -> None:\n+        # When True, add_remote_peer_async parks the registration until\n+        # complete_registrations() resolves it, standing in for the real\n+        # transport's worker thread.\n+        self.defer_registration = defer_registration\n+        self._deferred: list[tuple[Future[None], Callable[[], None]]] = []\n         self._base_addr = base_addr\n         self._num_blocks = num_blocks\n         self._block_len = block_len\n@@ -116,6 +123,38 @@ def add_remote_peer(\n             \"block_len\": block_len,\n         }\n \n+    def add_remote_peer_async(\n+        self, peer_id, agent_metadata, base_addr, num_blocks, block_len\n+    ) -> Future[None]:\n+        future: Future[None] = Future()\n+\n+        def apply() -> None:\n+            self.add_remote_peer(\n+                peer_id, agent_metadata, base_addr, num_blocks, block_len\n+            )\n+\n+        if self.defer_registration:\n+            self._deferred.append((future, apply))\n+            return future\n+        apply()\n+        future.set_result(None)\n+        return future\n+\n+    def complete_registrations(self, exc: Exception | None = None) -> int:\n+        \"\"\"Resolve parked registrations the way the worker thread would.\n+\n+        Returns the number resolved so callers can assert one was actually\n+        in flight rather than silently testing nothing.\n+        \"\"\"\n+        deferred, self._deferred = self._deferred, []\n+        for future, apply in deferred:\n+            if exc is not None:\n+                future.set_exception(exc)\n+            else:\n+                apply()\n+                future.set_result(None)\n+        return len(deferred)\n+\n     def remove_remote_peer(self, peer_id: str) -> None:\n         self._remote_peers.pop(peer_id, None)\n \n@@ -390,6 +429,67 @@ def test_peer_connect_triggers_add_remote_and_ack(self):\n         ack = next(m for m in conn._sent if m[TYPE_KEY] == ConnectAckMsg.TYPE)\n         assert ack[ConnectAckMsg.PEER_ID] == \"local:9000\"\n \n+    def test_ack_withheld_until_registration_completes(self):\n+        \"\"\"ConnectAck must not precede registration.\n+\n+        The peer treats ConnectAck as permission to send, so acking while\n+        registration is still in flight would let a FetchMsg arrive for\n+        blocks this side cannot yet write to.\n+        \"\"\"\n+        transport = FakeDataTransport(defer_registration=True)\n+        session, conn, _ = _make_session(transport=transport)\n+        conn.enqueue(_peer_connect_msg())\n+        session.poll()\n+\n+        assert \"peer:8000\" not in transport._remote_peers\n+        assert not any(m[TYPE_KEY] == ConnectAckMsg.TYPE for m in conn._sent)\n+\n+        assert transport.complete_registrations() == 1\n+        session.poll()\n+\n+        assert \"peer:8000\" in transport._remote_peers\n+        ack = next(m for m in conn._sent if m[TYPE_KEY] == ConnectAckMsg.TYPE)\n+        assert ack[ConnectAckMsg.PEER_ID] == \"local:9000\"\n+\n+    def test_pending_registration_is_pending_work(self):\n+        \"\"\"An in-flight registration keeps the engine ticking.\n+\n+        Nothing else drives poll(), so if the session reported idle the\n+        ack would never be sent.\n+        \"\"\"\n+        transport = FakeDataTransport(defer_registration=True)\n+        session, conn, _ = _make_session(transport=transport)\n+        conn.enqueue(_peer_connect_msg())\n+        session.poll()\n+        assert session.has_pending_work\n+\n+        transport.complete_registrations()\n+        session.poll()\n+        assert not session.has_pending_work\n+\n+    def test_failed_registration_rejects_peer(self):\n+        \"\"\"A registration that fails kills the connection instead of acking.\"\"\"\n+        transport = FakeDataTransport(defer_registration=True)\n+        session, conn, _ = _make_session(transport=transport)\n+        conn.enqueue(_peer_connect_msg())\n+        session.poll()\n+\n+        transport.complete_registrations(exc=RuntimeError(\"nixl exploded\"))\n+        session.poll()\n+\n+        assert not conn.alive\n+        assert not any(m[TYPE_KEY] == ConnectAckMsg.TYPE for m in conn._sent)\n+\n+    def test_duplicate_connect_during_registration_is_rejected(self):\n+        \"\"\"A second ConnectMsg mid-registration is a protocol violation.\"\"\"\n+        transport = FakeDataTransport(defer_registration=True)\n+        session, conn, _ = _make_session(transport=transport)\n+        conn.enqueue(_peer_connect_msg())\n+        session.poll()\n+        conn.enqueue(_peer_connect_msg())\n+        session.poll()\n+        assert not conn.alive\n+\n     def test_connect_ack_makes_session_ready(self):\n         \"\"\"Session.ready becomes True after ConnectAckMsg.\"\"\"\n         session, conn, _ = _make_session()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/92330057da49c1ff08b1bbb04c806b970ed6fbc2/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_sessions.py",
+      "sha": "0d756cbf42650e018a7bc354907d2b299ae12438",
+      "status": "modified"
+    },
+    {
+      "additions": 48,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/92330057da49c1ff08b1bbb04c806b970ed6fbc2/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py",
+      "changes": 48,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py?ref=92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "deletions": 0,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/data/base.py",
+      "patch": "@@ -76,6 +76,7 @@\n import json\n from abc import ABC, abstractmethod\n from collections.abc import Iterable, Sequence\n+from concurrent.futures import Future\n from typing import Literal, NamedTuple\n \n CancelMode = Literal[\"immediate\", \"wait\"]\n@@ -179,6 +180,53 @@ def add_remote_peer(\n         \"\"\"\n         ...\n \n+    def add_remote_peer_async(\n+        self,\n+        peer_id: str,\n+        agent_metadata: bytes,\n+        base_addr: int,\n+        num_blocks: int,\n+        block_len: int,\n+    ) -> Future[None]:\n+        \"\"\"Register a remote peer without blocking the caller.\n+\n+        Registration is O(num_blocks) and can take seconds for a large\n+        secondary tier, so the session starts it here and sends\n+        ``ConnectAckMsg`` only once the returned future resolves. The\n+        acknowledgement is therefore the peer's guarantee that this side\n+        is ready to serve, and no ``write_blocks`` can arrive before it.\n+\n+        The default implementation runs ``add_remote_peer`` inline and\n+        returns an already-resolved future; transports whose registration\n+        is cheap need not override it.\n+\n+        Args:\n+            peer_id: Unique identifier for the remote peer.\n+            agent_metadata: Opaque bytes from the peer's get_agent_metadata().\n+            base_addr: Base address of the peer's block memory region.\n+            num_blocks: Number of blocks in the peer's region.\n+            block_len: Size of each block (must match local block_len).\n+\n+        Returns:\n+            A future resolving to None on success. A failed future means\n+            the peer must be rejected rather than acknowledged.\n+\n+        \"\"\"\n+        future: Future[None] = Future()\n+        try:\n+            self.add_remote_peer(\n+                peer_id,\n+                agent_metadata=agent_metadata,\n+                base_addr=base_addr,\n+                num_blocks=num_blocks,\n+                block_len=block_len,\n+            )\n+        except Exception as exc:\n+            future.set_exception(exc)\n+        else:\n+            future.set_result(None)\n+        return future\n+\n     @abstractmethod\n     def remove_remote_peer(self, peer_id: str) -> None:\n         \"\"\"Unregister a remote peer and release associated resources.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/92330057da49c1ff08b1bbb04c806b970ed6fbc2/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py",
+      "sha": "574ba8955d7e51807251936869f0281833a9694b",
+      "status": "modified"
+    },
+    {
+      "additions": 120,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/92330057da49c1ff08b1bbb04c806b970ed6fbc2/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py",
+      "changes": 128,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py?ref=92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "deletions": 8,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "patch": "@@ -5,7 +5,9 @@\n from __future__ import annotations\n \n import itertools\n+import threading\n from collections.abc import Iterable\n+from concurrent.futures import Future, ThreadPoolExecutor\n from typing import Any, NamedTuple\n \n import numpy as np\n@@ -66,6 +68,23 @@ def __init__(\n         # transfer_id → _Inflight(peer_id, handle).\n         self._inflight: dict[int, _Inflight] = {}\n         self._next_id = itertools.count()\n+        # Registration is O(num_blocks) NIXL work — add_remote_agent plus a\n+        # prep_xfer_dlist over every block of the peer's region — so it runs\n+        # off the scheduler thread, mirroring the NIXL connector's\n+        # _handshake_initiation_executor. One worker only: NIXL is not\n+        # guaranteed to be thread-safe, so registrations stay serialized\n+        # against each other.\n+        self._reg_executor = ThreadPoolExecutor(\n+            max_workers=1, thread_name_prefix=\"vllm-p2p-nixl-reg\"\n+        )\n+        # peer_id → registration generation, bumped on every add and remove.\n+        # A worker that finishes building handles under a stale generation\n+        # releases them instead of publishing, so a late completion cannot\n+        # revive a peer that was reaped or superseded meanwhile.\n+        self._peer_gen: dict[str, int] = {}\n+        # Guards _peer_gen together with _peer_nixl_names/_remote_dlists so\n+        # the generation check and the publish are one atomic step.\n+        self._peer_lock = threading.Lock()\n \n         self._init(view)\n \n@@ -126,23 +145,113 @@ def add_remote_peer(\n         num_blocks: int,\n         block_len: int,\n     ) -> None:\n+        gen = self._begin_registration(peer_id)\n+        nixl_name, remote_dlist = self._build_peer_handles(\n+            agent_metadata, base_addr, num_blocks, block_len\n+        )\n+        self._publish_peer(peer_id, gen, nixl_name, remote_dlist)\n+\n+    def add_remote_peer_async(\n+        self,\n+        peer_id: str,\n+        agent_metadata: bytes,\n+        base_addr: int,\n+        num_blocks: int,\n+        block_len: int,\n+    ) -> Future[None]:\n+        gen = self._begin_registration(peer_id)\n+\n+        def register() -> None:\n+            nixl_name, remote_dlist = self._build_peer_handles(\n+                agent_metadata, base_addr, num_blocks, block_len\n+            )\n+            if not self._publish_peer(peer_id, gen, nixl_name, remote_dlist):\n+                raise RuntimeError(\n+                    f\"registration for peer {peer_id} was superseded \"\n+                    \"(peer removed or re-registered while registering)\"\n+                )\n+\n+        return self._reg_executor.submit(register)\n+\n+    def remove_remote_peer(self, peer_id: str) -> None:\n+        with self._peer_lock:\n+            # Invalidate any registration still being built for this peer so\n+            # its worker releases the handles instead of publishing them.\n+            self._peer_gen[peer_id] = self._peer_gen.get(peer_id, 0) + 1\n+            nixl_name = self._peer_nixl_names.pop(peer_id, None)\n+            dlist = self._remote_dlists.pop(peer_id, None)\n+        if self._agent is not None:\n+            if dlist is not None:\n+                self._agent.release_dlist_handle(dlist)\n+            if nixl_name:\n+                self._agent.remove_remote_agent(nixl_name)\n+\n+    def _begin_registration(self, peer_id: str) -> int:\n+        \"\"\"Claim the next registration generation for *peer_id*.\"\"\"\n+        with self._peer_lock:\n+            gen = self._peer_gen.get(peer_id, 0) + 1\n+            self._peer_gen[peer_id] = gen\n+            return gen\n+\n+    def _build_peer_handles(\n+        self,\n+        agent_metadata: bytes,\n+        base_addr: int,\n+        num_blocks: int,\n+        block_len: int,\n+    ) -> tuple[str, Any]:\n+        \"\"\"The expensive half: agent wireup plus one descriptor per block.\n+\n+        Touches no shared state, so it runs unlocked — holding the peer\n+        lock across it would stall the scheduler thread for exactly as\n+        long as the registration it is meant to move off that thread.\n+        \"\"\"\n         nixl_name = self._agent.add_remote_agent(agent_metadata)\n         block_descs = [\n             (base_addr + i * block_len, block_len, 0) for i in range(num_blocks)\n         ]\n         xfer_dlist = self._agent.get_xfer_descs(block_descs, mem_type=\"DRAM\")\n         remote_dlist = self._agent.prep_xfer_dlist(nixl_name, xfer_dlist)\n-        self._peer_nixl_names[peer_id] = nixl_name\n-        self._remote_dlists[peer_id] = remote_dlist\n+        return nixl_name, remote_dlist\n \n-    def remove_remote_peer(self, peer_id: str) -> None:\n-        nixl_name = self._peer_nixl_names.pop(peer_id, None)\n-        dlist = self._remote_dlists.pop(peer_id, None)\n+    def _publish_peer(\n+        self,\n+        peer_id: str,\n+        gen: int,\n+        nixl_name: str,\n+        remote_dlist: Any,\n+    ) -> bool:\n+        \"\"\"Install freshly built handles, unless *gen* is stale.\n+\n+        Returns False when the peer was removed or re-registered while the\n+        handles were being built; the handles are released here since\n+        nothing else ever saw them.\n+        \"\"\"\n+        with self._peer_lock:\n+            fresh = self._peer_gen.get(peer_id) == gen\n+            if fresh:\n+                self._peer_nixl_names[peer_id] = nixl_name\n+                self._remote_dlists[peer_id] = remote_dlist\n+        if fresh:\n+            return True\n+        logger.info(\n+            \"NixlTransport %s: discarding superseded registration for peer=%s\",\n+            self._agent_name,\n+            peer_id,\n+        )\n         if self._agent is not None:\n-            if dlist is not None:\n-                self._agent.release_dlist_handle(dlist)\n-            if nixl_name:\n+            try:\n+                self._agent.release_dlist_handle(remote_dlist)\n                 self._agent.remove_remote_agent(nixl_name)\n+            except Exception as exc:\n+                logger.warning(\n+                    \"NixlTransport %s: releasing superseded registration \"\n+                    \"for peer=%s failed: %s\",\n+                    self._agent_name,\n+                    peer_id,\n+                    exc,\n+                )\n+        return False\n \n     # ------------------------------------------------------------------\n     # Transfer submission and polling\n@@ -286,6 +395,9 @@ def cancel(\n     # ------------------------------------------------------------------\n \n     def close(self) -> None:\n+        # Stop accepting registrations and let any in-flight one finish\n+        # before the agent goes away underneath it.\n+        self._reg_executor.shutdown(wait=True)\n         if self._agent is None:\n             return\n         self._release_handles([entry.handle for entry in self._inflight.values()])",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/92330057da49c1ff08b1bbb04c806b970ed6fbc2/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py",
+      "sha": "c44069ceecb4d7f39185cfa27eb19a0eb7f3ca79",
+      "status": "modified"
+    },
+    {
+      "additions": 78,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/92330057da49c1ff08b1bbb04c806b970ed6fbc2/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fsession.py",
+      "changes": 90,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fsession.py?ref=92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "deletions": 12,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/session/session.py",
+      "patch": "@@ -11,15 +11,19 @@\n \n Wire protocol is unchanged. Both sides advertise their NIXL metadata\n via ConnectMsg when their session is connected; the peer's ConnectMsg\n-triggers transport.add_remote_peer; ConnectAckMsg confirms the peer\n-received our ConnectMsg, after which queued outgoing messages are flushed.\n+starts transport.add_remote_peer_async off the scheduler thread, and\n+ConnectAckMsg is sent only once that registration lands. ConnectAckMsg\n+confirms the peer received our ConnectMsg, after which queued outgoing\n+messages are flushed — so a peer that may send is a peer we have already\n+registered.\n \"\"\"\n \n from __future__ import annotations\n \n import contextlib\n import time\n from collections.abc import Sequence\n+from concurrent.futures import Future\n from typing import TYPE_CHECKING, NamedTuple\n \n import vllm.envs as envs\n@@ -100,9 +104,11 @@ class P2PSession:\n         the decoder connects).\n       - Constructor with conn != None ⇒ connected. Sends our own ConnectMsg\n         immediately; the peer's ConnectMsg arrives in poll() and is\n-        dispatched to _on_connect (which calls transport.add_remote_peer\n-        and replies with ConnectAckMsg). Outgoing sends are queued until\n-        ConnectAckMsg confirms our metadata reached the peer.\n+        dispatched to _on_connect, which starts\n+        transport.add_remote_peer_async. A later poll() sees the\n+        registration land and replies with ConnectAckMsg; a failed\n+        registration marks the connection dead instead. Outgoing sends are\n+        queued until ConnectAckMsg confirms our metadata reached the peer.\n       - attach_connection(conn) on a pending session ⇒ same as above,\n         starting from pending.\n     \"\"\"\n@@ -140,6 +146,13 @@ def __init__(\n         # submit_store batches parked before the binding existed.\n         self._new_fetch_ids: list[str] = []\n \n+        # In-flight peer registration started by _on_connect. Registration\n+        # is O(num_blocks) and runs off this thread, so ConnectAckMsg is\n+        # held back until the future resolves — the ack is what tells the\n+        # peer it may start sending, and nothing may be served before the\n+        # peer's blocks are registered here.\n+        self._pending_registration: Future[None] | None = None\n+\n         self._client = ClientRole(peer_id=peer_id, send=self._send)\n         self._server = ServerRole(\n             peer_id=peer_id,\n@@ -172,7 +185,11 @@ def ready(self) -> bool:\n     @property\n     def has_pending_work(self) -> bool:\n         \"\"\"True while inbound loads or outbound transfers are outstanding.\"\"\"\n-        return self._client.has_active_loads or self._server.has_inflight_transfers\n+        return (\n+            self._pending_registration is not None\n+            or self._client.has_active_loads\n+            or self._server.has_inflight_transfers\n+        )\n \n     @property\n     def last_activity_at(self) -> float:\n@@ -278,9 +295,21 @@ def poll(self) -> SessionPollResult:\n         for msg in messages:\n             self._on_message(msg)\n \n+        # After dispatch: a ConnectMsg handled just above may already have a\n+        # resolved registration (transports that register inline ack in the\n+        # same tick), and a registration started on an earlier tick may have\n+        # landed while the engine was busy elsewhere. This runs before the\n+        # handshake deadline below so a registration that just resolved gets\n+        # its ConnectAckMsg out rather than being judged as timed out, and so\n+        # a failed registration's mark_dead() short-circuits that check.\n+        self._poll_registration()\n+\n         # Handshake deadline: a peer that never completes the handshake\n         # is stuck in connected-but-not-ready state. Mark it dead so the\n         # manager reaps it instead of accumulating sockets indefinitely.\n+        # Note this also covers the peer registering *our* region before it\n+        # acks, so the deadline must exceed remote registration time; the\n+        # 30s default leaves ample room for the descriptor build.\n         if (\n             not self._send_ready\n             and self._conn.alive\n@@ -320,6 +349,14 @@ def close(self) -> SessionCloseResult:\n             ``parent.on_request_finished`` (the manager flushes these on\n             its next ``serve_external_requests``).\n         \"\"\"\n+        # Abandon any in-flight registration: nothing will ack this peer\n+        # now. The manager's remove_remote_peer bumps the transport's\n+        # generation for this peer, so a worker already past cancellation\n+        # releases its handles instead of publishing them.\n+        if self._pending_registration is not None:\n+            self._pending_registration.cancel()\n+            self._pending_registration = None\n+\n         client_result = self._client.close()\n         failed_stores, failed_serves = self._server.close()\n \n@@ -470,10 +507,11 @@ def _on_connect(self, msg: dict) -> None:\n         # Validation failures here mean an incompatible or malicious peer.\n         # Mark the connection dead so the manager reaps the session;\n         # don't call add_remote_peer or send connect_ack.\n-        if self._send_ready:\n-            # We've already received connect_ack, so the handshake is\n-            # complete. A second connect from the peer is a protocol\n-            # violation — re-registering would corrupt transport state.\n+        if self._send_ready or self._pending_registration is not None:\n+            # Either the handshake completed (we hold the peer's ack) or a\n+            # registration for this peer is already in flight. A second\n+            # connect either way is a protocol violation — re-registering\n+            # would corrupt transport state.\n             self._protocol_error(\"duplicate connect after handshake\")\n             return\n         try:\n@@ -498,7 +536,7 @@ def _on_connect(self, msg: dict) -> None:\n                     f\"local={self._local_hash_seed!r}. Ensure PYTHONHASHSEED \"\n                     \"(if set) matches on all P2P peers.\"\n                 )\n-            self._transport.add_remote_peer(\n+            registration = self._transport.add_remote_peer_async(\n                 self.peer_id,\n                 agent_metadata=msg[ConnectMsg.AGENT_METADATA],\n                 base_addr=msg[ConnectMsg.BASE_ADDR],\n@@ -511,7 +549,35 @@ def _on_connect(self, msg: dict) -> None:\n                 self._conn.mark_dead()\n             return\n \n-        if self._conn is not None:\n+        # ConnectAckMsg is deferred to _poll_registration once the\n+        # registration lands; sending it now would let the peer fetch\n+        # against blocks this side has not registered yet.\n+        self._pending_registration = registration\n+\n+    def _poll_registration(self) -> None:\n+        \"\"\"Ack or reject the peer once its registration resolves.\n+\n+        Called from poll() after message dispatch. A successful\n+        registration releases ConnectAckMsg — the peer treats that as\n+        permission to send, so it must not go out earlier. A failed one\n+        marks the connection dead so the manager reaps the session.\n+        \"\"\"\n+        registration = self._pending_registration\n+        if registration is None or not registration.done():\n+            return\n+        self._pending_registration = None\n+        try:\n+            registration.result()\n+        except Exception as exc:\n+            logger.error(\n+                \"P2PSession %s: peer registration failed, rejecting peer: %s\",\n+                self.peer_id,\n+                exc,\n+            )\n+            if self._conn is not None:\n+                self._conn.mark_dead()\n+            return\n+        if self._conn is not None and self._conn.alive:\n             self._conn.send(\n                 {\n                     TYPE_KEY: ConnectAckMsg.TYPE,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/92330057da49c1ff08b1bbb04c806b970ed6fbc2/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fsession.py",
+      "sha": "6d3d99003469c3ccebd44ca672fff79a166a5941",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "I ran this PR on the same cell and case chain I used for #55962, to check whether registration alone covers #55179.\n\nSetup: GLM-5.2-FP8, two prefill pods (DP8/TP1, 8xH200 each) and a decode pair, `MultiConnector(NixlConnector, OffloadingConnector)` with a 64 GiB CPU tier per rank and the P2P secondary tier, NIXL 1.4.1. Image = my `6f91edf9` hotfix stack plus a clean backport of this PR at `7b077f36a`, nothing else. The metric is the destination's `kv_offload_lookup_async_delay_seconds`: time from the first deferred lookup until the scheduler observes a resolved result. The busy cases load the source rank with three 115K-token prefills before the pull. One boot, n=1 per case.\n\n| case | baseline (no patch) | #55962 as first submitted (async registration active, wait callback inert) | this PR | #55962 + `c5bfb39d3` (wait callback active) |\n|---|---|---|---|---|\n| first pull, cold destination | 10.5-10.7 s | 10.63 s | 10.56 s | 10.74 s |\n| idle-warm 1 | 0.63 s | 0.63 s | 0.58 s | 0.57 s |\n| idle-warm 2 | 0.94 s | 0.94 s | 0.59 s | 0.91 s |\n| busy-warm 1 | 2.46 s | 2.47 s | 1.96 s | 0.65 s |\n| busy-warm 2 | 2.88 s | 2.05 s | 2.17 s | 0.60 s |\n| busy-cold | 0.99-3.19 s | 3.19 s | 3.69 s | 0.88 s |\n\nThe busy rows stay in the baseline band with this PR, the same as the registration-only #55962 arm, and drop to 0.6-0.9 s only once the control plane is serviced during the model wait. Idle rows are the same on every tree.\n\nOn the model in the description: I measured registration directly with trace stamps on both peers in an earlier round, and `add_remote_agent` plus `prep_xfer_dlist` for 19,599 blocks took 14-40 ms per side, not seconds. The 13.6 s in the issue is the cold first pull, and that turned out to be the destination rank's first `execute_dummy_batch()` compiling kernels (#57133); it is the same ~10.5 s on every tree here, this PR included, and no control-plane change can remove it. What #55179's busy stall is made of, per the same trace, is step waits on the source: the `LookupMsg` sits in the server queue until the next step (0.55-0.61 s), the `FetchMsg` is dispatched at the next step (0.45-0.50 s), and each handshake hop costs a step while the source is busy. That is why moving registration off the thread leaves the busy numbers where they were.\n\nSo I would keep this change (the reap-race generation guard is worth having on its own), but not as the fix for #55179: that needs the per-step gating addressed.",
+      "created_at": "2026-09-16T10:48:46Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-5696245596",
+      "updated_at": "2026-09-16T10:48:46Z",
+      "user": {
+        "login": "nilig"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-07T19:24:07Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045186671",
+      "updated_at": "2026-10-07T19:24:07Z",
+      "user": {
+        "login": "Etelis"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93394](https://buildkite.com/vllm/ci/builds/93394) for commit `f8c18ce0147b`.",
+      "created_at": "2026-10-07T19:26:49Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045231666",
+      "updated_at": "2026-10-07T19:26:49Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "✅ @liranschour, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-10-07T19:27:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045249852",
+      "updated_at": "2026-10-07T19:27:57Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 1 test steps (1 jobs) instead of 62 (78 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 62 (78) | 1 (1) | 61 (77) | 0 (0) |\n| AMD mirrors | 54 (65) | 1 (1) | 53 (64) | 0 (0) |\n\n<details><summary>Selector would run (1)</summary>\n\n- `v1-kv-offload`\n</details>\n\n<details><summary>Would skip (today's rules run them) (61)</summary>\n\n- `ascend-npu-test`\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-test-other-cpu`\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `benchmarks-cli-test`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `cpu-multimodal-config`\n- `cpu-params-env-tokenizers-parser`\n- `cpu-reasoning-renderers`\n- `cpu-tool-parsers`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `kv-offload-large`\n- `kv-offload-medium`\n- `kv-offload-small`\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `metrics-tracing-2-gpus`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `multi-modal-processor-cpu` ×4\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `regression`\n- `rl-entrypoints-tests`\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-others-cpu`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (0)</summary>\n\nnone\n</details>\n\n<details><summary>AMD mirrors: would skip (53)</summary>\n\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `benchmarks-cli-test`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `kv-offload-large`\n- `kv-offload-medium`\n- `kv-offload-small`\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `metrics-tracing-2-gpus`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `platform-tests`\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `regression`\n- `rl-entrypoints-tests`\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>AMD mirrors: would add (0)</summary>\n\nnone\n</details>\n\n<sub>6 changed files · base `a33d46b471` · head `92330057da` · Python record: build 93039 at `1e5d0ea888` · kernel record: table f26d9f432c (build 94096), map f26d9f432c · not counted: 11 build steps, 5 A100 steps the generator no longer emits, 7 optional steps the selector would also run</sub>\n",
+      "created_at": "2026-10-07T20:02:03Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6045805864",
+      "updated_at": "2026-10-12T09:35:40Z",
+      "user": {
+        "login": "vllm-agent"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-08T11:00:56Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6058410873",
+      "updated_at": "2026-10-08T11:00:56Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "❌ This PR is 14 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:6058410873 -->",
+      "created_at": "2026-10-08T11:01:16Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6058416435",
+      "updated_at": "2026-10-08T11:01:16Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-10T18:06:34Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6100588763",
+      "updated_at": "2026-10-10T18:06:34Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94025](https://buildkite.com/vllm/ci/builds/94025) for commit `1128deede723`.",
+      "created_at": "2026-10-10T18:06:54Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6100591559",
+      "updated_at": "2026-10-10T18:06:54Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @liranschour.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-11T16:17:22Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6111049526",
+      "updated_at": "2026-10-11T16:17:22Z",
+      "user": {
+        "login": "mergify"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-11T17:16:53Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6111602842",
+      "updated_at": "2026-10-11T17:16:53Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94086](https://buildkite.com/vllm/ci/builds/94086) for commit `711707391fd1`.",
+      "created_at": "2026-10-11T17:17:18Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6111606690",
+      "updated_at": "2026-10-11T17:17:18Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-12T06:38:48Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119111092",
+      "updated_at": "2026-10-12T06:38:48Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94130](https://buildkite.com/vllm/ci/builds/94130) for commit `8514e0f4a7a4`.",
+      "created_at": "2026-10-12T06:40:00Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119124716",
+      "updated_at": "2026-10-12T06:40:00Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-12T07:45:58Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119977324",
+      "updated_at": "2026-10-12T07:45:58Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ CI is already running for this commit: https://buildkite.com/vllm/ci/builds/94130",
+      "created_at": "2026-10-12T07:46:15Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6119981117",
+      "updated_at": "2026-10-12T07:46:15Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-12T09:16:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6121286993",
+      "updated_at": "2026-10-12T09:16:06Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94160](https://buildkite.com/vllm/ci/builds/94160) for commit `92330057da49`.",
+      "created_at": "2026-10-12T09:16:26Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#issuecomment-6121292358",
+      "updated_at": "2026-10-12T09:16:26Z",
+      "user": {
+        "login": "github-actions"
+      }
+    }
+  ],
+  "number": 57139,
+  "refs": {
+    "base": {
+      "commit": "a33d46b47193e3273dc38f980abbf55459f3c77f",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "92330057da49c1ff08b1bbb04c806b970ed6fbc2",
+      "repository": "liranschour/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#pullrequestreview-5376904099",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-01T08:38:26Z",
+      "user": {
+        "login": "claude"
+      }
+    },
+    {
+      "body": "LGTM",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57139#pullrequestreview-5447229904",
+      "state": "APPROVED",
+      "submitted_at": "2026-10-07T19:22:15Z",
+      "user": {
+        "login": "Etelis"
+      }
+    }
+  ]
+}

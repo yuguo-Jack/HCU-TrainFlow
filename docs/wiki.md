@@ -70,9 +70,9 @@ hcu-trainflow wiki-pr NVIDIA/Megatron-LM 7897 --retain-project /path/to/HCU-Trai
 
 工具验证仓库公开性，拒绝将私有仓内容写入公共 Wiki。生成来源页被手改后拒绝覆盖；解释写到独立专题或案例。404、迁移和被删除 fork 都是访问缺口，不能推断未实现。
 
-### TorchTitan 官方内容
+### 按工程与机制定位内容
 
-[TorchTitan Wiki](../knowledge/official-torchtitan-wiki/overview.md)按工程目录、Python recipe、编译运行测试、训练/数值、并行显存、编译通信、MoE/量化、profiling、恢复与 TitanRL 组织；原文、PR 与固定源码同时可查。使用 `--engine torchtitan` 可定向检索，更新来源 ID 为 `pytorch-torchtitan`。仓库由 `knowledge/sources.json` 动态注册，不需要新增硬编码搜索引擎或安装 TorchTitan 才能查询。未收录的 PR 仍走线上搜索，release/roadmap 由 Agent 沿官方入口继续查证；原文状态不代表内容或 HCU 已验证。
+[覆盖导航](../knowledge/COVERAGE.md)列出全部工程的统一内容维度和机制专题，[参考选择表](optimization-reference-map.md)按并行、显存、SFT、RL、训推协同与底层算子组织联查。先跨库搜索，再用 `--engine megatron`、`deepspeed`、`torchtitan`、`swift`、`verl` 等缩小范围。engine 是阅读标签，source ID 是 `sources.json` 中的更新身份，二者不要混用；不需要安装这些训练引擎才能查询其 Wiki。未收录的 PR 继续在线检索，release/roadmap 沿官方入口查证；原文状态不代表内容或 HCU 已验证。
 
 ## 更新闭环
 
@@ -81,6 +81,8 @@ hcu-trainflow wiki-update PROJECT nvidia-megatron-lm --max-documents 40 --max-pr
 ```
 
 依次做完整目录检查、文档增量采集、PR/讨论更新、登记源码和关联作者页/工作流检查。web 来源走登记官网抓取。局部 Wiki 可以按问题、里程碑和版本漂移主动更新；不触发 HCU-Knowledge 更新，不改变运行任务依赖。
+
+一次 `wiki-update` 的源码正文沿用该轮完整目录的固定提交，避免 PR 采集期间分支前进后，把旧目录/教程与新代码混成同一快照。PR 仍保留各自 head/base；下一轮再观察后续提交。作者页可保留有明确适用范围的历史证据，不能把它写成最新分支已验证。
 
 ### 目录与新文档
 

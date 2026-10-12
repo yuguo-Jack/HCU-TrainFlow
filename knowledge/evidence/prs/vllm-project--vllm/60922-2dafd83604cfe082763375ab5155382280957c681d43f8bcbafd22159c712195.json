@@ -1,0 +1,246 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "be0823357f2c1c7833805be480470df8995371ec",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Overview\n\nCancel native gRPC `GenerateStream` requests promptly when the client disconnects, including requests that have produced no engine output, by removing the detached producer task so that the response body owns the generation stream. Related downstream report: [ai-dynamo/dynamo#16012](https://github.com/ai-dynamo/dynamo/issues/16012).\n\nThis PR was first opened by @alec-flowers with a `tx.closed()` race in the producer loop; the root cause is the `tokio::spawn` itself, so this revision removes it instead. The original description is kept below.\n\n## Claims\n\n- The gRPC response body owns the generation stream, so a client disconnect drops it and triggers the existing auto-abort, even before any engine output. This matches the HTTP SSE handlers, which already return the stream directly.\n- Removing the producer task is not a performance regression: on a mock engine it saves one cross-runtime wakeup per delivery and cuts frontend CPU substantially at default worker counts.\n\n## Validation\n\n- `dropping_generate_stream_aborts_before_engine_output` (added in the first revision) passes, and fails on the original spawn code with the five-second abort timeout.\n- `cargo nextest run -p vllm-server`: **455 passed**; `cargo clippy -p vllm-server --tests -- -D warnings`: passed.\n\nMock-engine comparison on GB200: Rust mock engine DP=4, one token per step; closed-loop gRPC client, 32 prompt tokens → 512 output tokens with text output, concurrency 2048 over 32 HTTP/2 connections, 32768 requests after warmup; two runs per variant in alternating order.\n\n| Regime | Variant | req/s | Frontend CPU |\n| --- | --- | ---: | ---: |\n| Default workers (frontend + mock on 70 cores) | spawn (base) | 1495 | 350 s |\n| | `tx.closed()` select (first revision) | 1500 | 376 s |\n| | no spawn (this PR) | **2366 (+58%)** | **151 s (−57%)** |\n| Frontend-bound (frontend on 8 cores) | spawn (base) | 2255 | 86 s |\n| | `tx.closed()` select (first revision) | 2371 | 85 s |\n| | no spawn (this PR) | 2305 | 81 s (−6%) |\n\nThe mock emits a token every ~0.1 ms per request, so wakeup overhead weighs far more than with a real model; the gain in production will be much smaller.\n\n## Details\n\n`generate_stream` spawned a producer task that owned the generation stream and fed a 32-slot channel; the response body held only the receiver. A client disconnect dropped the receiver, and the producer only noticed when `tx.send()` failed. A queued request produces no events, so its stream and engine work stayed alive indefinitely.\n\nThe conversion loop is now a `#[try_stream]` fn returned directly as the response body, instrumented with the request span, as the HTTP SSE handlers do. The match body is unchanged, an error still ends the stream after it is sent, and the \"stream closed\" log stays at the normal end of the stream. `tokio-stream` is no longer needed by `vllm-server`.\n\nThe task did not provide useful isolation, since the per-request engine output channel is already unbounded. Its one side effect was running detokenization and proto conversion on the request runtime, at the cost of an extra cross-runtime wakeup per delivery (ZMQ → request → IO runtime). HTTP SSE already does this work while the body is polled on the IO runtime, and the frontend-bound run above shows no cost from moving it.\n\nPrepared with AI assistance from Claude Code.\n\n## Original description (first revision)\n\n### Overview\n\nCancel native gRPC `GenerateStream` requests promptly when the response stream disconnects, including requests that have produced no engine output. Related downstream report: [ai-dynamo/dynamo#16012](https://github.com/ai-dynamo/dynamo/issues/16012).\n\n### Claims\n\n- A disconnected client releases the owned generation stream without waiting for another engine event, allowing the existing auto-abort path to run.\n- One regression test verifies the real gRPC transport and Rust engine client deliver the correct request ID in an engine abort while the scripted engine emits no output.\n\n### Validation\n\n- The new `dropping_generate_stream_aborts_before_engine_output` test fails on unpatched upstream with a five-second abort timeout.\n- `cargo test --manifest-path rust/Cargo.toml -p vllm-server --locked grpc::tests -- --nocapture`: **40 passed**, including the new regression and existing normal-streaming/error/control tests. `cargo-nextest` was unavailable locally.\n- `cargo clippy --manifest-path rust/Cargo.toml -p vllm-server --tests --locked -- -D warnings`: passed.\n- `pre-commit run --files rust/src/server/src/grpc/inference.rs rust/src/server/src/grpc/tests.rs`: passed.\n- The test is included in the existing Rust frontend workspace CI suite.\n\nReal-engine validation used one H100 PCIe, `Qwen/Qwen3-0.6B`, and the Python engine from `vllm/vllm-openai:v0.31.0-ubuntu2404`. Both native server binaries were built from `ffdde24f54`; their only source difference was this producer-loop fix.\n\n| Scenario | Unpatched | Patched |\n| --- | --- | --- |\n| Disconnect a queued, zero-token request with two blockers still running | Waiting=1 throughout the five-second observation window | Waiting=0 observed after **57 ms**, running=2 |\n| Subsequent normal streaming request | Completed, 16 tokens | Completed, 16 tokens |\n\nOne run per variant; occupancy was polled approximately every 50 ms. The 57 ms value is observed queue-removal latency, not a precise engine-abort timestamp. These were direct native gRPC requests, without Dynamo or a client-issued `Control.Abort` during the observation window.\n\nServer command for each binary:\n\n```bash\nvllm-rs serve Qwen/Qwen3-0.6B \\\n  --host 127.0.0.1 --port 18100 --grpc-port 18200 \\\n  --max-model-len 4096 -- \\\n  --enforce-eager --max-num-seqs 2 \\\n  --kv-cache-memory-bytes 1119388000 --gpu-memory-utilization 0.1\n```\n\nSubmit two streaming requests with `max_new_tokens=3500`, `min_new_tokens=3499`, and `ignore_eos=true`; require output from both and running=2. Submit a third request and require running=2/waiting=1 with zero target tokens. Cancel only that gRPC stream and observe the scheduler gauges while both blockers remain active. Explicit abort is used afterward solely to clean up the test load.\n\n### Details\n\nThe detached response producer owns the generation stream. Previously it awaited `stream.next()` and only detected a disconnected receiver when `tx.send()` failed. A queued request can produce no events, keeping the stream and its engine work alive indefinitely.\n\nRace `tx.closed()` against the next engine event with `tokio::select!`, prioritizing closure when both are ready. Exiting drops the stream and uses the existing per-request auto-abort machinery. This adds no polling task, timer, protocol change, or explicit abort RPC. The regression reuses the existing server fixture and synchronizes on engine admission.\n\nOpen upstream PR searches for GenerateStream cancellation and gRPC disconnect found no duplicate. [Dynamo #16007](https://github.com/ai-dynamo/dynamo/pull/16007) instead sends an explicit abort from a downstream client; this change repairs native server disconnect handling for all clients.\n\nPrepared with AI assistance from Codex.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "BugenZhao"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-10T04:12:23Z",
+            "updatedAt": "2026-10-10T04:12:23Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60922#issuecomment-6093641042"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93968](https://buildkite.com/vllm/ci/builds/93968) for commit `4153585d60b3`.",
+            "createdAt": "2026-10-10T04:12:43Z",
+            "updatedAt": "2026-10-10T04:12:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60922#issuecomment-6093643797"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWs1oBU=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "4153585d60b35527c188e0c8cf9635b737d78a89",
+      "headRepository": {
+        "nameWithOwner": "alec-flowers/vllm"
+      },
+      "merged": true,
+      "number": 60922,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-09T23:12:50Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60922#pullrequestreview-5476236128"
+          },
+          {
+            "author": {
+              "login": "BugenZhao"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-10-10T04:13:33Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60922#pullrequestreview-5477514832"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMFQwNDoxMzozM1q0MjAyNi0xMC0xMFQwNDoxMzozM1rPAAAAAUZ8PlA=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Rust Frontend][gRPC] Remove `GenerateStream` producer task so disconnects abort requests",
+      "updatedAt": "2026-10-10T04:59:36Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60922"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "be0823357f2c1c7833805be480470df8995371ec"
+    },
+    "body": "## Overview\n\nCancel native gRPC `GenerateStream` requests promptly when the client disconnects, including requests that have produced no engine output, by removing the detached producer task so that the response body owns the generation stream. Related downstream report: [ai-dynamo/dynamo#16012](https://github.com/ai-dynamo/dynamo/issues/16012).\n\nThis PR was first opened by @alec-flowers with a `tx.closed()` race in the producer loop; the root cause is the `tokio::spawn` itself, so this revision removes it instead. The original description is kept below.\n\n## Claims\n\n- The gRPC response body owns the generation stream, so a client disconnect drops it and triggers the existing auto-abort, even before any engine output. This matches the HTTP SSE handlers, which already return the stream directly.\n- Removing the producer task is not a performance regression: on a mock engine it saves one cross-runtime wakeup per delivery and cuts frontend CPU substantially at default worker counts.\n\n## Validation\n\n- `dropping_generate_stream_aborts_before_engine_output` (added in the first revision) passes, and fails on the original spawn code with the five-second abort timeout.\n- `cargo nextest run -p vllm-server`: **455 passed**; `cargo clippy -p vllm-server --tests -- -D warnings`: passed.\n\nMock-engine comparison on GB200: Rust mock engine DP=4, one token per step; closed-loop gRPC client, 32 prompt tokens → 512 output tokens with text output, concurrency 2048 over 32 HTTP/2 connections, 32768 requests after warmup; two runs per variant in alternating order.\n\n| Regime | Variant | req/s | Frontend CPU |\n| --- | --- | ---: | ---: |\n| Default workers (frontend + mock on 70 cores) | spawn (base) | 1495 | 350 s |\n| | `tx.closed()` select (first revision) | 1500 | 376 s |\n| | no spawn (this PR) | **2366 (+58%)** | **151 s (−57%)** |\n| Frontend-bound (frontend on 8 cores) | spawn (base) | 2255 | 86 s |\n| | `tx.closed()` select (first revision) | 2371 | 85 s |\n| | no spawn (this PR) | 2305 | 81 s (−6%) |\n\nThe mock emits a token every ~0.1 ms per request, so wakeup overhead weighs far more than with a real model; the gain in production will be much smaller.\n\n## Details\n\n`generate_stream` spawned a producer task that owned the generation stream and fed a 32-slot channel; the response body held only the receiver. A client disconnect dropped the receiver, and the producer only noticed when `tx.send()` failed. A queued request produces no events, so its stream and engine work stayed alive indefinitely.\n\nThe conversion loop is now a `#[try_stream]` fn returned directly as the response body, instrumented with the request span, as the HTTP SSE handlers do. The match body is unchanged, an error still ends the stream after it is sent, and the \"stream closed\" log stays at the normal end of the stream. `tokio-stream` is no longer needed by `vllm-server`.\n\nThe task did not provide useful isolation, since the per-request engine output channel is already unbounded. Its one side effect was running detokenization and proto conversion on the request runtime, at the cost of an extra cross-runtime wakeup per delivery (ZMQ → request → IO runtime). HTTP SSE already does this work while the body is polled on the IO runtime, and the frontend-bound run above shows no cost from moving it.\n\nPrepared with AI assistance from Claude Code.\n\n## Original description (first revision)\n\n### Overview\n\nCancel native gRPC `GenerateStream` requests promptly when the response stream disconnects, including requests that have produced no engine output. Related downstream report: [ai-dynamo/dynamo#16012](https://github.com/ai-dynamo/dynamo/issues/16012).\n\n### Claims\n\n- A disconnected client releases the owned generation stream without waiting for another engine event, allowing the existing auto-abort path to run.\n- One regression test verifies the real gRPC transport and Rust engine client deliver the correct request ID in an engine abort while the scripted engine emits no output.\n\n### Validation\n\n- The new `dropping_generate_stream_aborts_before_engine_output` test fails on unpatched upstream with a five-second abort timeout.\n- `cargo test --manifest-path rust/Cargo.toml -p vllm-server --locked grpc::tests -- --nocapture`: **40 passed**, including the new regression and existing normal-streaming/error/control tests. `cargo-nextest` was unavailable locally.\n- `cargo clippy --manifest-path rust/Cargo.toml -p vllm-server --tests --locked -- -D warnings`: passed.\n- `pre-commit run --files rust/src/server/src/grpc/inference.rs rust/src/server/src/grpc/tests.rs`: passed.\n- The test is included in the existing Rust frontend workspace CI suite.\n\nReal-engine validation used one H100 PCIe, `Qwen/Qwen3-0.6B`, and the Python engine from `vllm/vllm-openai:v0.31.0-ubuntu2404`. Both native server binaries were built from `ffdde24f54`; their only source difference was this producer-loop fix.\n\n| Scenario | Unpatched | Patched |\n| --- | --- | --- |\n| Disconnect a queued, zero-token request with two blockers still running | Waiting=1 throughout the five-second observation window | Waiting=0 observed after **57 ms**, running=2 |\n| Subsequent normal streaming request | Completed, 16 tokens | Completed, 16 tokens |\n\nOne run per variant; occupancy was polled approximately every 50 ms. The 57 ms value is observed queue-removal latency, not a precise engine-abort timestamp. These were direct native gRPC requests, without Dynamo or a client-issued `Control.Abort` during the observation window.\n\nServer command for each binary:\n\n```bash\nvllm-rs serve Qwen/Qwen3-0.6B \\\n  --host 127.0.0.1 --port 18100 --grpc-port 18200 \\\n  --max-model-len 4096 -- \\\n  --enforce-eager --max-num-seqs 2 \\\n  --kv-cache-memory-bytes 1119388000 --gpu-memory-utilization 0.1\n```\n\nSubmit two streaming requests with `max_new_tokens=3500`, `min_new_tokens=3499`, and `ignore_eos=true`; require output from both and running=2. Submit a third request and require running=2/waiting=1 with zero target tokens. Cancel only that gRPC stream and observe the scheduler gauges while both blockers remain active. Explicit abort is used afterward solely to clean up the test load.\n\n### Details\n\nThe detached response producer owns the generation stream. Previously it awaited `stream.next()` and only detected a disconnected receiver when `tx.send()` failed. A queued request can produce no events, keeping the stream and its engine work alive indefinitely.\n\nRace `tx.closed()` against the next engine event with `tokio::select!`, prioritizing closure when both are ready. Exiting drops the stream and uses the existing per-request auto-abort machinery. This adds no polling task, timer, protocol change, or explicit abort RPC. The regression reuses the existing server fixture and synchronizes on engine admission.\n\nOpen upstream PR searches for GenerateStream cancellation and gRPC disconnect found no duplicate. [Dynamo #16007](https://github.com/ai-dynamo/dynamo/pull/16007) instead sends an explicit abort from a downstream client; this change repairs native server disconnect handling for all clients.\n\nPrepared with AI assistance from Codex.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n\n",
+    "changed_files": 4,
+    "head": {
+      "repo": {
+        "full_name": "alec-flowers/vllm"
+      },
+      "sha": "4153585d60b35527c188e0c8cf9635b737d78a89"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60922",
+    "merged": true,
+    "number": 60922,
+    "state": "closed",
+    "title": "[Rust Frontend][gRPC] Remove `GenerateStream` producer task so disconnects abort requests",
+    "updated_at": "2026-10-10T04:59:36Z"
+  },
+  "files": [
+    {
+      "additions": 0,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2FCargo.lock",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/rust%2FCargo.lock?ref=4153585d60b35527c188e0c8cf9635b737d78a89",
+      "deletions": 1,
+      "filename": "rust/Cargo.lock",
+      "patch": "@@ -5997,7 +5997,6 @@ dependencies = [\n  \"tls-listener\",\n  \"tokio\",\n  \"tokio-openssl\",\n- \"tokio-stream\",\n  \"tokio-util\",\n  \"tonic\",\n  \"tonic-health\",",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2FCargo.lock",
+      "sha": "4193655805354b170906ec4d03f69ee922d8f1ed",
+      "status": "modified"
+    },
+    {
+      "additions": 0,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2Fsrc%2Fserver%2FCargo.toml",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/rust%2Fsrc%2Fserver%2FCargo.toml?ref=4153585d60b35527c188e0c8cf9635b737d78a89",
+      "deletions": 1,
+      "filename": "rust/src/server/Cargo.toml",
+      "patch": "@@ -35,7 +35,6 @@ thiserror-ext.workspace = true\n tls-listener.workspace = true\n tokio.workspace = true\n tokio-openssl.workspace = true\n-tokio-stream.workspace = true\n tokio-util.workspace = true\n tonic.workspace = true\n tonic-health.workspace = true",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2Fsrc%2Fserver%2FCargo.toml",
+      "sha": "b7b00398ced1c6f8aa6208c74c11701fcf043209",
+      "status": "modified"
+    },
+    {
+      "additions": 68,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2Fsrc%2Fserver%2Fsrc%2Fgrpc%2Finference.rs",
+      "changes": 130,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/rust%2Fsrc%2Fserver%2Fsrc%2Fgrpc%2Finference.rs?ref=4153585d60b35527c188e0c8cf9635b737d78a89",
+      "deletions": 62,
+      "filename": "rust/src/server/src/grpc/inference.rs",
+      "patch": "@@ -5,16 +5,17 @@ use std::pin::Pin;\n use std::sync::Arc;\n use std::time::Instant;\n \n-use futures::{Stream, StreamExt as _};\n+use asynk_strim_attr::{TryYielder, try_stream};\n+use futures::{Stream, StreamExt as _, pin_mut};\n use thiserror_ext::AsReport as _;\n-use tokio::sync::mpsc;\n-use tokio_stream::wrappers::ReceiverStream;\n use tonic::{Request, Response, Status};\n use tracing::{Span, info, info_span, warn};\n use tracing_futures::Instrument as _;\n use uuid::Uuid;\n use vllm_llm::current_unix_timestamp_secs;\n-use vllm_text::{DecodedTextEvent, Prompt, SampledDelta, TextOutputStreamExt as _, TextRequest};\n+use vllm_text::{\n+    DecodedTextEvent, Prompt, SampledDelta, TextOutputStream, TextOutputStreamExt as _, TextRequest,\n+};\n \n use super::convert::{self, ResponseOpts};\n use super::{InferenceServer, pb};\n@@ -304,67 +305,72 @@ impl pb::inference_server::Inference for InferenceServiceImpl {\n             .await\n             .map_err(|error| log_text_error(&request_span, started_at, \"submission\", error))?;\n \n-        let (tx, rx) = mpsc::channel(32);\n-\n-        let task_span = request_span.clone();\n-        tokio::spawn(\n-            async move {\n-                futures::pin_mut!(stream);\n-                while let Some(event) = stream.next().await {\n-                    let response = match event {\n-                        Err(error) => Err(log_text_error(&task_span, started_at, \"stream\", error)),\n-                        Ok(DecodedTextEvent::Start {\n-                            prompt_token_ids,\n-                            prompt_logprobs,\n-                        }) => {\n-                            let prompt_info = convert::to_prompt_info(\n-                                &prompt_token_ids,\n-                                prompt_logprobs.as_ref(),\n-                                &response_opts,\n-                            );\n-                            Ok(pb::GenerateResponse {\n-                                prompt_info: Some(prompt_info),\n-                                outputs: None,\n-                            })\n-                        }\n-                        Ok(DecodedTextEvent::TextDelta {\n-                            decoded,\n-                            sampled:\n-                                SampledDelta {\n-                                    token_ids,\n-                                    logprobs,\n-                                },\n-                            finished,\n-                        }) => convert::to_sequence_output(\n-                            &decoded.text,\n-                            &token_ids,\n-                            logprobs.as_ref(),\n-                            finished.as_deref(),\n-                            &response_opts,\n-                        )\n-                        .map(|outputs| pb::GenerateResponse {\n-                            prompt_info: None,\n-                            outputs: Some(outputs),\n-                        }),\n-                    };\n-\n-                    let failed = response.is_err();\n-                    if tx.send(response).await.is_err() || failed {\n-                        break;\n-                    }\n-                }\n-                info!(\n-                    parent: &task_span,\n-                    elapsed_ms = started_at.elapsed().as_millis() as u64,\n-                    \"gRPC inference stream closed\"\n+        let response_stream =\n+            generate_stream_responses(stream, response_opts, request_span.clone(), started_at)\n+                .instrument(request_span);\n+        Ok(Response::new(Box::pin(response_stream)))\n+    }\n+}\n+\n+/// Convert one decoded text stream into gRPC streaming responses.\n+///\n+/// The response body owns the generation stream, so a client disconnect drops\n+/// it and aborts the request in the engine, even before any output arrives.\n+#[try_stream]\n+async fn generate_stream_responses(\n+    stream: impl TextOutputStream,\n+    response_opts: ResponseOpts,\n+    request_span: Span,\n+    started_at: Instant,\n+    mut y: TryYielder<pb::GenerateResponse, Status>,\n+) -> Result<(), Status> {\n+    pin_mut!(stream);\n+\n+    while let Some(event) = stream.next().await {\n+        let response = match event {\n+            Err(error) => Err(log_text_error(&request_span, started_at, \"stream\", error)),\n+            Ok(DecodedTextEvent::Start {\n+                prompt_token_ids,\n+                prompt_logprobs,\n+            }) => {\n+                let prompt_info = convert::to_prompt_info(\n+                    &prompt_token_ids,\n+                    prompt_logprobs.as_ref(),\n+                    &response_opts,\n                 );\n+                Ok(pb::GenerateResponse {\n+                    prompt_info: Some(prompt_info),\n+                    outputs: None,\n+                })\n             }\n-            .instrument(request_span),\n-        );\n-\n-        let response_stream = ReceiverStream::new(rx);\n-        Ok(Response::new(Box::pin(response_stream)))\n+            Ok(DecodedTextEvent::TextDelta {\n+                decoded,\n+                sampled:\n+                    SampledDelta {\n+                        token_ids,\n+                        logprobs,\n+                    },\n+                finished,\n+            }) => convert::to_sequence_output(\n+                &decoded.text,\n+                &token_ids,\n+                logprobs.as_ref(),\n+                finished.as_deref(),\n+                &response_opts,\n+            )\n+            .map(|outputs| pb::GenerateResponse {\n+                prompt_info: None,\n+                outputs: Some(outputs),\n+            }),\n+        };\n+        y.yield_ok(response?).await;\n     }\n+    info!(\n+        parent: &request_span,\n+        elapsed_ms = started_at.elapsed().as_millis() as u64,\n+        \"gRPC inference stream closed\"\n+    );\n+    Ok(())\n }\n \n fn text_error_to_status(error: vllm_text::Error) -> Status {",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2Fsrc%2Fserver%2Fsrc%2Fgrpc%2Finference.rs",
+      "sha": "1484a9f9e3751b92fe1e7569f1fc82688f88ff08",
+      "status": "modified"
+    },
+    {
+      "additions": 64,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2Fsrc%2Fserver%2Fsrc%2Fgrpc%2Ftests.rs",
+      "changes": 64,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/rust%2Fsrc%2Fserver%2Fsrc%2Fgrpc%2Ftests.rs?ref=4153585d60b35527c188e0c8cf9635b737d78a89",
+      "deletions": 0,
+      "filename": "rust/src/server/src/grpc/tests.rs",
+      "patch": "@@ -1827,6 +1827,70 @@ async fn grpc_without_keepalive_keeps_unresponsive_connection_open() {\n     server_task.abort();\n }\n \n+#[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]\n+#[serial]\n+async fn dropping_generate_stream_aborts_before_engine_output() {\n+    let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel();\n+    let (inference_service, control_service, engine_health, engine_task) =\n+        setup_grpc_service_with_engine_script(\n+            b\"engine-grpc-cancel-pending-output\".to_vec(),\n+            default_ready_response(),\n+            Arc::new(FakeTextBackend),\n+            None,\n+            move |dealer, _push| {\n+                boxed_test_future(async move {\n+                    let add = recv_engine_message(dealer).await;\n+                    assert_eq!(add[0].as_ref(), &[0x00]);\n+                    let request: EngineCoreRequest =\n+                        rmp_serde::from_slice(&add[1]).expect(\"decode request\");\n+                    submitted_tx.send(()).expect(\"signal submitted request\");\n+\n+                    // A queued request produces no output before cancellation.\n+                    let abort = recv_engine_message(dealer).await;\n+                    assert_eq!(abort[0].as_ref(), &[0x01]);\n+                    let request_ids: Vec<String> =\n+                        rmp_serde::from_slice(&abort[1]).expect(\"decode abort request IDs\");\n+                    assert_eq!(request_ids, vec![request.request_id]);\n+                })\n+            },\n+        )\n+        .await;\n+    let (channel, server_task) = start_grpc_test_server(\n+        inference_service,\n+        control_service,\n+        engine_health,\n+        tokio_util::sync::CancellationToken::new(),\n+    )\n+    .await;\n+    let mut client = InferenceClient::new(channel);\n+    let stream = client\n+        .generate_stream(pb::GenerateRequest {\n+            request_id: \"test-cancel-pending-output\".to_string(),\n+            model: \"test-model\".to_string(),\n+            prompt: Some(pb::generate_request::Prompt::Text(\"hello\".to_string())),\n+            stopping: Some(pb::StoppingCriteria {\n+                max_new_tokens: 10,\n+                ..Default::default()\n+            }),\n+            ..Default::default()\n+        })\n+        .await\n+        .expect(\"start generation\")\n+        .into_inner();\n+    tokio::time::timeout(Duration::from_secs(5), submitted_rx)\n+        .await\n+        .expect(\"timed out waiting for engine submission\")\n+        .expect(\"engine submission signal\");\n+\n+    drop(stream);\n+\n+    let result = tokio::time::timeout(Duration::from_secs(5), engine_task).await;\n+    server_task.abort();\n+    result\n+        .expect(\"disconnect must abort without waiting for engine output\")\n+        .expect(\"mock engine task\");\n+}\n+\n #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]\n #[serial]\n async fn control_abort_resolves_external_id_and_empty_is_noop() {",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4153585d60b35527c188e0c8cf9635b737d78a89/rust%2Fsrc%2Fserver%2Fsrc%2Fgrpc%2Ftests.rs",
+      "sha": "f46c658b018806765fc191ccb8757c0440e32b25",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-10T04:12:23Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60922#issuecomment-6093641042",
+      "updated_at": "2026-10-10T04:12:23Z",
+      "user": {
+        "login": "BugenZhao"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93968](https://buildkite.com/vllm/ci/builds/93968) for commit `4153585d60b3`.",
+      "created_at": "2026-10-10T04:12:43Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60922#issuecomment-6093643797",
+      "updated_at": "2026-10-10T04:12:43Z",
+      "user": {
+        "login": "github-actions"
+      }
+    }
+  ],
+  "number": 60922,
+  "refs": {
+    "base": {
+      "commit": "be0823357f2c1c7833805be480470df8995371ec",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "4153585d60b35527c188e0c8cf9635b737d78a89",
+      "repository": "alec-flowers/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60922#pullrequestreview-5476236128",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-09T23:12:50Z",
+      "user": {
+        "login": "claude"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60922#pullrequestreview-5477514832",
+      "state": "APPROVED",
+      "submitted_at": "2026-10-10T04:13:33Z",
+      "user": {
+        "login": "BugenZhao"
+      }
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+---
+id: doc-ascend-mindspeed-9fed7b3e4a3c2d930db2
+title: Ascend/MindSpeed / docs/zh/features/fsdp2.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/fsdp2.md
+raw_sha256: 8fc5db6609e67a1d5f030fdc678b586475d3816562fb40496447429e2c80c48a
+sources: []
+generated_body_sha256: 623e730ff9704e19e596e6056e84075fd661e2d825cfbe4e8f1d7c5be92dfa1e
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/fsdp2.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/fsdp2.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# FSDP2
+
+## 背景与挑战
+
+PyTorch的完全分片数据并行（FSDP）旨在提供一个高性能的即时执行模式实现，包含通信分桶和通信/计算掩盖功能。该API通过将一组参数展平拼接成FlatParameter来表示通信桶。然而，这种FlatParameter设计导致难以对桶内单个参数实施差异化操作（如参数冻结、精度转换等），损害了组合灵活性，同时也使内部实现复杂化（例如状态字典逻辑长达数千行代码且需要额外通信）。
+
+## 解决方案
+
+基于上述局限性，FSDP2移除了FlatParameter，采用沿0维分片的DTensor表示分片参数，支持对单个参数的便捷操作、免通信的分片状态字典，以及更简化的初始化流程。
+
+## 使用方法
+
+在mindspeed中FSDP2的入口是一个配置文件，通过生成配置文件，传入命令行参数即可使用该特性。
+
+```bash
+export CUDA_DEVICE_MAX_CONNECTIONS=2 # 设置不能为1
+--use-torch-fsdp2 \
+--fsdp2-config-path ./fsdp2_config.yaml \
+--ckpt-format torch_dist \
+--untie-embeddings-and-output-weights \
+# 注意不能打开分布式优化器
+```
+
+fsdp2_config.yaml的配置项如下：
+
+```yaml
+sharding_size: int # 分片组大小，表示每个参数分片组的NPU数量
+sub_modules_to_wrap: Optional[Iterable[torch.nn.Module]] = None # 需要进行FSDP包装的模块类列表，需通过绝对路径引入：例如：mindspeed_mm.models.predictor.dits.sat_dit.VideoDiTBlock
+reshard_after_forward: Union[bool, int] = True # 前向计算后立即重新分片参数
+param_dtype: bf16 # 参数存储精度
+reduce_dtype: fp32 # 梯度通信精度
+cast_forward_inputs: bool = True # 自动转换前向输入到计算精度
+ignored_modules: Optional[Iterable[torch.nn.Module]] = None # 排除FSDP管理的模块类列表, 需要通过绝对路径引入：例如：mindspeed_mm.models.ae.base.AEModel
+offload_to_cpu: bool = False # 将权重，梯度以及优化器状态卸载到cpu
+pin_memory: bool = True  # 只有当offload_to_cpu为True时才会生效
+num_to_forward_prefetch: int  # 指定前向计算预取（forward prefetch）的层数，默认值为0
+recompute_modules: Optional[Iterable[torch.nn.Module]] = None # 需要进行重计算的模块类列表，需通过绝对路径引入：例如：mindspeed_mm.models.predictor.dits.sat_dit.VideoDiTBlock
+```
+
+> [!NOTE]
+>
+> **重计算机制说明**：FSDP2模式下使用 `fsdp2_config.yaml` 中的 `recompute_modules` 配置项进行重计算，基于PyTorch原生的 `apply_activation_checkpointing` + `checkpoint_wrapper` 实现，对指定模块进行激活检查点包装，在前向传播时不保存中间激活值，反向传播时重新计算。
+> 该模式下的重计算与Megatron风格的重计算（如`--recompute-granularity`、`--recompute-method`、`--recompute-num-layers`）互斥，不可同时开启。
+>
+> **重计算性能代价**：重计算通过牺牲计算量换取显存空间，全层重计算可节省约30~40%显存，但会带来约15~25%的吞吐下降；部分重计算可节省约15~25%显存，吞吐下降约5~10%。实际代价与模型结构、batch size、硬件配置密切相关。
+>
+> **吞吐下降原因**：重计算通过在前向传播时不保存中间激活值，反向传播时重新计算这些值，增加了额外的计算开销；同时，如果配置了 `reshard_after_forward=True`，反向传播时还需要重新获取分片参数，可能产生额外的通信开销。
+>
+> **重计算使用边界**：仅在激活显存为主瓶颈时推荐开启重计算。推荐开启条件：训练过程中出现OOM错误、激活显存占用超过总显存的50%、需要更大的batch size或更长的序列长度。不推荐开启条件：计算本身是瓶颈（NPU利用率接近100%）、通信是瓶颈（网络带宽已饱和）、模型较小或batch size较小且显存充足。
+
+## 使用效果
+
+针对Llama-7B，FSDP2相比FSDP1实现了更高的MFU，峰值内存降低7%，且保持相同的损失曲线。
+
+## 注意事项
+
+1、当开启fsdp2训练时，需关闭分布式优化器及其相关配置
+
+2、当开启fsdp2训练时，模型权重的保存格式`ckpt-format`仅支持`torch_dist`或`torch_dcp`
+
+- 配置为`torch_dist`，模型需通过继承`MegatronModule`或自定义来实现`sharded_state_dict()`方法；同时需保证模型中所有权重的0维size均大于或等于sharding_size
+
+- 配置为`torch_dcp`，模型需通过继承`MegatronModule`或自定义来实现`state_dict_for_save_checkpoint()`方法，并且其返回的权重字典需要与`model.state_dict()`的返回值一致
+
+3、当开启fsdp2训练时，需关闭Megatron重计算的相关配置，包括：`--recompute-granularity`、`--recompute-method`以及`--recompute-num-layers`等

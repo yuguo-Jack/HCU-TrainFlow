@@ -1,0 +1,55 @@
+---
+id: doc-ascend-mindspeed-8149ccc247eef22ab2fc
+title: Ascend/MindSpeed / docs/zh/features/npu_datadump.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/npu_datadump.md
+raw_sha256: 94e7504c0c76f5a9f97eaba744aa09785d9bb8a57bd1ab81437e002db58388cb
+sources: []
+generated_body_sha256: 443f7950a7a249fe584479fe6b0b9ad6c2dcd5860f9608dfa2cda51b68b9f4e6
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/npu_datadump.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/npu_datadump.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Ascend MindStudio Training Tools 精度对照
+
+## 背景与挑战
+
+大模型训练中，极小的数据波动就很可能带来最终评分的较大下降，这使得模型在精度对照时往往存在巨大的工作量，尤其是在进行跨平台（GPU→NPU）对照的场景。借助msprobe工具，Ascend芯片可以较快地完成整网训练数据的采集，配合确定性计算来达到精度对照的功能。然而msprobe使用时需要手动修改代码，并设置调节config，这使得其在MindSpeed中的使能存在一定不便。
+
+## 解决方案
+
+为满足上述需求，引入了“精度对照”功能，MindSpeed通过集成并简化了msprobe工具的使用，允许用户通过设置参数，快速进行整网的精度数据dump及比对。
+
+## 使用场景
+
+需要进行精度对照、特定场景复现时。
+
+## 使用方法
+
+要启用此功能，在脚本中加入`--npu-datadump`即可。使用前请先进行下述config.json的修改。默认状态下，采集RANK0（仅采集0号卡）、STEP0（仅采集第0步）下的statistics精度（统计量级精度数据类型）。
+通过调整`mindspeed/functional/npu_datadump/config.json`，可以进行整网dump时各选项的调整。
+通过调整`mindspeed/functional/npu_datadump/compare.json`，可以利用msprobe进行各dump数据的精度对照。
+关于config设置的更多细节，请参考[msprobe官方使用教程](https://gitcode.com/Ascend/msprobe/blob/master/docs/zh/user_guide/dump/config_json_introduct.md)。
+
+- 暂不支持Lite后端。
+- dump数据默认保存在Megatron-LM目录下。
+
+## 使用效果
+
+通过精度对照功能，可快速确认整网运行过程中的精度误差。

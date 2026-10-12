@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
 path: docs/docs/advanced_features/separate_reasoning.mdx
-raw_sha256: 6cdd26ddec5e413d1763637e5e8288468f40efe15d64bd7216ee3a1236c8145f
+raw_sha256: c542702f7a56c21ab9e1eb070027e5f7acbf4272a8dc0b071e07eb289bed92bb
 sources: []
-generated_body_sha256: a534ef70734b63c18381437740055ec58177f39c1b1ab1a0e063ddc2b74c8463
+generated_body_sha256: 73a6feed0f70fc2274cf99bd1101a27b38d0cfa7b3f02c13dff2bea39000b8f2
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/separate_reasoning.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/separate_reasoning.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/docs/docs/advanced_features/separate_reasoning.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -142,6 +142,8 @@ wait_for_server(f"http://localhost:{port}")
 ```
 
 Note that `--reasoning-parser` defines the parser used to interpret responses.
+
+To cap how many tokens the model spends thinking, see [Thinking Budget](/docs/advanced_features/thinking_budget).
 
 
 ### OpenAI Compatible API

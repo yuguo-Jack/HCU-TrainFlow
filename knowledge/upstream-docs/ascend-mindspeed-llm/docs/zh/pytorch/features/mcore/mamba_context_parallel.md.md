@@ -1,0 +1,78 @@
+---
+id: doc-ascend-mindspeed-llm-8a2c48b23f03f13960b8
+title: Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/mamba_context_parallel.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed-LLM
+commit: 2fed626696175480ae1ab3342a94017301a25209
+path: docs/zh/pytorch/features/mcore/mamba_context_parallel.md
+raw_sha256: 6e81b6e31780dbebcaeb78b03b197570b1f37ea3430043f4dbb8d1d4f8393296
+sources: []
+generated_body_sha256: bf64014b0facd046c66d786deaa0f364d69b4762381070937f5f60f527e24756
+source_state: current-scan
+---
+
+# Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/mamba_context_parallel.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/features/mcore/mamba_context_parallel.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Mamba-CP
+
+## 背景
+
+Mamba 为解决 Transformer 模型序列长度平方复杂度问题而提出，成为长序列训练的重要架构。在序列长度大幅增长时，激活值增加导致显存压力大幅增长，仍然急需 CP 大幅降低超长序列带来的显存压力，当前外部 Mamba 开源框架 CP 仍处于空白。
+
+## 问题
+
+Mamba 的 SSM 递归运算步骤存在时间依赖关系。传统 CP 必须等上一 CP rank 运算完毕，将结果传递到下一 CP rank 方可执行下一步运算，引入空闲等待。故设计了一种并行 Mamba-CP 方案使得所有 rank 可以并发执行状态传递计算，相对传统 CP 性能大幅提升。
+
+传统 CP 可参考 [Mamba-2 paper](https://arxiv.org/abs/2405.21060) Figure 5。
+
+## 解决方案
+
+针对存在时间依赖关系的状态传递部分，对各个 CP rank 中 local_decay 及 local_state 进行 AllGather，使所有 CP rank 可以并发执行状态传递计算，同时还对前向的 AllGather 和反向的 ReduceScatter 进行了计算通信掩盖。
+
+## 使用场景
+
+1. 与 TP 和 SP 正交，可以在开启 TP 的基础上进一步开启 CP 降低显存；
+2. TP 有 n_groups 整除限制，CP 无限制；
+3. CP 在显存不足场景，开启 CP 相比开启重计算降低显存方式性能更优；
+
+## 使用方法
+
+| 重要参数                                  | 参数说明                                                            |
+|---------------------------------------|-----------------------------------------------------------------|
+| --context-parallel-algo mamba_cp_algo | 长序列并行算法选项，默认项为 `ulysses_cp_algo`，当设置为 `mamba_cp_algo` 时开启 Mamba-CP。 |
+| --context-parallel-size [int]         | 开启 CP 对应的数量，默认为 1，根据用户需求配置。                                        |
+
+## 使用效果
+
+节省显存方式包括重计算、额外开启 CP 等。重计算为常见方式，但会引入额外 30% 耗时，在长序列、显存受限场景通常需要组合特性，在不超出硬件显存的前提下尽可能提升性能。在相同显存占用基础上，对开启 CP 节省显存和开启重计算方式节省显存进行了性能对比如下：
+
+CP 开启前后显存优化及性能变化：
+
+| 序列长度 | 并行配置   | 显存占用    | 显存优化 | 性能       | 性能变化   |
+|------|--------|---------|------|----------|--------|
+| 32K  | TP4CP1 | 56129MB | -    | 3761.1ms | -      |
+| 32K  | TP4CP2 | 32613MB | 42%  | 3862.3ms | -2.69% |
+
+CP 与重计算缩减显存和性能对比：
+
+| 序列长度 | 并行配置           | 显存占用     | 性能        |  加速比例     |
+|------|----------------|----------|-----------|-----------|
+| 32K  |  TP4CP1 + 全重计算 |  同等显存 30GB |  4728.8ms |  -       |
+| 32K  |  TP4CP2        |  同等显存 30GB |  3862.3ms |  +22.43%  |
+
+## 注意事项
+
+1. 在面临 Mamba-CP 场景需要省显存情况下，优先开启 CP，然后再开重计算；

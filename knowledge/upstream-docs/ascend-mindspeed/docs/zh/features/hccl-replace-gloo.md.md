@@ -1,0 +1,72 @@
+---
+id: doc-ascend-mindspeed-7df044436dbf052bb3b7
+title: Ascend/MindSpeed / docs/zh/features/hccl-replace-gloo.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/hccl-replace-gloo.md
+raw_sha256: 9c536ea82bdfea549ec6e51d38d6a702a80f692f248d5a33189e99cd9ef40dd4
+sources: []
+generated_body_sha256: fcfb7edd8f3029d74aa4b55cd18a38fa5b6baca54c17f71ec50f369729d3e088
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/hccl-replace-gloo.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/hccl-replace-gloo.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# Gloo存档落盘优化
+
+## 背景与挑战
+
+在大规模集群下，Gloo通信存在规模限制和稳定性问题。一方面，容易出现Gloo通信组创建失败的情况；另一方面，与HCCL通信相比，Gloo通信较慢。
+
+对于Gloo通信组创建失败报错`Gloo connectFullMesh failed with ...`的问题，本质上是由于N张卡连接到主节点来完成建链，集群规模大时，主节点处理能力不足，可能造成建链失败。可通过调整和网络建链相关参数进行规避（云上8k卡场景验证有效）：
+
+```text
+net.ipv4.tcp_max_syn_backlog = 65536
+net.core.netdev_max_backlog = 65536
+```
+
+此外，MindSpeed设计了Gloo通信优化方案，使用HCCL通信替代Gloo。
+
+## 解决方案
+
+- 采用HCCL通信组替换Gloo通信组，实现在原有功能基础上的替代。
+
+- 采用切片方式减少单次通信的数据量，避免通信量过大导致的显存消耗。
+
+## 使用场景
+
+当Gloo通信频繁出现建链失败时，模型启动效率较低，此时需要通过替换Gloo通信组来提升效率。
+
+## 使用方法
+
+1. 在训练脚本中加入`--disable-gloo-group`，以启用该特性。
+
+2. 在脚本中定义`--hccl-slice-size N`（可选），设置DP组保存和加载分布式优化器状态时的通信量大小。该参数的有效区间为 `(0, bucket_size/dp]`，其中bucket_size为分布式优化器中每个桶的大小。建议在显存允许的情况下，尽量增大该参数，以提高通信效率。
+
+## 使用效果
+
+**通信效率分析**
+
+理论上，分布式优化器状态保存和加载的通信效率在一定范围内随着`hccl-slice-size`增加而提升。
+<!-- ，以下提供几个参考数据：
+- 当切片大小为 $10 * 1024 * 1024$ 时，模型加载时间有所增加，模型保存效率不变；
+- 当切片大小为 $30 * 1024 * 1024$ 时，模型保存和加载效率与原来相当；
+- 当切片大小为 $100 * 1024 * 1024$ 时，模型保存和加载效率有所提升。-->
+
+**显存增量分析**
+
+开启该特性后，显存的增加量为 `hccl-slice-size * (2 * dp + 1) * 4Byte`。

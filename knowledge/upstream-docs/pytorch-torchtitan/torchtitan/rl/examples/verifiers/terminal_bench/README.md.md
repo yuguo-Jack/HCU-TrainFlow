@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: b663c1673c00d97864bb32f18029ce5ec40442e2
 path: torchtitan/rl/examples/verifiers/terminal_bench/README.md
-raw_sha256: 0a0313c2efeb0c1ce012a789ea8a75f4d9352e98f8155cae561c4705b093a3de
+raw_sha256: 17392992b96472cffc0fd22627b2c52f35ca56266125ce46d33cce7879f1bc95
 sources: []
-generated_body_sha256: 0735b287e1eaabf1452e779eb47fc3445d210dcc9056a62b754f3a96b849921e
+generated_body_sha256: 1c3d1e18818fb4feb7374683768888110a9d386b6c2e3c8b7543103112fb8284
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/examples/verifiers/terminal_bench/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/examples/verifiers/terminal_bench/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/examples/verifiers/terminal_bench/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -104,9 +104,13 @@ training tasks (see [Datasets](#datasets)), then:
 ```bash
 python -m torchtitan.rl.train \
   --module torchtitan_recipes.rl.verifiers_terminal_bench \
-  --config rl_grpo_qwen35_9b_terminal_bench \
-  --hf_assets_path /path/to/Qwen3.5-9B
+  --config rl_grpo_qwen35_9b_terminal_bench
 ```
+
+The 9B recipe sets `hf_assets_path` to `./assets/hf/Qwen3.5-9B`, and the 35B
+recipe sets `./assets/hf/Qwen3.5-35B-A3B`. Change that assignment in
+`torchtitan_recipes/rl/verifiers_terminal_bench.py` to use another directory.
+There is no CLI flag for the path.
 
 | Config | Model | GPUs |
 | --- | --- | --- |

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: b663c1673c00d97864bb32f18029ce5ec40442e2
 path: torchtitan/rl/README.md
-raw_sha256: ccb29a904363f34a929b2cc28ca4ee423f638352f70ac4202f34f1c06e579d0a
+raw_sha256: d0cced32ef4222b2473689607eadcb749cbb4650e6da9da27df32353842908e6
 sources: []
-generated_body_sha256: 396a8a5c388c88a30dde54df807daf4a49893f1dda60db47fa0e25abdae787c3
+generated_body_sha256: d5f0a9aa93419c7e218617a8584049b5f0658c2ef7d91969986a7aaa19bb90ed
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -183,13 +183,13 @@ as a CUDA-graph-compatible MoE dispatcher for the generator, are model config
 transforms applied to one role (`apply_transforms(config.generator, ...)`).
 `Controller.Config.override` applies registered overrides to both models.
 
-Then run it by module and config name. CLI arguments override fields from the registry:
+Then run it by module and config name. `--output-dir` sets the output directory:
 
 ```bash
 python -m torchtitan.rl.train \
   --module my_project.my_experiment \
   --config my_experiment \
-  --dump-folder outputs/rl/my_experiment
+  --output-dir outputs/rl/my_experiment
 ```
 
 ## Experiments

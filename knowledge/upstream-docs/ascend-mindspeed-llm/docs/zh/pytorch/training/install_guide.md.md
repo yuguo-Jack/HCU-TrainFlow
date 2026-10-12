@@ -1,0 +1,360 @@
+---
+id: doc-ascend-mindspeed-llm-5f30fa8ec688dbbeb27a
+title: Ascend/MindSpeed-LLM / docs/zh/pytorch/training/install_guide.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed-LLM
+commit: 2fed626696175480ae1ab3342a94017301a25209
+path: docs/zh/pytorch/training/install_guide.md
+raw_sha256: d22ed424e8b64ac60f9c3482c882cedb0634458fd416c39bd669dd565a63d567
+sources: []
+generated_body_sha256: de442b643fb1fcd9a0a499b0a4a643a6fde80ea1cae66489b2e51f38383afeb4
+source_state: current-scan
+---
+
+# Ascend/MindSpeed-LLM / docs/zh/pytorch/training/install_guide.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/install_guide.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# MindSpeed LLM软件安装
+
+本文主要向用户介绍如何快速基于PyTorch框架完成MindSpeed LLM（大语言模型分布式训练套件）的安装。
+
+## 硬件配套和支持的操作系统
+
+**表 1**  产品硬件支持列表
+
+|产品|是否支持|
+|--|:-:|
+|<term>Ascend 950PR&950DT系列产品</term>|√|
+|<term>Atlas A3训练系列产品</term>|√|
+|<term>Atlas A3推理系列产品</term>|x|
+|<term>Atlas A2训练系列产品</term>|√|
+|<term>Atlas A2推理系列产品</term>|x|
+|<term>Atlas 200I/500 A2推理产品</term>|x|
+|<term>Atlas推理系列产品</term>|x|
+|<term>Atlas训练系列产品</term>|x|
+
+> [!NOTE]
+>
+> 本节表格中“√”代表支持，“x”代表不支持。
+
+- 各硬件产品对应物理机部署场景支持的操作系统请参考[兼容性查询助手](https://www.hiascend.com/hardware/compatibility)。
+- 各硬件产品对应虚拟机及容器部署场景支持的操作系统请参考《CANN 软件安装》的“[操作系统兼容性说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum)”章节。
+
+## 安装前准备
+
+请参见《版本说明》中的“[相关产品版本配套说明](../../release_notes_llm.md#相关产品版本配套说明)”章节，下载安装对应的软件版本。
+
+请单击[固件与驱动](https://www.hiascend.com/hardware/firmware-drivers)，并根据引导完成固件与驱动的安装。
+
+> [!NOTICE]
+>
+> 安装运行程序建议使用非root用户，且建议对安装程序的目录文件做好权限管控：文件夹权限设置为750，文件权限设置为640。可以通过设置umask控制安装后文件的权限，如设置umask为0027。
+>
+> 更多安全相关内容请参见《[安全声明](../../SECURITYNOTE.md)》中各组件关于“文件权限控制”的说明。
+
+## 安装MindSpeed LLM
+
+MindSpeed LLM支持镜像安装和源码安装。
+
+各安装方式的使用场景如下，请根据实际情况选择合适的安装方式。
+
+镜像安装：该方式是较为简单的安装方式，用户可直接从昇腾社区下载已经构建好的镜像，镜像中已包含CANN、TorchNPU及MindSpeed LLM等必要的依赖与软件，用户只需拉取镜像并启动容器即可。
+
+源码安装：如需体验最新功能，或对源码进行修改增强，可下载对应分支的MindSpeed LLM代码，自行完成安装。
+
+源码安装（Submodule统一安装）：该方式为可选方案，适用于需要统一管理MindSpeed等三方依赖软件版本的场景。
+
+### 方式一：镜像安装
+
+> [!NOTE]
+>
+> - 使用镜像前，请先确认机器型号。最新镜像支持aarch64及X86_64架构，可通过`uname -a`命令确认当前环境是否符合要求。
+> - 配套镜像已预装配套的CANN 9.1.0软件及TorchNPU 26.1.0插件，可根据需要选用。
+> - 若当前环境与提供的镜像不兼容，请选择[方式二：源码安装](#方式二源码安装)。
+> - master分支后续会更新新的镜像，如果需要自定义构建镜像请参见[镜像概述](../../../../docker/OVERVIEW.zh.md)。
+
+1. 获取镜像
+
+   最新镜像均配套[MindSpeed LLM的26.1.0分支](https://gitcode.com/Ascend/MindSpeed-LLM/tree/26.1.0)，请按需[获取镜像](https://www.hiascend.com/developer/ascendhub/detail/e26da9266559438b93354792f25b2f4a)。
+
+   <!-- npu="950" id1 -->
+   - <term>Ascend 950PR&950DT系列产品</term>：v26.1.0-cann9.1.0-torch_npu2.7.1.post8-950-openeuler24.03-py3.12
+
+   - <term>Ascend 950PR&950DT系列产品</term>：v26.1.0-cann9.1.0-torch_npu2.7.1.post8-950-ubuntu22.04-py3.12
+   <!-- end id1 -->
+   <!-- npu="A3" id2 -->
+   - <term>Atlas A3训练系列产品</term>：v26.1.0-cann9.1.0-torch_npu2.7.1.post8-a3-openeuler24.03-py3.12
+
+   - <term>Atlas A3训练系列产品</term>：v26.1.0-cann9.1.0-torch_npu2.7.1.post8-a3-ubuntu22.04-py3.12
+   <!-- end id2 -->
+   <!-- npu="910b" id3 -->
+   - <term>Atlas A2训练系列产品</term>：v26.1.0-cann9.1.0-torch_npu2.7.1.post8-910b-openeuler24.03-py3.12
+
+   - <term>Atlas A2训练系列产品</term>：v26.1.0-cann9.1.0-torch_npu2.7.1.post8-910b-ubuntu22.04-py3.12
+   <!-- end id3 -->
+
+   ```bash
+   # 确认是否成功获取镜像
+   docker image list
+   ```
+
+2. 启动容器
+
+   执行以下命令启动容器，该命令仅供参考，可根据需求自行修改，命令参数介绍如[表2](#table1)所示。
+
+   ```bash
+   docker run -it -d \
+      --ipc=host \
+      --network=host \
+      --pid=host \
+      --name mindspeed_llm \
+      --privileged \
+      --shm-size=512g \
+      --device=/dev/davinci0 \
+      --device=/dev/davinci_manager \
+      --device=/dev/devmm_svm \
+      --device=/dev/hisi_hdc \
+      -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+      -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+      -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+      -v /usr/local/dcmi:/usr/local/dcmi \
+      -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+      -v /etc/ascend_install.info:/etc/ascend_install.info \
+      -v /data:/data \
+      -v /weights:/weights \
+      mindspeed-llm:v26.1.0-cann9.1.0-torch_npu2.7.1.post8-910b-openeuler24.03-py3.12 \
+      /bin/bash
+   ```
+
+   > [!NOTE]
+   >
+   > - 当前默认配置驱动和固件安装在/usr/local/Ascend，如有差异请修改指令路径。
+   > - 复制启动命令前，请将-v参数内的/data、/weights两处路径，替换为宿主机本地真实目录，否则容器启动失败。
+   > - 当前容器默认初始化NPU驱动和CANN环境信息，如需要安装新的，请自行替换或手动source，详见容器的~/.bashrc。
+   > - “_mindspeed-llm:v26.1.0-cann9.1.0-torch_npu2.7.1.post8-910b-openeuler24.03-py3.12_”为镜像名称和标签，可根据实际情况修改。可在宿主机执行`docker images`命令查看当前机器上已有的镜像。
+
+   **表 2**  参数说明 <a id="table1"></a>
+
+    |参数|说明|
+    |----|----|
+    |-it|表示启动一个交互式终端（-i）并将其连接到容器的标准输入输出 （-t），能够与容器内部进行交互，如运行命令行操作。|
+    |-d|表示容器将以后台模式运行，即容器在后台启动。使用该参数后不会阻塞当前终端的操作，可以在启动容器后继续进行其他操作。|
+    |--ipc|表示使用宿主机的IPC（进程间通信）命名空间。|
+    |--network|表示使用宿主机的网络栈。|
+    |--pid|表示使用宿主机的PID命名空间。使用该参数后容器内的进程可以查看宿主机上的所有进程ID。|
+    |--name|表示给容器指定一个名称。mindspeed_llm是容器的标识符，可以自行设置，且在当前系统中具有唯一性。如果不设置，Docker会自动分配一个随机名称。|
+    |--privileged|用于解除容器默认权限限制，赋予容器近乎宿主机的权限，保证昇腾驱动调用、npu-smi等工具能够正常与硬件设备交互。|
+    |--shm-size|表示指定容器的共享内存（/dev/shm）大小，用户可自行设置，512g为示例值。<br>该值不能超过宿主机剩余的物理内存总量，可使用`free -h`命令查看。|
+    |--device|表示将宿主机的设备映射到容器内。每个--device参数将宿主机设备（例如硬件加速卡或其他硬件设备）共享给容器，以便容器可以直接访问。<ul><li>/dev/davinci_manager：davinci相关的管理设备。</li><li>/dev/hisi_hdc：hdc相关管理设备。</li><li>/dev/devmm_svm：内存管理相关设备。</li><li>/dev/davinci*X*：NPU设备，*X*是ID号，如：davinci0。</li></ul>可根据`ll /dev/ \| grep davinci`命令查询device个数及名称，根据需要绑定设备，修改上面命令中的"--device=****"。|
+     |-v|表示将物理机的文件夹映射到容器内的相应目录，以下参数请根据实际路径修改。<ul><li>/usr/local/Ascend/driver：该路径包含硬件驱动程序文件，驱动在宿主机上安装，将其映射到容器中，方可在容器中使用。</li><li>/usr/local/Ascend/firmware：该路径包含硬件固件程序文件，固件在宿主机上安装，将其映射到容器中，方可在容器中使用。</li><li>/usr/local/bin/npu-smi：该路径包含npu-smi等NPU状态查看命令，请根据实际路径修改。</li><li>/usr/local/dcmi：该路径用于挂载dcmi工具。</li><li>/usr/local/Ascend/driver/version.info：该路径包含驱动版本信息文件。</li><li>/etc/ascend_install.info：该路径包含安装版本信息文件。</li><li>/data：该路径为设定数据集挂载的路径，指向保存数据集的目录，使容器能访问数据集。</li><li>/weights：该路径为设定权重挂载的路径，指向保存权重的目录，使容器能访问权重。</li></ul>|
+
+3. 加载容器并确认环境状态
+
+   ```bash
+   # 查询本地运行中的容器ID/名称
+   docker ps -a
+   # 加载容器
+   docker exec -it 容器ID/名称 bash
+   # 确认NPU是否可以正常使用
+   npu-smi info
+   ```
+
+### 方式二：源码安装
+
+请参考如下操作获取对应源码及安装相关依赖，完成MindSpeed LLM的安装。
+
+1. （可选）创建虚拟环境
+
+   建议使用Python 3.12版本，具体可参见[版本说明](../../release_notes_llm.md)。若不希望影响全局Python环境，可使用venv、conda、uv等常用虚拟环境管理工具创建独立的虚拟环境。
+
+   以conda为例，可参考如下命令：
+
+   ```bash
+   conda create -n test python=3.12
+   conda activate test
+   ```
+
+2. 安装CANN
+
+   安装配套版本的NPU驱动固件、CANN软件（Toolkit、ops和NNAL）并配置CANN环境变量，具体请参考《[CANN 快速安装](https://www.hiascend.com/cann/download?versionId=783&ids=d806%2Ch0501%2Ch0601%2Ch0703)》。
+
+   CANN软件提供进程级环境变量设置脚本，训练或推理场景下使用NPU执行业务代码前需要调用该脚本，否则业务代码将无法执行。
+
+   ```shell
+   # 非root用户的默认安装路径
+   source ${HOME}/Ascend/cann/set_env.sh
+   source ${HOME}/Ascend/nnal/atb/set_env.sh
+   ```
+
+   ```shell
+   # root用户默认安装路径
+   source /usr/local/Ascend/cann/set_env.sh
+   source /usr/local/Ascend/nnal/atb/set_env.sh
+   ```
+
+   以上命令以CANN离线安装场景未指定安装路径为例，给出了不同用户的默认安装路径及对应的配置环境变量的命令。
+
+   若用户指定安装路径或使用其他安装方式，请参考《[CANN 软件安装](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0000.html)》查阅对应的配置环境变量的命令。
+
+3. 安装PyTorch以及TorchNPU
+
+   根据引导安装配套版本的PyTorch以及TorchNPU，具体请参考《[TorchNPU 快速安装](https://www.hiascend.com/developer/software/ai-frameworks/pytorch/download?versionId=175&ids=89dda9ba9de741349efa03687a487678%2C98%2C107%2C1%2C6%2C177%2C)》。
+
+   > [!NOTE]
+   >
+   > - 更多TorchNPU插件版本请单击[Link](https://gitcode.com/ascend/pytorch/releases)。
+   > - TorchNPU相关文档请参见《[TorchNPU使用导读](https://www.hiascend.com/document/detail/zh/Pytorch/latest/index/index.html)》。
+
+4. 安装Triton-Ascend
+
+   安装配套版本的Triton-Ascend，请参考[Triton-Ascend安装指南](https://triton-ascend.readthedocs.io/zh-cn/latest/installation_guide.html#id1)，获取配套版本的Triton-Ascend安装指令。
+
+   可参考如下安装命令：
+
+   ```shell
+   pip install triton-ascend==3.2.2 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
+   ```
+
+   > [!NOTE]
+   >
+   > Triton-Ascend 3.2.0及以下版本，Triton-Ascend和Triton不能同时存在。需先卸载社区Triton，再安装Triton-Ascend。
+
+5. 安装MindSpeed Core训练加速库
+
+    ```shell
+    git clone https://gitcode.com/ascend/MindSpeed.git
+    cd MindSpeed
+    git checkout master  # 切换至MindSpeed Core的master分支
+    pip3 install -r requirements.txt
+    pip3 install -e .
+    cd ..
+    ```
+
+6. 安装FSDPTurbo加速库
+
+    ```shell
+    git clone https://gitcode.com/Ascend/FSDPTurbo.git
+    cd FSDPTurbo
+    pip3 install -e .
+    cd ..
+    ```
+
+7. 准备MindSpeed LLM及Megatron-LM源码
+
+    ```shell
+    git clone https://gitcode.com/ascend/MindSpeed-LLM.git
+    git clone https://github.com/NVIDIA/Megatron-LM.git  # 从GitHub下载Megatron-LM，请确保网络能访问
+    cd Megatron-LM
+    git checkout core_v0.12.1
+    cp -r megatron ../MindSpeed-LLM/
+    cd ../MindSpeed-LLM
+    git checkout master
+    mkdir logs
+
+    pip3 install -r requirements.txt  # 安装其余依赖库
+    ```
+
+### 方式三：源码安装（Submodule统一安装）
+
+> [!NOTE]
+>
+> - 采用此方式后，上述[方式二：源码安装](#方式二源码安装)中的逐个依赖仓库拉取与版本切换步骤可通过一条命令完成。
+> - 若已通过方式二手动clone了相关仓库，请先删除对应目录后再使用本方式，避免目录冲突。
+
+MindSpeed LLM支持通过Git Submodule统一管理三方依赖仓库，便于版本追踪与协同开发。子模块统一放置在`3rdparty/`目录下，其中：
+
+- **MindSpeed**：默认拉取远端master分支最新代码。
+- **FSDPTurbo**：默认拉取远端main分支最新代码。
+- **Megatron-LM**：固定在tag `core_v0.12.1`。
+
+1. 准备基础环境
+
+   准备虚拟环境、CANN、TorchNPU、Triton-Ascend等基础环境准备，详情请参考[方式二：源码安装](#方式二源码安装)的步骤1-4。
+
+2. 下载源码
+
+   在完成MindSpeed LLM源码克隆后，初始化并拉取全部子模块：
+
+   ```shell
+   git clone https://gitcode.com/ascend/MindSpeed-LLM.git
+   cd MindSpeed-LLM
+   git submodule update --init --recursive
+   git submodule update --init --remote 3rdparty/MindSpeed 3rdparty/FSDPTurbo
+   ```
+
+   > [!NOTE]
+   >
+   > 如需更新Submodule，详见如下操作：
+   > - MindSpeed和FSDPTurbo默认跟踪远端最新，初始化时已完成刷新，后需继续拉取最新提交可执行`git submodule update --init --remote 3rdparty/MindSpeed 3rdparty/FSDPTurbo`。(3rdparty目录下commit可不关注)
+   > - Megatron-LM固定在相应版本，执行`git submodule update --init`会始终检出该版本，不会自动更新。如需切换版本，参见下方章节[（可选）切换子模块版本](#checkout_submodules)。
+
+   源码结构如下：
+
+   ```shell
+   MindSpeed-LLM/
+   ├── 3rdparty/
+   │   ├── MindSpeed/          # 加速库（对应方式二步骤5）
+   │   ├── FSDPTurbo/          # FSDP加速库（对应方式二步骤6）
+   │   └── Megatron-LM/        # Megatron-LM核心代码（对应方式二步骤7）
+   └── ...
+   ```
+
+3. 安装依赖子模块
+
+   拉取子模块后，按顺序安装各组件依赖：
+
+   ```shell
+   # 安装MindSpeed依赖
+   pip3 install -r 3rdparty/MindSpeed/requirements.txt
+
+   # 将依赖仓库源码软链接到MindSpeed LLM根目录
+   ln -s 3rdparty/MindSpeed/mindspeed mindspeed
+   ln -s 3rdparty/FSDPTurbo/fsdpturbo fsdpturbo
+   ln -s 3rdparty/Megatron-LM/megatron megatron
+
+   # 安装MindSpeed LLM其余依赖
+   pip3 install -r requirements.txt
+   ```
+
+   > [!NOTE]
+   >
+   > - MindSpeed和FSDPTurbo通过软链接方式安装，无需`pip3 install -e .`，子模块代码更新后软链接自动生效，无需重新安装。
+   > - Megatron-LM子模块包含完整仓库，需将`megatron/`源码目录链接至MindSpeed LLM根目录下使用。
+   > - 若需使用`pip3 install -e .`方式安装MindSpeed或FSDPTurbo，可分别进入对应子模块目录执行。
+
+4. （可选）切换子模块版本<div id="checkout_submodules"/>
+
+   如需切换某个子模块到指定分支或标签，例如将Megatron-LM切换到其他版本：
+
+   ```shell
+   cd 3rdparty/Megatron-LM
+   git checkout <tag或分支名>
+   cd ../..
+   ```
+
+   如需将MindSpeed或FSDPTurbo更新到远端最新：
+
+   ```shell
+   cd 3rdparty/MindSpeed
+   git pull origin master
+   cd ../..
+   ```
+
+   如需将版本切换改动提交上仓:
+
+   ```shell
+   git add 3rdparty/<改动的仓库名称>
+   git commit -m "chore: pin <改动的仓库名称> to <版本号>"
+   ```

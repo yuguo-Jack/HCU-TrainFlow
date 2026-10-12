@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
 path: docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx
-raw_sha256: 06a4185f2919ccec23ecc914036acd745ba6d5f201bc575cefb37e366c461dc1
+raw_sha256: 34a853c20a6e17711fb06224af66e7e472455fafb8f89a792ecd4e768ee818c4
 sources: []
-generated_body_sha256: eef602691121cf429e00833bc162f725488fa8b674bdcb1ba748e21be341b095
+generated_body_sha256: bb51f0cabba6a1bfaedcba241339f3ff3fb8ea9233b77a4dd7de9c23732b1488
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/docs/docs/advanced_features/cuda_graph_for_multi_modal_encoder.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -97,7 +97,7 @@ it; naming a backend locks the choice and skips that rule:
 SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-VL-8B-Instruct \
-  --cuda-graph-backend-prefill tc_piecewise \
+  --cuda-graph-backend-prefill breakable \
   --cuda-graph-max-bs-prefill 4096 \
   --cuda-graph-tc-compiler eager
 ```

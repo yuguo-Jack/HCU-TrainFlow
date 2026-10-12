@@ -1,0 +1,178 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "187a0eb98aa42341d703f83421d693fa7585581b",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\n`FlashMLASparseImpl.__init__` reserves the bf16 prefill KV workspace (`5 * max_model_len * head_size * 2` bytes) for every quantized DS-MLA cache. Only the separate prefill/decode path reads it: the mixed-batch path, which the builder selects below `MIN_HEADS_FOR_BF16_PREFILL` heads per rank (`fp8_use_mixed_batch`), runs the fp8 decode kernel over the whole batch and never touches it. The reservation still comes out of the KV cache budget.\n\nAt long context the buffer is not small. The note in `get_prefill_workspace_size` sizes it at ~900 MB for `max_model_len=163840` and calls it free because it sits under the MoE workspace; at `max_model_len=786432` and `head_size=576` it is 4.22 GiB per rank.\n\nThe three buffers added in #57575 (padded query, padded output, output; 1.19 GiB at `max_num_batched_tokens=8192` with 16 heads padded to 64) stay reserved on both paths. The mixed-batch path does not read them on main today, but #60220 stages the mixed-batch kernel's q and out in them, and it unpacks them from the end of `workspace_specs`. The first revision of this PR dropped them too; with #60220 applied that fails on the first forward.\n\nMeasured on `Inferact/GLM-5.3-NVFP4`, TP4 + DCP4 (16 heads per rank, mixed-batch path), `fp8_ds_mla`, `--max-model-len 786432 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.945`, MTP 3, 4x H200, nightly `af7f9488c`:\n\n| | before | first revision (all prefill buffers skipped) |\n|---|---:|---:|\n| `Model loading took` (per rank) | 116.55 GiB | 111.15 GiB |\n| GPU KV cache size | 913,664 tokens | 1,045,248 tokens |\n\nThe current revision keeps the 1.19 GiB of #57575 buffers, so it should free 4.22 of those 5.40 GiB per rank, roughly 1.016M KV tokens on this config. I have not re-measured it on the serving config.\n\nChanges:\n\n- `FlashMLASparseImpl._use_fp8_mixed_batch(num_heads, use_hisparse, pcp_dcp_kv_gather)` holds the condition; the metadata builder and the impl both call it, so the two cannot drift.\n- The impl computes `pcp_dcp_kv_gather` and `fp8_use_mixed_batch` up front and appends the `max_model_len`-sized prefill buffer (and the PCP+DCP gather buffer) only when the separate path is selected. The `max_num_batched_tokens` buffers are appended on both paths.\n- `forward_mqa` asserts `attn_metadata.fp8_use_mixed_batch == self.fp8_use_mixed_batch` before dispatching on the fp8 cache. If the two ever disagreed, the separate path would fail on unpacking `get_simultaneous(*self.workspace_specs)`; the assert names the cause instead.\n- The dead `assert vllm_config is not None` is gone (`get_current_vllm_config()` raises rather than returning `None`).\n\nFreeing this reservation also removes slack that was quietly covering an unprofiled transient in the DCP top-k merge of the sparse indexer; that one is filed as #59317 (fix in #59367). Our measurements above keep the default cudagraph memory estimate, which leaves enough headroom for it.\n\nNot a duplicate: `gh pr list --state open --search` for \"flashmla sparse workspace\", \"mixed batch prefill workspace\" and \"prefill workspace mixed batch sparse\" turns up no PR that gates this reservation. #57575 (merged) moved the reservation before KV cache sizing, which is what made the cost visible; #56902 (merged) releases stale views after workspace growth; #42856 (open) lowers the multiplier on SM120 only; #60220 (open) reuses the `max_num_batched_tokens` buffers on the mixed-batch path, which this revision keeps.\n\n## Test Plan\n\n`tests/v1/attention/test_sparse_mla_backends.py`:\n\n- `test_fp8_mixed_batch_path_reserves_no_prefill_workspace`: builds a `FlashMLASparseImpl` with `fp8_ds_mla` under `set_current_vllm_config`, with `current_workspace_manager` replaced by a stub that records the `get_simultaneous` arguments, for heads 16/32, HiSparse on/off, and (PCP, DCP) = (1, 1) / (2, 2). The mixed-batch case must reserve `q_concat` plus the three `max_num_batched_tokens` buffers and nothing sized by `max_model_len`; every other case must reserve the `5 * max_model_len` prefill buffer and the expected number of specs (5, or 6 with the PCP+DCP gather buffer).\n- `test_fp8_mixed_batch_requires_few_heads_without_hisparse_or_kv_gather`: truth table of the helper.\n- `test_flashmla_fp8_paths_accept_decode_subset`: the impl stub carries `fp8_use_mixed_batch` for the new parity assert.\n- `test_sparse_backend_decode_correctness`: `tensor_parallel_size=8` added (16 heads per rank, so the fp8 mixed-batch path runs against the locked workspace); skipped for the FlashInfer TRTLLM backend, which this change does not touch.\n\nCommands (1x H200, `vllm/vllm-openai:nightly` at `af7f9488c` with this branch's `flashmla_sparse.py` and test file mounted; both files are identical between `af7f9488c` and this PR's base):\n\n```\npytest tests/v1/attention/test_sparse_mla_backends.py -o addopts= -q \\\n  -k \"fp8_mixed_batch_path_reserves_no_prefill_workspace or fp8_mixed_batch_requires_few_heads or fp8_paths_accept_decode_subset\"\npytest tests/v1/attention/test_sparse_mla_backends.py -o addopts= -q \\\n  -k \"decode_correctness and FlashMLA and fp8_ds_mla\"\n\n# the same two selections plus #60220's test, with #60220 applied on top\npytest tests/v1/attention/test_sparse_mla_backends.py -o addopts= -q \\\n  -k \"decode_correctness and FlashMLA and fp8_ds_mla or fp8_mixed_batch_stages_in_workspace or <unit selection above>\"\n\npre-commit run ruff-check ruff-format --files vllm/v1/attention/backends/mla/flashmla_sparse.py tests/v1/attention/test_sparse_mla_backends.py\n```\n\n## Test Result\n\nUnit tests on the unpatched `flashmla_sparse.py`, mixed-batch case:\n\n```\n____ test_fp8_mixed_batch_path_reserves_no_prefill_workspace[1-1-False-16] _____\nE           assert 5 == 4\nE            +  where 5 = len((((8192, 16, 576), torch.bfloat16), ((20480, 576), torch.bfloat16), ((8192, 64, 576), torch.bfloat16), ((8192, 64, 512), torch.bfloat16), ((8192, 16, 512), torch.bfloat16)))\n```\n\n(the whole selection: `12 failed, 2 passed`; the truth-table cases fail on the missing helper, the other spec cases on the missing `fp8_use_mixed_batch` attribute.)\n\nWith this change:\n\n```\nunit selection:                   14 passed, 996 deselected\ndecode_correctness (FlashMLA, fp8_ds_mla, TP 1/2/4/8): 56 passed, 56 skipped\n                                  (all skips: FLASHMLA_SPARSE does not support block_size=32)\nwith #60220 applied:              72 passed, 56 skipped\nfirst revision + #60220:          14 failed (all TP=8 decode_correctness cases)\n                                  ValueError: not enough values to unpack (expected at least 3, got 1)\n```\n\nruff check / ruff format (0.14.0, the pre-commit pin): clean on both files.\n\nServing: the first revision runs in the image serving GLM-5.3 on TP4 + DCP4 with the workspace locked (8 x 32K fresh prefills, needle retrieval at 230K tokens 3/3, three 544K-token cold prompts 3/3). The current revision reserves a superset of what that one did, and the mixed-batch path reads none of the extra buffers on main, so no model evaluation was run for this PR.\n\nAI assistance (Claude Code) was used for the implementation, the tests and this description.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @drakosha.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-10T16:44:15Z",
+            "updatedAt": "2026-10-10T16:44:15Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59319#issuecomment-6099835626"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWuUGuo=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "01a4dfeda6993c08086085ba79a2dfb240a3376d",
+      "headRepository": {
+        "nameWithOwner": "drakosha/vllm"
+      },
+      "merged": false,
+      "number": 59319,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-29T23:29:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59319#pullrequestreview-5359741340"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wOS0yOVQyMzoyOToyN1q0MjAyNi0wOS0yOVQyMzoyOToyN1rPAAAAAT93KZw=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Bugfix][Attention] Skip the FlashMLA sparse bf16 prefill workspace on the fp8 mixed-batch path",
+      "updatedAt": "2026-10-10T17:41:48Z",
+      "url": "https://github.com/vllm-project/vllm/pull/59319"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "187a0eb98aa42341d703f83421d693fa7585581b"
+    },
+    "body": "## Purpose\n\n`FlashMLASparseImpl.__init__` reserves the bf16 prefill KV workspace (`5 * max_model_len * head_size * 2` bytes) for every quantized DS-MLA cache. Only the separate prefill/decode path reads it: the mixed-batch path, which the builder selects below `MIN_HEADS_FOR_BF16_PREFILL` heads per rank (`fp8_use_mixed_batch`), runs the fp8 decode kernel over the whole batch and never touches it. The reservation still comes out of the KV cache budget.\n\nAt long context the buffer is not small. The note in `get_prefill_workspace_size` sizes it at ~900 MB for `max_model_len=163840` and calls it free because it sits under the MoE workspace; at `max_model_len=786432` and `head_size=576` it is 4.22 GiB per rank.\n\nThe three buffers added in #57575 (padded query, padded output, output; 1.19 GiB at `max_num_batched_tokens=8192` with 16 heads padded to 64) stay reserved on both paths. The mixed-batch path does not read them on main today, but #60220 stages the mixed-batch kernel's q and out in them, and it unpacks them from the end of `workspace_specs`. The first revision of this PR dropped them too; with #60220 applied that fails on the first forward.\n\nMeasured on `Inferact/GLM-5.3-NVFP4`, TP4 + DCP4 (16 heads per rank, mixed-batch path), `fp8_ds_mla`, `--max-model-len 786432 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.945`, MTP 3, 4x H200, nightly `af7f9488c`:\n\n| | before | first revision (all prefill buffers skipped) |\n|---|---:|---:|\n| `Model loading took` (per rank) | 116.55 GiB | 111.15 GiB |\n| GPU KV cache size | 913,664 tokens | 1,045,248 tokens |\n\nThe current revision keeps the 1.19 GiB of #57575 buffers, so it should free 4.22 of those 5.40 GiB per rank, roughly 1.016M KV tokens on this config. I have not re-measured it on the serving config.\n\nChanges:\n\n- `FlashMLASparseImpl._use_fp8_mixed_batch(num_heads, use_hisparse, pcp_dcp_kv_gather)` holds the condition; the metadata builder and the impl both call it, so the two cannot drift.\n- The impl computes `pcp_dcp_kv_gather` and `fp8_use_mixed_batch` up front and appends the `max_model_len`-sized prefill buffer (and the PCP+DCP gather buffer) only when the separate path is selected. The `max_num_batched_tokens` buffers are appended on both paths.\n- `forward_mqa` asserts `attn_metadata.fp8_use_mixed_batch == self.fp8_use_mixed_batch` before dispatching on the fp8 cache. If the two ever disagreed, the separate path would fail on unpacking `get_simultaneous(*self.workspace_specs)`; the assert names the cause instead.\n- The dead `assert vllm_config is not None` is gone (`get_current_vllm_config()` raises rather than returning `None`).\n\nFreeing this reservation also removes slack that was quietly covering an unprofiled transient in the DCP top-k merge of the sparse indexer; that one is filed as #59317 (fix in #59367). Our measurements above keep the default cudagraph memory estimate, which leaves enough headroom for it.\n\nNot a duplicate: `gh pr list --state open --search` for \"flashmla sparse workspace\", \"mixed batch prefill workspace\" and \"prefill workspace mixed batch sparse\" turns up no PR that gates this reservation. #57575 (merged) moved the reservation before KV cache sizing, which is what made the cost visible; #56902 (merged) releases stale views after workspace growth; #42856 (open) lowers the multiplier on SM120 only; #60220 (open) reuses the `max_num_batched_tokens` buffers on the mixed-batch path, which this revision keeps.\n\n## Test Plan\n\n`tests/v1/attention/test_sparse_mla_backends.py`:\n\n- `test_fp8_mixed_batch_path_reserves_no_prefill_workspace`: builds a `FlashMLASparseImpl` with `fp8_ds_mla` under `set_current_vllm_config`, with `current_workspace_manager` replaced by a stub that records the `get_simultaneous` arguments, for heads 16/32, HiSparse on/off, and (PCP, DCP) = (1, 1) / (2, 2). The mixed-batch case must reserve `q_concat` plus the three `max_num_batched_tokens` buffers and nothing sized by `max_model_len`; every other case must reserve the `5 * max_model_len` prefill buffer and the expected number of specs (5, or 6 with the PCP+DCP gather buffer).\n- `test_fp8_mixed_batch_requires_few_heads_without_hisparse_or_kv_gather`: truth table of the helper.\n- `test_flashmla_fp8_paths_accept_decode_subset`: the impl stub carries `fp8_use_mixed_batch` for the new parity assert.\n- `test_sparse_backend_decode_correctness`: `tensor_parallel_size=8` added (16 heads per rank, so the fp8 mixed-batch path runs against the locked workspace); skipped for the FlashInfer TRTLLM backend, which this change does not touch.\n\nCommands (1x H200, `vllm/vllm-openai:nightly` at `af7f9488c` with this branch's `flashmla_sparse.py` and test file mounted; both files are identical between `af7f9488c` and this PR's base):\n\n```\npytest tests/v1/attention/test_sparse_mla_backends.py -o addopts= -q \\\n  -k \"fp8_mixed_batch_path_reserves_no_prefill_workspace or fp8_mixed_batch_requires_few_heads or fp8_paths_accept_decode_subset\"\npytest tests/v1/attention/test_sparse_mla_backends.py -o addopts= -q \\\n  -k \"decode_correctness and FlashMLA and fp8_ds_mla\"\n\n# the same two selections plus #60220's test, with #60220 applied on top\npytest tests/v1/attention/test_sparse_mla_backends.py -o addopts= -q \\\n  -k \"decode_correctness and FlashMLA and fp8_ds_mla or fp8_mixed_batch_stages_in_workspace or <unit selection above>\"\n\npre-commit run ruff-check ruff-format --files vllm/v1/attention/backends/mla/flashmla_sparse.py tests/v1/attention/test_sparse_mla_backends.py\n```\n\n## Test Result\n\nUnit tests on the unpatched `flashmla_sparse.py`, mixed-batch case:\n\n```\n____ test_fp8_mixed_batch_path_reserves_no_prefill_workspace[1-1-False-16] _____\nE           assert 5 == 4\nE            +  where 5 = len((((8192, 16, 576), torch.bfloat16), ((20480, 576), torch.bfloat16), ((8192, 64, 576), torch.bfloat16), ((8192, 64, 512), torch.bfloat16), ((8192, 16, 512), torch.bfloat16)))\n```\n\n(the whole selection: `12 failed, 2 passed`; the truth-table cases fail on the missing helper, the other spec cases on the missing `fp8_use_mixed_batch` attribute.)\n\nWith this change:\n\n```\nunit selection:                   14 passed, 996 deselected\ndecode_correctness (FlashMLA, fp8_ds_mla, TP 1/2/4/8): 56 passed, 56 skipped\n                                  (all skips: FLASHMLA_SPARSE does not support block_size=32)\nwith #60220 applied:              72 passed, 56 skipped\nfirst revision + #60220:          14 failed (all TP=8 decode_correctness cases)\n                                  ValueError: not enough values to unpack (expected at least 3, got 1)\n```\n\nruff check / ruff format (0.14.0, the pre-commit pin): clean on both files.\n\nServing: the first revision runs in the image serving GLM-5.3 on TP4 + DCP4 with the workspace locked (8 x 32K fresh prefills, needle retrieval at 230K tokens 3/3, three 544K-token cold prompts 3/3). The current revision reserves a superset of what that one did, and the mixed-batch path reads none of the extra buffers on main, so no model evaluation was run for this PR.\n\nAI assistance (Claude Code) was used for the implementation, the tests and this description.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "drakosha/vllm"
+      },
+      "sha": "01a4dfeda6993c08086085ba79a2dfb240a3376d"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/59319",
+    "merged": false,
+    "number": 59319,
+    "state": "open",
+    "title": "[Bugfix][Attention] Skip the FlashMLA sparse bf16 prefill workspace on the fp8 mixed-batch path",
+    "updated_at": "2026-10-10T17:41:48Z"
+  },
+  "files": [
+    {
+      "additions": 89,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/01a4dfeda6993c08086085ba79a2dfb240a3376d/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py",
+      "changes": 90,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py?ref=01a4dfeda6993c08086085ba79a2dfb240a3376d",
+      "deletions": 1,
+      "filename": "tests/v1/attention/test_sparse_mla_backends.py",
+      "patch": "@@ -81,10 +81,12 @@\n     FlashInferMLASparseSM120Impl,\n )\n from vllm.v1.attention.backends.mla.flashmla_sparse import (\n+    MIN_HEADS_FOR_BF16_PREFILL,\n     FlashMLASparseBackend,\n     FlashMLASparseImpl,\n     FlashMLASparseMetadata,\n     FlashMLASparseMetadataBuilder,\n+    get_prefill_workspace_size,\n     triton_convert_req_index_to_global_index,\n )\n from vllm.v1.attention.backends.mla.index_group import (\n@@ -411,7 +413,7 @@ def unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:\n     \"kv_cache_dtype\",\n     [\"auto\", \"fp8\", \"fp8_ds_mla\", \"nvfp4_ds_mla\"],\n )\n-@pytest.mark.parametrize(\"tensor_parallel_size\", [1, 2, 4])\n+@pytest.mark.parametrize(\"tensor_parallel_size\", [1, 2, 4, 8])\n @pytest.mark.parametrize(\"block_size\", [32, 64])\n @pytest.mark.parametrize((\"q_scale\", \"k_scale\"), [(1.0, 1.0), (2.0, 3.0)])\n @pytest.mark.parametrize(\n@@ -458,6 +460,11 @@ def test_sparse_backend_decode_correctness(\n     if kv_cache_dtype not in backend_cls.supported_kv_cache_dtypes:\n         pytest.skip(f\"{backend_cls.get_name()} does not support {kv_cache_dtype}\")\n \n+    if tensor_parallel_size == 8 and backend_cls != FlashMLASparseBackend:\n+        # 16 heads per rank drives the FlashMLA fp8 mixed-batch path, whose\n+        # workspace is reserved separately from the bf16 prefill buffers.\n+        pytest.skip(\"TP=8 only exercises the FlashMLA mixed-batch path\")\n+\n     if (\n         backend_cls == FlashMLASparseBackend\n         and kv_cache_dtype.startswith(\"fp8\")\n@@ -3931,6 +3938,7 @@ def run_kernel(**kwargs):\n         index_group_index=0,\n         dcp_world_size=1,\n         pcp_dcp_kv_gather=False,\n+        fp8_use_mixed_batch=use_mixed_batch,\n         need_to_return_lse_for_decode=False,\n         _fp8_flash_mla_kernel=run_kernel,\n         _convert_logical_to_physical_topk=(\n@@ -4055,6 +4063,86 @@ def test_fp8_dcp_head_envelope_guard(local_heads, dcp_world_size, should_raise):\n         assert local_pad == gathered_pad\n \n \n+@pytest.mark.parametrize(\n+    (\"num_heads\", \"use_hisparse\", \"pcp_dcp_kv_gather\", \"expected\"),\n+    [\n+        (MIN_HEADS_FOR_BF16_PREFILL - 1, False, False, True),\n+        (MIN_HEADS_FOR_BF16_PREFILL, False, False, False),\n+        (MIN_HEADS_FOR_BF16_PREFILL - 1, True, False, False),\n+        (MIN_HEADS_FOR_BF16_PREFILL - 1, False, True, False),\n+    ],\n+)\n+def test_fp8_mixed_batch_requires_few_heads_without_hisparse_or_kv_gather(\n+    num_heads, use_hisparse, pcp_dcp_kv_gather, expected\n+):\n+    assert (\n+        FlashMLASparseImpl._use_fp8_mixed_batch(\n+            num_heads, use_hisparse, pcp_dcp_kv_gather\n+        )\n+        is expected\n+    )\n+\n+\n+@pytest.mark.parametrize(\"num_heads\", [16, 32])\n+@pytest.mark.parametrize(\"use_hisparse\", [False, True])\n+@pytest.mark.parametrize((\"pcp_size\", \"dcp_size\"), [(1, 1), (2, 2)])\n+def test_fp8_mixed_batch_path_reserves_no_prefill_workspace(\n+    dist_init, monkeypatch, num_heads, use_hisparse, pcp_size, dcp_size\n+):\n+    \"\"\"The bf16 prefill KV buffer scales with max_model_len and is only read by\n+    the separate prefill/decode path; reserving it on the mixed-batch path takes\n+    GiBs off the KV cache budget at long context for nothing. The buffers sized\n+    by max_num_batched_tokens stay on both paths.\"\"\"\n+    head_size = 576\n+    vllm_config = _build_sparse_dcp_vllm_config(num_heads, dcp_size)\n+    vllm_config.parallel_config.prefill_context_parallel_size = pcp_size\n+    if use_hisparse:\n+        vllm_config.attention_config.hisparse_config = HiSparseConfig()\n+\n+    reserved = []\n+    monkeypatch.setattr(\n+        \"vllm.v1.attention.backends.mla.flashmla_sparse.current_workspace_manager\",\n+        lambda: SimpleNamespace(get_simultaneous=lambda *specs: reserved.append(specs)),\n+    )\n+    with set_current_vllm_config(vllm_config):\n+        impl = FlashMLASparseImpl(\n+            num_heads=num_heads,\n+            head_size=head_size,\n+            scale=1.0,\n+            num_kv_heads=1,\n+            alibi_slopes=None,\n+            sliding_window=None,\n+            kv_cache_dtype=\"fp8_ds_mla\",\n+            logits_soft_cap=None,\n+            attn_type=\"decoder\",\n+            kv_sharing_target_layer_name=None,\n+            q_lora_rank=None,\n+            kv_lora_rank=512,\n+            qk_nope_head_dim=128,\n+            qk_rope_head_dim=64,\n+            qk_head_dim=192,\n+            v_head_dim=128,\n+            kv_b_proj=MagicMock(),\n+        )\n+\n+    mixed_batch = num_heads < MIN_HEADS_FOR_BF16_PREFILL and not (\n+        use_hisparse or pcp_size > 1\n+    )\n+    (specs,) = reserved\n+    assert list(specs) == impl.workspace_specs\n+    max_tokens = vllm_config.scheduler_config.max_num_batched_tokens\n+    q_concat = ((max_tokens, num_heads, head_size), torch.bfloat16)\n+    prefill_rows = get_prefill_workspace_size(vllm_config.model_config.max_model_len)\n+    assert specs[0] == q_concat\n+    if mixed_batch:\n+        assert len(specs) == 4\n+        assert all(shape[0] == max_tokens for shape, _ in specs)\n+    else:\n+        assert ((prefill_rows, head_size), torch.bfloat16) in specs\n+        assert len(specs) == (6 if pcp_size > 1 else 5)\n+    assert impl.fp8_use_mixed_batch is mixed_batch\n+\n+\n def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):\n     \"\"\"A decode row whose top-k shard holds no local candidates (all -1) has\n     undefined kernel out/lse; it must come back as (0, -inf), the identity of",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/01a4dfeda6993c08086085ba79a2dfb240a3376d/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py",
+      "sha": "f875bc7b5ff8f8e813257653e6016996269c1369",
+      "status": "modified"
+    },
+    {
+      "additions": 43,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/01a4dfeda6993c08086085ba79a2dfb240a3376d/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Fflashmla_sparse.py",
+      "changes": 67,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Fflashmla_sparse.py?ref=01a4dfeda6993c08086085ba79a2dfb240a3376d",
+      "deletions": 24,
+      "filename": "vllm/v1/attention/backends/mla/flashmla_sparse.py",
+      "patch": "@@ -439,10 +439,8 @@ def __init__(\n         # PCP+DCP attends prefill rows over the DCP-gathered KV, which only the\n         # separate prefill/decode path can do.\n         self.pcp_dcp_kv_gather = self.use_pcp and self.dcp_world_size > 1\n-        self.fp8_use_mixed_batch = (\n-            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL\n-            and not self.use_hisparse\n-            and not self.pcp_dcp_kv_gather\n+        self.fp8_use_mixed_batch = FlashMLASparseImpl._use_fp8_mixed_batch(\n+            self.num_heads, self.use_hisparse, self.pcp_dcp_kv_gather\n         )\n \n         if parallel_config.decode_context_parallel_size > 1:\n@@ -725,6 +723,16 @@ def _compute_fp8_decode_padded_heads(num_heads: int) -> int:\n         # Compute padded head count for decode\n         return 64 if num_heads <= 64 else 128\n \n+    @staticmethod\n+    def _use_fp8_mixed_batch(\n+        num_heads: int, use_hisparse: bool, pcp_dcp_kv_gather: bool\n+    ) -> bool:\n+        return (\n+            num_heads < MIN_HEADS_FOR_BF16_PREFILL\n+            and not use_hisparse\n+            and not pcp_dcp_kv_gather\n+        )\n+\n     def __init__(\n         self,\n         num_heads: int,\n@@ -797,32 +805,40 @@ def __init__(\n                 \"the bf16 sparse path is not supported under DCP.\"\n             )\n \n-        self.pcp_dcp_kv_gather = False\n+        parallel_config = vllm_config.parallel_config\n+        self.pcp_dcp_kv_gather = (\n+            parallel_config.prefill_context_parallel_size > 1\n+            and parallel_config.decode_context_parallel_size > 1\n+        )\n+        self.fp8_use_mixed_batch = self._use_fp8_mixed_batch(\n+            num_heads,\n+            vllm_config.attention_config.hisparse_config is not None,\n+            self.pcp_dcp_kv_gather,\n+        )\n         self.workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [\n             (q_concat_shape, torch.bfloat16)\n         ]\n         if kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS:\n-            # Reserve workspace during initialization\n-            assert vllm_config is not None and vllm_config.model_config is not None\n-            prefill_workspace_size = get_prefill_workspace_size(\n-                vllm_config.model_config.max_model_len\n-            )\n-            parallel_config = vllm_config.parallel_config\n-            self.pcp_dcp_kv_gather = (\n-                parallel_config.prefill_context_parallel_size > 1\n-                and parallel_config.decode_context_parallel_size > 1\n-            )\n-            shard_rows = prefill_workspace_size\n-            if self.pcp_dcp_kv_gather:\n-                # PCP+DCP upconverts this rank's KV shard, then all-gathers the\n-                # shards into a workspace of the full prefill size.\n-                shard_rows //= parallel_config.decode_context_parallel_size\n-            self.prefill_workspace_shape = (shard_rows, self.q_head_size)\n-            self.workspace_specs.append((self.prefill_workspace_shape, torch.bfloat16))\n-            if self.pcp_dcp_kv_gather:\n+            # The bf16 prefill KV buffers scale with max_model_len and are only\n+            # read by the separate prefill/decode path.\n+            if not self.fp8_use_mixed_batch:\n+                assert vllm_config.model_config is not None\n+                prefill_workspace_size = get_prefill_workspace_size(\n+                    vllm_config.model_config.max_model_len\n+                )\n+                shard_rows = prefill_workspace_size\n+                if self.pcp_dcp_kv_gather:\n+                    # PCP+DCP upconverts this rank's KV shard, then all-gathers\n+                    # the shards into a workspace of the full prefill size.\n+                    shard_rows //= parallel_config.decode_context_parallel_size\n+                self.prefill_workspace_shape = (shard_rows, self.q_head_size)\n                 self.workspace_specs.append(\n-                    ((prefill_workspace_size, self.q_head_size), torch.bfloat16)\n+                    (self.prefill_workspace_shape, torch.bfloat16)\n                 )\n+                if self.pcp_dcp_kv_gather:\n+                    self.workspace_specs.append(\n+                        ((prefill_workspace_size, self.q_head_size), torch.bfloat16)\n+                    )\n             prefill_query_heads = num_heads\n             if self.pcp_dcp_kv_gather and self.dcp_world_size > self.pcp_world_size:\n                 prefill_query_heads *= parallel_config.tensor_parallel_size\n@@ -1437,6 +1453,9 @@ def forward_mqa(\n         topk_indices = self.topk_indices_buffer[:num_actual_toks]\n \n         use_fp8_cache = self.kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS\n+        if use_fp8_cache:\n+            # The workspace specs were reserved for this path at init.\n+            assert attn_metadata.fp8_use_mixed_batch == self.fp8_use_mixed_batch\n \n         lse: torch.Tensor | None = None\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/01a4dfeda6993c08086085ba79a2dfb240a3376d/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Fflashmla_sparse.py",
+      "sha": "1da0bda354f02cc24dbaaf1d7fac6e82ca795dca",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @drakosha.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-10T16:44:15Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59319#issuecomment-6099835626",
+      "updated_at": "2026-10-10T16:44:15Z",
+      "user": {
+        "login": "mergify"
+      }
+    }
+  ],
+  "number": 59319,
+  "refs": {
+    "base": {
+      "commit": "187a0eb98aa42341d703f83421d693fa7585581b",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "01a4dfeda6993c08086085ba79a2dfb240a3376d",
+      "repository": "drakosha/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59319#pullrequestreview-5359741340",
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-29T23:29:27Z",
+      "user": {
+        "login": "claude"
+      }
+    }
+  ]
+}

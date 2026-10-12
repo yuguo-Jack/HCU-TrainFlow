@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
 path: docs/docs/advanced_features/prefill_cp.mdx
-raw_sha256: ce2c3d36db7f46a7064e3fb7cede0127a18656fdaa8a4677dd8af6f278cbea4f
+raw_sha256: ccc32b5a95280f447524c4db64cb6d4f0a33f78e9c4ed4ca56dc6a0fcf8dfd39
 sources: []
-generated_body_sha256: 986a686688709a144df5da563ebef3db4516c7714b49b38abe4e99e9da341ed7
+generated_body_sha256: 6e498d37452dcd6b924ac2c1c30c08b1c5606957a1c87268cbb9461a2fd2f73f
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/prefill_cp.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/prefill_cp.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/docs/docs/advanced_features/prefill_cp.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -28,12 +28,11 @@ Upstream source document; original commands, claims and links require their stat
 
 ---
 title: "Prefill Context Parallelism"
-description: "Distribute prefill tokens across GPUs with zigzag and interleave strategies, and understand their integration with model execution and attention backends."
 ---
 
 Prefill context parallelism (CP) distributes the tokens of a prompt across an attention CP group. Each rank computes attention and, for models with an indexer, indexer operations for its local queries, while all-gather on the KV cache makes the required keys and values available. This lets multiple GPUs share the work of processing a long prompt.
 
-Unlike tensor parallelism (TP), which partitions attention heads and weights, prefill CP partitions the token dimension. Unlike [decode context parallelism (DCP)](https://docs.sglang.io/docs/advanced_features/dcp), it targets prefill computation rather than dividing the decode KV-cache scan and merging partial attention results. The two features have separate configuration and support constraints.
+To compare prefill CP with other common parallelism strategy: Tensor parallelism (TP) splits attention heads and weights, [Decode context parallelism (DCP)](https://docs.sglang.io/docs/advanced_features/dcp) shards the KV cache and its attention workload during decode, while prefill CP (PCP) splits prompt tokens across GPUs. Note that PCP and DCP are independent optimizations for different phases of inference.
 
 ## Why prefill context parallelism?
 
@@ -108,9 +107,9 @@ The eager runner preserves CP-local hidden states between pipeline stages and ga
 
 ### Prefill CP × speculative decoding
 
-Prefill CP can coexist with supported speculative-decoding configurations. The CP runner handles aligned speculative hidden-state inputs and gathers supported auxiliary outputs. This does not make decode or target verification context-parallel through the prefill strategy.
+Prefill CP can coexist with supported speculative-decoding configurations. The CP runner handles aligned speculative hidden-state inputs and gathers supported auxiliary outputs.
 
-### Prefill CP × CUDA graphs (Experimental)
+### Prefill CP × CUDA graphs
 
 The shared CP breakable-prefill-graph path currently requires `zigzag`, the `trtllm_mha` prefill backend, PP=1, and attention CP size equal to TP size. It uses CP-local static input buffers and selects capture buckets large enough for each rank's padded input. Support for combining other attention backends with prefill CP and Breakable CUDA Graph is under development.
 

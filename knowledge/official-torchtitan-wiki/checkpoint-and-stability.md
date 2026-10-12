@@ -15,34 +15,33 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/components/checkpointer/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: a385b4f49f7e170b6f4cbd5acf888aaad140bc5cc6b720789c5252def5c3a856
 - source: pytorch-torchtitan
   path: torchtitan/components/checkpointer/base.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: b5c261173bffe3a60a01fe708dd4cc77526b1ad80ede8fd882dd27abe960a3a7
 - source: pytorch-torchtitan
   path: torchtitan/components/checkpointer/dcp.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 04e293b4fe60ef655b13989198f48c2fabb480a8741704cf7de2cc718225be30
 - source: pytorch-torchtitan
   path: torchtitan/components/checkpointer/torch_checkpointing.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 6e26f9773054379b2f63f29347ac764734e9e3bd0b435e4dd7a74b15ddcf9e6d
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/ema.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
-  sha256: 25adab00ead2846704bbf6bf1b2fd9560d6e80008bc2048c2fad10a6116be4f8
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: d41f90389d35aa3ba0d3050fba312772c52d10428e53e7b3dd24aecf8144ea3c
 - source: pytorch-torchtitan
   path: torchtitan/experiments/torchft/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: d46632a55b147e5085c3ff1e0e05fb00a6ceb2be6001dabf102759fb63a87572
 - source: pytorch-torchtitan
   path: torchtitan/trainer.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e7a7162304a1741cfa86ef7969d7619f985f2263f9aace617bdc6955185c41f4
 ---
-
 # TorchTitan Checkpoint、恢复语义与长稳训练
 
 ## 恢复与导出必须区分
@@ -83,10 +82,14 @@ HCU 任务仍以已经部署的 Cluster Manager/容错系统为恢复控制方�
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/components/checkpointer/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/checkpointer/README.md)
-- [torchtitan/components/checkpointer/base.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/checkpointer/base.py)
-- [torchtitan/components/checkpointer/dcp.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/checkpointer/dcp.py)
-- [torchtitan/components/checkpointer/torch_checkpointing.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/checkpointer/torch_checkpointing.py)
-- [torchtitan/components/optim/ema.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/optim/ema.py)
-- [torchtitan/experiments/torchft/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/experiments/torchft/README.md)
-- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/trainer.py)
+- [torchtitan/components/checkpointer/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/checkpointer/README.md)
+- [torchtitan/components/checkpointer/base.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/checkpointer/base.py)
+- [torchtitan/components/checkpointer/dcp.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/checkpointer/dcp.py)
+- [torchtitan/components/checkpointer/torch_checkpointing.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/checkpointer/torch_checkpointing.py)
+- [torchtitan/components/optim/ema.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/ema.py)
+- [torchtitan/experiments/torchft/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/experiments/torchft/README.md)
+- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/trainer.py)
+
+## EMA 初始化峰值与恢复
+
+当前 EMA 改为直接在 pinned CPU 存储建立状态，避免先克隆一份 GPU 参数再搬到 CPU；恢复时还要匹配当次 DTensor 分布。详见 [并行与显存](parallelism-and-memory.md)。评估需同时覆盖初始化、稳态和 checkpoint/load 峰值，不能只拿优化后的 step 显存证明可恢复。

@@ -1,0 +1,62 @@
+---
+id: doc-ascend-mindspeed-llm-082c462ad061a879bacd
+title: Ascend/MindSpeed-LLM / docs/zh/pytorch/training/evaluation/evaluation_datasets/hellaswag_evaluation.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed-LLM
+commit: 2fed626696175480ae1ab3342a94017301a25209
+path: docs/zh/pytorch/training/evaluation/evaluation_datasets/hellaswag_evaluation.md
+raw_sha256: c69151186a57e33968835717e1d754dea185851adbf73da1c0d7519711ad4fbc
+sources: []
+generated_body_sha256: e73fbdf85eef2b9adad7769ba8f7a6658c407e36685369e4da35d0fa6146afbe
+source_state: current-scan
+---
+
+# Ascend/MindSpeed-LLM / docs/zh/pytorch/training/evaluation/evaluation_datasets/hellaswag_evaluation.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/evaluation/evaluation_datasets/hellaswag_evaluation.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# HellaSwag 评估
+
+## 使用场景
+
+### 问题描述
+
+HellaSwag 评估集主要用于测试自然语言处理模型在常识推理任务中的表现。通过提供上下文和多个选项，模型需要选择最合理的后续事件或句子结尾。这种任务设计旨在评估模型对复杂情境的理解能力以及常识推理能力。
+
+### 特性介绍
+
+HellaSwag 评估集专注于以下几个方面：
+
+1. **常识推理能力**：测试模型是否能够理解日常情境中的常识，并选择最合理的答案。
+2. **对抗性过滤**：通过对抗性过滤方法，确保数据集中的问题具有挑战性，能够揭示模型的弱点。
+3. **多样化场景**：数据集涵盖了多种生活场景，如体育、烹饪、家庭生活等，确保了数据的多样性和复杂性。
+4. **多选项设计**：每个问题包含一个背景描述和四个选项，要求模型从选项中选择最合理的答案。
+5. **高质量标注**：数据集经过严格的人工标注和验证，确保数据的准确性和一致性。
+6. **适用于多种任务**：可用于模型训练、评估以及优化，尤其在对话系统、智能助手等实际应用中表现突出。
+
+目前 MindSpeed-LLM 仓库对 HellaSwag 评估集支持以下的评估模式：
+
+## 使用方法
+
+### 直接评估模式
+
+#### 使用影响
+
+- 此模式将会把需要回答的问题直接输入到模型中，进行评估
+
+#### 推荐参数配置
+
+【--max-new-tokens】
+
+设置为 32，确保任务可以完整输出

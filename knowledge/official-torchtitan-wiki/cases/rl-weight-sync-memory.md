@@ -15,33 +15,32 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/rl/trainer.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 77eea0ae2d0db6b99c65a68db1db7b1844e38be0367d421f776eba2da92f82de
 - source: pytorch-torchtitan
   path: torchtitan/rl/generator.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
-  sha256: 109291afc2d11a6a0ccc39cd93374c32b9809ba003c82eb9966b9633eb415569
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: 01fb62b560f65880b33d51135d2fe10a49d15a00cb153fc56f8ff9003b585155
 - source: pytorch-torchtitan
   path: torchtitan/rl/model/vllm_wrapper.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: c65f7744b246873aa71b0161dbb471108abc77646118a9c70f6c483539c304da
 - source: pytorch-torchtitan
   path: torchtitan/rl/distributed/WEIGHT_SYNC.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: f04cf9beb18c900eab1c2aff5d079e1fe4fa4db03fda74286cf72ebd6ff3e669
 - source: pytorch-torchtitan
   path: tests/rl/unit_tests/cpu/test_vllm_wrapper.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: a188cead28dac31cf45fb49019a1a01e83333931dd6093c9691e46d2a4e0bc5b
 - source: pytorch-torchtitan
   path: tests/rl/unit_tests/cpu/test_weight_sync.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 0f180806965df19bfec4c7a323123ce676eb83c59c9acb611e54b6665c7c3d24
 pr_sources:
 - pr-pytorch--torchtitan-5107
 - pr-pytorch--torchtitan-5268
 ---
-
 # 案例：TitanRL 权重同步的训练侧暂存与生成侧峰值
 
 ## 两个不同的瓶颈
@@ -82,12 +81,16 @@ HCU 接入先查已有 RL/推理工程的同步实现与底层通信库，不机
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/rl/trainer.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/trainer.py)
-- [torchtitan/rl/generator.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/generator.py)
-- [torchtitan/rl/model/vllm_wrapper.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/model/vllm_wrapper.py)
-- [torchtitan/rl/distributed/WEIGHT_SYNC.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/distributed/WEIGHT_SYNC.md)
-- [tests/rl/unit_tests/cpu/test_vllm_wrapper.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/tests/rl/unit_tests/cpu/test_vllm_wrapper.py)
-- [tests/rl/unit_tests/cpu/test_weight_sync.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/tests/rl/unit_tests/cpu/test_weight_sync.py)
+- [torchtitan/rl/trainer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/trainer.py)
+- [torchtitan/rl/generator.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/generator.py)
+- [torchtitan/rl/model/vllm_wrapper.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/model/vllm_wrapper.py)
+- [torchtitan/rl/distributed/WEIGHT_SYNC.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/distributed/WEIGHT_SYNC.md)
+- [tests/rl/unit_tests/cpu/test_vllm_wrapper.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/tests/rl/unit_tests/cpu/test_vllm_wrapper.py)
+- [tests/rl/unit_tests/cpu/test_weight_sync.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/tests/rl/unit_tests/cpu/test_weight_sync.py)
 
 - [PR #5107：描述、review、评论及 diff](../../prs/pytorch--torchtitan/PR-5107.md)
 - [PR #5268：描述、review、评论及 diff](../../prs/pytorch--torchtitan/PR-5268.md)
+
+## 权重同步之外的生成故障
+
+当前生成器区分单请求 admission/generation 异常与 engine loop 故障，失败返回和 request 清理不能替代权重更新资格。同步测量期间若出现请求失败，记录成功率与失败分布，避免以完成请求减少造成的显存/耗时下降冒充优化。当前请求故障/路由释放细节见 [TitanRL](../titanrl.md)。

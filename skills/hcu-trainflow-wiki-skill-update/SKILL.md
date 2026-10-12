@@ -23,6 +23,8 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 ## 更新协议
 
+HCU 大知识库已更新或用户要求对齐时，先只读核对其当前提交与变更影响：覆盖三个阶段引用的工程、工具/命令、依赖与能力边界，再检查 TrainFlow 锁和本机已安装 Skill。确有过时用法才修订对应指南、适配器和测试；无变化的有效证据继续复用。将检查范围、结论与未验证项写入现有维护记录，随后推进局部 Wiki 深化，不以只更新官方 Wiki 代替此项。不得附带更新 HCU 大库或自动改变正在训练的依赖。
+
 1. 检查公共 GitHub/文档权限、限流与实际访问，不把 404 当成已删除。读取 knowledge/sources.json 与已有 observed/reviewed 游标。
 2. 先读项目 `docs/wiki.md` 与 `docs/knowledge-architecture.md` 的“自动更新时的内容筛选”。按问题复核收录范围；已确定低相关资料在 sources.json 的 document_exclusions 登记路径模式和理由，不能只删页面让下次同步重建，也不能因目录通配符匹配就全收。`wiki-update PROJECT SOURCE` 依次检查完整树、document_globs 新文档（排除上述规则）、PR/讨论与登记源码；也可单独使用 wiki-inventory / wiki-sync-docs / wiki-sync-prs / wiki-refresh。重复运行续完 pending，检查所有阶段错误及 excluded_paths。未监测的新文件从完整树发现，按最新 commit 用 wiki-triage 记录 knowledge-added/not-relevant/deferred，不能只抓 README 宣称全仓无变化。web 来源生成内容指纹，不能当 Git SHA；TE/cuDNN 同时检查代码与官方教程。
 3. PR 来源页保存描述、普通评论、行内评论、独立 review 顶层状态/正文、文件列表及原始 JSON。首次增量发现默认最近 30 天，已保留历史 PR 每七天重新查讨论；需要扩大范围用 --since，不能称已覆盖全部历史。主动按问题 wiki-search-pr 补重要未收录 PR，再 wiki-pr 和 wiki-code 追最终代码；可显式 --retain-project 纳入公共来源页。缺 patch/分页/权限时保留失败并补证据，不将标题或初始描述直接编成案例。
@@ -49,6 +51,8 @@ TraceLens 同时监测 `amd-agi-tracelens` 上游与 `hcu-tracelens` fork。查�
 精度方法维护还需复核项目 `docs/practices/model-accuracy-diagnosis.md` 与三个阶段的入口。按 HCU-Knowledge 的 dcu_probe 项目或当前源码核对 hcu-probe/hcuprobe 包与 CLI、配置、hook/异步快照/flush、compare 映射和跨 rank 首差、训推接入；同时核对 PyTorch/TE 的精度与随机性接口。来源变更不代表所有后端已实测，保留登记/离线/现场的验证范围，不自动刷新 HCU 大库。
 
 ## 组织标准
+
+维护所有来源时先读项目 `docs/wiki-authoring-standard.md` 和 `knowledge/coverage.json`；按相同内容维度检查各工程，包括用于优化借鉴的 DeepSpeed、Primus、MindSpeed 系列和 LoongForge。新增来源补角色/入口/维度；补齐薄弱正文并关联实际源码，不用页数或原文采集量冒充深度。更新相关 README、参考选择表、HCU 库归属与受影响阶段，运行 `python scripts/check_wiki_coverage.py`；它只检查组织完整性，结论仍需源码复核。
 
 流程与 Skill 只提炼跨模型、跨项目可迁移的方法。保留触发条件、输入契约、判断依据、验证和回退；命令用可发现的接口和参数化配置表示。单项目 shape/拓扑、地址、补丁、临时编译选项或实验顺序留在 workspace，不升级为通用默认或必做步骤。现有内容与新版本不同，先核对适用条件，不能把一次现场成功推广成所有环境适用。
 

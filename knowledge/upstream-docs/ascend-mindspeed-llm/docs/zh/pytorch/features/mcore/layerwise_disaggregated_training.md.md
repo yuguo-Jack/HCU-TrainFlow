@@ -1,0 +1,161 @@
+---
+id: doc-ascend-mindspeed-llm-411e7ab81734448acb51
+title: Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/layerwise_disaggregated_training.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed-LLM
+commit: 2fed626696175480ae1ab3342a94017301a25209
+path: docs/zh/pytorch/features/mcore/layerwise_disaggregated_training.md
+raw_sha256: 7bb1075f844590a6f3a4e165befdc887e7a3ef6980bddd1d4789e700dd3bb7cb
+sources: []
+generated_body_sha256: 14a9de5fa5aca5e4d5f7b12f912e7f011006a36f00e95c82f41a56074cddd469
+source_state: current-scan
+---
+
+# Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/layerwise_disaggregated_training.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/features/mcore/layerwise_disaggregated_training.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# 边云协同分布式安全训练
+
+## 使用场景
+
+### 特性介绍
+
+边云协同分布式训练是为“运营商提供数据安全的算力租赁业务”而设计的特性。
+
+目前，针对企业客户（如金融、医疗等）大模型微调的需求，有两种主流方案：
+
+- 企业自建算力：其缺点是投资大（需要购买训练服务器、自建机房等），难以在中小企业推广；
+- 租赁运营商算力：其缺点是需要上传样本至运营商云服务器，数据隐私及合规性要求难以满足。
+
+边云协同分布式训练是一种同时满足“本地微算力”和“数据不出园”的训练方案。该方案在常规PP并行的基础上，采用了新的模型切分方案：少量直接处理原始样本的模型块部署在企业本地（边侧）、大量仅需处理中间结果的模型块部署在运营商侧（云侧）。在此部署方案下，边侧仅需少量算力处理模型首尾层，且原始样本无需上传云端。
+
+![image](../../figures/ldt_sft/layerwise_disaggregated_training_stage.png 'layerwise_disaggregated_training_stage.png')
+
+边云协同分布式训练特性支持以下功能：
+
+- 原始样本不上云：PP并行支持模型U-shape切分，模型首尾层同时部署在边侧，云侧无需读取样本；
+- 跨域协同训练性能优化：通过流水编排优化和计算通信掩盖，实现边云跨域连接场景的高效训练；
+- 边云卡数不一致：支持 TP 不对等的p2p通信模式，实现边侧与云侧卡数不一致的训练。
+
+### 方案原理
+
+原理说明：PP并行支持模型U-shape切分，即模型首尾层参数在第一级流水线共部署。实际使用时，可以指定边侧设备为第一级流水，则模型首尾层同时部署在边侧。
+
+训练过程中，单样本的训练流程如下：
+
+- 前向传播（边）：边侧读取原始样本，经过模型首层处理后，转换为激活值传输至云侧；
+- 前向传播（云）：云侧收到边侧的激活值后，完成中间隐藏层处理，将结果发送至边侧；
+- 前向传播（边）：边侧完成模型尾层处理并完成loss计算，前向传播阶段完成。
+
+反向传播流程类似。
+
+效果：整个训练流程中，边侧仅向云侧发送激活值（前向传播阶段）和梯度（反向传播阶段），原始样本无需上云。
+
+注：U-shape切分情况下，每个样本在边侧需要完成四步处理：模型首层前向（ForwardStart，FS）、模型尾层前向（ForwardEnd，FE）、模型尾层反向（BackwardStart，BS）和模型首层反向（BackwardEnd，BE）。
+
+### 跨域协同训练性能优化
+
+功能说明：针对U-shape模型切分，优化流水编排，并通过计算通信掩盖实现跨域训练高算效。
+
+流水编排方案：U-shape模型切分情况下，相比常规PP（第一级流水处理FS、BE），第一级流水还要额外处理（FE、BS）。流水编排方案设计如下：
+
+- 步骤1：将第一级流水拆分为两级逻辑流水（一级处理首层、一级处理尾层），并参照常规PP并行的1F1B schedule，完成流水编排；
+- 步骤2：将两级逻辑流水合并，若两级流水的任务队列出现冲突，则优化任务执行顺序。
+
+案例：PP=3，mbn = 4
+![image](../../figures/ldt_sft/pipeline_chart.png 'pipeline_chart.png')
+
+其中上图中图1为步骤1生成的两级逻辑流水、图2为步骤2合并后的最终流水方案。步骤2合并边侧两级流水时出现了任务冲突，优化阶段按FS-FE-BS-BE的执行顺序重排。优化的依据是此执行顺序可以增大可容忍边云通信时延：以样本3的前向传播通信为例，其通信时间可以由样本5的前向计算时间掩盖，提升了可容忍通信时延，从而在拉远收敛场景下减小算效损失。
+
+综上，边侧流水编排规则如下（云侧参照常规PP的中间层进行编排）：
+
+| 阶段| 操作 | 次数 | 案例计算结果 |
+| --- | --- | --- | --- |
+| warmup | FS | PP+1 | 4 |
+| steady state 1 | FEBS | floor((PP-1)*2/3 - 1/2 + 2) | 2 |
+| steady state 2 | FS-FE-BS-BE | mbn - floor((PP-1)*2/3 - 1/2 + 2) | 2 |
+| cooldown | BE | floor((PP-1)*2/3 - 1/2 + 2) | 2|
+
+效果：以上流水编排方案可保证稳态运行阶段（steady state）不引入额外空泡。当边云通信时延小于 tf（边侧单个microbatch的前向计算时间）时，稳态运行阶段无额外空泡（warmup/cooldown阶段有少量额外空泡）。
+
+### 非对称TP
+
+功能说明：针对边侧算力卡数量不足的情况，支持边侧TP小于云侧TP。
+
+非对称TP实现逻辑：在对称TP的P2P通信模式下，每张卡会与同一PP组上的相邻卡进行通信（以PP=2，TP=8为例，前向传播通信方式为0->8, 1->9, 2->10, ...）。不同于对称TP，非对称TP的P2P通信模式如下：
+
+- 步骤1：当前TP组内编号最小的卡将数据传输给下一个TP组内编号最小的卡；
+- 步骤2：下一TP组内编号最小的卡在接收到数据后，通过broadcast将数据共享给TP组内的全部卡。
+
+案例：PP=2，TP=8，对称TP
+
+![image](../../figures/ldt_sft/ldt_tp.png 'ldt_tp.png')
+
+案例：PP=2，TP=4/TP=8，非对称TP
+
+![image](../../figures/ldt_sft/ldt_vtp.png 'ldt_vtp.png')
+
+效果：由于在进行P2P通信之前，megatron现有逻辑会提前在TP组内完成AR通信，因此仅通过单卡进行通信即可将完整的数据传递给下一级PP，以上P2P通信方式可保证非对称TP下跨流水线层级通信的正确性。
+
+### 非对称DP
+
+功能说明：针对边侧节点数量不足的情况，支持边侧DP小于云侧DP。
+非对称DP实现逻辑：在对称DP场景下，通过卡分复用的方式，不同DP域的节点或卡处理各自DP域的数据。不同于对称DP，非对称DP场景下，边侧通过时分复用的方式处理多个DP域的数据，并分别与云侧进行通信。
+
+案例：PP=3, TP=8, DP=2，对称DP
+
+![image](../../figures/ldt_sft/ldt_dp.png 'ldt_dp.png')
+
+案例：PP=3, TP=8, DP=1/DP=2，非对称DP
+
+![image](../../figures/ldt_sft/ldt_vdp.png 'ldt_vdp.png')
+
+针对通讯组初始化的处理，复用现有megatron生成rank组的逻辑，首先基于对称DP场景将边云分开进行rank组生成；再将边侧的rank组进行重计算合并；云侧的rank组整体偏移边侧卡数。
+
+![image](../../figures/ldt_sft/ldt_vdp_gen_ranks.png 'ldt_vdp_gen_ranks.png')
+
+针对边侧梯度的处理，megatron现有逻辑在时分复用处理多个DP域的数据计算梯度时，默认会累加梯度，相当于边侧默认对梯度已经做了AR操作，只需要在最后对累加的总梯度求平均即可。
+
+效果：边侧通过时分复用的方式处理多个DP域的数据，并分别与云侧进行通信。数据处理和通信顺序统一按照PP组内（不同的PP组处理不同DP域的数据）Ranks的顺序进行，保证多DP域数据处理和通信的正确性。
+
+## 使用方法
+
+详细操作指导详见：[使用说明](../../training/finetune/mcore/layerwise_disaggregated_training.md)
+
+| 重要参数 | 参数说明 |
+|---------------------------------------|-----------------------------------------------------------------|
+| --layerwise-disaggregated-training | 开启边云协同分布式安全训练 |
+| --num-layer-list [str] | 配置非均匀PP切分，传参为各级流水的隐藏层数`L0,...,LPP`，其中L0和LPP表示首尾隐藏层数，分别传参。 |
+| --num-virtual-stages-per-pipeline-rank [int] | 配置虚拟Pipeline Stage数，必须配置为`2`。 |
+
+## 使用约束
+
+### 模型范围
+
+- 支持以下Qwen2.5/Qwen3系列的LLM模型：
+
+| 模型类型 | 具体模型 |
+|---------------------------------------|-----------------------------------------------------------------|
+| LLM | Qwen3-32B, Qwen2.5-32B, Qwen2.5-72B |
+
+- 暂不支持MoE模型。
+
+## 其他约束
+
+- 暂不支持LoRA
+- 暂不支持常规VPP并行：`--num-virtual-stages-per-pipeline-rank`传参必须为`2`，使能首尾层共部署。
+- 非对称TP场景，仅支持DP=1。
+- 非对称DP场景，仅支持边侧DP=1。
+- 非对称TP和非对称DP同时开启场景，仅支持TP为偶数，且边侧TP可以被云侧TP整除。

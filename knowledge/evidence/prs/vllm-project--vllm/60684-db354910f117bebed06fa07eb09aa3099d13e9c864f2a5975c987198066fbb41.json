@@ -1,0 +1,318 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "3c062d391d15cfa41d3f321cad24f3030c892a97",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "<!-- markdownlint-disable -->\n\n## Overview\n\nWith CUTLASS MSA sparse decode on (an NVFP4 KV cache, or an FP8 E4M3 cache with the `CUTLASS_MSA` decode backend), the fused QK-norm/RoPE/insert kernel writes MiniMax-M3's query only in E4M3. `MiniMaxM3SparseMSAImpl` then dequantized it back into the BF16 query buffer before every prefill. Both `fmha_sm100` prefill kernels take an E4M3 query natively, so prefill now passes it through as is. The PR also bumps `fmha_sm100` (vllm-project/MSA) from `be4a52a` to `968061a`. The new pin includes MSA's Blackwell prefill port, which now serves an E4M3 query over vLLM's packed K|V pages (vllm-project/MSA#32).\n\n## Claims\n\n- MSA prefill attention is **26–37% faster with an FP8 KV cache** and **8–13% faster with an NVFP4 KV cache** than on main (per layer on GB300; table below).\n- Prefill no longer makes a BF16 copy of the query. Only the Triton decode fallback still reads the dequantized query.\n- BF16 caches and the default Triton decode backend for FP8 caches still pass a BF16 query, so their path is unchanged.\n\n## Validation\n\n**Tests:** on GB300 (SM103, CUDA 13.4, `fmha_sm100` built from the new pin), `pytest tests/kernels/attention/test_minimax_m3_msa_cutlass_sparse_decode.py tests/kernels/attention/test_minimax_m3_fp8_triton_indexer.py tests/kernels/attention/test_minimax_m3.py tests/kernels/test_minimax_m3_sparse_attn_fp8_scale.py tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py` gives **240 passed, 45 skipped**. All skips are ROCm-only tests. The MSA test file runs in CI on B200.\n- New `test_msa_prefill_reads_query_fp8_over_fp8_cache[tp1|tp4]` covers FP8-cache prefill, including chunks over cached context, with CUTLASS decode on. It checks that `sparse_atten_func` receives the E4M3 query and that the output matches Triton on the dequantized query.\n- `test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache` now checks that `sparse_atten_nvfp4_kv_func` receives the E4M3 query. Its reference is now the cache as an E4M3-query kernel reads it (see Details).\n- Both prefill tests require all but 1e-4 of the elements within atol/rtol 0.05 and bound the rest at 0.25. The E4M3 probabilities are rounded per split, and splits follow the SM count, so a rare element lands just past 0.05: 1 of 4.1M on B200 CI. On GB300 over 16 seeds the worst case is 2.4e-7 of the elements and 0.07 max abs error.\n- On the old code, all four prefill cases fail with `[torch.bfloat16] == [torch.float8_e4m3fn]`.\n\n**Performance:** `MiniMaxM3SparseMSAImpl.forward` on prefill-only batches (`build_k2q_csr` + attention + combine, plus the dequant where the query is BF16). GB300, one request, top-k 16, page 128. Each value is the median of 3×50 iterations after warmup; spread ≤1%, except ±5% on the first FP8 row of the main run.\n\n| KV cache | Q heads / KV heads | Query tokens @ cached context | main (MSA `be4a52a`, BF16 q) | pin bump only (BF16 q) | this PR (E4M3 q) |\n|---|---|---|---:|---:|---:|\n| FP8 | 16 / 1 (TP4) | 8k @ 0 | 411 µs | 368 µs | 303 µs (-26%) |\n| FP8 | 16 / 1 | 8k @ 32k | 462 µs | 439 µs | 314 µs (-32%) |\n| FP8 | 16 / 1 | 16k @ 112k | 801 µs | 754 µs | 530 µs (-34%) |\n| FP8 | 64 / 4 (TP1) | 8k @ 0 | 1423 µs | 1320 µs | 891 µs (-37%) |\n| FP8 | 64 / 4 | 8k @ 32k | 1498 µs | 1423 µs | 985 µs (-34%) |\n| NVFP4 | 16 / 1 | 8k @ 0 | 379 µs | 375 µs | 342 µs (-10%) |\n| NVFP4 | 16 / 1 | 8k @ 32k | 457 µs | 458 µs | 420 µs (-8%) |\n| NVFP4 | 16 / 1 | 16k @ 112k | 798 µs | 795 µs | 695 µs (-13%) |\n| NVFP4 | 64 / 4 | 8k @ 0 | 1411 µs | 1395 µs | 1255 µs (-11%) |\n| NVFP4 | 64 / 4 | 8k @ 32k | 1491 µs | 1491 µs | 1317 µs (-12%) |\n\nPercentages are relative to main. With the new pin, a BF16 query over the FP8 cache also reaches the Blackwell port, but with BF16 MMAs. The E4M3 query gives the bulk of the FP8 gain at either pin: on main's pin alone it is 13–24% (411 → 356, 462 → 367, 801 → 623, 1423 → 1083, 1498 → 1162 µs).\n\n<details>\n<summary>Benchmark script (run from the repo root with <code>PYTHONPATH=.</code>)</summary>\n\n```python\n\"\"\"Per-layer MSA prefill attention (impl.forward) with an E4M3 query.\"\"\"\nimport math\nfrom types import SimpleNamespace\n\nimport torch\n\nimport tests.kernels.attention.test_minimax_m3_msa_cutlass_sparse_decode as t\nfrom vllm.forward_context import ForwardContext, override_forward_context\nfrom vllm.models.minimax_m3.common.sparse_attention import (\n    MiniMaxM3SparseMetadata, MiniMaxM3SparsePrefillMetadata)\n\nBLK, TOPK = 128, 16\n\n\ndef case(q_len, seq_len, hkv, g):\n    pos = torch.arange(seq_len - q_len, seq_len, device=\"cuda\")\n    visible = pos // BLK + 1\n    vmax = int(visible.max())\n    r = torch.rand(q_len, hkv, vmax, device=\"cuda\", generator=g)\n    ar = torch.arange(vmax, device=\"cuda\")\n    r = torch.where(ar < visible[:, None, None] - 1, r, -1.0)\n    r = torch.where(ar == visible[:, None, None] - 1, 2.0, r)\n    k = min(TOPK, vmax)\n    val, idx = r.topk(k, dim=-1)\n    topk = torch.where(val >= 0, idx, -1).int()\n    if k < TOPK:\n        topk = torch.cat([topk, topk.new_full((q_len, hkv, TOPK - k), -1)], -1)\n    pages = math.ceil(seq_len / BLK)\n    block_table = torch.randperm(pages, dtype=torch.int32, device=\"cuda\")[None]\n    seq = torch.tensor([seq_len], dtype=torch.int32, device=\"cuda\")\n    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=\"cuda\")\n    cu_k = torch.tensor([0, seq_len], dtype=torch.int32, device=\"cuda\")\n    p = MiniMaxM3SparsePrefillMetadata(\n        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, seq_lens=seq, context_lens=seq - q_len,\n        block_table=block_table, max_query_len=q_len, max_seq_len=seq_len,\n        total_kv_blocks=pages)\n    md = MiniMaxM3SparseMetadata(\n        seq_lens=seq, max_seq_len=seq_len,\n        slot_mapping=torch.empty(q_len, dtype=torch.int64, device=\"cuda\"),\n        num_actual_tokens=q_len, num_decodes=0, num_decode_tokens=0, num_prefills=1,\n        num_prefill_tokens=q_len, prefill=p)\n    return md, topk, pages\n\n\ndef bench(fn, iters=50):\n    for _ in range(10):\n        fn()\n    torch.cuda.synchronize()\n    s, e = torch.cuda.Event(True), torch.cuda.Event(True)\n    s.record()\n    for _ in range(iters):\n        fn()\n    e.record()\n    torch.cuda.synchronize()\n    return s.elapsed_time(e) / iters * 1e3\n\n\ng = torch.Generator(device=\"cuda\").manual_seed(0)\nfor kv_dtype in (\"fp8\", \"nvfp4\"):\n    for hq, hkv, q_len, ctx in ((16, 1, 8192, 0), (16, 1, 8192, 32768),\n                                (16, 1, 16384, 114688), (64, 4, 8192, 0),\n                                (64, 4, 8192, 32768)):\n        md, topk, pages = case(q_len, ctx + q_len, hkv, g)\n        k_scale = torch.tensor(1.0, device=\"cuda\")\n        v_scale = torch.tensor(1.0, device=\"cuda\")\n        if kv_dtype == \"nvfp4\":\n            kv_cache, _ = t._make_nvfp4_kv_cache(pages, hkv, \"nvfp4\", k_scale, v_scale)\n        else:\n            kv_cache = (torch.randn(pages, hkv, BLK, 256, device=\"cuda\") * 0.5).to(torch.float8_e4m3fn)\n        layer = SimpleNamespace(layer_name=\"l\", topk_indices_buffer=topk, _q_scale_float=0.5,\n                                _k_scale=k_scale, _v_scale=v_scale)\n        qf = torch.randn(q_len, hq * 128, device=\"cuda\").to(torch.float8_e4m3fn)\n        query = torch.empty(q_len, hq * 128, dtype=torch.bfloat16, device=\"cuda\")\n        out = torch.empty_like(query)\n        impl = t.MiniMaxM3SparseMSAImpl(\n            num_heads=hq, head_size=128, scale=t.SM_SCALE, num_kv_heads=hkv,\n            kv_cache_dtype=kv_dtype, topk_blocks=TOPK, sparse_block_size=BLK,\n            msa_decode_backend=\"cutlass\")\n        assert impl.use_cutlass_decode\n        with override_forward_context(ForwardContext(no_compile_layers={}, attn_metadata={\"l\": md}, slot_mapping={})):\n            bench(lambda: impl.forward(layer, query, kv_cache, out, query_fp8=qf), iters=200)\n            ts = [bench(lambda: impl.forward(layer, query, kv_cache, out, query_fp8=qf)) for _ in range(3)]\n        print(f\"{kv_dtype} H{hq}/{hkv} q{q_len} ctx{ctx}: \" + \" \".join(f\"{x:.1f}\" for x in ts) + \" us\")\n```\n</details>\n\n**No end-to-end accuracy eval or serving benchmark** is included; validation is the kernel-level numerics and per-layer timings above.\n\n## Details\n\n**Kernel capability (MSA `968061a`; same at `be4a52a` except the Blackwell port):**\n- `sparse_atten_func` accepts an FP8 E4M3 query over FP8 E4M3 K/V and runs FP8 QK/PV MMAs, on the Blackwell port when eligible. The BF16-Q × FP8-K/V mode stages K/V up to BF16 instead.\n- `sparse_atten_nvfp4_kv_func` accepts a BF16 or E4M3 query. With E4M3 it dequantizes each NVFP4 `code × block_scale` to E4M3 instead of BF16, and applies the K global scale to the scores and the V global scale in the combine.\n\n**Scales:** `q_scale` folds into `softmax_scale`. The FP8 cache is written with unit scales and the NVFP4 global scales are passed as before, so K/V scale handling is unchanged.\n\n**Numerics:** the E4M3-query kernels round the softmax probabilities to E4M3. The NVFP4 kernel also rounds K/V to E4M3. On the NVFP4 test (TP1):\n- Against the E4M3-staged cache: max abs error 0.06, and 0 of 4.1M elements outside atol/rtol 0.05.\n- Against the exact BF16 dequantization: max 0.14, with 122 of 4.1M elements outside that tolerance. This is why the test's reference changed.\n\nOn the FP8 test the max abs error is ≈0.03.\n\n**Limitations:** validated on SM103. SM100 is covered by the CI kernel job. The E4M3-query NVFP4 kernel is untested on SM107 here.\n\n**MSA pin bump (`be4a52a` → `968061a`):**\n- The functions vLLM calls keep their signatures: `fmha_sm100`, `fmha_sm100_plan`, `_fmha_sm100(_plan)`, `sparse_topk_select`, `sparse_atten_func`, `sparse_atten_nvfp4_kv_func` and `nvfp4_head_slot_views`.\n- vLLM's decode plans still pin `decode_backend=\"kv_mode3\"`. The new `prefill_backend` plan option only routes sparse-prefill plans built through `fmha_sm100_plan`, which vLLM does not use.\n- The cmake install list adds the files the package now imports: `_jit_cache.py`, `msa_warmup.py`, `q8kv4_prefill_adapter.py` and `prefill_q8kv4/`.\n\n**Duplicate check:** no open PR touches the MSA prefill query or `fmha_sm100.cmake`. Open MiniMax-M3 MSA PRs (#55838, #56932, #59979) change decode or indexer metadata only.\n\nAI assistance (Claude Code) was used to investigate, implement, test and benchmark this change.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "zyongye"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-08T20:14:14Z",
+            "updatedAt": "2026-10-08T20:14:14Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6068217283"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93707](https://buildkite.com/vllm/ci/builds/93707) for commit `74f9556f5aeb`.",
+            "createdAt": "2026-10-08T20:14:35Z",
+            "updatedAt": "2026-10-08T20:14:35Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6068223078"
+          },
+          {
+            "author": {
+              "login": "zyongye"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-10T06:33:34Z",
+            "updatedAt": "2026-10-10T06:33:34Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6094692236"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93993](https://buildkite.com/vllm/ci/builds/93993) for commit `e43e74596315`.",
+            "createdAt": "2026-10-10T06:33:53Z",
+            "updatedAt": "2026-10-10T06:33:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6094694448"
+          },
+          {
+            "author": {
+              "login": "zyongye"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-11T02:04:47Z",
+            "updatedAt": "2026-10-11T02:04:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6104454600"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94040](https://buildkite.com/vllm/ci/builds/94040) for commit `aad624dc0196`.",
+            "createdAt": "2026-10-11T02:05:53Z",
+            "updatedAt": "2026-10-11T02:05:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6104462461"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWvatH0=",
+          "hasNextPage": false
+        },
+        "totalCount": 6
+      },
+      "headRefOid": "aad624dc019614c78acffffd0ee47aef0e5d0c2f",
+      "headRepository": {
+        "nameWithOwner": "zyongye/vllm"
+      },
+      "merged": true,
+      "number": 60684,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-08T20:14:10Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#pullrequestreview-5462315664"
+          },
+          {
+            "author": {
+              "login": "ZJY0516"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-10-11T05:40:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60684#pullrequestreview-5482053808"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMVQwNTo0MDo0Mlq0MjAyNi0xMC0xMVQwNTo0MDo0MlrPAAAAAUbBgLA=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Perf][MiniMax-M3] MSA prefill attends with the E4M3 query; bump fmha_sm100 to 968061a",
+      "updatedAt": "2026-10-11T05:40:46Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60684"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "3c062d391d15cfa41d3f321cad24f3030c892a97"
+    },
+    "body": "<!-- markdownlint-disable -->\n\n## Overview\n\nWith CUTLASS MSA sparse decode on (an NVFP4 KV cache, or an FP8 E4M3 cache with the `CUTLASS_MSA` decode backend), the fused QK-norm/RoPE/insert kernel writes MiniMax-M3's query only in E4M3. `MiniMaxM3SparseMSAImpl` then dequantized it back into the BF16 query buffer before every prefill. Both `fmha_sm100` prefill kernels take an E4M3 query natively, so prefill now passes it through as is. The PR also bumps `fmha_sm100` (vllm-project/MSA) from `be4a52a` to `968061a`. The new pin includes MSA's Blackwell prefill port, which now serves an E4M3 query over vLLM's packed K|V pages (vllm-project/MSA#32).\n\n## Claims\n\n- MSA prefill attention is **26–37% faster with an FP8 KV cache** and **8–13% faster with an NVFP4 KV cache** than on main (per layer on GB300; table below).\n- Prefill no longer makes a BF16 copy of the query. Only the Triton decode fallback still reads the dequantized query.\n- BF16 caches and the default Triton decode backend for FP8 caches still pass a BF16 query, so their path is unchanged.\n\n## Validation\n\n**Tests:** on GB300 (SM103, CUDA 13.4, `fmha_sm100` built from the new pin), `pytest tests/kernels/attention/test_minimax_m3_msa_cutlass_sparse_decode.py tests/kernels/attention/test_minimax_m3_fp8_triton_indexer.py tests/kernels/attention/test_minimax_m3.py tests/kernels/test_minimax_m3_sparse_attn_fp8_scale.py tests/kernels/test_fused_minimax_m3_qknorm_rope_kv_insert.py` gives **240 passed, 45 skipped**. All skips are ROCm-only tests. The MSA test file runs in CI on B200.\n- New `test_msa_prefill_reads_query_fp8_over_fp8_cache[tp1|tp4]` covers FP8-cache prefill, including chunks over cached context, with CUTLASS decode on. It checks that `sparse_atten_func` receives the E4M3 query and that the output matches Triton on the dequantized query.\n- `test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache` now checks that `sparse_atten_nvfp4_kv_func` receives the E4M3 query. Its reference is now the cache as an E4M3-query kernel reads it (see Details).\n- Both prefill tests require all but 1e-4 of the elements within atol/rtol 0.05 and bound the rest at 0.25. The E4M3 probabilities are rounded per split, and splits follow the SM count, so a rare element lands just past 0.05: 1 of 4.1M on B200 CI. On GB300 over 16 seeds the worst case is 2.4e-7 of the elements and 0.07 max abs error.\n- On the old code, all four prefill cases fail with `[torch.bfloat16] == [torch.float8_e4m3fn]`.\n\n**Performance:** `MiniMaxM3SparseMSAImpl.forward` on prefill-only batches (`build_k2q_csr` + attention + combine, plus the dequant where the query is BF16). GB300, one request, top-k 16, page 128. Each value is the median of 3×50 iterations after warmup; spread ≤1%, except ±5% on the first FP8 row of the main run.\n\n| KV cache | Q heads / KV heads | Query tokens @ cached context | main (MSA `be4a52a`, BF16 q) | pin bump only (BF16 q) | this PR (E4M3 q) |\n|---|---|---|---:|---:|---:|\n| FP8 | 16 / 1 (TP4) | 8k @ 0 | 411 µs | 368 µs | 303 µs (-26%) |\n| FP8 | 16 / 1 | 8k @ 32k | 462 µs | 439 µs | 314 µs (-32%) |\n| FP8 | 16 / 1 | 16k @ 112k | 801 µs | 754 µs | 530 µs (-34%) |\n| FP8 | 64 / 4 (TP1) | 8k @ 0 | 1423 µs | 1320 µs | 891 µs (-37%) |\n| FP8 | 64 / 4 | 8k @ 32k | 1498 µs | 1423 µs | 985 µs (-34%) |\n| NVFP4 | 16 / 1 | 8k @ 0 | 379 µs | 375 µs | 342 µs (-10%) |\n| NVFP4 | 16 / 1 | 8k @ 32k | 457 µs | 458 µs | 420 µs (-8%) |\n| NVFP4 | 16 / 1 | 16k @ 112k | 798 µs | 795 µs | 695 µs (-13%) |\n| NVFP4 | 64 / 4 | 8k @ 0 | 1411 µs | 1395 µs | 1255 µs (-11%) |\n| NVFP4 | 64 / 4 | 8k @ 32k | 1491 µs | 1491 µs | 1317 µs (-12%) |\n\nPercentages are relative to main. With the new pin, a BF16 query over the FP8 cache also reaches the Blackwell port, but with BF16 MMAs. The E4M3 query gives the bulk of the FP8 gain at either pin: on main's pin alone it is 13–24% (411 → 356, 462 → 367, 801 → 623, 1423 → 1083, 1498 → 1162 µs).\n\n<details>\n<summary>Benchmark script (run from the repo root with <code>PYTHONPATH=.</code>)</summary>\n\n```python\n\"\"\"Per-layer MSA prefill attention (impl.forward) with an E4M3 query.\"\"\"\nimport math\nfrom types import SimpleNamespace\n\nimport torch\n\nimport tests.kernels.attention.test_minimax_m3_msa_cutlass_sparse_decode as t\nfrom vllm.forward_context import ForwardContext, override_forward_context\nfrom vllm.models.minimax_m3.common.sparse_attention import (\n    MiniMaxM3SparseMetadata, MiniMaxM3SparsePrefillMetadata)\n\nBLK, TOPK = 128, 16\n\n\ndef case(q_len, seq_len, hkv, g):\n    pos = torch.arange(seq_len - q_len, seq_len, device=\"cuda\")\n    visible = pos // BLK + 1\n    vmax = int(visible.max())\n    r = torch.rand(q_len, hkv, vmax, device=\"cuda\", generator=g)\n    ar = torch.arange(vmax, device=\"cuda\")\n    r = torch.where(ar < visible[:, None, None] - 1, r, -1.0)\n    r = torch.where(ar == visible[:, None, None] - 1, 2.0, r)\n    k = min(TOPK, vmax)\n    val, idx = r.topk(k, dim=-1)\n    topk = torch.where(val >= 0, idx, -1).int()\n    if k < TOPK:\n        topk = torch.cat([topk, topk.new_full((q_len, hkv, TOPK - k), -1)], -1)\n    pages = math.ceil(seq_len / BLK)\n    block_table = torch.randperm(pages, dtype=torch.int32, device=\"cuda\")[None]\n    seq = torch.tensor([seq_len], dtype=torch.int32, device=\"cuda\")\n    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=\"cuda\")\n    cu_k = torch.tensor([0, seq_len], dtype=torch.int32, device=\"cuda\")\n    p = MiniMaxM3SparsePrefillMetadata(\n        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, seq_lens=seq, context_lens=seq - q_len,\n        block_table=block_table, max_query_len=q_len, max_seq_len=seq_len,\n        total_kv_blocks=pages)\n    md = MiniMaxM3SparseMetadata(\n        seq_lens=seq, max_seq_len=seq_len,\n        slot_mapping=torch.empty(q_len, dtype=torch.int64, device=\"cuda\"),\n        num_actual_tokens=q_len, num_decodes=0, num_decode_tokens=0, num_prefills=1,\n        num_prefill_tokens=q_len, prefill=p)\n    return md, topk, pages\n\n\ndef bench(fn, iters=50):\n    for _ in range(10):\n        fn()\n    torch.cuda.synchronize()\n    s, e = torch.cuda.Event(True), torch.cuda.Event(True)\n    s.record()\n    for _ in range(iters):\n        fn()\n    e.record()\n    torch.cuda.synchronize()\n    return s.elapsed_time(e) / iters * 1e3\n\n\ng = torch.Generator(device=\"cuda\").manual_seed(0)\nfor kv_dtype in (\"fp8\", \"nvfp4\"):\n    for hq, hkv, q_len, ctx in ((16, 1, 8192, 0), (16, 1, 8192, 32768),\n                                (16, 1, 16384, 114688), (64, 4, 8192, 0),\n                                (64, 4, 8192, 32768)):\n        md, topk, pages = case(q_len, ctx + q_len, hkv, g)\n        k_scale = torch.tensor(1.0, device=\"cuda\")\n        v_scale = torch.tensor(1.0, device=\"cuda\")\n        if kv_dtype == \"nvfp4\":\n            kv_cache, _ = t._make_nvfp4_kv_cache(pages, hkv, \"nvfp4\", k_scale, v_scale)\n        else:\n            kv_cache = (torch.randn(pages, hkv, BLK, 256, device=\"cuda\") * 0.5).to(torch.float8_e4m3fn)\n        layer = SimpleNamespace(layer_name=\"l\", topk_indices_buffer=topk, _q_scale_float=0.5,\n                                _k_scale=k_scale, _v_scale=v_scale)\n        qf = torch.randn(q_len, hq * 128, device=\"cuda\").to(torch.float8_e4m3fn)\n        query = torch.empty(q_len, hq * 128, dtype=torch.bfloat16, device=\"cuda\")\n        out = torch.empty_like(query)\n        impl = t.MiniMaxM3SparseMSAImpl(\n            num_heads=hq, head_size=128, scale=t.SM_SCALE, num_kv_heads=hkv,\n            kv_cache_dtype=kv_dtype, topk_blocks=TOPK, sparse_block_size=BLK,\n            msa_decode_backend=\"cutlass\")\n        assert impl.use_cutlass_decode\n        with override_forward_context(ForwardContext(no_compile_layers={}, attn_metadata={\"l\": md}, slot_mapping={})):\n            bench(lambda: impl.forward(layer, query, kv_cache, out, query_fp8=qf), iters=200)\n            ts = [bench(lambda: impl.forward(layer, query, kv_cache, out, query_fp8=qf)) for _ in range(3)]\n        print(f\"{kv_dtype} H{hq}/{hkv} q{q_len} ctx{ctx}: \" + \" \".join(f\"{x:.1f}\" for x in ts) + \" us\")\n```\n</details>\n\n**No end-to-end accuracy eval or serving benchmark** is included; validation is the kernel-level numerics and per-layer timings above.\n\n## Details\n\n**Kernel capability (MSA `968061a`; same at `be4a52a` except the Blackwell port):**\n- `sparse_atten_func` accepts an FP8 E4M3 query over FP8 E4M3 K/V and runs FP8 QK/PV MMAs, on the Blackwell port when eligible. The BF16-Q × FP8-K/V mode stages K/V up to BF16 instead.\n- `sparse_atten_nvfp4_kv_func` accepts a BF16 or E4M3 query. With E4M3 it dequantizes each NVFP4 `code × block_scale` to E4M3 instead of BF16, and applies the K global scale to the scores and the V global scale in the combine.\n\n**Scales:** `q_scale` folds into `softmax_scale`. The FP8 cache is written with unit scales and the NVFP4 global scales are passed as before, so K/V scale handling is unchanged.\n\n**Numerics:** the E4M3-query kernels round the softmax probabilities to E4M3. The NVFP4 kernel also rounds K/V to E4M3. On the NVFP4 test (TP1):\n- Against the E4M3-staged cache: max abs error 0.06, and 0 of 4.1M elements outside atol/rtol 0.05.\n- Against the exact BF16 dequantization: max 0.14, with 122 of 4.1M elements outside that tolerance. This is why the test's reference changed.\n\nOn the FP8 test the max abs error is ≈0.03.\n\n**Limitations:** validated on SM103. SM100 is covered by the CI kernel job. The E4M3-query NVFP4 kernel is untested on SM107 here.\n\n**MSA pin bump (`be4a52a` → `968061a`):**\n- The functions vLLM calls keep their signatures: `fmha_sm100`, `fmha_sm100_plan`, `_fmha_sm100(_plan)`, `sparse_topk_select`, `sparse_atten_func`, `sparse_atten_nvfp4_kv_func` and `nvfp4_head_slot_views`.\n- vLLM's decode plans still pin `decode_backend=\"kv_mode3\"`. The new `prefill_backend` plan option only routes sparse-prefill plans built through `fmha_sm100_plan`, which vLLM does not use.\n- The cmake install list adds the files the package now imports: `_jit_cache.py`, `msa_warmup.py`, `q8kv4_prefill_adapter.py` and `prefill_q8kv4/`.\n\n**Duplicate check:** no open PR touches the MSA prefill query or `fmha_sm100.cmake`. Open MiniMax-M3 MSA PRs (#55838, #56932, #59979) change decode or indexer metadata only.\n\nAI assistance (Claude Code) was used to investigate, implement, test and benchmark this change.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+    "changed_files": 4,
+    "head": {
+      "repo": {
+        "full_name": "zyongye/vllm"
+      },
+      "sha": "aad624dc019614c78acffffd0ee47aef0e5d0c2f"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60684",
+    "merged": true,
+    "number": 60684,
+    "state": "closed",
+    "title": "[Perf][MiniMax-M3] MSA prefill attends with the E4M3 query; bump fmha_sm100 to 968061a",
+    "updated_at": "2026-10-11T05:40:46Z"
+  },
+  "files": [
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/aad624dc019614c78acffffd0ee47aef0e5d0c2f/cmake%2Fexternal_projects%2Ffmha_sm100.cmake",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/cmake%2Fexternal_projects%2Ffmha_sm100.cmake?ref=aad624dc019614c78acffffd0ee47aef0e5d0c2f",
+      "deletions": 1,
+      "filename": "cmake/external_projects/fmha_sm100.cmake",
+      "patch": "@@ -17,7 +17,7 @@ else()\n   FetchContent_Declare(\n     fmha_sm100\n     GIT_REPOSITORY https://github.com/vllm-project/MSA.git\n-    GIT_TAG be4a52aea420b6bef73be9af1a649859964790cb\n+    GIT_TAG 968061ab16cb14991a5c7d4c0e8eabf531be0dcf\n     GIT_PROGRESS TRUE\n     CONFIGURE_COMMAND \"\"\n     BUILD_COMMAND \"\"\n@@ -36,11 +36,14 @@ set(FMHA_SM100_PY_ROOT \"${fmha_sm100_SOURCE_DIR}/python/fmha_sm100\")\n \n install(FILES\n   \"${FMHA_SM100_PY_ROOT}/__init__.py\"\n+  \"${FMHA_SM100_PY_ROOT}/_jit_cache.py\"\n   \"${FMHA_SM100_PY_ROOT}/api.py\"\n   \"${FMHA_SM100_PY_ROOT}/bench_utils.py\"\n   \"${FMHA_SM100_PY_ROOT}/jit.py\"\n+  \"${FMHA_SM100_PY_ROOT}/msa_warmup.py\"\n   \"${FMHA_SM100_PY_ROOT}/nvfp4_kv.py\"\n   \"${FMHA_SM100_PY_ROOT}/q8kv4_decode_adapter.py\"\n+  \"${FMHA_SM100_PY_ROOT}/q8kv4_prefill_adapter.py\"\n   \"${FMHA_SM100_PY_ROOT}/sparse.py\"\n   \"${FMHA_SM100_PY_ROOT}/sparse_fmha_adapter.py\"\n   DESTINATION vllm/third_party/fmha_sm100\n@@ -65,6 +68,12 @@ install(DIRECTORY \"${FMHA_SM100_PY_ROOT}/kvouter/\"\n   PATTERN \"__pycache__\" EXCLUDE\n   PATTERN \"*.pyc\" EXCLUDE)\n \n+install(DIRECTORY \"${FMHA_SM100_PY_ROOT}/prefill_q8kv4/\"\n+  DESTINATION vllm/third_party/fmha_sm100/prefill_q8kv4\n+  COMPONENT fmha_sm100\n+  PATTERN \"__pycache__\" EXCLUDE\n+  PATTERN \"*.pyc\" EXCLUDE)\n+\n install(DIRECTORY \"${FMHA_SM100_PY_ROOT}/cute/\"\n   DESTINATION vllm/third_party/fmha_sm100/cute\n   COMPONENT fmha_sm100",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/aad624dc019614c78acffffd0ee47aef0e5d0c2f/cmake%2Fexternal_projects%2Ffmha_sm100.cmake",
+      "sha": "6b84b35c9049577875d8743f1592322303137fdb",
+      "status": "modified"
+    },
+    {
+      "additions": 157,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/aad624dc019614c78acffffd0ee47aef0e5d0c2f/tests%2Fkernels%2Fattention%2Ftest_minimax_m3_msa_cutlass_sparse_decode.py",
+      "changes": 179,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fattention%2Ftest_minimax_m3_msa_cutlass_sparse_decode.py?ref=aad624dc019614c78acffffd0ee47aef0e5d0c2f",
+      "deletions": 22,
+      "filename": "tests/kernels/attention/test_minimax_m3_msa_cutlass_sparse_decode.py",
+      "patch": "@@ -782,6 +782,46 @@ def _make_nvfp4_kv_cache(\n     return kv_cache, torch.cat(dequantized, dim=-1).to(torch.bfloat16)\n \n \n+def _e4m3_staged_kv_reference(\n+    kv_reference: torch.Tensor, k_scale: torch.Tensor, v_scale: torch.Tensor\n+) -> torch.Tensor:\n+    \"\"\"The dequantized NVFP4 cache as an E4M3-query kernel reads it: each\n+    code * block_scale rounded to E4M3, then the global scale.\"\"\"\n+    sides = []\n+    for side, global_scale in zip(\n+        kv_reference.float().split(HEAD_DIM, dim=-1), (k_scale, v_scale)\n+    ):\n+        sides.append(\n+            (side / global_scale).to(torch.float8_e4m3fn).float() * global_scale\n+        )\n+    return torch.cat(sides, dim=-1).to(torch.bfloat16)\n+\n+\n+def _assert_close_fp8_prefill(actual: torch.Tensor, expected: torch.Tensor) -> None:\n+    \"\"\"The fp8-q prefill rounds each split's probabilities to E4M3, and the splits\n+    follow the SM count, so a rare element moves past the BF16 tolerance.\"\"\"\n+    close = torch.isclose(actual, expected, atol=0.05, rtol=0.05)\n+    assert close.float().mean().item() > 1 - 1e-4\n+    torch.testing.assert_close(actual, expected, atol=0.25, rtol=0.05)\n+\n+\n+def _record_query_dtypes(\n+    monkeypatch: pytest.MonkeyPatch, kernel_name: str\n+) -> list[torch.dtype]:\n+    \"\"\"Record the query dtype of every ``fmha_sm100.sparse.<kernel_name>`` call.\"\"\"\n+    from vllm.third_party.fmha_sm100 import sparse as msa_sparse\n+\n+    kernel = getattr(msa_sparse, kernel_name)\n+    query_dtypes: list[torch.dtype] = []\n+\n+    def record(q, *args, **kwargs):\n+        query_dtypes.append(q.dtype)\n+        return kernel(q, *args, **kwargs)\n+\n+    monkeypatch.setattr(msa_sparse, kernel_name, record)\n+    return query_dtypes\n+\n+\n def test_nvfp4_kv_cache_views_address_head_slots() -> None:\n     \"\"\"Slot 2h (K) and 2h + 1 (V) hold head h's data then scales, so each head\n     is one contiguous run of the page: a TP rank's page is a byte slice.\"\"\"\n@@ -898,27 +938,14 @@ def run() -> None:\n     torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)\n \n \n-@pytest.mark.parametrize(\n-    (\"num_q_heads\", \"num_kv_heads\"),\n-    [pytest.param(64, 4, id=\"tp1\"), pytest.param(16, 1, id=\"tp4\")],\n-)\n-def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(\n-    num_q_heads: int,\n+def _make_prefill_metadata(\n+    q_lens: list[int],\n+    seq_lens_list: list[int],\n+    block_table: torch.Tensor,\n     num_kv_heads: int,\n-) -> None:\n-    \"\"\"MSA prefill reads NVFP4 pages as their exact dequantized values,\n-    including chunked prefill over cached context, and takes q from its fp8\n-    copy (the only one the fused insert writes on this path).\"\"\"\n-    torch.manual_seed(0)\n-    q_lens = [300, 128, 77]\n-    seq_lens_list = [300, 640, 1100]\n-    block_table, num_pages = _make_paged_layout(seq_lens_list)\n-    k_scale = torch.tensor(0.5, dtype=torch.float32, device=\"cuda\")\n-    v_scale = torch.tensor(2.0, dtype=torch.float32, device=\"cuda\")\n-    kv_cache, kv_reference = _make_nvfp4_kv_cache(\n-        num_pages, num_kv_heads, \"nvfp4\", k_scale, v_scale\n-    )\n-\n+) -> tuple[MiniMaxM3SparseMetadata, torch.Tensor]:\n+    \"\"\"Prefill-only metadata (chunks over cached context) and a top-k selecting\n+    every causally visible page (<= TOPK per query), ending with the local one.\"\"\"\n     total_q = sum(q_lens)\n     seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=\"cuda\")\n     context_lens = seq_lens - torch.tensor(q_lens, dtype=torch.int32, device=\"cuda\")\n@@ -948,7 +975,6 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(\n         prefill=prefill,\n     )\n \n-    # Every causally visible page (<= TOPK per query), ending with the local one.\n     topk = torch.full(\n         (total_q, num_kv_heads, TOPK), -1, dtype=torch.int32, device=\"cuda\"\n     )\n@@ -959,6 +985,35 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(\n             assert visible <= TOPK\n             topk[token, :, :visible] = torch.arange(visible, device=\"cuda\")\n             token += 1\n+    return metadata, topk\n+\n+\n+@pytest.mark.parametrize(\n+    (\"num_q_heads\", \"num_kv_heads\"),\n+    [pytest.param(64, 4, id=\"tp1\"), pytest.param(16, 1, id=\"tp4\")],\n+)\n+def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(\n+    monkeypatch: pytest.MonkeyPatch,\n+    num_q_heads: int,\n+    num_kv_heads: int,\n+) -> None:\n+    \"\"\"MSA prefill reads NVFP4 pages as their dequantized values, staged to E4M3\n+    for the E4M3 q, including chunked prefill over cached context; it attends\n+    with the fp8 q (the only one the fused insert writes on this path).\"\"\"\n+    torch.manual_seed(0)\n+    q_lens = [300, 128, 77]\n+    seq_lens_list = [300, 640, 1100]\n+    block_table, num_pages = _make_paged_layout(seq_lens_list)\n+    k_scale = torch.tensor(0.5, dtype=torch.float32, device=\"cuda\")\n+    v_scale = torch.tensor(2.0, dtype=torch.float32, device=\"cuda\")\n+    kv_cache, kv_reference = _make_nvfp4_kv_cache(\n+        num_pages, num_kv_heads, \"nvfp4\", k_scale, v_scale\n+    )\n+\n+    metadata, topk = _make_prefill_metadata(\n+        q_lens, seq_lens_list, block_table, num_kv_heads\n+    )\n+    total_q = sum(q_lens)\n \n     layer_name = \"model.layers.0.self_attn.attn\"\n     q_scale = 0.5\n@@ -976,6 +1031,7 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(\n         / q_scale\n     ).to(torch.float8_e4m3fn)\n     query = query_fp8.to(torch.bfloat16) * q_scale\n+    kv_reference = _e4m3_staged_kv_reference(kv_reference, k_scale, v_scale)\n     common = dict(\n         num_heads=num_q_heads,\n         head_size=HEAD_DIM,\n@@ -984,6 +1040,7 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(\n         topk_blocks=TOPK,\n         sparse_block_size=BLOCK_SIZE,\n     )\n+    query_dtypes = _record_query_dtypes(monkeypatch, \"sparse_atten_nvfp4_kv_func\")\n     forward_context = ForwardContext(\n         no_compile_layers={},\n         attn_metadata={layer_name: metadata},\n@@ -1001,7 +1058,8 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(\n             query_fp8=query_fp8,\n         )\n     current_platform.synchronize()\n-    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)\n+    assert query_dtypes == [torch.float8_e4m3fn]\n+    _assert_close_fp8_prefill(actual, expected)\n \n \n def test_msa_triton_decode_fallback_reads_dequantized_query_fp8() -> None:\n@@ -1079,3 +1137,80 @@ def test_msa_triton_decode_fallback_reads_dequantized_query_fp8() -> None:\n         )\n     current_platform.synchronize()\n     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)\n+\n+\n+@pytest.mark.parametrize(\n+    (\"num_q_heads\", \"num_kv_heads\"),\n+    [pytest.param(64, 4, id=\"tp1\"), pytest.param(16, 1, id=\"tp4\")],\n+)\n+def test_msa_prefill_reads_query_fp8_over_fp8_cache(\n+    monkeypatch: pytest.MonkeyPatch,\n+    num_q_heads: int,\n+    num_kv_heads: int,\n+) -> None:\n+    \"\"\"With CUTLASS decode on, FP8 prefill (incl. chunks over cached context)\n+    attends with the fp8 q the fused insert writes, not a BF16 copy, and\n+    matches Triton on the dequantized q.\"\"\"\n+    torch.manual_seed(0)\n+    q_lens = [300, 128, 77]\n+    seq_lens_list = [300, 640, 1100]\n+    block_table, num_pages = _make_paged_layout(seq_lens_list)\n+    kv_cache = (\n+        torch.randn(\n+            num_pages,\n+            num_kv_heads,\n+            BLOCK_SIZE,\n+            2 * HEAD_DIM,\n+            dtype=torch.bfloat16,\n+            device=\"cuda\",\n+        )\n+        * 0.5\n+    ).to(torch.float8_e4m3fn)\n+    metadata, topk = _make_prefill_metadata(\n+        q_lens, seq_lens_list, block_table, num_kv_heads\n+    )\n+    layer_name = \"model.layers.0.self_attn.attn\"\n+    q_scale = 0.5\n+    layer = SimpleNamespace(\n+        layer_name=layer_name,\n+        topk_indices_buffer=topk,\n+        _q_scale_float=q_scale,\n+    )\n+    query_fp8 = (\n+        torch.randn(\n+            sum(q_lens), num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=\"cuda\"\n+        )\n+        / q_scale\n+    ).to(torch.float8_e4m3fn)\n+    query = query_fp8.to(torch.bfloat16) * q_scale\n+    common = dict(\n+        num_heads=num_q_heads,\n+        head_size=HEAD_DIM,\n+        scale=SM_SCALE,\n+        num_kv_heads=num_kv_heads,\n+        kv_cache_dtype=\"fp8\",\n+        topk_blocks=TOPK,\n+        sparse_block_size=BLOCK_SIZE,\n+    )\n+    impl = MiniMaxM3SparseMSAImpl(**common, msa_decode_backend=\"cutlass\")\n+    assert impl.use_cutlass_decode\n+    query_dtypes = _record_query_dtypes(monkeypatch, \"sparse_atten_func\")\n+    forward_context = ForwardContext(\n+        no_compile_layers={},\n+        attn_metadata={layer_name: metadata},\n+        slot_mapping={},\n+    )\n+    with override_forward_context(forward_context):\n+        expected = MiniMaxM3SparseTritonImpl(**common).forward(\n+            layer, query, kv_cache, torch.empty_like(query)\n+        )\n+        actual = impl.forward(\n+            layer,\n+            torch.full_like(query, float(\"nan\")),\n+            kv_cache,\n+            torch.zeros_like(query),\n+            query_fp8=query_fp8,\n+        )\n+    current_platform.synchronize()\n+    assert query_dtypes == [torch.float8_e4m3fn]\n+    _assert_close_fp8_prefill(actual, expected)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/aad624dc019614c78acffffd0ee47aef0e5d0c2f/tests%2Fkernels%2Fattention%2Ftest_minimax_m3_msa_cutlass_sparse_decode.py",
+      "sha": "42e2b86965e0ad1f28d74ce33feac427fdf9b61c",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/aad624dc019614c78acffffd0ee47aef0e5d0c2f/vllm%2Fmodels%2Fminimax_m3%2Fnvidia%2Fmodel.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fminimax_m3%2Fnvidia%2Fmodel.py?ref=aad624dc019614c78acffffd0ee47aef0e5d0c2f",
+      "deletions": 1,
+      "filename": "vllm/models/minimax_m3/nvidia/model.py",
+      "patch": "@@ -614,7 +614,7 @@ def forward(\n         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]\n         q = qkv.new_empty((num_tokens, self.q_size))\n         # With query_fp8, q is emitted only in fp8; the attend dequantizes it\n-        # into ``q`` for the tokens that run on bf16-query kernels.\n+        # into ``q`` for the tokens that run on Triton decode.\n         query_fp8 = self._allocate_query_fp8(qkv)\n         # index_q matches the index-K cache dtype (e4m3 for the fp8 score path);\n         # the fused kernel emits fp8 directly when this buffer is e4m3.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/aad624dc019614c78acffffd0ee47aef0e5d0c2f/vllm%2Fmodels%2Fminimax_m3%2Fnvidia%2Fmodel.py",
+      "sha": "d67e9ea19d908b048f1b2faed87ec0cb2ee863ab",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/aad624dc019614c78acffffd0ee47aef0e5d0c2f/vllm%2Fmodels%2Fminimax_m3%2Fnvidia%2Fsparse_attention_msa.py",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fminimax_m3%2Fnvidia%2Fsparse_attention_msa.py?ref=aad624dc019614c78acffffd0ee47aef0e5d0c2f",
+      "deletions": 8,
+      "filename": "vllm/models/minimax_m3/nvidia/sparse_attention_msa.py",
+      "patch": "@@ -266,7 +266,7 @@ def forward(\n         q = query[:num_tokens].view(-1, self.num_heads, hd)\n         out = output[:num_tokens].view(-1, self.num_heads, hd)\n         # Given query_fp8, it is the only q the fused insert wrote: CUTLASS\n-        # decode reads it directly, and the bf16-query kernels read it\n+        # decode and prefill read it directly, and Triton decode reads it\n         # dequantized into ``query``.\n         q_fp8 = (\n             None\n@@ -339,11 +339,11 @@ def forward(\n             # [H, prefill, MK] transposed view; build_k2q_csr consumes the\n             # strided view directly (topK stays innermost-contiguous).\n             prefill_topk = topk[nd:num_tokens].transpose(0, 1)\n-            qp = (\n-                q[nd:]\n-                if q_fp8 is None\n-                else _dequantize_query(q_fp8[nd:], q_scale_float, q[nd:])\n-            )\n+            # An E4M3 query attends as is, its scale folded into softmax_scale.\n+            if q_fp8 is None:\n+                qp, softmax_scale = q[nd:], self.scale\n+            else:\n+                qp, softmax_scale = q_fp8[nd:], self.scale * q_scale_float\n             k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(\n                 prefill_topk,\n                 p.cu_seqlens_q,\n@@ -375,7 +375,7 @@ def forward(\n                     max_seqlen_k=p.max_seq_len,\n                     blk_kv=SPARSE_BLOCK_SIZE,\n                     causal=True,\n-                    softmax_scale=self.scale,\n+                    softmax_scale=softmax_scale,\n                     page_table=p.block_table,\n                     seqused_k=p.seq_lens,\n                     schedule=schedule,\n@@ -393,7 +393,7 @@ def forward(\n                 topK=self.topk_blocks,\n                 blk_kv=SPARSE_BLOCK_SIZE,\n                 causal=True,\n-                softmax_scale=self.scale,\n+                softmax_scale=softmax_scale,\n                 cu_seqlens_q=p.cu_seqlens_q,\n                 cu_seqlens_k=p.cu_seqlens_k,\n                 max_seqlen_q=p.max_query_len,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/aad624dc019614c78acffffd0ee47aef0e5d0c2f/vllm%2Fmodels%2Fminimax_m3%2Fnvidia%2Fsparse_attention_msa.py",
+      "sha": "ed8ca2a784745181396f8e44e8ab603f6a2fc552",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-08T20:14:14Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6068217283",
+      "updated_at": "2026-10-08T20:14:14Z",
+      "user": {
+        "login": "zyongye"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93707](https://buildkite.com/vllm/ci/builds/93707) for commit `74f9556f5aeb`.",
+      "created_at": "2026-10-08T20:14:35Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6068223078",
+      "updated_at": "2026-10-08T20:14:35Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-10T06:33:34Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6094692236",
+      "updated_at": "2026-10-10T06:33:34Z",
+      "user": {
+        "login": "zyongye"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93993](https://buildkite.com/vllm/ci/builds/93993) for commit `e43e74596315`.",
+      "created_at": "2026-10-10T06:33:53Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6094694448",
+      "updated_at": "2026-10-10T06:33:53Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-11T02:04:47Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6104454600",
+      "updated_at": "2026-10-11T02:04:47Z",
+      "user": {
+        "login": "zyongye"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94040](https://buildkite.com/vllm/ci/builds/94040) for commit `aad624dc0196`.",
+      "created_at": "2026-10-11T02:05:53Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#issuecomment-6104462461",
+      "updated_at": "2026-10-11T02:05:53Z",
+      "user": {
+        "login": "github-actions"
+      }
+    }
+  ],
+  "number": 60684,
+  "refs": {
+    "base": {
+      "commit": "3c062d391d15cfa41d3f321cad24f3030c892a97",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "aad624dc019614c78acffffd0ee47aef0e5d0c2f",
+      "repository": "zyongye/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#pullrequestreview-5462315664",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-08T20:14:10Z",
+      "user": {
+        "login": "claude"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60684#pullrequestreview-5482053808",
+      "state": "APPROVED",
+      "submitted_at": "2026-10-11T05:40:42Z",
+      "user": {
+        "login": "ZJY0516"
+      }
+    }
+  ]
+}

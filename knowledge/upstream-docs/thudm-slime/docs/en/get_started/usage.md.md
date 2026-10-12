@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: docs/en/get_started/usage.md
-raw_sha256: c840ef9b969af265da3b92f66eafe5220087a85eb4b609a71356ed01a10afe27
+raw_sha256: 1305d31cb0489966b3f793630b7cbae72b50353ecede6c3a4100f211d186f044
 sources: []
-generated_body_sha256: 66129b7433af30764726a9972b13bacd794a874eac66461f3fb3bf569971b1ca
+generated_body_sha256: 2d253a6eb65760ca4aef9382536dd8f69f64c72aa3dac980ee80e2c4d9978dd4
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/get_started/usage.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/get_started/usage.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/get_started/usage.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -310,7 +310,7 @@ Add the following options to an existing RL launch:
 
 **Sampling requirements:** Use a positive temperature, `0 < top_p <= 1`, `top_k=-1`, `min_p=0`, and no repetition/frequency/presence penalties or constrained decoding. Keep `SGLANG_RETURN_ORIGINAL_LOGPROB` unset or false on all sampler workers when temperature differs from one or top_p is below one. Per-request temperature or top_p changes and streaming SC are unsupported. Evaluation does not request SC data and may use its own sampling settings.
 
-**Combining with top-p replay:** Change `--rollout-top-p 1.0` above to, for example, `--rollout-top-p 0.9`. SC automatically sums over the complete replay support and ignores `--score-centering-top-k`. Rollout returns all support IDs and their post-truncation, normalized sampler logprobs. The trainer normalizes on the same support and computes the correction `sum(stop_gradient(q * weight) * log p)`. This uses no tail approximation and excludes tokens outside the support. Full trainer logits cannot reconstruct the sampler probabilities, so the original probabilities must still be stored. Payload size varies with the support and can greatly exceed fixed top-k heads when top-p approaches one. Exactness is relative to the recorded replay support, including replay's existing rule for retaining sampled boundary tokens.
+**Combining with top-p replay:** Change `--rollout-top-p 1.0` above to, for example, `--rollout-top-p 0.9`. SC automatically sums over the complete replay support and ignores `--score-centering-top-k`. Rollout returns all support IDs and their post-truncation, normalized sampler logprobs. The trainer normalizes on the same support and computes the correction `sum(stop_gradient(q * weight - weight(1) * p) * log p)`. This matches the existing non-top-p centering convention on a complete support. The subtracted baseline has zero score gradient, so the update is unchanged, and `sc_correction` is zero when trainer and sampler distributions match (up to rounding). This uses no tail approximation and excludes tokens outside the support. Full trainer logits cannot reconstruct the sampler probabilities, so the original probabilities must still be stored. Payload size varies with the support and can greatly exceed fixed top-k heads when top-p approaches one. Exactness is relative to the recorded replay support, including replay's existing rule for retaining sampled boundary tokens.
 
 **SGLang support:** Use an image built with `docker/patch/latest/sglang-top_p.patch`, which provides binary top-k and complete top-p probability outputs. Slime requests `top_logprobs_num=k` when `top_p=1`, or `custom_params.return_top_p_log_probs` when `top_p<1`, and stores the original sampler probabilities without recomputing them with a newer checkpoint. Custom generators should call `score_centering_request` from `slime.utils.score_centering` and pass the response metadata to `Sample.append_response_tokens`.
 

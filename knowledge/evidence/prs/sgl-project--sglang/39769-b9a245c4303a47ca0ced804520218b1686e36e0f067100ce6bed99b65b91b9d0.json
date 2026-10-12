@@ -1,0 +1,150 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "08fc290f48a865f2cd0b9cf7a90f5a1c44dc0bd1",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nOn a sliding-window layer, the stage-2 loop in `_fwd_kernel` sweeps the extend KV from 0:\n\n```python\nfor start_n in range(0, extend_end, BLOCK_N):\n```\n\nThe window mask inside that loop keeps `(q, kv)` only when `q <= kv + SLIDING_WINDOW_SIZE`, so every tile lying entirely below `cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE` is fully masked and contributes nothing.\n\nThose tiles do not read K/V and do not run the dot — `SKIP_TILE` already guards that. What they still pay, once per tile, is the cost of establishing that they contribute nothing: building `final_mask` (the causal compare, the window compare, the `&`), and then the `[BLOCK_M, BLOCK_N]` cross-wave `tl.max` reduction that computes `SKIP_TILE` itself.\n\nOn a long extend with a small window that is the majority of the loop. At `extend_len = 8192` and `W = 127`, the last M block's floor sits at roughly `8192 - 127`, so almost every iteration is spent proving that the tile is empty.\n\n## Modifications\n\nStart the loop at the `BLOCK_N`-aligned tile that contains the window floor:\n\n```python\nextend_start = 0\nif SLIDING_WINDOW_SIZE > 0:\n    extend_start = (\n        tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N\n    ) * BLOCK_N\nfor start_n in range(extend_start, extend_end, BLOCK_N):\n```\n\nThe bound is derived from the mask predicate rather than estimated. The kernel returns early when `cur_block_m * BLOCK_M >= cur_seq_len_extend`, so `offs_m = 0` is always a live row and the smallest query index in the block is exactly `m0 = cur_block_m * BLOCK_M`. A skipped tile satisfies `start_n + BLOCK_N <= floor_aligned <= m0 - W`, hence its largest key index `start_n + BLOCK_N - 1 < m0 - W`, so the window mask is false for every one of its elements.\n\nIt is also tight at tile granularity: the preceding tile would need `floor_aligned >= m0 - W + 1` to hold a surviving element, which contradicts `floor_aligned <= m0 - W`. Nothing that can contribute is skipped, for any `BLOCK_M`/`BLOCK_N`.\n\n`SLIDING_WINDOW_SIZE` is a `tl.constexpr`, so a full-attention layer loses the branch at trace time and its loop is unchanged. `extend_start` is a multiple of `BLOCK_N`, so `tl.multiple_of(start_n, BLOCK_N)` stays valid. A custom mask or the non-causal path only adds conjuncts, which narrow the mask further, so the bound remains sound there. Under the HIP compact grid `cur_block_m` is still the per-sequence tile index, so the derivation is unaffected.\n\n## Accuracy Tests\n\n**MI355X (gfx950), 256 CU, ROCm 7.2, torch 2.9.1, Triton 3.7.0.**\n\nThe existing SWA suite passes unchanged: `test/registered/attention/unittests/swa/test_triton.py` reports 6 passed, 1 skipped, 20 subtests passed.\n\nOutput is unchanged rather than merely close. Across 21 configurations (12 sliding-window, 4 full-attention, 5 bound-inert) at `B=32, H_Q=64, H_KV=8, D=128`, bf16, causal, `o_extend` is bitwise identical before and after. Each run hashes its inputs as well as its output, so the comparison is only accepted when the inputs provably matched: **21/21 inputs identical, 21/21 outputs bitwise identical.**\n\nThe second commit adds coverage for the bound itself. Every pre-existing SWA extend case keeps the extend length under `BLOCK_M`, so `cur_block_m` is always 0 and the loop always starts at tile 0, leaving this code path unexercised. The three new cases use extend lengths above `BLOCK_M` with windows below it -- no prefix, with prefix and a window that is not a tile multiple, and a window landing exactly on a tile boundary -- so some query tile starts past the window and the bound takes effect.\n\n## Speed Tests\n\nMinimum over 7 repetitions of `triton.testing.do_bench(warmup=100ms, rep=500ms, return_mode=\"median\")`, one idle GPU. The baseline sweep was run twice, before and after the patched sweep; **maximum run-to-run drift was 0.23%**, so the deltas below are well outside noise.\n\nNote on methodology: `benchmark/kernels/sliding_window_attention_triton/bench_triton_swa_kernel.py` does not run on current main — its `_run_triton` predates the required `k_scale`/`v_scale` parameters of `extend_attention_fwd`, and `sglang.benchmark.bench_utils` hard-imports `flashinfer`, which has no ROCm build. These numbers therefore come from a harness that reuses that file's `_build_batch` for input generation but calls `extend_attention_fwd` the way `triton_backend` does, including `extend_seq_lens_cpu` so the HIP compact ragged grid is exercised.\n\n| N_CTX | window | before (ms) | after (ms) | delta |\n|---|---|---|---|---|\n| 8192 | 127 | 16.8210 | 10.2927 | **−38.8%** |\n| 8192 | 256 | 17.8645 | 11.8675 | **−33.6%** |\n| 8192 | 512 | 19.9542 | 14.9579 | **−25.0%** |\n| 4096 | 127 | 6.0787 | 4.4118 | −27.4% |\n| 4096 | 256 | 6.5772 | 5.1913 | −21.1% |\n| 4096 | 512 | 7.6285 | 6.6601 | −12.7% |\n| 2048 | 127 | 2.0689 | 1.7511 | −15.4% |\n| 2048 | 256 | 2.3980 | 2.1632 | −9.8% |\n| 2048 | 512 | 2.9954 | 2.8858 | −3.7% |\n| 1024 | 127 | 0.7128 | 0.6672 | −6.4% |\n| 1024 | 256 | 0.8542 | 0.8301 | −2.8% |\n| 1024 | 512 | 1.0625 | 1.0500 | −1.2% (bound inert, `max_len_extend`=466 < 512) |\n\nThe gain tracks the fraction of the loop below the floor: it grows with sequence length and shrinks with the window, which is what the derivation predicts.\n\n### End to end\n\n`gemma-4-26B-A4B-it` (25 of 30 layers `sliding_attention`, window 1024, `head_dim` 256, so `BLOCK_M`=128 here), `sglang.bench_one_batch --attention-backend triton`, one MI355X. Prefill latency, minimum of 4 alternating runs per arm. Minimum rather than mean because one patched run hit a 1.3 s startup artifact at `bs=4, 2048`; across the other cells the run-to-run spread is 0.2–1.3% for the baseline.\n\n| batch | input_len | before (s) | after (s) | delta |\n|---|---|---|---|---|\n| 1 | 16384 | 0.5173 | 0.4753 | **−8.1%** |\n| 4 | 16384 | 1.9708 | 1.8210 | **−7.6%** |\n| 1 | 8192 | 0.2041 | 0.1944 | −4.8% |\n| 4 | 8192 | 0.7725 | 0.7381 | −4.5% |\n| 1 | 2048 | 0.0501 | 0.0497 | −0.9% |\n| 4 | 2048 | 0.1558 | 0.1557 | −0.1% |\n\nThis is whole-model prefill, MoE included, so the attention-only share of the win is larger than these numbers. The 2048 rows are near zero because `BLOCK_M`=128 against a 1024 window means the bound only starts firing at `cur_block_m >= 9`, i.e. past token 1152. A model with a tighter window, such as `gpt-oss` at 128, should gain considerably more; I have not measured that.\n\n### Full-attention control\n\nAt `sliding_window_size = -1` the branch is constexpr-eliminated, so the two builds should be indistinguishable:\n\n| N_CTX | before (ms) | after (ms) | delta |\n|---|---|---|---|\n| 1024 | 0.6566 | 0.6573 | +0.1% |\n| 2048 | 2.4447 | 2.4423 | −0.1% |\n| 4096 | 8.0970 | 8.0976 | +0.0% |\n| 8192 | 22.8541 | 22.8669 | +0.1% |\n\nMean +0.02%, all within the 0.23% drift. Full-attention models and the global-attention layers of hybrid models are unaffected both by construction and by measurement.\n\n### Cost where the bound never fires\n\nA sliding-window layer whose every M block satisfies `m0 <= W`: `extend_start` always evaluates to 0 and the trip count is unchanged, yet the computation still runs. `_build_batch` draws extend lengths from `randint(1, N_CTX // 2)`, so `W >= N_CTX / 2` makes the bound inert; `max_len_extend <= W` was checked per configuration rather than assumed.\n\n| N_CTX | window | max_len_extend | before (ms) | after (ms) | delta |\n|---|---|---|---|---|---|\n| 1024 | 1024 | 466 | 1.1208 | 1.1082 | −1.1% |\n| 1024 | 2048 | 466 | 1.1167 | 1.1051 | −1.0% |\n| 2048 | 2048 | 913 | 4.3497 | 4.2907 | −1.4% |\n| 4096 | 4096 | 1884 | 14.8614 | 14.6661 | −1.3% |\n| 8192 | 8192 | 4072 | 42.3522 | 41.9029 | −1.1% |\n\nNo configuration regresses. The small consistent gain is above drift but I do not have an explanation for it, so I am reporting it rather than claiming it.\n\nThe AMDGCN metadata does **not** show this as free on gfx950, at `N_CTX=8192, W=127`:\n\n```\nsgpr_count:       106 -> 106\nvgpr_count:       204 -> 204\nsgpr_spill_count:  76 ->  80\nvgpr_spill_count:   0 ->   0\nshared:         16384 -> 16384\n```\n\nFour more SGPR spills. It does not show up in any measurement above, but I would rather flag it than assert the bound is free.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). — no user-facing behaviour change, nothing to document.\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:no_entry_sign: [Run #37891934742](https://github.com/sgl-project/sglang/actions/runs/37891934742)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37891934333](https://github.com/sgl-project/sglang/actions/runs/37891934333)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37891934665](https://github.com/sgl-project/sglang/actions/runs/37891934665)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "HaiShaw"
+            },
+            "body": "/tag-and-rerun-ci",
+            "createdAt": "2026-09-23T08:17:02Z",
+            "updatedAt": "2026-09-23T08:17:02Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39769#issuecomment-5791441963"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAVkyZCs=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "1e97fc39c637d043888b318dbe3b36a9e4dc2f73",
+      "headRepository": {
+        "nameWithOwner": "jiaqiang-dot-liu/sglang"
+      },
+      "merged": false,
+      "number": 39769,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "Skip fully-masked KV tiles in sliding-window extend attention",
+      "updatedAt": "2026-10-09T10:46:01Z",
+      "url": "https://github.com/sgl-project/sglang/pull/39769"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "08fc290f48a865f2cd0b9cf7a90f5a1c44dc0bd1"
+    },
+    "body": "## Motivation\n\nOn a sliding-window layer, the stage-2 loop in `_fwd_kernel` sweeps the extend KV from 0:\n\n```python\nfor start_n in range(0, extend_end, BLOCK_N):\n```\n\nThe window mask inside that loop keeps `(q, kv)` only when `q <= kv + SLIDING_WINDOW_SIZE`, so every tile lying entirely below `cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE` is fully masked and contributes nothing.\n\nThose tiles do not read K/V and do not run the dot — `SKIP_TILE` already guards that. What they still pay, once per tile, is the cost of establishing that they contribute nothing: building `final_mask` (the causal compare, the window compare, the `&`), and then the `[BLOCK_M, BLOCK_N]` cross-wave `tl.max` reduction that computes `SKIP_TILE` itself.\n\nOn a long extend with a small window that is the majority of the loop. At `extend_len = 8192` and `W = 127`, the last M block's floor sits at roughly `8192 - 127`, so almost every iteration is spent proving that the tile is empty.\n\n## Modifications\n\nStart the loop at the `BLOCK_N`-aligned tile that contains the window floor:\n\n```python\nextend_start = 0\nif SLIDING_WINDOW_SIZE > 0:\n    extend_start = (\n        tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N\n    ) * BLOCK_N\nfor start_n in range(extend_start, extend_end, BLOCK_N):\n```\n\nThe bound is derived from the mask predicate rather than estimated. The kernel returns early when `cur_block_m * BLOCK_M >= cur_seq_len_extend`, so `offs_m = 0` is always a live row and the smallest query index in the block is exactly `m0 = cur_block_m * BLOCK_M`. A skipped tile satisfies `start_n + BLOCK_N <= floor_aligned <= m0 - W`, hence its largest key index `start_n + BLOCK_N - 1 < m0 - W`, so the window mask is false for every one of its elements.\n\nIt is also tight at tile granularity: the preceding tile would need `floor_aligned >= m0 - W + 1` to hold a surviving element, which contradicts `floor_aligned <= m0 - W`. Nothing that can contribute is skipped, for any `BLOCK_M`/`BLOCK_N`.\n\n`SLIDING_WINDOW_SIZE` is a `tl.constexpr`, so a full-attention layer loses the branch at trace time and its loop is unchanged. `extend_start` is a multiple of `BLOCK_N`, so `tl.multiple_of(start_n, BLOCK_N)` stays valid. A custom mask or the non-causal path only adds conjuncts, which narrow the mask further, so the bound remains sound there. Under the HIP compact grid `cur_block_m` is still the per-sequence tile index, so the derivation is unaffected.\n\n## Accuracy Tests\n\n**MI355X (gfx950), 256 CU, ROCm 7.2, torch 2.9.1, Triton 3.7.0.**\n\nThe existing SWA suite passes unchanged: `test/registered/attention/unittests/swa/test_triton.py` reports 6 passed, 1 skipped, 20 subtests passed.\n\nOutput is unchanged rather than merely close. Across 21 configurations (12 sliding-window, 4 full-attention, 5 bound-inert) at `B=32, H_Q=64, H_KV=8, D=128`, bf16, causal, `o_extend` is bitwise identical before and after. Each run hashes its inputs as well as its output, so the comparison is only accepted when the inputs provably matched: **21/21 inputs identical, 21/21 outputs bitwise identical.**\n\nThe second commit adds coverage for the bound itself. Every pre-existing SWA extend case keeps the extend length under `BLOCK_M`, so `cur_block_m` is always 0 and the loop always starts at tile 0, leaving this code path unexercised. The three new cases use extend lengths above `BLOCK_M` with windows below it -- no prefix, with prefix and a window that is not a tile multiple, and a window landing exactly on a tile boundary -- so some query tile starts past the window and the bound takes effect.\n\n## Speed Tests\n\nMinimum over 7 repetitions of `triton.testing.do_bench(warmup=100ms, rep=500ms, return_mode=\"median\")`, one idle GPU. The baseline sweep was run twice, before and after the patched sweep; **maximum run-to-run drift was 0.23%**, so the deltas below are well outside noise.\n\nNote on methodology: `benchmark/kernels/sliding_window_attention_triton/bench_triton_swa_kernel.py` does not run on current main — its `_run_triton` predates the required `k_scale`/`v_scale` parameters of `extend_attention_fwd`, and `sglang.benchmark.bench_utils` hard-imports `flashinfer`, which has no ROCm build. These numbers therefore come from a harness that reuses that file's `_build_batch` for input generation but calls `extend_attention_fwd` the way `triton_backend` does, including `extend_seq_lens_cpu` so the HIP compact ragged grid is exercised.\n\n| N_CTX | window | before (ms) | after (ms) | delta |\n|---|---|---|---|---|\n| 8192 | 127 | 16.8210 | 10.2927 | **−38.8%** |\n| 8192 | 256 | 17.8645 | 11.8675 | **−33.6%** |\n| 8192 | 512 | 19.9542 | 14.9579 | **−25.0%** |\n| 4096 | 127 | 6.0787 | 4.4118 | −27.4% |\n| 4096 | 256 | 6.5772 | 5.1913 | −21.1% |\n| 4096 | 512 | 7.6285 | 6.6601 | −12.7% |\n| 2048 | 127 | 2.0689 | 1.7511 | −15.4% |\n| 2048 | 256 | 2.3980 | 2.1632 | −9.8% |\n| 2048 | 512 | 2.9954 | 2.8858 | −3.7% |\n| 1024 | 127 | 0.7128 | 0.6672 | −6.4% |\n| 1024 | 256 | 0.8542 | 0.8301 | −2.8% |\n| 1024 | 512 | 1.0625 | 1.0500 | −1.2% (bound inert, `max_len_extend`=466 < 512) |\n\nThe gain tracks the fraction of the loop below the floor: it grows with sequence length and shrinks with the window, which is what the derivation predicts.\n\n### End to end\n\n`gemma-4-26B-A4B-it` (25 of 30 layers `sliding_attention`, window 1024, `head_dim` 256, so `BLOCK_M`=128 here), `sglang.bench_one_batch --attention-backend triton`, one MI355X. Prefill latency, minimum of 4 alternating runs per arm. Minimum rather than mean because one patched run hit a 1.3 s startup artifact at `bs=4, 2048`; across the other cells the run-to-run spread is 0.2–1.3% for the baseline.\n\n| batch | input_len | before (s) | after (s) | delta |\n|---|---|---|---|---|\n| 1 | 16384 | 0.5173 | 0.4753 | **−8.1%** |\n| 4 | 16384 | 1.9708 | 1.8210 | **−7.6%** |\n| 1 | 8192 | 0.2041 | 0.1944 | −4.8% |\n| 4 | 8192 | 0.7725 | 0.7381 | −4.5% |\n| 1 | 2048 | 0.0501 | 0.0497 | −0.9% |\n| 4 | 2048 | 0.1558 | 0.1557 | −0.1% |\n\nThis is whole-model prefill, MoE included, so the attention-only share of the win is larger than these numbers. The 2048 rows are near zero because `BLOCK_M`=128 against a 1024 window means the bound only starts firing at `cur_block_m >= 9`, i.e. past token 1152. A model with a tighter window, such as `gpt-oss` at 128, should gain considerably more; I have not measured that.\n\n### Full-attention control\n\nAt `sliding_window_size = -1` the branch is constexpr-eliminated, so the two builds should be indistinguishable:\n\n| N_CTX | before (ms) | after (ms) | delta |\n|---|---|---|---|\n| 1024 | 0.6566 | 0.6573 | +0.1% |\n| 2048 | 2.4447 | 2.4423 | −0.1% |\n| 4096 | 8.0970 | 8.0976 | +0.0% |\n| 8192 | 22.8541 | 22.8669 | +0.1% |\n\nMean +0.02%, all within the 0.23% drift. Full-attention models and the global-attention layers of hybrid models are unaffected both by construction and by measurement.\n\n### Cost where the bound never fires\n\nA sliding-window layer whose every M block satisfies `m0 <= W`: `extend_start` always evaluates to 0 and the trip count is unchanged, yet the computation still runs. `_build_batch` draws extend lengths from `randint(1, N_CTX // 2)`, so `W >= N_CTX / 2` makes the bound inert; `max_len_extend <= W` was checked per configuration rather than assumed.\n\n| N_CTX | window | max_len_extend | before (ms) | after (ms) | delta |\n|---|---|---|---|---|---|\n| 1024 | 1024 | 466 | 1.1208 | 1.1082 | −1.1% |\n| 1024 | 2048 | 466 | 1.1167 | 1.1051 | −1.0% |\n| 2048 | 2048 | 913 | 4.3497 | 4.2907 | −1.4% |\n| 4096 | 4096 | 1884 | 14.8614 | 14.6661 | −1.3% |\n| 8192 | 8192 | 4072 | 42.3522 | 41.9029 | −1.1% |\n\nNo configuration regresses. The small consistent gain is above drift but I do not have an explanation for it, so I am reporting it rather than claiming it.\n\nThe AMDGCN metadata does **not** show this as free on gfx950, at `N_CTX=8192, W=127`:\n\n```\nsgpr_count:       106 -> 106\nvgpr_count:       204 -> 204\nsgpr_spill_count:  76 ->  80\nvgpr_spill_count:   0 ->   0\nshared:         16384 -> 16384\n```\n\nFour more SGPR spills. It does not show up in any measurement above, but I would rather flag it than assert the bound is free.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). — no user-facing behaviour change, nothing to document.\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:no_entry_sign: [Run #37891934742](https://github.com/sgl-project/sglang/actions/runs/37891934742)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37891934333](https://github.com/sgl-project/sglang/actions/runs/37891934333)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37891934665](https://github.com/sgl-project/sglang/actions/runs/37891934665)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "jiaqiang-dot-liu/sglang"
+      },
+      "sha": "1e97fc39c637d043888b318dbe3b36a9e4dc2f73"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/39769",
+    "merged": false,
+    "number": 39769,
+    "state": "open",
+    "title": "Skip fully-masked KV tiles in sliding-window extend attention",
+    "updated_at": "2026-10-09T10:46:01Z"
+  },
+  "files": [
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/1e97fc39c637d043888b318dbe3b36a9e4dc2f73/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fextend_attention.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fextend_attention.py?ref=1e97fc39c637d043888b318dbe3b36a9e4dc2f73",
+      "deletions": 1,
+      "filename": "python/sglang/kernels/ops/attention/extend_attention.py",
+      "patch": "@@ -667,7 +667,16 @@ def _fwd_kernel(\n         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)\n     )\n     extend_end = 0 if SKIP_EXTEND else cur_block_m_end\n-    for start_n in range(0, extend_end, BLOCK_N):\n+    # Causal or not, the mask below keeps (q, kv) only if q <= kv + SLIDING_WINDOW_SIZE,\n+    # so no tile under this floor holds an unmasked element -- tight for any\n+    # BLOCK_M/BLOCK_N. SKIP_TILE already zeroes them; bounding the loop also drops\n+    # their cross-wave tl.max.\n+    extend_start = 0\n+    if SLIDING_WINDOW_SIZE > 0:\n+        extend_start = (\n+            tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N\n+        ) * BLOCK_N\n+    for start_n in range(extend_start, extend_end, BLOCK_N):\n         start_n = tl.multiple_of(start_n, BLOCK_N)\n         mask_n = (start_n + offs_n) < cur_block_m_end\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/1e97fc39c637d043888b318dbe3b36a9e4dc2f73/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fextend_attention.py",
+      "sha": "ad6e5c6cd65132be09aebddfed8b314a689e92a1",
+      "status": "modified"
+    },
+    {
+      "additions": 54,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/1e97fc39c637d043888b318dbe3b36a9e4dc2f73/test%2Fregistered%2Fattention%2Funittests%2Fswa%2Ftest_triton.py",
+      "changes": 54,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fattention%2Funittests%2Fswa%2Ftest_triton.py?ref=1e97fc39c637d043888b318dbe3b36a9e4dc2f73",
+      "deletions": 0,
+      "filename": "test/registered/attention/unittests/swa/test_triton.py",
+      "patch": "@@ -252,6 +252,60 @@ def test_projected_swa_attention_cases(self):\n             with self.subTest(case=case.name, backend=case.backend):\n                 run_dense_attention_case(self, case)\n \n+    # Every other SWA case here keeps the extend length under BLOCK_M (64 or\n+    # 128 on the architectures we build for), so `cur_block_m` is always 0 and\n+    # the extend-KV loop always starts at tile 0. The kernel bounds that loop\n+    # below by the sliding-window floor, and that bound is only reachable once\n+    # a query tile starts past the window. These lengths are therefore load\n+    # bearing: they must stay above BLOCK_M with a window well below it, or\n+    # the bound goes unexercised and a wrong or missing one stays green.\n+    MULTI_TILE_SWA_CASES = (\n+        DenseAttentionCase(\n+            name=\"swa_extend_multi_tile_no_prefix\",\n+            backend=\"triton\",\n+            forward_mode=ForwardMode.EXTEND,\n+            num_heads=8,\n+            num_kv_heads=4,\n+            page_size=16,\n+            prefix_lens=(0, 0),\n+            extend_lens=(384, 321),\n+            sliding_window_size=24,\n+        ),\n+        # Non-empty prefix so the prefix sweep runs too, and a window that is\n+        # not a multiple of any BLOCK_N we use, which is where rounding the\n+        # floor down to a tile boundary would show up.\n+        DenseAttentionCase(\n+            name=\"swa_extend_multi_tile_with_prefix\",\n+            backend=\"triton\",\n+            forward_mode=ForwardMode.EXTEND,\n+            num_heads=8,\n+            num_kv_heads=4,\n+            page_size=16,\n+            prefix_lens=(48, 130),\n+            extend_lens=(384, 300),\n+            sliding_window_size=72,\n+        ),\n+        # Window exactly on a tile boundary: the floor lands on a tile start,\n+        # so an off-by-one in the bound drops a tile that still contributes.\n+        DenseAttentionCase(\n+            name=\"swa_extend_multi_tile_window_tile_aligned\",\n+            backend=\"triton\",\n+            forward_mode=ForwardMode.EXTEND,\n+            num_heads=8,\n+            num_kv_heads=4,\n+            page_size=16,\n+            prefix_lens=(0,),\n+            extend_lens=(448,),\n+            sliding_window_size=128,\n+        ),\n+    )\n+\n+    def test_multi_tile_swa_extend_cases(self):\n+        for case in self.MULTI_TILE_SWA_CASES:\n+            with self.subTest(case=case.name, backend=case.backend):\n+                # The kit defaults to 64, which these lengths exceed.\n+                run_dense_attention_case(self, case, max_context_len=512)\n+\n     # Layout-robustness. See dense/test_triton.py for full rationale.\n     # The default `shuffled_pages` layout is already exercised by\n     # test_projected_swa_attention_cases; this method opts into the",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/1e97fc39c637d043888b318dbe3b36a9e4dc2f73/test%2Fregistered%2Fattention%2Funittests%2Fswa%2Ftest_triton.py",
+      "sha": "209d6b3af1c3ef23cb8200cb21aa7b4d50cc62e0",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/tag-and-rerun-ci",
+      "created_at": "2026-09-23T08:17:02Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39769#issuecomment-5791441963",
+      "updated_at": "2026-09-23T08:17:02Z",
+      "user": {
+        "login": "HaiShaw"
+      }
+    }
+  ],
+  "number": 39769,
+  "refs": {
+    "base": {
+      "commit": "08fc290f48a865f2cd0b9cf7a90f5a1c44dc0bd1",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "1e97fc39c637d043888b318dbe3b36a9e4dc2f73",
+      "repository": "jiaqiang-dot-liu/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": []
+}

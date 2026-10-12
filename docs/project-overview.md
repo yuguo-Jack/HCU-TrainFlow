@@ -139,7 +139,7 @@ HCU 的环境与启动脚本决定实际部署方式；官方模型和训练代�
 
 Torch 原生训练在同一流程中加强输入流水、autograd、DDP/FSDP、`compile`、断图、重编译及前后向图分析。RL 还需拆开训练、rollout、推理、权重同步和样本流转，核对策略版本、logprob、reward 与样本时效。
 
-机制参考包括官方教程、开发分支和 PR，也包括 AMD Primus 系列、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 的适用实现。先查清适用条件和依赖，再在 HCU 上验证。见[性能分析](profiling.md)、[Torch 专项](../skills/hcu-train-analyze-and-optimize/references/torch-native-training.md)和[通信专项](../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)。
+按[优化参考表](optimization-reference-map.md)联查 Megatron、TorchTitan、DeepSpeed、AMD Primus、MindSpeed 系列、LoongForge 及相关 SFT/RL 引擎的教程、开发分支与 PR。先查清适用条件和依赖，再在 HCU 上验证。见[性能分析](profiling.md)、[Torch 专项](../skills/hcu-train-analyze-and-optimize/references/torch-native-training.md)和[通信专项](../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)。
 
 ### 5.4 TraceLens 如何帮助形成优化决策
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
 path: docs/en/advanced/arch-support-beyond-megatron.md
-raw_sha256: b537eb2d67cd41c2514069c272212e1501870f0b9b455c391c2691ca9eabddd6
+raw_sha256: 58d82c1cfcfbb7e209c2030c9dbc12fa7e1989295a0ee84659a70c462bce4e1d
 sources: []
-generated_body_sha256: 7ddeab51757ad2f1eee3fd26a7242a16ab61e3e9162fd8598dc9416ade6b58f4
+generated_body_sha256: 2ec4eaeed2a8b083fff7ff1c7ba21c0c05d1ce8cdd32cbde601b466cd203e645
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/arch-support-beyond-megatron.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/arch-support-beyond-megatron.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/advanced/arch-support-beyond-megatron.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,7 +38,7 @@ The Qwen3-Next integration has three parts:
 2. **Run GDN within Megatron.** The GDN implementation adapts the Hugging Face model layout and uses FLA or the optional FlashQLA backend for the recurrent attention kernel. `HuggingfaceAttention` gathers sequence and context partitions before the replicated computation, then returns the local output partition. See [hf_attention.py](https://github.com/THUDM/slime/blob/main/slime_plugins/models/hf_attention.py).
 3. **Load the model weights.** The checkpoint loader maps Hugging Face parameter names and tensor layouts to the custom modules and the retained Megatron layers. See [the Qwen3-Next weight loader](https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/hf_to_megatron/qwen3_next.py).
 
-The [Qwen3-Next example](../examples/qwen3-next-80B-A3B.md) contains the launch configuration and backend options.
+The [experiment tutorial](../get_started/experiment-guide.md) explains model selection and launch configuration. Existing architecture-specific launchers remain in `scripts/`.
 
 ## Current Limitations
 

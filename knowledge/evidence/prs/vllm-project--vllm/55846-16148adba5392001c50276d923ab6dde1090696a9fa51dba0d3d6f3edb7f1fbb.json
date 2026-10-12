@@ -1,0 +1,288 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "3766a67a32f7ea8130d84383f72883cee5e8b006",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "<!-- markdownlint-disable -->\n\n## Overview\n\nMake `EngineCore` and its workers exit, and release the GPUs, when the process that launched them dies without shutting them down (SIGKILL, OOM-kill, crash). Fixes #55510. Same class of report as #19849, #25850, #34643 and #43060.\n\n## Claims\n\n- When the launching process is SIGKILLed, `VLLM::EngineCore` and its `VLLM::Worker_TP*` processes exit within 15 s and release GPU memory. On `main` they keep running indefinitely, and a restart then fails the KV-cache memory check or OOMs.\n- Validated for `vllm serve` TP=2, `vllm serve` DP=2, offline `LLM()` with TP=1/2, and SIGKILL during model loading. @vinitrbl independently confirmed `vllm run-batch` ([review](https://github.com/vllm-project/vllm/pull/55846#pullrequestreview-5424839487)): on `main` even a plain SIGTERM orphans the engine there, because run-batch has no SIGTERM handler, and with this PR the GPU is free within 5 s for both SIGTERM and SIGKILL.\n- Clients that outlive the dead parent receive `ENGINE_CORE_DEAD` and fail fast instead of hanging with `/health` 200. The main example is the API-server processes in multi-API-server mode, which is the default for DP > 1.\n- Nothing changes while the parent is alive. SIGTERM/SIGINT handling and the `--shutdown-timeout` drain path are untouched, and the existing shutdown tests listed below pass.\n\n## Validation\n\nBase `84bcbc6264`, torch 2.13.0+cu132. The branch has since been rebased onto `04462732a4` with no conflicts and an unchanged patch. The reproducer and the existing shutdown suites ran on 2× A100-SXM4-40GB (driver 580.159.03). The final test files ran on 2× A100-PCIE-40GB (driver 595.71.05) with `NCCL_P2P_DISABLE=1 VLLM_SKIP_P2P_CHECK=0`. That host needs them for TP=2 because its GPUs sit on different sockets and P2P does not work inside its container. NVIDIA only: ROCm was not validated, but the AMD \"Distributed Torchrun + Shutdown\" mirror runs the new test.\n\nReproducer for #55510: start `vllm serve hmellor/tiny-random-LlamaForCausalLM --enforce-eager`, `kill -9` the launcher, then watch `ps` and `nvidia-smi`.\n\n| Scenario | `main` | this PR |\n|---|---|---|\n| TP=2, SIGKILL the API server | EngineCore + 2 workers still alive after 60 s, 75,856 MiB held | all exited after 8 s, 0 MiB |\n| DP=2 (2 API servers), SIGKILL the launcher | 2 EngineCores + 2 workers still alive after 60 s, 75,240 MiB held; the API servers keep serving | engines exited after 7 s, 0 MiB; both API servers got `EngineDeadError` and shut down on their own ~4 s later (only the CPU-only DP coordinator remains) |\n| TP=2, SIGKILL during model load | EngineCore finishes loading, starts its workers and holds 75,856 MiB after 60 s | all exited within 1 s, 0 MiB |\n\nIn every PR run the engine log shows `parent process exited, shutting down` followed by the normal abort and teardown; the 15 s force-kill fallback never fired.\n\n```\npytest tests/v1/engine/test_startup_watch_processes.py                       # 19 passed\nCUDA_VISIBLE_DEVICES=0,1 pytest -v -s tests/v1/shutdown/test_parent_death.py # 2 passed (TP=1: 33 s, TP=2: 53 s)\nCUDA_VISIBLE_DEVICES=0,1 pytest -v -s tests/v1/shutdown/test_delete.py tests/v1/shutdown/test_forward_error.py tests/v1/shutdown/test_startup_error.py  # 18 passed, 4 skipped\npytest -v -s tests/entrypoints/launchers/test_shutdown.py                    # 8 passed (SIGTERM drain/abort unchanged)\n```\n\nOn unpatched `main`, `test_parent_death.py` fails in both cases with `engine processes outlived their parent`. For TP=2 the survivors are EngineCore and both TP workers. `pre-commit` (ruff, typos) and mypy (`--python-version 3.12`) pass.\n\n## Details\n\n**Root cause.** `WorkerProc` already exits when its parent dies: `MultiprocExecutor` gives each worker the read end of a death pipe and keeps the write end. But the workers' parent is `EngineCore`, and `EngineCore` has no parent-liveness check of its own:\n- `CoreEngineProcManager` starts it as a plain non-daemon process.\n- `run_engine_core` installs only SIGTERM/SIGINT handlers.\n- Its ZMQ sockets have no heartbeat.\n\nSo when the frontend disappears, `EngineCore` idles forever and keeps its workers alive.\n\n**Fix.** Reuse the worker mechanism one level up.\n- **Shared helper.** The worker's death-pipe thread moves without behaviour changes into `vllm.utils.system_utils.monitor_parent_death()`, and `WorkerProc` calls it.\n- **Pipe ownership.** `CoreEngineProcManager` creates one pipe per engine and holds the write ends until after `shutdown(procs)` has stopped the engines, so a SIGTERM drain never sees EOF. Under fork, children close the inherited write ends, as `MultiprocExecutor` already does.\n- **On EOF.** `EngineCore` follows the approach @njhill suggested on #34816: \"set the shutdown flag and then kill after some delay\".\n  - It sends `ENGINE_CORE_DEAD` to its clients.\n  - It requests shutdown in abort mode and wakes the busy loop, so the normal teardown runs and terminates the workers.\n  - If it is still alive 15 s later, or if the parent died before the engine finished initializing, it SIGKILLs its process tree and then itself.\n\n<details>\n<summary>Design notes and alternatives</summary>\n\n- **Abort, not drain.** A drain is only ever bounded by the parent force-killing the engine when `--shutdown-timeout` expires, so without the parent a drain would be unbounded. RFC #24885 puts that decision with the parent, and that parent is gone. `--shutdown-timeout` defaults to 0, so default deployments abort anyway.\n- **Notify clients at EOF time.** The notice goes out before teardown rather than after it, so it cannot be pre-empted by the 15 s force-kill and does not delay GPU release. As a result, in-flight requests on surviving clients fail with `EngineDeadError`, the same as when an engine crashes.\n- **Not `prctl(PR_SET_PDEATHSIG)`** (#34816, draft #40935).\n  - The death pipe is portable and pure Python; on #40841 prctl was described as \"not easy to do in python\".\n  - It tracks the parent *process* rather than the thread that created the child, which matters for embedders that construct `LLM()` from a helper thread.\n  - It allows a cooperative abort before any kill.\n- **Not `multiprocessing.parent_process().sentinel`.** Under fork, CPython's parent keeps each child's sentinel write end open, so later siblings inherit the write ends of earlier siblings and EOF would cascade one engine at a time.\n- **Earlier attempts.** #27686, #36055 and #34816 were closed for inactivity, not rejected. Compared with them, this PR keeps the `processes` API, handles inherited fds under fork, closes the write ends only after the engines have shut down (so drain is preserved), and installs no new signal handlers.\n\n</details>\n\n<details>\n<summary>Not covered, and behaviour changes</summary>\n\nNot covered:\n- The DP supervisor itself being SIGKILLed. Its DP servers run in their own process group and keep their engines. Death of a single DP server *is* covered.\n- `vllm-rs serve` managed-engine mode when the Rust binary dies, because the headless Python launcher survives it.\n- CPU-only processes left behind by a SIGKILLed multi-API-server launcher: API servers (which now see `EngineDeadError`), the DP coordinator and the Rust frontend. Related: #43417.\n- Ray-managed engines.\n- If user code forks after creating `LLM()`, for example with a fork-mode `multiprocessing.Pool`, those children hold the write end and delay EOF until they exit. The existing worker death pipe has the same limitation.\n- A narrow startup race. If the parent dies while EngineCore is still starting its TP workers, the force-kill takes a single process-tree snapshot, so a worker started in the few milliseconds after it can be missed. That worker only exits at the distributed-init timeout (600 s by default), because workers start watching their death pipe after `WorkerProc` construction. This gap already exists on `main`, for example when EngineCore is OOM-killed while spawning workers. Closing it on the worker side is left for a follow-up.\n\nBehaviour changes:\n- If the parent dies during a SIGTERM drain, the engine switches to abort.\n- Multi-node DP: when one node's launcher dies, that node's ranks now exit instead of being left orphaned. They notify the head node and are force-killed after 15 s if their peers are still busy, so the DP group fails the same way it does when any rank dies.\n\n</details>\n\n<details>\n<summary>Interaction with open PRs</summary>\n\n- #52299 (merged since) is complementary: it handles SIGTERM during init, while this PR handles parent death during init. #50529 applies cleanly on top of this PR.\n- #55700 needs a one-line move: its `dump_stack` call goes into the new `on_parent_death` closure in `WorkerProc.monitor_death_pipe`.\n- The `kill_process_tree` regression from #52314, where it can raise `psutil.NoSuchProcess`, is fixed separately in #59984. The force-kill here performs its final self-SIGKILL either way.\n\n</details>\n\nAI assistance (Claude Code) was used for the patch, the tests and this description. I reviewed every changed line and ran the tests and GPU experiments above.\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @liulanze.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-09-30T08:31:49Z",
+            "updatedAt": "2026-09-30T08:31:49Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55846#issuecomment-5907348551"
+          },
+          {
+            "author": {
+              "login": "liulanze"
+            },
+            "body": "Rebased onto current main and reworked; the description has the updated validation (before/after reproducer on 2×A100, plus the existing shutdown suites).\r\n\r\n@njhill this follows the approach you suggested on #34816 (\"set the shutdown flag and then kill after some delay\"). Could you take a look when you have a moment?\r\ncc @markmc for the drain/abort semantics on parent death (RFC #24885), and @simon-mo since #52299 touches the same run_engine_core region, it applies cleanly on top of this.",
+            "createdAt": "2026-10-04T23:04:22Z",
+            "updatedAt": "2026-10-04T23:04:22Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55846#issuecomment-5985412902"
+          },
+          {
+            "author": {
+              "login": "liulanze"
+            },
+            "body": "Rebased onto the latest main; no conflicts and the patch is unchanged. It composes with #52299, which landed this week: #52299 handles SIGTERM during engine init, and this PR handles the parent dying, including a SIGKILL during init where no SIGTERM ever arrives.\n\nThanks @vinitrbl for testing `vllm run-batch`! I added it to the description.\n\n@andyxning thanks for picking this up. It's ready for review whenever you have time.\n",
+            "createdAt": "2026-10-09T19:58:54Z",
+            "updatedAt": "2026-10-09T19:58:54Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55846#issuecomment-6088274982"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWrjtCY=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "headRepository": {
+        "nameWithOwner": "liulanze/vllm"
+      },
+      "merged": false,
+      "number": 55846,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-08T22:19:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55846#pullrequestreview-5147576068"
+          },
+          {
+            "author": {
+              "login": "vinitrbl"
+            },
+            "body": "Gave this a try with `vllm run-batch`, since it isn't in the table and it's a slightly worse case: run-batch has no SIGTERM handler, so even a normal SIGTERM kills the launcher without telling the engine.\n\nA10G, tiny random-weight Llama, 4000-request batch, signal sent to the run-batch process once a few hundred requests had finished. Base is main at the merge base (7867d6c), PR head 81aa514, both with `VLLM_USE_PRECOMPILED=1`.\n\n| signal | main @ 7867d6c | this PR |\n|---|---|---|\n| SIGTERM | EngineCore still up after 60s, 21 GB held | gone, GPU free within 5s |\n| SIGKILL | | gone, GPU free within 5s |\n\nBoth PR runs log `EngineCore: parent process exited, shutting down`. I didn't redo SIGKILL on 7867d6c, but on another main-based build (the #52505 branch) it orphaned the engine the same way.\n\nOn main the next run on the same GPU fails in `request_memory` until you kill the orphan by hand, so this is a nice fix for anyone retrying interrupted batch jobs. Might be worth adding run-batch to the list of covered cases.\n",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-06T06:57:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55846#pullrequestreview-5424839487"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wNlQwNjo1NzoyNFq0MjAyNi0xMC0wNlQwNjo1NzoyNFrPAAAAAUNYez8=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "OPEN",
+      "title": "[Bugfix][Core] Shut down EngineCore and its workers when the parent process dies",
+      "updatedAt": "2026-10-09T19:58:54Z",
+      "url": "https://github.com/vllm-project/vllm/pull/55846"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "3766a67a32f7ea8130d84383f72883cee5e8b006"
+    },
+    "body": "<!-- markdownlint-disable -->\n\n## Overview\n\nMake `EngineCore` and its workers exit, and release the GPUs, when the process that launched them dies without shutting them down (SIGKILL, OOM-kill, crash). Fixes #55510. Same class of report as #19849, #25850, #34643 and #43060.\n\n## Claims\n\n- When the launching process is SIGKILLed, `VLLM::EngineCore` and its `VLLM::Worker_TP*` processes exit within 15 s and release GPU memory. On `main` they keep running indefinitely, and a restart then fails the KV-cache memory check or OOMs.\n- Validated for `vllm serve` TP=2, `vllm serve` DP=2, offline `LLM()` with TP=1/2, and SIGKILL during model loading. @vinitrbl independently confirmed `vllm run-batch` ([review](https://github.com/vllm-project/vllm/pull/55846#pullrequestreview-5424839487)): on `main` even a plain SIGTERM orphans the engine there, because run-batch has no SIGTERM handler, and with this PR the GPU is free within 5 s for both SIGTERM and SIGKILL.\n- Clients that outlive the dead parent receive `ENGINE_CORE_DEAD` and fail fast instead of hanging with `/health` 200. The main example is the API-server processes in multi-API-server mode, which is the default for DP > 1.\n- Nothing changes while the parent is alive. SIGTERM/SIGINT handling and the `--shutdown-timeout` drain path are untouched, and the existing shutdown tests listed below pass.\n\n## Validation\n\nBase `84bcbc6264`, torch 2.13.0+cu132. The branch has since been rebased onto `04462732a4` with no conflicts and an unchanged patch. The reproducer and the existing shutdown suites ran on 2× A100-SXM4-40GB (driver 580.159.03). The final test files ran on 2× A100-PCIE-40GB (driver 595.71.05) with `NCCL_P2P_DISABLE=1 VLLM_SKIP_P2P_CHECK=0`. That host needs them for TP=2 because its GPUs sit on different sockets and P2P does not work inside its container. NVIDIA only: ROCm was not validated, but the AMD \"Distributed Torchrun + Shutdown\" mirror runs the new test.\n\nReproducer for #55510: start `vllm serve hmellor/tiny-random-LlamaForCausalLM --enforce-eager`, `kill -9` the launcher, then watch `ps` and `nvidia-smi`.\n\n| Scenario | `main` | this PR |\n|---|---|---|\n| TP=2, SIGKILL the API server | EngineCore + 2 workers still alive after 60 s, 75,856 MiB held | all exited after 8 s, 0 MiB |\n| DP=2 (2 API servers), SIGKILL the launcher | 2 EngineCores + 2 workers still alive after 60 s, 75,240 MiB held; the API servers keep serving | engines exited after 7 s, 0 MiB; both API servers got `EngineDeadError` and shut down on their own ~4 s later (only the CPU-only DP coordinator remains) |\n| TP=2, SIGKILL during model load | EngineCore finishes loading, starts its workers and holds 75,856 MiB after 60 s | all exited within 1 s, 0 MiB |\n\nIn every PR run the engine log shows `parent process exited, shutting down` followed by the normal abort and teardown; the 15 s force-kill fallback never fired.\n\n```\npytest tests/v1/engine/test_startup_watch_processes.py                       # 19 passed\nCUDA_VISIBLE_DEVICES=0,1 pytest -v -s tests/v1/shutdown/test_parent_death.py # 2 passed (TP=1: 33 s, TP=2: 53 s)\nCUDA_VISIBLE_DEVICES=0,1 pytest -v -s tests/v1/shutdown/test_delete.py tests/v1/shutdown/test_forward_error.py tests/v1/shutdown/test_startup_error.py  # 18 passed, 4 skipped\npytest -v -s tests/entrypoints/launchers/test_shutdown.py                    # 8 passed (SIGTERM drain/abort unchanged)\n```\n\nOn unpatched `main`, `test_parent_death.py` fails in both cases with `engine processes outlived their parent`. For TP=2 the survivors are EngineCore and both TP workers. `pre-commit` (ruff, typos) and mypy (`--python-version 3.12`) pass.\n\n## Details\n\n**Root cause.** `WorkerProc` already exits when its parent dies: `MultiprocExecutor` gives each worker the read end of a death pipe and keeps the write end. But the workers' parent is `EngineCore`, and `EngineCore` has no parent-liveness check of its own:\n- `CoreEngineProcManager` starts it as a plain non-daemon process.\n- `run_engine_core` installs only SIGTERM/SIGINT handlers.\n- Its ZMQ sockets have no heartbeat.\n\nSo when the frontend disappears, `EngineCore` idles forever and keeps its workers alive.\n\n**Fix.** Reuse the worker mechanism one level up.\n- **Shared helper.** The worker's death-pipe thread moves without behaviour changes into `vllm.utils.system_utils.monitor_parent_death()`, and `WorkerProc` calls it.\n- **Pipe ownership.** `CoreEngineProcManager` creates one pipe per engine and holds the write ends until after `shutdown(procs)` has stopped the engines, so a SIGTERM drain never sees EOF. Under fork, children close the inherited write ends, as `MultiprocExecutor` already does.\n- **On EOF.** `EngineCore` follows the approach @njhill suggested on #34816: \"set the shutdown flag and then kill after some delay\".\n  - It sends `ENGINE_CORE_DEAD` to its clients.\n  - It requests shutdown in abort mode and wakes the busy loop, so the normal teardown runs and terminates the workers.\n  - If it is still alive 15 s later, or if the parent died before the engine finished initializing, it SIGKILLs its process tree and then itself.\n\n<details>\n<summary>Design notes and alternatives</summary>\n\n- **Abort, not drain.** A drain is only ever bounded by the parent force-killing the engine when `--shutdown-timeout` expires, so without the parent a drain would be unbounded. RFC #24885 puts that decision with the parent, and that parent is gone. `--shutdown-timeout` defaults to 0, so default deployments abort anyway.\n- **Notify clients at EOF time.** The notice goes out before teardown rather than after it, so it cannot be pre-empted by the 15 s force-kill and does not delay GPU release. As a result, in-flight requests on surviving clients fail with `EngineDeadError`, the same as when an engine crashes.\n- **Not `prctl(PR_SET_PDEATHSIG)`** (#34816, draft #40935).\n  - The death pipe is portable and pure Python; on #40841 prctl was described as \"not easy to do in python\".\n  - It tracks the parent *process* rather than the thread that created the child, which matters for embedders that construct `LLM()` from a helper thread.\n  - It allows a cooperative abort before any kill.\n- **Not `multiprocessing.parent_process().sentinel`.** Under fork, CPython's parent keeps each child's sentinel write end open, so later siblings inherit the write ends of earlier siblings and EOF would cascade one engine at a time.\n- **Earlier attempts.** #27686, #36055 and #34816 were closed for inactivity, not rejected. Compared with them, this PR keeps the `processes` API, handles inherited fds under fork, closes the write ends only after the engines have shut down (so drain is preserved), and installs no new signal handlers.\n\n</details>\n\n<details>\n<summary>Not covered, and behaviour changes</summary>\n\nNot covered:\n- The DP supervisor itself being SIGKILLed. Its DP servers run in their own process group and keep their engines. Death of a single DP server *is* covered.\n- `vllm-rs serve` managed-engine mode when the Rust binary dies, because the headless Python launcher survives it.\n- CPU-only processes left behind by a SIGKILLed multi-API-server launcher: API servers (which now see `EngineDeadError`), the DP coordinator and the Rust frontend. Related: #43417.\n- Ray-managed engines.\n- If user code forks after creating `LLM()`, for example with a fork-mode `multiprocessing.Pool`, those children hold the write end and delay EOF until they exit. The existing worker death pipe has the same limitation.\n- A narrow startup race. If the parent dies while EngineCore is still starting its TP workers, the force-kill takes a single process-tree snapshot, so a worker started in the few milliseconds after it can be missed. That worker only exits at the distributed-init timeout (600 s by default), because workers start watching their death pipe after `WorkerProc` construction. This gap already exists on `main`, for example when EngineCore is OOM-killed while spawning workers. Closing it on the worker side is left for a follow-up.\n\nBehaviour changes:\n- If the parent dies during a SIGTERM drain, the engine switches to abort.\n- Multi-node DP: when one node's launcher dies, that node's ranks now exit instead of being left orphaned. They notify the head node and are force-killed after 15 s if their peers are still busy, so the DP group fails the same way it does when any rank dies.\n\n</details>\n\n<details>\n<summary>Interaction with open PRs</summary>\n\n- #52299 (merged since) is complementary: it handles SIGTERM during init, while this PR handles parent death during init. #50529 applies cleanly on top of this PR.\n- #55700 needs a one-line move: its `dump_stack` call goes into the new `on_parent_death` closure in `WorkerProc.monitor_death_pipe`.\n- The `kill_process_tree` regression from #52314, where it can raise `psutil.NoSuchProcess`, is fixed separately in #59984. The force-kill here performs its final self-SIGKILL either way.\n\n</details>\n\nAI assistance (Claude Code) was used for the patch, the tests and this description. I reviewed every changed line and ran the tests and GPU experiments above.\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "liulanze/vllm"
+      },
+      "sha": "73ce1bfbd82b12fd60e7a86cd182e36b7404dac8"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/55846",
+    "merged": false,
+    "number": 55846,
+    "state": "open",
+    "title": "[Bugfix][Core] Shut down EngineCore and its workers when the parent process dies",
+    "updated_at": "2026-10-09T19:58:54Z"
+  },
+  "files": [
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/tests%2Fv1%2Fengine%2Ftest_startup_watch_processes.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fengine%2Ftest_startup_watch_processes.py?ref=73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "deletions": 1,
+      "filename": "tests/v1/engine/test_startup_watch_processes.py",
+      "patch": "@@ -100,11 +100,13 @@ def start_process():\n     def get_context():\n         assert thread_state() == (initial_threads, user_threads, None)\n         return SimpleNamespace(\n+            Pipe=connection.Pipe,\n+            get_start_method=lambda: \"spawn\",\n             Process=lambda **kwargs: SimpleNamespace(\n                 name=kwargs[\"name\"],\n                 exitcode=1 if fail_start else None,\n                 start=start_process,\n-            )\n+            ),\n         )\n \n     monkeypatch.setattr(engine_utils, \"get_mp_context\", get_context)\n@@ -167,6 +169,7 @@ def test_engine_core_process_shutdown_timeout(\n     manager._request_shutdown_timeout = request_timeout\n     manager.manager_stopped = Event()\n     manager.processes = [object()]\n+    manager._death_writers = []\n     detach_results = iter((object(), None))\n     manager._finalizer = SimpleNamespace(detach=lambda: next(detach_results))\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/tests%2Fv1%2Fengine%2Ftest_startup_watch_processes.py",
+      "sha": "2866df62176541acbea09e2a8780d94ab0d2b1ea",
+      "status": "modified"
+    },
+    {
+      "additions": 110,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/tests%2Fv1%2Fshutdown%2Ftest_parent_death.py",
+      "changes": 110,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fshutdown%2Ftest_parent_death.py?ref=73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "deletions": 0,
+      "filename": "tests/v1/shutdown/test_parent_death.py",
+      "patch": "@@ -0,0 +1,110 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Test that EngineCore and its workers exit when their parent process dies\n+without shutting them down (API server SIGKILLed, OOM-killed or crashed).\"\"\"\n+\n+import contextlib\n+import multiprocessing\n+import os\n+import signal\n+import time\n+\n+import psutil\n+import pytest\n+\n+from tests.utils import wait_for_gpu_memory_to_clear\n+from tests.v1.shutdown.utils import (\n+    SHUTDOWN_TEST_THRESHOLD_BYTES,\n+    SHUTDOWN_TEST_TIMEOUT_SEC,\n+)\n+from vllm.platforms import current_platform\n+from vllm.v1.engine.core import PARENT_DEATH_SHUTDOWN_TIMEOUT_S\n+\n+MODELS = [\"hmellor/tiny-random-LlamaForCausalLM\"]\n+\n+# Cooperative shutdown budget plus a margin for the force-kill fallback.\n+ORPHAN_EXIT_TIMEOUT_SEC = PARENT_DEATH_SHUTDOWN_TIMEOUT_S + 30\n+\n+\n+def _serve_until_killed(model: str, tensor_parallel_size: int, conn) -> None:\n+    \"\"\"Child process: start an LLM, report its engine process tree, then idle\n+    until the test kills this process.\"\"\"\n+    from vllm import LLM, SamplingParams\n+\n+    llm = LLM(\n+        model=model,\n+        enforce_eager=True,\n+        tensor_parallel_size=tensor_parallel_size,\n+    )\n+    llm.generate(\"Hello my name is\", SamplingParams(max_tokens=1))\n+    conn.send([child.pid for child in psutil.Process().children(recursive=True)])\n+    conn.close()\n+    while True:\n+        time.sleep(1)\n+\n+\n+def _is_running(pid: int) -> bool:\n+    try:\n+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE\n+    except psutil.NoSuchProcess:\n+        return False\n+\n+\n+def _wait_until_gone(pids: list[int], timeout: float) -> list[int]:\n+    \"\"\"Return the pids still running after ``timeout`` seconds.\"\"\"\n+    deadline = time.monotonic() + timeout\n+    while True:\n+        alive = [pid for pid in pids if _is_running(pid)]\n+        if not alive or time.monotonic() >= deadline:\n+            return alive\n+        time.sleep(0.5)\n+\n+\n+def _kill_all(pids: list[int]) -> None:\n+    for pid in pids:\n+        with contextlib.suppress(ProcessLookupError):\n+            os.kill(pid, signal.SIGKILL)\n+\n+\n+@pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC * 2)\n+@pytest.mark.parametrize(\"model\", MODELS)\n+@pytest.mark.parametrize(\"tensor_parallel_size\", [2, 1])\n+def test_engine_exits_after_parent_sigkill(model: str, tensor_parallel_size: int):\n+    \"\"\"SIGKILL the process that owns a running LLM; EngineCore and every\n+    worker must exit on their own and release GPU memory.\"\"\"\n+    if current_platform.device_count() < tensor_parallel_size:\n+        pytest.skip(reason=\"Not enough CUDA devices\")\n+\n+    ctx = multiprocessing.get_context(\"spawn\")\n+    parent_conn, child_conn = ctx.Pipe(duplex=False)\n+    proc = ctx.Process(\n+        target=_serve_until_killed, args=(model, tensor_parallel_size, child_conn)\n+    )\n+    proc.start()\n+    child_conn.close()\n+    assert proc.pid is not None\n+    parent_pid = proc.pid\n+    engine_pids: list[int] = []\n+    try:\n+        assert parent_conn.poll(SHUTDOWN_TEST_TIMEOUT_SEC), \"LLM did not start\"\n+        engine_pids = parent_conn.recv()\n+        # EngineCore, plus one worker per rank when TP > 1.\n+        expected = 1 + (tensor_parallel_size if tensor_parallel_size > 1 else 0)\n+        assert len(engine_pids) >= expected, engine_pids\n+        assert all(_is_running(pid) for pid in engine_pids)\n+\n+        os.kill(parent_pid, signal.SIGKILL)\n+        proc.join(10)\n+        assert proc.exitcode == -signal.SIGKILL\n+\n+        orphans = _wait_until_gone(engine_pids, ORPHAN_EXIT_TIMEOUT_SEC)\n+        assert not orphans, f\"engine processes outlived their parent: {orphans}\"\n+    finally:\n+        if proc.is_alive():\n+            proc.kill()\n+        _kill_all(engine_pids)\n+\n+    wait_for_gpu_memory_to_clear(\n+        devices=list(range(tensor_parallel_size)),\n+        threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,\n+    )",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/tests%2Fv1%2Fshutdown%2Ftest_parent_death.py",
+      "sha": "6c695cc2c64f79426763c596a210db1ae2df81c4",
+      "status": "added"
+    },
+    {
+      "additions": 30,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Futils%2Fsystem_utils.py",
+      "changes": 30,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Futils%2Fsystem_utils.py?ref=73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "deletions": 0,
+      "filename": "vllm/utils/system_utils.py",
+      "patch": "@@ -9,7 +9,9 @@\n import os\n import signal\n import sys\n+import threading\n from collections.abc import Callable, Iterator\n+from multiprocessing.connection import Connection\n from pathlib import Path\n \n import psutil\n@@ -234,6 +236,34 @@ def kill_process_tree(pid: int):\n         os.kill(pid, signal.SIGKILL)\n \n \n+def monitor_parent_death(\n+    death_pipe: Connection | None,\n+    on_parent_death: Callable[[], None],\n+    *,\n+    name: str = \"DeathPipeMonitor\",\n+) -> None:\n+    \"\"\"Run ``on_parent_death`` on a daemon thread once ``death_pipe`` hits EOF.\n+\n+    The parent keeps the write end open and never writes to it; the kernel\n+    closes it when the parent exits by any means, including SIGKILL. Children\n+    started with fork must close every inherited copy of the write end,\n+    including their own.\n+    \"\"\"\n+    if death_pipe is None:\n+        return\n+\n+    def death_pipe_monitor():\n+        try:\n+            # This will block until parent process exits (pipe closes)\n+            death_pipe.recv()\n+        except EOFError:\n+            on_parent_death()\n+        except Exception as e:\n+            logger.warning(\"Death monitoring error: %s\", e)\n+\n+    threading.Thread(target=death_pipe_monitor, daemon=True, name=name).start()\n+\n+\n # Resource utilities\n \n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Futils%2Fsystem_utils.py",
+      "sha": "49a252dc8c7ae3170527a1aee3a41a30a007e36f",
+      "status": "modified"
+    },
+    {
+      "additions": 46,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Fv1%2Fengine%2Fcore.py",
+      "changes": 48,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fengine%2Fcore.py?ref=73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "deletions": 2,
+      "filename": "vllm/v1/engine/core.py",
+      "patch": "@@ -45,7 +45,12 @@\n )\n from vllm.utils.hashing import get_hash_fn_by_name\n from vllm.utils.network_utils import make_zmq_socket\n-from vllm.utils.system_utils import decorate_logs, set_process_title\n+from vllm.utils.system_utils import (\n+    decorate_logs,\n+    kill_process_tree,\n+    monitor_parent_death,\n+    set_process_title,\n+)\n from vllm.v1.attention.backends.utils import resolve_kv_cache_layout\n from vllm.v1.core.kv_cache_utils import (\n     BlockHash,\n@@ -105,6 +110,7 @@\n \n \n HANDSHAKE_TIMEOUT_MINS = 5\n+PARENT_DEATH_SHUTDOWN_TIMEOUT_S = 15.0\n \n _R = TypeVar(\"_R\")  # Return type for collective_rpc\n \n@@ -1139,6 +1145,7 @@ def __init__(\n         identity = self.engine_index.to_bytes(length=2, byteorder=\"little\")\n         self.engines_running = False\n         self.shutdown_state = EngineShutdownState.RUNNING\n+        self.parent_exited = False\n \n         # Receiver for tensor IPC\n         self.tensor_ipc_receiver: TensorIpcReceiver | None = None\n@@ -1382,9 +1389,42 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):\n         # Ensure we can serialize transformer config after spawning\n         maybe_register_config_serialize_by_value()\n \n+        death_pipe = kwargs.pop(\"death_pipe\", None)\n+        # Close write ends of death pipes inherited under fork.\n+        for fd in kwargs.pop(\"inherited_fds\", []):\n+            try:\n+                os.close(fd)\n+            except OSError as e:\n+                logger.warning(\"Error closing inherited fd %d: %s\", fd, e)\n+\n         engine_core: EngineCoreProc | None = None\n         signal_callback: SignalCallback | None = None\n         clean_shutdown = False\n+\n+        def on_parent_death():\n+            logger.warning(\n+                \"[shutdown] EngineCore: parent process exited, shutting down\"\n+            )\n+            if engine_core is not None:\n+                engine_core.parent_exited = True\n+                engine_core.shutdown_state = EngineShutdownState.REQUESTED\n+                engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))\n+                # Clients other than the dead parent, e.g. API servers in\n+                # multi-API-server mode, would otherwise wait forever.\n+                engine_core.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)\n+                time.sleep(PARENT_DEATH_SHUTDOWN_TIMEOUT_S)\n+                logger.warning(\n+                    \"[shutdown] EngineCore: still alive %ss after parent death, \"\n+                    \"force-killing process tree\",\n+                    PARENT_DEATH_SHUTDOWN_TIMEOUT_S,\n+                )\n+            try:\n+                kill_process_tree(os.getpid())\n+            finally:\n+                # Still exit if a child vanishes mid-walk and the call raises.\n+                os.kill(os.getpid(), signal.SIGKILL)\n+\n+        monitor_parent_death(death_pipe, on_parent_death, name=\"EngineCoreDeathMonitor\")\n         try:\n             parallel_config: ParallelConfig = vllm_config.parallel_config\n             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0\n@@ -1512,6 +1552,8 @@ def signal_handler(signum, frame):\n                     # Freeze the surviving graph to skip another slow cyclic-GC\n                     # scan during finalization; process exit reclaims it.\n                     gc.freeze()\n+            if death_pipe is not None:\n+                death_pipe.close()\n \n     def _init_data_parallel(self, vllm_config: VllmConfig):\n         pass\n@@ -1614,7 +1656,9 @@ def _handle_shutdown(self) -> bool:\n             return True\n \n         if self.shutdown_state == EngineShutdownState.REQUESTED:\n-            shutdown_timeout = self.vllm_config.shutdown_timeout\n+            shutdown_timeout = (\n+                0 if self.parent_exited else self.vllm_config.shutdown_timeout\n+            )\n             mode = \"abort\" if shutdown_timeout == 0 else \"drain\"\n \n             logger.info(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Fv1%2Fengine%2Fcore.py",
+      "sha": "8925357dc12ace0a8d41dd96a4074812cffae6a5",
+      "status": "modified"
+    },
+    {
+      "additions": 23,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Fv1%2Fengine%2Futils.py",
+      "changes": 25,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fengine%2Futils.py?ref=73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "deletions": 2,
+      "filename": "vllm/v1/engine/utils.py",
+      "patch": "@@ -270,9 +270,22 @@ def __init__(\n \n         from vllm.v1.engine.core import EngineCoreProc\n \n+        # Engines see EOF on these pipes once this process exits.\n+        self._death_writers: list[connection.Connection] = []\n+        death_readers: list[connection.Connection] = []\n+        for _ in range(local_engine_count):\n+            death_reader, death_writer = context.Pipe(duplex=False)\n+            death_readers.append(death_reader)\n+            self._death_writers.append(death_writer)\n+        if context.get_start_method() == \"fork\":\n+            # Forked engines inherit every write end; tell them which to close.\n+            common_kwargs[\"inherited_fds\"] = [\n+                writer.fileno() for writer in self._death_writers\n+            ]\n+\n         self.processes: list[BaseProcess] = []\n         local_dp_ranks = []\n-        for index in range(local_engine_count):\n+        for index, death_reader in enumerate(death_readers):\n             local_index = local_start_index + index\n             global_index = start_index + index\n \n@@ -283,7 +296,11 @@ def __init__(\n                     target=EngineCoreProc.run_engine_core,\n                     name=f\"EngineCore_DP{global_index}\" if is_dp else \"EngineCore\",\n                     kwargs=common_kwargs\n-                    | {\"dp_rank\": global_index, \"local_dp_rank\": local_index},\n+                    | {\n+                        \"dp_rank\": global_index,\n+                        \"local_dp_rank\": local_index,\n+                        \"death_pipe\": death_reader,\n+                    },\n                 )\n             )\n \n@@ -328,6 +345,8 @@ def __init__(\n                     ):\n                         proc.start()\n         finally:\n+            for death_reader in death_readers:\n+                death_reader.close()\n             # Kill other procs if not all are running.\n             if self.finished_procs():\n                 self.shutdown()\n@@ -346,6 +365,8 @@ def shutdown(self, timeout: float | None = None) -> None:\n                     process_timeout,\n                 )\n             shutdown(self.processes, timeout=process_timeout)\n+            for writer in self._death_writers:\n+                writer.close()\n \n     def monitor_engine_liveness(self) -> None:\n         \"\"\"Monitor engine core process liveness.\"\"\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Fv1%2Fengine%2Futils.py",
+      "sha": "4c22fc2cfbe4767bbc0dc242b10c65fa78148f93",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Fv1%2Fexecutor%2Fmultiproc_executor.py",
+      "changes": 31,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fexecutor%2Fmultiproc_executor.py?ref=73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "deletions": 21,
+      "filename": "vllm/v1/executor/multiproc_executor.py",
+      "patch": "@@ -59,6 +59,7 @@\n     _maybe_force_spawn,\n     decorate_logs,\n     get_mp_context,\n+    monitor_parent_death,\n     set_process_title,\n )\n from vllm.utils.torch_utils import (\n@@ -831,29 +832,17 @@ def shutdown(self):\n         destroy_distributed_environment()\n \n     def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):\n-        if death_pipe is None:\n-            return\n+        # Capture queue references directly to avoid gc issues if capturing self\n+        queues_to_shutdown = [self.rpc_broadcast_mq, self.worker_response_mq]\n \n-        def death_pipe_monitor(queues_to_shutdown: list[MessageQueue]):\n-            try:\n-                # This will block until parent process exits (pipe closes)\n-                death_pipe.recv()\n-            except EOFError:\n-                logger.info_once(\"Parent process exited, terminating worker queues\")\n-                shutdown_requested.set()\n-                for mq in queues_to_shutdown:\n-                    if mq is not None:\n-                        mq.shutdown()\n-            except Exception as e:\n-                logger.warning(\"Death monitoring error: %s\", e)\n+        def on_parent_death():\n+            logger.info_once(\"Parent process exited, terminating worker queues\")\n+            shutdown_requested.set()\n+            for mq in queues_to_shutdown:\n+                if mq is not None:\n+                    mq.shutdown()\n \n-        # Pass queue references directly to avoid gc issues if passing self\n-        Thread(\n-            target=death_pipe_monitor,\n-            args=([self.rpc_broadcast_mq, self.worker_response_mq],),\n-            daemon=True,\n-            name=\"DeathPipeMonitor\",\n-        ).start()\n+        monitor_parent_death(death_pipe, on_parent_death)\n \n     @staticmethod\n     def worker_main(*args, **kwargs):",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/73ce1bfbd82b12fd60e7a86cd182e36b7404dac8/vllm%2Fv1%2Fexecutor%2Fmultiproc_executor.py",
+      "sha": "76c29e3da3a008cc1562fae933d6543bd278cc09",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @liulanze.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-09-30T08:31:49Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55846#issuecomment-5907348551",
+      "updated_at": "2026-09-30T08:31:49Z",
+      "user": {
+        "login": "mergify"
+      }
+    },
+    {
+      "body": "Rebased onto current main and reworked; the description has the updated validation (before/after reproducer on 2×A100, plus the existing shutdown suites).\r\n\r\n@njhill this follows the approach you suggested on #34816 (\"set the shutdown flag and then kill after some delay\"). Could you take a look when you have a moment?\r\ncc @markmc for the drain/abort semantics on parent death (RFC #24885), and @simon-mo since #52299 touches the same run_engine_core region, it applies cleanly on top of this.",
+      "created_at": "2026-10-04T23:04:22Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55846#issuecomment-5985412902",
+      "updated_at": "2026-10-04T23:04:22Z",
+      "user": {
+        "login": "liulanze"
+      }
+    },
+    {
+      "body": "Rebased onto the latest main; no conflicts and the patch is unchanged. It composes with #52299, which landed this week: #52299 handles SIGTERM during engine init, and this PR handles the parent dying, including a SIGKILL during init where no SIGTERM ever arrives.\n\nThanks @vinitrbl for testing `vllm run-batch`! I added it to the description.\n\n@andyxning thanks for picking this up. It's ready for review whenever you have time.\n",
+      "created_at": "2026-10-09T19:58:54Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55846#issuecomment-6088274982",
+      "updated_at": "2026-10-09T19:58:54Z",
+      "user": {
+        "login": "liulanze"
+      }
+    }
+  ],
+  "number": 55846,
+  "refs": {
+    "base": {
+      "commit": "3766a67a32f7ea8130d84383f72883cee5e8b006",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "73ce1bfbd82b12fd60e7a86cd182e36b7404dac8",
+      "repository": "liulanze/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55846#pullrequestreview-5147576068",
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-08T22:19:20Z",
+      "user": {
+        "login": "claude"
+      }
+    },
+    {
+      "body": "Gave this a try with `vllm run-batch`, since it isn't in the table and it's a slightly worse case: run-batch has no SIGTERM handler, so even a normal SIGTERM kills the launcher without telling the engine.\n\nA10G, tiny random-weight Llama, 4000-request batch, signal sent to the run-batch process once a few hundred requests had finished. Base is main at the merge base (7867d6c), PR head 81aa514, both with `VLLM_USE_PRECOMPILED=1`.\n\n| signal | main @ 7867d6c | this PR |\n|---|---|---|\n| SIGTERM | EngineCore still up after 60s, 21 GB held | gone, GPU free within 5s |\n| SIGKILL | | gone, GPU free within 5s |\n\nBoth PR runs log `EngineCore: parent process exited, shutting down`. I didn't redo SIGKILL on 7867d6c, but on another main-based build (the #52505 branch) it orphaned the engine the same way.\n\nOn main the next run on the same GPU fails in `request_memory` until you kill the orphan by hand, so this is a nice fix for anyone retrying interrupted batch jobs. Might be worth adding run-batch to the list of covered cases.\n",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55846#pullrequestreview-5424839487",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-06T06:57:24Z",
+      "user": {
+        "login": "vinitrbl"
+      }
+    }
+  ]
+}

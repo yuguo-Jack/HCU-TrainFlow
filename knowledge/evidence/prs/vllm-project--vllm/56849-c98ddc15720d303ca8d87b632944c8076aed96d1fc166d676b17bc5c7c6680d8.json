@@ -1,0 +1,384 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "bb5507741155a698750bc422cda1f7c57f7d114d",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Summary\r\n\r\n- Pass the strided K/V slices straight to AITER `reshape_and_cache` on the MiniMax-M3 sparse-PA path instead of calling `.contiguous()` on them first.\r\n- Add `_kv_insert_operand`, which returns the tensor as-is when the kernel's layout requirements are met and copies otherwise.\r\n- No kernel change, no AITER dependency, no new env var, no change to the NVIDIA path.\r\n\r\n## Motivation\r\n\r\n`MiniMaxM3SparseAttention._insert_aiter_sparse_pa_kv` gets K and V as column slices of the fused `[q | k | v | index_q | index_k]` projection. Column slices are strided, so they are never contiguous, and the two `.contiguous()` calls copy both tensors on every sparse layer of every forward pass.\r\n\r\nThose copies are not needed. `reshape_and_cache` already takes the row pitch as a kernel argument and indexes with it (AITER `csrc/kernels/cache_kernels.cu`):\r\n\r\n```cpp\r\nint key_stride = key.stride(0);\r\n...\r\nconst int64_t src_key_idx = token_idx * key_stride + i;   // i over num_heads*head_size\r\n```\r\n\r\nIn other words the kernel does not care how far apart two tokens are, only that each token's heads sit next to each other in memory. A `qkv[:, a:b].view(n, H, D)` slice is always laid out that way, whatever `H` is, which is why the copy buys nothing.\r\n\r\n`_kv_insert_operand` skips the copy only when it can confirm that layout, and copies in every other case: a tensor of a different rank, one whose heads are not back to back, or one where tokens are so far apart that the gap would not fit in the kernel's `int` stride argument. So the worst case is the behaviour we have today.\r\n\r\n## Existing work and non-duplication\r\n\r\n- #53833 (with ROCm/AITER#4813) routes to a new fused AITER op and says it will \"retain the existing vLLM preprocessing plus `reshape_and_cache` / index-scatter path when an older AITER build does not provide the operation\". This PR fixes that retained fallback, so the two do not overlap and can land in any order.\r\n- #54535 (with ROCm/AITER#5143 and #52664) integrates the consolidated AITER QK-norm op and falls back the same way.\r\n- #55007 was the closest in spirit, a small vLLM-only change in this same function, and it states that \"the main K/V cache writer remains AITER `reshape_and_cache`; this PR changes only the BF16 index-cache insertion boundary\". It left the K/V boundary alone, which is what this PR covers.\r\n- #54682 and #54681 are about the decode indexer and top-k, not cache insertion.\r\n\r\n## Performance and Trace Analysis\r\n\r\nKernel trace, same bench shape on both legs:\r\n\r\n| Kernel | Baseline | This PR |\r\n|---|---|---|\r\n| `elementwise_kernel_manual_unroll` (the copies) | 191,488 launches, 770.4 ms, 4.56% | 3,503 launches, 19.2 ms, 0.12% |\r\n| `aiter::reshape_and_cache_kernel` | 104,652 launches, 458.5 ms | 104,652 launches, 471.2 ms |\r\n| total device time | 16.886 s | 16.039 s (-5.0%) |\r\n\r\nE2E serving benchmark on top of the nightly image `vllm/vllm-openai-rocm:nightly-dc36fcce902a63eab06c1b93a5c4a5ee178a0c56`\r\n\r\n| ISL | OSL | conc | TPOT base (ms) | TPOT PR (ms) | saved (ms) | TPOT gain | tok/s base | tok/s PR | tok/s gain |\r\n| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\r\n| 8192 | 1024 | 4 | 7.66 | 7.32 | 0.34 | 4.44% | 499.80 | 522.79 | +4.60% |\r\n| 8192 | 1024 | 8 | 9.57 | 9.16 | 0.41 | 4.28% | 797.52 | 832.83 | +4.43% |\r\n| 8192 | 1024 | 16 | 12.18 | 11.76 | 0.42 | 3.45% | 1254.96 | 1299.26 | +3.53% |\r\n| 8192 | 1024 | 32 | 16.51 | 16.15 | 0.36 | 2.18% | 1808.94 | 1860.35 | +2.84% |\r\n| 8192 | 1024 | 64 | 24.49 | 24.11 | 0.38 | 1.55% | 2466.32 | 2513.29 | +1.90% |\r\n| 8192 | 1024 | 128 | 36.03 | 35.76 | 0.27 | 0.75% | 3246.47 | 3282.80 | +1.12% |\r\n| 60000 | 600 | 4 | 12.67 | 12.30 | 0.37 | 2.92% | 265.85 | 272.54 | +2.52% |\r\n| 60000 | 600 | 16 | 36.12 | 35.36 | 0.76 | 2.10% | 398.88 | 403.56 | +1.17% |\r\n| 60000 | 600 | 64 | 123.46 | 124.06 | -0.60 | -0.49% | 469.70 | 473.01 | +0.70% |\r\n| 128000 | 1024 | 4 | 14.47 | 14.13 | 0.34 | 2.35% | 226.63 | 231.19 | +2.01% |\r\n| 128000 | 1024 | 16 | 46.31 | 45.19 | 1.12 | 2.42% | 313.25 | 315.94 | +0.86% |\r\n\r\n\r\n## Kernel/Server Correctness \r\n\r\nThe change is bit-exact rather than within-tolerance, since the kernel reads the same values in the same order either way.\r\n\r\n```text\r\npytest tests/kernels/test_minimax_m3_amd_ops.py -k kv_insert -v\r\n9 passed, 55 deselected in 6.01s\r\n```\r\n\r\n|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|\r\n|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|\r\n|gsm8k|      3|flexible-extract|     8|exact_match|↑  |0.9477|±  |0.0061|\r\n|     |       |strict-match    |     8|exact_match|↑  |0.9484|±  |0.0061|\r\n\r\n## Reproduction\r\n\r\nMI355X (gfx950), TP=4, ROCm 7.2.3, amd-aiter 0.1.21.post2, vLLM 0.28.1rc1.dev628+g2a02f6efe.\r\n\r\n<details>\r\n<summary>Server, bench and trace commands</summary>\r\n\r\nServer, identical on both legs:\r\n\r\n```bash\r\nHIP_VISIBLE_DEVICES=0,1,2,3 \\\r\nVLLM_ROCM_USE_AITER=1 \\\r\nVLLM_ROCM_USE_AITER_MOE=1 \\\r\nVLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \\\r\nVLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 \\\r\nVLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1 \\\r\nVLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \\\r\nVLLM_ROCM_USE_AITER_FLYDSL_QR_INT4=1 \\\r\nVLLM_USE_BREAKABLE_CUDAGRAPH=1 \\\r\nVLLM_WORKER_MULTIPROC_METHOD=spawn \\\r\nSAFETENSORS_FAST_GPU=1 \\\r\nvllm serve amd/MiniMax-M3-MXFP4 \\\r\n  --host 0.0.0.0 --port 8000 \\\r\n  --tensor-parallel-size 4 \\\r\n  --distributed-executor-backend mp \\\r\n  --trust-remote-code \\\r\n  --kv-cache-dtype fp8 \\\r\n  --block-size 128 \\\r\n  --no-enable-prefix-caching \\\r\n  --language-model-only \\\r\n  --max-model-len 133120 \\\r\n  --gpu-memory-utilization 0.95 \\\r\n  --max-num-batched-tokens 32768 \\\r\n  --max-num-seqs 128 \\\r\n  --enable-chunked-prefill \\\r\n  --async-scheduling \\\r\n  --attention-config '{\"backend\":\"ROCM_AITER_UNIFIED_ATTN\",\"indexer_kv_dtype\":\"fp8\"}' \\\r\n  --moe-backend aiter \\\r\n  --tool-call-parser minimax_m3 \\\r\n  --enable-auto-tool-choice \\\r\n  --reasoning-parser minimax_m3 \\\r\n  --no-enable-log-requests\r\n```\r\n\r\nServer A/B bench, 2 repeats per leg after one warmup pass:\r\n\r\n```bash\r\nvllm bench serve --backend vllm --dataset-name random \\\r\n  --host localhost --port 8000 --model amd/MiniMax-M3-MXFP4 --trust-remote-code \\\r\n  --request-rate inf --random-range-ratio 0.8 \\\r\n  --random-input-len 8192 --random-output-len 1024 \\\r\n  --max-concurrency 8 --seed 2 \\\r\n  --num-prompts 64 --num-warmups 8 \\\r\n  --percentile-metrics ttft,tpot,itl,e2el\r\n```\r\n\r\nTrace capture used the same server plus `--profiler-config.profiler=torch --profiler-config.torch_profiler_record_shapes=1`, and a shorter bench so the kineto trace flushes reliably: `--num-prompts 8 --num-warmups 1`, everything else unchanged.\r\n\r\n</details>\r\n\r\n## AI Assistance\r\n\r\nOpus 4.6's help for implementation\r\nGPT-5.6-Sol's for help drafting the PR body",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "tjtanaa"
+            },
+            "body": "@akii96 can you also provide gsm8k numshot 30 accuracy data as well?",
+            "createdAt": "2026-09-15T03:34:09Z",
+            "updatedAt": "2026-09-15T03:34:09Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674326518"
+          },
+          {
+            "author": {
+              "login": "tjtanaa"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-15T03:34:27Z",
+            "updatedAt": "2026-09-15T03:34:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674330745"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ @akii96, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-09-15T03:34:33Z",
+            "updatedAt": "2026-09-15T03:34:33Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674331742"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "❌ This PR is 24 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5674330745 -->",
+            "createdAt": "2026-09-15T03:34:45Z",
+            "updatedAt": "2026-09-15T03:34:45Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674334205"
+          },
+          {
+            "author": {
+              "login": "akii96"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-15T04:41:41Z",
+            "updatedAt": "2026-09-15T04:41:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674838550"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #89019](https://buildkite.com/vllm/ci/builds/89019) for commit `39af273985d9`.",
+            "createdAt": "2026-09-15T04:41:59Z",
+            "updatedAt": "2026-09-15T04:41:59Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674840764"
+          },
+          {
+            "author": {
+              "login": "akii96"
+            },
+            "body": "@tjtanaa \r\n\r\nlm-eval n-shot 30 data:\r\n\r\n|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|\r\n|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|\r\n|gsm8k|      3|flexible-extract|    30|exact_match|↑  |0.9469|±  |0.0062|\r\n|     |       |strict-match    |    30|exact_match|↑  |0.9477|±  |0.0061|\r\n\r\nlm-eval command for reference!\r\n```\r\nlm_eval --model local-chat-completions --tasks gsm8k --num_fewshot 30 \\\r\n  --apply_chat_template --fewshot_as_multiturn --gen_kwargs max_gen_toks=1024 \\\r\n  --model_args model=amd/MiniMax-M3-MXFP4,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_length=32768\r\n```",
+            "createdAt": "2026-09-15T04:51:30Z",
+            "updatedAt": "2026-09-15T04:51:30Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674911442"
+          },
+          {
+            "author": {
+              "login": "akii96"
+            },
+            "body": "@tjtanaa \r\n\r\nStatus on CI\r\n1 expected CI failure is waiting for the fix from #56955 to land before rebase + re-running CI ",
+            "createdAt": "2026-09-15T06:49:16Z",
+            "updatedAt": "2026-09-15T06:49:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5676030818"
+          },
+          {
+            "author": {
+              "login": "akii96"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-15T11:32:26Z",
+            "updatedAt": "2026-09-15T11:32:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5679468774"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #89085](https://buildkite.com/vllm/ci/builds/89085) for commit `82bbe0683611`.",
+            "createdAt": "2026-09-15T11:32:43Z",
+            "updatedAt": "2026-09-15T11:32:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5679472302"
+          },
+          {
+            "author": {
+              "login": "akii96"
+            },
+            "body": "@tjtanaa CI is green 🥳  (since the fix for the previous failure landed!) ",
+            "createdAt": "2026-09-15T13:01:53Z",
+            "updatedAt": "2026-09-15T13:01:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5680600787"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAVKXFtM=",
+          "hasNextPage": false
+        },
+        "totalCount": 11
+      },
+      "headRefOid": "82bbe0683611a6b892ae7e2ed51d5b33da30ec9b",
+      "headRepository": {
+        "nameWithOwner": "akii96/vllm"
+      },
+      "merged": true,
+      "number": 56849,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-14T20:39:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#pullrequestreview-5202666340"
+          },
+          {
+            "author": {
+              "login": "dllehr-amd"
+            },
+            "body": "Looks good to me, thanks @akii96 ",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-09-17T14:44:25Z",
+            "url": "https://github.com/vllm-project/vllm/pull/56849#pullrequestreview-5237341323"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wOS0xN1QxNDo0NDoyNVq0MjAyNi0wOS0xN1QxNDo0NDoyNVrPAAAAATgrfIs=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[ROCm][Perf] Insert MiniMax-M3 sparse-PA K/V without a contiguous copy",
+      "updatedAt": "2026-10-12T05:31:32Z",
+      "url": "https://github.com/vllm-project/vllm/pull/56849"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "bb5507741155a698750bc422cda1f7c57f7d114d"
+    },
+    "body": "## Summary\r\n\r\n- Pass the strided K/V slices straight to AITER `reshape_and_cache` on the MiniMax-M3 sparse-PA path instead of calling `.contiguous()` on them first.\r\n- Add `_kv_insert_operand`, which returns the tensor as-is when the kernel's layout requirements are met and copies otherwise.\r\n- No kernel change, no AITER dependency, no new env var, no change to the NVIDIA path.\r\n\r\n## Motivation\r\n\r\n`MiniMaxM3SparseAttention._insert_aiter_sparse_pa_kv` gets K and V as column slices of the fused `[q | k | v | index_q | index_k]` projection. Column slices are strided, so they are never contiguous, and the two `.contiguous()` calls copy both tensors on every sparse layer of every forward pass.\r\n\r\nThose copies are not needed. `reshape_and_cache` already takes the row pitch as a kernel argument and indexes with it (AITER `csrc/kernels/cache_kernels.cu`):\r\n\r\n```cpp\r\nint key_stride = key.stride(0);\r\n...\r\nconst int64_t src_key_idx = token_idx * key_stride + i;   // i over num_heads*head_size\r\n```\r\n\r\nIn other words the kernel does not care how far apart two tokens are, only that each token's heads sit next to each other in memory. A `qkv[:, a:b].view(n, H, D)` slice is always laid out that way, whatever `H` is, which is why the copy buys nothing.\r\n\r\n`_kv_insert_operand` skips the copy only when it can confirm that layout, and copies in every other case: a tensor of a different rank, one whose heads are not back to back, or one where tokens are so far apart that the gap would not fit in the kernel's `int` stride argument. So the worst case is the behaviour we have today.\r\n\r\n## Existing work and non-duplication\r\n\r\n- #53833 (with ROCm/AITER#4813) routes to a new fused AITER op and says it will \"retain the existing vLLM preprocessing plus `reshape_and_cache` / index-scatter path when an older AITER build does not provide the operation\". This PR fixes that retained fallback, so the two do not overlap and can land in any order.\r\n- #54535 (with ROCm/AITER#5143 and #52664) integrates the consolidated AITER QK-norm op and falls back the same way.\r\n- #55007 was the closest in spirit, a small vLLM-only change in this same function, and it states that \"the main K/V cache writer remains AITER `reshape_and_cache`; this PR changes only the BF16 index-cache insertion boundary\". It left the K/V boundary alone, which is what this PR covers.\r\n- #54682 and #54681 are about the decode indexer and top-k, not cache insertion.\r\n\r\n## Performance and Trace Analysis\r\n\r\nKernel trace, same bench shape on both legs:\r\n\r\n| Kernel | Baseline | This PR |\r\n|---|---|---|\r\n| `elementwise_kernel_manual_unroll` (the copies) | 191,488 launches, 770.4 ms, 4.56% | 3,503 launches, 19.2 ms, 0.12% |\r\n| `aiter::reshape_and_cache_kernel` | 104,652 launches, 458.5 ms | 104,652 launches, 471.2 ms |\r\n| total device time | 16.886 s | 16.039 s (-5.0%) |\r\n\r\nE2E serving benchmark on top of the nightly image `vllm/vllm-openai-rocm:nightly-dc36fcce902a63eab06c1b93a5c4a5ee178a0c56`\r\n\r\n| ISL | OSL | conc | TPOT base (ms) | TPOT PR (ms) | saved (ms) | TPOT gain | tok/s base | tok/s PR | tok/s gain |\r\n| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\r\n| 8192 | 1024 | 4 | 7.66 | 7.32 | 0.34 | 4.44% | 499.80 | 522.79 | +4.60% |\r\n| 8192 | 1024 | 8 | 9.57 | 9.16 | 0.41 | 4.28% | 797.52 | 832.83 | +4.43% |\r\n| 8192 | 1024 | 16 | 12.18 | 11.76 | 0.42 | 3.45% | 1254.96 | 1299.26 | +3.53% |\r\n| 8192 | 1024 | 32 | 16.51 | 16.15 | 0.36 | 2.18% | 1808.94 | 1860.35 | +2.84% |\r\n| 8192 | 1024 | 64 | 24.49 | 24.11 | 0.38 | 1.55% | 2466.32 | 2513.29 | +1.90% |\r\n| 8192 | 1024 | 128 | 36.03 | 35.76 | 0.27 | 0.75% | 3246.47 | 3282.80 | +1.12% |\r\n| 60000 | 600 | 4 | 12.67 | 12.30 | 0.37 | 2.92% | 265.85 | 272.54 | +2.52% |\r\n| 60000 | 600 | 16 | 36.12 | 35.36 | 0.76 | 2.10% | 398.88 | 403.56 | +1.17% |\r\n| 60000 | 600 | 64 | 123.46 | 124.06 | -0.60 | -0.49% | 469.70 | 473.01 | +0.70% |\r\n| 128000 | 1024 | 4 | 14.47 | 14.13 | 0.34 | 2.35% | 226.63 | 231.19 | +2.01% |\r\n| 128000 | 1024 | 16 | 46.31 | 45.19 | 1.12 | 2.42% | 313.25 | 315.94 | +0.86% |\r\n\r\n\r\n## Kernel/Server Correctness \r\n\r\nThe change is bit-exact rather than within-tolerance, since the kernel reads the same values in the same order either way.\r\n\r\n```text\r\npytest tests/kernels/test_minimax_m3_amd_ops.py -k kv_insert -v\r\n9 passed, 55 deselected in 6.01s\r\n```\r\n\r\n|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|\r\n|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|\r\n|gsm8k|      3|flexible-extract|     8|exact_match|↑  |0.9477|±  |0.0061|\r\n|     |       |strict-match    |     8|exact_match|↑  |0.9484|±  |0.0061|\r\n\r\n## Reproduction\r\n\r\nMI355X (gfx950), TP=4, ROCm 7.2.3, amd-aiter 0.1.21.post2, vLLM 0.28.1rc1.dev628+g2a02f6efe.\r\n\r\n<details>\r\n<summary>Server, bench and trace commands</summary>\r\n\r\nServer, identical on both legs:\r\n\r\n```bash\r\nHIP_VISIBLE_DEVICES=0,1,2,3 \\\r\nVLLM_ROCM_USE_AITER=1 \\\r\nVLLM_ROCM_USE_AITER_MOE=1 \\\r\nVLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \\\r\nVLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 \\\r\nVLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1 \\\r\nVLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \\\r\nVLLM_ROCM_USE_AITER_FLYDSL_QR_INT4=1 \\\r\nVLLM_USE_BREAKABLE_CUDAGRAPH=1 \\\r\nVLLM_WORKER_MULTIPROC_METHOD=spawn \\\r\nSAFETENSORS_FAST_GPU=1 \\\r\nvllm serve amd/MiniMax-M3-MXFP4 \\\r\n  --host 0.0.0.0 --port 8000 \\\r\n  --tensor-parallel-size 4 \\\r\n  --distributed-executor-backend mp \\\r\n  --trust-remote-code \\\r\n  --kv-cache-dtype fp8 \\\r\n  --block-size 128 \\\r\n  --no-enable-prefix-caching \\\r\n  --language-model-only \\\r\n  --max-model-len 133120 \\\r\n  --gpu-memory-utilization 0.95 \\\r\n  --max-num-batched-tokens 32768 \\\r\n  --max-num-seqs 128 \\\r\n  --enable-chunked-prefill \\\r\n  --async-scheduling \\\r\n  --attention-config '{\"backend\":\"ROCM_AITER_UNIFIED_ATTN\",\"indexer_kv_dtype\":\"fp8\"}' \\\r\n  --moe-backend aiter \\\r\n  --tool-call-parser minimax_m3 \\\r\n  --enable-auto-tool-choice \\\r\n  --reasoning-parser minimax_m3 \\\r\n  --no-enable-log-requests\r\n```\r\n\r\nServer A/B bench, 2 repeats per leg after one warmup pass:\r\n\r\n```bash\r\nvllm bench serve --backend vllm --dataset-name random \\\r\n  --host localhost --port 8000 --model amd/MiniMax-M3-MXFP4 --trust-remote-code \\\r\n  --request-rate inf --random-range-ratio 0.8 \\\r\n  --random-input-len 8192 --random-output-len 1024 \\\r\n  --max-concurrency 8 --seed 2 \\\r\n  --num-prompts 64 --num-warmups 8 \\\r\n  --percentile-metrics ttft,tpot,itl,e2el\r\n```\r\n\r\nTrace capture used the same server plus `--profiler-config.profiler=torch --profiler-config.torch_profiler_record_shapes=1`, and a shorter bench so the kineto trace flushes reliably: `--num-prompts 8 --num-warmups 1`, everything else unchanged.\r\n\r\n</details>\r\n\r\n## AI Assistance\r\n\r\nOpus 4.6's help for implementation\r\nGPT-5.6-Sol's for help drafting the PR body",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "akii96/vllm"
+      },
+      "sha": "82bbe0683611a6b892ae7e2ed51d5b33da30ec9b"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/56849",
+    "merged": true,
+    "number": 56849,
+    "state": "closed",
+    "title": "[ROCm][Perf] Insert MiniMax-M3 sparse-PA K/V without a contiguous copy",
+    "updated_at": "2026-10-12T05:31:32Z"
+  },
+  "files": [
+    {
+      "additions": 76,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/82bbe0683611a6b892ae7e2ed51d5b33da30ec9b/tests%2Fkernels%2Ftest_minimax_m3_amd_ops.py",
+      "changes": 76,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Ftest_minimax_m3_amd_ops.py?ref=82bbe0683611a6b892ae7e2ed51d5b33da30ec9b",
+      "deletions": 0,
+      "filename": "tests/kernels/test_minimax_m3_amd_ops.py",
+      "patch": "@@ -10,6 +10,7 @@\n   * Fused MXFP8 activation quant (Triton)        -> _mxfp8_e4m3_quantize_torch\n   * Native MXFP8 linear (dot_scaled)             -> dequant-to-bf16 @ matmul\n   * Native MXFP8 MoE (dot_scaled grouped GEMM)   -> dequant-to-bf16 MoE math\n+  * Strided K/V sparse-PA cache insert           -> contiguous-copy insert\n \n The native MXFP8 GEMMs also guard the ``dot_scaled`` rhs-scale orientation: the\n scale is loaded ``[N, K//32]`` and passed WITHOUT transpose; a stray ``.T``\n@@ -39,6 +40,7 @@\n     _mxfp8_e4m3_quantize_triton,\n     dequant_mxfp8_to_bf16,\n )\n+from vllm.models.minimax_m3.amd.model import _kv_insert_operand  # noqa: E402\n from vllm.models.minimax_m3.amd.ops import (  # noqa: E402\n     gemma_fused_add_rmsnorm,\n     gemma_rmsnorm,\n@@ -588,3 +590,77 @@ def resolve(consumes_mask, *, has_moe_kernel=True):\n     assert torch.equal(resolve(True), mask)  # AITER kernel -> 0/1 mask\n     assert torch.equal(resolve(False), canonical)  # non-AITER -> canonical map\n     assert torch.equal(resolve(False, has_moe_kernel=False), canonical)  # non-modular\n+\n+\n+# --------------------------------------------------------------------------- #\n+# Strided K/V operand for the AITER sparse-PA cache insert\n+# --------------------------------------------------------------------------- #\n+def _fused_qkv_kv_slices(num_tokens, num_kv_heads, head_dim, num_q_heads=16):\n+    \"\"\"K/V as the sparse-PA insert sees them: column slices of a fused qkv.\"\"\"\n+    kv = num_kv_heads * head_dim\n+    row = num_q_heads * head_dim + 2 * kv + 2 * head_dim\n+    qkv = torch.randn((num_tokens, row), dtype=torch.bfloat16, device=DEVICE)\n+    k_start = num_q_heads * head_dim\n+    k = qkv[:, k_start : k_start + kv].view(num_tokens, num_kv_heads, head_dim)\n+    v = qkv[:, k_start + kv : k_start + 2 * kv].view(num_tokens, num_kv_heads, head_dim)\n+    return k, v\n+\n+\n+def _asm_kv_cache(pages, num_kv_heads, head_dim):\n+    \"\"\"Page-16 K/V cache views matching ``_ensure_aiter_sparse_pa_kv_cache``.\"\"\"\n+    x = 16 // torch.tensor([], dtype=torch.bfloat16).element_size()\n+    key = torch.zeros(\n+        (pages, num_kv_heads, head_dim // x, 16, x),\n+        dtype=torch.bfloat16,\n+        device=DEVICE,\n+    )\n+    value = torch.zeros(\n+        (pages, num_kv_heads, 16 // x, head_dim, x),\n+        dtype=torch.bfloat16,\n+        device=DEVICE,\n+    )\n+    return key, value\n+\n+\n+@pytest.mark.parametrize(\"num_tokens\", [1, 8, 129, 1024])\n+@pytest.mark.parametrize(\"num_kv_heads\", [1, 2])\n+def test_kv_insert_operand_matches_contiguous(num_tokens, num_kv_heads):\n+    \"\"\"A strided K/V slice must insert bit-identically to a contiguous copy.\"\"\"\n+    reshape_and_cache = pytest.importorskip(\"aiter\").reshape_and_cache\n+    head_dim = 128\n+    pages = num_tokens // 16 + 4\n+    slots = torch.randperm(pages * 16, device=DEVICE)[:num_tokens].to(torch.int32)\n+\n+    torch.manual_seed(num_tokens)\n+    k, v = _fused_qkv_kv_slices(num_tokens, num_kv_heads, head_dim)\n+    assert num_tokens == 1 or not k.is_contiguous()\n+\n+    caches = []\n+    for operand in (lambda t: t.contiguous(), _kv_insert_operand):\n+        key_cache, value_cache = _asm_kv_cache(pages, num_kv_heads, head_dim)\n+        reshape_and_cache(\n+            operand(k),\n+            operand(v),\n+            key_cache,\n+            value_cache,\n+            slots,\n+            kv_cache_dtype=\"auto\",\n+            asm_layout=True,\n+        )\n+        caches.append((key_cache, value_cache))\n+\n+    (ref_k, ref_v), (got_k, got_v) = caches\n+    assert torch.equal(ref_k, got_k)\n+    assert torch.equal(ref_v, got_v)\n+\n+\n+def test_kv_insert_operand_copies_unsupported_layouts():\n+    \"\"\"Only a row-strided slice passes through; anything else is copied.\"\"\"\n+    k, _ = _fused_qkv_kv_slices(32, 2, 128)\n+    assert _kv_insert_operand(k) is k\n+\n+    inner_strided = k[:, :, ::2]\n+    assert _kv_insert_operand(inner_strided).is_contiguous()\n+\n+    flat = k.reshape(32, -1)\n+    assert _kv_insert_operand(flat).is_contiguous()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/82bbe0683611a6b892ae7e2ed51d5b33da30ec9b/tests%2Fkernels%2Ftest_minimax_m3_amd_ops.py",
+      "sha": "230246ad9acf547771abf81df3d71fd9962535b4",
+      "status": "modified"
+    },
+    {
+      "additions": 28,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/82bbe0683611a6b892ae7e2ed51d5b33da30ec9b/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fmodel.py",
+      "changes": 30,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fmodel.py?ref=82bbe0683611a6b892ae7e2ed51d5b33da30ec9b",
+      "deletions": 2,
+      "filename": "vllm/models/minimax_m3/amd/model.py",
+      "patch": "@@ -579,6 +579,32 @@ def forward(\n         return output\n \n \n+# Widest row pitch aiter's reshape_and_cache can carry in its `int` stride args.\n+_MAX_KV_INSERT_ROW_STRIDE = 2**31 - 1\n+\n+\n+def _kv_insert_operand(t: torch.Tensor) -> torch.Tensor:\n+    \"\"\"K or V operand for ``aiter.reshape_and_cache``, without a needless copy.\n+\n+    The AITER sparse-PA insert takes K and V as column slices of the fused\n+    ``[q | k | v | index_q | index_k]`` projection, so they are row-strided\n+    views and never contiguous. ``reshape_and_cache`` does not need them to be:\n+    it passes ``key.stride(0)`` to the kernel as the row pitch and reads\n+    ``key[token_idx * key_stride + i]`` for ``i`` over ``num_heads *\n+    head_size``, so the only requirement is that the trailing\n+    ``(num_heads, head_size)`` block be contiguous within a row, which such a\n+    slice always satisfies. Any other layout falls back to a copy.\n+    \"\"\"\n+    if (\n+        t.dim() == 3\n+        and t.stride(2) == 1\n+        and t.stride(1) == t.shape[2]\n+        and t.stride(0) <= _MAX_KV_INSERT_ROW_STRIDE\n+    ):\n+        return t\n+    return t.contiguous()\n+\n+\n class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):\n     \"\"\"Block-sparse attention layer with the lightning-indexer branch.\n \n@@ -902,8 +928,8 @@ def _insert_aiter_sparse_pa_kv(\n             else \"auto\"\n         )\n         reshape_and_cache(\n-            k.contiguous(),\n-            v.contiguous(),\n+            _kv_insert_operand(k),\n+            _kv_insert_operand(v),\n             key_cache,\n             value_cache,\n             slot_mapping,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/82bbe0683611a6b892ae7e2ed51d5b33da30ec9b/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fmodel.py",
+      "sha": "a0a58253d1a8f26fa4f7890a718d94dd3fef51ec",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "@akii96 can you also provide gsm8k numshot 30 accuracy data as well?",
+      "created_at": "2026-09-15T03:34:09Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674326518",
+      "updated_at": "2026-09-15T03:34:09Z",
+      "user": {
+        "login": "tjtanaa"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-15T03:34:27Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674330745",
+      "updated_at": "2026-09-15T03:34:27Z",
+      "user": {
+        "login": "tjtanaa"
+      }
+    },
+    {
+      "body": "✅ @akii96, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-09-15T03:34:33Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674331742",
+      "updated_at": "2026-09-15T03:34:33Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "❌ This PR is 24 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5674330745 -->",
+      "created_at": "2026-09-15T03:34:45Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674334205",
+      "updated_at": "2026-09-15T03:34:45Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-15T04:41:41Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674838550",
+      "updated_at": "2026-09-15T04:41:41Z",
+      "user": {
+        "login": "akii96"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #89019](https://buildkite.com/vllm/ci/builds/89019) for commit `39af273985d9`.",
+      "created_at": "2026-09-15T04:41:59Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674840764",
+      "updated_at": "2026-09-15T04:41:59Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "@tjtanaa \r\n\r\nlm-eval n-shot 30 data:\r\n\r\n|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|\r\n|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|\r\n|gsm8k|      3|flexible-extract|    30|exact_match|↑  |0.9469|±  |0.0062|\r\n|     |       |strict-match    |    30|exact_match|↑  |0.9477|±  |0.0061|\r\n\r\nlm-eval command for reference!\r\n```\r\nlm_eval --model local-chat-completions --tasks gsm8k --num_fewshot 30 \\\r\n  --apply_chat_template --fewshot_as_multiturn --gen_kwargs max_gen_toks=1024 \\\r\n  --model_args model=amd/MiniMax-M3-MXFP4,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_length=32768\r\n```",
+      "created_at": "2026-09-15T04:51:30Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5674911442",
+      "updated_at": "2026-09-15T04:51:30Z",
+      "user": {
+        "login": "akii96"
+      }
+    },
+    {
+      "body": "@tjtanaa \r\n\r\nStatus on CI\r\n1 expected CI failure is waiting for the fix from #56955 to land before rebase + re-running CI ",
+      "created_at": "2026-09-15T06:49:16Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5676030818",
+      "updated_at": "2026-09-15T06:49:16Z",
+      "user": {
+        "login": "akii96"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-15T11:32:26Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5679468774",
+      "updated_at": "2026-09-15T11:32:26Z",
+      "user": {
+        "login": "akii96"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #89085](https://buildkite.com/vllm/ci/builds/89085) for commit `82bbe0683611`.",
+      "created_at": "2026-09-15T11:32:43Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5679472302",
+      "updated_at": "2026-09-15T11:32:43Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "@tjtanaa CI is green 🥳  (since the fix for the previous failure landed!) ",
+      "created_at": "2026-09-15T13:01:53Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#issuecomment-5680600787",
+      "updated_at": "2026-09-15T13:01:53Z",
+      "user": {
+        "login": "akii96"
+      }
+    }
+  ],
+  "number": 56849,
+  "refs": {
+    "base": {
+      "commit": "bb5507741155a698750bc422cda1f7c57f7d114d",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "82bbe0683611a6b892ae7e2ed51d5b33da30ec9b",
+      "repository": "akii96/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#pullrequestreview-5202666340",
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-14T20:39:19Z",
+      "user": {
+        "login": "claude"
+      }
+    },
+    {
+      "body": "Looks good to me, thanks @akii96 ",
+      "html_url": "https://github.com/vllm-project/vllm/pull/56849#pullrequestreview-5237341323",
+      "state": "APPROVED",
+      "submitted_at": "2026-09-17T14:44:25Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    }
+  ]
+}

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.6 — 2026-10-12
+
+- Align affected environment, adaptation, library-tuning and recovery guidance with the latest read-only HCU-Knowledge audit; refresh its dependency pin while preserving the existing local checkout binding. Distinguish Cluster Manager result schemas and exit status, actual grouped-GEMM arguments, backend/version coupling and recovery ownership.
+- Expand official engine, library and optimization-reference Wikis with common content dimensions, fixed-source call chains and mechanism topics. Add balanced navigation and an offline coverage check; include the actual LoongForge-pinned Loong-Megatron dependency rather than an unrelated child HEAD.
+- Give Megatron, TorchTitan, DeepSpeed, SFT/RL engines, Primus, MindSpeed and LoongForge consistent reference routes. Identify HCU lower-library ownership and the actual HCU RCCL repository, independently from rccl-test and external ROCm references.
+- Bind coordinated source refresh to its inventoried commit so concurrent upstream changes cannot mix source trees. Keep raw acquisition, authored content review and hardware qualification distinct; this release adds no new GPU training qualification.
+- Require the first authored-page review even when source hashes are unchanged, closing a gap where a newly written interpretation could otherwise bypass review.
+- Update Wiki/Skill maintenance and installation checks so affected guidance and the local installed Skills stay aligned with the reviewed project.
+
 ## 0.6.5 — 2026-10-12
 
 - Define a shared workspace write boundary across all six Skills and standalone modes: verified local/remote/container mappings, task-local outputs and caches, inherited Agent scopes, and narrowly recorded necessary exceptions using existing authorization. Keep reads available and preserve separate maintenance/install targets.

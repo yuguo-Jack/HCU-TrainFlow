@@ -1,0 +1,182 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "89ac8d971be7d2f598598c1551a21c646bdf8b0d",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "\n\n## Overview\n\nDeepSeek-V4 fails at engine init with `--linear-backend marlin` (#60587) or `triton`. `deep_gemm_fp8_o_proj` reads `wo_a.weight` directly and only understands the grouped `[g, r, d]` FP8 layout that the DeepGEMM linear kernels leave behind. Other backends lay the weight out for their own GEMM. This PR dequantizes such a `wo_a` to BF16 after loading so the existing BF16 bmm branch handles it.\n\nFixes #60587.\n\n## Claims\n\n- DeepSeek-V4-Flash starts and generates with `--linear-backend marlin` and `--linear-backend triton` (both crashed in `_o_proj` during profiling before).\n- With real weights, GSM8K under `--linear-backend marlin` matches the default backend (table below).\n- Default path (DeepGEMM / FlashInfer-DeepGEMM kernels) is unchanged: `wo_a` is already the 3D FP8 tensor, so the new hook returns early.\n\n## Validation\n\nNew test in `tests/quantization/test_fp8.py`: builds a block-FP8 `wo_a` under `linear_backend` in {marlin, triton}, runs the kernel's `process_weights_after_loading`, then `deep_gemm_fp8_o_proj`, and compares with an FP32 reference.\n\n```bash\npytest tests/quantization/test_fp8.py -k test_deepseek_v4_o_proj_with_non_deep_gemm_wo_a\n```\n\n1xH100: 2 passed. With the `maybe_dequant_wo_a` call removed from the test, both fail: marlin with `Expected size for first two dimensions of batch2 tensor to be: [2, 512] but got: [2, 128]` (same error as #60587), triton with DeepGEMM's `layout.hpp:46: t.dim() == N`.\n\nE2E on 1xH100, `deepseek-ai/DeepSeek-V4-Flash` with dummy weights, `hf_overrides={\"n_routed_experts\": 8}`, `enforce_eager=True`, 2 prompts x 16 tokens:\n\n| `linear_backend` | main | this PR |\n|---|---|---|\n| auto (FlashInfer-DeepGEMM) | ok | ok |\n| deep_gemm | ok | ok |\n| marlin | `RuntimeError: Expected size for first two dimensions of batch2 tensor to be: [8, 4096] but got: [8, 1024].` | ok |\n| triton | DeepGEMM `layout.hpp:46: t.dim() == N` in `fp8_einsum` | ok |\n| cutlass | `dispatch_scaled_mm ... scaled_mm_helper.hpp:17` | same, see below |\n| torch | `Invalid scaling configuration.` | same, see below |\n\nSM100 FlashInfer layer (RopeQuant recheck), 1xB200, same dummy setup reshaped to 128 local heads / 16 `wo_a` groups so RopeQuant applies, `kv_cache_dtype=\"fp8\"`, `attention_backend=\"FLASHINFER_MLA_SPARSE_DSV4\"`:\n\n| run | result |\n|---|---|\n| auto | RopeQuant on, ok |\n| marlin, this PR | RopeQuant chosen in `__init__`, turned off after `wo_a` becomes BF16, ok |\n| marlin, this PR minus the `_fuse_rope_quant` recheck line | `assert use_fp8` in `deep_gemm_fp8_o_proj` |\n\nGSM8K, real weights, 2xH200, TP=2, `--kv-cache-dtype fp8 --block-size 256 --max-model-len 8192`, `tests/evals/gsm8k/gsm8k_eval.py --num-questions 1319 --num-shots 5`:\n\n| `linear_backend` | code | GSM8K | invalid |\n|---|---|---|---|\n| auto (FlashInfer-DeepGEMM, FP8 `wo_a`) | this PR (path unchanged) | 0.9492 | 0.0 |\n| marlin | this PR (BF16 `wo_a`) | 0.9484 | 0.0 |\n\nOne run each, greedy; the gap is 1 question out of 1319. I did not rerun main with real weights; the main failure is the dummy-weight row above. Per-GPU model memory goes from 73.8 GiB to 74.52 GiB with the BF16 `wo_a`.\n\n## Details\n\nRoot cause: `wo_a` is a `ColumnParallelLinear` marked `is_bmm`, but it is never called. `deep_gemm_fp8_o_proj` takes `wo_a.weight` (and its scale) and feeds them to `fp8_einsum`, or to a BF16 `bmm` when the weight is not FP8. Only `DeepGemmFp8BlockScaledMMKernel.process_weights_after_loading` (also used by the FlashInfer-DeepGEMM kernel) reshapes the weight to `[g, r, d]` with DeepGEMM scales. The kernel is picked in `create_weights`, before `is_bmm` is set, and `--linear-backend` applies to every FP8 linear, so `wo_a` can end up in Marlin's packed int32 layout or a plain 2D FP8 tensor.\n\nThe fix is local to the three CUDA attention layers that call `deep_gemm_fp8_o_proj` (FlashMLA, FlashInfer SM100, FlashInfer SM120). Their new `process_weights_after_loading` runs after every quant method's own processing (deferred attention layers), and calls `maybe_dequant_wo_a`, which uses `get_and_maybe_dequant_weights` (same helper MLA uses for `kv_b_proj`). For Marlin and the DeepGEMM-capable platforms it dequantizes through the kernel's own `apply`, so it does not depend on each backend's layout. ROCm/XPU/CPU subclasses are untouched since their `wo_a` paths differ. On the SM100 FlashInfer layer, RopeQuant was decided in `__init__` against the not-yet-loaded FP8 weight, so it is rechecked after the swap.\n\nTradeoffs: on non-DeepGEMM backends `wo_a` is held in BF16 (4096x8192 per layer, about 1.5 GB more for DeepSeek-V4-Flash at TP=1, split across TP ranks) and that projection runs as a BF16 bmm. The default backend keeps the FP8 path.\n\nLimitations:\n- `cutlass` and `torch` still fail before reaching `_o_proj`: their block-FP8 GEMMs reject the checkpoint's UE8M0 scales (#47988 covers CUTLASS/Triton E8M0 handling). Out of scope here.\n- The reporter is on GB10 (SM121), which I don't have. I validated on H100/H200. The SM120 layer gets the same hook.\n\nNot a duplicate:\n- #56119 (open, last updated 09-24, merge conflicts, no review) dequantizes `is_bmm` weights inside `Fp8LinearMethod` only when Marlin is selected. This PR keeps shared FP8 code untouched and covers any backend that leaves `wo_a` outside the DeepGEMM layout: Triton is verified above; B12x (used by the GB10 recipe) also keeps a plain 2D FP8 weight and takes the same path, not run.\n- #55172 adds a BF16 helper for SM8x. I applied its `o_proj.py` on H100 with `--linear-backend marlin` and it still fails (`marlin_gemm ... a.size(1) = 32768, size_k = 4096`), because it infers the group width from the packed Marlin weight.\n- #41834 (SM12x enablement, open since May) makes Marlin refuse block-FP8 layers instead.\n\nAI assistance (Claude Code) was used to find the root cause, write the change and run the validation above.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "454e342f38a9f103401729c3e698fd9d71a7d99c",
+      "headRepository": {
+        "nameWithOwner": "ischencheng/vllm"
+      },
+      "merged": false,
+      "number": 60891,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-09T17:08:17Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60891#pullrequestreview-5473103163"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wOVQxNzowODoxN1q0MjAyNi0xMC0wOVQxNzowODoxN1rPAAAAAUY47Ts=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Bugfix] Dequantize DeepSeek-V4 wo_a for non-DeepGEMM linear backends",
+      "updatedAt": "2026-10-09T17:08:54Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60891"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "89ac8d971be7d2f598598c1551a21c646bdf8b0d"
+    },
+    "body": "\n\n## Overview\n\nDeepSeek-V4 fails at engine init with `--linear-backend marlin` (#60587) or `triton`. `deep_gemm_fp8_o_proj` reads `wo_a.weight` directly and only understands the grouped `[g, r, d]` FP8 layout that the DeepGEMM linear kernels leave behind. Other backends lay the weight out for their own GEMM. This PR dequantizes such a `wo_a` to BF16 after loading so the existing BF16 bmm branch handles it.\n\nFixes #60587.\n\n## Claims\n\n- DeepSeek-V4-Flash starts and generates with `--linear-backend marlin` and `--linear-backend triton` (both crashed in `_o_proj` during profiling before).\n- With real weights, GSM8K under `--linear-backend marlin` matches the default backend (table below).\n- Default path (DeepGEMM / FlashInfer-DeepGEMM kernels) is unchanged: `wo_a` is already the 3D FP8 tensor, so the new hook returns early.\n\n## Validation\n\nNew test in `tests/quantization/test_fp8.py`: builds a block-FP8 `wo_a` under `linear_backend` in {marlin, triton}, runs the kernel's `process_weights_after_loading`, then `deep_gemm_fp8_o_proj`, and compares with an FP32 reference.\n\n```bash\npytest tests/quantization/test_fp8.py -k test_deepseek_v4_o_proj_with_non_deep_gemm_wo_a\n```\n\n1xH100: 2 passed. With the `maybe_dequant_wo_a` call removed from the test, both fail: marlin with `Expected size for first two dimensions of batch2 tensor to be: [2, 512] but got: [2, 128]` (same error as #60587), triton with DeepGEMM's `layout.hpp:46: t.dim() == N`.\n\nE2E on 1xH100, `deepseek-ai/DeepSeek-V4-Flash` with dummy weights, `hf_overrides={\"n_routed_experts\": 8}`, `enforce_eager=True`, 2 prompts x 16 tokens:\n\n| `linear_backend` | main | this PR |\n|---|---|---|\n| auto (FlashInfer-DeepGEMM) | ok | ok |\n| deep_gemm | ok | ok |\n| marlin | `RuntimeError: Expected size for first two dimensions of batch2 tensor to be: [8, 4096] but got: [8, 1024].` | ok |\n| triton | DeepGEMM `layout.hpp:46: t.dim() == N` in `fp8_einsum` | ok |\n| cutlass | `dispatch_scaled_mm ... scaled_mm_helper.hpp:17` | same, see below |\n| torch | `Invalid scaling configuration.` | same, see below |\n\nSM100 FlashInfer layer (RopeQuant recheck), 1xB200, same dummy setup reshaped to 128 local heads / 16 `wo_a` groups so RopeQuant applies, `kv_cache_dtype=\"fp8\"`, `attention_backend=\"FLASHINFER_MLA_SPARSE_DSV4\"`:\n\n| run | result |\n|---|---|\n| auto | RopeQuant on, ok |\n| marlin, this PR | RopeQuant chosen in `__init__`, turned off after `wo_a` becomes BF16, ok |\n| marlin, this PR minus the `_fuse_rope_quant` recheck line | `assert use_fp8` in `deep_gemm_fp8_o_proj` |\n\nGSM8K, real weights, 2xH200, TP=2, `--kv-cache-dtype fp8 --block-size 256 --max-model-len 8192`, `tests/evals/gsm8k/gsm8k_eval.py --num-questions 1319 --num-shots 5`:\n\n| `linear_backend` | code | GSM8K | invalid |\n|---|---|---|---|\n| auto (FlashInfer-DeepGEMM, FP8 `wo_a`) | this PR (path unchanged) | 0.9492 | 0.0 |\n| marlin | this PR (BF16 `wo_a`) | 0.9484 | 0.0 |\n\nOne run each, greedy; the gap is 1 question out of 1319. I did not rerun main with real weights; the main failure is the dummy-weight row above. Per-GPU model memory goes from 73.8 GiB to 74.52 GiB with the BF16 `wo_a`.\n\n## Details\n\nRoot cause: `wo_a` is a `ColumnParallelLinear` marked `is_bmm`, but it is never called. `deep_gemm_fp8_o_proj` takes `wo_a.weight` (and its scale) and feeds them to `fp8_einsum`, or to a BF16 `bmm` when the weight is not FP8. Only `DeepGemmFp8BlockScaledMMKernel.process_weights_after_loading` (also used by the FlashInfer-DeepGEMM kernel) reshapes the weight to `[g, r, d]` with DeepGEMM scales. The kernel is picked in `create_weights`, before `is_bmm` is set, and `--linear-backend` applies to every FP8 linear, so `wo_a` can end up in Marlin's packed int32 layout or a plain 2D FP8 tensor.\n\nThe fix is local to the three CUDA attention layers that call `deep_gemm_fp8_o_proj` (FlashMLA, FlashInfer SM100, FlashInfer SM120). Their new `process_weights_after_loading` runs after every quant method's own processing (deferred attention layers), and calls `maybe_dequant_wo_a`, which uses `get_and_maybe_dequant_weights` (same helper MLA uses for `kv_b_proj`). For Marlin and the DeepGEMM-capable platforms it dequantizes through the kernel's own `apply`, so it does not depend on each backend's layout. ROCm/XPU/CPU subclasses are untouched since their `wo_a` paths differ. On the SM100 FlashInfer layer, RopeQuant was decided in `__init__` against the not-yet-loaded FP8 weight, so it is rechecked after the swap.\n\nTradeoffs: on non-DeepGEMM backends `wo_a` is held in BF16 (4096x8192 per layer, about 1.5 GB more for DeepSeek-V4-Flash at TP=1, split across TP ranks) and that projection runs as a BF16 bmm. The default backend keeps the FP8 path.\n\nLimitations:\n- `cutlass` and `torch` still fail before reaching `_o_proj`: their block-FP8 GEMMs reject the checkpoint's UE8M0 scales (#47988 covers CUTLASS/Triton E8M0 handling). Out of scope here.\n- The reporter is on GB10 (SM121), which I don't have. I validated on H100/H200. The SM120 layer gets the same hook.\n\nNot a duplicate:\n- #56119 (open, last updated 09-24, merge conflicts, no review) dequantizes `is_bmm` weights inside `Fp8LinearMethod` only when Marlin is selected. This PR keeps shared FP8 code untouched and covers any backend that leaves `wo_a` outside the DeepGEMM layout: Triton is verified above; B12x (used by the GB10 recipe) also keeps a plain 2D FP8 weight and takes the same path, not run.\n- #55172 adds a BF16 helper for SM8x. I applied its `o_proj.py` on H100 with `--linear-backend marlin` and it still fails (`marlin_gemm ... a.size(1) = 32768, size_k = 4096`), because it infers the group width from the packed Marlin weight.\n- #41834 (SM12x enablement, open since May) makes Marlin refuse block-FP8 layers instead.\n\nAI assistance (Claude Code) was used to find the root cause, write the change and run the validation above.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+    "changed_files": 4,
+    "head": {
+      "repo": {
+        "full_name": "ischencheng/vllm"
+      },
+      "sha": "454e342f38a9f103401729c3e698fd9d71a7d99c"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60891",
+    "merged": false,
+    "number": 60891,
+    "state": "open",
+    "title": "[Bugfix] Dequantize DeepSeek-V4 wo_a for non-DeepGEMM linear backends",
+    "updated_at": "2026-10-09T17:08:54Z"
+  },
+  "files": [
+    {
+      "additions": 68,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/454e342f38a9f103401729c3e698fd9d71a7d99c/tests%2Fquantization%2Ftest_fp8.py",
+      "changes": 68,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fquantization%2Ftest_fp8.py?ref=454e342f38a9f103401729c3e698fd9d71a7d99c",
+      "deletions": 0,
+      "filename": "tests/quantization/test_fp8.py",
+      "patch": "@@ -600,6 +600,74 @@ def test_mxfp8_bmm_loads_and_projects_grouped_weights(\n         torch.testing.assert_close(compiled(inputs), output, rtol=0, atol=0)\n \n \n+@pytest.mark.skipif(not current_platform.is_cuda(), reason=\"DeepSeek V4 needs CUDA\")\n+@pytest.mark.parametrize(\"linear_backend\", [\"marlin\", \"triton\"])\n+def test_deepseek_v4_o_proj_with_non_deep_gemm_wo_a(\n+    dist_init, default_vllm_config, linear_backend\n+):\n+    \"\"\"A wo_a laid out by a non-DeepGEMM backend goes through the BF16 o_proj.\"\"\"\n+    from vllm.model_executor.layers.linear import ColumnParallelLinear\n+    from vllm.models.deepseek_v4.nvidia.ops.o_proj import (\n+        compute_fp8_einsum_recipe,\n+        deep_gemm_fp8_o_proj,\n+        maybe_dequant_wo_a,\n+    )\n+\n+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)\n+    default_vllm_config.kernel_config.linear_backend = linear_backend\n+    with torch.device(\"cuda\"):\n+        wo_a = ColumnParallelLinear(\n+            512,\n+            256,\n+            bias=False,\n+            params_dtype=torch.bfloat16,\n+            quant_config=Fp8Config(\n+                is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]\n+            ),\n+            return_bias=False,\n+        )\n+    wo_a.is_bmm = True\n+    wo_a.bmm_batch_size = 2\n+    weight = torch.randn(256, 512, device=\"cuda\").to(torch.float8_e4m3fn)\n+    scale = torch.rand(2, 4, device=\"cuda\") + 0.5\n+    wo_a.weight.data.copy_(weight)\n+    wo_a.weight_scale_inv.data.copy_(scale)\n+    wo_a.quant_method.process_weights_after_loading(wo_a)\n+    maybe_dequant_wo_a(wo_a)\n+\n+    num_tokens = 7\n+    x = torch.randn(num_tokens, 2, 512, device=\"cuda\", dtype=torch.bfloat16)\n+    # cos = 1, sin = 0 makes the inverse RoPE an identity.\n+    cache = torch.cat(\n+        (\n+            torch.ones(num_tokens, 32, device=\"cuda\"),\n+            torch.zeros(num_tokens, 32, device=\"cuda\"),\n+        ),\n+        dim=1,\n+    )\n+    recipe, tma_aligned_scales = compute_fp8_einsum_recipe()\n+    projected = deep_gemm_fp8_o_proj(\n+        x,\n+        torch.arange(num_tokens, device=\"cuda\"),\n+        cache,\n+        wo_a,\n+        torch.nn.Identity(),\n+        n_groups=2,\n+        heads_per_group=1,\n+        nope_dim=448,\n+        rope_dim=64,\n+        o_lora_rank=128,\n+        einsum_recipe=recipe,\n+        tma_aligned_scales=tma_aligned_scales,\n+    )\n+    reference_weight = (\n+        weight.float().view(2, 128, 4, 128) * scale[:, None, :, None]\n+    ).view(2, 128, 512)\n+    reference = torch.einsum(\"tgk,grk->tgr\", x.float(), reference_weight)\n+    error = (projected.float() - reference.flatten(1)).norm() / reference.norm()\n+    assert error < 0.01\n+\n+\n def test_prepare_gated_trtllm_fp8_moe_weights_pads_each_projection(monkeypatch):\n     monkeypatch.setattr(\n         flashinfer_utils,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/454e342f38a9f103401729c3e698fd9d71a7d99c/tests%2Fquantization%2Ftest_fp8.py",
+      "sha": "be280cbd347d112b36aa7a6a79b158d52e3a4865",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/454e342f38a9f103401729c3e698fd9d71a7d99c/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fflashinfer_sparse.py",
+      "changes": 9,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fflashinfer_sparse.py?ref=454e342f38a9f103401729c3e698fd9d71a7d99c",
+      "deletions": 0,
+      "filename": "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py",
+      "patch": "@@ -19,6 +19,7 @@\n from vllm.models.deepseek_v4.nvidia.ops.o_proj import (\n     compute_fp8_einsum_recipe,\n     deep_gemm_fp8_o_proj,\n+    maybe_dequant_wo_a,\n     rope_quant_attn_out,\n     rope_quant_unsupported_reason,\n )\n@@ -234,6 +235,11 @@ def _alloc_attn_out(\n             return rope_quant_attn_out(num_tokens, hidden_states.device)\n         return super()._alloc_attn_out(num_tokens, hidden_states)\n \n+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:\n+        maybe_dequant_wo_a(self.wo_a)\n+        # __init__ chose RopeQuant against the FP8 wo_a before loading.\n+        self._fuse_rope_quant &= rope_quant_unsupported_reason(self) is None\n+\n     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:\n         super().__init__(vllm_config, *args, **kwargs)\n         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()\n@@ -639,6 +645,9 @@ def _as_sparse_cache(kv_cache: torch.Tensor) -> torch.Tensor:\n     def get_padded_num_q_heads(cls, num_heads: int) -> int:\n         return _pad_to_supported_q_heads(num_heads)\n \n+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:\n+        maybe_dequant_wo_a(self.wo_a)\n+\n     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:\n         return deep_gemm_fp8_o_proj(\n             o,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/454e342f38a9f103401729c3e698fd9d71a7d99c/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fflashinfer_sparse.py",
+      "sha": "4a471431f8694fbb7f773e4daf6374ebf7d410a1",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/454e342f38a9f103401729c3e698fd9d71a7d99c/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fflashmla.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fflashmla.py?ref=454e342f38a9f103401729c3e698fd9d71a7d99c",
+      "deletions": 0,
+      "filename": "vllm/models/deepseek_v4/nvidia/flashmla.py",
+      "patch": "@@ -15,6 +15,7 @@\n from vllm.models.deepseek_v4.nvidia.ops.o_proj import (\n     compute_fp8_einsum_recipe,\n     deep_gemm_fp8_o_proj,\n+    maybe_dequant_wo_a,\n )\n from vllm.models.deepseek_v4.sparse_mla import (\n     DeepseekV4FlashMLABackend,\n@@ -58,6 +59,9 @@ def __init__(self, *args, **kwargs) -> None:\n         super().__init__(*args, **kwargs)\n         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()\n \n+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:\n+        maybe_dequant_wo_a(self.wo_a)\n+\n     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:\n         return deep_gemm_fp8_o_proj(\n             o,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/454e342f38a9f103401729c3e698fd9d71a7d99c/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fflashmla.py",
+      "sha": "c8f447a17494c3be3a722e2cbdbf85f8df93ada2",
+      "status": "modified"
+    },
+    {
+      "additions": 20,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/454e342f38a9f103401729c3e698fd9d71a7d99c/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fops%2Fo_proj.py",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fops%2Fo_proj.py?ref=454e342f38a9f103401729c3e698fd9d71a7d99c",
+      "deletions": 0,
+      "filename": "vllm/models/deepseek_v4/nvidia/ops/o_proj.py",
+      "patch": "@@ -7,8 +7,10 @@\n \n from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation\n from vllm.model_executor.layers.quantization.utils.quant_utils import (\n+    get_and_maybe_dequant_weights,\n     kFp8Dynamic128Sym,\n )\n+from vllm.model_executor.utils import replace_parameter\n from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (\n     fused_inv_rope_fp8_quant,\n )\n@@ -103,6 +105,24 @@ def deep_gemm_fp8_o_proj(\n     return wo_b(z.flatten(1))\n \n \n+def maybe_dequant_wo_a(wo_a: nn.Module) -> None:\n+    \"\"\"Fall back to a BF16 ``wo_a`` when ``fp8_einsum`` cannot read its weight.\n+\n+    ``deep_gemm_fp8_o_proj`` reads ``wo_a.weight`` directly. Only the DeepGEMM\n+    linear kernels leave it as the grouped ``[g, r, d]`` FP8 tensor that\n+    ``fp8_einsum`` expects; other linear backends (e.g. ``--linear-backend\n+    marlin``) lay it out for their own GEMM. Dequantize those once after\n+    loading so the BF16 bmm path can use them.\n+    \"\"\"\n+    weight = wo_a.weight\n+    if weight.dtype == torch.bfloat16 or (\n+        weight.dtype == torch.float8_e4m3fn and weight.dim() == 3\n+    ):\n+        return\n+    weight = get_and_maybe_dequant_weights(wo_a, out_dtype=torch.bfloat16)\n+    replace_parameter(wo_a, \"weight\", weight.contiguous())\n+\n+\n # TRTLLM-gen's DSv4 RopeQuant epilogue (flashinfer-ai/flashinfer#4918) has one\n # fixed schedule: 128 query heads in groups of 8 512-wide heads, and FP8 with\n # one packed UE8M0 scale per 128 elements.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/454e342f38a9f103401729c3e698fd9d71a7d99c/vllm%2Fmodels%2Fdeepseek_v4%2Fnvidia%2Fops%2Fo_proj.py",
+      "sha": "9d497c06720f513aeb90de89cc2aa9d8909b19cd",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [],
+  "number": 60891,
+  "refs": {
+    "base": {
+      "commit": "89ac8d971be7d2f598598c1551a21c646bdf8b0d",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "454e342f38a9f103401729c3e698fd9d71a7d99c",
+      "repository": "ischencheng/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60891#pullrequestreview-5473103163",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-09T17:08:17Z",
+      "user": {
+        "login": "claude"
+      }
+    }
+  ]
+}

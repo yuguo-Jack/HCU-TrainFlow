@@ -9,35 +9,35 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-12'
 sources:
 - source: nvidia-cudnn-frontend
   path: README.md
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 4cabe0bbf2a76d4b5bbb1b06eae8d1de73aaf8cddb756e38903b6f62689b9279
 - source: nvidia-cudnn-frontend
   path: setup.py
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 1751eb8280739e6b7be513a36eaaaec357ce406c2a4d0f76290efafe1e615cdd
 - source: nvidia-cudnn-frontend
   path: pyproject.toml
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 27fb5d86264af4263cb8faec5597b6c412a499c0b69d04bb803eac73e868c865
 - source: nvidia-cudnn-frontend
   path: CMakeLists.txt
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 2b29c9721c9a03fe90378f323a5bdd2c11c2381fce8f43cfd3c9cfe6e8df9ce6
 - source: nvidia-cudnn-frontend
   path: samples/cpp/CMakeLists.txt
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 082d97b1796be55f09fa144c9a510be9ccd3db25725b7eee483492bcbf838ed9
 - source: nvidia-cudnn-frontend
   path: samples/cpp/sdpa/fp16_bwd.cpp
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 62f47b922848b39b6ec9ee07f2dbac8e65b2f46cfffb1e327e9b050a4d9f6bc2
 - source: nvidia-cudnn-frontend
   path: docs/quickstart.mdx
-  commit: eae67e3b9f78bac93cf19b0569effa01f760e1e8
+  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
   sha256: 93ed00e9f0f26ad5a4f31971b226ffaef47477e435e61cc66e4f9f9b47c456ea
 - source: nvidia-cudnn-frontend-docs
   path: quickstart
@@ -46,7 +46,6 @@ sources:
   url: https://docs.nvidia.com/deeplearning/cudnn/latest/quickstart.html
   revision_kind: web-content-fingerprint
 ---
-
 # cuDNN Frontend 编译安装、运行示例与测试路线
 
 ## 两类安装路径
@@ -72,13 +71,13 @@ C++ Frontend 主要通过头文件接入；编译应用和样例仍需匹配 CUD
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/README.md)
-- [nvidia-cudnn-frontend: setup.py](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/setup.py)
-- [nvidia-cudnn-frontend: pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/pyproject.toml)
-- [nvidia-cudnn-frontend: CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/CMakeLists.txt)
-- [nvidia-cudnn-frontend: samples/cpp/CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/samples/cpp/CMakeLists.txt)
-- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/samples/cpp/sdpa/fp16_bwd.cpp)
-- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/eae67e3b9f78bac93cf19b0569effa01f760e1e8/docs/quickstart.mdx)
+- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/README.md)
+- [nvidia-cudnn-frontend: setup.py](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/setup.py)
+- [nvidia-cudnn-frontend: pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/pyproject.toml)
+- [nvidia-cudnn-frontend: CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/CMakeLists.txt)
+- [nvidia-cudnn-frontend: samples/cpp/CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/cpp/CMakeLists.txt)
+- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/cpp/sdpa/fp16_bwd.cpp)
+- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/quickstart.mdx)
 - [nvidia-cudnn-frontend-docs: quickstart](https://docs.nvidia.com/deeplearning/cudnn/latest/quickstart.html)
 
-本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码 main、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。

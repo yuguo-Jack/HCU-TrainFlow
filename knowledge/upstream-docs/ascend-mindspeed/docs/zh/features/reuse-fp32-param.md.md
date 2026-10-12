@@ -1,0 +1,74 @@
+---
+id: doc-ascend-mindspeed-b3b2c418c0bf54b0f559
+title: Ascend/MindSpeed / docs/zh/features/reuse-fp32-param.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed
+commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+path: docs/zh/features/reuse-fp32-param.md
+raw_sha256: 55ae70ccfe0f6f5f1012774bf202e76ac2e4ff2ea8cc314e4ed411357e9bb6fd
+sources: []
+generated_body_sha256: 5d7b7775a5bb427b45833372ed17f00b1ae10a1dae710d4b587df66a97557699
+source_state: current-scan
+---
+
+# Ascend/MindSpeed / docs/zh/features/reuse-fp32-param.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/reuse-fp32-param.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# 参数副本复用
+
+## 背景与挑战
+
+在当前大模型训练场景中，混合精度训练已成为标准实践，其中涉及计算权重与状态权重的持续存储。然而，这两类权重的生命周期并不重叠，这意味着它们可以共享内存空间，而非各自独立占用。通过数值变换技巧，我们能消除这一冗余，实现资源的有效利用。
+
+## 解决方案
+
+鉴于在大模型混合精度训练中，BF16（Brain Floating Point 16）计算参数（用于前向和后向计算）与FP32参数副本（用于参数更新）无需同时存在于内存中，且两者之间存在明确的数值对应关系，我们设计了一种内存共用算法，以优化内存使用效率。
+
+具体算法步骤如下：
+
+1. FP32 = BF16 + Residual。
+2. 前向计算前：将FP32参数转换为BF16格式，并保存残差（Residual）。
+3. 优化器更新前：基于BF16参数和之前保存的残差，恢复FP32参数至其原始状态，随后进行参数更新。
+4. 数值变换模拟：利用int32加减运算来等价模拟原始逻辑中FP32与BF16之间的相互转换，遵循IEEE 754标准的向偶数舍入规则。
+
+**图1** 参数副本复用的具体流程
+<p align="left"> <img src="../figures/reuse_fp32_param_a.png" height="300px" width="750px"></p>
+
+**图2** 数值变换的详细逻辑
+
+<p align="left"> <img src="../figures/reuse_fp32_param_b.png" height="400px" width="750px"></p>
+
+## 使用场景
+
+此特性适用于采用BF16数据格式进行训练的场景。通过复用FP32参数内存，减少了权重的内存占用。
+
+## 使用方法
+
+启用参数副本复用，需在训练脚本中加入以下参数配置：
+
+```bash
+--reuse-fp32-param
+```
+
+## 使用效果
+
+* 对于Float16OptimizerWithFloat16Params类型的优化器，整体可节省的静态内存空间为sizeof(bfloat16) * 模型参数量，且在多个模型上的测试表明，性能损耗低于1%。
+* 对于启用了分布式优化器的训练任务，总体节省的静态内存空间为sizeof(bfloat16) * 模型参数量 / DP，同样地，性能损耗在测试中也控制在1%以内。
+
+> [!NOTE]
+>
+> * 使用legacy model训练时，`--reuse-fp32-param`暂不支持和`--overlap-param-gather`一起使用。
+> * 使用fused_ema_adamw优化器时，不支持同时开启`--reuse-fp32-param`参数。
+> * 断点续训场景下，不支持修改切分方式及卡数。

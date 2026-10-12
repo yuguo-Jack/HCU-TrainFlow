@@ -9,31 +9,31 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-09'
+reviewed_on: '2026-10-12'
 sources:
 - source: nvidia-transformerengine
   path: docs/installation.rst
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: e572fc6ba65d15e9092baa71c3e09e724ad344b52d7c4a28a4e854e58d36093e
 - source: nvidia-transformerengine
   path: docs/envvars.rst
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
-  sha256: 38ecf02281c2f6f6e0f06d09b6e388c418091b284f203a262e8bcc8ef06b2cc1
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  sha256: adf0db6d74919217dfd3879578f63e2ffa5c4925795c7bec5cd2d8ee6862e30e
 - source: nvidia-transformerengine
   path: setup.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 7329a6981de6e6fa50a86971fd914a0a3db2f08b47287694c00e468a59a32dac
 - source: nvidia-transformerengine
   path: .gitmodules
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: f59cb931b9c260f59fdf31beaf800a8df536fa50eec9470b381d3bf7b1e62986
 - source: nvidia-transformerengine
   path: tests/pytorch/test_numerics.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: 2752df5c59a5f9dd2ff5d44c8babe7d1f9bde48931311c4a0f228298c46ec35f
 - source: nvidia-transformerengine
   path: tests/pytorch/attention/test_attention_backend_selection.py
-  commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
   sha256: e0ee6f26e308ab0481f6bb7a12f88b1a1ffdf4a4a19f9e294ace495cab2de252
 - source: nvidia-transformerengine-docs
   path: installation
@@ -47,6 +47,14 @@ sources:
   sha256: 271080d66a4ab1c3fb529a4cd1368163f6de97da1cf195eadbbda4296df76af7
   url: https://docs.nvidia.com/deeplearning/transformer-engine/envvars.html
   revision_kind: web-content-fingerprint
+- source: nvidia-transformerengine
+  path: transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  sha256: 81b878962638eb81c571a5930e2b856f82299a40b6e5fb0040df97d2a6a30c9e
+- source: nvidia-transformerengine
+  path: tests/cpp/operator/test_swizzle.cu
+  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  sha256: 3d9909e1dc3729afbf6667169bf9e89a26f1a982afd822b44dd82da881c18d59
 ---
 
 # TE 安装、运行、单测与 HCU 环境接入
@@ -77,13 +85,22 @@ sources:
 
 ## 来源与版本复核
 
-- [nvidia-transformerengine: docs/installation.rst](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/docs/installation.rst)
-- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/docs/envvars.rst)
-- [nvidia-transformerengine: setup.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/setup.py)
-- [nvidia-transformerengine: .gitmodules](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/.gitmodules)
-- [nvidia-transformerengine: tests/pytorch/test_numerics.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/tests/pytorch/test_numerics.py)
-- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/tests/pytorch/attention/test_attention_backend_selection.py)
+- [nvidia-transformerengine: docs/installation.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/installation.rst)
+- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/envvars.rst)
+- [nvidia-transformerengine: setup.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/setup.py)
+- [nvidia-transformerengine: .gitmodules](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/.gitmodules)
+- [nvidia-transformerengine: tests/pytorch/test_numerics.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/pytorch/test_numerics.py)
+- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/pytorch/attention/test_attention_backend_selection.py)
 - [nvidia-transformerengine-docs: installation](https://docs.nvidia.com/deeplearning/transformer-engine/installation.html)
 - [nvidia-transformerengine-docs: environment-variables](https://docs.nvidia.com/deeplearning/transformer-engine/envvars.html)
 
-本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码 main、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+
+## 量化布局开关的版本核对
+
+当前官方新增 `NVTE_MXFP8_PER_TILE_SWIZZLE`，作用于 MXFP8 tile scale 的排列/量化路径；它不是 HCU 通用调优环境变量。测试需核对 GEMM 消费的 swizzled scale 与 rowwise/columnwise 输出契约，不能只比较 logical shape。遇到切换后数值或性能变化，先回到实际 dispatcher 与 quantizer，再决定是否存在额外重排或 fallback；本轮没有测量其 HCU 收益。
+
+补充固定证据：
+
+- [transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh)
+- [tests/cpp/operator/test_swizzle.cu](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/cpp/operator/test_swizzle.cu)

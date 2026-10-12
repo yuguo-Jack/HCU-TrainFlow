@@ -1,5 +1,15 @@
 # HCU-TrainFlow development plan
 
+## Current: HCU alignment and balanced official Wiki (2026-10-12)
+
+1. Audit the latest HCU-Knowledge commit, TrainFlow dependency locks, all installed Skills and three-stage usage — complete; read-only HCU audit, only demonstrated drift repaired.
+2. Read fixed official sources and expand every engine/library/ecosystem to common content dimensions with concrete mechanisms — complete; 22 coverage groups, 27 registered sources including a parent-pinned Loong-Megatron dependency.
+3. Reconcile inventories, monitored code, official documents, PR bodies/reviews and related workflow reviews — complete: all 27 registered sources checked, all 25 Git PR queues empty with no acquisition errors. GitHub throttling was resumed without dropping cursors; GraphQL discussion acquisition was compared against REST samples and incomplete connections used the existing collector. Pagination accounting was reconciled before publication.
+4. Cross-review authored claims, run offline/CLI/search/install checks, fix findings and synchronize the existing local installation — complete: 99 pages / 27 workflow targets have current review bindings; 1262 tests passed, 4 platform skips, plus 22 final data/integrity checks. All 5179 Wiki pages validate; representative and default search checks pass. All 11 required Skills and bindings verified; HCU-Knowledge checkout/index reused without source updates.
+5. Publish reviewed main and annotated v0.6.6, verify remote refs — ready; publication is the remaining operation.
+
+No HCU-Knowledge mutation or new GPU qualification. Source acquisition, authored review and runtime validation remain distinct. Raw source caches and interim scripts stay in ignored .work/wiki-maintenance.
+
 ## Current: check/adapt rename and optional KernelWiki (2026-10-12)
 
 1. Rename Skill entry, UI, dispatch and reading/update references; preserve installer migration — complete.
@@ -364,3 +374,13 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [x] 更新版本并完成发布准备；提交推送 main 与 annotated v0.6.5 的最终结果以远端 Git 回执确认。
 
 只维护工作流工程，不操作实际远端训练目录、不清理真实数据、不更新 HCU 大知识库。默认工作空间边界是 Agent 执行约定；不得将路径预检描述成任意子进程的文件系统沙箱。
+
+## 2026-10-12：官方 Wiki 均衡深化、统一更新与 0.6.6
+
+- [ ] 审计全部来源、作者页深度、更新覆盖和 HCU 底层库归属。
+- [ ] 按相同工程内容维度深化各官方仓，补调用链、配置、机制、诊断和 PR 证据。
+- [ ] 全部登记源增量更新，逐源检查采集/复核/版本锁与缺口，保持 HCU 实测边界。
+- [ ] 统一 README/Skill 参考路由与底层修改归属，完善长期维护检查。
+- [ ] 全量测试、链接/知识/检索 review、本机同步、提交推送和 annotated v0.6.6。
+
+授权写入：D:/codex/projects/HCU-TrainFlow；私有维护缓存 .work/wiki-maintenance；系统 Python editable 安装及 C:/Users/Administrator/.codex/skills 下既有六项 TrainFlow Skill。HCU-Knowledge 仅查询，不修改；不启动远端训练。

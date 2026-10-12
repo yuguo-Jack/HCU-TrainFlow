@@ -1,0 +1,230 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "ad8a6065f4bcbdfafd38828a4b3f1c6fac4dbf89",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Overview\n\ntorch's caching host allocator, which `pin_memory()` and `pin_memory=True` go through, rounds every block up to the next power of two. That's fine for short-lived staging buffers. But for buffers that live as long as the process the cache doesn't buy anything, and a buffer just over a power of two pins up to twice its size in page-locked memory the OS can't reclaim.\n\nThis adds a small `empty_pinned()` helper (`vllm/utils/pinned_memory.py`). It allocates exactly the requested size with `cudaHostAlloc` / `hipHostMalloc` through the existing `CudaRTLibrary` wrapper and frees it once the last view is gone. I've used it in the two GiB-sized places that don't already have an open PR:\n\n- The private per-tensor CPU KV offload tier. CUDA normally uses one exactly registered region (#50094), but ROCm has been on the private tensors since #57160, so the rounding from #53042 is back there. Fixes #53042 on ROCm.\n- CPU-resident weights, which is what the prefetch weight offloader leaves on the host (CUDA and ROCm). Two places allocate those: the offloader's own copy, and `device_loading_context`, which moves a CPU weight to the GPU for `process_weights_after_loading` and then copies it back into a new pinned tensor. The second copy is the one that stays, so both have to change.\n\nXPU keeps torch's allocator.\n\n## Claims\n\n- The CPU KV tier on ROCm pins exactly what it asks for instead of rounding each tensor up to a power of two. In my repro that's 4.25 GiB less page-locked memory for a 4.75 GiB tier, with identical output.\n- CPU-offloaded weights are pinned at their exact size too. With the prefetch offloader on Qwen3-1.7B that's 168 MiB less page-locked memory (main pins 1.25x the offloaded weights), with identical output.\n- No change to what gets pinned or when, only how big the allocation is.\n\n## Validation\n\n```\npytest tests/utils_/test_pinned_memory.py \\\n  \"tests/v1/kv_offload/cpu/test_gpu_worker.py::test_private_cpu_tier_pins_its_exact_size\" \\\n  tests/model_executor/model_loader/test_device_loading_context.py\npre-commit run --files <changed files>\n```\n\nAll 10 pass on CUDA (RTX A2000 Laptop, sm_86, torch 2.13.0+cu132). The pinned memory and KV tier tests also pass on ROCm (Radeon AI PRO R9700, gfx1201, ROCm 10.0, torch 2.13). To make sure the tests check the right thing, I ran them against the code from before this change too:\n\n- With `empty_pinned` pinning through torch and the old `gpu_worker.py`, two fail on both platforms, as they should: the fallback test (it pins when pinning is off) and the KV tier test (the caching allocator holds 128 MiB for a 66 MiB tier).\n- The `device_loading_context` test fails on main: a 33 MiB weight comes back in a 64 MiB pinned block.\n\nThe KV tier test passes `mmap_region=None`, so it takes the private path on CUDA as well. The new tests are in `tests/utils_`, `tests/v1/kv_offload` and `tests/model_executor`, which CI already runs on NVIDIA and AMD.\n\nKV tier memory, stock `Qwen/Qwen3-8B` on vLLM v0.31.1rc0 (ROCm build), `--kv-offloading-size 4.75`, which makes 36 per-layer tensors of 141,623,296 B. Pinned is the engine process's page-locked mappings minus the same baseline without a tier (about 212 MB in both runs):\n\n| | pinned for the tier | greedy output |\n|---|---|---|\n| main | 9,663,676,416 B (36 x 256 MiB, 1.82x the 5,100,273,664 B asked) | `05304724...` |\n| this PR | 5,098,438,656 B (36 x 141,623,296 B) | `05304724...` (same) |\n\nWeight offload, stock `Qwen/Qwen3-1.7B` on CUDA (RTX A2000), `--offload-backend prefetch --offload-group-size 4 --offload-num-in-group 1`, so 7 of 28 layers on the host. Pinned is the server's page-locked mappings minus a run without offload. I booted main and this branch alternately, twice each, and got the same numbers both times:\n\n| | pinned for the offloaded weights | per layer (gate_up / down / qkv / o) | c=1 decode | greedy output |\n|---|---|---|---|---|\n| main | 880,803,840 B | 64 / 32 / 16 / 8 MiB | 9.72 tok/s | same |\n| this PR | 704,643,072 B (the 0.7047 GB the offloader reports) | 48 / 24 / 16 / 8 MiB | 9.73 tok/s | same |\n\nI first only changed the offloader's own copy, and on ROCm with Qwen3-8B that made no difference at all (5,544,337,408 B pinned either way, 9 x (256 + 128 + 64 + 32) MiB where the weights are 192 + 96 + 48 + 32 MiB). That's how I found the `device_loading_context` copy.\n\n## Details\n\nWhy not the alternatives:\n\n- `cudaHostRegister` over pageable memory needs unregister bookkeeping, and registering one big region is what #57160 moved ROCm away from (`cudaHostRegister failed` at TP8 with a 500 GiB tier).\n- torch's `pinned_max_round_threshold_mb` turns the rounding off, but on torch 2.13 it can hand an exact-size cached block to a larger request and overflow it (pytorch/pytorch#192722, fixed on torch main but not in a release yet). It's also process-wide.\n- `get_accelerator_view_from_cpu_tensor`'s unpinned branch (what #56413 relies on) returns a device view, and these two sites need host tensors.\n\nTrade-offs: one `cudaHostAlloc` per buffer at startup instead of a cached block, so allocation is a bit slower, but it only happens once. torch doesn't track blocks it didn't allocate across `non_blocking` copies, so the copy stays async but torch won't keep the block alive for it. Every buffer here lives as long as its worker, so that can't free memory under a copy.\n\nOther open PRs on the same rounding, each at a different site and not touched here: UVA weight offload #56413 / #58185, the Qwen4Exp PLE table #59848, DSv4.1 Engram tables #59849, the sleep-mode CPU backup #60003, and the XPU KV tier #51956. #57506 changes `CPUOffloadingWorker.shutdown` in the same file, so one of us will need a small rebase, but the changes don't overlap.\n\nV1's `CpuGpuBuffer` and MRV2's `UvaBuffer` also pin through torch, but they're KiB to MiB, so I left them out to keep core components untouched. Happy to do them in a follow-up with the same helper if that's wanted.\n\nAI assistance (Claude) was used to write the code, run the tests and measurements, and draft this description. I reviewed the change and the results before posting.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+      "changedFiles": 8,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "headRepository": {
+        "nameWithOwner": "lobo235/vllm"
+      },
+      "merged": false,
+      "number": 60909,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-09T19:06:30Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60909#pullrequestreview-5474267526"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wOVQxOTowNjozMFq0MjAyNi0xMC0wOVQxOTowNjozMFrPAAAAAUZKsYY=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Bugfix] Pin long-lived host buffers at their exact size",
+      "updatedAt": "2026-10-09T19:07:08Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60909"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "ad8a6065f4bcbdfafd38828a4b3f1c6fac4dbf89"
+    },
+    "body": "## Overview\n\ntorch's caching host allocator, which `pin_memory()` and `pin_memory=True` go through, rounds every block up to the next power of two. That's fine for short-lived staging buffers. But for buffers that live as long as the process the cache doesn't buy anything, and a buffer just over a power of two pins up to twice its size in page-locked memory the OS can't reclaim.\n\nThis adds a small `empty_pinned()` helper (`vllm/utils/pinned_memory.py`). It allocates exactly the requested size with `cudaHostAlloc` / `hipHostMalloc` through the existing `CudaRTLibrary` wrapper and frees it once the last view is gone. I've used it in the two GiB-sized places that don't already have an open PR:\n\n- The private per-tensor CPU KV offload tier. CUDA normally uses one exactly registered region (#50094), but ROCm has been on the private tensors since #57160, so the rounding from #53042 is back there. Fixes #53042 on ROCm.\n- CPU-resident weights, which is what the prefetch weight offloader leaves on the host (CUDA and ROCm). Two places allocate those: the offloader's own copy, and `device_loading_context`, which moves a CPU weight to the GPU for `process_weights_after_loading` and then copies it back into a new pinned tensor. The second copy is the one that stays, so both have to change.\n\nXPU keeps torch's allocator.\n\n## Claims\n\n- The CPU KV tier on ROCm pins exactly what it asks for instead of rounding each tensor up to a power of two. In my repro that's 4.25 GiB less page-locked memory for a 4.75 GiB tier, with identical output.\n- CPU-offloaded weights are pinned at their exact size too. With the prefetch offloader on Qwen3-1.7B that's 168 MiB less page-locked memory (main pins 1.25x the offloaded weights), with identical output.\n- No change to what gets pinned or when, only how big the allocation is.\n\n## Validation\n\n```\npytest tests/utils_/test_pinned_memory.py \\\n  \"tests/v1/kv_offload/cpu/test_gpu_worker.py::test_private_cpu_tier_pins_its_exact_size\" \\\n  tests/model_executor/model_loader/test_device_loading_context.py\npre-commit run --files <changed files>\n```\n\nAll 10 pass on CUDA (RTX A2000 Laptop, sm_86, torch 2.13.0+cu132). The pinned memory and KV tier tests also pass on ROCm (Radeon AI PRO R9700, gfx1201, ROCm 10.0, torch 2.13). To make sure the tests check the right thing, I ran them against the code from before this change too:\n\n- With `empty_pinned` pinning through torch and the old `gpu_worker.py`, two fail on both platforms, as they should: the fallback test (it pins when pinning is off) and the KV tier test (the caching allocator holds 128 MiB for a 66 MiB tier).\n- The `device_loading_context` test fails on main: a 33 MiB weight comes back in a 64 MiB pinned block.\n\nThe KV tier test passes `mmap_region=None`, so it takes the private path on CUDA as well. The new tests are in `tests/utils_`, `tests/v1/kv_offload` and `tests/model_executor`, which CI already runs on NVIDIA and AMD.\n\nKV tier memory, stock `Qwen/Qwen3-8B` on vLLM v0.31.1rc0 (ROCm build), `--kv-offloading-size 4.75`, which makes 36 per-layer tensors of 141,623,296 B. Pinned is the engine process's page-locked mappings minus the same baseline without a tier (about 212 MB in both runs):\n\n| | pinned for the tier | greedy output |\n|---|---|---|\n| main | 9,663,676,416 B (36 x 256 MiB, 1.82x the 5,100,273,664 B asked) | `05304724...` |\n| this PR | 5,098,438,656 B (36 x 141,623,296 B) | `05304724...` (same) |\n\nWeight offload, stock `Qwen/Qwen3-1.7B` on CUDA (RTX A2000), `--offload-backend prefetch --offload-group-size 4 --offload-num-in-group 1`, so 7 of 28 layers on the host. Pinned is the server's page-locked mappings minus a run without offload. I booted main and this branch alternately, twice each, and got the same numbers both times:\n\n| | pinned for the offloaded weights | per layer (gate_up / down / qkv / o) | c=1 decode | greedy output |\n|---|---|---|---|---|\n| main | 880,803,840 B | 64 / 32 / 16 / 8 MiB | 9.72 tok/s | same |\n| this PR | 704,643,072 B (the 0.7047 GB the offloader reports) | 48 / 24 / 16 / 8 MiB | 9.73 tok/s | same |\n\nI first only changed the offloader's own copy, and on ROCm with Qwen3-8B that made no difference at all (5,544,337,408 B pinned either way, 9 x (256 + 128 + 64 + 32) MiB where the weights are 192 + 96 + 48 + 32 MiB). That's how I found the `device_loading_context` copy.\n\n## Details\n\nWhy not the alternatives:\n\n- `cudaHostRegister` over pageable memory needs unregister bookkeeping, and registering one big region is what #57160 moved ROCm away from (`cudaHostRegister failed` at TP8 with a 500 GiB tier).\n- torch's `pinned_max_round_threshold_mb` turns the rounding off, but on torch 2.13 it can hand an exact-size cached block to a larger request and overflow it (pytorch/pytorch#192722, fixed on torch main but not in a release yet). It's also process-wide.\n- `get_accelerator_view_from_cpu_tensor`'s unpinned branch (what #56413 relies on) returns a device view, and these two sites need host tensors.\n\nTrade-offs: one `cudaHostAlloc` per buffer at startup instead of a cached block, so allocation is a bit slower, but it only happens once. torch doesn't track blocks it didn't allocate across `non_blocking` copies, so the copy stays async but torch won't keep the block alive for it. Every buffer here lives as long as its worker, so that can't free memory under a copy.\n\nOther open PRs on the same rounding, each at a different site and not touched here: UVA weight offload #56413 / #58185, the Qwen4Exp PLE table #59848, DSv4.1 Engram tables #59849, the sleep-mode CPU backup #60003, and the XPU KV tier #51956. #57506 changes `CPUOffloadingWorker.shutdown` in the same file, so one of us will need a small rebase, but the changes don't overlap.\n\nV1's `CpuGpuBuffer` and MRV2's `UvaBuffer` also pin through torch, but they're KiB to MiB, so I left them out to keep core components untouched. Happy to do them in a follow-up with the same helper if that's wanted.\n\nAI assistance (Claude) was used to write the code, run the tests and measurements, and draft this description. I reviewed the change and the results before posting.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+    "changed_files": 8,
+    "head": {
+      "repo": {
+        "full_name": "lobo235/vllm"
+      },
+      "sha": "be3a3753c05b685a06ac6b03a86cb6f776dede9b"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60909",
+    "merged": false,
+    "number": 60909,
+    "state": "open",
+    "title": "[Bugfix] Pin long-lived host buffers at their exact size",
+    "updated_at": "2026-10-09T19:07:08Z"
+  },
+  "files": [
+    {
+      "additions": 34,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/tests%2Fmodel_executor%2Fmodel_loader%2Ftest_device_loading_context.py",
+      "changes": 34,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fmodel_executor%2Fmodel_loader%2Ftest_device_loading_context.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 0,
+      "filename": "tests/model_executor/model_loader/test_device_loading_context.py",
+      "patch": "@@ -0,0 +1,34 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+import pytest\n+import torch\n+from torch import nn\n+\n+from vllm.model_executor.model_loader.utils import device_loading_context\n+from vllm.platforms import current_platform\n+from vllm.utils.platform_utils import is_pin_memory_available\n+\n+\n+@pytest.mark.skipif(\n+    not current_platform.is_cuda_alike() or not is_pin_memory_available(),\n+    reason=\"needs pinned memory on CUDA/ROCm\",\n+)\n+def test_cpu_params_come_back_pinned_at_their_exact_size():\n+    # A CPU-offloaded weight of 33 MiB. torch's caching host allocator would\n+    # pin 64 MiB for it, for as long as the model lives.\n+    module = nn.Module()\n+    module.weight = nn.Parameter(\n+        torch.arange(33 << 19, dtype=torch.float32).to(torch.bfloat16),\n+        requires_grad=False,\n+    )\n+    expected = module.weight.detach().clone()\n+    before = torch.cuda.host_memory_stats().get(\"allocated_bytes.current\", 0)\n+\n+    with device_loading_context(module, torch.device(current_platform.device_type)):\n+        assert module.weight.device.type != \"cpu\"\n+\n+    assert module.weight.device.type == \"cpu\"\n+    assert module.weight.is_pinned()\n+    torch.testing.assert_close(module.weight, expected)\n+    cached = torch.cuda.host_memory_stats().get(\"allocated_bytes.current\", 0)\n+    assert cached - before < module.weight.nbytes",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/tests%2Fmodel_executor%2Fmodel_loader%2Ftest_device_loading_context.py",
+      "sha": "68a8fa82b5f3496dbfad5871acb0a4205648c7aa",
+      "status": "added"
+    },
+    {
+      "additions": 83,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/tests%2Futils_%2Ftest_pinned_memory.py",
+      "changes": 83,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Futils_%2Ftest_pinned_memory.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 0,
+      "filename": "tests/utils_/test_pinned_memory.py",
+      "patch": "@@ -0,0 +1,83 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+import gc\n+\n+import pytest\n+import torch\n+\n+from vllm.platforms import current_platform\n+from vllm.utils import pinned_memory\n+from vllm.utils.pinned_memory import empty_pinned\n+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor\n+\n+requires_cuda_alike = pytest.mark.skipif(\n+    not current_platform.is_cuda_alike(), reason=\"exact pinning is CUDA/ROCm only\"\n+)\n+\n+# torch's caching host allocator would pin 128 MiB for this.\n+JUST_OVER_A_POWER_OF_TWO = (64 << 20) + 4096\n+\n+\n+def _caching_allocator_bytes() -> int:\n+    return torch.cuda.host_memory_stats().get(\"allocated_bytes.current\", 0)\n+\n+\n+@requires_cuda_alike\n+def test_pins_outside_the_caching_allocator():\n+    before = _caching_allocator_bytes()\n+    host = empty_pinned(JUST_OVER_A_POWER_OF_TWO, torch.uint8)\n+\n+    assert host.is_pinned()\n+    assert host.untyped_storage().nbytes() == JUST_OVER_A_POWER_OF_TWO\n+    assert _caching_allocator_bytes() == before\n+\n+\n+@requires_cuda_alike\n+@pytest.mark.parametrize(\n+    (\"size\", \"stride\"),\n+    [((7,), None), ((3, 5), None), ((4, 6), (1, 4)), ((0, 4), None)],\n+    ids=[\"vector\", \"matrix\", \"column-major\", \"empty\"],\n+)\n+def test_round_trips_through_the_device(size, stride):\n+    dtype = torch.bfloat16\n+    host = empty_pinned(size, dtype, stride=stride)\n+    assert host.shape == size\n+    if stride is not None:\n+        assert host.stride() == stride\n+\n+    device = current_platform.device_type\n+    source = torch.randint(-100, 100, size, device=device).to(dtype)\n+    host.copy_(source, non_blocking=True)\n+    torch.accelerator.synchronize()\n+    assert torch.equal(host.to(device), source)\n+\n+\n+@requires_cuda_alike\n+def test_the_device_sees_the_same_memory_through_uva():\n+    host = empty_pinned(1024, torch.int32)\n+    host.copy_(torch.arange(1024, dtype=torch.int32))\n+    view = get_accelerator_view_from_cpu_tensor(host)\n+    assert torch.equal(view.cpu(), host)\n+\n+    host[0] = -1\n+    assert view[0].item() == -1\n+\n+\n+@requires_cuda_alike\n+def test_memory_outlives_the_tensor_while_a_view_remains():\n+    host = empty_pinned(256, torch.int32)\n+    host.copy_(torch.arange(256, dtype=torch.int32))\n+    tail = host[128:]\n+    del host\n+    gc.collect()\n+\n+    assert torch.equal(tail, torch.arange(128, 256, dtype=torch.int32))\n+\n+\n+def test_falls_back_to_pageable_memory_without_pinning(monkeypatch):\n+    monkeypatch.setattr(pinned_memory, \"is_pin_memory_available\", lambda: False)\n+    host = empty_pinned((2, 3), torch.float16, stride=(1, 2))\n+\n+    assert not host.is_pinned()\n+    assert host.shape == (2, 3)\n+    assert host.stride() == (1, 2)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/tests%2Futils_%2Ftest_pinned_memory.py",
+      "sha": "b03624ad50d8380f8bd7f1a631cbde2477804097",
+      "status": "added"
+    },
+    {
+      "additions": 42,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/tests%2Fv1%2Fkv_offload%2Fcpu%2Ftest_gpu_worker.py",
+      "changes": 42,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Fcpu%2Ftest_gpu_worker.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 0,
+      "filename": "tests/v1/kv_offload/cpu/test_gpu_worker.py",
+      "patch": "@@ -698,3 +698,45 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No\n                 torch.testing.assert_close(gpu_tensor[block_id].cpu(), expected)\n     finally:\n         worker.shutdown()\n+\n+\n+@pytest.mark.skipif(\n+    not current_platform.is_cuda_alike(), reason=\"exact pinning is CUDA/ROCm only\"\n+)\n+def test_private_cpu_tier_pins_its_exact_size(default_vllm_config) -> None:\n+    # Without a shared region (always the case on ROCm) each KV tensor gets\n+    # a private pinned CPU tensor. 2 x 33 MiB through torch's caching host\n+    # allocator would pin 2 x 64 MiB.\n+    page_size_bytes = 1 << 20\n+    num_cpu_chunks = 33\n+    tensors = [\n+        CanonicalKVCacheTensor(\n+            tensor=torch.zeros(\n+                (4, page_size_bytes), dtype=torch.int8, device=DEVICES[0]\n+            ),\n+            page_size_bytes=page_size_bytes,\n+        )\n+        for _ in range(2)\n+    ]\n+    kv_caches = CanonicalKVCaches(\n+        tensors=tensors,\n+        group_data_refs=[\n+            [\n+                CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=page_size_bytes)\n+                for i in range(2)\n+            ]\n+        ],\n+    )\n+    before = torch.cuda.host_memory_stats().get(\"allocated_bytes.current\", 0)\n+\n+    worker = CPUOffloadingWorker(\n+        kv_caches=kv_caches,\n+        blocks_per_chunk=1,\n+        num_cpu_chunks=num_cpu_chunks,\n+        mmap_region=None,\n+    )\n+    try:\n+        cached = torch.cuda.host_memory_stats().get(\"allocated_bytes.current\", 0)\n+        assert cached - before < num_cpu_chunks * page_size_bytes\n+    finally:\n+        worker.shutdown()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/tests%2Fv1%2Fkv_offload%2Fcpu%2Ftest_gpu_worker.py",
+      "sha": "4c4366a9302585930d512b336829b83925012f35",
+      "status": "modified"
+    },
+    {
+      "additions": 20,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fdistributed%2Fdevice_communicators%2Fcuda_wrapper.py",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fdevice_communicators%2Fcuda_wrapper.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 0,
+      "filename": "vllm/distributed/device_communicators/cuda_wrapper.py",
+      "patch": "@@ -86,6 +86,14 @@ class CudaRTLibrary:\n         ),\n         # cudaError_t cudaHostUnregister ( void* ptr )\n         Function(\"cudaHostUnregister\", cudaError_t, [ctypes.c_void_p]),\n+        # cudaError_t cudaHostAlloc ( void** pHost, size_t size, unsigned int flags )\n+        Function(\n+            \"cudaHostAlloc\",\n+            cudaError_t,\n+            [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint],\n+        ),\n+        # cudaError_t cudaFreeHost ( void* ptr )\n+        Function(\"cudaFreeHost\", cudaError_t, [ctypes.c_void_p]),\n         # cudaError_t cudaGetLastError ( void )\n         Function(\"cudaGetLastError\", cudaError_t, []),\n     ]\n@@ -104,6 +112,8 @@ class CudaRTLibrary:\n         \"cudaIpcOpenMemHandle\": \"hipIpcOpenMemHandle\",\n         \"cudaHostRegister\": \"hipHostRegister\",\n         \"cudaHostUnregister\": \"hipHostUnregister\",\n+        \"cudaHostAlloc\": \"hipHostMalloc\",\n+        \"cudaFreeHost\": \"hipHostFree\",\n         \"cudaGetLastError\": \"hipGetLastError\",\n     }\n \n@@ -208,6 +218,16 @@ def cudaHostUnregister(self, ptr: int) -> int:\n         \"\"\"Return the raw error code instead of raising.\"\"\"\n         return self.funcs[\"cudaHostUnregister\"](ctypes.c_void_p(ptr))\n \n+    def cudaHostAlloc(self, size: int, flags: int = 0) -> int:\n+        \"\"\"Allocate exactly ``size`` bytes of page-locked host memory.\"\"\"\n+        ptr = ctypes.c_void_p()\n+        self.CUDART_CHECK(self.funcs[\"cudaHostAlloc\"](ctypes.byref(ptr), size, flags))\n+        assert ptr.value is not None\n+        return ptr.value\n+\n+    def cudaFreeHost(self, ptr: int) -> None:\n+        self.CUDART_CHECK(self.funcs[\"cudaFreeHost\"](ctypes.c_void_p(ptr)))\n+\n     def cudaGetLastError(self) -> int:\n         \"\"\"Return and clear the error pending on this thread.\"\"\"\n         return self.funcs[\"cudaGetLastError\"]()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fdistributed%2Fdevice_communicators%2Fcuda_wrapper.py",
+      "sha": "51cc761dcae96846fa15ebc958afa444cc2729df",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fmodel_executor%2Fmodel_loader%2Futils.py",
+      "changes": 13,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fmodel_loader%2Futils.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 3,
+      "filename": "vllm/model_executor/model_loader/utils.py",
+      "patch": "@@ -37,6 +37,7 @@\n from vllm.model_executor.utils import is_weights_pre_processed\n from vllm.tracing import instrument\n from vllm.utils.mem_utils import release_device_memory_under_pressure\n+from vllm.utils.pinned_memory import empty_pinned\n from vllm.utils.platform_utils import is_pin_memory_available\n from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor\n \n@@ -239,9 +240,15 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)\n         # Restore the CPU-resident parameters, ignoring new parameters.\n         for name, p in module.named_parameters():\n             if name in cpu_params:\n-                p.data = torch.empty_like(\n-                    p.data, device=\"cpu\", pin_memory=use_pin_memory\n-                ).copy_(p.data)\n+                if use_pin_memory and p.data.layout == torch.strided:\n+                    cpu_data = empty_pinned(\n+                        p.data.size(), p.data.dtype, stride=p.data.stride()\n+                    )\n+                else:\n+                    cpu_data = torch.empty_like(\n+                        p.data, device=\"cpu\", pin_memory=use_pin_memory\n+                    )\n+                p.data = cpu_data.copy_(p.data)\n \n             # parameter is UVA offloaded, but was replaced with a new device tensor\n             # re-offload it to CPU using UVA",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fmodel_executor%2Fmodel_loader%2Futils.py",
+      "sha": "a5d4f5e99b8314e85f4e5c82e668a8ef4c435818",
+      "status": "modified"
+    },
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fmodel_executor%2Foffloader%2Fprefetch.py",
+      "changes": 33,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Foffloader%2Fprefetch.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 16,
+      "filename": "vllm/model_executor/offloader/prefetch.py",
+      "patch": "@@ -21,6 +21,7 @@\n import vllm.model_executor.offloader.prefetch_ops  # noqa: F401\n from vllm.logger import init_logger\n from vllm.model_executor.offloader.base import BaseOffloader, should_pin_memory\n+from vllm.utils.pinned_memory import empty_pinned\n from vllm.utils.torch_utils import get_dtype_size\n \n logger = init_logger(__name__)\n@@ -623,6 +624,20 @@ def assign_static_buffer(self, gpu_buffer: torch.Tensor) -> None:\n         pass\n \n \n+def _empty_cpu_like(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:\n+    \"\"\"CPU storage with ``tensor``'s size and stride, pinned at its exact size.\"\"\"\n+    if pin_memory and tensor.layout == torch.strided:\n+        return empty_pinned(tensor.size(), tensor.dtype, stride=tensor.stride())\n+    return torch.empty_strided(\n+        size=tensor.size(),\n+        stride=tensor.stride(),\n+        dtype=tensor.dtype,\n+        layout=tensor.layout,\n+        device=\"cpu\",\n+        pin_memory=pin_memory,\n+    )\n+\n+\n class _CpuParamOffloader(_BaseParamOffloader):\n     \"\"\"Offload parameter to pinned CPU memory.\n \n@@ -658,14 +673,7 @@ def _offload_to_cpu_internal(self):\n         pin_memory = should_pin_memory()\n \n         # Create pinned CPU storage and copy current GPU data\n-        self._cpu_storage = torch.empty_strided(\n-            size=param.data.size(),\n-            stride=param.data.stride(),\n-            dtype=param.data.dtype,\n-            layout=param.data.layout,\n-            device=\"cpu\",\n-            pin_memory=pin_memory,\n-        )\n+        self._cpu_storage = _empty_cpu_like(param.data, pin_memory)\n         self._cpu_storage.copy_(param.data)\n \n         self.offloaded_bytes = (\n@@ -693,14 +701,7 @@ def _update_cpu_storage_from_param(self) -> None:\n \n         if param.data.device.type == \"cpu\":\n             if should_pin_memory() and not param.data.is_pinned():\n-                pinned = torch.empty_strided(\n-                    size=param.data.size(),\n-                    stride=param.data.stride(),\n-                    dtype=param.data.dtype,\n-                    layout=param.data.layout,\n-                    device=\"cpu\",\n-                    pin_memory=True,\n-                )\n+                pinned = _empty_cpu_like(param.data, pin_memory=True)\n                 pinned.copy_(param.data)\n                 self._cpu_storage = pinned\n             else:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fmodel_executor%2Foffloader%2Fprefetch.py",
+      "sha": "10c4e5d196e130d25142279843f85f831026d2a5",
+      "status": "modified"
+    },
+    {
+      "additions": 70,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Futils%2Fpinned_memory.py",
+      "changes": 70,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Futils%2Fpinned_memory.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 0,
+      "filename": "vllm/utils/pinned_memory.py",
+      "patch": "@@ -0,0 +1,70 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Exact-size pinned host memory.\n+\n+``pin_memory()`` and ``pin_memory=True`` go through torch's caching host\n+allocator, which rounds every block up to the next power of two. A buffer that\n+lives for the whole process gains nothing from that cache, and one sized just\n+above a power of two pins up to twice its size in page-locked RAM.\n+\"\"\"\n+\n+import ctypes\n+import weakref\n+from collections.abc import Sequence\n+\n+import torch\n+\n+from vllm.utils.platform_utils import is_pin_memory_available\n+\n+# cudaHostAllocPortable | cudaHostAllocMapped (hipHostMallocPortable |\n+# hipHostMallocMapped have the same values). Mapped keeps the buffer usable\n+# by get_accelerator_view_from_cpu_tensor.\n+_HOST_ALLOC_FLAGS = 0x1 | 0x2\n+\n+\n+def empty_pinned(\n+    size: int | Sequence[int],\n+    dtype: torch.dtype,\n+    *,\n+    stride: Sequence[int] | None = None,\n+) -> torch.Tensor:\n+    \"\"\"Return an uninitialized pinned CPU tensor that pins exactly its size.\n+\n+    Meant for buffers that live as long as the process. On CUDA and ROCm the\n+    memory comes from cudaHostAlloc / hipHostMalloc and is freed when the last\n+    tensor viewing it is collected; the caller must not drop it while an\n+    asynchronous copy still reads or writes it. Elsewhere this falls back to\n+    torch's pinned allocator (still rounded), or to pageable memory when\n+    pinning is unavailable.\n+    \"\"\"\n+    shape = (size,) if isinstance(size, int) else tuple(size)\n+    strides = (\n+        tuple(stride)\n+        if stride is not None\n+        else torch.empty(shape, device=\"meta\").stride()\n+    )\n+    if not is_pin_memory_available():\n+        return torch.empty_strided(shape, strides, dtype=dtype, device=\"cpu\")\n+    from vllm.platforms import current_platform\n+\n+    numel = 0\n+    if all(shape):\n+        numel = 1 + sum((dim - 1) * step for dim, step in zip(shape, strides))\n+    nbytes = numel * dtype.itemsize\n+    if not current_platform.is_cuda_alike() or nbytes == 0:\n+        return torch.empty_strided(\n+            shape, strides, dtype=dtype, device=\"cpu\", pin_memory=True\n+        )\n+\n+    from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary\n+\n+    # Otherwise is_pinned() reports False for this memory.\n+    torch.cuda.init()\n+    cudart = CudaRTLibrary()\n+    ptr = cudart.cudaHostAlloc(nbytes, _HOST_ALLOC_FLAGS)\n+    buffer = (ctypes.c_uint8 * nbytes).from_address(ptr)\n+    release = weakref.finalize(buffer, cudart.cudaFreeHost, ptr)\n+    # The OS reclaims everything at exit, after the runtime may be gone.\n+    release.atexit = False  # type: ignore[misc]  # typeshed omits it from slots\n+    flat = torch.frombuffer(buffer, dtype=torch.uint8)\n+    return flat.view(dtype).as_strided(shape, strides)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Futils%2Fpinned_memory.py",
+      "sha": "8aa055226c74793ed67559e47791e91ca074c740",
+      "status": "added"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fv1%2Fkv_offload%2Fcpu%2Fgpu_worker.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Fcpu%2Fgpu_worker.py?ref=be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "deletions": 7,
+      "filename": "vllm/v1/kv_offload/cpu/gpu_worker.py",
+      "patch": "@@ -15,6 +15,7 @@\n from vllm.platforms import current_platform\n from vllm.triton_utils import HAS_TRITON, triton\n from vllm.utils.math_utils import cdiv\n+from vllm.utils.pinned_memory import empty_pinned\n from vllm.utils.torch_utils import PIN_MEMORY\n from vllm.v1.kv_offload.base import (\n     BlockIDsLoadStoreSpec,\n@@ -814,14 +815,13 @@ def __init__(\n                 cpu_tensor = mmap_region.create_next_worker_view(cpu_page_size_bytes)\n             else:\n                 t0 = time.monotonic()\n-                cpu_tensor = torch.zeros(\n-                    (num_cpu_chunks, cpu_page_size_bytes),\n-                    dtype=torch.int8,\n-                    device=\"cpu\",\n-                    pin_memory=pin_memory,\n-                )\n+                shape = (num_cpu_chunks, cpu_page_size_bytes)\n+                if pin_memory:\n+                    cpu_tensor = empty_pinned(shape, torch.int8).zero_()\n+                else:\n+                    cpu_tensor = torch.zeros(shape, dtype=torch.int8, device=\"cpu\")\n                 logger.debug(\n-                    \"torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s\",\n+                    \"Pinned CPU tensor %d×%d (%.2f GB): %.3f s\",\n                     num_cpu_chunks,\n                     cpu_page_size_bytes,\n                     num_cpu_chunks * cpu_page_size_bytes / 1e9,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/be3a3753c05b685a06ac6b03a86cb6f776dede9b/vllm%2Fv1%2Fkv_offload%2Fcpu%2Fgpu_worker.py",
+      "sha": "ffb8ffc9c79d3d0a556d0d34fd9c041e9adf7184",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [],
+  "number": 60909,
+  "refs": {
+    "base": {
+      "commit": "ad8a6065f4bcbdfafd38828a4b3f1c6fac4dbf89",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "be3a3753c05b685a06ac6b03a86cb6f776dede9b",
+      "repository": "lobo235/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60909#pullrequestreview-5474267526",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-09T19:06:30Z",
+      "user": {
+        "login": "claude"
+      }
+    }
+  ]
+}

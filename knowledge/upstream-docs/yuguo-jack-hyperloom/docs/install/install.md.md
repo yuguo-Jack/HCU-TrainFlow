@@ -1,0 +1,452 @@
+---
+id: doc-yuguo-jack-hyperloom-fc48b7504c0f0c476daa
+title: yuguo-Jack/Hyperloom / docs/install/install.md
+engine: hyperloom
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: yuguo-Jack/Hyperloom
+commit: 0425bde3f6e76e1588400c37d056dfd3bb75ac11
+path: docs/install/install.md
+raw_sha256: 983b32fb6f50894c892d313507e0be6789748d65e9d72ae775ceed8595940ba7
+sources: []
+generated_body_sha256: 3c106b2f242c523e26485d04d350f0de194cd2dfe352d634b7d5a90940ad2199
+source_state: current-scan
+---
+
+# yuguo-Jack/Hyperloom / docs/install/install.md
+
+[Original at fixed commit](https://github.com/yuguo-Jack/Hyperloom/blob/0425bde3f6e76e1588400c37d056dfd3bb75ac11/docs/install/install.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+---
+myst:
+    html_meta:
+        "description": "Run Hyperloom inside a Docker container or on bare-metal on an AMD GPU machine. Covers installing Hyperloom, configuring credentials, and running a demo."
+        "keywords": "Hyperloom, Docker, container, bare metal, install, AMD GPU, MI300X, MI325X, MI355X, SGLang, vLLM, Claude, Dev Containers, Install, ROCm"
+---
+# Install Hyperloom on Docker or bare metal
+
+These instructions allow you to set up and run Hyperloom inside a Docker container
+or on bare-metal on an AMD GPU machine. The recommended path is to prepare a
+dedicated workspace, open that directory in Claude Code and
+install the wheel into the current directory with `pip install --target .`. The
+source-clone path is kept at the end for developers and manual debugging.
+
+## Pip install (recommended)
+
+This is the recommended path to install and get started with Hyperloom. The
+current directory is both the install target and the agent workspace. Prepare a
+dedicated clean directory first, then open that directory in Claude Code before
+running the install command.
+
+> **Recommended run mode: Docker** Running the demos inside the provided
+> [ROCm container](https://rocm.docs.amd.com/projects/hyperloom/en/latest/compatibility.html#container-images)
+> ships a validated ROCm + framework stack, gives reproducible results,
+> and keeps your host untouched. Bare-metal mode is for advanced users: it
+> depends on your host's existing ROCm/torch and installs framework components
+> into your environment, which can cause environment-specific issues or
+> conflicts. Docker is preferred for a validated, reproducible stack.
+
+### Prerequisites
+
+Before installing Hyperloom, ensure the following requirements are met.
+
+- Python 3.10+ and `pip` on the machine where you open the workspace and run
+  `pip install --target .`. This covers the Hyperloom wheel only; serving-framework
+  Python constraints depend on your setup scenario below.
+- Access to the Anthropic LLM provider.
+- A dedicated workspace directory opened in the user's agent.
+
+### Install Hyperloom
+
+From the agent terminal in that workspace, install the published release wheel:
+
+```bash
+pip install hyperloom-inference-optimizer==1.1.0 --target .
+```
+
+It is normal for the current directory to contain many Python package directories
+after install. Do not use an existing project directory unless it is acceptable
+for Hyperloom to create or update `.env` there.
+
+### Set up Hyperloom
+
+With the agent still opened in the same workspace, run:
+
+```text
+/hyperloom-setup
+```
+
+This command runs the setup skill installed from
+[`src/hyperloom/skills/hyperloom-setup/SKILL.md`](../../src/hyperloom/skills/hyperloom-setup/SKILL.md).
+
+The setup skill is interactive. It creates or updates `.env` in the current
+workspace, records the selected run scenario, and stops before launching an
+optimization. Run `/hyperloom-setup` once per workspace; demo skills reuse the
+values already written to `.env`.
+
+It asks for these values with a fixed option order:
+
+1. Anthropic URL:
+   - `Use default (https://api.anthropic.com)`
+   - `Use AMD gateway (https://llm-api.amd.com/anthropic)`
+   - `Custom`
+2. Model:
+   - `Use default (claude-opus-5)`
+   - `Custom`
+3. Secrets:
+   - Setup writes placeholders in `.env`.
+   - Edit secrets directly in `.env`; never paste API keys into chat.
+   - If `.env` already exists, setup preserves unrelated keys but updates the
+     Hyperloom setup keys selected in this run.
+4. `USER_DATA_PATH`:
+   - Default: `<workspace>/session`
+   - Custom path
+5. Run mode, recorded in `.env` as `HYPERLOOM_RUN_MODE`:
+   - `docker`
+   - `baremetal`
+
+```note
+If you are performing the Hyperloom setup inside of a Docker container, select
+the "baremetal" option as the run mode during setup.
+```
+
+## Setup scenarios
+
+Hyperloom supports two local setup scenarios. Pick the one that matches where your 
+serving framework will run.
+
+### Scenario A: Bare metal
+
+Use this when the current host is the AMD GPU host where Hyperloom will run
+directly.
+
+Requirements:
+
+- Ubuntu 24.04 is the recommended host OS for bare-metal setup. vLLM 0.28.0+
+  requires Ubuntu 24.04 or newer; on Ubuntu 22.04, downgrade vLLM (for example
+  ``VLLM_VERSION=0.27.1``) or use Docker mode instead.
+- ROCm runtime and ROCm torch are already installed.
+- `git` is available for dependency checkouts.
+- A serving framework is either already installed, or setup might install one.
+- **Base Python on this GPU host** — the interpreter `install_baremetal.sh`
+  resolves, not a child venv:
+  - Python 3.10+ for SGLang and general operation.
+  - Exactly Python 3.12 when setup installs vLLM. vLLM ROCm wheels are
+    built for 3.12 only. vLLM defaults to an isolated framework venv, but that
+    venv is created from the base interpreter and inherits its version; isolated
+    mode does not relax the requirement.
+
+In this scenario, `/hyperloom-setup` runs the packaged setup backend on the host:
+
+```bash
+export REPO_ROOT="$(pwd -P)"
+PYTHONPATH="$REPO_ROOT" python3 -m hyperloom.inference_optimizer.setup
+```
+
+The backend runs `install_baremetal.sh` in five phases:
+
+1. **Base preflight**: Checks ROCm, GPU arch, ROCm torch, torch/triton alignment,
+   and serving framework imports.
+2. **Framework install**: Optionally installs the SGLang or vLLM framework layer.
+3. **ROCm hotfix**: Applies the profiler hotfix when the ROCm stack is eligible,
+   covering both `/opt/rocm/lib` and PyTorch's bundled `torch/lib/`.
+4. **Credentials**: Resolves LLM gateway credentials into `.env`.
+5. **Runtime env**: Persists bare-metal runtime vars (framework, ROCm/venv roots,
+   etc.) into `.env`.
+
+### Scenario B: Bare metal + Docker
+
+Use this when the workload will run inside a ROCm container. This is the
+recommended path when the host does not have ROCm torch or a serving framework
+installed, or when the serving framework should come from a known container
+image.
+
+Requirements:
+
+- Docker with AMD GPU access (`/dev/kfd`, `/dev/dri`) on the selected target
+  host.
+- A ROCm container image that already ships the serving framework, such as
+  SGLang or vLLM.
+- Host Python 3.10+ (from [Prerequisites](#prerequisites)) is enough for the
+  wheel and agent. Serving-framework Python versions come from the container
+  image, not the host.
+
+In this scenario, `/hyperloom-setup` writes `.env` only and does *not* start a
+container. The selected demo skill owns the container lifecycle.
+
+If Slurm is available, setup also checks the current user's allocation so Docker
+runs on the intended single GPU host instead of a login host. The user chooses
+whether Docker should run on:
+
+- the current host;
+- one allocated Slurm host;
+- a custom host.
+
+The chosen host is written to `.env`:
+
+```bash
+HYPERLOOM_DOCKER_TARGET_HOST=<hostname>
+```
+
+The demo skill reads this value to target the chosen host.
+
+The demo skill runs the setup backend inside the container, so Phase 3 applies
+the ROCm profiler hotfix there too, but only for SGLang images: vLLM ROCm images
+ship their own profiler workaround. Setup reads the run mode from `.env`, so keep
+`HYPERLOOM_RUN_MODE=docker` for container runs even though the backend itself
+runs inside the container.
+
+### Environment written by setup
+
+LLM defaults:
+
+| Mode | Required secret | Default base URL | Default model |
+|------|-----------------|------------------|---------------|
+| Anthropic | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | `CLAUDE_MODEL=claude-opus-5` |
+
+Setup creates or updates `.env` in the current workspace and writes the resolved
+values there.
+
+Common keys:
+
+- `USER_DATA_PATH`
+- `HYPERLOOM_RUN_MODE`
+- `HYPERLOOM_DOCKER_TARGET_HOST` (only when `HYPERLOOM_RUN_MODE=docker`)
+
+Bare-metal setup might also write runtime vars such as `FRAMEWORK`, `ROCM_PATH`,
+`VIRTUAL_ENV`, and `VLLM_VENV_ROOT`. `AITER_REF` pins ROCm/aiter to a released
+tag or commit; when unset the installer selects the newest tag compatible with
+the already-installed ROCm torch/triton stack. The ROCm wheel index for SGLang
+is controlled by `SGLANG_ROCM_EXTRA` (default `rocm724`) and
+`SGLANG_ROCM_PYPI_VERSION`. Kernel-agent paths (`MAGPIE_PATH`,
+`INFERENCEX_PATH`, `TRACELENS_ROOT`, `GEAK_ROOT`) are added later by the
+workload skill's `install.sh`.
+
+Specialist subprocesses inherit a minimal environment including LLM provider
+credentials (`ANTHROPIC_API_KEY`, `LLM_GATEWAY_KEY`, AWS Bedrock vars, etc.)
+by default so the agent CLI can authenticate. Unrelated secrets such as GitHub
+and KB tokens are never forwarded. To suppress credential forwarding when the
+`claude` CLI is authenticated through its own config, set
+`HYPERLOOM_SPECIALIST_INHERIT_SECRET_ENV=0`.
+
+`.env` in the current workspace is the single source of truth; no extra script
+needs sourcing. Setup only needs to run again when changing the LLM provider,
+base URL, model, `USER_DATA_PATH`, run mode, Docker target host, or bare-metal
+framework setup choice.
+
+## Run a demo
+
+Once setup is finished in `baremetal` mode (and `FRAMEWORK` is set), or when `.env`
+has been written in `docker` mode, the setup skill offers a model demo run
+and hands off to the matching demo skill. Choose a fixed preset or the advanced
+custom run:
+
+- [`3h`](../../examples/hyperloom-qwen3-8b-3h/SKILL.md): Qwen3-8B, short no-kernel run; best
+  for a first end-to-end check.
+- [`12h`](../../examples/hyperloom-qwen3-14b-fp8-12h/SKILL.md): Qwen3-14B-FP8, medium-length FP8 run.
+- [`custom advanced`](../../examples/hyperloom-custom-advanced/SKILL.md): user-selected
+  model, framework, TP/EP, concurrency, ISL/OSL, precision, budget, phase
+  toggles, and advanced CLI flags.
+
+The preset demos reuse the values already in `.env`, so nothing needs to be
+re-entered. The custom advanced run also reuses setup values, then asks for
+workload and phase choices before launch.
+
+## Use a custom model
+
+For a custom model with a preset workload, start from one of the fixed demo
+skills above. Pick the demo whose runtime shape is closest to the model and
+experiment you want to run, then provide your model path when the skill asks for
+it. You can also set it before launching the demo:
+
+```bash
+export MODEL_PATH=/path/to/your/model
+```
+
+`MODEL_PATH` should point to a model directory that the selected serving
+framework can load; a local Hugging Face-style directory should contain
+`config.json`. When `MODEL_PATH` is set and valid, the demo skill uses that
+directory instead of downloading its default model.
+
+The fixed demo skill is still a preset workload. Replacing the model path does not
+automatically retune tensor parallelism, concurrency, input/output lengths,
+precision, or the run budget. If the custom model is much larger, smaller, or
+uses a different architecture than the preset model, use
+[`custom advanced`](../../examples/hyperloom-custom-advanced/SKILL.md) to choose
+the model, framework, TP/EP, CONC, ISL/OSL, precision, budget, skip flags, and
+other optimizer CLI flags explicitly.
+
+## What to expect during a demo
+
+Demo optimizations are long-running background jobs. The agent should not stream
+every debug log line, but it should make progress visible before and after
+launch.
+
+Before launch, expect a short plan that includes the resolved model path, run
+mode, framework, TP, concurrency, ISL/OSL, precision, run budget, and
+`USER_DATA_PATH`. After launch, expect the optimizer PID, run log path,
+launch-info JSON path, session directory, `state.json` path, and the initial
+health check result.
+
+During the run, the agent should report a concise status summary about every
+300 seconds. Useful fields include whether the process is still alive, the
+current phase, `stop_reason`, baseline throughput, current best throughput,
+cumulative gain, latest benchmark result or candidate decision, and the most
+relevant recent log lines. Secrets such as API keys, tokens, and custom headers
+must never be printed.
+
+## Troubleshooting
+
+- The current workspace contains many package folders after `pip install
+  --target .` - this is the expected behavior.
+- If `/hyperloom-setup` is not visible, confirm the setup skill exists under
+  the current workspace. It is installed to `.claude/skills/hyperloom-setup/`;
+  restart the agent if needed.
+- `ImportError: libamdhip64.so.7` or `libhipblas.so.3` means the installed
+  framework torch wheel expects different ROCm user-space libraries; align
+  `ROCM_PATH` and `LD_LIBRARY_PATH`.
+- `hipDeviceAttributePciChipId` missing during AITER build means `hipcc` is
+  using older ROCm headers; put the matching ROCm `bin` first on `PATH`.
+
+## Source checkout and manual installation
+
+These instructions are for advanced users and developers. Use this path only
+when developing Hyperloom, testing local source changes, or debugging setup
+internals.
+
+Clone the repository:
+
+```bash
+git clone https://github.com/AMD-AGI/Hyperloom.git
+cd Hyperloom
+```
+
+In source mode, the agent workspace is the repository root. Create `.env`
+yourself with placeholders and fill in the real values before launching. Never
+paste API keys into chat.
+
+```bash
+cat > .env <<'EOF'
+ANTHROPIC_API_KEY=<PLEASE_FILL_IN>
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+CLAUDE_MODEL=claude-opus-5
+# Writable artifact root for runtime files, dependency checkouts, logs,
+# optimizer runs, and generated env files. Set an absolute path you own.
+USER_DATA_PATH=<PLEASE_FILL_IN>
+HYPERLOOM_RUN_MODE=baremetal
+EOF
+```
+
+### Using an enterprise LLM gateway
+
+`https://api.anthropic.com` above is only the default. `ANTHROPIC_BASE_URL`
+accepts any Anthropic-protocol endpoint, so an enterprise LLM gateway is
+configured through the same official variables rather than a Hyperloom-specific
+one: point the base URL at the gateway and use the key the gateway issues.
+
+```bash
+cat > .env <<'EOF'
+ANTHROPIC_API_KEY=<PLEASE_FILL_IN>
+ANTHROPIC_BASE_URL=https://<your-gateway-host>/api/v1/llm-proxy
+# Pin an orchestration model id your gateway actually serves. Preflight
+# validates it against the gateway's /models catalog and does not silently
+# substitute a different model.
+CLAUDE_MODEL=<PLEASE_FILL_IN>
+USER_DATA_PATH=<PLEASE_FILL_IN>
+HYPERLOOM_RUN_MODE=baremetal
+EOF
+```
+
+Gateways that authenticate on a header of their own need that header in addition
+to the bearer key. AMD's gateway is one of them: `llm-api.amd.com` requires the
+API key to also travel as an `Ocp-Apim-Subscription-Key` header. Add one more line
+to `.env` below `ANTHROPIC_API_KEY` — `${VAR}` references are expanded from the
+same file, so the secret stays in one place:
+
+```bash
+ANTHROPIC_CUSTOM_HEADERS="Ocp-Apim-Subscription-Key: ${ANTHROPIC_API_KEY}"
+```
+
+Keep the double quotes. Setup and the launch scripts might load `.env` with a shell
+`source`, and an unquoted value containing a space and a colon is parsed as a
+command, failing with exit 127.
+
+If the gateway also serves an OpenAI-compatible route, set `OPENAI_BASE_URL` and
+`OPENAI_API_KEY` against it to enable the Codex-side features. On the AMD
+network the interactive flow described in [Set up Hyperloom](#set-up-hyperloom)
+offers the AMD gateway as a ready-made choice, so you do not need to write any
+of this by hand. See
+[Authentication and credentials](../reference/authentication.md) for the full
+set of accepted shapes, including split entrypoints and self-hosted gateways.
+
+### Bare metal (source)
+
+Make sure the host already provides the required base environment:
+
+- ROCm runtime and a ROCm-built torch.
+- A serving framework (SGLang or vLLM) importable in the active Python.
+- `git` for the dependency checkouts the optimization skill performs.
+
+With that in place, open the repository root in the agent and paste a launch
+prompt, filling in your workload and configuration:
+
+```text
+@src/hyperloom/inference_optimizer/SKILL.md
+
+Optimize inference for this workload:
+- Model: /path/to/your/model
+- Framework: sglang
+- GPU: MI300X
+- TP: 8
+- CONC: 64
+- ISL: 1024
+- OSL: 1024
+- Goal: improve throughput by at least 10%
+- Budget: 24 hours
+
+Requirements:
+1. Report the session ID, log path, PID, and initial health check result.
+2. Monitor the process every 300s until the optimization is complete or failed.
+```
+
+### Docker (source)
+
+It is recommended that you use a ROCm image that already ships the serving
+framework, so nothing needs to be installed inside the container beyond
+Hyperloom's runtime deps. The following images are recommended:
+
+- `vllm`: `docker.io/vllm/vllm-openai-rocm:v0.28.0`
+- `sglang` MI300X: `docker.io/lmsysorg/sglang-rocm:v0.5.18-rocm724-mi30x-20260825`
+- `sglang` MI355X: `docker.io/lmsysorg/sglang-rocm:v0.5.18-rocm724-mi35x-20260825`
+
+Start a long-running container from the repo root, mounting it at the same path
+so `.env`, logs, and session artifacts stay valid:
+
+```bash
+export HYPERLOOM_IMAGE=docker.io/vllm/vllm-openai-rocm:v0.28.0
+export REPO_ROOT="$(pwd -P)"
+docker run -d \
+  --name "${HYPERLOOM_CONTAINER_NAME:-hyperloom-local}" \
+  --shm-size "${HYPERLOOM_SHM_SIZE:-64g}" \
+  --entrypoint tail \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --group-add video \
+  -v "$REPO_ROOT:$REPO_ROOT" \
+  "$HYPERLOOM_IMAGE" \
+  -f /dev/null
+```
+
+Then run all Hyperloom commands inside that container with
+`docker exec -w "$REPO_ROOT" "${HYPERLOOM_CONTAINER_NAME:-hyperloom-local}" ...`,
+using `PYTHONPATH="$REPO_ROOT/src"` so the source checkout is importable. Use the
+same launch prompt as bare metal above.

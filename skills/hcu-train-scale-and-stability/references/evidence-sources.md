@@ -1,6 +1,6 @@
 # 排障的知识检索与源码查证
 
-诊断指南的参考复核日期：2026-10-10。以下 ID/路径属于独立的 **HCU-Knowledge**，不是本 Skill 安装目录；按 `$hcu-knowledge-search` 的 `workspace.json` 找实际 KB_ROOT。路径只是导航，最新索引与当前部署版本须另核对。不复制内部原始材料到公开 Skill，也不因查询触发全库更新。
+诊断指南的参考复核日期：2026-10-12（HCU-Knowledge `4596fd436`）。以下 ID/路径属于独立的 **HCU-Knowledge**，不是本 Skill 安装目录；按 `$hcu-knowledge-search` 的 `workspace.json` 找实际 KB_ROOT。路径只是导航，最新索引与当前部署版本须另核对。不复制内部原始材料到公开 Skill，也不因查询触发全库更新。
 
 ## 按问题查证
 
@@ -36,14 +36,14 @@ python -X utf8 <KB_ROOT>/kb.py --root <KB_ROOT> search-pr "graph proxy hang" --p
 | 性能/驻留与采集副作用 | `xprof-xcompute-workflow`、`hipprof-2610-metrics`、`infra-resource-critical-path` | 资源/依赖、指标层级和 replay 扰动，防止把采集伪影当硬件瓶颈 |
 | 容错和健康重入 | `cluster-manager-engineering-handbook`、`cluster-fault-taint-recovery`，以及 `knowledge/projects/primus-safe/` | 区分子工程/部署入口，检测、处置、重建和解除隔离的独立条件 |
 
-例：本次 KB 中 RCCL 总览对应 `80b1215701a8cb657c9ec5f2aab37cd8a7086727`，Cluster Manager 主题对应 `026452b298814065b317273c28cc6d707567c20c`，hcuprobe 对应 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5`。这些用于说明参考快照，**不是工作流依赖锁或推荐部署版本**；现场另行固定。大库已记录的未合入 PR 与已部署的自定义分支分别检查。
+例：本次 KB 中 RCCL 总览对应 `80b1215701a8cb657c9ec5f2aab37cd8a7086727`，Cluster Manager 主题对应 `438847c1877cdce17cb524cb8825d49bd6917d6a`，hcuprobe 对应 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5`。这些用于说明参考快照，**不是工作流依赖锁或推荐部署版本**；现场另行固定。大库已记录的未合入 PR 与已部署的自定义分支分别检查。
 
 ## 公开官方补充
 
 - [PyTorch distributed 调试](https://docs.pytorch.org/docs/stable/distributed.html)：组/成员、调试日志和 Gloo `monitored_barrier`。先核对 HCU PyTorch 实际实现，不能直接把 stable 文档所有能力当成本机已有。
 - [PyTorch memory snapshot](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html)：追分配生命周期；它只能看到 allocator 管理的内存，库外直接分配需另查。HCU 构建能否使用相关 API/可视化由现场确认。
 - [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)：主机/容器限额与 memory.events；读取实际进程所属层级和时间增量。v1 环境用对应内核文档，不照搬 v2 路径。
-- [Cluster Manager 固定源码](https://github.com/HYGON-AI/cluster-manager-das/tree/026452b298814065b317273c28cc6d707567c20c)：按部署子工程追控制与恢复；用现场版本比较该参考快照。
+- [Cluster Manager 固定源码](https://github.com/HYGON-AI/cluster-manager-das/tree/438847c1877cdce17cb524cb8825d49bd6917d6a)：按部署子工程追控制与恢复；用现场版本比较该参考快照。
 
 ## 如何维护这些方法
 

@@ -32,9 +32,11 @@
 
 三个阶段共用[精度诊断方法](practices/model-accuracy-diagnosis.md)：NV 对照、HCU 自查、HCU Probe 采集和匹配、跨 rank 首差、SFT/RL 与恢复后偏差。已核对固定 Probe 源码及官方方法，登记调用入口和验收边界；本轮没有新增 HCU/NV 模型对照或 Probe 现场实验，不要求预先实测全部后端。现有质量门槛继续核对冻结初态、配方、样本和实际候选；Probe 不会由 CLI 自动安装/执行，也不自动判模型通过。
 
-## TorchTitan 官方 Wiki 覆盖
+## 官方 Wiki 的统一阅读粒度
 
-[TorchTitan 专区](../knowledge/official-torchtitan-wiki/overview.md)补充了 15 页源码/教程专题（含三个优化案例）、64 份官方文档与 59 份相关 PR 的描述、review、评论和 diff，并登记完整目录、源码监测与关联工作流。可通过既有 Wiki search 查询本地内容、线上 PR 和固定源码，后续通过 Wiki update 增量维护。Release/main/未合入 PR 分开解释；本轮完成的是知识与工具检查，未执行 TorchTitan 的 HCU 安装、训练或性能验证。收录窗口和精读边界见[版本与更新说明](../knowledge/official-torchtitan-wiki/releases-prs-and-update.md)。
+所有登记来源共用[九项内容标准](wiki-authoring-standard.md)：定位、目录、安装、运行测试、数值/状态契约、调用链、性能显存、诊断恢复、版本与 PR。各仓入口和具体机制见[覆盖导航](../knowledge/COVERAGE.md)，跨引擎优化见[参考选择](optimization-reference-map.md)。Megatron、TorchTitan、DeepSpeed、SFT/RL、推理后端与第三方参考均有同等阅读维度；页数可以不同，不能用大量原文或 PR 数量代替专题讲解。
+
+源码目录、教程和 PR 增量分别采集；作者页说明选定机制、证据及边界，正文复核后才应用来源更新。组织检查仅确认阅读入口完整，不证明每个结论正确或通过 HCU 实测。发布线、开发分支和未合入 PR 分开追踪；本轮没有增加训练、性能或故障注入的硬件验证声明。
 
 ## 后续验收重点
 

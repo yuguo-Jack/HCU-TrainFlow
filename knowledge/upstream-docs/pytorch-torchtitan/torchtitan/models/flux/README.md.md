@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: b663c1673c00d97864bb32f18029ce5ec40442e2
 path: torchtitan/models/flux/README.md
-raw_sha256: c5f425ce7a9e52c349d0dfa96c500182a3012009b7fb36381bb30f9e40a0e5cb
+raw_sha256: 63090efd1c71ea0b10f0b4ed318959ab7eaf37336276997f712b9aa662175ca6
 sources: []
-generated_body_sha256: addf5e752fadc32927f552c32bb6b656e6b378673a354332d218a8988cb988d6
+generated_body_sha256: a443d81eb4fa587237431c08e0a49bfa50ff3a54d31246ee1b5350bf34dc7d5d
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/flux/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/flux/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/flux/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -34,7 +34,7 @@ This directory contains the implementation of the [FLUX](https://github.com/blac
 ## Prerequisites
 Install the required dependencies:
 ```bash
-pip install -r requirements-flux.txt
+pip install -r .ci/docker/requirements-flux.txt
 ```
 
 ## Usage

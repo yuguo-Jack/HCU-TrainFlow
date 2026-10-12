@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
 path: docs/docs/references/environment_variables.mdx
-raw_sha256: 24c8500900de3259e880acf98202a3867900e664bc83c36efe44ac584afaea85
+raw_sha256: 1894131c3e7fe8ad7a30a2f68b7181f472b902fa2890de31f73c3a16f102d19b
 sources: []
-generated_body_sha256: b15b69ebf137cfc99ea409335772ac6a27b5e378da156ade990f40fba92a623b
+generated_body_sha256: 1ec03e592b8175612e8bcfb790834843a3ddaad97783a2f80a706e7d4ea4d202
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/references/environment_variables.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/references/environment_variables.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/docs/docs/references/environment_variables.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -545,8 +545,18 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_MOE_MAX_INPUT_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Truncate the dispatch buffer to this many rows before MoE computation, reducing kernel overhead on padding tokens. The value must be &gt;= the actual number of received tokens (<code>totalRecvTokenNum</code>); setting it too small causes incorrect results. <code>0</code> disables truncation (use full buffer).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Manual MoE input row limit for MORI EPv1 and EPv2. A positive value overrides <code>SGLANG_MORI_RECV_BOUND</code> and is used unrounded, capped at the receive capacity; it only narrows the MoE input view, not the communication buffer. It must be &gt;= the actual received tokens, or results are incorrect. <code>0</code> leaves it to <code>SGLANG_MORI_RECV_BOUND</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_EP_V2</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select MORI EPv2 for <code>--moe-a2a-backend mori</code>. When unset, EPv2 is used only for DeepSeek-V4 models on AITER with <code>ep_size</code> &lt;= 8 (on gfx1250, any <code>ep_size</code> that fits one UALink vPOD), a bfloat16 model dtype and <code>MORI_ENABLE_SDMA</code> off, and MORI EPv1 otherwise. Set to <code>true</code> to use EPv2 even when these checks fail (a warning names the failed check), or <code>false</code> to always use EPv1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_RECV_BOUND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hand the MoE only the receive rows the per-rank DP token counts can fill (rounded up) instead of the full MORI receive buffer. Unverified layouts, missing metadata and two-batch overlap keep the full view.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
@@ -1754,11 +1764,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Triton prefill truncation alignment size for deterministic attention.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4096</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Triton decode split-tile size for deterministic attention.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
@@ -1878,6 +1883,11 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use an explicitly passed <code>--mem-fraction-static</code> as-is on AITER with context length above 8192, instead of scaling it by 0.85 to reserve non-static attention workspace. Skipping the reserve can OOM long-context serving; set it only when the scaled fraction is too small to hold the model weights.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx942, run dense block-FP8 linears with the AITER CK blockscale GEMM instead of the AITER Triton one. Faster, especially at decode batch sizes, but check accuracy: it lowers GSM8K on Qwen3-32B-FP8 by about 2 points.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

@@ -396,3 +396,25 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 全量回归：1255 passed、4 skipped（保留平台限制，不冒充远端硬件验证）；文档增加契约边界说明后 65 页/461 处链接校验通过。此前 v0.6.4 的 Linux/Windows 3.10/3.12 CI 也已全部成功。
 - 本机系统 Python editable 包已升级 0.6.5；六个工作流/Wiki Skill、引用与工程绑定同步完成，独立 --check 为 current。安装器只清理本次校验完成的临时备份，第三方依赖和 HCU 大知识库没有更新。
 - 发布审查覆盖六入口、阶段/独立模式、协作交接、命令和源码传输、数值/性能判定的既有回归、长训观察及清理、Wiki 与安装同步；未新增状态门槛、不要求重验已匹配实验。本轮最终 Git 推送/tag 以远端回执确认。
+
+2026-10-12：已建立均衡内容标准与检查器、跨引擎参考路由和最新 HCU 库归属。采集进程在新输入切换后退出，已确认无原进程，沿落盘的文档/PR游标续接；不将中断批次记为完成。
+
+### 本轮进行中：统一内容粒度与来源刷新
+
+- 新增九维作者内容规范、跨引擎参考/修改归属表、覆盖检查器及3项回归；README和搜索/更新Skill已接入。
+- TE补RMSNorm→MXFP8和grouped低精度MLP案例；cuDNN补FlexAttention计划、Graph/NORM与稀疏API生命周期；TorchTitan复核EMA、MoE aux loss与RL请求故障。
+- Cluster Manager实读当前hcu-cluster-run入口；补Train Simulator、Hyperloom和BBuf方法页。
+- cuDNN main停在1.31.0 RC，develop为1.32.0开发且包含既有专题机制；已记录选线依据，改跟踪develop，部署版本仍需单独确认。
+- 26个登记来源正进行全范围增量采集，未完成前不声明已全量刷新；采集原文不等于内容精读或硬件验证。
+# 2026-10-12 前置影响检查补齐
+
+按用户澄清先完成 HCU 大库更新影响检查：本机 11 个 Skill 的原安装无漂移，两个知识 Skill 与大库新版本一致；TrainFlow 大库锁滞后已修正。三个阶段的工具、依赖和能力变化已落实到环境、适配、通信/库调优、精度及恢复指南。后续继续合并作者 Wiki 深化和全源采集，最后统一验证、安装、提交及 tag；本轮没有硬件实测或大库写入。
+
+## HCU alignment and balanced Wiki completion (2026-10-12)
+
+- Completed read-only comparison with HCU-Knowledge 4596fd4 and installed Skill/dependency bindings. Updated only affected environment checks, adaptation, numerical contracts, math-library/communication integration and recovery guidance.
+- Expanded every registered engine/library/ecosystem to the shared authoring dimensions and concrete mechanisms; 22 coverage groups / 27 sources. Added 37 authored/navigation pages and jointly reviewed 99 authored pages with 27 workflow targets. Fixed parent/child gitlink coverage, current branch labels, reference navigation and exact HCU RCCL ownership.
+- Updated all registered source/document stages and completed all 25 PR queues after rate-limit recovery. Final public navigation has 3835 PR pages, 1211 document pages and 5179 total Markdown pages. These are retained sources, not counts of independently reviewed cases. Twenty-one directly cited PR conclusions were reviewed with 244 related-page bindings; uncurated files and discussions remain explicitly unreviewed.
+- Full suite: 1262 passed / 4 platform skips; final data/integrity subset: 22 passed. Knowledge validation reports zero errors. Twenty-two representative engine/tool searches, cross-engine queries and six default-ranking checks find the intended explanations and source evidence. No new GPU/site qualification.
+- Full setup preserved the external HCU-Knowledge checkout and current index, installed TrainFlow 0.6.6 and verified 11 required Skills. Local synchronization/check passed for the six TrainFlow Skills and package. Raw download caches, interim scripts and maintenance receipts remain ignored. Source/license notices accompany retained public documents.
+- Ready to publish reviewed main and annotated v0.6.6; verify remote refs after push.

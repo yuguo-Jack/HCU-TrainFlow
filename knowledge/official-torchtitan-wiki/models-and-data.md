@@ -15,41 +15,44 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/models/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: c8f50dedb90e280b96a6b0832c5cd76a7ae37daf1e11d18d70cca5407c281da6
 - source: pytorch-torchtitan
   path: torchtitan/models/kimi_k3/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 48883ae505cd2bc21c63be5a8a9e3d33dddaa4da108ada1688b0e1d7d407f40c
 - source: pytorch-torchtitan
   path: torchtitan/models/kimi_k3/flavors.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: d09991c1bd12a012e9e02f3920c9babd2ca76cc044fdf2e9f98db942e479f4ca
 - source: pytorch-torchtitan
   path: torchtitan_recipes/tests/models/kimi_k3.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 198f69c5f92c1352649a27be9d1e6827dca887f328c4ab0e2ff00ee655bef684
 - source: pytorch-torchtitan
   path: torchtitan/models/flux/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
-  sha256: c5f425ce7a9e52c349d0dfa96c500182a3012009b7fb36381bb30f9e40a0e5cb
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: 63090efd1c71ea0b10f0b4ed318959ab7eaf37336276997f712b9aa662175ca6
 - source: pytorch-torchtitan
   path: torchtitan/components/data/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 71a525c8a44f5a637df29cedf0db79c74cc6004fd2326d3dbc37a1d0ea3565e3
 - source: pytorch-torchtitan
   path: torchtitan_recipes/tests/models/llama3.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: f2e6289611a2da2009bf947a2dbeae60a98432741e0100b19877e483c3c976d6
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: d24fa16f2b8cef0aed3a4f601d55ec88f5a22b44572c00c0e411d8933ed5bcef
+- source: pytorch-torchtitan
+  path: torchtitan/models/deepseek_v4/model.py
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: 702cb94df888a49656687e8e4c3a9f107d07042c70719c891cfbfb48a4ff7792
 pr_sources:
 - pr-pytorch--torchtitan-5280
 - pr-pytorch--torchtitan-5266
 ---
-
 # TorchTitan 模型配方、数据语义与 Kimi/FLUX 适配边界
 
 ## 配方不只是模型名字
@@ -91,14 +94,23 @@ LoRA、量化、异步 TP、dispatcher 和 CP transform 可能改模块类型、
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/models/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/README.md)
-- [torchtitan/models/kimi_k3/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/kimi_k3/README.md)
-- [torchtitan/models/kimi_k3/flavors.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/kimi_k3/flavors.py)
-- [torchtitan_recipes/tests/models/kimi_k3.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan_recipes/tests/models/kimi_k3.py)
-- [torchtitan/models/flux/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/flux/README.md)
-- [torchtitan/components/data/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/data/README.md)
-- [torchtitan_recipes/tests/models/llama3.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan_recipes/tests/models/llama3.py)
-- [torchtitan/config/transform/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/transform/README.md)
+- [torchtitan/models/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/README.md)
+- [torchtitan/models/kimi_k3/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/kimi_k3/README.md)
+- [torchtitan/models/kimi_k3/flavors.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/kimi_k3/flavors.py)
+- [torchtitan_recipes/tests/models/kimi_k3.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan_recipes/tests/models/kimi_k3.py)
+- [torchtitan/models/flux/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/flux/README.md)
+- [torchtitan/components/data/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/data/README.md)
+- [torchtitan_recipes/tests/models/llama3.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan_recipes/tests/models/llama3.py)
+- [torchtitan/config/transform/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/transform/README.md)
 
 - [PR #5280：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5280.md)
 - [PR #5266：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5266.md)
+
+## FLUX 与 RL 的入口变化
+
+FLUX 图像配方依赖专门的 `.ci/docker/requirements-flux.txt`；图片特征管线、资产目录和训练主环境分开核对，不能照搬文本模型的依赖集合。TitanRL 当前使用 `--output-dir` 指定输出位置，启动与资产说明见 [运行测试](build-run-test.md) 和 [TitanRL](titanrl.md)；源码存在配方不代表 HCU 已验证。
+## DeepSeek V4 辅助目标的适配检查
+
+当前 decoder 将 `aux_loss_denominator` 和 `padding_mask` 继续传入 attention，并在优化器 hook 注册中加入辅助 loss 的清零逻辑（[PR #4835](https://github.com/pytorch/torchtitan/pull/4835)）。只对齐主 loss 或只移植 attention kernel 会漏掉 indexer 辅助训练路径；应核对有效 token 分母、累积窗口、清零时机以及重算是否重复计数。该模型定义的变化不表示其他模型需要启用相同辅助目标。
+
+固定入口：[DeepSeekV4Model](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/deepseek_v4/model.py)。

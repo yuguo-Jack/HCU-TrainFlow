@@ -15,46 +15,49 @@ coverage: Curated source chains and official evidence at a fixed main commit; no
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/distributed/PARALLELISM_CONTEXT.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: b3592c4fd1279ec85a188510a3cf13b9dc63ecfc3e10a50270047fff8f044948
 - source: pytorch-torchtitan
   path: torchtitan/distributed/parallelism_context.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 36d2ff85f47b79e42d1e69567c9a4466f4573340630a4b5b55479cadb85350f1
 - source: pytorch-torchtitan
   path: torchtitan/config/parallelism.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 7fd587ef274963ff8171981b3dee2adde352c4401466044ecc05b39fdf834573
 - source: pytorch-torchtitan
   path: torchtitan/distributed/fsdp.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 572effd3ae6d6d0e65c436cac17fbeecbd0927a1c41eaa166bb98884da0b6377
 - source: pytorch-torchtitan
   path: torchtitan/distributed/PIPELINE_PARALLEL.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: c7f4d13d05e0c858f586c431c643e8b5478f9145318e7fdc75fe6df79fded44e
 - source: pytorch-torchtitan
   path: torchtitan/distributed/pipeline_parallel.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: b2dd65caa89d17c500f9ee4c765a500654e4678d5108e6e5c2fb8581a5476b8b
 - source: pytorch-torchtitan
   path: torchtitan/distributed/REMAT.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: 330408f54575d08657fae75ece3890f6f5329eeced1b1d07d43d7f1e9868328b
 - source: pytorch-torchtitan
   path: torchtitan/distributed/activation_checkpoint.py
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: d2ecf1a77668b5e1d83c162b067ed47881eb6549ccfa793ec5ea6958a06a6a20
 - source: pytorch-torchtitan
   path: torchtitan/config/README.md
-  commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
   sha256: e62e3776a4dd1c2179b3643d9e611f5a6f53fc972ac16de4588ee96a99a06b9b
+- source: pytorch-torchtitan
+  path: torchtitan/components/optim/ema.py
+  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  sha256: d41f90389d35aa3ba0d3050fba312772c52d10428e53e7b3dd24aecf8144ea3c
 pr_sources:
 - pr-pytorch--torchtitan-5101
 - pr-pytorch--torchtitan-5280
 - pr-pytorch--torchtitan-5266
 ---
-
 # TorchTitan 并行域、容量、重算与显存生命周期
 
 ## 正确计算卡数与 EP
@@ -110,16 +113,26 @@ PR #5266 的上游实验也提醒：视觉编码器减少 FSDP 通信后，指�
 
 本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/distributed/PARALLELISM_CONTEXT.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/PARALLELISM_CONTEXT.md)
-- [torchtitan/distributed/parallelism_context.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/parallelism_context.py)
-- [torchtitan/config/parallelism.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/parallelism.py)
-- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/fsdp.py)
-- [torchtitan/distributed/PIPELINE_PARALLEL.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/PIPELINE_PARALLEL.md)
-- [torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/pipeline_parallel.py)
-- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/REMAT.md)
-- [torchtitan/distributed/activation_checkpoint.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/activation_checkpoint.py)
-- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/README.md)
+- [torchtitan/distributed/PARALLELISM_CONTEXT.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/PARALLELISM_CONTEXT.md)
+- [torchtitan/distributed/parallelism_context.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/parallelism_context.py)
+- [torchtitan/config/parallelism.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/parallelism.py)
+- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/fsdp.py)
+- [torchtitan/distributed/PIPELINE_PARALLEL.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/PIPELINE_PARALLEL.md)
+- [torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/pipeline_parallel.py)
+- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/REMAT.md)
+- [torchtitan/distributed/activation_checkpoint.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/activation_checkpoint.py)
+- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/config/README.md)
 
 - [PR #5101：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5101.md)
 - [PR #5280：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5280.md)
 - [PR #5266：描述、review、评论及 diff](../prs/pytorch--torchtitan/PR-5266.md)
+
+## 当前主线补充：EMA offload 初始化也有峰值
+
+[PR #5282](https://github.com/pytorch/torchtitan/pull/5282) 改变 CPU-offloaded EMA 的创建位置：`_EMAParamOptimizer(..., offload_to_cpu=True)` 直接对 local shard 在 pinned CPU storage 建副本，避免先完整 clone 到 GPU 再搬到 CPU 的初始化峰值。参数与匹配 buffer 都传入同一配置；普通非 offload 路径继续 clone。
+
+`EMA._materialize_dtensor` 在保存/加载时按当前活跃参数的 sharding spec 重建 DTensor，用于 DCP 重分片；不能缓存旧 world size 的 spec。CPU offload 仍有 pinned host 内存、DMA、更新/保存同步和临时 GPU staging 的代价。容量评估需要分别看初始化、稳态 step、EMA更新与保存恢复峰值，而不是只看几个稳定 step 的 allocated。
+
+验证应覆盖 offload 开关、参数和 buffers、多步 EMA 数值、checkpoint round trip 以及并行规模变化；本页仅审查当前源码，没有执行该测试矩阵。不要用这个实现去推断所有 optimizer state 都自动采用同一 offload 策略。
+
+- [torchtitan/components/optim/ema.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/ema.py)

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
 path: README.md
-raw_sha256: 8d2e7cd8d120bcd91ddfa85ef957f7246021b4a3f46f2e1f4ccf084ec6c20026
+raw_sha256: 4dc7399323b9660117f8cc1226afb7a81cdbb912dbb4ae74b66d89052417d11c
 sources: []
-generated_body_sha256: 423ed1e8e197d9cc42dadf4b75f8ba75a20ef878c15255a5460c5b4ed8b0fcc9
+generated_body_sha256: 283df8fc1e9ab194b7412a6bf9cc07e4d5012ec65c738d9128bfb6d85460980b
 source_state: current-scan
 ---
 
 # vllm-project/vllm / README.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/README.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -95,6 +95,7 @@ Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
 
 ```bash
 uv pip install vllm
+vllm download-kernels  # precompiled kernels for faster startup
 ```
 
 Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.

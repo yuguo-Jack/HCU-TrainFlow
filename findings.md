@@ -331,3 +331,24 @@ capabilities.md 此前最近修改于 v0.6.1，v0.6.2 未单独同步 Wiki 命�
 - `_new_transfer_destination` 原先先 resolve，能够把悬空目标/父目录链接解析到未预期位置。改为解析前检查各级 symlink/reparse point 与 ..；只修正意外重定向，不宣称抵御并发父目录替换。
 - TraceLens 已有报告输出隔离，但 Python 临时文件和 Matplotlib 字体/XDG 缓存仍可能继承宿主默认路径。两个受管离线 worker 统一在当前报告目录定位这些输出及转换缓存，保留 HOME 和主进程环境。
 - 复核源码快照/接收、命令组、任务与 Agent 范围、观察器、临时 IPC 探针、retention 和 Skill 安装备份：保留已有生命周期/归属检查；普通执行、正式 Wiki 维护、安装升级采用不同明确目标，不把所有写入强行锁在 SQLite Store 下。
+
+## 2026-10-12 Wiki 均衡维护开始
+当前 main=55fb210，版本0.6.5，工作树干净。已有 Megatron/TorchTitan/TE/cuDNN多专题，其他引擎多数单篇，需要按内容维度补齐而非凑相同页数；新增来源更新须走原有采集/复核协议。
+# 2026-10-12 HCU-Knowledge 更新后的前置影响复核
+
+- 只读基准为 HCU-Knowledge `4596fd4365805696b17ed312d34822e042f6e339`（0.5.4），覆盖本轮正文变更与三个阶段的现行依赖。未更新大库、未运行远端训练。
+- 本机六个 TrainFlow Skill 与维护前 HEAD 一致，三算子 Skill 与 `cuda-optimized-skill@f39ba95` 一致，两个 HCU 知识 Skill 与当前大库一致；绑定均正确。系统 Python 的三个 editable 包来自预期 checkout。问题是 TrainFlow 的 HCU-Knowledge 安装锁仍指向旧提交，已调整；外部绑定继续复用现有知识库，不另建副本。
+- Cluster Manager：更新入口已登记，但需要补足 schema 2.0 实际类别、BLOCKED/INCOMPLETE 可能 exit0、旧选节点/doctor 入口撤除、RCCL 独立峰值与真实 size、Docker 替补准备与旧进程退出的边界。已经联动环境页、工具 Wiki 与诊断指南。
+- 训练/推理：Megatron、Bridge、DeepSpeed、verl、Slime、AReaL、SGLang、vLLM 的实际 HCU 分支、父仓 gitlink、插件与基础包须成组核对；近期存在模块迁移、旧开关删除和功能撤回。未发现 TrainFlow 强制安装这些旧版本的脚本；加强制品/配方与当前支持检查，不把私有源码复制进公开 Wiki。
+- 库与编译：复核 TE、Primus Turbo、AITER、BoltOPs、CK、Hytlass、FlashAttention、Moe、Triton、TileLang、FlyDSL、XLA；补真实 grouped 参数、forward-only/反向、输出初始化、内部累加与包装布局、机器事务和资源口径。通信侧复核 RCCL、DeepEP、rocSHMEM、MoonEP、UltraEP、TorchComms 的依赖/后端/完成语义，不把拓扑专项泛化为全平台能力。
+- 诊断与工具：Probe 现有 b8dddb57 入口及 XProf/XCompute 与 DTK26.10 hipprof 的区分仍适用；保留原现场验证范围。Primus Safe 工作负载创建与通知送达、UID 及镜像依赖分别验收；检查完成不等于本轮实测通过。
+- 安装比对原始清单在忽略的 `.work/wiki-maintenance/install-preflight.json`。新正文及 Wiki 汇总完成后重新整体安装验收，而非提前同步半成品。
+
+## Balanced Wiki: final content review findings (2026-10-12)
+
+- All 27 sources have fixed acquisition/review baselines. The 22 reading groups share nine content dimensions; 99 authored pages and 27 workflow targets have current content hashes. Equal coverage dimensions do not claim every model, backend or upstream file has been deeply read.
+- Fixed two demonstrated maintenance gaps: coordinated content acquisition now uses the inventoried commit; a first authored-page review is required even when upstream hashes are unchanged. Regression tests cover branch movement and missing first-review receipts.
+- Review examples: Megatron Paged Stash documentation and configuration have different scopes; its historical launch PR description mentions configuration fields absent from the final implementation. SGLang cache-flush failure can leave new weights loaded; per-runner partial-update tracking remains an open proposal. TE RMSNorm/MXFP8 fusion has explicit layout/numerical constraints and review discussion questioning performance estimates. DeepSpeed offload safety remains tied to storage/stream ownership.
+- HCU source/branch references are evidence-qualified, not deployment locks. RCCL points to the DTK repository, separate from rccl-test and ROCm references. The broader HCU-Knowledge update was consumed read-only; its private bodies and credentials were not copied into public Wiki.
+- Retained PRs are searchable source evidence, not automatically authored cases. Twenty-one directly cited PRs were reviewed against current related pages, with 244 page bindings; other collected PRs retain source-reported status. Full repository path inventories remain available even where file-level curation is deferred.
+- Local full suite: 1262 passed, 4 platform skips. Twenty-two representative engine/tool queries and cross-engine retrieval passed. Existing installation upgraded to 0.6.6; all 11 required Skills verified, six TrainFlow Skills synchronized. No new GPU qualification.

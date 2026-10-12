@@ -1,0 +1,660 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "2534a96fcf165202f5358335f8b0705175159fd0",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Summary\n\n`RocmPlatform` does not override `is_integrated_gpu()`, so vLLM treats AMD APUs\nlike discrete GPUs and trusts `hipMemGetInfo()` as-is. On APUs that allocate from\nGTT (system RAM mapped for the GPU — the default on Strix Halo and the\nconfiguration AMD recommends), that is wrong in two ways:\n\n- **free** is KFD's static system limit minus KFD's own allocations, so it\n  ignores memory used by everything else on the host. With 60 GiB held by a CPU\n  process, HIP still reports 100 GiB free while ~59 GiB is actually available.\n  vLLM then sizes the KV cache for memory that does not exist and, without swap,\n  ends in the OOM killer instead of a clean startup error.\n- **total** is the TTM/GTT limit, which can exceed the RAM the OS sees (e.g.\n  after enlarging the BIOS carve-out without retuning `ttm.pages_limit`). With a\n  64 GiB carve-out and a 100 GiB GTT limit, HIP reports 100 GiB total with ~60 GiB\n  of RAM, so the default `gpu_memory_utilization=0.9` cannot start.\n\nThis PR:\n\n- Detects ROCm APUs via HIP's `is_integrated` device property.\n- Replaces the platform branch in `MemorySnapshot.measure()` with a\n  `Platform.get_integrated_gpu_memory_info()` hook. The default implementation\n  keeps the existing NVIDIA UMA behavior (free from `psutil`) unchanged.\n- On ROCm, determines which pool HIP allocates from by comparing the pool size\n  HIP reports with the amdgpu sysfs sizes (`mem_info_vram_total`,\n  `mem_info_gtt_total`, located via the amdsmi PCI BDF; no HIP context needed):\n  - **GTT-backed:** `free = min(hip_free, MemAvailable)`,\n    `total = min(hip_total, MemTotal)`.\n  - **Carve-out-backed:** HIP's numbers are used as-is. The carve-out is hidden\n    from the OS, so host memory must not bound it.\n  - Native MI300A (no carve-out) is treated as GTT-backed; unreadable sysfs falls\n    back to GTT-backed.\n\nThe pool is read from what HIP reports rather than re-deriving amdgpu's rule\nbecause that rule depends on the kernel: before 6.10 consumer APUs allocate from\nthe carve-out, 6.10–6.14 always use GTT, and 6.15+ (`apu_prefer_gtt`) use GTT\nonly when the carve-out is smaller. Distribution kernels also backport amdgpu,\nso the kernel version is not a reliable signal.\n\n## Relationship to existing PRs\n\n- **#50320** adds the same `is_integrated_gpu()` detection but applies the\n  NVIDIA policy (free = `psutil` available). On GTT-limited systems that reports\n  free > total and negative used memory (measured: −24 GiB at idle), and with a\n  large carve-out it caps the GPU by unrelated host memory.\n- **#40963** relies on DRM/sysfs heuristics and fixed reserves; this PR uses the\n  values HIP reports and only uses sysfs to identify which pool they describe.\n- An earlier revision of this PR used `min(hip_free, host_available)`\n  unconditionally. Hardware testing showed that regresses carve-out-backed\n  configurations (64 GiB carve-out, 38 GiB GTT: `main` starts, that revision\n  failed with `57.29/64.0 < 57.6 GiB`), which led to the pool-aware version.\n\n## Validation\n\nHardware: AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151), 128 GiB unified, Linux\n6.18, ROCm 10.1 nightly, vLLM ROCm image with this branch's files, Qwen3-0.6B.\nEach configuration was set via the BIOS carve-out and `ttm.pages_limit` and\nrebooted.\n\n| Configuration | Scenario | `main` | This PR |\n|---|---|---|---|\n| 0.5 GiB carve-out, 100 GiB GTT (default) | idle | free/total 100/100 | 100/100 (unchanged); util 0.9 starts, KV 88.16 GiB |\n| | 30 GiB held by another process | free 100 (over-reports) | free 90.94 |\n| 64 GiB carve-out, 37.7 GiB GTT | util 0.9, idle | starts, KV 55.72 GiB | starts, KV 55.72 GiB (identical) |\n| | util 0.9 + 12 GiB host process | starts, KV 55.72 GiB | starts, KV 55.72 GiB (identical) |\n| 64 GiB carve-out, 100 GiB GTT | util 0.9 | **fails** (`60.1/100.0 < 90.0 GiB`) | starts, KV 53.99 GiB |\n\nPool detection on hardware: GTT in the first and third configuration, carve-out\nin the second, matching where allocations actually landed (`mem_info_*_used`).\n\nUnit tests (`tests/utils_/test_mem_utils.py`): the snapshot uses the platform\nhook's result; ROCm-only parametrized cases cover the GTT-backed (idle, host\npressure, GTT limit above RAM) and carve-out-backed configurations measured above.\n\n```bash\npytest tests/utils_/test_mem_utils.py -v --deselect tests/utils_/test_mem_utils.py::test_memory_profiling\n# ROCm container: 6 passed (test_memory_profiling needs libcudart; unrelated)\npre-commit run --files vllm/platforms/rocm.py vllm/platforms/interface.py \\\n  vllm/utils/mem_utils.py tests/utils_/test_mem_utils.py\n# all hooks passed\n```\n\n## Behavior notes\n\n- Discrete GPUs and NVIDIA integrated GPUs are unchanged.\n- When the GTT limit exceeds RAM, `gpu_memory_utilization` is now a fraction of\n  the memory that actually exists. A value tuned on `main` to work around the\n  inflated total yields a smaller KV cache (64 GiB carve-out + 100 GiB GTT,\n  util 0.5: 48.04 → 29.09 GiB).\n- In GTT-backed mode, host memory used by other processes during startup is\n  accounted against the KV cache (conservative). If host memory is released while\n  profiling, the existing ROCm fallback (#53591) applies.\n- MI300A reports as integrated and takes the GTT-backed path; behavior was\n  derived from the amdgpu/KFD source and is untested on hardware. Because\n  `MemAvailable` is node-wide, the host bound rarely applies there.\n- Enabling `is_integrated_gpu()` also enables the existing UMA cache release in\n  `release_device_memory_under_pressure()` during weight loading on APUs.\n\n## Model evaluation\n\nNot applicable. This changes startup memory accounting only; no model, kernel,\ndtype, or numerical paths are modified.\n\n## AI assistance\n\nAI assistance (Claude) was used for analysis, implementation, hardware testing,\nand drafting this description. The changes were reviewed and the hardware\nresults were checked before submission.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @sstamenk.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-09-17T07:38:07Z",
+            "updatedAt": "2026-09-17T07:38:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5710776325"
+          },
+          {
+            "author": {
+              "login": "dllehr-amd"
+            },
+            "body": "Can you test with VRAM Carve out instead of GTT and make sure this is still viable.",
+            "createdAt": "2026-09-29T14:55:48Z",
+            "updatedAt": "2026-09-29T14:55:48Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892776933"
+          },
+          {
+            "author": {
+              "login": "dllehr-amd"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-29T14:58:06Z",
+            "updatedAt": "2026-09-29T14:58:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892814020"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ @sstamenk, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-09-29T14:58:20Z",
+            "updatedAt": "2026-09-29T14:58:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892817698"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "❌ This PR is 644 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5892814020 -->",
+            "createdAt": "2026-09-29T14:58:44Z",
+            "updatedAt": "2026-09-29T14:58:44Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892824316"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-29T15:02:19Z",
+            "updatedAt": "2026-09-29T15:02:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892885332"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #91876](https://buildkite.com/vllm/ci/builds/91876) for commit `ddea5bc7d71c`.",
+            "createdAt": "2026-09-29T15:02:41Z",
+            "updatedAt": "2026-09-29T15:02:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892891514"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-01T12:16:03Z",
+            "updatedAt": "2026-10-01T12:16:03Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5931212526"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #92399](https://buildkite.com/vllm/ci/builds/92399) for commit `8e42f83af006`.",
+            "createdAt": "2026-10-01T12:16:24Z",
+            "updatedAt": "2026-10-01T12:16:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5931219965"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "@dllehr-amd I've updated the PR based on hardware testing on Strix Halo:\r\n\r\n- **Pool-aware accounting.** On ROCm APUs the code now determines which pool HIP allocates from, by comparing the size HIP reports with the amdgpu sysfs carve-out and GTT sizes. It doesn't hard-code the driver's rule, because that rule changed across kernels (≤6.9 carve-out only, 6.10–6.14 always GTT, 6.15+ GTT only when carve-out < GTT).\r\n  - **GTT-backed:** free is bounded by available host memory and total by host RAM, since GTT pages are system memory that HIP doesn't account for.\r\n  - **Carve-out-backed:** HIP's numbers are used as-is, because host allocations can't touch the carve-out. The previous `min()` version regressed this case (`main` started, the PR failed).\r\n  - **MI300A** has no carve-out, so it always takes the GTT path. This is derived from the driver source and is untested on hardware.\r\n- **Structure:** added `Platform.get_integrated_gpu_memory_info()` with a ROCm override, replacing the `is_rocm()` branch in `MemorySnapshot`. Other backends, including NVIDIA UMA, are unchanged.\r\n- **Validated** on gfx1151 with 0.5 GiB carve-out + 100 GiB GTT, 64 GiB carve-out + 38 GiB GTT (identical to `main`), and 64 GiB carve-out + 100 GiB GTT (`main` fails at util 0.9; this PR starts). Details are in the description.\r\n- **Note: `gpu_memory_utilization` now applies to real memory.** When the GTT limit is set higher than the RAM the OS sees, `main` takes the GTT limit as total, so the utilization fraction applies to memory that doesn't exist. For example, with a 64 GiB carve-out and 100 GiB GTT on a 128 GiB machine (~62 GiB visible to the OS), util 0.9 asks for 90 GiB and fails to start. This PR caps total at host RAM, so util 0.9 asks for ~56 GiB and starts. The flip side: users who lowered utilization on `main` to work around this get a smaller KV cache for the same value (util 0.5: 48 → 29 GiB) and can raise it again. Configurations where GTT is smaller than RAM, including the default, are unaffected.",
+            "createdAt": "2026-10-01T12:25:57Z",
+            "updatedAt": "2026-10-01T12:25:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5931413292"
+          },
+          {
+            "author": {
+              "login": "dllehr-amd"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-06T13:54:21Z",
+            "updatedAt": "2026-10-06T13:54:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6017793680"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93093](https://buildkite.com/vllm/ci/builds/93093) for commit `583c97cb356e`, running 112 failed step(s) from [Buildkite CI #92399](https://buildkite.com/vllm/ci/builds/92399).",
+            "createdAt": "2026-10-06T13:54:59Z",
+            "updatedAt": "2026-10-06T13:54:59Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6017805313"
+          },
+          {
+            "author": {
+              "login": "vllm-agent"
+            },
+            "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 143 test steps (205 jobs) instead of 63 (79 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 63 (79) | 143 (205) | 15 (23) | 95 (149) |\n| AMD mirrors | 157 (221) | 163 (227) | 0 (0) | 6 (6) |\n\n<details><summary>Selector would run (143)</summary>\n\n- `amd-fp8-moe-kernels-mi355`\n- `amd-kernels-mi355`\n- `amd-lm-eval-small-models-harness`\n- `amd-native-quantization-kernels-mi355`\n- `amd-qwen3-next-mtp-async-eplb-accuracy`\n- `arm-cpu-test` ×3\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-tests-extra-initialization` ×14\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `batch-invariance-b200`\n- `batch-invariance-h100`\n- `benchmarks-cli-test`\n- `cpu-kernel-tests` ×2\n- `cpu-multi-modal-model-tests-n` ×4\n- `cpu-quantization-model-tests`\n- `crosslayer-kv-layout-distributed-nixlconnector-pd-accuracy-tests-4-gpus`\n- `cudagraph`\n- `distributed-compile-comm-4-gpus`\n- `distributed-compile-rpc-tests-2-gpus`\n- `distributed-dp-tests-2-gpus`\n- `distributed-dp-tests-4-gpus`\n- `distributed-flashinfer-nixlconnector-pd-accuracy-4-gpus`\n- `distributed-model-tests-2-gpus` ×3\n- `distributed-mooncakeconnector-pd-accuracy-4-gpus`\n- `distributed-nixlconnector-pd-accuracy-4-gpus`\n- `distributed-tests-8xh100`\n- `distributed-torchrun-examples-4-gpus`\n- `distributed-torchrun-shutdown-tests-2-gpus`\n- `dp-ep-distributed-nixlconnector-pd-accuracy-tests-4-gpus`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `elastic-ep-scaling-test`\n- `engine`\n- `engine-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `entrypoints-unit-tests`\n- `examples`\n- `extract-hidden-states-integration`\n- `extract-hidden-states-integration-2-gpus`\n- `fault-tolerance-e2e-2xh100`\n- `fusion-e2e-config-sweep-h100`\n- `fusion-e2e-quick-h100`\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100`\n- `fusion-e2e-tp2-ar-rms-dynamo-partition-amd`\n- `fusion-e2e-tp2-ar-rms-inductor-partition-amd`\n- `fusion-e2e-tp2-asynctp-config-sweep-h100`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `hybrid-ssm-nixlconnector-pd-accuracy-tests-4-gpus`\n- `hybrid-ssm-nixlconnector-pd-prefix-cache-2-gpus`\n- `inkling-unit-tests-b200`\n- `kernels-attention-test` ×7\n- `kernels-b200` ×3\n- `kernels-deepgemm-test-h100`\n- `kernels-moe-test` ×5\n- `kernels-quantization-test` ×6\n- `kernels-root-misc-test-b200`\n- `kimi-k3-prefix-cache-4xb200` ×2\n- `kv-offload-large`\n- `kv-offload-medium`\n- `kv-offload-small`\n- `language-models-tests-extra-standard` ×2\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `lm-eval-dspark-watermark-2xh100`\n- `lm-eval-small-models`\n- `lm-eval-turboquant-k3v4nc`\n- `lm-eval-turboquant-k8v4`\n- `lm-eval-turboquant-t3nc`\n- `lm-eval-turboquant-t4nc`\n- `lm-eval-watermarking`\n- `lora` ×4\n- `lora-tp-distributed` ×4\n- `metrics-tracing-2-gpus`\n- `model-executor`\n- `mooncake-ec-tcp-e2e-2-gpus`\n- `mrcr-eval-small-models`\n- `multi-modal-accuracy-eval-small-models`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multiconnector-nixl-offloading-pd-accuracy-2-gpus`\n- `multiconnector-nixl-offloading-pd-edge-cases-2-gpus`\n- `nixlconnector-pd-edge-cases-2-gpus`\n- `openai-api-correctness`\n- `pipeline-context-parallelism-4-gpus`\n- `plugin-tests-2-gpus`\n- `push-nixlconnector-pp-prefill-pd-accuracy-4-gpus`\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `quantization` ×4\n- `quantized-models-test`\n- `quantized-moe-test-b200`\n- `rayexecutorv2-4-gpus`\n- `regression`\n- `replayssm-e2e`\n- `rust-frontend-core-correctness`\n- `rust-frontend-distributed`\n- `rust-frontend-openai-coverage`\n- `rust-frontend-serve-admin-coverage`\n- `rust-frontend-tool-use`\n- `samplers-multimodal-beam-search`\n- `samplers-test`\n- `scale-out-ec-e2e-2-gpus`\n- `sharded-rdt-weight-transfer`\n- `spec-decode-draft-model` ×4\n- `spec-decode-eagle-1-deepseek-qwen`\n- `spec-decode-eagle-2-llama3-qwen-vl-other`\n- `spec-decode-mtp-deepseek-mimo`\n- `spec-decode-mtp-gemma4`\n- `spec-decode-mtp-qwen3-5`\n- `spec-decode-ngram-suffix`\n- `spec-decode-speculators`\n- `v1-attention-b200` ×2\n- `v1-attention-h100-mi300` ×2\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>Would skip (today's rules run them) (15)</summary>\n\n- `ascend-npu-test`\n- `basic-models-test-other-cpu`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `cpu-multimodal-config`\n- `cpu-params-env-tokenizers-parser`\n- `cpu-reasoning-renderers`\n- `cpu-tool-parsers`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `multi-modal-processor` ×4\n- `multi-modal-processor-cpu` ×4\n- `platform-tests`\n- `pytorch-compilation-passes-unit-tests`\n- `v1-kv-offload`\n- `v1-others-cpu`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (95)</summary>\n\n- `arm-cpu-test` ×3 (code map)\n- `basic-models-tests-extra-initialization` ×14 (code map)\n- `batch-invariance-b200` (code map)\n- `batch-invariance-h100` (Python record)\n- `cpu-kernel-tests` ×2 (code map)\n- `cpu-multi-modal-model-tests-n` ×4 (code map)\n- `cpu-quantization-model-tests` (code map)\n- `crosslayer-kv-layout-distributed-nixlconnector-pd-accuracy-tests-4-gpus` (Python record)\n- `cudagraph` (code map)\n- `distributed-compile-comm-4-gpus` (Python record)\n- `distributed-compile-rpc-tests-2-gpus` (Python record)\n- `distributed-dp-tests-2-gpus` (Python record)\n- `distributed-dp-tests-4-gpus` (Python record)\n- `distributed-flashinfer-nixlconnector-pd-accuracy-4-gpus` (Python record)\n- `distributed-model-tests-2-gpus` ×3 (code map)\n- `distributed-mooncakeconnector-pd-accuracy-4-gpus` (Python record)\n- `distributed-nixlconnector-pd-accuracy-4-gpus` (Python record)\n- `distributed-tests-8xh100` (Python record)\n- `distributed-torchrun-examples-4-gpus` (Python record)\n- `distributed-torchrun-shutdown-tests-2-gpus` (code map)\n- `dp-ep-distributed-nixlconnector-pd-accuracy-tests-4-gpus` (Python record)\n- `e2e-core-1-gpu` (code map)\n- `e2e-core-large-memory` (Python record)\n- `e2e-scheduling-1-gpu` (Python record)\n- `e2e-scheduling-accuracy-1-gpu` (Python record)\n- `elastic-ep-scaling-test` (Python record)\n- `engine-1-gpu` (Python record)\n- `entrypoints-unit-tests` (Python record)\n- `examples` (Python record)\n- `extract-hidden-states-integration` (Python record)\n- `extract-hidden-states-integration-2-gpus` (Python record)\n- `fault-tolerance-e2e-2xh100` (Python record)\n- `fusion-e2e-config-sweep-h100` (Python record)\n- `fusion-e2e-quick-h100` (Python record)\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100` (Python record)\n- `fusion-e2e-tp2-asynctp-config-sweep-h100` (Python record)\n- `fusion-e2e-tp2-b200` (Python record)\n- `fusion-e2e-tp2-quick-h100` (Python record)\n- `hybrid-ssm-nixlconnector-pd-accuracy-tests-4-gpus` (Python record)\n- `hybrid-ssm-nixlconnector-pd-prefix-cache-2-gpus` (Python record)\n- `inkling-unit-tests-b200` (code map)\n- `kernels-attention-test` ×7 (code map)\n- `kernels-b200` ×3 (code map)\n- `kernels-deepgemm-test-h100` (code map)\n- `kernels-moe-test` ×5 (code map)\n- `kernels-quantization-test` ×6 (code map)\n- `kimi-k3-prefix-cache-4xb200` ×2 (Python record)\n- `kv-offload-large` (Python record)\n- `kv-offload-medium` (Python record)\n- `kv-offload-small` (Python record)\n- `language-models-tests-extra-standard` ×2 (code map)\n- `lm-eval-dspark-watermark-2xh100` (code map)\n- `lm-eval-small-models` (code map)\n- `lm-eval-turboquant-k3v4nc` (code map)\n- `lm-eval-turboquant-k8v4` (code map)\n- `lm-eval-turboquant-t3nc` (code map)\n- `lm-eval-turboquant-t4nc` (code map)\n- `lm-eval-watermarking` (code map)\n- `lora` ×4 (Python record)\n- `lora-tp-distributed` ×4 (Python record)\n- `model-executor` (code map)\n- `mooncake-ec-tcp-e2e-2-gpus` (Python record)\n- `mrcr-eval-small-models` (Python record)\n- `multi-modal-accuracy-eval-small-models` (Python record)\n- `multiconnector-nixl-offloading-pd-accuracy-2-gpus` (Python record)\n- `multiconnector-nixl-offloading-pd-edge-cases-2-gpus` (Python record)\n- `nixlconnector-pd-edge-cases-2-gpus` (Python record)\n- `openai-api-correctness` (Python record)\n- `pipeline-context-parallelism-4-gpus` (Python record)\n- `plugin-tests-2-gpus` (Python record)\n- `push-nixlconnector-pp-prefill-pd-accuracy-4-gpus` (Python record)\n- `quantization` ×4 (code map)\n- `quantized-models-test` (code map)\n- `quantized-moe-test-b200` (Python record)\n- `rayexecutorv2-4-gpus` (code map)\n- `replayssm-e2e` (Python record)\n- `rust-frontend-core-correctness` (Python record)\n- `rust-frontend-distributed` (Python record)\n- `rust-frontend-openai-coverage` (Python record)\n- `rust-frontend-serve-admin-coverage` (Python record)\n- `rust-frontend-tool-use` (Python record)\n- `samplers-multimodal-beam-search` (Python record)\n- `samplers-test` (Python record)\n- `scale-out-ec-e2e-2-gpus` (Python record)\n- `sharded-rdt-weight-transfer` (Python record)\n- `spec-decode-draft-model` ×4 (Python record)\n- `spec-decode-eagle-1-deepseek-qwen` (Python record)\n- `spec-decode-eagle-2-llama3-qwen-vl-other` (Python record)\n- `spec-decode-mtp-deepseek-mimo` (Python record)\n- `spec-decode-mtp-gemma4` (Python record)\n- `spec-decode-mtp-qwen3-5` (Python record)\n- `spec-decode-ngram-suffix` (Python record)\n- `spec-decode-speculators` (Python record)\n- `v1-attention-b200` ×2 (code map)\n- `v1-attention-h100-mi300` ×2 (code map)\n</details>\n\n<details><summary>AMD mirrors: would skip (0)</summary>\n\nnone\n</details>\n\n<details><summary>AMD mirrors: would add (6)</summary>\n\n- `docker-build-metadata` (code map)\n- `fusion-and-compile-unit-tests-2xb200` (code map)\n- `fusion-e2e-tp2-asynctp-config-sweep-h100` (code map)\n- `qwen4-exp-unit-tests` (code map)\n- `rust-frontend-cargo-style-clippy` (code map)\n- `rust-frontend-cargo-tests` (code map)\n</details>\n\n<sub>4 changed files · base `819852df6b` · head `e29d0200c9` · Python record: build 93039 at `1e5d0ea888` · kernel record: table 1e5d0ea888 (build 93039), map 1e5d0ea888 · not counted: 10 build steps, 5 A100 steps the generator no longer emits, 129 optional steps the selector would also run</sub>\n",
+            "createdAt": "2026-10-06T14:28:24Z",
+            "updatedAt": "2026-10-06T21:09:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6018462740"
+          },
+          {
+            "author": {
+              "login": "dllehr-amd"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-06T14:43:58Z",
+            "updatedAt": "2026-10-06T14:43:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6018758644"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #93093](https://buildkite.com/vllm/ci/builds/93093).",
+            "createdAt": "2026-10-06T14:45:01Z",
+            "updatedAt": "2026-10-06T14:45:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6018778262"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-06T15:35:30Z",
+            "updatedAt": "2026-10-06T15:35:30Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6019765687"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93114](https://buildkite.com/vllm/ci/builds/93114) for commit `2ffcb8f98f39`, running 1 failed step(s) from [Buildkite CI #93093](https://buildkite.com/vllm/ci/builds/93093).",
+            "createdAt": "2026-10-06T15:35:52Z",
+            "updatedAt": "2026-10-06T15:35:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6019772603"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-06T20:35:03Z",
+            "updatedAt": "2026-10-06T20:35:03Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6024953474"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93180](https://buildkite.com/vllm/ci/builds/93180) for commit `e29d0200c9da`.",
+            "createdAt": "2026-10-06T20:35:25Z",
+            "updatedAt": "2026-10-06T20:35:25Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6024959786"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-08T15:33:03Z",
+            "updatedAt": "2026-10-08T15:33:03Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063391487"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93632](https://buildkite.com/vllm/ci/builds/93632) for commit `93fc1b6109d5`.",
+            "createdAt": "2026-10-08T15:33:25Z",
+            "updatedAt": "2026-10-08T15:33:25Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063398433"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-08T15:51:55Z",
+            "updatedAt": "2026-10-08T15:51:55Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063742849"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ The previous CI build is still running: https://buildkite.com/vllm/ci/builds/93632",
+            "createdAt": "2026-10-08T15:53:00Z",
+            "updatedAt": "2026-10-08T15:53:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063762403"
+          },
+          {
+            "author": {
+              "login": "sstamenk"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-12T10:22:05Z",
+            "updatedAt": "2026-10-12T10:22:05Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6122324466"
+          },
+          {
+            "author": {
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94174](https://buildkite.com/vllm/ci/builds/94174) for commit `36c68ce94d46`, running 6 failed step(s) from [Buildkite CI #93632](https://buildkite.com/vllm/ci/builds/93632).",
+            "createdAt": "2026-10-12T10:22:26Z",
+            "updatedAt": "2026-10-12T10:22:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6122329651"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWzrVjM=",
+          "hasNextPage": false
+        },
+        "totalCount": 25
+      },
+      "headRefOid": "36c68ce94d46e3544f5c21ebc4eb60d274800362",
+      "headRepository": {
+        "nameWithOwner": "sstamenk/vllm"
+      },
+      "merged": false,
+      "number": 54776,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-01T13:18:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#pullrequestreview-5078500630"
+          },
+          {
+            "author": {
+              "login": "dllehr-amd"
+            },
+            "body": "Looks good @sstamenk!  Looks like we're guarded off from affecting other Unified Arch schemes",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "state": "APPROVED",
+            "submittedAt": "2026-10-06T13:56:13Z",
+            "url": "https://github.com/vllm-project/vllm/pull/54776#pullrequestreview-5429441819"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wNlQxMzo1NjoxM1q0MjAyNi0xMC0wNlQxMzo1NjoxM1rPAAAAAUOetRs=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "OPEN",
+      "title": "[ROCm] Fix APU unified-memory accounting across GTT and host pressure",
+      "updatedAt": "2026-10-12T10:22:26Z",
+      "url": "https://github.com/vllm-project/vllm/pull/54776"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "2534a96fcf165202f5358335f8b0705175159fd0"
+    },
+    "body": "## Summary\n\n`RocmPlatform` does not override `is_integrated_gpu()`, so vLLM treats AMD APUs\nlike discrete GPUs and trusts `hipMemGetInfo()` as-is. On APUs that allocate from\nGTT (system RAM mapped for the GPU — the default on Strix Halo and the\nconfiguration AMD recommends), that is wrong in two ways:\n\n- **free** is KFD's static system limit minus KFD's own allocations, so it\n  ignores memory used by everything else on the host. With 60 GiB held by a CPU\n  process, HIP still reports 100 GiB free while ~59 GiB is actually available.\n  vLLM then sizes the KV cache for memory that does not exist and, without swap,\n  ends in the OOM killer instead of a clean startup error.\n- **total** is the TTM/GTT limit, which can exceed the RAM the OS sees (e.g.\n  after enlarging the BIOS carve-out without retuning `ttm.pages_limit`). With a\n  64 GiB carve-out and a 100 GiB GTT limit, HIP reports 100 GiB total with ~60 GiB\n  of RAM, so the default `gpu_memory_utilization=0.9` cannot start.\n\nThis PR:\n\n- Detects ROCm APUs via HIP's `is_integrated` device property.\n- Replaces the platform branch in `MemorySnapshot.measure()` with a\n  `Platform.get_integrated_gpu_memory_info()` hook. The default implementation\n  keeps the existing NVIDIA UMA behavior (free from `psutil`) unchanged.\n- On ROCm, determines which pool HIP allocates from by comparing the pool size\n  HIP reports with the amdgpu sysfs sizes (`mem_info_vram_total`,\n  `mem_info_gtt_total`, located via the amdsmi PCI BDF; no HIP context needed):\n  - **GTT-backed:** `free = min(hip_free, MemAvailable)`,\n    `total = min(hip_total, MemTotal)`.\n  - **Carve-out-backed:** HIP's numbers are used as-is. The carve-out is hidden\n    from the OS, so host memory must not bound it.\n  - Native MI300A (no carve-out) is treated as GTT-backed; unreadable sysfs falls\n    back to GTT-backed.\n\nThe pool is read from what HIP reports rather than re-deriving amdgpu's rule\nbecause that rule depends on the kernel: before 6.10 consumer APUs allocate from\nthe carve-out, 6.10–6.14 always use GTT, and 6.15+ (`apu_prefer_gtt`) use GTT\nonly when the carve-out is smaller. Distribution kernels also backport amdgpu,\nso the kernel version is not a reliable signal.\n\n## Relationship to existing PRs\n\n- **#50320** adds the same `is_integrated_gpu()` detection but applies the\n  NVIDIA policy (free = `psutil` available). On GTT-limited systems that reports\n  free > total and negative used memory (measured: −24 GiB at idle), and with a\n  large carve-out it caps the GPU by unrelated host memory.\n- **#40963** relies on DRM/sysfs heuristics and fixed reserves; this PR uses the\n  values HIP reports and only uses sysfs to identify which pool they describe.\n- An earlier revision of this PR used `min(hip_free, host_available)`\n  unconditionally. Hardware testing showed that regresses carve-out-backed\n  configurations (64 GiB carve-out, 38 GiB GTT: `main` starts, that revision\n  failed with `57.29/64.0 < 57.6 GiB`), which led to the pool-aware version.\n\n## Validation\n\nHardware: AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151), 128 GiB unified, Linux\n6.18, ROCm 10.1 nightly, vLLM ROCm image with this branch's files, Qwen3-0.6B.\nEach configuration was set via the BIOS carve-out and `ttm.pages_limit` and\nrebooted.\n\n| Configuration | Scenario | `main` | This PR |\n|---|---|---|---|\n| 0.5 GiB carve-out, 100 GiB GTT (default) | idle | free/total 100/100 | 100/100 (unchanged); util 0.9 starts, KV 88.16 GiB |\n| | 30 GiB held by another process | free 100 (over-reports) | free 90.94 |\n| 64 GiB carve-out, 37.7 GiB GTT | util 0.9, idle | starts, KV 55.72 GiB | starts, KV 55.72 GiB (identical) |\n| | util 0.9 + 12 GiB host process | starts, KV 55.72 GiB | starts, KV 55.72 GiB (identical) |\n| 64 GiB carve-out, 100 GiB GTT | util 0.9 | **fails** (`60.1/100.0 < 90.0 GiB`) | starts, KV 53.99 GiB |\n\nPool detection on hardware: GTT in the first and third configuration, carve-out\nin the second, matching where allocations actually landed (`mem_info_*_used`).\n\nUnit tests (`tests/utils_/test_mem_utils.py`): the snapshot uses the platform\nhook's result; ROCm-only parametrized cases cover the GTT-backed (idle, host\npressure, GTT limit above RAM) and carve-out-backed configurations measured above.\n\n```bash\npytest tests/utils_/test_mem_utils.py -v --deselect tests/utils_/test_mem_utils.py::test_memory_profiling\n# ROCm container: 6 passed (test_memory_profiling needs libcudart; unrelated)\npre-commit run --files vllm/platforms/rocm.py vllm/platforms/interface.py \\\n  vllm/utils/mem_utils.py tests/utils_/test_mem_utils.py\n# all hooks passed\n```\n\n## Behavior notes\n\n- Discrete GPUs and NVIDIA integrated GPUs are unchanged.\n- When the GTT limit exceeds RAM, `gpu_memory_utilization` is now a fraction of\n  the memory that actually exists. A value tuned on `main` to work around the\n  inflated total yields a smaller KV cache (64 GiB carve-out + 100 GiB GTT,\n  util 0.5: 48.04 → 29.09 GiB).\n- In GTT-backed mode, host memory used by other processes during startup is\n  accounted against the KV cache (conservative). If host memory is released while\n  profiling, the existing ROCm fallback (#53591) applies.\n- MI300A reports as integrated and takes the GTT-backed path; behavior was\n  derived from the amdgpu/KFD source and is untested on hardware. Because\n  `MemAvailable` is node-wide, the host bound rarely applies there.\n- Enabling `is_integrated_gpu()` also enables the existing UMA cache release in\n  `release_device_memory_under_pressure()` during weight loading on APUs.\n\n## Model evaluation\n\nNot applicable. This changes startup memory accounting only; no model, kernel,\ndtype, or numerical paths are modified.\n\n## AI assistance\n\nAI assistance (Claude) was used for analysis, implementation, hardware testing,\nand drafting this description. The changes were reviewed and the hardware\nresults were checked before submission.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 4,
+    "head": {
+      "repo": {
+        "full_name": "sstamenk/vllm"
+      },
+      "sha": "36c68ce94d46e3544f5c21ebc4eb60d274800362"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/54776",
+    "merged": false,
+    "number": 54776,
+    "state": "open",
+    "title": "[ROCm] Fix APU unified-memory accounting across GTT and host pressure",
+    "updated_at": "2026-10-12T10:22:26Z"
+  },
+  "files": [
+    {
+      "additions": 62,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/36c68ce94d46e3544f5c21ebc4eb60d274800362/tests%2Futils_%2Ftest_mem_utils.py",
+      "changes": 77,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Futils_%2Ftest_mem_utils.py?ref=36c68ce94d46e3544f5c21ebc4eb60d274800362",
+      "deletions": 15,
+      "filename": "tests/utils_/test_mem_utils.py",
+      "patch": "@@ -2,9 +2,12 @@\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n from unittest.mock import MagicMock, patch\n \n+import pytest\n import torch\n from vllm_test_utils.monitor import monitor\n \n+from vllm.platforms import current_platform\n+from vllm.utils.mem_constants import GiB_bytes as GiB\n from vllm.utils.mem_utils import MemorySnapshot, memory_profiling\n \n from ..utils import create_new_process_for_each_test\n@@ -89,37 +92,81 @@ def measure_current_non_torch():\n     lib.cudaFree(handle2)\n \n \n-def test_memory_snapshot_uses_psutil_on_integrated_gpu():\n-    \"\"\"On integrated (UMA) GPUs, free_memory should come from psutil.\"\"\"\n-    mock_cuda_free = 40 * 1024**3\n-    mock_cuda_total = 120 * 1024**3\n-    mock_psutil_available = 100 * 1024**3\n+def test_memory_snapshot_on_integrated_gpu():\n+    \"\"\"Integrated GPUs should use the platform's corrected memory info.\"\"\"\n+    mock_cuda_free = 40 * GiB\n+    mock_cuda_total = 120 * GiB\n \n     with (\n         patch(\"vllm.utils.mem_utils.current_platform\") as mock_platform,\n-        patch(\"vllm.utils.mem_utils.psutil\") as mock_psutil,\n         patch(\"torch.accelerator\") as mock_accelerator,\n     ):\n         mock_accelerator.get_memory_info.return_value = (\n             mock_cuda_free,\n             mock_cuda_total,\n         )\n         mock_platform.is_integrated_gpu.return_value = True\n-        mock_platform.memory_stats.return_value = {\n+        mock_platform.get_integrated_gpu_memory_info.return_value = (\n+            30 * GiB,\n+            100 * GiB,\n+        )\n+        mock_accelerator.memory_stats.return_value = {\n             \"allocated_bytes.all.peak\": 0,\n         }\n         mock_accelerator.memory_reserved.return_value = 0\n-        mock_accelerator.current_device = lambda: \"cuda:0\"\n-\n-        mock_vmem = MagicMock()\n-        mock_vmem.available = mock_psutil_available\n-        mock_psutil.virtual_memory.return_value = mock_vmem\n \n         snapshot = MemorySnapshot(device=\"cuda:0\")\n \n-        assert snapshot.free_memory == mock_psutil_available\n-        assert snapshot.total_memory == mock_cuda_total\n-        mock_psutil.virtual_memory.assert_called_once()\n+        mock_platform.get_integrated_gpu_memory_info.assert_called_once_with(\n+            0, mock_cuda_free, mock_cuda_total\n+        )\n+        assert snapshot.free_memory == 30 * GiB\n+        assert snapshot.total_memory == 100 * GiB\n+        assert snapshot.cuda_memory == 70 * GiB\n+\n+\n+# Cases measured on a 128 GiB Strix Halo (gfx1151). HIP reports the GTT limit\n+# while it serves allocations from GTT, and the carve-out otherwise.\n+@pytest.mark.skipif(not current_platform.is_rocm(), reason=\"ROCm only\")\n+@pytest.mark.parametrize(\n+    (\"from_gtt\", \"hip_info\", \"host_available\", \"host_total\", \"expected\"),\n+    [\n+        # GTT-backed, idle: HIP's GTT bound is the tighter one.\n+        (True, (100, 100), 121, 125, (100, 100)),\n+        # GTT-backed, host memory in use elsewhere: host bound is tighter.\n+        (True, (100, 100), 59, 125, (59, 100)),\n+        # GTT-backed with a GTT limit above the RAM the OS sees: clamp total.\n+        (True, (60.1, 100), 58.9, 62.6, (58.9, 62.6)),\n+        # Carve-out-backed: host usage does not consume the carve-out.\n+        (False, (63.8, 64), 38.3, 62.6, (63.8, 64)),\n+    ],\n+)\n+def test_rocm_integrated_gpu_memory_info(\n+    from_gtt: bool,\n+    hip_info: tuple[float, float],\n+    host_available: float,\n+    host_total: float,\n+    expected: tuple[float, float],\n+):\n+    from vllm.platforms.rocm import RocmPlatform\n+\n+    def gib(x: float) -> int:\n+        return int(x * GiB)\n+\n+    with (\n+        patch(\"vllm.platforms.rocm._apu_allocates_from_gtt\", return_value=from_gtt),\n+        patch(\"vllm.platforms.rocm.psutil\") as mock_psutil,\n+    ):\n+        mock_psutil.virtual_memory.return_value = MagicMock(\n+            available=gib(host_available), total=gib(host_total)\n+        )\n+\n+        free, total = RocmPlatform.get_integrated_gpu_memory_info(\n+            0, gib(hip_info[0]), gib(hip_info[1])\n+        )\n+\n+    assert (free, total) == (gib(expected[0]), gib(expected[1]))\n+    assert 0 <= free <= total\n \n \n def test_memory_snapshot_uses_cuda_on_discrete_gpu():",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/36c68ce94d46e3544f5c21ebc4eb60d274800362/tests%2Futils_%2Ftest_mem_utils.py",
+      "sha": "e0b75cbb46af62c5befbbf8e8c639b1d993e08b5",
+      "status": "modified"
+    },
+    {
+      "additions": 15,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/36c68ce94d46e3544f5c21ebc4eb60d274800362/vllm%2Fplatforms%2Finterface.py",
+      "changes": 15,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fplatforms%2Finterface.py?ref=36c68ce94d46e3544f5c21ebc4eb60d274800362",
+      "deletions": 0,
+      "filename": "vllm/platforms/interface.py",
+      "patch": "@@ -11,6 +11,7 @@\n from datetime import timedelta\n from typing import TYPE_CHECKING, Any, NamedTuple\n \n+import psutil\n import torch\n \n from vllm.logger import init_logger\n@@ -1232,6 +1233,20 @@ def enable_multi_stream_overlap(\n         for the given aux streams and attention metadata.\"\"\"\n         return False\n \n+    @classmethod\n+    def get_integrated_gpu_memory_info(\n+        cls, device_id: int | None, free_memory: int, total_memory: int\n+    ) -> tuple[int, int]:\n+        \"\"\"Returns the (free, total) memory of an integrated (UMA) GPU, given\n+        what the device runtime reported for it. ``device_id`` is the torch\n+        device index (a visible device ordinal), or None for the current one.\n+\n+        By default free memory comes from psutil, because cudaMemGetInfo does\n+        not account for reclaimable OS memory on UMA systems.\n+        https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/#estimating-total-allocatable-device-memory-on-an-integrated-gpu-device\n+        \"\"\"\n+        return psutil.virtual_memory().available, total_memory\n+\n     @classmethod\n     def supports_mx(cls) -> bool:\n         \"\"\"Returns whether the current platform supports MX types.\"\"\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/36c68ce94d46e3544f5c21ebc4eb60d274800362/vllm%2Fplatforms%2Finterface.py",
+      "sha": "b6712e88957417adf4374645c0b0d12cfd5ce6f0",
+      "status": "modified"
+    },
+    {
+      "additions": 68,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/36c68ce94d46e3544f5c21ebc4eb60d274800362/vllm%2Fplatforms%2Frocm.py",
+      "changes": 68,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fplatforms%2Frocm.py?ref=36c68ce94d46e3544f5c21ebc4eb60d274800362",
+      "deletions": 0,
+      "filename": "vllm/platforms/rocm.py",
+      "patch": "@@ -6,8 +6,10 @@\n import platform\n from datetime import timedelta\n from functools import cache, lru_cache, wraps\n+from pathlib import Path\n from typing import TYPE_CHECKING\n \n+import psutil\n import regex as re\n import torch\n from torch.distributed import PrefixStore, ProcessGroup\n@@ -197,6 +199,49 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:\n     return amdsmi_get_gpu_memory_total(handle, AmdSmiMemoryType.VRAM)\n \n \n+_PCI_DEVICES_PATH = Path(\"/sys/bus/pci/devices\")\n+\n+\n+@cache\n+def _query_apu_pool_sizes(device_id: int) -> tuple[int, int] | None:\n+    \"\"\"(VRAM carve-out, GTT) sizes in bytes from amdgpu sysfs, or None.\n+\n+    Reads sysfs because amdsmi reports KFD's pool size when VRAM total is 0.\n+    The PCI address comes from HIP itself, so the device always matches even\n+    when HIP and amdsmi enumerate GPUs differently.\n+    \"\"\"\n+    try:\n+        props = torch.cuda.get_device_properties(device_id)\n+        bdf = (\n+            f\"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:\"\n+            f\"{props.pci_device_id:02x}.0\"\n+        )\n+        device_path = _PCI_DEVICES_PATH / bdf\n+        vram_total = int((device_path / \"mem_info_vram_total\").read_text())\n+        gtt_total = int((device_path / \"mem_info_gtt_total\").read_text())\n+    except Exception as e:\n+        logger.debug(\"Failed to read APU memory pools: %s\", e)\n+        return None\n+    return vram_total, gtt_total\n+\n+\n+def _apu_allocates_from_gtt(device_id: int, device_total: int) -> bool:\n+    \"\"\"Whether an APU serves device allocations from GTT rather than VRAM.\n+\n+    Which pool amdgpu uses depends on the kernel version (always VRAM before\n+    6.10, always GTT before 6.15, the smaller of the two after), so compare\n+    the pool size HIP reports against both instead of predicting it. Native\n+    MI300A has no carve-out. Assumes GTT if the sizes cannot be read.\n+    \"\"\"\n+    pool_sizes = _query_apu_pool_sizes(device_id)\n+    if pool_sizes is None:\n+        return True\n+    vram_total, gtt_total = pool_sizes\n+    if vram_total == 0:\n+        return True\n+    return abs(device_total - gtt_total) < abs(device_total - vram_total)\n+\n+\n def _get_gcn_arch() -> str:\n     \"\"\"Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.\n     Called once at module level; result stored in _GCN_ARCH.\n@@ -1046,6 +1091,10 @@ def get_device_total_memory(cls, device_id: int = 0) -> int:\n             )\n         return torch.cuda.get_device_properties(device_id).total_memory\n \n+    @classmethod\n+    def is_integrated_gpu(cls, device_id: int = 0) -> bool:\n+        return bool(torch.cuda.get_device_properties(device_id).is_integrated)\n+\n     @classmethod\n     def pre_register_and_update(\n         cls, parser: \"FlexibleArgumentParser | None\" = None\n@@ -1056,6 +1105,25 @@ def pre_register_and_update(\n         # 4 GiB.\n         os.environ.setdefault(\"GPU_PINNED_MIN_XFER_SIZE\", str(4 * 1024 * 1024))\n \n+    @classmethod\n+    def get_integrated_gpu_memory_info(\n+        cls, device_id: int | None, free_memory: int, total_memory: int\n+    ) -> tuple[int, int]:\n+        # The carve-out is hidden from the OS, so HIP's numbers are exact when\n+        # it backs allocations. GTT pages are system RAM, but HIP reports the\n+        # GTT limit as total and ignores host usage, so bound both by what the\n+        # OS actually has.\n+        if device_id is None:\n+            device_id = torch.cuda.current_device()\n+        if not _apu_allocates_from_gtt(device_id, total_memory):\n+            return free_memory, total_memory\n+\n+        host_memory = psutil.virtual_memory()\n+        return (\n+            min(free_memory, host_memory.available),\n+            min(total_memory, host_memory.total),\n+        )\n+\n     @classmethod\n     def apply_config_platform_defaults(cls, vllm_config: \"VllmConfig\") -> None:\n         from vllm._aiter_ops import rocm_aiter_ops",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/36c68ce94d46e3544f5c21ebc4eb60d274800362/vllm%2Fplatforms%2Frocm.py",
+      "sha": "43546043a77db129039df981cb3cdc7b8dae774f",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/36c68ce94d46e3544f5c21ebc4eb60d274800362/vllm%2Futils%2Fmem_utils.py",
+      "changes": 15,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Futils%2Fmem_utils.py?ref=36c68ce94d46e3544f5c21ebc4eb60d274800362",
+      "deletions": 7,
+      "filename": "vllm/utils/mem_utils.py",
+      "patch": "@@ -142,13 +142,14 @@ def measure(self) -> None:\n \n         self.free_memory, self.total_memory = torch.accelerator.get_memory_info(device)\n         if current_platform.is_integrated_gpu(device.index):\n-            # On UMA (Unified Memory Architecture) platforms where CPU and\n-            # GPU share physical memory (e.g. GH200, DGX Spark, Jetson Orin),\n-            # cudaMemGetInfo underreports free memory because it does not\n-            # account for reclaimable OS memory (page cache, buffers).\n-            # Use psutil to get the true available memory.\n-            # https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/#estimating-total-allocatable-device-memory-on-an-integrated-gpu-device\n-            self.free_memory = psutil.virtual_memory().available\n+            # On UMA (Unified Memory Architecture) platforms the CPU and GPU\n+            # share physical memory, so the device runtime's numbers need\n+            # platform-specific correction.\n+            self.free_memory, self.total_memory = (\n+                current_platform.get_integrated_gpu_memory_info(\n+                    device.index, self.free_memory, self.total_memory\n+                )\n+            )\n \n         self.cuda_memory = self.total_memory - self.free_memory\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/36c68ce94d46e3544f5c21ebc4eb60d274800362/vllm%2Futils%2Fmem_utils.py",
+      "sha": "412a565842942231e6bfe0de1b7676e4406e915b",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @sstamenk.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-09-17T07:38:07Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5710776325",
+      "updated_at": "2026-09-17T07:38:07Z",
+      "user": {
+        "login": "mergify"
+      }
+    },
+    {
+      "body": "Can you test with VRAM Carve out instead of GTT and make sure this is still viable.",
+      "created_at": "2026-09-29T14:55:48Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892776933",
+      "updated_at": "2026-09-29T14:55:48Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-29T14:58:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892814020",
+      "updated_at": "2026-09-29T14:58:06Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    },
+    {
+      "body": "✅ @sstamenk, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-09-29T14:58:20Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892817698",
+      "updated_at": "2026-09-29T14:58:20Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "❌ This PR is 644 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5892814020 -->",
+      "created_at": "2026-09-29T14:58:44Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892824316",
+      "updated_at": "2026-09-29T14:58:44Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-29T15:02:19Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892885332",
+      "updated_at": "2026-09-29T15:02:19Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #91876](https://buildkite.com/vllm/ci/builds/91876) for commit `ddea5bc7d71c`.",
+      "created_at": "2026-09-29T15:02:41Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5892891514",
+      "updated_at": "2026-09-29T15:02:41Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-01T12:16:03Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5931212526",
+      "updated_at": "2026-10-01T12:16:03Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #92399](https://buildkite.com/vllm/ci/builds/92399) for commit `8e42f83af006`.",
+      "created_at": "2026-10-01T12:16:24Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5931219965",
+      "updated_at": "2026-10-01T12:16:24Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "@dllehr-amd I've updated the PR based on hardware testing on Strix Halo:\r\n\r\n- **Pool-aware accounting.** On ROCm APUs the code now determines which pool HIP allocates from, by comparing the size HIP reports with the amdgpu sysfs carve-out and GTT sizes. It doesn't hard-code the driver's rule, because that rule changed across kernels (≤6.9 carve-out only, 6.10–6.14 always GTT, 6.15+ GTT only when carve-out < GTT).\r\n  - **GTT-backed:** free is bounded by available host memory and total by host RAM, since GTT pages are system memory that HIP doesn't account for.\r\n  - **Carve-out-backed:** HIP's numbers are used as-is, because host allocations can't touch the carve-out. The previous `min()` version regressed this case (`main` started, the PR failed).\r\n  - **MI300A** has no carve-out, so it always takes the GTT path. This is derived from the driver source and is untested on hardware.\r\n- **Structure:** added `Platform.get_integrated_gpu_memory_info()` with a ROCm override, replacing the `is_rocm()` branch in `MemorySnapshot`. Other backends, including NVIDIA UMA, are unchanged.\r\n- **Validated** on gfx1151 with 0.5 GiB carve-out + 100 GiB GTT, 64 GiB carve-out + 38 GiB GTT (identical to `main`), and 64 GiB carve-out + 100 GiB GTT (`main` fails at util 0.9; this PR starts). Details are in the description.\r\n- **Note: `gpu_memory_utilization` now applies to real memory.** When the GTT limit is set higher than the RAM the OS sees, `main` takes the GTT limit as total, so the utilization fraction applies to memory that doesn't exist. For example, with a 64 GiB carve-out and 100 GiB GTT on a 128 GiB machine (~62 GiB visible to the OS), util 0.9 asks for 90 GiB and fails to start. This PR caps total at host RAM, so util 0.9 asks for ~56 GiB and starts. The flip side: users who lowered utilization on `main` to work around this get a smaller KV cache for the same value (util 0.5: 48 → 29 GiB) and can raise it again. Configurations where GTT is smaller than RAM, including the default, are unaffected.",
+      "created_at": "2026-10-01T12:25:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-5931413292",
+      "updated_at": "2026-10-01T12:25:57Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-06T13:54:21Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6017793680",
+      "updated_at": "2026-10-06T13:54:21Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93093](https://buildkite.com/vllm/ci/builds/93093) for commit `583c97cb356e`, running 112 failed step(s) from [Buildkite CI #92399](https://buildkite.com/vllm/ci/builds/92399).",
+      "created_at": "2026-10-06T13:54:59Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6017805313",
+      "updated_at": "2026-10-06T13:54:59Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 143 test steps (205 jobs) instead of 63 (79 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 63 (79) | 143 (205) | 15 (23) | 95 (149) |\n| AMD mirrors | 157 (221) | 163 (227) | 0 (0) | 6 (6) |\n\n<details><summary>Selector would run (143)</summary>\n\n- `amd-fp8-moe-kernels-mi355`\n- `amd-kernels-mi355`\n- `amd-lm-eval-small-models-harness`\n- `amd-native-quantization-kernels-mi355`\n- `amd-qwen3-next-mtp-async-eplb-accuracy`\n- `arm-cpu-test` ×3\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-tests-extra-initialization` ×14\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `batch-invariance-b200`\n- `batch-invariance-h100`\n- `benchmarks-cli-test`\n- `cpu-kernel-tests` ×2\n- `cpu-multi-modal-model-tests-n` ×4\n- `cpu-quantization-model-tests`\n- `crosslayer-kv-layout-distributed-nixlconnector-pd-accuracy-tests-4-gpus`\n- `cudagraph`\n- `distributed-compile-comm-4-gpus`\n- `distributed-compile-rpc-tests-2-gpus`\n- `distributed-dp-tests-2-gpus`\n- `distributed-dp-tests-4-gpus`\n- `distributed-flashinfer-nixlconnector-pd-accuracy-4-gpus`\n- `distributed-model-tests-2-gpus` ×3\n- `distributed-mooncakeconnector-pd-accuracy-4-gpus`\n- `distributed-nixlconnector-pd-accuracy-4-gpus`\n- `distributed-tests-8xh100`\n- `distributed-torchrun-examples-4-gpus`\n- `distributed-torchrun-shutdown-tests-2-gpus`\n- `dp-ep-distributed-nixlconnector-pd-accuracy-tests-4-gpus`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `elastic-ep-scaling-test`\n- `engine`\n- `engine-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `entrypoints-unit-tests`\n- `examples`\n- `extract-hidden-states-integration`\n- `extract-hidden-states-integration-2-gpus`\n- `fault-tolerance-e2e-2xh100`\n- `fusion-e2e-config-sweep-h100`\n- `fusion-e2e-quick-h100`\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100`\n- `fusion-e2e-tp2-ar-rms-dynamo-partition-amd`\n- `fusion-e2e-tp2-ar-rms-inductor-partition-amd`\n- `fusion-e2e-tp2-asynctp-config-sweep-h100`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `hybrid-ssm-nixlconnector-pd-accuracy-tests-4-gpus`\n- `hybrid-ssm-nixlconnector-pd-prefix-cache-2-gpus`\n- `inkling-unit-tests-b200`\n- `kernels-attention-test` ×7\n- `kernels-b200` ×3\n- `kernels-deepgemm-test-h100`\n- `kernels-moe-test` ×5\n- `kernels-quantization-test` ×6\n- `kernels-root-misc-test-b200`\n- `kimi-k3-prefix-cache-4xb200` ×2\n- `kv-offload-large`\n- `kv-offload-medium`\n- `kv-offload-small`\n- `language-models-tests-extra-standard` ×2\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `lm-eval-dspark-watermark-2xh100`\n- `lm-eval-small-models`\n- `lm-eval-turboquant-k3v4nc`\n- `lm-eval-turboquant-k8v4`\n- `lm-eval-turboquant-t3nc`\n- `lm-eval-turboquant-t4nc`\n- `lm-eval-watermarking`\n- `lora` ×4\n- `lora-tp-distributed` ×4\n- `metrics-tracing-2-gpus`\n- `model-executor`\n- `mooncake-ec-tcp-e2e-2-gpus`\n- `mrcr-eval-small-models`\n- `multi-modal-accuracy-eval-small-models`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multiconnector-nixl-offloading-pd-accuracy-2-gpus`\n- `multiconnector-nixl-offloading-pd-edge-cases-2-gpus`\n- `nixlconnector-pd-edge-cases-2-gpus`\n- `openai-api-correctness`\n- `pipeline-context-parallelism-4-gpus`\n- `plugin-tests-2-gpus`\n- `push-nixlconnector-pp-prefill-pd-accuracy-4-gpus`\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `quantization` ×4\n- `quantized-models-test`\n- `quantized-moe-test-b200`\n- `rayexecutorv2-4-gpus`\n- `regression`\n- `replayssm-e2e`\n- `rust-frontend-core-correctness`\n- `rust-frontend-distributed`\n- `rust-frontend-openai-coverage`\n- `rust-frontend-serve-admin-coverage`\n- `rust-frontend-tool-use`\n- `samplers-multimodal-beam-search`\n- `samplers-test`\n- `scale-out-ec-e2e-2-gpus`\n- `sharded-rdt-weight-transfer`\n- `spec-decode-draft-model` ×4\n- `spec-decode-eagle-1-deepseek-qwen`\n- `spec-decode-eagle-2-llama3-qwen-vl-other`\n- `spec-decode-mtp-deepseek-mimo`\n- `spec-decode-mtp-gemma4`\n- `spec-decode-mtp-qwen3-5`\n- `spec-decode-ngram-suffix`\n- `spec-decode-speculators`\n- `v1-attention-b200` ×2\n- `v1-attention-h100-mi300` ×2\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>Would skip (today's rules run them) (15)</summary>\n\n- `ascend-npu-test`\n- `basic-models-test-other-cpu`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `cpu-multimodal-config`\n- `cpu-params-env-tokenizers-parser`\n- `cpu-reasoning-renderers`\n- `cpu-tool-parsers`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `multi-modal-processor` ×4\n- `multi-modal-processor-cpu` ×4\n- `platform-tests`\n- `pytorch-compilation-passes-unit-tests`\n- `v1-kv-offload`\n- `v1-others-cpu`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (95)</summary>\n\n- `arm-cpu-test` ×3 (code map)\n- `basic-models-tests-extra-initialization` ×14 (code map)\n- `batch-invariance-b200` (code map)\n- `batch-invariance-h100` (Python record)\n- `cpu-kernel-tests` ×2 (code map)\n- `cpu-multi-modal-model-tests-n` ×4 (code map)\n- `cpu-quantization-model-tests` (code map)\n- `crosslayer-kv-layout-distributed-nixlconnector-pd-accuracy-tests-4-gpus` (Python record)\n- `cudagraph` (code map)\n- `distributed-compile-comm-4-gpus` (Python record)\n- `distributed-compile-rpc-tests-2-gpus` (Python record)\n- `distributed-dp-tests-2-gpus` (Python record)\n- `distributed-dp-tests-4-gpus` (Python record)\n- `distributed-flashinfer-nixlconnector-pd-accuracy-4-gpus` (Python record)\n- `distributed-model-tests-2-gpus` ×3 (code map)\n- `distributed-mooncakeconnector-pd-accuracy-4-gpus` (Python record)\n- `distributed-nixlconnector-pd-accuracy-4-gpus` (Python record)\n- `distributed-tests-8xh100` (Python record)\n- `distributed-torchrun-examples-4-gpus` (Python record)\n- `distributed-torchrun-shutdown-tests-2-gpus` (code map)\n- `dp-ep-distributed-nixlconnector-pd-accuracy-tests-4-gpus` (Python record)\n- `e2e-core-1-gpu` (code map)\n- `e2e-core-large-memory` (Python record)\n- `e2e-scheduling-1-gpu` (Python record)\n- `e2e-scheduling-accuracy-1-gpu` (Python record)\n- `elastic-ep-scaling-test` (Python record)\n- `engine-1-gpu` (Python record)\n- `entrypoints-unit-tests` (Python record)\n- `examples` (Python record)\n- `extract-hidden-states-integration` (Python record)\n- `extract-hidden-states-integration-2-gpus` (Python record)\n- `fault-tolerance-e2e-2xh100` (Python record)\n- `fusion-e2e-config-sweep-h100` (Python record)\n- `fusion-e2e-quick-h100` (Python record)\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100` (Python record)\n- `fusion-e2e-tp2-asynctp-config-sweep-h100` (Python record)\n- `fusion-e2e-tp2-b200` (Python record)\n- `fusion-e2e-tp2-quick-h100` (Python record)\n- `hybrid-ssm-nixlconnector-pd-accuracy-tests-4-gpus` (Python record)\n- `hybrid-ssm-nixlconnector-pd-prefix-cache-2-gpus` (Python record)\n- `inkling-unit-tests-b200` (code map)\n- `kernels-attention-test` ×7 (code map)\n- `kernels-b200` ×3 (code map)\n- `kernels-deepgemm-test-h100` (code map)\n- `kernels-moe-test` ×5 (code map)\n- `kernels-quantization-test` ×6 (code map)\n- `kimi-k3-prefix-cache-4xb200` ×2 (Python record)\n- `kv-offload-large` (Python record)\n- `kv-offload-medium` (Python record)\n- `kv-offload-small` (Python record)\n- `language-models-tests-extra-standard` ×2 (code map)\n- `lm-eval-dspark-watermark-2xh100` (code map)\n- `lm-eval-small-models` (code map)\n- `lm-eval-turboquant-k3v4nc` (code map)\n- `lm-eval-turboquant-k8v4` (code map)\n- `lm-eval-turboquant-t3nc` (code map)\n- `lm-eval-turboquant-t4nc` (code map)\n- `lm-eval-watermarking` (code map)\n- `lora` ×4 (Python record)\n- `lora-tp-distributed` ×4 (Python record)\n- `model-executor` (code map)\n- `mooncake-ec-tcp-e2e-2-gpus` (Python record)\n- `mrcr-eval-small-models` (Python record)\n- `multi-modal-accuracy-eval-small-models` (Python record)\n- `multiconnector-nixl-offloading-pd-accuracy-2-gpus` (Python record)\n- `multiconnector-nixl-offloading-pd-edge-cases-2-gpus` (Python record)\n- `nixlconnector-pd-edge-cases-2-gpus` (Python record)\n- `openai-api-correctness` (Python record)\n- `pipeline-context-parallelism-4-gpus` (Python record)\n- `plugin-tests-2-gpus` (Python record)\n- `push-nixlconnector-pp-prefill-pd-accuracy-4-gpus` (Python record)\n- `quantization` ×4 (code map)\n- `quantized-models-test` (code map)\n- `quantized-moe-test-b200` (Python record)\n- `rayexecutorv2-4-gpus` (code map)\n- `replayssm-e2e` (Python record)\n- `rust-frontend-core-correctness` (Python record)\n- `rust-frontend-distributed` (Python record)\n- `rust-frontend-openai-coverage` (Python record)\n- `rust-frontend-serve-admin-coverage` (Python record)\n- `rust-frontend-tool-use` (Python record)\n- `samplers-multimodal-beam-search` (Python record)\n- `samplers-test` (Python record)\n- `scale-out-ec-e2e-2-gpus` (Python record)\n- `sharded-rdt-weight-transfer` (Python record)\n- `spec-decode-draft-model` ×4 (Python record)\n- `spec-decode-eagle-1-deepseek-qwen` (Python record)\n- `spec-decode-eagle-2-llama3-qwen-vl-other` (Python record)\n- `spec-decode-mtp-deepseek-mimo` (Python record)\n- `spec-decode-mtp-gemma4` (Python record)\n- `spec-decode-mtp-qwen3-5` (Python record)\n- `spec-decode-ngram-suffix` (Python record)\n- `spec-decode-speculators` (Python record)\n- `v1-attention-b200` ×2 (code map)\n- `v1-attention-h100-mi300` ×2 (code map)\n</details>\n\n<details><summary>AMD mirrors: would skip (0)</summary>\n\nnone\n</details>\n\n<details><summary>AMD mirrors: would add (6)</summary>\n\n- `docker-build-metadata` (code map)\n- `fusion-and-compile-unit-tests-2xb200` (code map)\n- `fusion-e2e-tp2-asynctp-config-sweep-h100` (code map)\n- `qwen4-exp-unit-tests` (code map)\n- `rust-frontend-cargo-style-clippy` (code map)\n- `rust-frontend-cargo-tests` (code map)\n</details>\n\n<sub>4 changed files · base `819852df6b` · head `e29d0200c9` · Python record: build 93039 at `1e5d0ea888` · kernel record: table 1e5d0ea888 (build 93039), map 1e5d0ea888 · not counted: 10 build steps, 5 A100 steps the generator no longer emits, 129 optional steps the selector would also run</sub>\n",
+      "created_at": "2026-10-06T14:28:24Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6018462740",
+      "updated_at": "2026-10-06T21:09:53Z",
+      "user": {
+        "login": "vllm-agent"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-06T14:43:58Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6018758644",
+      "updated_at": "2026-10-06T14:43:58Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    },
+    {
+      "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #93093](https://buildkite.com/vllm/ci/builds/93093).",
+      "created_at": "2026-10-06T14:45:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6018778262",
+      "updated_at": "2026-10-06T14:45:01Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-06T15:35:30Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6019765687",
+      "updated_at": "2026-10-06T15:35:30Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93114](https://buildkite.com/vllm/ci/builds/93114) for commit `2ffcb8f98f39`, running 1 failed step(s) from [Buildkite CI #93093](https://buildkite.com/vllm/ci/builds/93093).",
+      "created_at": "2026-10-06T15:35:52Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6019772603",
+      "updated_at": "2026-10-06T15:35:52Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-06T20:35:03Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6024953474",
+      "updated_at": "2026-10-06T20:35:03Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93180](https://buildkite.com/vllm/ci/builds/93180) for commit `e29d0200c9da`.",
+      "created_at": "2026-10-06T20:35:25Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6024959786",
+      "updated_at": "2026-10-06T20:35:25Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-08T15:33:03Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063391487",
+      "updated_at": "2026-10-08T15:33:03Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93632](https://buildkite.com/vllm/ci/builds/93632) for commit `93fc1b6109d5`.",
+      "created_at": "2026-10-08T15:33:25Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063398433",
+      "updated_at": "2026-10-08T15:33:25Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-08T15:51:55Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063742849",
+      "updated_at": "2026-10-08T15:51:55Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "✅ The previous CI build is still running: https://buildkite.com/vllm/ci/builds/93632",
+      "created_at": "2026-10-08T15:53:00Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6063762403",
+      "updated_at": "2026-10-08T15:53:00Z",
+      "user": {
+        "login": "github-actions"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-12T10:22:05Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6122324466",
+      "updated_at": "2026-10-12T10:22:05Z",
+      "user": {
+        "login": "sstamenk"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94174](https://buildkite.com/vllm/ci/builds/94174) for commit `36c68ce94d46`, running 6 failed step(s) from [Buildkite CI #93632](https://buildkite.com/vllm/ci/builds/93632).",
+      "created_at": "2026-10-12T10:22:26Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#issuecomment-6122329651",
+      "updated_at": "2026-10-12T10:22:26Z",
+      "user": {
+        "login": "github-actions"
+      }
+    }
+  ],
+  "number": 54776,
+  "refs": {
+    "base": {
+      "commit": "2534a96fcf165202f5358335f8b0705175159fd0",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "36c68ce94d46e3544f5c21ebc4eb60d274800362",
+      "repository": "sstamenk/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#pullrequestreview-5078500630",
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-01T13:18:07Z",
+      "user": {
+        "login": "claude"
+      }
+    },
+    {
+      "body": "Looks good @sstamenk!  Looks like we're guarded off from affecting other Unified Arch schemes",
+      "html_url": "https://github.com/vllm-project/vllm/pull/54776#pullrequestreview-5429441819",
+      "state": "APPROVED",
+      "submitted_at": "2026-10-06T13:56:13Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    }
+  ]
+}

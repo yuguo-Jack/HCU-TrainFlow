@@ -1,0 +1,450 @@
+{
+  "acquisition": {
+    "method": "GraphQL complete PR/comment/review connections + REST files",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "fc3385d53005945473bca42ae62e9635cea1d6ca",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\n- DeepSeek-V4 keeps two kinds of KV for a cached prefix: the full KV (compressed entries and indexer keys) and a smaller sliding-window (SWA) KV. Under memory pressure the SWA KV of an idle prefix is evicted first.\n- On main, a request that reuses such a prefix gets no cache hit. It prefills the whole prefix again even though the full KV is still on the GPU.\n- This PR rebuilds the SWA KV instead. It replays only the last tokens of the prefix (5,632 for V4-Flash) and reads everything older from the cached full KV.\n- On a 120K-token prompt the request after an eviction takes 0.21 s instead of 2.21 s.\n- This is a smaller take on #31713 by @jellysnack. The replay length and the \"at least twice the replay length\" threshold come from that PR.\n\n## Modifications\n\n- New server flag `--enable-swa-recompute`, off by default.\n- Replay length: `ceil_align(ceil_align(W, page) + (L - 1) * W, page)` for window `W` and `L` layers. Layer `l` needs window rows built from layer `l - 1`, one window further back each time, so only the last window of the replay is exact and only that window is kept.\n- Cache side (`unified_cache/swa_recompute.py`):\n  - A match reports how many full-KV tokens a replay would make reusable. Prefixes that would save less than twice the replay length are prefilled again as before.\n  - When the request is admitted, fresh SWA rows are bound to the replayed tokens and the last window is attached to the tree. The other rows are scratch and are freed after the forward.\n  - The scratch rows are freed with the page-aligned segment free, which does not call `torch.unique`.\n- Worker side (`model_executor/swa_recompute.py`):\n  - The replay is one extra extend forward over the replayed tokens, run before the request's normal extend.\n  - It writes SWA rows and the 4x compressor state, which lives beside the SWA rows. It does not store compressed or indexer entries, so the cached full KV is not touched.\n  - Window slots before the replay start are masked with the existing `swa_replay_start` floor.\n  - The prefill CUDA graph is not used for the replay.\n- DSpark: the draft keeps its own SWA rows. They are rebuilt from the replay's captured hidden states through the existing prefill injection path.\n- The flag is refused at startup with DeepSeek-V4.1, DP attention, context parallelism, pipeline parallelism, PD disaggregation, the TRT-LLM attention backend, the unified KV layout, unified memory, online C128 compression, two-batch overlap, mixed chunks, HiSparse, LoRA, radix sessions, the external cache linker, speculative decoding other than DSpark, SM120 and non-CUDA hardware.\n- Docs: a row in the server arguments table and a section in the DeepSeek-V4 cookbook.\n- Tests: the request stubs in `test_prefill_adder.py` and `test_batch_result_processor_hidden_states.py` get the new replay fields, because the scheduler now reads them on every request.\n\nDifferences from #31713:\n\n1. A server flag instead of an environment variable.\n2. The replay binds fresh SWA rows through the normal full-to-SWA mapping. There is no private-page routing in the planner or the attention kernels, and no change to the compress-plan JIT kernel.\n3. DSpark is supported.\n4. HiCache is not covered. Only full KV that is on the GPU is reused.\n\n## Accuracy Tests\n\n`deepseek-ai/DeepSeek-V4-Flash-0731` on 4x B300. The check is the repo's cache-hit KL helper, `test_input_output_logprobs_match_prefill_cache_hit_helper`, run on 8 LongBench-v2 prompts of 13,436 to 26,739 tokens with 512 new tokens. The helper's default prompt length is 3,000 tokens, which is too short to rebuild, so the prompts were cut at 12,000 to 36,000 tokens instead. It prefills each prompt, generates from the cache hit, and compares the output logprobs with a cold prefill of the same tokens.\n\nThe squeezed pool has 12,800 SWA rows, so each prompt's SWA KV is evicted by the next prompt. The intact pool keeps every prompt's SWA KV.\n\n```bash\n# rebuild, squeezed SWA pool\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.032 --max-running-requests 1 --enable-swa-recompute\n\n# rebuild with DSpark, squeezed SWA pool\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.032 --max-running-requests 1 --enable-swa-recompute --speculative-algorithm DSPARK\n\n# intact cache\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.5 --max-running-requests 1 --enable-swa-recompute\n\n# intact cache with DSpark\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.5 --max-running-requests 1 --enable-swa-recompute --speculative-algorithm DSPARK\n\n# flag off, squeezed SWA pool\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.032 --max-running-requests 1\n```\n\n| Server | Prompts with a cache hit | Hits through the rebuild | Average KL |\n|---|---|---|---|\n| Rebuild, squeezed pool | 8/8 | 7 | 0.0046 |\n| Rebuild with DSpark, squeezed pool | 8/8 | 7 | 0.0063 |\n| Intact cache | 8/8 | 0 | 0.0048 |\n| Intact cache with DSpark | 8/8 | 0 | 0.0054 |\n| Flag off, squeezed pool | 0/8 | 0 | not computed |\n\n- Each row is one run. This model is not reproducible run to run at these prompt lengths. Earlier runs of the intact row on the same prompts gave 0.0036 to 0.0059, and a cold run with DSpark and no cache hit gave 0.0071, so the rebuild rows are within noise of the intact rows.\n- The last prompt is never evicted, so it is a normal hit in every row.\n- No scheduler exceptions in any run.\n- After merging main at `7760d5264a`, the two rebuild rows were run again: 8/8 hits with 7 through the rebuild in both, average KL 0.0052 without DSpark and 0.0051 with DSpark, and no scheduler exceptions.\n- After a second merge of main at `0f5bc4af4b`, the DSpark rebuild row was run once more: 8/8 hits, average KL 0.0056, no scheduler exceptions.\n- After a third merge of main at `943621c336`, the DSpark rebuild row was run again: 8/8 hits, average KL 0.0040, no scheduler exceptions. Main had renamed `MatchResult.device_indices` to `device_prefix_len` and now gives the draft model its write locations through `kv_loc_plan`, so the rebuild code was updated to use both.\n- After a fourth merge of main at `fc3385d530`, the DSpark rebuild row was run again: 8/8 hits, average KL 0.0044, no scheduler exceptions.\n\n## Speed Tests and Profiling\n\nSame model and hardware. A 120,000-token prompt A is prefilled, a second 120,000-token prompt evicts A's SWA KV, and A is sent again. This is repeated four more times. Numbers are time to first token.\n\n```bash\n# flag on\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --speculative-algorithm DSPARK --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 300000 --swa-full-tokens-ratio 0.032 --max-running-requests 8 --enable-swa-recompute\n\n# flag off\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --speculative-algorithm DSPARK --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 300000 --swa-full-tokens-ratio 0.032 --max-running-requests 8\n```\n\nThe no-DSpark row uses the flag-on command without `--speculative-algorithm DSPARK`.\n\n| Server | Cold prefill | Hit, SWA KV intact | Hit after SWA eviction |\n|---|---|---|---|\n| Flag off, DSpark | 2.21 s | 0.10 to 0.14 s | 2.21 s (prefilled again) |\n| Flag on, DSpark | 2.21 s | 0.10 to 0.14 s | 0.21 s |\n| Flag on, no DSpark | 2.19 s | 0.10 to 0.12 s | 0.21 s |\n\n- One server run per row. The \"after eviction\" number is the same within 0.01 s over the last four cycles. The first rebuild after server start takes 0.26 s.\n- The rebuild costs about 0.1 s more than an intact hit. That is the replay forward over 5,632 tokens.\n- After merging main at `7760d5264a`, the two flag-on rows were run again and the numbers are the same: 0.21 s after eviction, 2.19 to 2.21 s cold.\n- After the second merge at `0f5bc4af4b`, the DSpark row is again 0.21 s after eviction and 2.19 s cold.\n- After the third merge at `943621c336`, the DSpark row is 0.22 s after eviction and 2.21 s cold.\n- After the fourth merge at `fc3385d530`, the DSpark row is 0.21 s after eviction and 2.21 s cold.\n\n## Follow-ups\n\n- No test is added in this PR. A registered test needs a V4-Flash lane with a squeezed SWA pool and the KL helper on long prompts.\n- HiCache, DP attention and PD disaggregation are not supported yet.\n- The DSpark draft rows are rebuilt from the replay's hidden states. The KL check above does not tell an exact draft window from a stale one. The only check on the draft side is the accept length in the timing run, which is 2.91 after a rebuild and 2.91 on an intact hit (32 new tokens, random-token prompt). A real-text accept-length check is still owed.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n## Review and Merge Process\n\n1. Ping Merge Oncalls to start the process. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).\n2. Get approvals from [CODEOWNERS](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and other reviewers.\n3. Trigger CI tests with [comments](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests) or contact authorized users to do so.\n   - Common commands include `/tag-and-rerun-ci`, `/tag-run-ci-label`, `/rerun-failed-ci`\n4. After green CI and required approvals, ask Merge Oncalls or people with Write permission to merge the PR.\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #37865092550](https://github.com/sgl-project/sglang/actions/runs/37865092550)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37865092335](https://github.com/sgl-project/sglang/actions/runs/37865092335)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37865092618](https://github.com/sgl-project/sglang/actions/runs/37865092618)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n\n\n\n",
+      "changedFiles": 24,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "vincentzed"
+            },
+            "body": "@xiezhq-hermann could you review this? It is a smaller version of #31713, which you are assigned on, and it touches the unified radix cache and the SWA allocator path.\n\n@jellysnack this reuses your replay-length formula and gain threshold from #31713. Could you check that it covers what you need, and say if you would rather land yours?\n\ncc @hnyls2002 for the scheduler and batch changes.\n\nCI needs the `run-ci` label.",
+            "createdAt": "2026-10-07T18:26:07Z",
+            "updatedAt": "2026-10-07T18:26:07Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43009#issuecomment-6044199804"
+          },
+          {
+            "author": {
+              "login": "vincentzed"
+            },
+            "body": "I merged main into this branch because it had a conflict in `schedule_batch.py`.\n\n- main removed `Req.prefix_indices` and `Req.extend_range` (#42822, #42824, #42825) and moved the cache match into `match_kv_cache`. The replay bookkeeping now lives in `match_kv_cache` and uses `req.prefix_len`.\n- The scheduler unit tests in `test/registered/unit/managers` failed on this PR because their request stubs did not have the new replay fields. I added the fields to the stubs and the tests pass again.\n- I ran the two rebuild rows of the accuracy table and the two flag-on rows of the timing table again on the merged branch. The results are in the PR description and match the earlier runs.",
+            "createdAt": "2026-10-08T00:37:22Z",
+            "updatedAt": "2026-10-08T00:37:22Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43009#issuecomment-6049724127"
+          },
+          {
+            "author": {
+              "login": "vincentzed"
+            },
+            "body": "Merged main at `943621c336` to clear a conflict. Two things in main had changed under this PR, so the rebuild code was updated:\n\n- `MatchResult.device_indices` is now `device_prefix_len`.\n- The DSpark draft model now gets its write locations from `kv_loc_plan`, so the replay passes its own plan.\n\nThe DSpark rebuild row was run again after the merge: 8/8 hits, average KL 0.0040, 0.22 s after eviction against 2.21 s cold, no scheduler exceptions. The description has the numbers.",
+            "createdAt": "2026-10-08T12:58:42Z",
+            "updatedAt": "2026-10-08T12:58:42Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43009#issuecomment-6060396456"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWk6T6g=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "918928321fa8b0572170aa40f30128e94a52e0bb",
+      "headRepository": {
+        "nameWithOwner": "vincentzed/sglang"
+      },
+      "merged": false,
+      "number": 43009,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[DSv4] Rebuild the evicted SWA window on a cache hit instead of prefilling again",
+      "updatedAt": "2026-10-09T00:30:57Z",
+      "url": "https://github.com/sgl-project/sglang/pull/43009"
+    }
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "fc3385d53005945473bca42ae62e9635cea1d6ca"
+    },
+    "body": "## Motivation\n\n- DeepSeek-V4 keeps two kinds of KV for a cached prefix: the full KV (compressed entries and indexer keys) and a smaller sliding-window (SWA) KV. Under memory pressure the SWA KV of an idle prefix is evicted first.\n- On main, a request that reuses such a prefix gets no cache hit. It prefills the whole prefix again even though the full KV is still on the GPU.\n- This PR rebuilds the SWA KV instead. It replays only the last tokens of the prefix (5,632 for V4-Flash) and reads everything older from the cached full KV.\n- On a 120K-token prompt the request after an eviction takes 0.21 s instead of 2.21 s.\n- This is a smaller take on #31713 by @jellysnack. The replay length and the \"at least twice the replay length\" threshold come from that PR.\n\n## Modifications\n\n- New server flag `--enable-swa-recompute`, off by default.\n- Replay length: `ceil_align(ceil_align(W, page) + (L - 1) * W, page)` for window `W` and `L` layers. Layer `l` needs window rows built from layer `l - 1`, one window further back each time, so only the last window of the replay is exact and only that window is kept.\n- Cache side (`unified_cache/swa_recompute.py`):\n  - A match reports how many full-KV tokens a replay would make reusable. Prefixes that would save less than twice the replay length are prefilled again as before.\n  - When the request is admitted, fresh SWA rows are bound to the replayed tokens and the last window is attached to the tree. The other rows are scratch and are freed after the forward.\n  - The scratch rows are freed with the page-aligned segment free, which does not call `torch.unique`.\n- Worker side (`model_executor/swa_recompute.py`):\n  - The replay is one extra extend forward over the replayed tokens, run before the request's normal extend.\n  - It writes SWA rows and the 4x compressor state, which lives beside the SWA rows. It does not store compressed or indexer entries, so the cached full KV is not touched.\n  - Window slots before the replay start are masked with the existing `swa_replay_start` floor.\n  - The prefill CUDA graph is not used for the replay.\n- DSpark: the draft keeps its own SWA rows. They are rebuilt from the replay's captured hidden states through the existing prefill injection path.\n- The flag is refused at startup with DeepSeek-V4.1, DP attention, context parallelism, pipeline parallelism, PD disaggregation, the TRT-LLM attention backend, the unified KV layout, unified memory, online C128 compression, two-batch overlap, mixed chunks, HiSparse, LoRA, radix sessions, the external cache linker, speculative decoding other than DSpark, SM120 and non-CUDA hardware.\n- Docs: a row in the server arguments table and a section in the DeepSeek-V4 cookbook.\n- Tests: the request stubs in `test_prefill_adder.py` and `test_batch_result_processor_hidden_states.py` get the new replay fields, because the scheduler now reads them on every request.\n\nDifferences from #31713:\n\n1. A server flag instead of an environment variable.\n2. The replay binds fresh SWA rows through the normal full-to-SWA mapping. There is no private-page routing in the planner or the attention kernels, and no change to the compress-plan JIT kernel.\n3. DSpark is supported.\n4. HiCache is not covered. Only full KV that is on the GPU is reused.\n\n## Accuracy Tests\n\n`deepseek-ai/DeepSeek-V4-Flash-0731` on 4x B300. The check is the repo's cache-hit KL helper, `test_input_output_logprobs_match_prefill_cache_hit_helper`, run on 8 LongBench-v2 prompts of 13,436 to 26,739 tokens with 512 new tokens. The helper's default prompt length is 3,000 tokens, which is too short to rebuild, so the prompts were cut at 12,000 to 36,000 tokens instead. It prefills each prompt, generates from the cache hit, and compares the output logprobs with a cold prefill of the same tokens.\n\nThe squeezed pool has 12,800 SWA rows, so each prompt's SWA KV is evicted by the next prompt. The intact pool keeps every prompt's SWA KV.\n\n```bash\n# rebuild, squeezed SWA pool\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.032 --max-running-requests 1 --enable-swa-recompute\n\n# rebuild with DSpark, squeezed SWA pool\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.032 --max-running-requests 1 --enable-swa-recompute --speculative-algorithm DSPARK\n\n# intact cache\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.5 --max-running-requests 1 --enable-swa-recompute\n\n# intact cache with DSpark\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.5 --max-running-requests 1 --enable-swa-recompute --speculative-algorithm DSPARK\n\n# flag off, squeezed SWA pool\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 400000 --swa-full-tokens-ratio 0.032 --max-running-requests 1\n```\n\n| Server | Prompts with a cache hit | Hits through the rebuild | Average KL |\n|---|---|---|---|\n| Rebuild, squeezed pool | 8/8 | 7 | 0.0046 |\n| Rebuild with DSpark, squeezed pool | 8/8 | 7 | 0.0063 |\n| Intact cache | 8/8 | 0 | 0.0048 |\n| Intact cache with DSpark | 8/8 | 0 | 0.0054 |\n| Flag off, squeezed pool | 0/8 | 0 | not computed |\n\n- Each row is one run. This model is not reproducible run to run at these prompt lengths. Earlier runs of the intact row on the same prompts gave 0.0036 to 0.0059, and a cold run with DSpark and no cache hit gave 0.0071, so the rebuild rows are within noise of the intact rows.\n- The last prompt is never evicted, so it is a normal hit in every row.\n- No scheduler exceptions in any run.\n- After merging main at `7760d5264a`, the two rebuild rows were run again: 8/8 hits with 7 through the rebuild in both, average KL 0.0052 without DSpark and 0.0051 with DSpark, and no scheduler exceptions.\n- After a second merge of main at `0f5bc4af4b`, the DSpark rebuild row was run once more: 8/8 hits, average KL 0.0056, no scheduler exceptions.\n- After a third merge of main at `943621c336`, the DSpark rebuild row was run again: 8/8 hits, average KL 0.0040, no scheduler exceptions. Main had renamed `MatchResult.device_indices` to `device_prefix_len` and now gives the draft model its write locations through `kv_loc_plan`, so the rebuild code was updated to use both.\n- After a fourth merge of main at `fc3385d530`, the DSpark rebuild row was run again: 8/8 hits, average KL 0.0044, no scheduler exceptions.\n\n## Speed Tests and Profiling\n\nSame model and hardware. A 120,000-token prompt A is prefilled, a second 120,000-token prompt evicts A's SWA KV, and A is sent again. This is repeated four more times. Numbers are time to first token.\n\n```bash\n# flag on\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --speculative-algorithm DSPARK --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 300000 --swa-full-tokens-ratio 0.032 --max-running-requests 8 --enable-swa-recompute\n\n# flag off\npython3 -m sglang.launch_server --trust-remote-code --model-path deepseek-ai/DeepSeek-V4-Flash-0731 --tp 4 --moe-runner-backend flashinfer_mxfp4 --speculative-algorithm DSPARK --mem-fraction-static 0.90 --chunked-prefill-size 8192 --max-total-tokens 300000 --swa-full-tokens-ratio 0.032 --max-running-requests 8\n```\n\nThe no-DSpark row uses the flag-on command without `--speculative-algorithm DSPARK`.\n\n| Server | Cold prefill | Hit, SWA KV intact | Hit after SWA eviction |\n|---|---|---|---|\n| Flag off, DSpark | 2.21 s | 0.10 to 0.14 s | 2.21 s (prefilled again) |\n| Flag on, DSpark | 2.21 s | 0.10 to 0.14 s | 0.21 s |\n| Flag on, no DSpark | 2.19 s | 0.10 to 0.12 s | 0.21 s |\n\n- One server run per row. The \"after eviction\" number is the same within 0.01 s over the last four cycles. The first rebuild after server start takes 0.26 s.\n- The rebuild costs about 0.1 s more than an intact hit. That is the replay forward over 5,632 tokens.\n- After merging main at `7760d5264a`, the two flag-on rows were run again and the numbers are the same: 0.21 s after eviction, 2.19 to 2.21 s cold.\n- After the second merge at `0f5bc4af4b`, the DSpark row is again 0.21 s after eviction and 2.19 s cold.\n- After the third merge at `943621c336`, the DSpark row is 0.22 s after eviction and 2.21 s cold.\n- After the fourth merge at `fc3385d530`, the DSpark row is 0.21 s after eviction and 2.21 s cold.\n\n## Follow-ups\n\n- No test is added in this PR. A registered test needs a V4-Flash lane with a squeezed SWA pool and the KL helper on long prompts.\n- HiCache, DP attention and PD disaggregation are not supported yet.\n- The DSpark draft rows are rebuilt from the replay's hidden states. The KL check above does not tell an exact draft window from a stale one. The only check on the draft side is the accept length in the timing run, which is 2.91 after a rebuild and 2.91 on an intact hit (32 new tokens, random-token prompt). A real-text accept-length check is still owed.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n## Review and Merge Process\n\n1. Ping Merge Oncalls to start the process. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).\n2. Get approvals from [CODEOWNERS](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and other reviewers.\n3. Trigger CI tests with [comments](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests) or contact authorized users to do so.\n   - Common commands include `/tag-and-rerun-ci`, `/tag-run-ci-label`, `/rerun-failed-ci`\n4. After green CI and required approvals, ask Merge Oncalls or people with Write permission to merge the PR.\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #37865092550](https://github.com/sgl-project/sglang/actions/runs/37865092550)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #37865092335](https://github.com/sgl-project/sglang/actions/runs/37865092335)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #37865092618](https://github.com/sgl-project/sglang/actions/runs/37865092618)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n\n\n\n",
+    "changed_files": 24,
+    "head": {
+      "repo": {
+        "full_name": "vincentzed/sglang"
+      },
+      "sha": "918928321fa8b0572170aa40f30128e94a52e0bb"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/43009",
+    "merged": false,
+    "number": 43009,
+    "state": "open",
+    "title": "[DSv4] Rebuild the evicted SWA window on a cache hit instead of prefilling again",
+    "updated_at": "2026-10-09T00:30:57Z"
+  },
+  "files": [
+    {
+      "additions": 23,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/docs%2Fcookbook%2Fautoregressive%2FDeepSeek%2FDeepSeek-V4.mdx",
+      "changes": 23,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/docs%2Fcookbook%2Fautoregressive%2FDeepSeek%2FDeepSeek-V4.mdx?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "docs/cookbook/autoregressive/DeepSeek/DeepSeek-V4.mdx",
+      "patch": "@@ -1162,3 +1162,26 @@ sglang serve ...\n ```\n \n Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.7 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.\n+\n+### 3.9 SWA Recompute (Experimental)\n+\n+DeepSeek-V4 keeps two kinds of KV for a cached prefix: the full KV and a smaller sliding-window (SWA) KV sized by `--swa-full-tokens-ratio`. Under memory pressure the SWA KV of an idle prefix is evicted first. A later request that reuses that prefix then has to prefill it again, even though its full KV is still cached.\n+\n+`--enable-swa-recompute` rebuilds the SWA KV instead. The server replays only the last tokens of the prefix (5,632 tokens for V4-Flash at the default page size of 256) and reads everything older from the cached full KV. Prefixes shorter than about twice that length are prefilled again as before.\n+\n+```bash Command\n+sglang serve \\\n+  --trust-remote-code \\\n+  --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \\\n+  --tp 4 \\\n+  --moe-runner-backend flashinfer_mxfp4 \\\n+  --speculative-algorithm DSPARK \\\n+  --mem-fraction-static 0.90 \\\n+  --chunked-prefill-size 8192 \\\n+  --swa-full-tokens-ratio 0.1 \\\n+  --enable-swa-recompute \\\n+  --host 0.0.0.0 \\\n+  --port 30000\n+```\n+\n+The flag works with TP and with DSpark. It does not yet work with DP attention, PD disaggregation, the TRT-LLM attention backend, UMBP or DeepSeek-V4.1, and the server refuses to start when it is combined with one of them.",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/docs%2Fcookbook%2Fautoregressive%2FDeepSeek%2FDeepSeek-V4.mdx",
+      "sha": "622ef6a7d0f5d84b31e1a71471cf83b684550433",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/docs%2Fdocs%2Fadvanced_features%2Fserver_arguments.mdx",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/docs%2Fdocs%2Fadvanced_features%2Fserver_arguments.mdx?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "docs/docs/advanced_features/server_arguments.mdx",
+      "patch": "@@ -549,6 +549,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.</td>\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.02)\"}}>`0.8`</td>\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>Type: float</td>\n+    </tr>\n+        <tr>\n+      <td style={{padding: \"9px 12px\", fontWeight: 500, backgroundColor: \"rgba(255,255,255,0.02)\"}}>`--enable-swa-recompute`</td>\n+      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>DeepSeek-V4 only. When a cached prefix kept its full KV but lost its sliding-window KV, rebuild the sliding-window KV by replaying the last tokens of the prefix instead of prefilling the prefix again. Experimental.</td>\n+      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.02)\"}}>`False`</td>\n+      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>bool flag (set to enable)</td>\n     </tr>\n         <tr>\n       <td style={{padding: \"9px 12px\", fontWeight: 500, backgroundColor: \"rgba(255,255,255,0.02)\"}}>`--disable-hybrid-swa-memory`</td>",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/docs%2Fdocs%2Fadvanced_features%2Fserver_arguments.mdx",
+      "sha": "189cfc2370575b6cd219dccf499d861aa9613772",
+      "status": "modified"
+    },
+    {
+      "additions": 42,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Fdeepseek_v4_hook.py",
+      "changes": 42,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Fdeepseek_v4_hook.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/arg_groups/deepseek_v4_hook.py",
+      "patch": "@@ -201,6 +201,48 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:\n     )\n \n \n+def validate_deepseek_v4_swa_recompute(server_args: ServerArgs) -> None:\n+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (\n+        is_unified_kv_triton,\n+    )\n+\n+    cfg = resolving_view(server_args)\n+    if not cfg.enable_swa_recompute:\n+        return\n+    if model_config_of(server_args).hf_config.model_type == \"deepseek_v41\":\n+        raise ValueError(\n+            \"--enable-swa-recompute does not support DeepSeek-V4.1; use \"\n+            \"--enable-encoder-swa-bounded-replay\"\n+        )\n+    incompatible = (\n+        (\"hardware other than CUDA\", not get_platform().is_cuda),\n+        (\"SM120\", get_platform().is_sm120),\n+        (\n+            \"speculative decoding other than DSpark\",\n+            cfg.speculative_algorithm is not None\n+            and str(cfg.speculative_algorithm).upper() != \"DSPARK\",\n+        ),\n+        (\"DP attention\", attn_dp_enabled_of(cfg)),\n+        (\"context parallelism\", cfg.attn_cp_size > 1),\n+        (\"decode context parallelism\", cfg.dcp_size > 1),\n+        (\"pipeline parallelism\", cfg.pp_size > 1),\n+        (\"PD disaggregation\", cfg.disaggregation_mode != \"null\"),\n+        (\"the TRT-LLM attention backend\", cfg.dsv4_attn_backend == \"trtllm\"),\n+        (\"the unified KV layout\", is_unified_kv_triton()),\n+        (\"unified memory\", cfg.enable_unified_memory),\n+        (\"online C128 compression\", envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()),\n+        (\"two-batch overlap\", cfg.enable_two_batch_overlap),\n+        (\"mixed prefill/decode\", cfg.enable_mixed_chunk),\n+        (\"HiSparse\", cfg.enable_hisparse),\n+        (\"LoRA\", cfg.enable_lora),\n+        (\"radix sessions\", cfg.enable_session_radix_cache),\n+        (\"external cache linker\", cfg.enable_unified_cache_external_linker),\n+    )\n+    for feature, enabled in incompatible:\n+        if enabled:\n+            raise ValueError(f\"--enable-swa-recompute does not support {feature} yet\")\n+\n+\n def validate_deepseek_v41_features(server_args: ServerArgs) -> None:\n     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (\n         is_unified_kv_triton,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Fdeepseek_v4_hook.py",
+      "sha": "7377dc7d8d5e9b30edab61a43205fa9fc1505ffa",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Ffield_order.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Ffield_order.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/arg_groups/field_order.py",
+      "patch": "@@ -519,6 +519,7 @@\n     \"swa_prefix_tails\",\n     \"enable_encoder_swa_bounded_replay\",\n     \"enable_decoder_swa_bounded_replay\",\n+    \"enable_swa_recompute\",\n     \"enable_response_store\",\n     \"disaggregation_decode_host_receive_threshold\",\n )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Ffield_order.py",
+      "sha": "f211fac27b2d48e7bd8fa4e5296bc17fdba25d22",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fexec_.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fexec_.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/arg_groups/fields/exec_.py",
+      "patch": "@@ -98,6 +98,12 @@ class ExecFeatures(msgspec.Struct):\n         bool,\n         \"DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.\",\n     ] = False\n+    enable_swa_recompute: A[\n+        bool,\n+        \"DeepSeek-V4 SWA recompute: when a cached prefix kept its full KV but lost \"\n+        \"its sliding-window state, replay only the trailing dependency window \"\n+        \"instead of prefilling the prefix again. Experimental; CUDA.\",\n+    ] = False\n     sampling_mask_max_tokens: A[\n         int,\n         \"The maximum number of token IDs in a returned sampling mask. Requests \"",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fexec_.py",
+      "sha": "afd3821b49380dc9ebc72e4d925651d43a3750f0",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Fmodel_hook.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Fmodel_hook.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/arg_groups/model_hook.py",
+      "patch": "@@ -469,11 +469,13 @@ def handle_model_specific_adjustments(server_args: Any):\n     ]:\n         from sglang.srt.arg_groups.deepseek_v4_hook import (\n             validate_deepseek_v4_cp,\n+            validate_deepseek_v4_swa_recompute,\n             validate_deepseek_v41_features,\n         )\n \n         # Before the CP validation: V4.1 rejects CP outright, the actionable message.\n         validate_deepseek_v41_features(server_args)\n+        validate_deepseek_v4_swa_recompute(server_args)\n         validate_deepseek_v4_cp(server_args)\n \n         if get_platform().is_sm120:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Farg_groups%2Fmodel_hook.py",
+      "sha": "be4bf1b6a115b1cca1dec4d195be503181e69cda",
+      "status": "modified"
+    },
+    {
+      "additions": 14,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "patch": "@@ -941,6 +941,13 @@ def _tail_rows(\n _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048\n \n \n+def swa_recompute_floor(forward_batch: ForwardBatch) -> torch.Tensor:\n+    \"\"\"Per-token replay start: window rows below it were never rebuilt.\"\"\"\n+    extend_lens = forward_batch.extend_seq_lens.to(torch.int64)\n+    prefix_lens = forward_batch.seq_lens.to(torch.int64) - extend_lens\n+    return torch.repeat_interleave(prefix_lens, extend_lens).to(torch.int32)\n+\n+\n def _prefill_graph_max_seq_len() -> Optional[int]:\n     from sglang.srt.runtime_context import get_exec\n \n@@ -1531,6 +1538,8 @@ def low_ratio_prefill_graph(self) -> bool:\n     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:\n         max_seq_len = _prefill_graph_max_seq_len()\n         seq_lens_cpu = forward_batch.seq_lens_cpu\n+        if forward_batch.swa_recompute:\n+            return False\n         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:\n             return True\n         return int(seq_lens_cpu.max().item()) <= max_seq_len\n@@ -2571,6 +2580,11 @@ def _build_forward_metadata(\n                 need_compress=True,\n                 use_prefill_cuda_graph=use_prefill_cuda_graph,\n                 forward_batch=forward_batch,\n+                swa_replay_start=(\n+                    swa_recompute_floor(forward_batch)\n+                    if forward_batch.swa_recompute\n+                    else None\n+                ),\n             )\n         else:\n             raise NotImplementedError(f\"unsupported mode {forward_batch.forward_mode=}\")",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py",
+      "sha": "d10a88f7680be4040c9a79e6e0cb7fa7fa9a3027",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fcompressor_v2.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fcompressor_v2.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/layers/attention/dsv4/compressor_v2.py",
+      "patch": "@@ -85,6 +85,7 @@ def _forward_compress_all_in_one(\n         kv_layout: KVLayout = KVLayout.V4,\n         fp8_2buff: bool = False,\n         kv_cache_rope: Optional[torch.Tensor] = None,\n+        store: bool = True,\n     ) -> None:\n         assert compress_ratio == 4 or compress_ratio == 128\n         assert rotate == is_indexer == (head_dim == 128)\n@@ -120,6 +121,9 @@ def _forward_compress_all_in_one(\n             is_online=is_online,\n         )\n \n+        if not store:\n+            return\n+\n         # The AITER FP4 writer takes BF16; the compressor mirrors its FP32 norm\n         # weight so the conversion stays out of the per-layer forward.\n         norm_weight = norm.weight\n@@ -161,6 +165,11 @@ def forward_unified(\n     ) -> None:\n         if forward_batch.forward_mode.is_idle():\n             return\n+        # A replay keeps the cached pools and rebuilds only the 4x state, which\n+        # lives beside the SWA rows.\n+        store = not forward_batch.swa_recompute\n+        if not store and not is_overlap_compress(compressor.ratio):\n+            return\n \n         token_to_kv_pool = self.token_to_kv_pool\n         token_to_kv_pool = cast(\"DeepSeekV4TokenToKVPool\", token_to_kv_pool)\n@@ -250,6 +259,7 @@ def forward_unified(\n             kv_cache_rope=(\n                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)\n             ),\n+            store=store,\n         )\n         online_c128_mtp = getattr(self, \"online_c128_mtp\", None)\n         if online_c128_mtp is not None:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fcompressor_v2.py",
+      "sha": "46c665bb673989034b8190a887c6b370dcc99136",
+      "status": "modified"
+    },
+    {
+      "additions": 18,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/managers/schedule_batch.py",
+      "patch": "@@ -1187,6 +1187,12 @@ def __init__(\n         self.host_hit_length = 0\n         self.swa_host_hit_length = 0\n         self.mamba_host_hit_length = 0\n+        # Device FULL tokens past prefix_len that an SWA replay makes\n+        # reusable, and the key they were matched with.\n+        self.swa_recompute_hit_length = 0\n+        self.swa_recompute_key = None\n+        # Replay owed by this request's next forward (SWARecompute), or None.\n+        self.swa_recompute = None\n         # The branching point seqlen to track mamba state. If set, given by prefix\n         # match, it will be the tracked seqlen in the ping pong buffer for the\n         # right prefill pass.\n@@ -1936,6 +1942,8 @@ def reset_for_retract(self):\n         self.num_matched_prefix_tokens = 0\n         self.lock = None\n         self.swa_branching_seqlen = None\n+        self.swa_recompute_hit_length = 0\n+        self.swa_recompute_key = None\n         self.extend_end = None\n         self.dllm_initialized = False\n         self.is_retracted = True\n@@ -2395,6 +2403,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):\n     # of each request's first extend token (NgramEmbeddingManager).\n     engram_history: Optional[torch.Tensor] = None\n     encoder_swa_reset: Optional[List[bool]] = None\n+    # Per request: first prefix position whose SWA rows the worker rebuilds\n+    # before this extend, or None.\n+    swa_recompute_starts: Optional[List[Optional[int]]] = None\n \n     req_pool_indices: torch.Tensor = None  # shape: [b], int64\n     seq_lens: torch.Tensor = None  # shape: [b], int64\n@@ -2762,6 +2773,11 @@ def prepare_for_extend(self):\n             self.encoder_swa_reset = [\n                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs\n             ]\n+        if any(r.swa_recompute is not None for r in reqs):\n+            self.swa_recompute_starts = [\n+                None if r.swa_recompute is None else r.swa_recompute.take_start()\n+                for r in reqs\n+            ]\n         # Allocate memory\n         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(\n             self\n@@ -3533,6 +3549,8 @@ def prepare_for_decode(self):\n         # Decode embeds the last output token via embed_tokens; clear the stale\n         # prefill-time tensor so it doesn't leak into ForwardBatch.\n         self.input_embeds = None\n+        # The replay belongs to the prefill this batch just ran.\n+        self.swa_recompute_starts = None\n \n         self.mamba_cow_src_indices = None\n         self.mamba_cow_dst_indices = None",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py",
+      "sha": "3e4d6316318ec10c9553f5ac5fea21182dc4a81f",
+      "status": "modified"
+    },
+    {
+      "additions": 29,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_policy.py",
+      "changes": 31,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_policy.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 2,
+      "filename": "python/sglang/srt/managers/schedule_policy.py",
+      "patch": "@@ -1323,11 +1323,16 @@ def add_one_req(\n         # The temporary pin excludes this prefix from the evictable budget.\n         # Selection itself neither allocates slots nor materializes host hits.\n         with self._lock_node(req.last_node):\n+            # A replay reuses resident FULL like a host hit and needs SWA rows\n+            # for the whole replayed span.\n+            swa_recompute_len = (\n+                self.tree_cache.swa_recompute_len if req.swa_recompute_hit_length else 0\n+            )\n             admission = self._select_prefill_admission(\n                 req,\n                 total_tokens=total_tokens,\n-                host_hit_length=req.host_hit_length,\n-                swa_host_hit_length=req.swa_host_hit_length,\n+                host_hit_length=req.host_hit_length + req.swa_recompute_hit_length,\n+                swa_host_hit_length=req.swa_host_hit_length + swa_recompute_len,\n                 truncation_align_size=truncation_align_size,\n                 has_chunked_req=has_chunked_req,\n             )\n@@ -1440,6 +1445,28 @@ def add_one_req(\n                 req.prefix_len += req.host_loaded_length\n                 req.kv.cache_protected_len = req.prefix_len\n \n+            if req.swa_recompute_hit_length:\n+                recomputed = self.tree_cache.init_swa_recompute(\n+                    req, req.swa_recompute_key\n+                )\n+                req.swa_recompute_hit_length = 0\n+                req.swa_recompute_key = None\n+                if recomputed is None:\n+                    admission = self._select_prefill_admission(\n+                        req,\n+                        total_tokens=total_tokens,\n+                        host_hit_length=0,\n+                        swa_host_hit_length=0,\n+                        truncation_align_size=truncation_align_size,\n+                        has_chunked_req=has_chunked_req,\n+                    )\n+                    if isinstance(admission, AddReqResult):\n+                        return admission\n+                else:\n+                    gained_len, req.last_node, req.swa_recompute = recomputed\n+                    req.prefix_len += gained_len\n+                    req.kv.cache_protected_len = req.prefix_len\n+\n             # Sharded pools cannot load host KV; reserve scratch after all other gates.\n             if not self._kv_shard_reserve_scratch(\n                 prefix_len=admission.prefix_len, extend_len=admission.extend_len",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_policy.py",
+      "sha": "7dc5ea218afa29fce5b3bbc9b87da198954635f4",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler_components%2Fbatch_result_processor.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler_components%2Fbatch_result_processor.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
+      "patch": "@@ -266,6 +266,9 @@ def process_batch_result_prefill(\n         if self.is_generation:\n             if result.copy_done is not None:\n                 result.copy_done.synchronize()\n+            for req in batch.reqs:\n+                if req.swa_recompute is not None:\n+                    self.tree_cache.release_swa_recompute_workspace(req)\n             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(\n                 batch, result\n             )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler_components%2Fbatch_result_processor.py",
+      "sha": "cead7e052ae2e8efffcd0fb565a67cbbd0e0ea53",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Ftp_worker.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Ftp_worker.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/managers/tp_worker.py",
+      "patch": "@@ -619,6 +619,14 @@ def forward_batch_generation(\n                 # Replay reads restored main/indexer KV before the normal extend.\n                 run_encoder_swa_replay(self, batch)\n \n+            swa_recompute_outputs = []\n+            if batch.swa_recompute_starts is not None:\n+                from sglang.srt.model_executor.swa_recompute import run_swa_recompute\n+\n+                swa_recompute_outputs = run_swa_recompute(\n+                    self, batch, capture_hidden_mode\n+                )\n+\n             forward_batch = ForwardBatch.init_new(\n                 batch,\n                 self.model_runner,\n@@ -628,6 +636,7 @@ def forward_batch_generation(\n         else:\n             # FIXME(lsyin): unify the interface of forward_batch\n             assert forward_batch is not None\n+            swa_recompute_outputs = []\n             assert capture_hidden_mode is None, (\n                 \"capture_hidden_mode override requires a ScheduleBatch input\"\n             )\n@@ -650,6 +659,7 @@ def forward_batch_generation(\n                 expert_distribution_metrics=out.expert_distribution_metrics,\n                 routed_experts_output=out.routed_experts_output,\n                 indexer_topk_output=out.indexer_topk_output,\n+                swa_recompute_outputs=swa_recompute_outputs,\n                 kv_loc_plan=forward_batch.kv_loc_plan if return_kv_loc_plan else None,\n             )\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Ftp_worker.py",
+      "sha": "8d8b90d8084f8bc6f001ad710edbcee22f7d437e",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Futils.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Futils.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/managers/utils.py",
+      "patch": "@@ -62,6 +62,9 @@ class GenerationBatchResult:\n     accept_length_per_req_cpu: Optional[List[int]] = None\n     dllm_algo_state: Optional[List[Any]] = None\n     can_run_cuda_graph: bool = False\n+    # Replays that rebuilt cached SWA rows before this forward; a draft worker\n+    # that keeps per-token state rebuilds its own rows from them.\n+    swa_recompute_outputs: Optional[List[Any]] = None\n \n     # PP skip output comm: True when output send/recv was skipped and\n     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmanagers%2Futils.py",
+      "sha": "8a2b9ac3a9e0836c2c8d2d82871160a7080353b6",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fbase_prefix_cache.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmem_cache%2Fbase_prefix_cache.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/mem_cache/base_prefix_cache.py",
+      "patch": "@@ -314,6 +314,9 @@ class MatchResult(NamedTuple):\n     mamba_branching_seqlen: Optional[int] = None\n     cache_protected_len: Optional[int] = None\n     full_kv_hit_length: int = 0\n+    # Device FULL tokens past the SWA boundary that a trailing-window replay\n+    # makes reusable.\n+    swa_recompute_hit_length: int = 0\n     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.\n     cache_actions: Sequence[CacheAction | ComponentAction] = ()\n \n@@ -335,6 +338,7 @@ def zero_match_result(\n         swa_branching_seqlen=None,\n         mamba_host_hit_length=0,\n         full_kv_hit_length=0,\n+        swa_recompute_hit_length=0,\n     )\n \n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fbase_prefix_cache.py",
+      "sha": "7ed5542773e1ce4787ce144ba3c4ffc7e7ff799c",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fcache_init_params.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmem_cache%2Fcache_init_params.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/mem_cache/cache_init_params.py",
+      "patch": "@@ -47,6 +47,8 @@ class CacheInitParams:\n     chunked_prefill_size: Optional[int] = None\n \n     sliding_window_size: Optional[int] = None\n+    # Tokens a trailing-window replay covers; None disables SWA recompute.\n+    swa_recompute_len: Optional[int] = None\n \n     # Time-to-live for cache entries in seconds. If None, TTL is disabled.\n     cache_ttl_seconds: Optional[float] = None",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fcache_init_params.py",
+      "sha": "3cdad95f670f3774140cd6fba6e899df44cd4567",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fcommon.py",
+      "changes": 9,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmem_cache%2Fcommon.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 5,
+      "filename": "python/sglang/srt/mem_cache/common.py",
+      "patch": "@@ -212,12 +212,9 @@ def match_kv_cache(\n     if token_ids is None:\n         token_ids = req.origin_input_ids + req.output_ids\n \n+    key = _req_radix_key(tree_cache, req, token_ids, max_prefix_len)\n     match_result = tree_cache.match_prefix(\n-        MatchPrefixParams(\n-            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),\n-            cow_mamba=cow_mamba,\n-            req=req,\n-        )\n+        MatchPrefixParams(key=key, cow_mamba=cow_mamba, req=req)\n     )\n     if envs.SGLANG_RADIX_FORCE_MISS.get():\n         match_result = zero_match_result(\n@@ -242,6 +239,8 @@ def match_kv_cache(\n     max_len = req._compute_max_prefix_len(len(token_ids))\n     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)\n     req.swa_branching_seqlen = match_result.swa_branching_seqlen\n+    req.swa_recompute_hit_length = match_result.swa_recompute_hit_length\n+    req.swa_recompute_key = key if req.swa_recompute_hit_length else None\n     # A probe match keeps what it did not report; a new round resets both.\n     if match_result.mamba_branching_seqlen is not None:\n         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fcommon.py",
+      "sha": "50f572466d59a8b7d5871bdb9bba5577da54710a",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fkv_cache_builder.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmem_cache%2Fkv_cache_builder.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/mem_cache/kv_cache_builder.py",
+      "patch": "@@ -3,6 +3,7 @@\n import logging\n \n from sglang.srt.layers.dp_attention import get_dp_tp_group\n+from sglang.srt.mem_cache.unified_cache.swa_recompute import swa_recompute_len\n from sglang.srt.runtime_context import get_exec\n \n logger = logging.getLogger(__name__)\n@@ -355,6 +356,15 @@ def build_kv_cache(\n         attn_cp_size=parallel.attn_cp_size,\n         chunked_prefill_size=effective_chunked_prefill_size,\n         sliding_window_size=sliding_window_size,\n+        swa_recompute_len=(\n+            swa_recompute_len(\n+                sliding_window=sliding_window_size,\n+                num_layers=model_config.hf_config.num_hidden_layers,\n+                page_size=page_size,\n+            )\n+            if get_exec().features.enable_swa_recompute and is_hybrid_swa\n+            else None\n+        ),\n         mtp_draft_device_pools=mtp_draft_device_pools,\n     )\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Fkv_cache_builder.py",
+      "sha": "0d29d729baa67e240676fb2aa7475f77a59d98ce",
+      "status": "modified"
+    },
+    {
+      "additions": 144,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_cache%2Fswa_recompute.py",
+      "changes": 144,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_cache%2Fswa_recompute.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/mem_cache/unified_cache/swa_recompute.py",
+      "patch": "@@ -0,0 +1,144 @@\n+\"\"\"Cache side of DeepSeek-V4 SWA recompute: bind fresh SWA rows to a FULL\n+prefix that outlived its window, for the worker's replay to fill.\"\"\"\n+\n+from __future__ import annotations\n+\n+from typing import TYPE_CHECKING, Optional\n+\n+import msgspec\n+import torch\n+\n+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator\n+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import UnifiedSWAAllocatorBase\n+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams\n+from sglang.srt.mem_cache.radix_cache import RadixKey\n+from sglang.srt.utils.common import ceil_align\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req\n+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId\n+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache\n+\n+# A replay costs about a prefill of swa_recompute_len tokens; prefixes that\n+# save less than twice that are prefilled again instead.\n+_MIN_GAIN_RATIO = 2\n+\n+\n+def swa_recompute_len(*, sliding_window: int, num_layers: int, page_size: int) -> int:\n+    \"\"\"Tokens to replay so every layer's last window is exact: layer ``l`` reads\n+    window rows built from layer ``l - 1`` outputs, one window further back each.\"\"\"\n+    return ceil_align(\n+        ceil_align(sliding_window, page_size) + (num_layers - 1) * sliding_window,\n+        page_size,\n+    )\n+\n+\n+class SWARecompute(msgspec.Struct):\n+    # First prefix position the worker replays; page-aligned.\n+    start: int\n+    # FULL ids from ``start`` whose SWA rows only the replay reads; freed after the forward.\n+    workspace: torch.Tensor\n+    # False once a batch took the replay.\n+    pending: bool = True\n+\n+    def take_start(self) -> Optional[int]:\n+        pending, self.pending = self.pending, False\n+        return self.start if pending else None\n+\n+\n+def supports_swa_recompute(allocator) -> bool:\n+    return (\n+        isinstance(allocator, SWATokenToKVPoolAllocator)\n+        and not isinstance(allocator, UnifiedSWAAllocatorBase)\n+        and not allocator.swa_req_ring\n+    )\n+\n+\n+def _recomputable_full_len(\n+    cache: UnifiedRadixCache, key: RadixKey, matched_len: int\n+) -> tuple[int, Optional[NodeId]]:\n+    \"\"\"Device FULL length a replay can reach from ``matched_len``, else ``matched_len``.\"\"\"\n+    replay_len = cache.swa_recompute_len\n+    window = ceil_align(cache.sliding_window_size, cache.page_size)\n+    full_len, node_id, _ = cache.tree_core.match_full_device_prefix(key)\n+    full_len = full_len // cache.page_size * cache.page_size\n+    if full_len - matched_len < _MIN_GAIN_RATIO * replay_len:\n+        return matched_len, None\n+    window_start = full_len - window\n+    if cache.tree_core.swa_tombstone_ranges(key, window_start, full_len) != [\n+        (window_start, full_len)\n+    ]:\n+        return matched_len, None\n+    return full_len, node_id\n+\n+\n+def swa_recompute_hit_length(\n+    cache: UnifiedRadixCache, key: RadixKey, matched_len: int, full_kv_hit_length: int\n+) -> int:\n+    # full_kv_hit_length also counts host FULL, so it only bounds the gain.\n+    if full_kv_hit_length - matched_len < _MIN_GAIN_RATIO * cache.swa_recompute_len:\n+        return 0\n+    full_len, _ = _recomputable_full_len(cache, key, matched_len)\n+    return full_len - matched_len\n+\n+\n+def init_swa_recompute(\n+    cache: UnifiedRadixCache, req: Req, key: RadixKey\n+) -> Optional[tuple[int, NodeId, SWARecompute]]:\n+    \"\"\"Bind fresh SWA rows behind the FULL prefix and publish its last window.\n+    The window holds no data until the returned replay runs, so the request must\n+    enter the batch being built.\"\"\"\n+    matched_len = req.prefix_len\n+    full_len, node_id = _recomputable_full_len(cache, key, matched_len)\n+    if node_id is None:\n+        return None\n+    replay_len = cache.swa_recompute_len\n+    window = ceil_align(cache.sliding_window_size, cache.page_size)\n+    allocator = cache.token_to_kv_pool_allocator\n+    tree_core = cache.tree_core\n+\n+    tree_core.inc_full_pin(node_id)\n+    try:\n+        shortfall = replay_len - allocator.swa_available_size()\n+        if shortfall > 0:\n+            cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))\n+        if allocator.swa_available_size() < replay_len:\n+            return None\n+        gained = tree_core.collect_full_device_indices(node_id, req.last_node)[\n+            : full_len - matched_len\n+        ]\n+        replayed = gained[-replay_len:]\n+        swa_indices = allocator.swa_attn_allocator.alloc(replay_len)\n+        assert swa_indices is not None\n+        allocator.set_full_to_swa_mapping(replayed, swa_indices)\n+        for action in tree_core.attach_swa_window(\n+            key,\n+            full_len - window,\n+            full_len,\n+            swa_indices[-window:].to(torch.int64),\n+        ):\n+            cache._apply_cache_action(action)\n+    finally:\n+        tree_core.dec_full_pin(node_id)\n+\n+    match = cache.match_prefix(MatchPrefixParams(key=key))\n+    assert match.device_prefix_len == full_len, (\n+        f\"SWA recompute published [{full_len - window}, {full_len}) but the \"\n+        f\"prefix matches {match.device_prefix_len} tokens\"\n+    )\n+    return (\n+        full_len - matched_len,\n+        match.last_device_node,\n+        SWARecompute(start=full_len - replay_len, workspace=replayed[:-window]),\n+    )\n+\n+\n+def release_swa_recompute_workspace(cache: UnifiedRadixCache, req: Req) -> None:\n+    recompute = req.swa_recompute\n+    if recompute is None:\n+        return\n+    req.swa_recompute = None\n+    # Whole pages from a page-aligned start: the segment free needs no torch.unique.\n+    cache.token_to_kv_pool_allocator.free_swa_segment(\n+        recompute.workspace, start_pos=recompute.start\n+    )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_cache%2Fswa_recompute.py",
+      "sha": "c1d8e93004321415b07fb0a537013f2ca4113b9f",
+      "status": "added"
+    },
+    {
+      "additions": 34,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_radix_cache.py",
+      "changes": 34,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_radix_cache.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/mem_cache/unified_radix_cache.py",
+      "patch": "@@ -82,6 +82,13 @@\n     UnifiedSessionRefTracker,\n )\n from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment\n+from sglang.srt.mem_cache.unified_cache.swa_recompute import (\n+    SWARecompute,\n+    init_swa_recompute,\n+    release_swa_recompute_workspace,\n+    supports_swa_recompute,\n+    swa_recompute_hit_length,\n+)\n from sglang.srt.mem_cache.unified_cache.tree_core_registry import (\n     create_tree_core,\n     select_tree_core_backend,\n@@ -213,6 +220,12 @@ def __init__(\n         self._sliding_window_size = (\n             params.sliding_window_size if self.is_swa_enabled else None\n         )\n+        self.swa_recompute_len = (\n+            params.swa_recompute_len\n+            if self.is_swa_enabled\n+            and supports_swa_recompute(params.token_to_kv_pool_allocator)\n+            else None\n+        )\n         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,\n         # evictable leaves) and drives the components' tree-level hooks.\n         self._tree_core_backend = select_tree_core_backend(params)\n@@ -594,8 +607,29 @@ def _match_tree(self, params: MatchPrefixParams) -> MatchResult:\n         assert not result.cache_actions\n         if self.linker is not None and params.req is not None:\n             result = self.linker.match(params.key, params.req, result)\n+        if (\n+            self.swa_recompute_len is not None\n+            and result.host_hit_length == 0\n+            and result.swa_host_hit_length == 0\n+        ):\n+            result = result._replace(\n+                swa_recompute_hit_length=swa_recompute_hit_length(\n+                    self,\n+                    params.key,\n+                    result.device_prefix_len,\n+                    result.full_kv_hit_length,\n+                )\n+            )\n         return result\n \n+    def init_swa_recompute(\n+        self, req: Req, key: RadixKey\n+    ) -> Optional[tuple[int, NodeId, SWARecompute]]:\n+        return init_swa_recompute(self, req, key)\n+\n+    def release_swa_recompute_workspace(self, req: Req) -> None:\n+        release_swa_recompute_workspace(self, req)\n+\n     def supports_fast_match_prefix(self) -> bool:\n         return self.tree_core.supports_fast_match_prefix()\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmem_cache%2Funified_radix_cache.py",
+      "sha": "2e8b19bf914ce713f1c2bd526a3dd0a1fcb2782a",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmodel_executor%2Fforward_batch_info.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodel_executor%2Fforward_batch_info.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/model_executor/forward_batch_info.py",
+      "patch": "@@ -760,6 +760,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):\n     # For ngram embedding\n     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None\n     encoder_swa_replay: bool = False\n+    # Replay of cached prefix tokens that rebuilds only their SWA rows.\n+    swa_recompute: bool = False\n \n     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's\n     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmodel_executor%2Fforward_batch_info.py",
+      "sha": "e5079767558c69088a632638c3547e3b2b0861b8",
+      "status": "modified"
+    },
+    {
+      "additions": 92,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmodel_executor%2Fswa_recompute.py",
+      "changes": 92,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodel_executor%2Fswa_recompute.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "python/sglang/srt/model_executor/swa_recompute.py",
+      "patch": "@@ -0,0 +1,92 @@\n+\"\"\"Rebuild the trailing SWA window of a cached DeepSeek-V4 prefix by replaying\n+its last ``swa_recompute_len`` tokens. The replay reads compressed and indexer\n+entries from the cache and writes only SWA rows and the 4x compressor state.\"\"\"\n+\n+from copy import copy\n+from typing import List\n+\n+import msgspec\n+import torch\n+\n+from sglang.srt.layers.logits_processor import LogitsProcessorOutput\n+from sglang.srt.managers.schedule_batch import ScheduleBatch\n+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan\n+\n+\n+class SWARecomputeOutput(msgspec.Struct):\n+    # Extend-shaped view of the replayed span: prefix_lens, extend_lens, out_cache_loc.\n+    batch: ScheduleBatch\n+    logits_output: LogitsProcessorOutput\n+    kv_loc_plan: KVLocPlan\n+\n+\n+def _replay_batch(batch: ScheduleBatch, i: int, start: int, runner) -> ScheduleBatch:\n+    end = batch.prefix_lens[i]\n+    req = batch.reqs[i]\n+    slot = batch.req_pool_indices[i : i + 1]\n+    device = runner.device\n+    replay = copy(batch)\n+    replay.reqs = [req]\n+    replay.input_ids = torch.tensor(\n+        list(req.full_untruncated_fill_ids[start:end]),\n+        dtype=torch.int64,\n+        device=device,\n+    )\n+    replay.prefill_input_ids_cpu = None\n+    replay.req_pool_indices = slot\n+    replay.req_pool_indices_cpu = batch.req_pool_indices_cpu[i : i + 1]\n+    replay.prefix_lens = [start]\n+    replay.extend_lens = [end - start]\n+    replay.extend_num_tokens = end - start\n+    replay.seq_lens = torch.tensor([end], dtype=torch.int64, device=device)\n+    replay.seq_lens_cpu = torch.tensor([end], dtype=torch.int64)\n+    replay.seq_lens_sum = end\n+    replay.orig_seq_lens = replay.seq_lens\n+    replay.out_cache_loc = runner.req_to_token_pool.req_to_token[\n+        slot[0], start:end\n+    ].long()\n+    replay.return_logprob = False\n+    replay.top_logprobs_nums = None\n+    replay.token_ids_logprobs = None\n+    replay.extend_logprob_start_lens = [end - start]\n+    replay.extend_input_logprob_token_ids = None\n+    replay.is_prefill_only = True\n+    replay.spec_info = None\n+    replay.sampling_info = None\n+    replay.has_grammar = False\n+    replay.multimodal_inputs = [None]\n+    replay.engram_history = None\n+    replay.swa_recompute_starts = None\n+    return replay\n+\n+\n+def run_swa_recompute(\n+    worker, batch: ScheduleBatch, capture_hidden_mode\n+) -> List[SWARecomputeOutput]:\n+    from sglang.srt.model_executor.forward_batch_info import (\n+        CaptureHiddenMode,\n+        ForwardBatch,\n+    )\n+\n+    runner = worker.model_runner\n+    outputs = []\n+    for i, start in enumerate(batch.swa_recompute_starts):\n+        if start is None:\n+            continue\n+        replay = _replay_batch(batch, i, start, runner)\n+        forward_batch = ForwardBatch.init_new(\n+            replay,\n+            runner,\n+            capture_hidden_mode=capture_hidden_mode or CaptureHiddenMode.NULL,\n+            return_hidden_states_before_norm=False,\n+        )\n+        forward_batch.swa_recompute = True\n+        out = runner.forward(forward_batch)\n+        outputs.append(\n+            SWARecomputeOutput(\n+                batch=replay,\n+                logits_output=out.logits_output,\n+                kv_loc_plan=forward_batch.kv_loc_plan,\n+            )\n+        )\n+    return outputs",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fmodel_executor%2Fswa_recompute.py",
+      "sha": "66bf463b98f30ea0e685f5b6813ad596521559f3",
+      "status": "added"
+    },
+    {
+      "additions": 31,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fspeculative%2Fdspark_components%2Fdspark_worker_v2.py",
+      "changes": 40,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fspeculative%2Fdspark_components%2Fdspark_worker_v2.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 9,
+      "filename": "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py",
+      "patch": "@@ -661,6 +661,36 @@ def _forward_prefill(\n         if on_publish is not None:\n             on_publish(batch_output.new_seq_lens)\n \n+        self._inject_prefill_target_hidden(\n+            batch,\n+            logits_output,\n+            batch_output.kv_loc_plan,\n+            next_token_ids.device,\n+            target_hidden_is_projected,\n+        )\n+        batch_output.kv_loc_plan = None\n+        for replay in batch_output.swa_recompute_outputs or ():\n+            self._inject_prefill_target_hidden(\n+                replay.batch,\n+                replay.logits_output,\n+                replay.kv_loc_plan,\n+                next_token_ids.device,\n+                target_hidden_is_projected,\n+            )\n+        batch_output.next_draft_input = make_next_draft_input(\n+            bonus_tokens=next_token_ids,\n+            new_seq_lens=new_seq_lens,\n+        )\n+        return batch_output\n+\n+    def _inject_prefill_target_hidden(\n+        self,\n+        batch: ScheduleBatch,\n+        logits_output,\n+        kv_loc_plan,\n+        device,\n+        target_hidden_is_projected: bool,\n+    ) -> None:\n         if logits_output.hidden_states is None:\n             raise RuntimeError(\n                 \"DSpark requires target aux hidden capture for prefill, but got None. \"\n@@ -675,7 +705,6 @@ def _forward_prefill(\n \n         # Must inject before prefill returns: the scheduler may update radix\n         # afterward, invalidating out_cache_loc.\n-        device = next_token_ids.device\n         pin_memory = is_pin_memory_available(device)\n         ctx_lens = torch.tensor(\n             batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory\n@@ -708,8 +737,7 @@ def _forward_prefill(\n                 output_size=num_tokens,\n             )\n         # The draft KV goes to the slots the target prefill just wrote.\n-        cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)\n-        batch_output.kv_loc_plan = None\n+        cache_loc = self._kv_injector.ids_for(kv_loc_plan)\n         token_indices = logits_output.hidden_states_token_indices\n         if token_indices is not None:\n             cache_loc = cache_loc[token_indices]\n@@ -729,12 +757,6 @@ def _forward_prefill(\n         logits_output.hidden_states = None\n         logits_output.hidden_states_token_indices = None\n \n-        batch_output.next_draft_input = make_next_draft_input(\n-            bonus_tokens=next_token_ids,\n-            new_seq_lens=new_seq_lens,\n-        )\n-        return batch_output\n-\n     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):\n         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:\n             return None",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/python%2Fsglang%2Fsrt%2Fspeculative%2Fdspark_components%2Fdspark_worker_v2.py",
+      "sha": "ffc7fd96316ccf9080c8d70d436da8b411c8a472",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/test%2Fregistered%2Funit%2Fmanagers%2Ftest_batch_result_processor_hidden_states.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmanagers%2Ftest_batch_result_processor_hidden_states.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "test/registered/unit/managers/test_batch_result_processor_hidden_states.py",
+      "patch": "@@ -161,6 +161,7 @@ def __init__(self, *, rid: str, inflight_middle_chunks: int, return_hidden_state\n         self.return_hidden_states = return_hidden_states\n         self.hidden_states = []\n         self.is_retracted = False\n+        self.swa_recompute = None\n         self.output_ids = []\n         self.time_stats = Mock()\n         self.return_logprob = False",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/test%2Fregistered%2Funit%2Fmanagers%2Ftest_batch_result_processor_hidden_states.py",
+      "sha": "50db971e053cceee30aab87c48d0cc37ccac7c93",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/918928321fa8b0572170aa40f30128e94a52e0bb/test%2Fregistered%2Funit%2Fmanagers%2Ftest_prefill_adder.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmanagers%2Ftest_prefill_adder.py?ref=918928321fa8b0572170aa40f30128e94a52e0bb",
+      "deletions": 0,
+      "filename": "test/registered/unit/managers/test_prefill_adder.py",
+      "patch": "@@ -133,6 +133,7 @@ def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time\n         req.retracted_stain = False\n         req.host_hit_length = 0\n         req.swa_host_hit_length = 0\n+        req.swa_recompute_hit_length = 0\n         req.storage_hit_length = 0\n         req.storage_hit_start = None\n         req.host_hit_is_storage = False\n@@ -194,6 +195,7 @@ def create_shared_req(self, rid, max_new_tokens=4):\n         req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)\n         req.sampling_params.ignore_eos = False\n         req.swa_host_hit_length = 0\n+        req.swa_recompute_hit_length = 0\n         req.last_node = MagicMock()\n         req.full_untruncated_fill_ids = list(range(12))\n         return req\n@@ -1134,6 +1136,7 @@ def test_swa_admission_admits_short_cached_resume_at_two_window_pool(self):\n         req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))\n         req.host_hit_length = 0\n         req.swa_host_hit_length = 0\n+        req.swa_recompute_hit_length = 0\n         req.last_node = MagicMock()\n         req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/918928321fa8b0572170aa40f30128e94a52e0bb/test%2Fregistered%2Funit%2Fmanagers%2Ftest_prefill_adder.py",
+      "sha": "b5ef097ad9cf16e77032305c7ac816d4e45ea60e",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "@xiezhq-hermann could you review this? It is a smaller version of #31713, which you are assigned on, and it touches the unified radix cache and the SWA allocator path.\n\n@jellysnack this reuses your replay-length formula and gain threshold from #31713. Could you check that it covers what you need, and say if you would rather land yours?\n\ncc @hnyls2002 for the scheduler and batch changes.\n\nCI needs the `run-ci` label.",
+      "created_at": "2026-10-07T18:26:07Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43009#issuecomment-6044199804",
+      "updated_at": "2026-10-07T18:26:07Z",
+      "user": {
+        "login": "vincentzed"
+      }
+    },
+    {
+      "body": "I merged main into this branch because it had a conflict in `schedule_batch.py`.\n\n- main removed `Req.prefix_indices` and `Req.extend_range` (#42822, #42824, #42825) and moved the cache match into `match_kv_cache`. The replay bookkeeping now lives in `match_kv_cache` and uses `req.prefix_len`.\n- The scheduler unit tests in `test/registered/unit/managers` failed on this PR because their request stubs did not have the new replay fields. I added the fields to the stubs and the tests pass again.\n- I ran the two rebuild rows of the accuracy table and the two flag-on rows of the timing table again on the merged branch. The results are in the PR description and match the earlier runs.",
+      "created_at": "2026-10-08T00:37:22Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43009#issuecomment-6049724127",
+      "updated_at": "2026-10-08T00:37:22Z",
+      "user": {
+        "login": "vincentzed"
+      }
+    },
+    {
+      "body": "Merged main at `943621c336` to clear a conflict. Two things in main had changed under this PR, so the rebuild code was updated:\n\n- `MatchResult.device_indices` is now `device_prefix_len`.\n- The DSpark draft model now gets its write locations from `kv_loc_plan`, so the replay passes its own plan.\n\nThe DSpark rebuild row was run again after the merge: 8/8 hits, average KL 0.0040, 0.22 s after eviction against 2.21 s cold, no scheduler exceptions. The description has the numbers.",
+      "created_at": "2026-10-08T12:58:42Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43009#issuecomment-6060396456",
+      "updated_at": "2026-10-08T12:58:42Z",
+      "user": {
+        "login": "vincentzed"
+      }
+    }
+  ],
+  "number": 43009,
+  "refs": {
+    "base": {
+      "commit": "fc3385d53005945473bca42ae62e9635cea1d6ca",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "918928321fa8b0572170aa40f30128e94a52e0bb",
+      "repository": "vincentzed/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": []
+}

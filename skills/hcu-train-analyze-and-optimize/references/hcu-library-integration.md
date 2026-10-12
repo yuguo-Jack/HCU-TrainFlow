@@ -18,18 +18,36 @@
 
 先选择与热点直接相关的一两条候选路径，说明收益假设与排除理由。可以复用实现，也可以移植局部机制；不为“联动”重装全栈。不把某后端 `import` 成功、接口同名、README 上的速度或某个 gfx code object 存在视作目标训练通过。
 
+融合候选还需区分 forward-only 与完整反向、逻辑 shape 与量化/预排布后的物理 shape、写入范围与调用方初始化责任。用非零/非有限哨兵检查未写区域和尾部，核对概率/中间张量的舍入点；不能仅凭 dtype 相同宣称数值等价。新例程或源码中的理论优化不等于生产 dispatcher 已采用，测试默认关闭参考校验或 CI allow-failure 也不构成正确性通过。
+
+编译器升级时核对实际 intrinsic 累加精度、低精度 packing/scale ABI 和最终代码的等待/同步。源码 load 数量可能因向量化而不同于机器事务数；`vmcnt` 非零不能单独证明有效重叠，目标资源上限也不等于实际 VGPR 用量或 occupancy。按当前 HCU 知识和 kernel Skill 继续查 IR/ISA/性能计数器，不复制另一 gfx 的指令门禁或把 no-NaN 假设当通用加速开关。
+
 **新增实现的归属：** 当前 HCU 各库均无适用实现的通用训练 HIP 算子，默认放 HCU Flash-Train；增强 TE 既有算子、接口或优化器实现则交 HCU TE，Primus Turbo 自有模块交其 HCU 仓。引擎保留调用接入、配置和集成测试，不复制通用 kernel。先在独立开发树完成验证，整合/PR 沿用任务的完整工作流交付顺序，不中途切换执行基线。
 
 ## 2. HCU 分支与能力边界的检索入口
 
-下列为 **2026-10-10 读取 HCU-Knowledge 保留报告的来源**，不是本轮新编译或新硬件验证。实际使用前核对当前仓和部署版本；当 GitHub HYGON 同用途仓与内部等价时优先公开，内部实质领先用其活跃分支。
+下表由 **2026-10-12 的 HCU-Knowledge 工程报告**核对，提供仓库身份和分支选择起点，不固定未来任务依赖，也不宣称本轮编译验证。实际操作先用 `$hcu-knowledge-search` 查工程报告和最新来源决策，再确认现场版本与当前源码；同用途公开 HYGON 仓实质同步时优先公开，内部领先则用内部适用分支。DTK `:20080` 与 DAS `:10068` 是两个权限域。
 
-- `primus-turbo`：内部 `dcutoolkit/deeplearing/Primus-Turbo`，通用 HCU 线 `wyf-main@717671bc4597f4f0850324b1dca37589b0b06195`；`perf/hygon-megamoe-asm-final` 为专项线，不能因名字新就替代通用线。先读 `tools/hygon_setup_utils.py`、`primus_turbo/common/hygon_runtime_utils.py`、`pytorch/core/backend.py`、`ops/grouped_gemm.py` 和实际 MoE dispatcher。现有构建识别有 DTK 版本限制、AICC/CK/外部 DeepEP 要求；升级镜像后须复核。shape profile 是采样/调试功能，与正式计时分开。
-- `uccl`：内部 `dcutoolkit/deeplearing/uccl`，`main@c84261ae83158e307decfc18b290212f3fcd1b37`。区分 `collective/`、`p2p/Makefile.dtk` 与 `ep/setup.py` 三条路径；核实 provider、rail、CPU proxy、真实gfx及Torch ABI。DeepEP接口风格相近不代表handle可互换。
-- `ultraep`：内部 `dcutoolkit/deeplearing/ultraep`，`develop@876af49045f36608ebe1743f070786959de83c3f`。当前入口 `docs/hcu.md`、`build_hcu_shca.sh`、`tests/hcu/`；按所需路径追 `weight_sync`、`reroute`、`grad_reduce`、runtime/provider。旧 `dcu_*` 路径需对版本，DTK/HCU同义不代表历史命令原封可用。
-- `moonep`：内部 `dcutoolkit/deeplearing/MoonEP`，`develop@d913e0088c11966dcdcf45d059e3955ec6c3bccb`；`master` 仅初始化。保留报告描述的是节点内 BF16、同步、单 inflight、`zero_copy=True` 的候选，不能假定跨节点、FP8、graph、公共异步event或Megatron集成已支持。读 `README_CN.md`、`RELEASE_COMPATIBILITY.md`、`moonep/api.py`、`tests/TEST_MATRIX.md`，再追 native 实现。
+| HCU 工程 / 源码入口 | 已登记分支与修改归属 |
+| --- | --- |
+| [RCCL](http://42.228.13.241:20080/dcutoolkit/deeplearing/rccl) | `develop` 为集成线；collective 调度、拓扑、transport、设备侧通信归此仓。directRS/XDP/p2p 专项须单独确认是否合入 |
+| [rccl-test](http://42.228.13.241:20080/dcutoolkit/driverruntime/rccl-test) | `dtk-26.04.2` 测试集成线；负责复现与计时/正确性测试，不是通信算法库。AMD RCCL 仅作上游参考 |
+| [Transformer Engine](http://42.228.13.241:10068/dcutoolkit/deeplearing/TransformerEngine) | HCU `release_v2.16` 配套线与 `main`；模块、低精度状态、融合及接口归此仓。公开同名仓须确认确有 HCU 后端 |
+| [Flash-Train](https://github.com/HYGON-AI/flash-train) | `develop` 综合入口；优先复用训练融合算子，没有适用实现的通用 HIP 算子默认交这里 |
+| [Primus Turbo](http://42.228.13.241:10068/dcutoolkit/deeplearing/Primus-Turbo) | `wyf-main` 为综合 HCU 线，`perf/hygon-megamoe-asm-final` 是专项；自有算子/backend 归这里，并核对 Primus patch、CK/hipBLASLt/AICC 依赖 |
+| [rocSHMEM](https://github.com/HYGON-AI/rocSHMEM-das) | `develop`；设备侧单边通信、heap、provider/SHCA 与内存可见性。消费者实际 gitlink 优先于该分支 HEAD |
+| [DeepEP](http://42.228.13.241:10068/dcutoolkit/deeplearing/DeepEP) | `ci-release` 当前内部集成线；[公开仓](https://github.com/HYGON-AI/DeepEP-das)落后能力需按当前决策比较，不直接替代 |
+| [UCCL](http://42.228.13.241:10068/dcutoolkit/deeplearing/uccl) | `main`；分别确认 `collective/`、`p2p/`、`ep/`。不能把整个仓当单一 RCCL 替换库 |
+| [UltraEP](https://github.com/HYGON-AI/UltraEP-das) | `main` 已为公开主来源；专家复制、reroute、weight sync、grad reduce，内部 `develop` 保留配套参考 |
+| [MoonEP](http://42.228.13.241:10068/dcutoolkit/deeplearing/MoonEP) | `develop`，`master` 仅历史初始化；按实际版本检查 dispatch/combine、G1、同步和单/多节点支持 |
+| [MORI](http://42.228.13.241:10068/dcutoolkit/deeplearing/mori) | `dcu-mori-ep-internodev1ll`；MORI EP、MORI-SHMEM 和独立 morishmem 源不能互相代替 |
+| [rocBLAS](http://42.228.13.241:20080/dcutoolkit/mathlibs/rocblas) / [hipBLASLt](http://42.228.13.241:20080/dcutoolkit/mathlibs/hipblaslt) | 前者 `dtk-26.10.1`，后者 `chitu-develop-bw-nmz` 与对应发版线；先分析真实 bench 命令和 tune 需求，再决定算法/dispatch 修复 |
+| [DCC](http://42.228.13.241:20080/dcutoolkit/driverruntime/llvm-project) / [AICC](http://42.228.13.241:10068/dcutoolkit/deeplearing/aicc/llvm-project) | DCC `develop-6.0.0` 是 DTK HIP 编译器体系；AICC `dtk-llvm-6.3.3` / `dtk-llvm-7.2.1` 是独立 AI 编译器，不因同名 llvm-project 混用 |
+| [Galaxy](http://42.228.13.241:20080/dcutoolkit/driverruntime/galaxy) | `develop-merge-rock714` 为已选集成线；runtime、stream/event、调度/内存问题先做最小复现，再查对应运行版本 |
 
-统一知识入口为 HCU-Knowledge `knowledge/projects/<project>/knowledgebase/local/overview/engineering-guide.md`；搜索结果提供固定源码与原件。不写死别人的本机知识库路径。没有权限或内容落后时如实记录，并在当前授权范围读取上游/内部新源码，不能换成 AMD/NVIDIA 同名仓假装 HCU 已支持。
+CK、Flux、MIOpen、PyTorch/Inductor 等未在表中逐一列出的真实依赖也可按根因修改：从大知识库的对应项目取仓库身份，再沿引擎 build/lock/gitlink 和已加载制品确定目标，不能凭包名拼仓库 URL。权限不足保留缺口，不拿 NVIDIA/AMD 同名源码当作 HCU 实现。
+
+统一知识入口为 HCU-Knowledge `knowledge/projects/<project>/knowledgebase/local/overview/engineering-guide.md`；搜索结果提供固定源码、PR/MR 与原件。这里仅登记引用与归属，内部实现仍在其受控来源，不复制到公开 Wiki。库调用、架构/ABI、provider、精度与完成语义必须与本次任务相符。
 
 ## 3. 必要时修改和重编底层库
 

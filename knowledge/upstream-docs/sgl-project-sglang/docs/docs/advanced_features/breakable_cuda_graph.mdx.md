@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
 path: docs/docs/advanced_features/breakable_cuda_graph.mdx
-raw_sha256: e2d1041c87273e5809eee90c5fa86811c5d7eb4fa96df1a1541e0b95cdc35abc
+raw_sha256: 47f1b693dc26ea5273101520be4518ed1f90ce52273504c4753e6507042bdadb
 sources: []
-generated_body_sha256: 68f8aa26e77430fca78c8915ba8a18d6540c2e06208526220d6cc1b905c9b7af
+generated_body_sha256: 0ef657ec47e2e7931f6a96245e768f6a172f33c82981f3fd01f6224ed4afaf51
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/breakable_cuda_graph.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/breakable_cuda_graph.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/docs/docs/advanced_features/breakable_cuda_graph.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -63,7 +63,7 @@ For production use, you can mark specific functions as "non-graphable" using the
 ```python
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
 
-@eager_on_graph(enable=True)
+@eager_on_graph
 def my_dynamic_op(x):
     # This op is incompatible with CUDA graph capture
     return some_dynamic_operation(x)

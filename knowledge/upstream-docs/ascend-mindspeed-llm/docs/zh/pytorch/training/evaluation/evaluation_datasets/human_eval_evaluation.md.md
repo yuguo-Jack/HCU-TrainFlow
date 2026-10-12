@@ -1,0 +1,84 @@
+---
+id: doc-ascend-mindspeed-llm-6f68fcdb7b492cef05df
+title: Ascend/MindSpeed-LLM / docs/zh/pytorch/training/evaluation/evaluation_datasets/human_eval_evaluation.md
+engine: mindspeed
+kind: source-document
+review_level: source-reported
+runtime_validated: false
+stages:
+- adapt
+- optimize
+- fault-tolerance
+repository: Ascend/MindSpeed-LLM
+commit: 2fed626696175480ae1ab3342a94017301a25209
+path: docs/zh/pytorch/training/evaluation/evaluation_datasets/human_eval_evaluation.md
+raw_sha256: 9060cb26f5fdd8a9b259933fc5c9ffe11eeac489ca0c49c8826f917cbb07575f
+sources: []
+generated_body_sha256: ab3acb785454e4e705732cc39623a4bd91a7788ea122ec23a03de95ea08b86cd
+source_state: current-scan
+---
+
+# Ascend/MindSpeed-LLM / docs/zh/pytorch/training/evaluation/evaluation_datasets/human_eval_evaluation.md
+
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/evaluation/evaluation_datasets/human_eval_evaluation.md)
+
+Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
+
+---
+
+# HumanEval 评估
+
+## 使用场景
+
+### 问题描述
+
+- 大语言模型在代码生成的评估领域，如何精准衡量模型生成代码的质量与正确性是一个关键问题。HumanEval 数据集为这一难题提供了有效的解决方案。
+- 旨在客观、系统地评估代码生成模型的性能，以确定其生成代码在实际场景中的可靠性和实用性，助力模型的优化与改进，使其更好地满足软件开发等实际应用需求。
+
+### 特性介绍
+
+HumanEval 数据集具有诸多显著特性：
+
+- 包含一系列具有代表性的编程问题，这些问题涵盖了多种常见的编程任务场景，如数据结构操作、算法实现、字符串处理等，能够全面考察代码生成模型在不同领域的表现。
+- 数据集中的每个问题都配备了详细的描述以及对应的测试用例，为评估提供了明确的标准和依据，确保评估结果的客观性和准确性。
+- 其问题设计注重代码的可读性与规范性，促使模型生成高质量、易维护的代码，贴合实际开发中的代码要求，从而在多方面对代码生成模型进行综合考量，推动模型性能的提升，以适应复杂多变的编程应用场景。
+
+MindSpeed-LLM 会对 `human_eval` 问题集中的内容进行评估。`human_eval` 是 HumanEval 数据集在代码目录中的任务名称。
+
+## 使用方法
+
+### 1. 直接评估模式（默认）
+
+#### 使用影响
+
+- MindSpeed-LLM 对 `human_eval` 的评估不会使用任何的提示模板，而是直接对目标问题进行评估和输出最终答案。即模型直接接收问题-段落对，无需任何提示模板。
+
+- 该模式会使用束搜索的方法进行模型推理的输出。
+
+- 大语言模型对每个问题输出答案后，程序会通过 `logger.info` 的形式，来提示用户该问题是否评估通过。
+
+#### 推荐参数配置
+
+【--max-new-tokens】
+
+设置为 1024，确保代码可以输出完整。
+
+### 2. 平替模板输出模式
+
+#### 使用影响
+
+- 与`直接评估模式`相同的是，此种评估模式也不会使用任何自定义提示词（Prompt）。
+
+- 该模式会使用常规的推理方法进行模型推理的输出。即不进行任何采样或束搜索的推理方法。
+
+- 与`直接评估模式`不同的是，该模式会在全部问题推理结束后，统一对模型的推理结果进行评判。
+
+#### 推荐参数配置
+
+【--alternative-prompt】
+
+设为 true 可使能平替模板输出模式。
+
+【--max-new-tokens】
+
+设置为 1024，确保代码可以输出完整。
