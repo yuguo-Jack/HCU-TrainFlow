@@ -95,7 +95,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 本地主控按依赖和收益拆解任务，独立方向并行，共享资源测量与耦合修改协调执行；代码以固定快照同步远端，超时或断线先核查原作业。HCU-Knowledge、HCU-TrainFlow-Wiki、PR 与源码查证贯穿三个阶段，看板持续展示技术结论并采集指导。各阶段按范围交付代码、配方、验证和回退方法；完整任务在执行基线上完成约定验证后再整合目标主仓，精选通用经验和最终里程碑进入共享 Wiki。
 
-阶段入口分别为 `$hcu-train-environment-check-and-adapt`（环境检查与模型适配）、`$hcu-train-analyze-and-optimize`（性能分析与优化）、`$hcu-train-scale-and-stability`（规模扩展与长稳运行）；统一委托仍使用 `$hcu-trainflow`。也可仅委托接手已有修改、代码审查或提 PR，直接执行[交付规范](docs/change-delivery.md)，无需重新开展训练阶段。发生异常时按 [故障诊断指南](skills/hcu-train-scale-and-stability/references/diagnosis.md) 分流，结合 HCU 知识库、线上 PR 与实际源码查证，修复后回到对应阶段验收。
+阶段入口分别为 `$hcu-train-check-and-adapt`（环境检查与模型适配）、`$hcu-train-analyze-and-optimize`（性能分析与优化）、`$hcu-train-scale-and-stability`（规模扩展与长稳运行）；统一委托仍使用 `$hcu-trainflow`。也可仅委托接手已有修改、代码审查或提 PR，直接执行[交付规范](docs/change-delivery.md)，无需重新开展训练阶段。发生异常时按 [故障诊断指南](skills/hcu-train-scale-and-stability/references/diagnosis.md) 分流，结合 HCU 知识库、线上 PR 与实际源码查证，修复后回到对应阶段验收。
 
 完整分支、优化回路、独立任务与验收条件见 [工作流全景](docs/workflow-map.md)。
 
@@ -155,6 +155,8 @@ $env:TRAINFLOW_WORKSPACE = "D:/trainflow-work/my-task"
 ```
 
 已有独立知识库时加 `--knowledge-root /path/to/HCU-Knowledge`，复用原件、索引与配置，不重复克隆、不拉取其上游更新。缺少私有仓权限、LFS 原件或索引不可用时安装会报告未完成；不会静默跳过。飞书等在线能力另用本人账号授权。详见 [依赖与安装说明](docs/integrations.md)。
+
+可选安装 [KernelWiki](https://github.com/mit-han-lab/KernelWiki) 为算子优化提供 NVIDIA 案例、PR 和源码参考：在上面的安装命令加 `--with-kernelwiki`，共安装 12 个 Skill。默认不安装；已有环境的单独补装方式见[安装说明](docs/integrations.md#可选-kernelwiki)。
 
 ### 后续更新
 

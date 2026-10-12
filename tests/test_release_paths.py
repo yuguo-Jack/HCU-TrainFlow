@@ -74,17 +74,18 @@ def test_skill_install_idempotent_and_cleans_successful_backup(tmp_path):
     cmd=[sys.executable,str(script),'--target',str(target),'--workflow-only']
     assert subprocess.run(cmd,capture_output=True).returncode==0
     assert subprocess.run(cmd,capture_output=True).returncode==0
-    changed=target/'hcu-train-environment-check-and-adapt/SKILL.md';changed.write_text('local modified')
+    changed=target/'hcu-train-check-and-adapt/SKILL.md';changed.write_text('local modified')
     assert subprocess.run(cmd,capture_output=True).returncode!=0
     assert subprocess.run(cmd+['--replace'],capture_output=True).returncode==0
     assert not list((tmp_path/'trainflow-skill-backups').rglob('SKILL.md'))
-    assert changed.read_bytes() == (script.parent.parent/'skills/hcu-train-environment-check-and-adapt/SKILL.md').read_bytes()
+    assert changed.read_bytes() == (script.parent.parent/'skills/hcu-train-check-and-adapt/SKILL.md').read_bytes()
 
 
 @pytest.mark.parametrize('old_name,new_name', [
-    ('hcu-train-adapt','hcu-train-environment-check-and-adapt'),
+    ('hcu-train-environment-check-and-adapt','hcu-train-check-and-adapt'),
+    ('hcu-train-adapt','hcu-train-check-and-adapt'),
     ('hcu-train-fault-tolerance','hcu-train-scale-and-stability'),
-    ('hcu-train-prepare','hcu-train-environment-check-and-adapt'),
+    ('hcu-train-prepare','hcu-train-check-and-adapt'),
     ('hcu-train-operate','hcu-train-scale-and-stability'),
     ('hcu-engine-wiki-update','hcu-trainflow-wiki-skill-update'),
     ('hcu-engine-wiki-skill-update','hcu-trainflow-wiki-skill-update'),

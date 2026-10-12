@@ -12,7 +12,7 @@
 flowchart TD
     U["模型、环境、数据与目标<br/>预训练 / SFT / RL / Torch 原生训练"] --> C["本地主控 hcu-trainflow<br/>明确范围、预算、验收与现场权限"]
     C --> SCOPE{"本轮工作范围"}
-    SCOPE -->|完整训练任务| A["① 环境检查与模型适配<br/>hcu-train-environment-check-and-adapt · 详见图 2"]
+    SCOPE -->|完整训练任务| A["① 环境检查与模型适配<br/>hcu-train-check-and-adapt · 详见图 2"]
     SCOPE -->|独立请求| PART["按对应阶段执行并交付<br/>环境检查 / 适配 / 分析 / 优化 / 诊断 / 运行<br/>保留失败、未测项和适用范围"]
     SCOPE -->|仅审查或交付已有修改| DELIVER["直接执行改动审查与交付规范<br/>核对差异 / 目标分支 / 相关验证 / PR<br/>无需训练 TaskSpec 或重走训练阶段"]
     A --> AG{"环境与初始数值基线通过？"}
@@ -40,7 +40,7 @@ flowchart TD
 ```
 
 - **全流程入口：**`hcu-trainflow` 协调三个阶段 Skill，保留循环状态、证据和人的指导。
-- **独立入口：**`hcu-train-environment-check-and-adapt` 可仅检查环境；`hcu-train-analyze-and-optimize` 可仅分析性能；`hcu-train-scale-and-stability` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
+- **独立入口：**`hcu-train-check-and-adapt` 可仅检查环境；`hcu-train-analyze-and-optimize` 可仅分析性能；`hcu-train-scale-and-stability` 可仅诊断故障。独立任务按自己的目标交付，不强行经过后续训练阶段。
 - **仅交付入口：**主控直接执行[改动审查与交付](change-delivery.md)，核对已有证据并做受影响验证，不创建训练任务或要求无关阶段报告。
 - **持续运行：**启动训练不等于完成任务；尚在约定监测范围内就继续观测和处理异常。完成或交接须有明确条件、责任人和证据。
 
@@ -95,7 +95,7 @@ flowchart TD
 
 启动配方优先级是：**当前 HCU 分支同模型配方 → 同引擎相近模型的 HCU 配方 → 结合官方语义与 HCU 实现构建配方**。每一种都要核对实际生效参数，不能直接照搬 NV 的环境变量或旧 HCU 脚本。缩 layer 可用于适配/分析和筛机代理，不证明完整模型的显存、收敛和扩容能力。图中任务分支可组合，例如 Torch 原生 SFT；按实际语义核查，不是互斥类别。
 
-工具发现和预期查证由 Agent 按现场完成；当前工程没有为所有 HCU 型号内置一套恒定验收命令和阈值。仅环境检查也可交付明确的失败或不充分报告，这不等于通过训练准入。详见 [适配 Skill](../skills/hcu-train-environment-check-and-adapt/SKILL.md)。
+工具发现和预期查证由 Agent 按现场完成；当前工程没有为所有 HCU 型号内置一套恒定验收命令和阈值。仅环境检查也可交付明确的失败或不充分报告，这不等于通过训练准入。详见 [适配 Skill](../skills/hcu-train-check-and-adapt/SKILL.md)。
 
 ## 3. 性能分析、优化与验证
 

@@ -1,5 +1,13 @@
 # Implementation progress
 
+## 2026-10-12: Check/adapt rename and optional KernelWiki verification
+
+- Renamed stage Skill and updated runtime/UI/docs/maintenance routes; exercised migration from the previous entry, verified old installation removal only after replacement succeeded.
+- Focused installation/routing regressions: 100 passed. Full CPU suite: 1234 passed, 4 platform skips. Wiki validator: 489 pages/25 sources, zero errors. Reading resources: 59 pages/78 reachable, zero issues. New Skill metadata validation passed.
+- Actual pinned KernelWiki checkout, isolated installation, read-only installation check and warp-specialization query passed. Existing customized system KernelWiki was not overwritten. Built source distribution contains the renamed Skill and excludes the optional checkout.
+- Full local setup succeeded with the existing HCU-Knowledge binding/current index reused: 11 required Skills verified, renamed entry installed and old name removed. No online knowledge update or live HCU training performed. Final local sync/check passed for the package, six workflow Skills and all 11 required Skills; reviewed tree is ready for Git publication.
+
+
 - Preserved original approved planning privately before preparing public documentation.
 - Resolved 10 public upstreams to immutable commits and acquired 145 selected files; acquisition is distinct from content review.
 - Implemented transactional tasks/evidence/fencing, explicit command plans, immutable selected-source snapshots, health coverage, overlap-aware operator assessment, stage loss gates, durable watcher and replayable inbox, staged Wiki refresh/PR reviews and workflow impact checks.
@@ -226,7 +234,7 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 
 ## 2026-10-10：阶段命名与故障诊断补强
 
-- 两个阶段入口改为 hcu-train-environment-check-and-adapt、hcu-train-scale-and-stability；六 Skill 总体分工、CLI mode/state 和历史任务格式不变。
+- 两个阶段入口改为 hcu-train-check-and-adapt、hcu-train-scale-and-stability；六 Skill 总体分工、CLI mode/state 和历史任务格式不变。
 - 新增按症状诊断、知识/源码查证、适配失败分流和优化异常交接四份引用指南；主控、更新 Skill、README、介绍/流程图和 maintenance targets 同步。
 - 62 项安装/完整配置/集成相关测试通过；6 个 Skill quick_validate 通过；490 页/25 来源 Wiki 校验无错误；228 个本地 Markdown 引用无断链。
 - 独立前向复核完成：通信超时/主机OOM/旧观察身份、显存增长/动态输入/空报告两组模拟场景均能形成正确的有界下一行动，没有发现误导或断链；不构成真实故障验证。

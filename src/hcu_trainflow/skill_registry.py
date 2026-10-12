@@ -3,7 +3,7 @@
 Internal task modes/stage codes are stable protocol values, not folder names.
 """
 STAGE_SKILLS = {
-    'adapt': 'hcu-train-environment-check-and-adapt',
+    'adapt': 'hcu-train-check-and-adapt',
     'optimize': 'hcu-train-analyze-and-optimize',
     'fault-tolerance': 'hcu-train-scale-and-stability',
 }

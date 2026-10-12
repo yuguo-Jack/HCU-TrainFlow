@@ -15,6 +15,29 @@ python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills"
 
 失败返回非零，`.work/setup/status.json` 记录已完成阶段与失败阶段；修复后重跑会复用依赖和当前索引。缺私有仓权限、原件、Python 依赖或可用索引时不能声称完整安装通过。仅有 checkout 不等于知识搜索就绪。Git 使用本人已保存凭据；权限需本人获得，安装器不复制其他人的账号或自动提交访问申请。
 
+### 可选 KernelWiki
+
+需要为算子优化补充 NVIDIA 实现、PR 和优化机制参考时，可安装 [KernelWiki](https://github.com/mit-han-lab/KernelWiki)。来源与提交锁定在 `thirdparty/manifest.json`，checkout 放 `thirdparty/KernelWiki/`，安装入口保留上游名称 `$KernelWiki`。
+
+完整安装时选择：
+
+```powershell
+python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills" --with-kernelwiki
+```
+
+这样安装 11 个必需 Skill 加 1 个 KernelWiki。已有完整 TrainFlow 时可以单独补装，不重装 Python 包、不访问 HCU-Knowledge：
+
+```powershell
+python scripts/bootstrap_thirdparty.py --only kernelwiki
+python scripts/install_skills.py --kernelwiki-only --target "$HOME/.codex/skills"
+python scripts/install_skills.py --kernelwiki-only --target "$HOME/.codex/skills" --check
+python -X utf8 "$HOME/.codex/skills/KernelWiki/scripts/query.py" "warp specialization" --limit 3 --compact
+```
+
+选择后获取或安装失败会明确报错，不把缺少的可选组件记为安装成功。不加这些选项时，普通 setup、依赖同步和六个 TrainFlow Skill 的本机同步都不会安装、更新或删除已有 KernelWiki。清单升级后仍需显式选择更新；查询不自动刷新其上游。当前固定版本可使用自带 YAML 回退实现，无需额外 Python 包，安装目录须保留 scripts、data、wiki、sources、queries、references、artifacts 和 LICENSE 等完整资源，排除 `.git` 与缓存。
+
+已有不同副本先核对；非 Git 安装经明确选择可用 `--replace` 替换，验收成功后清理本次备份。已有独立 Git checkout 时保留其历史，通过该 checkout 自身的 Git 流程更新或另选目标目录，不用安装器覆盖。默认 HCU 知识库与三个算子 Skill 仍为必需；KernelWiki 用于比较机制和寻找思路，NVIDIA 专属指令与性能结论不能直接当作 HCU 支持或收益证据。
+
 ### 复用已有知识库
 
 ```powershell
@@ -48,7 +71,7 @@ python scripts/sync_local_install.py --target "$HOME/.codex/skills" --check
 
 这是 Agent 维护流程的收尾动作，不是后台文件监视器：只运行 Git pull、单独调用 wiki-update CLI 或修改文件不会触发安装。通过更新 Skill 或按本仓 AGENTS.md 维护时，Agent 应执行同步并报告结果。已运行会话不会因此自动重载指令；完成后新开会话，当前仍在工作的 Agent 应重新读取受影响的 Skill/指南。
 
-当前阶段入口是 `hcu-train-environment-check-and-adapt`、`hcu-train-analyze-and-optimize` 和 `hcu-train-scale-and-stability`。安装器只为较早安装保留过时目录的清理兼容，不安装旧名称或旧别名。两个 HCU 知识 Skill 的 `workspace.json` 绑定实际知识 checkout；完整复制其脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
+当前阶段入口是 `hcu-train-check-and-adapt`、`hcu-train-analyze-and-optimize` 和 `hcu-train-scale-and-stability`。安装器只为较早安装保留过时目录的清理兼容，不安装旧名称或旧别名。两个 HCU 知识 Skill 的 `workspace.json` 绑定实际知识 checkout；完整复制其脚本和 references。完成后重新打开 Agent 会话。Linux 使用对应 Skills 路径。
 
 六个 TrainFlow Skill 的安装目录各有 `workspace.json`，其中 `project_root` 指向本次安装使用的工程绝对路径；个人路径只写入安装目录，不写入仓库源文件。新会话从其他工作目录使用 Skill 时，先采用用户明确指定的项目或 `TRAINFLOW_PROJECT`，未指定时读取该绑定。绑定只用于定位项目，不设置或覆盖任务的 `TRAINFLOW_WORKSPACE`。工程搬家后从新位置运行安装器并加 `--replace`，校验新绑定成功后清理本次旧备份；两个 HCU 知识 Skill 的 `root` 继续独立指向知识 checkout。
 

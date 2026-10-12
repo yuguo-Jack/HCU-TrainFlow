@@ -10,7 +10,7 @@ from hcu_trainflow.core import FlowError, write_json
 from hcu_trainflow.dependencies import bind_knowledge, knowledge_ready, require_checkout, sync_dependencies
 
 
-def setup(project, skills_dir, knowledge_root=None, replace=False, run=subprocess.run):
+def setup(project, skills_dir, knowledge_root=None, replace=False, run=subprocess.run, *, with_kernelwiki=False):
     project = Path(project).expanduser().resolve()
     skills_dir = Path(skills_dir).expanduser().resolve()
     record = project / '.work/setup/status.json'
@@ -35,11 +35,16 @@ def setup(project, skills_dir, knowledge_root=None, replace=False, run=subproces
         if knowledge_root:
             bind_knowledge(project, knowledge_root)
         result = sync_dependencies(project)
+        if with_kernelwiki:
+            optional = sync_dependencies(project, only=['kernelwiki'])
+            result['dependencies'].extend(optional['dependencies'])
+            if optional['status'] != 'ready':
+                result['status'] = 'incomplete'
         state['dependencies'] = result
         write_json(record, state)
         if result['status'] != 'ready':
             missing = ', '.join(x['id'] + ':' + x['status'] for x in result['dependencies'] if x['status'] != 'ready')
-            raise FlowError('Required dependencies unavailable: ' + missing + '; check Git access or use --knowledge-root')
+            raise FlowError('Selected dependencies unavailable: ' + missing + '; check Git access or use --knowledge-root')
         knowledge, _ = require_checkout(project, 'hcu-knowledge')
         tracelens, _ = require_checkout(project, 'tracelens')
         state['completed_stages'].append(stage)
@@ -63,9 +68,10 @@ def setup(project, skills_dir, knowledge_root=None, replace=False, run=subproces
         else:
             command('knowledge-bootstrap', [sys.executable, '-X', 'utf8', str(knowledge/'tools/setup_workspace.py'), 'bootstrap'], knowledge)
         command('knowledge-doctor', doctor, knowledge)
-        command('skills', [sys.executable, '-X', 'utf8', str(project/'scripts/install_skills.py'), '--target', str(skills_dir), *(['--replace'] if replace else [])])
+        command('skills', [sys.executable, '-X', 'utf8', str(project/'scripts/install_skills.py'), '--target', str(skills_dir), *(['--replace'] if replace else []), *(['--with-kernelwiki'] if with_kernelwiki else [])])
         state.update(status='ready', knowledge_root=str(knowledge), skills_dir=str(skills_dir),
-                     note='Local search and 11 Skills installed; online accounts and real HCU execution require site validation')
+                     optional_skills=['KernelWiki'] if with_kernelwiki else [],
+                     note=f'Local search and {12 if with_kernelwiki else 11} Skills installed; online accounts and real HCU execution require site validation')
     except (FlowError, OSError) as exc:
         state.update(status='incomplete', failed_stage=stage, message=str(exc))
         raise
@@ -82,9 +88,10 @@ def main():
     parser.add_argument('--skills-dir', type=Path, required=True)
     parser.add_argument('--knowledge-root', type=Path, help='Reuse an existing KB without source updates; missing LFS objects must be restored there first')
     parser.add_argument('--replace', action='store_true', help='Replace installed Skills; clean temporary backups after successful verification')
+    parser.add_argument('--with-kernelwiki', action='store_true', help='Fetch and install optional NVIDIA KernelWiki for kernel optimization reference')
     args = parser.parse_args()
     try:
-        setup(ROOT, args.skills_dir, args.knowledge_root, args.replace)
+        setup(ROOT, args.skills_dir, args.knowledge_root, args.replace, with_kernelwiki=args.with_kernelwiki)
     except (FlowError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

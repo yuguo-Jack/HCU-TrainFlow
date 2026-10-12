@@ -1,5 +1,13 @@
 # Findings
 
+## 2026-10-12: Check/adapt naming and optional KernelWiki
+
+- Runtime stage codes stay unchanged; Skill routing, display name, directory, reading links and Wiki maintenance targets use hcu-train-check-and-adapt. Previous names remain only in installer migration and migration tests.
+- KernelWiki root is its Skill. Pin b6b4301, fetch to ignored thirdparty/KernelWiki, opt in via --with-kernelwiki or install only via --kernelwiki-only; keep all query/evidence/license resources but exclude Git metadata/caches and thirdparty checkout from sdist.
+- Align cuda-optimized-skill to reviewed f39ba95 so new installs include the HCU cases/PR/KernelWiki reference guidance. No HCU-Knowledge source refresh.
+- Existing system KernelWiki differs only in scripts/validate.py; preserve this independent local change. Verify new optional installation in an isolated .work directory instead. Default setup does not touch it.
+
+
 ## 2026-10-09 — implementation baseline
 - Approved design has 36 requirements, 106 work packages, 12 modules and exactly five Skill entrypoints.
 - First release follows the first vertical development batch; no training cluster was assigned.

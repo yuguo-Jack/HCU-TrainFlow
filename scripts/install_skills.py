@@ -1,4 +1,4 @@
-"""Install six workflow, three kernel and two bound HCU knowledge Skills."""
+"""Install TrainFlow Skills, with an explicit optional KernelWiki installation."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -17,10 +17,11 @@ from hcu_trainflow.skill_registry import WORKFLOW_SKILLS
 NAMES = WORKFLOW_SKILLS
 # Cleanup compatibility only: install the current entry once, with no aliases.
 RENAMED = {
+    'hcu-train-environment-check-and-adapt': 'hcu-train-check-and-adapt',
     'hcu-train-optimize': 'hcu-train-analyze-and-optimize',
-    'hcu-train-adapt': 'hcu-train-environment-check-and-adapt',
+    'hcu-train-adapt': 'hcu-train-check-and-adapt',
     'hcu-train-fault-tolerance': 'hcu-train-scale-and-stability',
-    'hcu-train-prepare': 'hcu-train-environment-check-and-adapt',
+    'hcu-train-prepare': 'hcu-train-check-and-adapt',
     'hcu-train-operate': 'hcu-train-scale-and-stability',
     'hcu-engine-wiki-update': 'hcu-trainflow-wiki-skill-update',
     'hcu-engine-wiki-skill-update': 'hcu-trainflow-wiki-skill-update',
@@ -28,9 +29,13 @@ RENAMED = {
 }
 KERNEL_NAMES = ('hygon-hip-baseline-generator', 'hygon-hip-kernel-optimizer', 'hygon-triton-kernel-optimizer')
 KNOWLEDGE_NAMES = ('hcu-knowledge-search', 'hcu-knowledge-update')
+OPTIONAL_NAMES = ('KernelWiki',)
+COPY_IGNORES = ('.git', '__pycache__', '.pytest_cache')
 
 def tree_hash(path):
-    return {p.relative_to(path).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in path.rglob('*') if p.is_file() and '__pycache__' not in p.parts}
+    return {p.relative_to(path).as_posix():hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in path.rglob('*') if p.is_file()
+            and not set(p.relative_to(path).parts).intersection(COPY_IGNORES)}
 
 def checked_destination(target, name):
     path=target/name
@@ -65,7 +70,7 @@ def cleanup_backups(target, backups):
     def check(backup):
         root=managed_backup_root(target)
         if (not backup.is_absolute() or backup.parent.parent!=root
-                or backup.name not in {*NAMES, *KERNEL_NAMES, *KNOWLEDGE_NAMES, *RENAMED}
+                or backup.name not in {*NAMES, *KERNEL_NAMES, *KNOWLEDGE_NAMES, *OPTIONAL_NAMES, *RENAMED}
                 or backup.is_symlink() or backup.resolve()!=backup or not backup.is_dir()):
             raise FlowError('Refusing unsafe backup cleanup: '+str(backup))
         for child in backup.rglob('*'):
@@ -87,14 +92,18 @@ def main():
     parser.add_argument('--target',type=Path,required=True,help='Agent skills directory; installation is explicit')
     parser.add_argument('--replace',action='store_true',help='Replace installed Skills; clean temporary backups only after all copies and bindings verify')
     parser.add_argument('--with-kernel-skills',action='store_true',help=argparse.SUPPRESS)
-    parser.add_argument('--workflow-only',action='store_true',help='Developer-only six-Skill refresh; not a complete TrainFlow installation')
+    scope=parser.add_mutually_exclusive_group()
+    scope.add_argument('--workflow-only',action='store_true',help='Developer-only six-Skill refresh; not a complete TrainFlow installation')
+    scope.add_argument('--kernelwiki-only',action='store_true',help='Install/check only the optional pinned KernelWiki Skill; leave existing TrainFlow and HCU knowledge untouched')
+    parser.add_argument('--with-kernelwiki',action='store_true',help='Also install the optional pinned KernelWiki Skill')
     parser.add_argument('--check',action='store_true',help='Read-only check of installed files, bindings and obsolete names; exit nonzero on drift')
     args=parser.parse_args()
     if args.check and args.replace:
         parser.error('--check and --replace cannot be combined')
-    sources={name: ROOT/'skills'/name for name in NAMES}
+    sources={} if args.kernelwiki_only else {name: ROOT/'skills'/name for name in NAMES}
+    renamed={} if args.kernelwiki_only else RENAMED
     knowledge = None
-    if not args.workflow_only:
+    if not args.workflow_only and not args.kernelwiki_only:
         try:
             checkout, _ = require_checkout(ROOT, 'cuda-optimized-skill')
             knowledge, _ = require_checkout(ROOT, 'hcu-knowledge')
@@ -106,11 +115,18 @@ def main():
                                 cwd=knowledge, capture_output=True, text=True, encoding='utf-8', errors='replace')
         if not knowledge_ready(result):
             parser.error('HCU-Knowledge is not locally ready; run scripts/setup_trainflow.py first')
+    if args.with_kernelwiki or args.kernelwiki_only:
+        try:
+            checkout, _ = require_checkout(ROOT, 'kernelwiki')
+        except FlowError as exc:
+            parser.error(str(exc))
+        # Upstream's repository root is the Skill, including its query resources.
+        sources['KernelWiki'] = checkout
     target=args.target.expanduser().resolve()
     expected = {name: tree_hash(source) for name, source in sources.items()}
     # Runtime bindings belong to installed Skills, never their portable source.
     bindings = {name: (json.dumps({'project_root':str(ROOT.resolve())},ensure_ascii=False,indent=2)+'\n').encode()
-                for name in NAMES}
+                for name in NAMES if name in sources}
     if knowledge:
         binding=(json.dumps({'root':str(knowledge)},ensure_ascii=False,indent=2)+'\n').encode()
         for name in KNOWLEDGE_NAMES:
@@ -122,16 +138,19 @@ def main():
         if not (source/'SKILL.md').is_file():parser.error('Missing source Skill: '+str(source))
         dest=checked_destination(target,name)
         if dest.is_relative_to(source.resolve()) or source.resolve().is_relative_to(dest):parser.error('Install outside source Skills: '+name)
+        if (name in OPTIONAL_NAMES and (dest/'.git').exists()
+                and tree_hash(dest)!=expected[name] and not args.check):
+            parser.error('Preserve this independent Git checkout; update it through its own Git workflow or choose another target: '+name)
         if dest.exists() and tree_hash(dest)!=expected[name] and not args.replace and not args.check:
             parser.error('Existing different installation; inspect it then use --replace: '+name)
-    for old in RENAMED:
+    for old in renamed:
         dest=checked_destination(target,old)
         if dest.exists() and not args.replace and not args.check:
             parser.error('Obsolete Skill entry found; inspect it then use --replace to install current names: '+old)
     if args.check:
         issues = [name+': missing or different content/binding' for name in sources
                   if tree_hash(checked_destination(target,name)) != expected[name]]
-        issues.extend(old+': obsolete entry still installed' for old in RENAMED
+        issues.extend(old+': obsolete entry still installed' for old in renamed
                       if checked_destination(target,old).exists())
         print(json.dumps({'status':'incomplete' if issues else 'current',
                           'checked_skills':len(sources), 'issues':issues},ensure_ascii=False))
@@ -139,7 +158,7 @@ def main():
             raise SystemExit(1)
         return
     backups=[]
-    for old in RENAMED:
+    for old in renamed:
         dest=checked_destination(target,old)
         if dest.exists():backups.append(backup_directory(target,dest))
     for name, source in sources.items():
@@ -148,7 +167,7 @@ def main():
             if tree_hash(dest)==expected[name]:print(name+': already current');continue
             # Retain originals on any install/verification failure.
             backups.append(backup_directory(target,dest))
-        shutil.copytree(source,dest,ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(source,dest,ignore=shutil.ignore_patterns(*COPY_IGNORES))
         if name in bindings:
             (dest/'workspace.json').write_bytes(bindings[name])
         print(name+': installed')

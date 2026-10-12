@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Rename the check/adaptation entry to `hcu-train-check-and-adapt` across runtime dispatch, installed UI, reading routes and maintenance references; migrate previous installations without leaving duplicate entries.
+- Add pinned, opt-in KernelWiki installation, standalone repair/check support and package exclusions. Keep default setup at 11 required Skills and preserve independent KernelWiki Git checkouts.
+- Update the kernel-Skill dependency pin to the reviewed HCU cases/PR/KernelWiki guidance.
+
+
 ## 0.6.2 — 2026-10-11
 
 - Align all six Skill menu labels with their English IDs. Rename the Wiki entrypoints to `hcu-trainflow-wiki-search` and `hcu-trainflow-wiki-skill-update`, with direct migration from the former names during installation upgrades.
@@ -45,7 +52,7 @@
 - Expose compute/memory/latency model terms and arithmetic intensity; reject invalid thresholds and overflowed model values before decision branching. Add CPU regressions; method and source review are not new hardware qualification.
 
 
-- Rename the environment/adaptation and scale/stability Skills to `hcu-train-environment-check-and-adapt` and `hcu-train-scale-and-stability`; update active references and migrate earlier installed entry directories without adding duplicate aliases.
+- Rename the environment/adaptation and scale/stability Skills to `hcu-train-check-and-adapt` and `hcu-train-scale-and-stability`; update active references and migrate earlier installed entry directories without adding duplicate aliases.
 - Add evidence-driven incident triage, hang/collective, crash/device dump, memory, numerical, slowdown and recovery runbooks grounded in HCU knowledge and version-matched sources; connect adaptation and optimization failure handling. These method additions do not claim new hardware fault coverage.
 
 - Expand the README overview into environment/model adaptation, performance and quality iteration, and DP scaling with sustained recovery/observation. Explain content maintenance through the Wiki/Skill update entry and installation synchronization separately.

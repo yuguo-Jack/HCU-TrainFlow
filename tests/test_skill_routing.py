@@ -90,8 +90,8 @@ def test_cancelled_task_has_no_success_curation_prompt(tmp_path):
 
 
 @pytest.mark.parametrize('mode,expected', [
-    ('environment', 'hcu-train-environment-check-and-adapt'),
-    ('adapt', 'hcu-train-environment-check-and-adapt'),
+    ('environment', 'hcu-train-check-and-adapt'),
+    ('adapt', 'hcu-train-check-and-adapt'),
     ('analyze', 'hcu-train-analyze-and-optimize'),
     ('optimize', 'hcu-train-analyze-and-optimize'),
     ('diagnose', 'hcu-train-scale-and-stability'),
@@ -107,8 +107,8 @@ def test_standalone_cli_routes_to_installed_skill(tmp_path, mode, expected, inst
 def test_complete_pipeline_routes_each_real_transition(tmp_path, installed_skills, capsys):
     store = setup(tmp_path, mode='full')
     routes = [
-        ('environment_checked', 'hcu-train-environment-check-and-adapt'),
-        ('baseline_validated', 'hcu-train-environment-check-and-adapt'),
+        ('environment_checked', 'hcu-train-check-and-adapt'),
+        ('baseline_validated', 'hcu-train-check-and-adapt'),
         ('profiling', 'hcu-train-analyze-and-optimize'),
         ('optimizing', 'hcu-train-analyze-and-optimize'),
         ('scale_ready', 'hcu-train-analyze-and-optimize'),

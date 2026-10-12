@@ -23,7 +23,9 @@ def main():
             if args.status:
                 raise FlowError('--status cannot modify the knowledge binding')
             bind_knowledge(ROOT, args.knowledge_root)
-        result = sync_dependencies(ROOT, args.only, args.include_knowledge, args.status, args.migrate_origin)
+        # Historical --include-knowledge remains a no-op: HCU-Knowledge is required.
+        # It must not accidentally opt users into newly registered optional tools.
+        result = sync_dependencies(ROOT, args.only, False, args.status, args.migrate_origin)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result['status'] == 'ready' else 2
     except (FlowError, OSError, ValueError, KeyError) as exc:

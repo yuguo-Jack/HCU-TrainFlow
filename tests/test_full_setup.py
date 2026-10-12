@@ -26,7 +26,8 @@ def test_real_manifest_requires_knowledge_by_default(tmp_path, monkeypatch):
     write_json(tmp_path/'thirdparty/manifest.json', {'schema_version': 1, 'dependencies': items})
     monkeypatch.setattr(dependencies, 'git', lambda *a, **k: pytest.fail('Status must not fetch'))
     result = dependencies.sync_dependencies(tmp_path, status_only=True)
-    assert {x['id'] for x in result['dependencies']} == {x['id'] for x in items}
+    assert {x['id'] for x in result['dependencies']} == {x['id'] for x in items if not x.get('optional')}
+    assert next(x for x in items if x['id'] == 'kernelwiki')['optional'] is True
     assert result['status'] == 'incomplete'
 
 
@@ -461,9 +462,10 @@ def test_local_sync_refuses_missing_or_foreign_binding_before_pip(tmp_path, bind
         module.sync(project, target, run=lambda *a, **kw: pytest.fail('No package/Skill mutation before binding check'))
 
 
-def test_local_sync_accepts_optimization_rename_but_rejects_uninstalled_entry(tmp_path):
+@pytest.mark.parametrize('current,old', [('hcu-train-analyze-and-optimize','hcu-train-optimize'), ('hcu-train-check-and-adapt','hcu-train-environment-check-and-adapt')])
+def test_local_sync_accepts_rename_but_rejects_uninstalled_entry(tmp_path,current,old):
     module, project, target = sync_fixture(tmp_path)
-    (target/'hcu-train-analyze-and-optimize').rename(target/'hcu-train-optimize')
+    (target/current).rename(target/old)
     module.check_existing_binding(project.resolve(), target.resolve())
     (target/module.NAMES[0]/'workspace.json').unlink()
     (target/module.NAMES[0]).rmdir()

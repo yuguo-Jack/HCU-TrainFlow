@@ -1,5 +1,14 @@
 # HCU-TrainFlow development plan
 
+## Current: check/adapt rename and optional KernelWiki (2026-10-12)
+
+1. Rename Skill entry, UI, dispatch and reading/update references; preserve installer migration — complete.
+2. Add pinned optional KernelWiki checkout and opt-in installation; keep the default required set unchanged — complete; kernel-Skill pin aligned with the already reviewed reference workflow.
+3. Validate routing, optional setup, source exclusion and local upgrade; synchronize installed TrainFlow and publish — complete (1234 passed, 4 platform skips; actual setup and final install checks passed). Publish the reviewed tree to main without a new tag.
+
+No model experiments or HCU-Knowledge content refresh in this task.
+
+
 ## Current: integrated workflow review and handoff (2026-10-10)
 
 The physical qualification round is sufficient for this review. Consolidate reusable decisions and evidence contracts so a fresh Agent can take over a new environment/model through the single coordinator Skill. Do not resume proxy tuning or present bounded drills as full-model convergence. Historical sections below record earlier decisions; current AGENTS.md and published workflow docs take precedence over superseded optional-dependency/naming/release notes.
@@ -207,7 +216,7 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 
 - [x] 查询 HCU 大知识库和匹配的官方证据，复核未充分实测的排障与适配/优化衔接。
 - [x] 补充按症状分流、证据采集、假设验证、升级和恢复验收的通用诊断指南；明确方法与实测边界。
-- [x] 阶段名称改为 hcu-train-environment-check-and-adapt / hcu-train-scale-and-stability，更新引用与安装迁移。
+- [x] 阶段名称改为 hcu-train-check-and-adapt / hcu-train-scale-and-stability，更新引用与安装迁移。
 - [x] 验证安装迁移、技能结构、文档与 Wiki，独立场景复核后修正。
 - [x] 同步本机 Skill，提交推送 main；不移动既有 v0.5.0。
 

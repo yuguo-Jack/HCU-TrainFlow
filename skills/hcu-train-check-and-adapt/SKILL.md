@@ -1,9 +1,9 @@
 ---
-name: hcu-train-environment-check-and-adapt
+name: hcu-train-check-and-adapt
 description: 检查 HCU 训练环境并准确适配预训练、SFT、RL 模型；支持仅环境检查，核对现场配方、容量、依赖和初始数值基线，定位启动及适配问题。
 ---
 
-# hcu-train-environment-check-and-adapt
+# hcu-train-check-and-adapt
 
 ## 开始前定位与阅读
 

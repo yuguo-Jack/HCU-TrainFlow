@@ -51,7 +51,7 @@ review 按 `docs/collaboration.md`“工作与审核的粒度”使用完整字�
 
 Torch 原生视频/VLA/世界模型训练沿用这三个阶段；由 optimize 按需加载 Torch 与通信专项，不增加独立 Skill。全流程先检查 HCU-Knowledge 的搜索 Skill、workspace 绑定及当前索引可用性；缺失按 docs/integrations.md 完成必需安装。三个阶段按实际 HCU 问题联查它，普通训练不触发大知识库更新。
 
-- `$hcu-train-environment-check-and-adapt`：环境验收、HCU 启动配方、全参容量预估与短跑校准、模型适配和初始基线。参考 HCU Train Sim 等工具核对真实卡数/显存及模型覆盖，能放下就优先全参，不够才缩 layer；缩维仍按授权。可仅检查环境。
+- `$hcu-train-check-and-adapt`：环境验收、HCU 启动配方、全参容量预估与短跑校准、模型适配和初始基线。参考 HCU Train Sim 等工具核对真实卡数/显存及模型覆盖，能放下就优先全参，不够才缩 layer；缩维仍按授权。可仅检查环境。
 - `$hcu-train-analyze-and-optimize`：可仅分析性能；先评估并行切分、微批/梯度累积与显存余量，按吞吐和通信代价选择配置；系统、融合、算子优化采用测量→假设→实施→验证→复核。累计 ≥90% 端到端热点集合中的非通信算子逐项建模；比较真实 shape 的独立测试。每轮局部正确性和 profiler-off 性能，稳定阶段才长窗口验 loss，始终对初始基线。复用 HCU Flash-Train/TE/Primus Turbo，通信按实际需求联动 RCCL/rocSHMEM/DeepEP/UCCL/UltraEP/MoonEP 等，必要时深入底层库隔离修改和重编，必要时调用三个 Hygon kernel Skill。
 - `$hcu-train-scale-and-stability`：按本轮选定配置扩 DP 域、筛机扩容、单一恢复负责人、长训监测及故障诊断。完整模型目标须先恢复完整配置；用户明确以缩减模型验证本轮流程时，可扩该配置的 DP 并保留完整模型缺口，见 `docs/proxy-contract.md`。训练启动不是任务结束；验证 step/loss/吞吐/显存/checkpoint/恢复是否持续符合预期。
 - `$hcu-trainflow-wiki-search` / `$hcu-trainflow-wiki-skill-update`：HCU-TrainFlow-Wiki 的检索与维护，覆盖官方资料、可复用环境经验及模型最终优化总结。需要 HCU 事实时读 HCU-Knowledge、当前底层库分支或官方资料；普通任务不顺带更新 HCU 大知识库。工具/脚本变了要复核相关 Skill、命令和解析器，不仅更新 Wiki。
