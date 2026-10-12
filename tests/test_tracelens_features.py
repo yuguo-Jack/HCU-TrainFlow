@@ -24,6 +24,9 @@ def test_feature_preserves_partial_and_review_status(tmp_path, monkeypatch, rece
     store, request, trace = setup(tmp_path, monkeypatch)
     def run(argv, **kwargs):
         folder = Path(argv[-1]).parent
+        assert Path(kwargs['env']['TMPDIR']).is_relative_to(folder)
+        assert Path(kwargs['env']['MPLCONFIGDIR']).is_relative_to(folder)
+        assert Path(kwargs['env']['TRACELENS_CACHE_DIR']).is_relative_to(folder)
         (folder / 'partial.csv').write_text('a\n1\n')
         if receipt is not None:
             write_json(folder / 'worker.json', receipt)

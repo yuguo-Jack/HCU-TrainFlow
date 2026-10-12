@@ -9,6 +9,8 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。
 
+默认只在当前任务工作空间及已核实的远端/容器映射目录内创建、修改、移动或删除；外部资料可按需读取。首次写入、映射变化或涉及外部路径时先读项目 `docs/workspace-boundaries.md`，复用已记录范围与授权；必要例外写清路径和影响，未获授权再询问，不逐条命令重复确认。 已授权的 Wiki/Skill 维护可写所绑定 TrainFlow 工程和选定安装位置；这是明确的维护范围，不扩展到 HCU 大知识库或上游环境。
+
 维护 HCU-TrainFlow-Wiki 的官方资料、可复用环境经验、模型最终优化总结，以及随源变化的工作流用法。它可以由训练任务按需主动调用；不替代或触发 HCU 大知识库 update。
 
 ## 调用时机与更新范围

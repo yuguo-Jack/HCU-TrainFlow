@@ -383,3 +383,16 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - 六类检索问题的预期页排在前两位；线上查到未收录 DistributedMuon PR #4105，读取完整 PR 到私有缓存并验证固定源码读取。首次搜索限定五项产生真实分页 partial，扩大到十项覆盖七个结果后完成，不将 partial 当作失败或全量结果。
 - 系统 Python editable 包升级至 0.6.4，六个 Skill/引用绑定同步，独立 --check 为 current。未安装 TorchTitan、未执行其 CPU/GPU 测试或训练、未更新 HCU-Knowledge；本轮上游测试内容核对和 TrainFlow 工具回归分别记录。远端 main 基线为 2967a9a，准备提交推送并打 v0.6.4。
 - Git 暂存检查发现上游 PR 评论自带行尾空格；保留原文和正文 hash，在 `.gitattributes` 仅对生成的 PR/官方文档页沿用原始证据的 whitespace 例外，作者文档仍照常检查。
+
+
+## 2026-10-12：工作空间范围与 0.6.5
+
+- 新增共用 workspace-boundaries 指南并贯穿六个入口、独立模式、成员交接、同步/输出、维护和交付；记录已有授权，不重复询问。版本准备升至 0.6.5。
+- 源码传输增加真实路径预检；145 项传输/执行/清理回归通过，含 Windows 真 junction、悬空目标、暂存链接、父路径和普通嵌套目标。
+- TraceLens 受管 worker 统一临时/绘图/转换缓存；46 项相关回归通过，真实 Python 子进程验证 tempfile 落点与 HOME/父环境保持不变。没有执行 GPU/远端训练。
+- 阅读资源 61 页/82 可达、知识 628 页/26 来源验证通过；65 份文档/Skill 的 460 个本地链接/锚点有效。
+- 初次追加计划补丁锚点未匹配，改用文件尾确切内容后成功；PowerShell 下 rg 路径通配不展开，后续使用目录与 -g 过滤。均未导致文件变更或证据丢失。
+
+- 全量回归：1255 passed、4 skipped（保留平台限制，不冒充远端硬件验证）；文档增加契约边界说明后 65 页/461 处链接校验通过。此前 v0.6.4 的 Linux/Windows 3.10/3.12 CI 也已全部成功。
+- 本机系统 Python editable 包已升级 0.6.5；六个工作流/Wiki Skill、引用与工程绑定同步完成，独立 --check 为 current。安装器只清理本次校验完成的临时备份，第三方依赖和 HCU 大知识库没有更新。
+- 发布审查覆盖六入口、阶段/独立模式、协作交接、命令和源码传输、数值/性能判定的既有回归、长训观察及清理、Wiki 与安装同步；未新增状态门槛、不要求重验已匹配实验。本轮最终 Git 推送/tag 以远端回执确认。

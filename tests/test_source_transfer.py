@@ -236,6 +236,80 @@ def test_existing_destination_refused_before_object_import(tmp_path):
         assert db.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
 
 
+@contextlib.contextmanager
+def redirected_directory(link, target):
+    """Exercise Windows reparse points too, without symlink privileges."""
+    if os.name == "nt":
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+        assert result.returncode == 0, result.stderr
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    try:
+        yield
+    finally:
+        if os.name == "nt":
+            os.rmdir(link)  # Remove only this fixture's junction, never its target.
+        else:
+            link.unlink()
+
+
+@pytest.mark.parametrize("operation", ["receive", "materialize", "bundle"])
+@pytest.mark.parametrize("redirect", ["parent", "dangling-target", "staging"])
+def test_transfer_rejects_redirected_write_before_external_mutation(tmp_path, operation, redirect):
+    store = Store(tmp_path / "state")
+    snap = snapshot(store, source(tmp_path, 1), ["code0.py"])
+    incoming = tmp_path / "incoming.zip"
+    bundle(store, snap["snapshot_id"], incoming)
+    task = tmp_path / "task"; task.mkdir()
+    external = tmp_path / "another-owner"; external.mkdir()
+    sentinel = external / "keep.txt"; sentinel.write_bytes(b"unrelated owner data")
+    if redirect == "parent":
+        link, target = task / "alias", external
+        destination = link / "new-output"
+    else:
+        destination = task / "new-output"
+        link = destination if redirect == "dangling-target" else task / "new-output.partial"
+        target = external / "new-output"
+    receiver = Store(tmp_path / "receiver")
+    with redirected_directory(link, target):
+        with pytest.raises(FlowError, match="link/reparse"):
+            if operation == "receive":
+                receive(receiver, incoming, destination)
+            else:
+                getattr(execution, operation)(store, snap["snapshot_id"], destination)
+        assert sentinel.read_bytes() == b"unrelated owner data"
+        assert sorted(p.name for p in external.iterdir()) == ["keep.txt"]
+        assert sorted(p.name for p in task.iterdir()) == [link.name]
+        with receiver.db() as db:
+            assert db.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
+
+
+def test_receive_rejects_dotdot_even_when_it_normalizes_to_existing_parent(tmp_path):
+    files = {"a": b"first"}
+    incoming = archive(tmp_path, manifest(files), files)
+    store = Store(tmp_path / "state")
+    (tmp_path / "task").mkdir()
+    with pytest.raises(FlowError, match="parent traversal"):
+        receive(store, incoming, tmp_path / "task" / ".." / "outside")
+    assert not (tmp_path / "outside").exists()
+    assert not (tmp_path / "outside.partial").exists()
+    with store.db() as db:
+        assert db.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
+
+
+def test_transfer_allows_explicit_plain_nested_destination_outside_store(tmp_path):
+    # The store and the authorized source destination can be siblings inside
+    # the task root. Path preflight must not invent a Store-only output policy.
+    files = {"module/code.py": b"# synthetic fixture\n"}
+    incoming = archive(tmp_path, manifest(files), files)
+    store = Store(tmp_path / "state")
+    destination = tmp_path / "task output" / "snapshots" / "new"
+    result = receive(store, incoming, destination)
+    assert result["verified"]
+    assert (destination / "module/code.py").read_bytes() == files["module/code.py"]
+    assert not destination.with_name("new.partial").exists()
+
+
 def test_windows_git_executable_mode_overrides_stat(tmp_path):
     script = tmp_path / "launch.sh"
     script.write_text("#!/bin/sh\n")

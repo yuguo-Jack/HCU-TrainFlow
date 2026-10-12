@@ -13,7 +13,7 @@ import uuid
 
 from .core import FlowError, read_json, write_json, utc
 from .dependencies import require_checkout
-from .tracelens import file_hash
+from .tracelens import file_hash, worker_environment
 
 
 FIELDS = {
@@ -125,8 +125,7 @@ def run_feature(store, project, request_path, timeout=1800):
     output.mkdir(parents=True)
     write_json(output / 'request.json', request)
     argv = [sys.executable, '-B', '-m', 'hcu_trainflow.tracelens_feature_worker', str(output / 'request.json')]
-    env = {**os.environ, 'PYTHONPATH': os.pathsep.join([str(checkout), str(Path(__file__).resolve().parent.parent)]),
-           'PYTHONUTF8': '1', 'MPLBACKEND': 'Agg', 'TRACELENS_CACHE_DIR': str(output / 'conversion-cache')}
+    env = worker_environment(checkout, output)
     failure, code, worker = None, None, None
     with (output / 'stdout.log').open('wb') as stdout, (output / 'stderr.log').open('wb') as stderr:
         try:

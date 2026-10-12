@@ -2,6 +2,8 @@
 
 ## 完整安装
 
+安装/升级采用[明确的维护写入范围](workspace-boundaries.md#4-必要例外与知识维护)：选定工程、第三方安装目录、实际 Python 与 Skill 目录。普通训练运行则默认写任务工作空间，不借安装绑定修改共享依赖或其他任务。
+
 系统 Python 3.10+、Git、Git LFS 和 HCU-Knowledge 读取权限是基础条件。`thirdparty/manifest.json` 锁定 TraceLens HCU fork、三个 Hygon 算子 Skill 的源仓以及必需的 HCU-Knowledge。第三方依赖本身只登记来源清单，不把完整 checkout 或 HCU-Knowledge 全量复制到本仓。本工程自带 Wiki 则提交实际站点知识、配方、测量及精选证据，见 [知识归属](knowledge-architecture.md)；凭据永不入仓。
 
 在工程根目录执行（PowerShell）：
@@ -129,6 +131,8 @@ hcu-trainflow --workspace .work/analysis tracelens-analyze request.json --projec
 ```
 
 单 rank 支持 PyTorch JSON 与 `.json.gz`，保存 native CSV、stdout/stderr、请求参数及 `report.json`；报告记录输入哈希和锁定的 TraceLens 提交。输出总在 workspace 内的新目录，不覆盖旧结果。`generated` 只表示产生了非空报告，完整训练结论仍需稳态窗口、实际 process groups、shape 与上限模型。
+
+受管的报告和高级分析 worker 将 Python 临时文件、Matplotlib/XDG 缓存及 trace 转换缓存定向到该次输出目录，并关闭 Python 字节码写入；不修改主进程的环境或 `HOME`。其他训练/采集工具的输出仍按[写入边界](workspace-boundaries.md)在实际启动配方中核对，不宣称任意子进程已被沙箱隔离。
 
 集成采用固定 checkout 的上游 Python report API，在独立进程执行。HCU fork 已修复本机复现的 Windows CSV 字段上限导入问题，原生 CLI 也可使用；TrainFlow 继续复用报告 API，不做全局 monkey patch。缺依赖、运行失败、超时或空表均保留失败信息，不降级伪报成功。
 

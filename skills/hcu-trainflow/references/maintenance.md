@@ -1,5 +1,7 @@
 # 私有工作区维护与观察交接入口
 
+先沿用项目 `docs/workspace-boundaries.md` 的任务根和本地/远端/容器映射；新观察 Store、日志与缓存不得因部署方便落到其他任务或共享父目录。目录在范围内也不能绕过本页的删除保护；外部服务/安装修改只按已确认的维护授权处理。
+
 先定位 `TRAINFLOW_PROJECT` 和 `TRAINFLOW_WORKSPACE`；命令从真实 checkout 的 `scripts/` 取，不从安装后的 Skill 相对路径推测。详细契约以项目 `docs/workspace-maintenance.md`、`docs/training-observation.md` 为准。三个阶段继续负责各自范围，不新增维护 Skill。
 
 ## 按阶段和低频时机维护

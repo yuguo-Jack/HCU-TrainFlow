@@ -19,6 +19,24 @@ from .core import FlowError, fingerprint, utc, write_json
 from .dependencies import require_checkout
 
 
+def worker_environment(checkout, output):
+    """Keep managed offline workers' temporary/font/conversion writes local.
+
+    Do not change HOME or the caller's training environment. This configures
+    cooperating libraries, not a filesystem sandbox for arbitrary programs.
+    """
+    output = Path(output).resolve()
+    temporary, cache = output / 'worker-tmp', output / 'worker-cache'
+    temporary.mkdir()
+    cache.mkdir()
+    return {**os.environ,
+            'PYTHONPATH': os.pathsep.join([str(checkout), str(Path(__file__).resolve().parent.parent)]),
+            'PYTHONUTF8': '1', 'PYTHONDONTWRITEBYTECODE': '1', 'MPLBACKEND': 'Agg',
+            'TMPDIR': str(temporary), 'TMP': str(temporary), 'TEMP': str(temporary),
+            'XDG_CACHE_HOME': str(cache), 'MPLCONFIGDIR': str(cache / 'matplotlib'),
+            'TRACELENS_CACHE_DIR': str(output / 'conversion-cache')}
+
+
 def _group_ranks(value):
     if isinstance(value, str):
         try:
@@ -328,7 +346,7 @@ def run_report(store, project, trace=None, trace_pattern=None, world_size=None,
     argv = [sys.executable, '-B', '-m', 'hcu_trainflow.tracelens_worker',
             'collective' if trace_pattern else 'pytorch', str(output / 'request.json')]
     # Force the reviewed checkout, even when a different TraceLens happens to be installed.
-    env = {**os.environ, 'PYTHONPATH': os.pathsep.join([str(checkout), str(Path(__file__).resolve().parent.parent)]), 'PYTHONUTF8': '1', 'MPLBACKEND': 'Agg'}
+    env = worker_environment(checkout, output)
     returncode, failure = None, None
     with (output / 'stdout.log').open('wb') as stdout, (output / 'stderr.log').open('wb') as stderr:
         try:

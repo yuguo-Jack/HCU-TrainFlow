@@ -1,8 +1,10 @@
 """Trace evidence contracts; fixtures are synthetic, not hardware validation."""
 import gzip
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -37,9 +39,31 @@ def prepare(tmp_path, monkeypatch, events=None, metadata=None):
 def native_tables(argv, **kwargs):
     request = json.loads(Path(argv[-1]).read_text())
     folder = Path(request['output_csvs_dir'])
+    assert Path(kwargs['env']['TMPDIR']).is_relative_to(folder.parent)
+    assert Path(kwargs['env']['MPLCONFIGDIR']).is_relative_to(folder.parent)
     folder.mkdir()
     (folder / 'kernel_summary.csv').write_text('kernel,duration\ngemm,5\n')
     return subprocess.CompletedProcess(argv, 0)
+
+
+def test_worker_environment_routes_real_tempfiles_without_changing_home(tmp_path, monkeypatch):
+    outside = tmp_path / 'shared cache'; outside.mkdir()
+    for name in ('TMPDIR', 'TMP', 'TEMP', 'MPLCONFIGDIR', 'XDG_CACHE_HOME', 'TRACELENS_CACHE_DIR'):
+        monkeypatch.setenv(name, str(outside))
+    monkeypatch.setenv('HOME', str(tmp_path / 'unchanged home'))
+    inherited = dict(os.environ)
+    output = tmp_path / 'analysis'; output.mkdir()
+    env = tracelens.worker_environment(tmp_path, output)
+    observed = subprocess.run([sys.executable, '-c',
+        'import json,os,sys,tempfile; '
+        'f=tempfile.NamedTemporaryFile(delete=False); f.write(b"fixture"); f.close(); '
+        'print(json.dumps({"file":f.name,"home":os.getenv("HOME"),"no_bytecode":sys.dont_write_bytecode}))'],
+        cwd=output, env=env, capture_output=True, text=True, check=True, timeout=15)
+    result = json.loads(observed.stdout)
+    assert Path(result['file']).is_relative_to(output)
+    assert Path(result['file']).read_bytes() == b'fixture'
+    assert result['no_bytecode'] is True and result['home'] == inherited['HOME']
+    assert list(outside.iterdir()) == [] and dict(os.environ) == inherited
 
 
 def test_inventory_records_training_metadata_without_vendor_guess(tmp_path):

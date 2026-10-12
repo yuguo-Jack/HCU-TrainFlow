@@ -322,3 +322,12 @@ capabilities.md 此前最近修改于 v0.6.1，v0.6.2 未单独同步 Wiki 命�
 - #5033 的独立 Attention Residual Triton fwd+bwd 比 local compile 快，但指定端到端 debug 实验更慢；#5266 的视觉 CP 改造通信量减少，也没有直接带来 step 提速。把 kernel/collective 局部数据与模型结果分别保留。
 - #5137/#5250 的 WGRAD 优化依赖 AccumulateGrad 的 buffer 重挂接；分离 backward、tracing 和数值舍入必须一起看。#5107/#5268 的 RL 内存优化分别改变 trainer CPU staging 与 generator FSDP group 加载，不是统一开关。
 - 所有新来源通过既有动态 registry、全文索引、在线 PR 与固定代码链路工作，不需新增搜索后端或安装训练框架。Release/roadmap 由 Agent 定向核查，CLI 文档/PR 增量采集不等于自动理解所有新功能。
+
+
+## 2026-10-12：工作空间写入边界复核
+
+- 清理已经由 retention 的登记、pin、活动/未决作业、隔离和身份检查约束；缺口是其他阶段、成员和安装/Wiki 维护没有统一写入范围。采用一份共用指南和六入口短规则，不增加任务状态或逐命令审批。
+- command-plan 的 cwd/argv quoting 只确定执行位置与参数，不是文件系统沙箱；不能自动阻止第三方工具向绝对路径写入。映射与隐式缓存须由配方/部署核实，必要时结合只读挂载和权限。
+- `_new_transfer_destination` 原先先 resolve，能够把悬空目标/父目录链接解析到未预期位置。改为解析前检查各级 symlink/reparse point 与 ..；只修正意外重定向，不宣称抵御并发父目录替换。
+- TraceLens 已有报告输出隔离，但 Python 临时文件和 Matplotlib 字体/XDG 缓存仍可能继承宿主默认路径。两个受管离线 worker 统一在当前报告目录定位这些输出及转换缓存，保留 HOME 和主进程环境。
+- 复核源码快照/接收、命令组、任务与 Agent 范围、观察器、临时 IPC 探针、retention 和 Skill 安装备份：保留已有生命周期/归属检查；普通执行、正式 Wiki 维护、安装升级采用不同明确目标，不把所有写入强行锁在 SQLite Store 下。

@@ -1,5 +1,7 @@
 # Project instructions
 
+- Default file mutations to the current task workspace and verified local/remote/container mappings. Read `docs/workspace-boundaries.md` before the first write or a mapping/exception change; preserve this scope when delegating or entering a standalone mode. External reads remain available. Record necessary external write paths, impact and existing authorization; ask only for missing authorization, not again for already approved work. Never treat cwd, root access or a workspace path as permission for broad deletion. Authorized Wiki/Skill/project maintenance uses its declared checkout/install targets.
+
 - Keep only official material, transferable environment knowledge, and final model-optimization milestone summaries/data in `knowledge/`. Intermediate candidates, one-off debugging and measurement logs stay in the task workspace/board. Apply the curation rules in `docs/knowledge-architecture.md` before adding shared pages. Never commit credentials, private keys or access tokens. External Cookbook publication rules are separate.
 - Preserve one coordinator entry plus three stage Skills and two Wiki Skills. Analysis-only, environment-only and diagnosis-only are valid independent requests.
 - For model adaptation, inspect applicable scripts/configs in the selected HCU repository and the user's actual deployment first. Reuse compatible HCU launch recipes; use NVIDIA upstream to check model/training semantics. Verify branch, dependencies and effective environment instead of copying NVIDIA launch commands or platform-specific variables.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.5 — 2026-10-12
+
+- Define a shared workspace write boundary across all six Skills and standalone modes: verified local/remote/container mappings, task-local outputs and caches, inherited Agent scopes, and narrowly recorded necessary exceptions using existing authorization. Keep reads available and preserve separate maintenance/install targets.
+- Connect setup, source transfer, execution, recovery, retention and delivery guidance; retain milestone-based cleanup and avoid per-command approval gates. Explicitly distinguish workflow policy from an OS filesystem sandbox.
+- Reject linked/reparse-point source-transfer destinations and parents before resolving them, including dangling links and unfinished staging paths. Verify path behavior with isolated local tests; no new remote hardware qualification is claimed.
+- Route managed TraceLens report/advanced-worker temporary files, plotting and conversion caches into the per-run workspace without changing HOME or the caller's environment.
+
 ## 0.6.4 — 2026-10-12
 
 - Add a curated official TorchTitan Wiki: engineering map, Python recipes, installation/run/test paths, model/data semantics, numerical validation, parallelism/memory, compilation/communication, MoE/precision, profiling, checkpoint/recovery and TitanRL. Include three source/PR-grounded optimization cases.

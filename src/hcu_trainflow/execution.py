@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 
@@ -364,11 +365,31 @@ def _executable_metadata(candidate, name, modes, *, windows=None):
     return {"executable": bool(candidate.stat().st_mode & 0o111), "executable_source": "posix-working-tree"}
 
 
+def _plain_transfer_path(path):
+    """Inspect the spelling before resolve can hide a redirected write target.
+
+    This is an accidental-redirection guard, not a concurrent filesystem
+    sandbox. Callers still own destination authorization and directory access.
+    """
+    path = Path(path)
+    if ".." in path.parts:
+        raise FlowError("Transfer destination must not contain parent traversal")
+    path = path.absolute()
+    for component in (*reversed(path.parents), path):
+        try:
+            info = component.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise FlowError("Transfer destination or parent is a link/reparse point; verify and use its real authorized path")
+    return path.resolve()
+
+
 def _new_transfer_destination(destination):
-    destination = Path(destination).resolve()
+    destination = _plain_transfer_path(destination)
     if destination.exists():
         raise FlowError("Snapshot destination must be new; never overwrite a running worktree")
-    staging = destination.with_name(destination.name + ".partial")
+    staging = _plain_transfer_path(destination.with_name(destination.name + ".partial"))
     if staging.exists() or staging.is_symlink():
         raise FlowError("An unfinished transfer exists; inspect it before retry")
     return destination, staging

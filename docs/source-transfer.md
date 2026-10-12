@@ -4,6 +4,8 @@
 
 ## 标准流程
 
+传输包、目标和暂存目录都应位于[已核实的任务映射范围](workspace-boundaries.md)。接收 CLI 允许指定 Store 之外的专属快照目录，因此仍需调用者核对真实目标和授权；文件完整性校验不能代替这项判断。
+
 ```bash
 # 在独立开发 checkout 暂停编辑，显式选择要运行的源码和配置。
 hcu-trainflow --workspace PRIVATE source-snapshot CHECKOUT src scripts configs
@@ -20,6 +22,7 @@ hcu-trainflow --workspace REMOTE_PRIVATE source-receive REMOTE_PRIVATE/source.zi
 
 ## 完整性与路径
 
+- 目标和现有父目录在 `resolve` 前逐项检查，拒绝 `..`、符号链接及 Windows reparse point/junction（含悬空目标或暂存链接），避免把外部位置静默当成授权目标。需要使用已核实的链接目录时，先确认真实落点属于本任务范围，再传实际路径；这不代替挂载/授权检查，也不提供抵御并发目录替换的沙箱。
 - 每个内容对象先写临时文件、flush/fsync，再原子替换。读取对象时再次校验哈希与已登记大小。
 - 快照和接收使用流式 `Store.put_many`。所有对象写入成功后，在一个 SQLite 事务中批量登记。不会为几千个源码文件各做一次数据库提交；对象文件的独立落盘保障仍然保留。
 - 打包和展开通过 `Store.iter_artifacts` 复用一个读取连接，逐文件校验、处理，只在内存中保留当前文件与清单元数据。

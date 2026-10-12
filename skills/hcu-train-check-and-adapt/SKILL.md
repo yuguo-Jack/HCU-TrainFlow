@@ -9,6 +9,8 @@ description: 检查 HCU 训练环境并准确适配预训练、SFT、RL 模型�
 
 先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。
 
+默认只在当前任务工作空间及已核实的远端/容器映射目录内创建、修改、移动或删除；外部资料可按需读取。首次写入、映射变化或涉及外部路径时先读项目 `docs/workspace-boundaries.md`，复用已记录范围与授权；必要例外写清路径和影响，未获授权再询问，不逐条命令重复确认。
+
 支持 `environment` 单独验收或 `adapt/full` 推进模型。先确定模式，环境检查任务交付检查结果后即可结束，不强行开始训练。
 
 同一流程适用于 Torch 原生的视频生成、VLA、世界模型等训练。核对数据解码/采样、时空输入与 mask、loss 分量、冻结模块、EMA、autograd 和 optimizer 语义；优化专项交给原 optimize Skill。仅缩 layer 的代理可用于跑通与筛机，记录代理配置及未覆盖范围，不作为完整模型显存、收敛或扩 DP 的证明；模型不适合缩层时，或用户明确允许缩维时，用显式授权列出每个可缩减维度并核对架构约束，不能暗改其他参数。详见项目 docs/proxy-contract.md。

@@ -22,6 +22,8 @@
 
 安装保留项目 checkout，Skill 自带 references 随安装复制，项目脚本/文档由显式项目路径、`TRAINFLOW_PROJECT` 或安装时写入的 `workspace.json.project_root` 定位。wheel 包含维护模块，单独安装 wheel 不会附带全部 scripts/docs/Wiki；远端辅助脚本须按同一修订显式部署。维护与观察换代的使用和边界见 [工作区维护](workspace-maintenance.md)。
 
+工作空间约束见[统一写入边界](workspace-boundaries.md)：六个 Skill 共用映射、输出/缓存和必要例外规则；源码传输另有目标链接预检，维护脚本保留受限删除检查。CLI 不为任意命令提供文件系统沙箱，部署仍须核对实际挂载、权限与工具输出。
+
 ## TraceLens 已验证范围
 
 当前主线另完成了 gfx936/DTK 26.10 的 TraceLens 有界资格验证：训练 Graph 前后向映射、实际输入 EventReplay、实测参考 Roofline、原生 Agent 指标及推理复核、hipprof JSON/pftrace 同源对照、XProf/XCompute counter 与 SQTT。命令、计时/数据边界和未覆盖项见 [TraceLens HCU 分析](tracelens-analysis.md)；没有因此扩大完整模型 loss、多架构或生产长稳的验证声明。

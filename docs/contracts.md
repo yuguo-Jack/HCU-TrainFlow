@@ -2,6 +2,8 @@
 
 以下值是示意，不能当作 HCU 的标称性能或统一精度容差。路径、阈值和来源必须由具体任务填写。完整可运行构造见 `src/hcu_trainflow/demo.py`。
 
+文件写入范围按[工作空间与映射约定](workspace-boundaries.md)记录在任务环境/DETAILS 中，不新增 TaskSpec 或命令卡的未知字段；现有 `permissions`、`cwd` 与 `allowed_paths` 不提供操作系统级路径隔离。
+
 ## TaskSpec
 
 `schema_version: 1`；`task_id` 为稳定 ID；`mode` 取 environment/adapt/analyze/optimize/diagnose/operate/full；`objective` 为任务目标；非空 `context` 描述比较范围；`permissions` 缺省为空，可选 execute/sync/notify/agent-dispatch；`recovery_owner` 指既有容错工具；`budget` 支持 max_operations/max_seconds。
