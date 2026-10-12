@@ -2,13 +2,13 @@
 
 - 内容基准：HCU-TrainFlow 当前主线；所有流程图均不写工程版本号。
 - 输出：[workflow-overview.png](workflow-overview.png)。首页使用摘要图，精确分支与验收门槛以[可编辑流程图](../workflow-map.md)和[能力边界](../capabilities.md)为准。
-- 生成方式：内置 `imagegen`，以此前的总览图为编辑输入，沿用白底、蓝绿紫配色和分阶段科技信息图风格。
+- 生成方式：内置 `imagegen`，以此前的总览图为编辑输入，采用白底、低饱和蓝灰 / 青灰 / 淡紫灰、细线边框与箭头，保留分阶段科技信息图结构及文字对比度。
 - 维护：图面不印版本号；流程、状态或边界变更时一起复核 README、工程介绍和细图。重新生成后检查文字、箭头及验证声明。
 
 ## 本次完整提示词
 
 ```text
-Edit the attached HCU-TrainFlow README overview infographic to reflect the current workflow. The existing image is the edit target and visual reference. Preserve the white background, refined flat technology style, dark navy Chinese typography, pale blue/teal/lavender rounded panels, small blue/teal/purple line icons, and restrained orange feedback arrows. High resolution wide landscape 3:2 composition, fully readable accurate Chinese. This is a technical workflow, not promotional art. Re-layout text cleanly as needed. No false dashboards or extra features. All panels inside safe margins. Never obscure text with arrows. Replace all wording with the following exact content, organized hierarchically. Do not add a project version number anywhere in the diagram.
+Edit the attached HCU-TrainFlow README overview infographic to reflect the current workflow. The existing image is the edit target and layout reference. Refine the design substantially: pure white canvas, nearly white panels, very pale desaturated blue-gray / teal-gray / lavender-gray accents, dark slate Chinese typography, fine hairline borders and arrows, small restrained thin-stroke icons. Make lines approximately HALF as thick as in the reference; remove the heavy saturated outlines and large vivid icons. The orange feedback accents must be muted warm gray-ochre, subtle but legible. Keep text dark and clearly readable: soften panel colors and lines, not the text. Use spacious margins, consistent subtle rounded corners, precise typographic hierarchy, clean technical editorial design. No gradients, glow, heavy shadows, thick arrows, saturated electric blue or violet. High resolution wide landscape 3:2 composition, ideally 2304 x 1536 or higher, with fully readable accurate Chinese. This is a technical workflow, not promotional art. Re-layout text cleanly as needed. No false dashboards or extra features. All panels inside safe margins. Never obscure text with arrows. Replace all wording with the following exact content, organized hierarchically. Do not add a project version number anywhere in the diagram.
 
 TITLE: HCU-TrainFlow
 SUBTITLE: 面向 HCU 大模型训练的全流程智能体协同工作流
@@ -52,10 +52,10 @@ card 4 重点算子：并行评估与验证
 ≥90% 端到端热点中的非通信项逐项建模
 未知项补证据，条件上限不等于整步收益
 card 5 复用与实现迭代
-HCU TE / Flash-Train / Primus Turbo
-Baseline → HIP · Triton 优化
-hipprof / XProf / XCompute · 数学库 tune
-局部回归 · 无 profiler 实测 · 停止有依据
+优先复用现有算子库 / 通信库能力
+能力或性能不足：基于对应库实现
+算子 Skill · 迭代回归 · 无 profiler 实测
+优化停止有依据
 
 Orange outlined stage gate below center cards:
 稳定阶段验收：同初态 A/B
@@ -66,13 +66,16 @@ Blue pass arrow labeled 通过 from gate to RIGHT FIRST CARD (not directly long 
 RIGHT 03 title 规模扩展与长稳运行
 card 1 验收目标配置，再扩 DP
 必要时恢复完整模型
-健康池 · 扩展效率 · 显存 / 通信
+精度 / loss · 健康池 · 扩展效率
+显存 / 通信 · 保存与恢复
 card 2 既有容错与故障诊断
 唯一恢复负责人 · 按部署授权
 定位 → 修复验证 → 恢复 → 持续推进
+恢复后复核训练状态与精度
 card 3 持续观测与曲线
-step · loss · 吞吐 · 显存
-checkpoint · 全部成员 · 观察器健康
+精度 / loss / 梯度 · 吞吐 · 显存
+step / checkpoint · 训练进展
+全部成员 · 观察器健康
 card 4 已部署的远端守护持续运行
 事件持久化 · 重放与去重
 本机恢复后接续，告警 / 唤醒分别验收
@@ -83,18 +86,21 @@ Full-width feedback band:
 实施 → 测量 → 独立复核 → 修正 / 推进
 BOARD / GUIDANCE / QUESTIONS · 每 5 分钟采集指导与问题
 
-Two bottom support panels:
+Three bottom support panels of similar height, with concise exact text:
 本地协同 · 远端执行
 固定源码快照 → 编译 / 训练 / 采集
 SSH / Docker / Conda / Slurm / K8s
 超时或断线：先核查原作业
-各阶段负责交付，已有修改可直接审查交付
 
 知识贯穿三个阶段
 必装 HCU-Knowledge · 联查官方 Wiki / PR / 源码
 共享 Wiki：官方资料 · 通用环境 · 最终模型总结
-过程留任务档案 · 更新前筛选内容
-局部 Wiki / Skill 按需维护，大知识库独立更新
+过程留任务档案 · 大知识库独立更新
+
+交付与交接
+训练引擎 · 算子库 · 通信库 · 相关工具
+按改动归属提交 PR，关联依赖与验证
+配方 · 精度 / 性能证据 · 回退 / 运行交接
 
 Footer:
 流程概览 · 具体分支、证据门槛与实测边界见工程文档

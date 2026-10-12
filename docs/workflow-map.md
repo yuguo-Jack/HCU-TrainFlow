@@ -23,14 +23,14 @@ flowchart TD
     Q --> QG{"达到约定目标且数值通过？"}
     QG -->|未达到| OR["定位问题、修正或回退<br/>无新证据 / 达到预算边界时请专家介入"]
     OR --> O
-    QG -->|通过| S["③ 规模扩展与长稳运行<br/>验收目标配置 → 扩 DP 域<br/>完整目标必要时恢复结构；代理保留缺口 · 图 6"]
+    QG -->|通过| S["③ 规模扩展与长稳运行<br/>验收目标配置 → 扩 DP 域<br/>精度 / loss、扩展效率与恢复质量 · 图 6"]
     S --> SG{"环境、质量与扩容验收通过？"}
     SG -->|失败| SR["按原因回到环境、适配或优化<br/>修复后重新验收受影响证据"]
     SR --> C
     SG -->|通过| T["长训：持续监测、既有容错与诊断<br/>hcu-train-scale-and-stability · 详见图 6"]
     T --> TG{"达到任务约定的完成 / 交接条件？"}
     TG -->|否| T
-    TG -->|是| Z["完成复核与交付<br/>代码 / 配方 / 证据 / 经验 / 运行交接"]
+    TG -->|是| Z["完成复核与交付交接<br/>训练引擎 / 算子库 / 通信库 / 工具：按归属提交 PR<br/>关联依赖、配方、精度与性能证据、回退和运行责任"]
     PART --> Z
     DELIVER --> Z
     LOOP["所有阶段共用<br/>实施 → 测量 → 独立复核 → 修正 / 推进<br/>详见图 4"] -.-> C
@@ -153,9 +153,9 @@ flowchart TD
     CALL --> MODEL["工作线 A：逐项建模 / TraceLens Roofline<br/>FLOPs、分层流量、必要延迟<br/>匹配硬件与可达参考；未知项继续补证据"]
     CALL --> ISO["工作线 B：同条件独立实测 / EventReplay<br/>复用实际输入与实现，核对数值和 dispatch<br/>比对模型内耗时，定位实现或资源干扰"]
     CALL --> F["对照 NV 融合粒度与数值契约<br/>接口、前后向、保存值、累加和 cast"]
-    F --> R{"当前 HCU TE / Flash-Train / Primus Turbo 已支持？"}
+    F --> R{"现有 HCU 算子库 / 通信库能力可复用？"}
     R -->|是| USE["优先复用并验证实际 dispatch<br/>融合后继续评估效率与剩余空间"]
-    R -->|否| NEW["按已裁决优先级补实现<br/>新通用训练 HIP 算子归 Flash-Train<br/>TE / Primus Turbo 自有能力归对应 HCU 仓"]
+    R -->|否| NEW["按已裁决优先级基于对应库补实现<br/>复用现有接口与基础能力<br/>改动按责任归属提交 PR"]
     MODEL --> EFF["汇合本项证据，互相校正假设<br/>当前效率、实现空间与整步可兑现收益<br/>各项就绪即可推进，无全体算子屏障"]
     ISO --> EFF
     USE --> EFF
@@ -168,7 +168,7 @@ flowchart TD
     NEW --> TASK
     COMM -->|系统调参 / overlap 问题| SYS
     COMM -->|已满足目标| KEEP
-    COMM -->|需要通算融合时| SH["核对 rocSHMEM / DeepEP / UCCL 等当前能力<br/>明确同步、生命周期和正确性"]
+    COMM -->|需要通算融合时| SH["先核对现有通信库 / 算子库能力<br/>复用或基于对应库实现<br/>明确同步、生命周期和正确性"]
     SH --> TASK
 ```
 
@@ -443,7 +443,7 @@ flowchart TD
     FULL --> POOL["Cluster Manager 为主筛机<br/>适用时结合 Primus Safe<br/>动态维护健康节点池"]
     PROXY --> POOL
     POOL --> DP["逐级扩 DP 域<br/>明确强 / 弱扩展与有效全局 batch 策略"]
-    DP --> SCALE["每级扩容验收<br/>吞吐效率 / 通信尾部 / 显存 / checkpoint<br/>当前环境 + 阶段质量 + scale 证据"]
+    DP --> SCALE["每级扩容验收<br/>精度 / loss、吞吐效率、通信尾部、显存<br/>checkpoint / 恢复质量与当前阶段证据"]
     SCALE --> SG{"当前级验收通过？"}
     SG -->|否| FIXS["按问题返回环境 / 适配 / 优化<br/>修复后重新验收当前上下文"]
     FIXS --> SCOPE
@@ -454,12 +454,12 @@ flowchart TD
     JOB --> LOG["现场归一化器<br/>全局进展 JSONL：attempt / step / 时间<br/>loss / grad / 显存 / 恢复状态等"]
     LOG --> WATCH["远端 watcher 持久采集<br/>游标、真实推进时钟、incident 与 outbox"]
     JOB --> MEMBERS["观测全部必需 launcher 成员<br/>进度日志源 / 身份 / 新鲜度 / 退出回执<br/>不把一个 rank 的进展当作全组健康"]
-    WATCH --> HEALTH{"进展和指标符合预期？"}
+    WATCH --> HEALTH{"精度 / loss、进展和指标符合预期？"}
     MEMBERS --> HEALTH
     HEALTH -->|是| CURVE["持续记录与分 attempt 曲线<br/>step / loss / grad / 显存 / 事件<br/>吞吐与 checkpoint 结合原始证据"]
     CURVE --> END{"达到约定的完成 / 交接条件？"}
     END -->|否| JOB
-    END -->|是| COMPLETE["完成报告、独立复核和运行交接"]
+    END -->|是| COMPLETE["完成报告、独立复核和运行交接<br/>训练引擎与相关库 / 工具改动按归属提交 PR"]
     HEALTH -->|异常| OUT[("各观察源的持久异常事件<br/>停滞 / 失联 / 恢复超时 / 非有限值 / 性能下降<br/>独立 Store 与 peer，按实际接口汇接")]
     OUT -->|已配置通知消费者| ALERT["站点通知接口<br/>优先既有容错的飞书告警通道<br/>实际发送与送达另行验收"]
     JOB -->|故障由既有规则处理| FT["现场既有容错负责人<br/>按授权隔离 / 重启 / 恢复"]

@@ -78,7 +78,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 - **并行切分与显存取舍**：先评估 TP/PP/DP/CP/EP、微批、累积、重算、状态切分及 overlap，在显存峰值、必要余量、通信和实际吞吐之间选择配置。调参保持训练语义可比，GPU_MAX_HW_QUEUES 等按当前 runtime 与实测核验。
 - **按主要瓶颈推进**：采集稳态端到端 profile，每个实际非单例并行组至少覆盖两个代表 rank，结合 TraceLens 分析空泡、通信、负载不均、计算和显存。谁占主要时间就先处理谁；通信达到单测预期仍大量暴露时，再考虑 overlap、调度或通算融合。
 - **重点算子持续迭代**：对累计 ≥90% 端到端热点中的非通信算子，按实际贡献排序，评估瓶颈、可达上限、当前效率和剩余空间。同 shape 独立实测与上限建模可以并行，用于区分实现差距和模型内资源竞争；保留空泡、重叠和未归因时间的正确口径。
-- **复用与深入实现**：优先复用 HCU TE、Flash-Train、Primus Turbo 等能力，对齐融合粒度和数值契约；缺 HIP 基线时先调用 baseline Skill，再进入 HIP 优化，已有 Triton 实现调用 Triton 优化 Skill。融合后仍有显著空间就继续迭代，瓶颈时使用实际性能工具；数学库有性能缺口时提取原生日志中的完整 bench 命令用于 tune。通信按需联动 RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP 等。
+- **复用与实现迭代**：优先复用现有 HCU 算子库、通信库的能力；能力或性能不足时，基于对应库补充实现并借助算子 Skill 持续优化。对齐接口与数值契约，以实际性能分析、局部回归和整步收益验证结果；具体工程分工见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。
 - **稳定阶段验 loss**：每轮做局部正确性、多形状和无 profiler 性能回归，集成后重测整步净收益；稳定阶段从同一冻结初态与配方比较 loss、性能和显存。达到目标、接近可达上限、无稳定收益或受阻，都须给出证据与停止依据。
 
 同一阶段包含 [Torch 原生训练专项](skills/hcu-train-analyze-and-optimize/references/torch-native-training.md) 和 [通信优化专项](skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，覆盖输入流水、autograd、compile/断图/重编译、DDP/FSDP，以及 bucket/chunk、同步、overlap、通算融合和资源竞争。机制选择联查官方教程与 PR、AMD Primus、MindSpeed 系列、LoongForge 和 HCU 底层源码。详见[热点排序与算子迭代](skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。
@@ -87,15 +87,17 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ### 3. 规模扩展与长稳运行
 
-- **逐级扩容**：完整模型目标必要时先恢复并验收完整配置；获准的代理任务可以扩选定代理配置的 DP，并保留完整模型验证缺口。以 Cluster Manager 为主筛机、交叉检查疑似节点并维护健康池，逐级核对吞吐、扩展效率、通信、显存和训练语义；新瓶颈返回优化。
-- **验证恢复链路**：接入现场既有容错并明确唯一恢复负责人，按部署授权诊断卡住、core dump、OOM、泄露等问题。验证旧进程处理、checkpoint 完整性、重新拉起及训练状态恢复，观察 step 是否真实持续推进。
-- **长时观察与接续**：持续记录 loss、吞吐、显存、全部必需成员、checkpoint 和恢复状态，生成曲线并检查观察器自身健康。本机离线时由已部署并验收的远端守护和既有容错继续工作；恢复后核对现场、重放事件并接续 Agent，告警和自动唤醒分别验收。
+- **逐级扩容**：完整模型目标必要时先恢复并验收完整配置；获准的代理任务可以扩选定代理配置的 DP，并保留完整模型验证缺口。以 Cluster Manager 为主筛机、交叉检查疑似节点并维护健康池，逐级核对精度/loss、吞吐、扩展效率、通信、显存和训练语义；新瓶颈返回优化。
+- **验证恢复链路**：接入现场既有容错并明确唯一恢复负责人，按部署授权诊断卡住、core dump、OOM、泄露等问题。验证旧进程处理、checkpoint 完整性、重新拉起及训练状态恢复，复核恢复后的精度与 loss，观察 step 是否真实持续推进。
+- **长时观察与接续**：持续记录精度与 loss/梯度异常、吞吐、显存、全部必需成员、checkpoint 和恢复状态，生成曲线并检查观察器自身健康。本机离线时由已部署并验收的远端守护和既有容错继续工作；恢复后核对现场、重放事件并接续 Agent，告警和自动唤醒分别验收。
 
 ### 贯穿全程的协同与交付
 
 **模型精度诊断**贯穿适配、优化和长稳：有 NV 环境进行同初态、同样本的分层对照；没有 NV 则用可信基线、独立参考和 HCU 自查。按需结合 HCU Probe 定位前向、梯度、更新或通信的首处分歧，局部修复回归后在稳定里程碑验 loss。详见[精度诊断方法](docs/practices/model-accuracy-diagnosis.md)和[精度分支图](docs/workflow-map.md#35-模型精度诊断跨阶段复用)。
 
 本地主控按依赖和收益拆解任务，独立方向并行，共享资源测量与耦合修改协调执行；代码以固定快照同步远端，超时或断线先核查原作业。HCU-Knowledge、HCU-TrainFlow-Wiki、PR 与源码查证贯穿三个阶段，看板持续展示技术结论并采集指导。各阶段按范围交付代码、配方、验证和回退方法；完整任务在执行基线上完成约定验证后再整合目标主仓，精选通用经验和最终里程碑进入共享 Wiki。
+
+**改动按工程归属交付**：训练引擎、算子库、通信库及相关工具分别向对应仓提交 PR，关联跨仓依赖、集成版本和验证结果；同时交接启动配方、精度与性能证据、回退方案及运行责任。
 
 阶段入口分别为 `$hcu-train-check-and-adapt`（环境检查与模型适配）、`$hcu-train-analyze-and-optimize`（性能分析与优化）、`$hcu-train-scale-and-stability`（规模扩展与长稳运行）；统一委托仍使用 `$hcu-trainflow`。也可仅委托接手已有修改、代码审查或提 PR，直接执行[交付规范](docs/change-delivery.md)，无需重新开展训练阶段。发生异常时按 [故障诊断指南](skills/hcu-train-scale-and-stability/references/diagnosis.md) 分流，结合 HCU 知识库、线上 PR 与实际源码查证，修复后回到对应阶段验收。
 
