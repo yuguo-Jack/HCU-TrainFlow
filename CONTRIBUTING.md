@@ -2,8 +2,16 @@
 
 问题或 PR 请描述实际版本、最小复现、预期/实际行为及验证。本工程 Wiki 仅收录官方资料、跨项目可复用环境经验和模型最终优化里程碑总结/关键数据，按 `docs/knowledge-architecture.md` 组织并随仓提交。完整任务日志、数据集与模型权重留在 workspace；凭据、私钥和 token 永不入仓。外部 Cookbook/其他目标仓 PR 按其发布要求处理，不套用到本站点知识。通用协议测试使用合成数据并标注范围。
 
-代码检查：`python -m pytest -q`、`python scripts/validate_knowledge.py`。变更涉及跨进程/时间/版本时测试失败、中断和重放路径，不只测 happy path。
+代码检查：`python -m pytest -q`、`python scripts/validate_knowledge.py`、`python scripts/check_skill_resources.py`、`python scripts/check_documentation.py`。变更涉及跨进程/时间/版本时测试失败、中断和重放路径，不只测 happy path。
 
 知识更新修改同仓所有受影响结论，保留固定来源/适用范围，原文抓取和作者推理分开。第三方代码依其许可证使用；本仓不因为链接某项目就获得其代码再许可权。
 
 项目过程记录在 task_plan.md、findings.md、progress.md；docs 和 Skill 只放可迁移的流程、方法和使用说明。项目特定的模型参数、节点地址、临时补丁、失败重试顺序或编译绕过不得固化为通用默认。新增方法说明适用触发、需要的输入、验证与回退；具体配置和操作记录留 workspace。
+
+## 文档与实现同步
+
+- 修改 CLI、安装、目录、Skill 名称或依赖时，搜索相关 README、docs、Skill/reference、Wiki 导航和图文入口，对照实际源码与帮助修订全部受影响用法。共用规则只在对应主题维护，其他页面链接到它。
+- 项目发布版本只在 README、包元数据和 CHANGELOG 维护。通用指南不重复固定项目版本；硬件/工具版本、固定上游提交、历史实验时间继续保留，以免丢失适用范围。
+- 删除已被替代的过时文档前检查入链、Skill 阅读路线、维护清单和生成器。仍有用的页面更新内容并补入口；无人引用不等于可删，上游原件、证据、稳定页面 ID 和历史记录分别处理。
+- 历史过程记录明确标识，不用旧的“Current/Active”计划充当当前指南。能力说明写明确的验证范围和日期/环境，避免不断追加没有时间归属的“本轮已完成”。
+- `check_documentation.py` 离线检查现行作者页面的文件/章节链接、大小写、孤立指南、CLI 示例、版本和退役 Skill 调用、已登记第三方来源。CI、完整安装及本机同步均执行；固定上游原文/历史正文不按当前用法改写。检查通过仍需人工对照源码审查结论，不能证明远程链接权限或硬件验证。

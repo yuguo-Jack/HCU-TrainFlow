@@ -1,5 +1,7 @@
 # Implementation progress
 
+> 本文件是按任务保留的历史记录；每段计数、版本、完成状态和限制仅对应当时的检查。现行用法见 README、AGENTS.md 与对应 Skill/docs，当前任务见 task_plan.md；不将旧安装或发布计划当作当前要求。
+
 ## 2026-10-12: Check/adapt rename and optional KernelWiki verification
 
 - Renamed stage Skill and updated runtime/UI/docs/maintenance routes; exercised migration from the previous entry, verified old installation removal only after replacement succeeded.
@@ -436,3 +438,10 @@ Merged published HCU 30f5dcd then upstream 493f750 in development checkout, merg
 - Initial full TrainFlow run: 1,284 passed/4 skips with one packaging failure; corrected setuptools/metadata compatibility. Final rerun and publication checks follow.
 
 - Final TrainFlow regression: 1,287 passed, 4 platform skips. All three new managed modes ran with real HCU traces against the published pin. Skill reading resources, six installed bindings and actual editable imports are current at 0.6.8. Dedicated remote validation containers stopped with no experiment processes remaining. Ready for main/v0.6.8 publication.
+
+## 2026-10-13: Current Markdown consistency review
+
+- Reviewed current root/docs/Skills/navigation against local code, installation and dependency contracts; repaired installation guidance, checker discovery, board interaction, navigation and ambiguous historical wording. Historical plans are explicitly separated from current instructions. No obsolete standalone page needed deletion after checking its purpose and incoming routes; retained upstream evidence and stable Wiki IDs keep their original identity.
+- Added offline documentation checks to CI, full setup and local synchronization, with regressions for stale paths/anchors, examples, versions/names, attribution and stopping installation before package/Skill replacement. The checker also runs with `python -S`, confirming it needs no installed third-party Python package for first setup.
+- Validation: 200 current authored Markdown pages, 68 CLI examples and 38 JSON examples pass; 5,185 knowledge pages / 24 sources pass validation; Wiki coverage and Skill reading routes pass. Full CPU suite: 1,298 passed, 4 platform skips. No new hardware or upstream-source qualification is implied.
+- System Python package and six TrainFlow Skills synchronized and checked at 0.6.8; the Wiki/Skill update Skill now includes the documentation maintenance rules. Source docs are read from the bound checkout. The reviewed changes are ready for main publication under yuguo-Jack; this maintenance does not create another release tag.

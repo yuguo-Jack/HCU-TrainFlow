@@ -132,11 +132,11 @@ XProf `.perf` 属另一种输入，先由匹配 XCompute 转计数器/SQTT CSV�
 
 这里的 XProf 是 HCU 工具包的 `xprof` 可执行程序，与 TraceLens `jax` extra 中同名 PyPI `xprof` 包不是同一安装来源；不要通过 `pip install xprof` 代替 HCU 工具安装。hipprof timeline、XProf counter/SQTT、XCompute 解析各自按版本和输入格式核对。
 
-counter replay 会多次运行 kernel；SQTT 通常仅采指定 SE/CU/dispatch。其时间不是 profiler-off 基线，也不代表全芯片所有 wave。权限随工具/驱动版本而定：本轮 XProf 需要 `/dev/mem` 及对应权限，缺失时初始化失败。按现场文档核对后在授权的专用诊断容器补齐，不无条件提高普通训练容器权限。
+counter replay 会多次运行 kernel；SQTT 通常仅采指定 SE/CU/dispatch。其时间不是 profiler-off 基线，也不代表全芯片所有 wave。权限随工具/驱动版本而定：已记录的 XProf 3.16.0 / aqlprofile 3.6.2 实测环境需要 `/dev/mem` 及对应权限，缺失时初始化失败。按现场文档核对后在授权的专用诊断容器补齐，不无条件提高普通训练容器权限。
 
 ## 实测覆盖与边界
 
-本轮在 BW1000_H/gfx936、DTK 26.10、Torch 2.11.0/HIP 7.2.26365 空闲设备上执行有界资格测试，原件/命令留私有任务证据。这是工具能力验证，不是 Kimi K3 优化或完整训练质量验证。
+以下是已记录的 BW1000_H/gfx936、DTK 26.10、Torch 2.11.0/HIP 7.2.26365 有界资格测试，原件/命令留私有任务证据。这是工具能力验证，不是 Kimi K3 优化或完整训练质量验证。
 
 | 能力 | 真实验证 | 边界 |
 | --- | --- | --- |

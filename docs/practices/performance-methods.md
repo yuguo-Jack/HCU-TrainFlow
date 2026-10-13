@@ -12,7 +12,7 @@
 | GEAK | AMD-AGI `ba509ef31d416350269266b626ec455e9d9475d1`：[端到端](https://github.com/AMD-AGI/GEAK/blob/ba509ef31d416350269266b626ec455e9d9475d1/perf_knowledge/workflows/optimize_e2e_model.md)、[集成验收](https://github.com/AMD-AGI/GEAK/blob/ba509ef31d416350269266b626ec455e9d9475d1/e2e_workflow/roles/e2e_integrator.md)、[profile 角色](https://github.com/AMD-AGI/GEAK/blob/ba509ef31d416350269266b626ec455e9d9475d1/kernel_workflow/roles/profile_engineer.md)、[wrapper](https://github.com/AMD-AGI/GEAK/blob/ba509ef31d416350269266b626ec455e9d9475d1/kernel_workflow/knowledge/wrapper_optimization.md)、[停滞反思](https://github.com/AMD-AGI/GEAK/blob/ba509ef31d416350269266b626ec455e9d9475d1/kernel_workflow/knowledge/self_monitoring.md) | 先证明命中，逐 shape 建模、资源与等待分析、API 包装成本、组合回归和原始 oracle。单卡 TP=1、固定 0.5% 门槛、推理输出对齐、统一 AMD 峰值/计数器、每轮清编译缓存不作为训练默认。训练保留 autograd、状态更新、显存和阶段 loss；不确定小收益只能待组合验证。 |
 | BBuf | `6dc9c66a008daded66f214022919ff88b2186252`：[profiler Skill](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/6dc9c66a008daded66f214022919ff88b2186252/skills/llm-torch-profiler-analysis/SKILL.md)、[归因边界](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/6dc9c66a008daded66f214022919ff88b2186252/skills/llm-torch-profiler-analysis/references/heuristics.md)、[重叠案例](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/6dc9c66a008daded66f214022919ff88b2186252/skills/llm-torch-profiler-analysis/references/overlap-catalog.md)、[故障分流](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/6dc9c66a008daded66f214022919ff88b2186252/skills/sglang-prod-incident-triage/SKILL.md)、[复现/二分](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/6dc9c66a008daded66f214022919ff88b2186252/skills/sglang-prod-incident-triage/references/replay-trace-profile.md) | 调用映射与正式时间分开；热点源码、overlap、fusion 三表；先保存失败条件再复现定位。训练扩展到 fwd/bwd/重算/更新、真实并行组与跨 rank join；区间重叠不等于因果隐藏，推理 HTTP/CUDA 调试命令不移植到 HCU 训练。 |
 
-用户 fork `yuguo-Jack/Hyperloom@0425bde3f6e76e1588400c37d056dfd3bb75ac11` 是此前参考；本次针对 AMD 上游新版本补看方法，未更新或覆盖用户 fork。
+上述方法按 2026-10-10 的固定源码复核；后文 TraceLens 专项另列参考版本，两者范围不同，不表示已更新或覆盖用户的 Hyperloom fork。
 
 TraceLens 原生 Agent 的方法另按 HCU fork `f22c517ee6a87850bcc3668facc6452c1b3b5bd2` 的[分析步骤](https://github.com/yuguo-Jack/TraceLens/blob/f22c517ee6a87850bcc3668facc6452c1b3b5bd2/TraceLens/Agent/Analysis/skills/analysis-orchestrator/reference.md)复核。其 top-10 选项和 idle >15% 的 CPU 分析触发条件是该工具的筛选策略，不是 TrainFlow 的 ≥90% 端到端覆盖标准；未生成某类 finding 也不证明不存在该瓶颈。Agent 的字段/表一致性检查只验证报告契约，实际因果、训练正确性与收益仍按本仓闭环复验。`fusion_flagged` 去重不能作为已近上限或停止算子迭代的理由。
 
@@ -77,7 +77,7 @@ flowchart TD
 
 ### TraceLens 调用链核对
 
-本次核对源码而非组件介绍：Hyperloom `0425bde`、GEAK `c0c0e2a`。它们并未要求每次执行全部 TraceLens 工具。
+2026-10-13 专项核对的固定源码为 Hyperloom `0425bde`、GEAK `c0c0e2a`，与前文通用方法的参考版本分别保留。它们并未要求每次执行全部 TraceLens 工具。
 
 | 参考实现 | 实际采用的方法 | TrainFlow 的落点 |
 |---|---|---|

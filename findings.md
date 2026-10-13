@@ -1,5 +1,7 @@
 # Findings
 
+> 本文件是按任务保留的历史记录；每段计数、版本、完成状态和限制仅对应当时的检查。现行用法见 README、AGENTS.md 与对应 Skill/docs，当前任务见 task_plan.md；不将旧安装或发布计划当作当前要求。
+
 ## 2026-10-12: Check/adapt naming and optional KernelWiki
 
 - Runtime stage codes stay unchanged; Skill routing, display name, directory, reading links and Wiki maintenance targets use hcu-train-check-and-adapt. Previous names remain only in installer migration and migration tests.
@@ -370,3 +372,15 @@ TraceLens native gaps found: TraceDiff, TraceFusion and semantic Graph detection
 - Final native qualification: real eager/Graph/replay, measured-reference Roofline, six Agent metrics, two-rank RCCL, same-capture hipprof JSON/pftrace equivalence, fresh counter/SQTT, source/index/split/TraceDiff/self-comparison. The three new managed TrainFlow modes also ran against those real traces with the published dependency pin.
 - Full Linux native regression initially passed 3,680 tests; reported failures were traced to missing optional parser/dependency/fixtures and two report helper defects, then corrected/retested. Follow-up suites passed 340 (with one newly exposed helper failure subsequently fixed) and 275/1 skip. Final local HCU suite passed 264/1 skip. These overlapping suites are not summed or presented as a wholly repeated full-suite pass. Remaining Windows-only upstream test assumptions are separate from native Linux/HCU qualification.
 - TrainFlow review added incomplete states for truncated step ranges, timeline-only comparisons and missing rank activity. Optional OpenXLA xprof pins setuptools below 70; license-file metadata permits TrainFlow packaging with 69.5 without breaking the existing analysis installation.
+# 2026-10-13 Markdown 审查范围
+
+Git 当前跟踪 Markdown：根目录 9、docs 40、skills 23、thirdparty 2、知识导航/外部入口 12、作者 Wiki 118、固定上游材料 5055。原检查器只扫 docs/skills 的目标文件存在性，没有覆盖根目录入口、锚点和名称/命令漂移。上轮根目录 design-details 的旧版本和声明名单遗漏因此未被发现。本轮以当前实现审查作者维护页面；固定上游原文保持其来源版本和作者归属。
+
+
+## 2026-10-13：文档与实现核对结果
+
+- 当前维护页 200 份：链接/锚点扫描无存量断链，68 条完整 CLI 示例与当前 argparse 接口一致，38 个 JSON 示例语法有效。旧 `official-megatron-wiki/...` 是实际保留的稳定页面 ID，不应误删或改名。
+- 已修订：快速开始的完整安装与开发演示边界；遗漏的命令组和工具导航；新版环境检查器与 NHC 的并列入口；QUESTIONS 与 GUIDANCE 交互；能力说明的无时间“本轮”措辞；模型精度实践和图像维护入口；设计导航引用。
+- 原 task_plan 同时有多个 Current/Active 和早期可选 HCU-Knowledge 规则；全部归入标明用途的历史折叠区，当前任务置顶，保留当时记录不伪造完成状态。findings/progress 同样声明历史范围。
+- check_documentation 新增离线当前文档检查；CI/首次安装/本机同步执行，补足根目录、锚点、大小写、孤立指南、CLI/JSON、版本、旧 Skill 调用与第三方来源名单盲区。固定上游和历史正文明确排除，不自动修改。
+- 初次审查误用了不存在的 ci.yml/collaboration.py 路径；已通过文件发现确认实际 test.yml 及 flow 模块。新检查初次发现图片提示词无入链，已从流程图正文补维护入口。

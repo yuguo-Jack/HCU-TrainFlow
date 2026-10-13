@@ -6,6 +6,8 @@
 
 先区分执行层：批量控制端、计算节点宿主、训练容器。用 `command -v` / `type -a`、限定目录查找和匹配版本源码确认入口，再读帮助；未知脚本不要假设 `--help` 一定无副作用。
 
+当前已登记的 `hcu-envcheck` 通过 `hcu-cluster-run` 组织批量检查，使用实际分配的 hostfile；不能照搬早期 doctor/verify 或自动选节点入口。具体版本、场景、结果字段与已知边界统一见[环境工具发现](environment-discovery.md#2-发现已有能力)，经[外部知识入口](../knowledge/catalog/external/cluster-manager.md)核对现场实现。下面的 NHC/ClusterShell 是现场可用时的路径，不是要求先安装旧工具才能使用新检查器。
+
 - 用户所说的“run nhc”在部分 ClusterManager 版本中实际调用 `run_nhc`，它是站点提供的命令，不能假定包含在训练镜像或 ClusterManager wheel 中。
 - 批量执行工具通常是 ClusterShell 的 `clush`。先核对实际可执行文件、SSH 路径和版本，不把口述拼写或旧脚本参数直接执行。
 - 控制端能找到 `clush`，不代表计算节点能找到 `run_nhc`；宿主能执行，也不代表容器有同一设备视图、驱动接口和权限。

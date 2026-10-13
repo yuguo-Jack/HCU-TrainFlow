@@ -15,6 +15,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT/'scripts'))
 sys.path.insert(0, str(ROOT/'src'))
 from check_skill_resources import check_resources
+from check_documentation import check_documentation
 from install_skills import NAMES, RENAMED, checked_destination
 from hcu_trainflow.core import FlowError, write_json
 
@@ -80,6 +81,9 @@ def sync(project, target, *, check_only=False, run=subprocess.run):
         resources = check_resources(project)
         if resources['issues']:
             raise FlowError('Reading resources incomplete: '+'; '.join(resources['issues']))
+        documentation = check_documentation(project)
+        if documentation['issues']:
+            raise FlowError('Documentation inconsistent: '+'; '.join(documentation['issues']))
         state['completed_stages'].append(stage)
         if not check_only:
             stage = 'package-install'

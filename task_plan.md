@@ -1,6 +1,20 @@
 # HCU-TrainFlow development plan
 
-## Current: project-first Wiki and HCU knowledge ownership (2026-10-12)
+> 当前维护计划在下方；折叠区仅是历史开发快照，旧版本、旧名称和未同步的当时待办不作为现行操作指令。使用规范见 README、AGENTS.md 与对应 Skill/docs，实际发布以 Git 提交和标签为准。
+
+## 2026-10-13：全仓 Markdown 与当前实现一致性审查
+
+- [x] 盘点所有受 Git 管理的 Markdown，区分当前指南、作者 Wiki、固定上游材料和历史记录，核查引用与旧入口。
+- [x] 对照 CLI、安装脚本、Skill、依赖锁及当前能力，修订现行说明；清理过时表述、补齐有用入口，将旧计划明确划为历史记录。
+- [x] 补充可持续执行的文档检查，覆盖根目录导航、失效路径、命令/版本/名称漂移及来源名单。
+- [x] 核对知识与 Skill 阅读路线、全量回归和安装同步，完成差异审查。收尾提交 main 并核验远端，实际发布记录以 Git 为准。
+
+范围：本 TrainFlow checkout、任务内审查缓存与已绑定的本机六项 Skill/Python 安装。HCU 大知识库和上游固定文档只读；不执行远端任务，不把历史 release 或上游版本号误改成 TrainFlow 当前版本。
+
+<details>
+<summary>历史开发计划与当时的状态记录（保留追溯）</summary>
+
+## 历史阶段： project-first Wiki and HCU knowledge ownership (2026-10-12)
 
 Scope: reorganize the bound TrainFlow checkout and its installed Skills; HCU-Knowledge is a read-only reference in this task. User authorizes commit, GitHub push and a new tag. No remote training runs or broad source refresh.
 
@@ -12,7 +26,7 @@ Scope: reorganize the bound TrainFlow checkout and its installed Skills; HCU-Kno
 
 Preserve source-reported versus reviewed versus hardware-validated boundaries. Detailed cases are only for substantial optimizations. Keep migration tooling and temporary outputs in ignored .work/wiki-layout; no deletion of original evidence merely to reduce size. Reorganization may retire redundant HCU source copies after verifying their replacement route and references.
 
-## Current: HCU alignment and balanced official Wiki (2026-10-12)
+## 历史阶段： HCU alignment and balanced official Wiki (2026-10-12)
 
 1. Audit the latest HCU-Knowledge commit, TrainFlow dependency locks, all installed Skills and three-stage usage — complete; read-only HCU audit, only demonstrated drift repaired.
 2. Read fixed official sources and expand every engine/library/ecosystem to common content dimensions with concrete mechanisms — complete; 22 coverage groups, 27 registered sources including a parent-pinned Loong-Megatron dependency.
@@ -22,7 +36,7 @@ Preserve source-reported versus reviewed versus hardware-validated boundaries. D
 
 No HCU-Knowledge mutation or new GPU qualification. Source acquisition, authored review and runtime validation remain distinct. Raw source caches and interim scripts stay in ignored .work/wiki-maintenance.
 
-## Current: check/adapt rename and optional KernelWiki (2026-10-12)
+## 历史阶段： check/adapt rename and optional KernelWiki (2026-10-12)
 
 1. Rename Skill entry, UI, dispatch and reading/update references; preserve installer migration — complete.
 2. Add pinned optional KernelWiki checkout and opt-in installation; keep the default required set unchanged — complete; kernel-Skill pin aligned with the already reviewed reference workflow.
@@ -31,7 +45,7 @@ No HCU-Knowledge mutation or new GPU qualification. Source acquisition, authored
 No model experiments or HCU-Knowledge content refresh in this task.
 
 
-## Current: integrated workflow review and handoff (2026-10-10)
+## 历史阶段： integrated workflow review and handoff (2026-10-10)
 
 The physical qualification round is sufficient for this review. Consolidate reusable decisions and evidence contracts so a fresh Agent can take over a new environment/model through the single coordinator Skill. Do not resume proxy tuning or present bounded drills as full-model convergence. Historical sections below record earlier decisions; current AGENTS.md and published workflow docs take precedence over superseded optional-dependency/naming/release notes.
 
@@ -71,7 +85,7 @@ Implement the first usable local-centred workflow release. Preserve the 36 requi
 - Complete: corrected preparation guidance to reuse applicable HCU scripts and the user's deployment, with official model/training semantics as the reference.
 - Complete: reviewed related workflow, Megatron topics, profiling and maintenance guidance together; Wiki integrity and all three changed Skills validate successfully.
 
-## Active follow-up: training libraries and bundled integrations
+## 历史后续工作： training libraries and bundled integrations
 
 1. Inspect current TE, cuDNN Frontend and TraceLens sources/tutorials and dependency repository layout — complete.
 2. Add detailed official library Wiki topics, monitored source/tutorial paths, source locks and workflow impact rules — complete.
@@ -86,7 +100,7 @@ Public repository stores reusable integration and public authored knowledge. HCU
 - TE's historical user-guide URL returns 404; use the current canonical documentation root and pinned in-repository tutorial sources.
 - The pinned TraceLens CLI imports an unrelated helper that sets csv.field_size_limit(sys.maxsize), overflowing Windows C long. The integration uses its supported report API in an isolated worker, retaining the upstream checkout unmodified.
 
-## Active follow-up: reusable HCU TraceLens fork
+## 历史后续工作： reusable HCU TraceLens fork
 
 1. Verify account and create/reuse the public yuguo-Jack fork with upstream history — complete.
 2. Preserve upstream modules and commands; document HCU extension/validation boundaries, and repair only locally reproduced compatibility defects — complete.
@@ -407,3 +421,5 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [x] Review, relevant/full tests, dependency and installed Skill sync; prepare TrainFlow v0.6.8 publication.
 
 Scope: TrainFlow checkout and .private/development/TraceLens (separate development repository); task evidence .work/tracelens-parity-20261013; remote /cfs/yuguo/tracelens-parity-20261013 after mount verification. User authorizes code, remote experiments, commits/pushes. Use idle devices only; do not update HCU-Knowledge; no historical author rewrite; approximate workload-specific roofline suffices, deep modeling only for unexplained limits.
+
+</details>

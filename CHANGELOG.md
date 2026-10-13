@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Reconcile current Markdown with installation, Skill names, environment-tool discovery and guidance handling; separate historical plans and pinned evidence from current instructions.
+- Check authored documentation links/anchors, CLI and JSON examples, release-version declarations and registered third-party attribution in CI and installation preflight. Keep the existing Skill reading-route check.
+
 ## 0.6.8 — 2026-10-13
 
 - Upgrade the HCU TraceLens fork after merging upstream `493f750`; retain native capabilities and document feature-specific HCU qualification.

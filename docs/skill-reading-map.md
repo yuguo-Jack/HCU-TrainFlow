@@ -53,4 +53,6 @@ Markdown 链接不会自动将所有文档注入 Agent 上下文。主控在任�
 
 更新这些内容时同步核对维护关联、入口路由与安装副本。安装校验能发现缺文件、断开的本地文档链接、没有阅读入口的 references 和版本不一致；不能自动证明模型已理解每一条方法或实验已通过。
 
+维护后运行 `python scripts/check_skill_resources.py` 和 `python scripts/check_documentation.py`：前者核对 Skill 阅读路线，后者覆盖现行作者文档、章节锚点、CLI 示例、名称/版本及第三方来源。固定上游原文和开发历史保持各自版本，处理规则见[文档维护规范](../CONTRIBUTING.md#文档与实现同步)。
+
 跨引擎机制选择、HCU 修改归属统一见[优化参考表](optimization-reference-map.md)，在适配、分析优化及恢复诊断需要比较其他实现时按问题进入；不要求每次遍历全部参考工程。

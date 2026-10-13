@@ -170,7 +170,7 @@ HCU-Knowledge 默认从 GitHub 获取；内部人员首次安装可加 `--knowle
 
 ### 后续更新
 
-日常维护使用 `$hcu-trainflow-wiki-skill-update`，由 Agent 检查相关官方与 HCU 工程变化、整理符合收录规则的环境经验和最终模型总结，并更新受影响的流程与 Skill，验证后同步本机安装。旧的 `hcu-engine-wiki-*` 安装名称会在升级时迁移为 `hcu-trainflow-wiki-*`，菜单显示名称与实际英文 Skill ID 一致。普通维护不更新 HCU-Knowledge，也不自动替换正在运行的训练依赖。
+日常维护使用 `$hcu-trainflow-wiki-skill-update`，由 Agent 检查相关官方与 HCU 工程变化、整理符合收录规则的环境经验和最终模型总结，并更新受影响的流程与 Skill，验证后同步本机安装。旧安装的兼容迁移由安装器处理，菜单使用当前英文 Skill ID。普通维护不更新 HCU-Knowledge，也不自动替换正在运行的训练依赖。
 
 已有完整安装时，更新 Skill 和本工程维护流程都会在验证后执行本机同步；手动 pull 后也可执行：
 
@@ -191,6 +191,7 @@ hcu-trainflow demo .work/analysis-first
 python -m pytest -q
 python scripts/validate_knowledge.py
 python scripts/check_skill_resources.py
+python scripts/check_documentation.py
 ```
 
 两个 demo 使用合成输入，分别演示协作协议和训练分析/监测；不需要 GPU，不构成真实训练验证。每次演示使用新目录。
@@ -209,8 +210,8 @@ python scripts/check_skill_resources.py
 任务源码、完整日志/trace/checkpoint、数据与看板保存在独立 workspace；默认 `.work/` 忽略提交。工程 Wiki 仅包含官方资料、可复用环境经验和模型最终优化总结；工作流方法在 docs/skills，过程记录不进入 Wiki；凭据、私钥和 token 不入仓。
 
 - [工程介绍](docs/project-overview.md) / [工作流全景](docs/workflow-map.md) / [协作循环](docs/collaboration.md) / [多 Agent 协同](docs/multi-agent.md) / [三个阶段工作流](docs/workflows.md)
-- [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md)
+- [快速开始与 CLI](docs/quickstart.md) / [架构](docs/architecture.md) / [设计文档导航](design-details.md)
 - [性能分析](docs/profiling.md) / [远程执行](docs/remote-execution.md)
 - [真实训练观察](docs/training-observation.md) / [离线训练图表](docs/training-dashboard.md) / [容量清理与观察换代](docs/workspace-maintenance.md)
-- [HCU-TrainFlow-Wiki](knowledge/README.md) / [搜索与更新](docs/wiki.md) / [私有训练经验与 Cookbook 记录](docs/experience-knowledge.md)
+- [HCU-TrainFlow-Wiki](knowledge/README.md) / [搜索与更新](docs/wiki.md) / [任务经验、Wiki 提炼与 Cookbook 记录](docs/experience-knowledge.md)
 - [贡献与公开边界](CONTRIBUTING.md) / [参考工程](THIRD_PARTY_NOTICES.md)

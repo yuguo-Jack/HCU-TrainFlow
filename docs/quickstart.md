@@ -6,9 +6,26 @@ Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需
 
 首次接入真实集群，先读 [环境发现与验收](environment-discovery.md)、[远程执行与准入](remote-execution.md) 和 [源码传输](source-transfer.md)。启动训练前按 [训练观测](training-observation.md) 建立真实 attempt、日志与退出回执；部署了观察器不等于已接通跨节点告警或 Agent 唤醒。
 
+## 完整安装
+
+在已克隆的工程根目录执行；此命令安装必需依赖、知识检索和 11 个 Skill。内部知识库来源、已有知识库绑定及升级见[安装说明](integrations.md)。
+
+```powershell
+git lfs install
+python scripts/setup_trainflow.py --skills-dir "$HOME/.codex/skills"
+```
+
+完成后新开 Agent 会话，通过 `$hcu-trainflow` 提供模型、环境和目标即可。下面的 CLI 是开发检查与手动操作入口，不需要用户逐条执行。
+
+## 开发检查与演示
+
+仅运行下面的 `pip install` 安装的是 TrainFlow 包和测试依赖，不代替上面的完整安装。
+
 ```bash
 python -m pip install -e ".[test]"
 python scripts/validate_knowledge.py
+python scripts/check_skill_resources.py
+python scripts/check_documentation.py
 python -m pytest -q
 hcu-trainflow --workspace .work/local init
 hcu-trainflow demo .work/demo-001
@@ -42,19 +59,22 @@ CLI 所有输出默认 JSON。0 表示命令正常完成；2 表示 fail/incompl
 |---|---|
 | 任务与证据 | task-create/show/context/transition、artifact-add/read、report-add |
 | 协作循环 | flow-start/next/submit/review/review-failed/advance/replan |
-| 看板与指导 | flow-board/watch/question/question-close/guidance-ack |
-| 资源与执行 | lease-acquire/renew/release、command-plan/run、operation-reconcile |
+| 看板与指导 | flow-board/watch/status-update/question/questions/answer/question-close/guidance-record/guidance-ack |
+| 资源与执行 | lease-acquire/renew/release、command-plan/run、command-group-plan/run/status/reconcile、operation-reconcile |
 | 源码传输 | source-snapshot/materialize/bundle/receive |
 | 多 Agent | team-plan/next、assignment-add/claim/bind/return/review/yield/cancel、agent-send/inbox/ack |
 | 事件投递 | inbox、inbox-dispatch |
 | 验收 | occupancy-check、environment-check、proxy-check、iteration-check、quality-check |
 | 分析 | profile-plan、profile-analyze、tracelens-report、tracelens-collective、tracelens-analyze |
 | 长训 | watch、heartbeat-check、events-export/import、monitor-report |
-| HCU-TrainFlow-Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog |
+| HCU-TrainFlow-Wiki | wiki-index/search/read/search-pr/pr/code、wiki-update/inventory/triage/sync-docs/sync-prs/refresh/review/review-pr/apply/catalog/routes |
 | 私有训练经验 | experience-record/sync/index/search/read/compare |
+| 条件参考 | reference-record/query，用于任务内硬件、环境与单测参考 |
 | 公开交付 | public-export |
 
 参数以子命令 `--help` 为准。JSON 文件用 UTF-8；PowerShell 重定向可能带 BOM，读取器已兼容。远端命令避免把凭据放 argv/env 明文卡中，使用站点管理的认证设施。
+
+训练启动、成员观察、独立健康监测、离线图表与低频清理由 `scripts/` 的对应工具提供，见[训练观测](training-observation.md)、[成员观测](distributed-observation.md)、[长训守护](operations.md)、[图表](training-dashboard.md)和[工作区维护](workspace-maintenance.md)。它们不由上述 CLI 命令自动全部部署。
 
 ## Skill 使用例
 

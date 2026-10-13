@@ -92,7 +92,7 @@ python scripts/sync_local_install.py --target "$HOME/.codex/skills" --check
 
 六个 TrainFlow Skill 的安装目录各有 `workspace.json`，其中 `project_root` 指向本次安装使用的工程绝对路径；个人路径只写入安装目录，不写入仓库源文件。新会话从其他工作目录使用 Skill 时，先采用用户明确指定的项目或 `TRAINFLOW_PROJECT`，未指定时读取该绑定。绑定只用于定位项目，不设置或覆盖任务的 `TRAINFLOW_WORKSPACE`。工程搬家后从新位置运行安装器并加 `--replace`，校验新绑定成功后清理本次旧备份；两个 HCU 知识 Skill 的 `root` 继续独立指向知识 checkout。
 
-因此要保留工程 checkout；只复制系统 Skills 目录不足以移植完整 TrainFlow。Skill/reference、共享 docs 和 Wiki 的分工及按模式阅读入口见 [阅读导航](skill-reading-map.md)。`python scripts/check_skill_resources.py` 离线检查本地 Markdown 链接、Skill 入口中的工程路径和 reference 可达性；文件检查不代表 Agent 已阅读全文或真实实验已通过。
+因此要保留工程 checkout；只复制系统 Skills 目录不足以移植完整 TrainFlow。Skill/reference、共享 docs 和 Wiki 的分工及按模式阅读入口见 [阅读导航](skill-reading-map.md)。`check_skill_resources.py` 检查 Skill 工程路径和 reference 可达性；`check_documentation.py` 补查根目录、通用文档与作者 Wiki 的链接/章节、CLI 示例、版本、退役 Skill 调用和第三方来源。完整安装与本机同步先执行这些检查；通过不代表 Agent 已阅读全文、远程链接有权限或真实实验已通过。
 
 飞书在线检索另外安装/配置 `lark-cli` 并用本人身份授权；浏览器辅助访问按需配置 `playwright-cli`。离线索引就绪不表示在线权限就绪，任务启动和使用在线来源时检查实际请求状态。Git、飞书和浏览器的身份分别管理。详细知识安装与权限规则见实际知识库的 `docs/installation.md`。
 

@@ -135,16 +135,20 @@ def test_index_failure_blocks_skills_and_replaces_old_success(tmp_path, monkeypa
     assert not any('install_skills.py' in str(x) for x in commands)
 
 
-def test_full_setup_blocks_install_on_broken_reading_resources(tmp_path, monkeypatch):
+@pytest.mark.parametrize('stage, checker', [
+    ('skill-resources', 'check_skill_resources.py'),
+    ('documentation', 'check_documentation.py'),
+])
+def test_full_setup_blocks_install_on_broken_documentation(tmp_path, monkeypatch, stage, checker):
     module = setup_fakes(monkeypatch, tmp_path)
     commands = []
     def run(argv, **kwargs):
         commands.append(argv)
-        return SimpleNamespace(returncode=1 if any('check_skill_resources.py' in str(a) for a in argv) else 0)
-    with pytest.raises(FlowError, match='skill-resources'):
+        return SimpleNamespace(returncode=1 if any(checker in str(a) for a in argv) else 0)
+    with pytest.raises(FlowError, match=stage):
         module.setup(tmp_path, tmp_path/'skills', run=run)
     assert not any('pip' in c or any('install_skills.py' in str(a) for a in c) for c in commands)
-    assert json.loads((tmp_path/'.work/setup/status.json').read_text())['failed_stage'] == 'skill-resources'
+    assert json.loads((tmp_path/'.work/setup/status.json').read_text())['failed_stage'] == stage
 
 
 def test_default_installer_copies_eleven_and_binds_knowledge(tmp_path, monkeypatch):
@@ -445,6 +449,15 @@ def test_local_sync_is_bounded_and_checks_package_before_replacing_skills(tmp_pa
     assert '--check' in commands[3]
     assert not any('setup_trainflow.py' in str(c) or 'git' in c for c in commands)
     assert json.loads((project/'.work/setup/local-sync.json').read_text())['status'] == 'current'
+
+
+def test_local_sync_rejects_stale_root_documentation_before_pip(tmp_path):
+    module, project, target = sync_fixture(tmp_path)
+    (project/'README.md').write_text('[Removed guide](docs/removed.md)\n', encoding='utf-8')
+    with pytest.raises(FlowError, match='Documentation inconsistent'):
+        module.sync(project, target, run=lambda *a, **kw: pytest.fail('Must not install with stale docs'))
+    state = json.loads((project/'.work/setup/local-sync.json').read_text())
+    assert state['status'] == 'incomplete' and state['failed_stage'] == 'preflight'
 
 
 @pytest.mark.parametrize('failed_stage', ['package-install', 'package-check', 'skills-install', 'skills-check'])

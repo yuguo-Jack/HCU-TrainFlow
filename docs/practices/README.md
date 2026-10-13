@@ -7,6 +7,7 @@
 - [HCU 算子、通信与底层依赖联动](hcu-library-routing.md)：Primus Turbo、UCCL、UltraEP、MoonEP 等的选择边界，重编制品、集成与PR。
 - [执行基线、候选验证与主仓交付顺序](execution-baseline.md)：保持实验连续性、复用已有资格、差异回归。
 - [性能方法与参考来源](performance-methods.md)：证据刷新、热点/重叠/融合分析、条件上限、组合验证，以及 Hyperloom、GEAK、BBuf 方法的采用边界。
+- [模型精度诊断](model-accuracy-diagnosis.md)：有 NV 时分层对照、无 NV 时可信基线自查，结合 HCU Probe 定位首处分歧及恢复后的状态问题。
 
 工具证据如何衔接这些方法，见 [TraceLens 分析与验证](../tracelens-analysis.md)和[性能分析流程细图](../workflow-map.md#36-tracelens-证据怎样进入优化闭环)。
 
