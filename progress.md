@@ -425,3 +425,14 @@ Implemented and locally tested occupancy admission, SSH hop contracts, dimension
 - Offline knowledge validation: 5,185 pages / 24 sources, zero errors. Coverage and Skill reading-route checks pass. Full initial suite: 1,268 passed, 4 platform skips; added review checks then passed 69 focused tests, with final whole-suite rerun underway. No new hardware qualification or broad online source acquisition.
 - System Python package and six installed TrainFlow Skills synchronized to 0.6.7; bindings/resource checks pass. Official source ownership and external use contracts are separate; HCU-Knowledge checkout and source data are unchanged by this task. Publication of main and annotated v0.6.7 remains the final operation.
 - Final review repaired relative `.` project handling in PR/document/catalog operations; real `wiki-catalog .` succeeds and remains idempotent. Final full suite after all fixes: 1,272 passed, 4 platform skips; knowledge validation 5,185 pages / 24 sources, coverage and Skill resource checks clear. System package/six Skills synchronized and checked again. Ready to push the reviewed commit and annotated v0.6.7, then verify remote refs.
+
+## 2026-10-13: TraceLens parity task started
+Read remote workflow, Wiki/Skill maintenance, repository instructions and existing qualification records. No active training dependency has been changed. Remote identity, occupancy and mounts will be rechecked before experiments.
+
+Merged published HCU 30f5dcd then upstream 493f750 in development checkout, merge fda36c8 authored yuguo-Jack. Initial local collection failed because sparse checkout omitted scripts/examples; expanded required paths. SSH through jump-host nested SSH reuses existing internal host trust. HCU-Knowledge queried read-only; command entry is kb.py, not hcu-knowledge.
+
+- TraceLens upstream merge and HCU fixes published as 22786b16d429783927981bd592a47ad0f79db3ba on the hcu branch with yuguo-Jack identity. Added standalone HCU README and reproducible qualification probes; native commands preserved.
+- TrainFlow adds three managed native modes, source/shape/refresh handoffs, verified Hyperloom/GEAK references and expanded dependency maintenance paths. Pinned checkout and actual Python import now point to the published fork; six installed Skills/bindings verified at 0.6.8. No HCU-Knowledge source update occurred.
+- Initial full TrainFlow run: 1,284 passed/4 skips with one packaging failure; corrected setuptools/metadata compatibility. Final rerun and publication checks follow.
+
+- Final TrainFlow regression: 1,287 passed, 4 platform skips. All three new managed modes ran with real HCU traces against the published pin. Skill reading resources, six installed bindings and actual editable imports are current at 0.6.8. Dedicated remote validation containers stopped with no experiment processes remaining. Ready for main/v0.6.8 publication.

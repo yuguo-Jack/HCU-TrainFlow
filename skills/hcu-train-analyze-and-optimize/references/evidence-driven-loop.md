@@ -31,6 +31,8 @@
 
 不要求复制三份原始大表：在现有报告/BOARD 维护关键行，链接 TraceLens 原件和 operator key。
 
+必要时按项目 `docs/tracelens-analysis.md` 先切出明确的训练步，再做 compare 或按实际 rank 合并查看；合并不自动校时。结构化热点回查原 trace 的 shape 和 phase，调用原生源码定位并核对实际加载库/提交。同源码函数可归并实施任务，但各特化的占比和回归仍分开；父 dispatcher 与子 kernel 不重复计时。已有 TraceLens 先验只在任务身份一致时复用，参数/实现变化后重采。二进制定位结果不可编辑时继续追所属 HCU 库或 tune 路径，不跳过高贡献项。
+
 Agent 结论逐条区分**观测事实、带条件的模型、待证伪假设**，保留原 trace/窗口/rank/operator key、统计分母、来源和缺项；建议还要能说明验证或否定它的实验。原生 Agent 的 top-10 与 idle >15% 分流不是本仓 ≥90% 墙钟覆盖规则；没有某类 finding 不证明问题不存在。其 `SUCCESS` 或字段/表校验仅表示该报告契约通过，不能直接升级为瓶颈确认、训练正确或实测收益。方法固定来源见项目 `docs/practices/performance-methods.md`。
 
 | 表 | 每条候选必须说明 |

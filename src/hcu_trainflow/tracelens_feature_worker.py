@@ -22,6 +22,47 @@ def run_native(module, *args):
 
 def analyze(request, output):
     mode = request['mode']
+    if mode == 'compare':
+        from TraceLens.Reporting.generate_perf_report_pytorch import generate_perf_report_pytorch
+        common = dict(gpu_arch_json_path=request.get('gpu_arch_json'), include_unlinked_kernels=True,
+                      kernel_summary=True, include_overlap_info=True)
+        tables = generate_perf_report_pytorch(profile_json_path=request['trace'],
+            comparison_json_path=request['comparison_trace'], output_csvs_dir=str(output / 'before'), **common)
+        after = generate_perf_report_pytorch(profile_json_path=request['comparison_trace'],
+            output_csvs_dir=str(output / 'after'), **common)
+        signal_tables = ('ops_summary', 'unified_perf_summary', 'kernel_summary')
+        if not any(len(tables.get(key, ())) for key in signal_tables) or not any(len(after.get(key, ())) for key in signal_tables):
+            return {'status': 'incomplete', 'gaps': ['Comparison has no native report rows']}
+        run_native('TraceLens.Reporting.compare_perf_reports_pytorch', output / 'before', output / 'after',
+                   '--names', 'before', 'after', '--output', output / 'comparison.xlsx',
+                   '--output_csvs_dir', output / 'comparison')
+        return {'status': 'generated', 'gaps': ['Caller must match shape, phase, precision, rank and timing windows; a trace difference is not profiler-off E2E speedup']}
+    if mode == 'split':
+        run_native('TraceLens.TraceUtils.split_trace.main', request['trace'],
+                   '--output-dir', output / 'split', '--iterations', request['iterations'])
+        details_path = output / 'split/execution_details.json'
+        details = read_json(details_path) if details_path.is_file() else []
+        valid = bool(details) and all(row.get('event_count', 0) > 0 and Path(row['output_path']).is_file() for row in details)
+        start = int(request['iterations'].split(':')[0])
+        end = int(request['iterations'].split(':')[1]) if ':' in request['iterations'] else start + 1
+        valid = valid and len(details) == 1 and details[0].get('idx') == f'{start}:{end}'
+        return {'status': 'generated' if valid else 'incomplete', 'selection': request['iterations'], 'extractions': details,
+                'gaps': ['Verify native detected annotations and extracted range against training steps; no automatic steady-state selection']}
+    if mode == 'merge':
+        import gzip
+        import json
+        from TraceLens.TraceFusion.trace_fuse import TraceFuse
+        ranks = {int(rank): path for rank, path in request['traces'].items()}
+        path = TraceFuse(ranks).merge_and_save(str(output / 'merged.json'))
+        with gzip.open(path, 'rt', encoding='utf-8') as stream:
+            events = json.load(stream)['traceEvents']
+        counts = {rank: 0 for rank in ranks}
+        for event in events:
+            rank = event.get('args', {}).get('rank')
+            if event.get('ph') == 'X' and rank in counts:
+                counts[rank] += 1
+        return {'status': 'generated' if all(counts.values()) else 'incomplete', 'ranks': sorted(ranks), 'duration_events_by_rank': counts,
+                'gaps': ['Visualization merge does not align node clocks, prove causality or replace process-group collective analysis']}
     if mode == 'hipprof':
         from TraceLens.Reporting.hipprof import generate_perf_report_hipprof
         tables = generate_perf_report_hipprof(request['trace'], str(output / 'tables'), request.get('traceconv_path'))

@@ -26,7 +26,7 @@
 
 ## TraceLens 已验证范围
 
-当前主线另完成了 gfx936/DTK 26.10 的 TraceLens 有界资格验证：训练 Graph 前后向映射、实际输入 EventReplay、实测参考 Roofline、原生 Agent 指标及推理复核、hipprof JSON/pftrace 同源对照、XProf/XCompute counter 与 SQTT。命令、计时/数据边界和未覆盖项见 [TraceLens HCU 分析](tracelens-analysis.md)；没有因此扩大完整模型 loss、多架构或生产长稳的验证声明。
+当前主线另完成了 gfx936/DTK 26.10 的 TraceLens 有界资格验证：训练 Graph 前后向映射、实际输入 EventReplay、实测参考 Roofline、原生 Agent 指标及推理复核、hipprof JSON/pftrace 同源对照、XProf/XCompute counter 与 SQTT。另以真实 trace 验证了受管 split/merge/compare 和原生源码定位、索引，合并不自动校时，自比较不代表提速。命令、计时/数据边界和未覆盖项见 [TraceLens HCU 分析](tracelens-analysis.md)；没有因此扩大完整模型 loss、多架构或生产长稳的验证声明。
 
 ## 模型精度诊断的覆盖
 

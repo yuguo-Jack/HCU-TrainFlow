@@ -75,6 +75,19 @@ flowchart TD
 
 ## 维护与验证边界
 
+### TraceLens 调用链核对
+
+本次核对源码而非组件介绍：Hyperloom `0425bde`、GEAK `c0c0e2a`。它们并未要求每次执行全部 TraceLens 工具。
+
+| 参考实现 | 实际采用的方法 | TrainFlow 的落点 |
+|---|---|---|
+| Hyperloom [tracelens_skill_runner.py](https://github.com/AMD-AGI/Hyperloom/blob/0425bde3f6e76e1588400c37d056dfd3bb75ac11/src/hyperloom/agents/kernel/tools/tracelens_skill_runner.py) | 给原生分析 orchestrator 传实际 trace、平台、capture 和输出目录，接收报告；分析阶段不直接改 kernel | `agent` 准备指标后由当前 Agent 查证；不自动启动另一套宿主/多 Agent 审核 |
+| Hyperloom [tracelens_analysis.py](https://github.com/AMD-AGI/Hyperloom/blob/0425bde3f6e76e1588400c37d056dfd3bb75ac11/src/hyperloom/agents/kernel/tools/tracelens_analysis.py) | 结构化候选、shape/效率线索、源码位置与可修改性；按源码函数归并候选 | 热点→源码→调用契约→实现任务，归并实现但保留各 shape/phase 的证据 |
+| GEAK [profiler.md](https://github.com/AMD-AGI/GEAK/blob/c0c0e2aee5e2bec70583253058382523bdf7a3ab/e2e_workflow/roles/profiler.md) | 初始轮可复用 TraceLens 先验；shape/dtype 回查稳态原 trace；变更后重新采集；模型估计仅供建议 | 复用条件写入现有证据刷新规则，保留 ≥90% 覆盖与高占比未知项 |
+| GEAK [run_e2e.py](https://github.com/AMD-AGI/GEAK/blob/c0c0e2aee5e2bec70583253058382523bdf7a3ab/interface/run_e2e.py) | 向端到端流程传递可选的既有 TraceLens 报告 | 通过固定任务证据链接交接，不把报告文件存在等同于当前候选已分析 |
+
+切分、合并、TraceDiff 和索引是本仓按训练分析需要补齐的原生入口，不宣称以上两个框架默认调用了每项功能。详细选择与命令见 [TraceLens 分析](../tracelens-analysis.md)。
+
 更新 Wiki/Skill 时一起复核上述固定路径的新版本与本仓采用规则；重点看默认门槛、测量方法、profile 刷新、dispatch、oracle、模式/重放副作用和支持范围。只比较相关差异，不机械合并上游流程或下载整个依赖生态。相关能力变化还应检查 `analysis.py`、质量评估、TraceLens 解析、主控交接和三个阶段的异常路由。
 
 上述实战方法经源码/知识查证和本地回归，未在 HCU 复现这些案例的完整训练或故障注入。TraceLens 工具另在 gfx936 上完成有界真实采集、Graph、回放和校准，范围见 [分析与验证](../tracelens-analysis.md)。现场跨节点因果、模型实际算子效率和生产故障恢复仍以任务验证为准。文档中的 Amdahl、Roofline 是带假设的评估方法，不能自动证明物理瓶颈、实际加速或训练收敛。

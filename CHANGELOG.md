@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.8 — 2026-10-13
+
+- Upgrade the HCU TraceLens fork after merging upstream `493f750`; retain native capabilities and document feature-specific HCU qualification.
+- Add bounded, input-hashed `tracelens-analyze` modes for explicit training-step splitting, actual-rank merging and before/after comparison using native TraceDiff and report tables. Truncated selections remain incomplete; merged timelines do not imply clock alignment.
+- Connect structured hotspots to source resolution, per-shape evidence and implementation ownership. Reuse unchanged baseline analysis, reprofile changed recipes/implementations, and retain high-impact unknown or binary-library targets.
+- Review the actual Hyperloom/GEAK TraceLens call paths and document the adopted practices without introducing a second scheduler or mandatory extra Agent reviews.
+- Repeat bounded gfx936/DTK 26.10 qualification and native regressions; keep hardware/runtime limits separate from parser coverage, report generation and training quality acceptance.
+- Use license-file package metadata compatible with setuptools 69.5, avoiding a build conflict with the optional OpenXLA xprof parser's setuptools constraint.
+
 ## 0.6.7 — 2026-10-12
 
 - Organize official Wikis by project under `knowledge/projects/<project>/knowledgebase/{upstream,local}`. Keep tutorials, PR source pages and source maps with their project; keep immutable PR JSON centrally. Add generated project navigation and update links, coverage, ledgers, collection paths and installed reading routes.

@@ -396,3 +396,14 @@ No automatic big knowledge-base update. No new public release. No artificial Age
 - [ ] 全量测试、链接/知识/检索 review、本机同步、提交推送和 annotated v0.6.6。
 
 授权写入：D:/codex/projects/HCU-TrainFlow；私有维护缓存 .work/wiki-maintenance；系统 Python editable 安装及 C:/Users/Administrator/.codex/skills 下既有六项 TrainFlow Skill。HCU-Knowledge 仅查询，不修改；不启动远端训练。
+
+## 2026-10-13: TraceLens upstream alignment and HCU qualification
+
+- [x] Sync clean development fork to published hcu and merge reviewed latest upstream.
+- [x] Inventory every native module/CLI, inspect HCU assumptions and repair applicable gaps.
+- [x] Verify remote admission and mappings; run native regressions plus real HCU report/diff/index/source/graph/replay/collective/profiler paths where available.
+- [x] Publish precise HCU README, reproducible validation and limitations; commit/push TraceLens as yuguo-Jack.
+- [x] Inspect Hyperloom/GEAK TraceLens usage, update TrainFlow integration, workflow and affected official Wiki/routes.
+- [x] Review, relevant/full tests, dependency and installed Skill sync; prepare TrainFlow v0.6.8 publication.
+
+Scope: TrainFlow checkout and .private/development/TraceLens (separate development repository); task evidence .work/tracelens-parity-20261013; remote /cfs/yuguo/tracelens-parity-20261013 after mount verification. User authorizes code, remote experiments, commits/pushes. Use idle devices only; do not update HCU-Knowledge; no historical author rewrite; approximate workload-specific roofline suffices, deep modeling only for unexplained limits.

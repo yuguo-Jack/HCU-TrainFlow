@@ -9,6 +9,9 @@
 | 问题 | 路径 | 后续动作 |
 | --- | --- | --- |
 | 时间花在哪里，CPU 怎样启动 kernel？ | `tracelens-report`；完整通信组用 `tracelens-collective` | `profile-analyze` 用显式墙钟窗口核对覆盖，区分空泡、通信、计算、copy 和未归因项 |
+| 原 trace 混有启动、预热和多步？ | `split` 模式，显式指定训练步范围 | 核对原生检测的 annotation 和实际截取范围；不套推理稳态规则 |
+| 多 rank 时序需要一起查看？ | `merge` 模式，提供实际 rank→文件映射 | 保留独立 trace；合并只用于展示，不自动校时或推导跨机因果 |
+| 修改后调用、次数和耗时如何变化？ | `compare` 模式，TraceDiff 加报告表比较 | 对齐比较 context，查看新增/消失/变慢调用，再用 profiler-off 整步验证 |
 | Graph replay 看不到原算子和 shape？ | `tracelens-analyze` 的 `graph` 模式 | capture 恢复调用，replay 提供 GPU 时间 |
 | 热点距离带宽/算力参考有多远？ | `roofline` 模式与原生性能模型 | 核算实际 shape/dtype/算法；未知高占比项继续建模 |
 | 需要原生 Agent 分析方法？ | `agent` 模式准备类别、指标与条件优先级 | 活跃 Agent 读指令、查证、写 findings/analysis，再独立复核 |
@@ -50,6 +53,20 @@ hcu-trainflow --workspace /private/task/analysis tracelens-analyze request.json 
 {"mode":"counters","manifest":"xcompute-manifest.json"}
 ```
 
+```json
+{"mode":"split","trace":"rank0.json","iterations":"10:20"}
+```
+
+```json
+{"mode":"merge","traces":{"0":"rank0.json","4":"rank4.json"}}
+```
+
+```json
+{"mode":"compare","trace":"before.json","comparison_trace":"after.json","gpu_arch_json":"hcu-arch.json"}
+```
+
+`iterations` 是检测到的迭代序列的零基序号，结束位置不包含在内；不必等于训练日志的全局 step ID。缺步骤或范围被原生工具截短时标为 incomplete。合并的 rank ID 必须来自实际采集，不把抽样 rank 重新编号为完整 world；未采样 rank 仍是覆盖缺口。
+
 每次生成独立目录，保留请求、输入/输出 SHA256、锁定源码提交、原生表、日志和 `report.json`。`generated` 仅表示该范围产物完成；`incomplete` 保留未知项；`needs-agent-review` 表示指标已准备、推理复核尚未完成，后两者返回退出码 2。残留 CSV 不能将失败/超时改判成功。这些状态都不替代训练阶段的数值、性能或独立 review 门槛。
 
 ## Roofline 与优化队列
@@ -61,6 +78,18 @@ HCU 架构 JSON 必须含实际设备身份和参数来源。实测 sustained en
 先处理最大的实际端到端问题。计算主导时按热点贡献排队，再结合模型空间、融合机会、已有实现和风险选任务；不能按自动模型跳过高占比未知项。`profile-analyze` 优先使用精确 operator key；名字级模型必须提供 `applies_to` 的匹配 shape/dtype/phase，已采集 stride 时也须匹配，避免同名 kernel 串用工作量。
 
 待优化热点交给适用的 Hygon HIP/Triton Skill；缺初版时先用 baseline Skill。交接必须含调用、固定数值参考、上限假设、当前效率、真实 profile 和下一轮验证条件。已有融合也要复评；离上限较远时用计数器/SQTT/ISA解释，不能展示图表后就关闭任务。累计 ≥90% 集合中的非通信热点及未知项仍逐一处置。
+
+## 从分析走到源码和候选实现
+
+借鉴 Hyperloom 的原生分析交接、源码定位，以及 GEAK 对 baseline 分析先验的复用方式，接入现有优化队列，不另起一套调度器。源码审阅依据见 [参考方法](practices/performance-methods.md#tracelens-调用链核对)。
+
+1. 将原生报告的热点映射到 `operator key + phase + shape/dtype/layout + backend`，保留原 trace/event/rank。CPU dispatcher、实际 GPU kernel、逻辑融合链分别记载，父调用与其子 kernel 不重复累加。报告中的 shape 回查原 trace 或捕获输入，不能只从分析文章提取。
+2. 需要寻找实现时运行 `TraceLens_resolve_kernel_source --kernel NAME --search-path CHECKOUT`，读取其定位方法、置信度和 `patchable`，再核对实际加载制品与源码提交。HIP/C++、Triton 和 DTK 数学库制品使用各自定位路径。只有二进制线索时继续查底层库对应分支，不能按符号猜一个函数就修改。
+3. 同一源码函数的多个特化可合并为一个实现任务，但保留每个 shape、dtype、phase 的频次/耗时与正确性回归，不能把它们合成一个虚构的平均调用。仅有相同 kernel 名称不构成同一实现的证据。
+4. 源码不可直接修改的高占比项仍须处置：数学库核对实际 bench/tune 输入，已有库复用或向所属库准备修复；继续按 HCU 大库和实际分支找实现。原生工具的 `patchable=false` 只说明该定位结果不能直接编辑，不表示无需优化。
+5. 旧报告仅在源码/制品、输入、配方、并行组和采集窗口一致时复用。参数、融合或实现改变后采新 trace，用 compare 检查调用变化，重新计算覆盖与优先级。性能提升以局部数值通过、profiler-off 配对和模型集成结果为准。
+
+大量 trace 的跨实验定位可用原生 `TraceLens_trace_index`，数据库放任务缓存，保留输入哈希和查询条件；它只帮助寻找报告，不替代 HCU-Knowledge 的领域知识检索。源码定位和索引不强制每轮运行。
 
 ## 训练 Graph
 
@@ -117,5 +146,7 @@ counter replay 会多次运行 kernel；SQTT 通常仅采指定 SE/CU/dispatch�
 | Agent | 原生类别指标、活跃 Agent findings/报告及聚合 | 不将刻意同步的微基准空泡推广为生产瓶颈 |
 | hipprof JSON/pftrace | 同次采集两路径表逐项一致：92 kernel、18 copy、26 memset | 其他 DTK 格式就地核对 |
 | XProf/XCompute | XProf 3.16.0+aqlprofile 3.6.2 counter/SQTT 实采；XCompute Light 4.8.0 解析 | GUI、其他 gfx/DTK、完整训练采样未覆盖 |
+
+2026-10-13 对同栈另做全路径复核：原生报告、Graph、Roofline、捕获值回放及六类 Agent 指标重跑；两 rank RCCL 的 8 条记录匹配成 4 次 collective；同一次 hipprof 采集的 JSON/pftrace 六张表逐项一致；XProf counter 和选定 dispatch 的 SQTT 均重新采集解析。本次还用真实 trace 验证切分、索引、HIP 源码定位、TraceDiff、报告自比较和多 rank 合并；自比较只验证工具，不能声称加速。Agent 最终推理报告的既有资格与本次指标复测分别记录，不把 metrics_complete 当作本轮完整推理已完成。
 
 保留上游 rocprofv3、TraceDiff、JAX 等入口。HCU 替代路径以实际格式适配及执行证据说明，不能把保留入口称作所有平台/格式均已实测。

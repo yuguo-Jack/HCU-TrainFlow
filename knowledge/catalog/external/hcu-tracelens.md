@@ -20,6 +20,8 @@ sources: []
 
 HCU 硬件、profiler 和底层库问题交给 `$hcu-knowledge-search`。目前不假定大库已有该定制 fork 的完整仓库 Wiki；必要时直接阅读实际锁定的工具源码和 fork 文档，不在这里再采集一套 HCU 源码/PR 知识库。
 
+按需使用受管 split/merge/compare、Graph/Roofline/Agent、hipprof/counters 和原生源码定位、索引、回放；具体请求与状态见上述分析接口。合并不自动校时，自动模型与报告不替代数值或端到端验收。
+
 ## 后续维护
 
 更新时读取[外部知识与用法关联](../external-knowledge.json)，核对大库结论和实际依赖；接口、输出、单位或副作用变化时复核其 `targets` 对应文档、Skill 和解析器。普通查询仅留任务缓存，TrainFlow 更新不自动更新 HCU-Knowledge，也不将 HCU 仓加入本地官方来源。

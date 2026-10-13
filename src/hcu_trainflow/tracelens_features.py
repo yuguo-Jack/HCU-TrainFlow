@@ -5,6 +5,7 @@ are prepared for the active workflow Agent to interpret and independently review
 """
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -22,6 +23,9 @@ FIELDS = {
     'roofline': ({'perf_csv', 'gpu_arch_json'}, {'wallclock_time_us'}),
     'agent': ({'trace', 'gpu_arch_json'}, set()),
     'counters': ({'manifest'}, set()),
+    'compare': ({'trace', 'comparison_trace'}, {'gpu_arch_json'}),
+    'split': ({'trace', 'iterations'}, set()),
+    'merge': ({'traces'}, set()),
 }
 
 
@@ -65,11 +69,30 @@ def prepare_request(request, base):
         inputs[str(path)] = file_hash(path)
         return str(path)
 
-    for field in ('trace', 'traceconv_path', 'perf_csv', 'gpu_arch_json', 'manifest'):
+    for field in ('trace', 'comparison_trace', 'traceconv_path', 'perf_csv', 'gpu_arch_json', 'manifest'):
         if field in value:
             if not isinstance(value[field], str) or not value[field]:
                 raise FlowError('Expected a file path: ' + field)
             value[field] = add(value[field])
+    if value['mode'] == 'split':
+        selection = value['iterations']
+        if not isinstance(selection, str) or not re.fullmatch(r'\d+(?::\d+)?', selection):
+            raise FlowError('iterations must be an explicit zero-based N or START:END (end exclusive)')
+        if ':' in selection:
+            start, end = map(int, selection.split(':'))
+            if end <= start:
+                raise FlowError('Iteration range must be nonempty and increasing')
+    if value['mode'] == 'merge':
+        traces = value['traces']
+        if not isinstance(traces, dict) or len(traces) < 2:
+            raise FlowError('traces must map at least two actual rank IDs to files')
+        if any(not isinstance(rank, str) or not re.fullmatch(r'0|[1-9]\d*', rank) for rank in traces):
+            raise FlowError('Rank IDs must be canonical nonnegative integers')
+        if any(not isinstance(path, str) or not path for path in traces.values()):
+            raise FlowError('Each rank needs a trace file path')
+        value['traces'] = {rank: add(traces[rank]) for rank in sorted(traces, key=int)}
+        if len(set(value['traces'].values())) != len(traces):
+            raise FlowError('Different ranks must not reuse the same trace file')
     if value['mode'] == 'hipprof' and str(value['trace']).lower().endswith(('.pftrace', '.pftrace.gz')) and not value.get('traceconv_path'):
         raise FlowError('Offline pftrace analysis requires an explicit installed traceconv_path')
     if 'wallclock_time_us' in value:

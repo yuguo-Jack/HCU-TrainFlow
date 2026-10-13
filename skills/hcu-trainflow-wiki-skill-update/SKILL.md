@@ -50,6 +50,8 @@ HCU 大知识库已更新或用户要求对齐时，先只读核对其当前提�
 
 TraceLens 的官方来源为 `amd-agi-tracelens`；HCU fork 通过外部维护关联、thirdparty 锁和 docs 的集成契约核对，不能再作为局部 Wiki 来源采集。检查其上游基准、接口、补丁与 HCU 验证状态；上游有等价修复时经回归再退役本地补丁。锁变化时同步复核 manifest 的 integration_contracts，不能只改 Wiki 就自动推进训练依赖。
 
+TraceLens 接口更新同时核对报告/collective、Graph、Roofline、Agent、hipprof/counters，以及 split/merge/compare 的请求、输入哈希和状态。源码定位、索引、EventReplay 保留原生使用路线；按受影响功能执行真实输入或合成回归，缺硬件时保留缺口。同步安装包与固定 checkout，避免本机仍导入临时开发副本。无需为一次文档改动重复采集全部硬件证据。
+
 精度方法维护还需复核项目 `docs/practices/model-accuracy-diagnosis.md` 与三个阶段的入口。按 HCU-Knowledge 的 dcu_probe 项目或当前源码核对 hcu-probe/hcuprobe 包与 CLI、配置、hook/异步快照/flush、compare 映射和跨 rank 首差、训推接入；同时核对 PyTorch/TE 的精度与随机性接口。来源变更不代表所有后端已实测，保留登记/离线/现场的验证范围，不自动刷新 HCU 大库。
 
 ## 组织标准

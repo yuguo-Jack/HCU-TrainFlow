@@ -140,13 +140,13 @@ hcu-trainflow --workspace .work/analysis tracelens-analyze request.json --projec
 
 ### 完整上游能力的入口
 
-fork 保留原有模块、API 和 13 个上游 console 命令；HCU 扩展通过 Python 模块及 `tracelens-analyze` 调用。Graph、Roofline、Agent、hipprof/pftrace、XProf/XCompute 和 EventReplay 的具体选择与实测边界见 [HCU 分析契约](tracelens-analysis.md)。其他原生工具仍可直接使用：
+fork 保留原有模块、API 和 13 个上游 console 命令；HCU 扩展通过 Python 模块及 `tracelens-analyze` 调用。统一分析另提供 split（明确训练步）、merge（实际 rank 合并）和 compare（TraceDiff + 表对比），与 Graph、Roofline、Agent、hipprof/pftrace、XProf/XCompute、EventReplay 的具体选择与实测边界见 [HCU 分析契约](tracelens-analysis.md)。其他原生工具仍可直接使用：
 
 | 需求 | 上游入口 |
 | --- | --- |
-| 优化前后报告对比 | `TraceLens_compare_perf_reports_pytorch` / `TraceDiff` |
+| 优化前后报告对比 | 受管 `compare`；原生 `TraceLens_compare_perf_reports_pytorch` / `TraceDiff` |
 | graph / 推理剖面 | `TraceLens_generate_perf_report_pytorch_inference` |
-| trace 分段、报告索引 | `TraceLens_split_trace`、`TraceLens_trace_index` |
+| trace 分段、多 rank 展示、报告索引 | 受管 `split` / `merge`；原生 `TraceLens_split_trace`、`TraceFuse`、`TraceLens_trace_index` |
 | kernel 源码定位 | `TraceLens_resolve_kernel_source` |
 | roofline、算子模型与回放 | `PerfModel`、`EventReplay` Python API |
 | JAX、rocprofv3、pftrace HIP/HSA、内存拷贝、Genesis | 对应原生 report 命令，参数和格式以该版本文档为准 |
