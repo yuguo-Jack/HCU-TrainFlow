@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
 path: docs/developer/overview.mdx
-raw_sha256: 4e59a925b5d4f6f2e8f2ce86ee0a6346d47ba69c527b97873747c7d53e70ebc4
+raw_sha256: 920383cc59860d33321643185b7491445ea9c5135b56e727990a5039eb8b8870
 sources: []
-generated_body_sha256: 5a1d0fcf5f78312eddf388e69e40f39c785626883e98d723454ddbd33f657fff
+generated_body_sha256: 84566927dc1c51573d6861c5334d8697ec14166b9e9b67f821633d09fd79cf73
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / docs/developer/overview.mdx
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/docs/developer/overview.mdx)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/developer/overview.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -134,7 +134,7 @@ This method internally queries the heuristics for engine configs for the given h
 
 ```
 cudnn_frontend::error_t
-cudnn_frontend::graph::Graph::get_execution_plans(std::vector<heur_mode_t>)
+cudnn_frontend::graph::Graph::create_execution_plans(std::vector<HeurMode_t> const&)
 ```
 
 ### Getting the Execution Plan Count
@@ -143,7 +143,7 @@ This method returns the number of execution plans returned by cuDNN heuristics. 
 
 ```
 cudnn_frontend::int64_t
-cudnn_frontend::Graph::get_execution_plan_count() const;
+cudnn_frontend::graph::Graph::get_execution_plan_count() const;
 ```
 
 ### Checking Graph Support
@@ -157,7 +157,7 @@ cudnn_frontend::graph::Graph::check_support(cudnnHandle_t h);
 
 ### Building the Execution Plan
 
-This function builds execution plans queried with the `create_execution_plan(...)` API.
+This function builds execution plans queried with the `create_execution_plans(...)` API.
 
 There are two flavors of this API:
 
@@ -165,7 +165,7 @@ There are two flavors of this API:
 
   ```
   cudnn_frontend::error_t
-  cudnn_frontend::graph::Graph::build_plan(
+  cudnn_frontend::graph::Graph::build_plans(
       cudnnHandle_t const &handle,
       cudnn_frontend::BuildPlanPolicy_t const policy,
       bool const do_multithreaded_builds
@@ -176,7 +176,7 @@ There are two flavors of this API:
 
   ```
   cudnn_frontend::error_t
-  cudnn_frontend::Graph::build_plan_at_index(
+  cudnn_frontend::graph::Graph::build_plan_at_index(
       cudnnHandle_t const &handle,
       int64_t plan_index
   );
@@ -203,12 +203,12 @@ Autotuning provides a way to execute different execution plans for a given graph
 
 Executing the graph requires device pointers to all input output tensors and a user-allocated device workspace pointer.
 
-Two flavors of execution exist, corresponding to the `build_plans(...)` API. This API already has a candidate execution plan set.
+Two flavors of execution exist, corresponding to the `execute(...)` API. This API already has a candidate execution plan set.
 
 The candidate execution plan gets internally set when either the:
 
-- `build_policy_t::HEURISTIC_CHOICE` is used, or
-- if any plan is built by `build_plan` API using `plan_index`.
+- `BuildPlanPolicy_t::HEURISTICS_CHOICE` is used, or
+- if any plan is built by the `build_plan_at_index(...)` API using `plan_index`.
 
 ```
 cudnn_frontend::error_t
@@ -219,11 +219,11 @@ cudnn_frontend::graph::Graph::execute(
 );
 ```
 
-The execute API also takes a plan index to target a specific plan. This may be used when autotuning, in conjunction with the `build_plan_at_index(...)` API.
+Use `execute_plan_at_index(...)` to target a specific plan. This may be used when autotuning, in conjunction with the `build_plan_at_index(...)` API.
 
 ```
 cudnn_frontend::error_t
-cudnn_frontend::graph::Graph::execute(
+cudnn_frontend::graph::Graph::execute_plan_at_index(
     cudnnHandle_t handle,
     std::unordered_map<std::shared_ptr<Tensor>, void *> var_pack,
     void* workspace,
@@ -233,15 +233,16 @@ cudnn_frontend::graph::Graph::execute(
 
 ### Miscellaneous APIs
 
-Use `get_workspace` to execute the currently selected execution plan.
+Use `get_workspace_size()` to query the workspace needed to execute the currently selected execution plan.
 
-You can also take in a plan index to query the workspace for. This may be used when autotuning, in conjunction with the `build_plan_at_index(...)` API.
+You can also pass a plan index to query the workspace for a specific plan. This may be used when autotuning, in conjunction with the `build_plan_at_index(...)` API.
 
 ```
-int64_t get_workspace_size() const int64_t get_workspace_size_plan_index(int64_t plan_index) const
+int64_t get_workspace_size() const
+int64_t get_workspace_size_plan_at_index(int64_t plan_index) const
 ```
 
-Use `get_autotune_workspace` to run autotune on all plans.
+Use `get_autotune_workspace_size()` to query the workspace needed to autotune all plans.
 
 ```
 get_autotune_workspace_size() const

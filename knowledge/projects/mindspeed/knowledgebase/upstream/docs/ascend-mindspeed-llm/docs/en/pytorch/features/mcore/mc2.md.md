@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: 5a8ea03b12066067f39b1771782d12db236267ef
 path: docs/en/pytorch/features/mcore/mc2.md
-raw_sha256: f4c30a64d27893bd2c4d6ffe99bf963a9a5cfb5fe5c66e96d7ff9d5f4ee808fa
+raw_sha256: 7fc8cbe930c6b653c7f5bfa41b5026d84c2f3b00994082736d23a0ccbdb12a28
 sources: []
-generated_body_sha256: 470129dc171022864c7fc1250ec8c551b9ef800563fc4b1567c79c5cd01bd292
+generated_body_sha256: 70792416abc9a50e83708ec16f6635e54dac1b77591e23fcff6e29f04c50a07e
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/features/mcore/mc2.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/mcore/mc2.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/pytorch/features/mcore/mc2.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -71,4 +71,4 @@ In training scenarios that enable TP and SP, MC2 can reduce memory overhead and 
 
 1. In MCore scenarios with `--use-mcore-models` enabled, the MLP part of MoE models does not enable MC2.
 
-2. The A5 model does not yet support this feature.
+2. The Ascend 950 products does not yet support this feature.

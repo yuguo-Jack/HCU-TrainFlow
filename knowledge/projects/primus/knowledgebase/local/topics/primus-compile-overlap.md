@@ -8,29 +8,28 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
 sources:
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/ddp_overlap_compile_patches.py
-  commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
   sha256: 37b37010af2d8580fa8367e3037334388bee85ebfb6e6b11c3e3ba44f5ec86e2
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/te_patches/tp_overlap_patches.py
-  commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
   sha256: 29fdfc204fd8e0e24211a2497bc60b761a2a5162c948047d722524cd501dda55
 - source: amd-agi-primus
   path: primus/core/patches/patch_runner.py
-  commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
   sha256: 330529f72986ec1d291222b0c3fbf556863ca03b7e72c986cba1f2ac081a645e
 - source: amd-agi-primus
   path: primus/core/runtime/train_runtime.py
-  commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
   sha256: 63c969944700b1d63d2393a9e96cb79ff373f25541f6f1e1fef060bdeb57de1c
 - source: amd-agi-primus
   path: tests/unit_tests/megatron/cco/test_tp_overlap.py
-  commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
   sha256: 3529ffe5254d81357d5e3e127be876df752486143fa830b22bc9e52687a5b1a9
 ---
 
@@ -64,10 +63,10 @@ patch 函数内部异常会 raise，但通用 runner 默认记录并继续；当
 
 ## 固定证据与复核范围
 
-- [primus/backends/megatron/patches/ddp_overlap_compile_patches.py](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/primus/backends/megatron/patches/ddp_overlap_compile_patches.py)
-- [primus/backends/megatron/patches/te_patches/tp_overlap_patches.py](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/primus/backends/megatron/patches/te_patches/tp_overlap_patches.py)
-- [primus/core/patches/patch_runner.py](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/primus/core/patches/patch_runner.py)
-- [primus/core/runtime/train_runtime.py](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/primus/core/runtime/train_runtime.py)
-- [tests/unit_tests/megatron/cco/test_tp_overlap.py](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/tests/unit_tests/megatron/cco/test_tp_overlap.py)
+- [primus/backends/megatron/patches/ddp_overlap_compile_patches.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/backends/megatron/patches/ddp_overlap_compile_patches.py)
+- [primus/backends/megatron/patches/te_patches/tp_overlap_patches.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/backends/megatron/patches/te_patches/tp_overlap_patches.py)
+- [primus/core/patches/patch_runner.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/core/patches/patch_runner.py)
+- [primus/core/runtime/train_runtime.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/core/runtime/train_runtime.py)
+- [tests/unit_tests/megatron/cco/test_tp_overlap.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/tests/unit_tests/megatron/cco/test_tp_overlap.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/03-configuration-reference/environment-variables.md
-raw_sha256: b195ead8b60a23c645966ee11c7f34d2311d91183f8939b90fd4355c4293fe67
+raw_sha256: 88c003bc9c4bd0fae1539de1b21287647b89f2e2a108a169ff871f63f5919104
 sources: []
-generated_body_sha256: 0f38bea994ce17e41c065f65bf227f96220a9bc32768c8368566af1f995bc58b
+generated_body_sha256: 6ac3322b9a6228311f9ff54d5359b1523b8dc0a0f965c3f65c2cd94d28dbe237
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/03-configuration-reference/environment-variables.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/03-configuration-reference/environment-variables.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/03-configuration-reference/environment-variables.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -293,4 +293,4 @@ Primus owns these defaults in one place per backend: `primus/backends/<backend>/
 
 ## 15. SpecForge (ROCm overlay)
 
-SpecForge env, YAML, and CLI live in the [SpecForge configuration reference](../../examples/specforge/CONFIGURATION.md). That page lists Primus-owned names (`RUN_ID`, `CONSUMER_STATE_DIR`, `PRIMUS_SPECFORGE_*`, …) and points SpecForge Hydra keys at the SpecForge AMD ROCm tutorial.
+SpecForge env, YAML, and CLI live in the [SpecForge configuration reference](../04-technical-guides/specforge/configuration.md). That page lists Primus-owned names (`RUN_ID`, `CONSUMER_STATE_DIR`, `PRIMUS_SPECFORGE_*`, …) and points SpecForge Hydra keys at the SpecForge AMD ROCm tutorial.

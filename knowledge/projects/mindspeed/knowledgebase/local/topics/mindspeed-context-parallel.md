@@ -9,21 +9,20 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source, official documentation and related PR reading; no HCU runtime validation
 sources:
 - source: ascend-mindspeed
   path: mindspeed/features_manager/context_parallel/context_parallel_feature.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: 965840f69c4a944f21ca3303b18a67cbb2daa7e72c9443b10bd5483e3eae9dd9
 - source: ascend-mindspeed
   path: docs/en/features/ring-attention-context-parallel.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: dece78275526a481193bda7a7e973576c69c5d0e606248e0bb3d56408f649359
 - source: ascend-mindspeed
   path: docs/en/features/kvallgather-context-parallel.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: f714c5c862a86a417d8c0c9597e8963d4c7e43b5e226be20e4f4821096e38115
 ---
 
@@ -55,8 +54,8 @@ feature 参数验证→model parallel group 初始化/销毁 patch→batch 的 C
 
 ## 固定证据与复核范围
 
-- [mindspeed/features_manager/context_parallel/context_parallel_feature.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/features_manager/context_parallel/context_parallel_feature.py)
-- [docs/en/features/ring-attention-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/features/ring-attention-context-parallel.md)
-- [docs/en/features/kvallgather-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/features/kvallgather-context-parallel.md)
+- [mindspeed/features_manager/context_parallel/context_parallel_feature.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/features_manager/context_parallel/context_parallel_feature.py)
+- [docs/en/features/ring-attention-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/features/ring-attention-context-parallel.md)
+- [docs/en/features/kvallgather-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/features/kvallgather-context-parallel.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

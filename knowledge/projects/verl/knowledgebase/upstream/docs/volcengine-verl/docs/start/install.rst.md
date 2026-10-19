@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: verl-project/verl
-commit: 5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d
+commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
 path: docs/start/install.rst
-raw_sha256: 0892c67e9d35372a6c1ecd477463851b992f13fb673c75916fbd9ca2c99130ad
+raw_sha256: 9c02bd24568ebf1c285bdcac45a472f60d7641c7cc658e5d40686457aa5a8eec
 sources: []
-generated_body_sha256: 4963c4e441f419f9b3a30e06ec21a2666db1782991841467c3b2673da493146e
+generated_body_sha256: 9865b69652db5329dfdd579a4756bf9414aae7922b47695f2f115be4f7b0f07a
 source_state: current-scan
 ---
 
 # verl-project/verl / docs/start/install.rst
 
-[Original at fixed commit](https://github.com/verl-project/verl/blob/5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d/docs/start/install.rst)
+[Original at fixed commit](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/start/install.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -64,7 +64,10 @@ committed ``uv.lock`` covers every backend, and you pick the backends for a
 given run as **extras**:
 
 - Inference: ``vllm`` or ``sglang``.
-- Training: ``fsdp`` or ``megatron``.
+- Training: ``fsdp``, ``megatron``, or ``veomni`` (``veomni`` runs VeOmni's
+  FSDP/SP/EP parallelism on the same cu130 / torch-2.13 stack as ``fsdp``;
+  select it at runtime with ``model_engine=veomni`` for PPO/GRPO or
+  ``engine=veomni`` for SFT).
 - ``cpu``: GPU-free, for CI / quick checks.
 
 There is **no install step**. ``uv run --extra ...`` materializes the project
@@ -192,7 +195,7 @@ A typical run combines **one inference engine** with **one training backend**,
 for example ``--extra vllm --extra fsdp``. The rules:
 
 - Choose at most one inference engine: ``vllm`` **or** ``sglang`` (not both).
-- Add a training backend: ``fsdp`` (default) or ``megatron``.
+- Add a training backend: ``fsdp`` (default), ``megatron``, or ``veomni``.
 - ``cpu`` is GPU-free and is used on its own.
 
 The mutually exclusive sets are declared in ``[tool.uv].conflicts``, so uv
@@ -289,7 +292,7 @@ Pick a base image
 
    * - Extra(s)
      - Recommended base image
-   * - ``vllm`` / ``fsdp`` / ``megatron``
+   * - ``vllm`` / ``fsdp`` / ``megatron`` / ``veomni``
      - ``nvidia/cuda:13.0.2-devel-ubuntu24.04`` (matches ``docker/Dockerfile.uv.cu130``)
    * - ``sglang``
      - ``lmsysorg/sglang:v0.5.20`` or ``nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04``

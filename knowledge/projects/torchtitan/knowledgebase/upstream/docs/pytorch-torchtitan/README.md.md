@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: README.md
-raw_sha256: dd4941f16439ed538500a40fe13f02f49d87c51c7a7a419289bee3e3d3e3d9bb
+raw_sha256: 3634007b5cca45b6e3ce61742e818c4c7fdb9c5147092cc4872e0752c00f7b75
 sources: []
-generated_body_sha256: 0ffbeb589beb1686616bcfc222f796eedcb362d4e69b02af7ecb57e815a9bb8d
+generated_body_sha256: c7d4480479b06318d272bf6c61e0123751bf38f1f5013c45e03e9e4837b7d0da
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -137,6 +137,7 @@ and [`torchtitan_recipes`](torchtitan_recipes/README.md) for the verified recipe
 | [Kimi K2.7](torchtitan/models/kimi_k2_7) | Moonlight-16B-A3B, Kimi-VL-A3B, K2.5 | Text, vision | | |
 | [Kimi K3](torchtitan/models/kimi_k3) | K3 | Text, vision | | Soon |
 | [Muse Glimmer](torchtitan/models/muse_glimmer) | 30B | Text, vision | `muse_glimmer_30b` | ✅ |
+| [Muse-Spark-Open](torchtitan/models/muse_spark) | 816B-A42B | Text, vision, audio | `muse_spark_816b_a42b` | ✅ text |
 | [FLUX](torchtitan/models/flux) | dev, schnell | Text-to-image | `flux_dev`, `flux_schnell` | |
 
 Every model has debug configurations exercised in CI. Verified recipes have
@@ -176,7 +177,7 @@ the [model guide](torchtitan/models/README.md).
 **Post-training with [TitanRL](torchtitan/rl/README.md)**
 - One model definition shared by the trainer and vLLM
 - [Bitwise trainer/generator parity](torchtitan/rl/BITWISE_PARITY.md) in batch-invariant mode
-- Async rollouts orchestrated with Monarch; weight sync over TorchStore
+- Async rollouts orchestrated with Monarch; trainer-to-generator model state dict transfer over TorchStore
 - GRPO and DAPO losses; [DAPO Math](torchtitan/rl/examples/dapo_math), [Search-R1](torchtitan/rl/examples/search_r1), and [Verifiers](torchtitan/rl/examples/verifiers) examples
 
 **Checkpointing**

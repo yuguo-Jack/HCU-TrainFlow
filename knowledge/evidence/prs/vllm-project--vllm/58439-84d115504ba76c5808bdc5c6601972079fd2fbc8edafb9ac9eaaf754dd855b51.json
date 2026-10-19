@@ -1,0 +1,1278 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "2280c7606744fbb6c99699d408c04f33432cb0e4b6afd395a39b0ea8aa69d2ef",
+      "isPrivate": false,
+      "numbers": [
+        58464,
+        58458,
+        58439,
+        58429,
+        58428,
+        58426,
+        58424,
+        58420
+      ],
+      "observed_at": "2026-10-19T19:32:26.230872+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4935,
+        "resetAt": "2026-10-19T19:53:19Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "4e4eab73ed2b4e00931a4636e926b8df1cb1fe50",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nQwen3.8-Flash-Next cannot be served on a unified-memory GPU such as **DGX Spark (GB10, 128 GB shared by CPU\nand GPU)** with either of the storage options #54371 introduced for its 47.7 GiB FP8 PLE table:\n\n- **device-resident:** the table does not fit next to the ~72 GiB of weights;\n- **pinned host (`cpu_offload`, the default):** a 47.7 GiB anonymous host copy of the table, in the same physical\n  pool as the weights and the KV cache. It cannot be cheaply dropped and re-created under memory pressure. On a\n  128 GB Spark, the pinned table plus weights plus KV has hard-reset the machine.\n\nThis PR adds a third, opt-in option, `--engram-config '{\"checkpoint_mapped\": true}'`, which **reads the table\nin place from the checkpoint's safetensors files**. On GPUs that access pageable host memory through the host\npage tables (`CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`), the lookup kernel reads a\nread-only mapping of the files. There is no table-sized device or pinned allocation, no resident duplicate of\nthe table, and no CPU-gather/H2D staging path; the kernel still copies the selected rows into its output\nbuffer. The table's pages are clean, file-backed page-cache pages that the kernel can drop and re-read, shared\nby every process that maps the same files.\n\n**Design:**\n\n- **New backend.** `Qwen4ExpPLEPageableHostEmbedding`, a third backend in the #54371 hierarchy. It reuses the\n  pinned backend's buffer, ETP reduction and finalize path; only the storage and the gather differ.\n- **Gather.** A Triton kernel gathers rows byte-wise through a per-shard base-address table, because the\n  safetensors data offsets are not aligned. It writes zeros for rows outside the rank's ETP range; the\n  existing ETP all-reduce combines ranks.\n- **Current stream.** The lookup runs on the current stream, not the pinned backend's side stream. With the\n  inherited side-stream lookup, greedy outputs on GB10 were not reproducible within one server start\n  (identical prompts, cold vs warm: 2/8 equal, |Δlogprob| up to 1.41). The observed cause on GB10: the side\n  stream reads the ids tensor from the CUDA-graph memory pool after the graph has released it, and later\n  segments overwrite it at replay. Reading a persistent copy instead made it reproducible (8/8); #57785's capture-time sync did not\n  (1/8). On the current stream: 8/8, |Δlogprob| 0, and identical across fresh starts. That race (#58441) is\n  now fixed on main by #58489's persistent ids buffer, which this backend also uses. The lookup stays on the\n  current stream, which also keeps FULL CUDA-graph capture free of a second stream: this backend does not\n  join the pinned side stream (a GPU test captures `start_prefetch` + forward in one FULL graph). A side-stream\n  lookup on top of #58489 was not measured.\n- **Host-side page prefetch.** GPU faults on non-resident file pages are serviced one page at a time. A cold\n  30k-token prefill (≈480k rows) took **88 s** with GPU faults alone, and **1.6 s** when 64 CPU threads fault\n  the step's rows in first. The prefetch is driven from `Qwen4ExpModelState.prepare_inputs`, from a CPU hash\n  of the same inputs, and only when `checkpoint_mapped` is set. It is only a hint: the lookup is correct\n  whether or not it has finished.\n- **File resolution.** Files come from the default loader's preparation, so `--download-dir`, subfolders and\n  the `model.safetensors.index.json` filter apply exactly as for loading. Every shard that owns rows must exist\n  once, with its exact shape and dtype; nothing is truncated.\n- **Formats.** FP8 and unquantized (BF16) tables. `--load-format dummy` maps private anonymous zero pages.\n- **Reload.** On a reload every incoming PLE shard is compared **in full** with the newly mapped files.\n  `reload_weights(weights_path=...)` streams those files, so it matches and remaps the new checkpoint (during\n  reload processing, or at the latest on the next lookup). PLE weights delivered from memory (weight sync)\n  differ from the files and are rejected. A rejected load stays rejected rather than falling back to the\n  previous mapping, and binding commits its state only after the mapping succeeded. The cost is one extra\n  pass over the table, on reloads only.\n- **Guards.** Rejected with `dp_shared_memory` (mapped pages are already shared), with `embedding_across_dp`\n  (the host prefetch only sees this DP rank's requests), for architectures without this backend (DeepSeek\n  V4.1), and off CUDA (the ROCm Qwen4Exp path from #57497 has no mapped backend and would otherwise allocate the\n  pinned table silently). A warning is logged on non-integrated GPUs that report the attribute, such as Grace Hopper or Grace\n  Blackwell: **validated on DGX Spark only.**\n\n## Test Plan\n\n**Unit tests** (`tests/models/qwen4_exp/test_ple_pageable.py`, wired into the existing `models_basic` Qwen4Exp\njob):\n\n- CPU tests, 22:\n  - discovery across files, short last shard, other layers ignored;\n  - refusals: missing, short-coverage, extra, short-interior and duplicate shards, dtype mismatch;\n  - index-filtered discovery;\n  - file resolution through the real default loader, not a stub;\n  - CPU views address the checkpoint rows;\n  - the zero mapping commits no memory when read (RSS);\n  - config rejections (DeepSeek V4.1, off CUDA, `dp_shared_memory`, `embedding_across_dp`);\n  - reload A→B remaps to B; an in-memory reload is rejected, including one with a single changed row that\n    no sample would hit; a rejected load stays rejected and a later reload from disk recovers.\n- GPU tests, 6, skipped without pageable access (the prefetcher test without CUDA):\n  - bit-exact FP8/BF16 gather with an ETP range over a 0xFF-poisoned allocation;\n  - CUDA-graph replay switching valid ids to invalid ids yields zeros, not stale bytes;\n  - one FULL CUDA graph capturing `start_prefetch` + forward, replayed with new ids;\n  - the zero mapping;\n  - short-then-long steps through the host prefetcher's pinned staging.\n- Each regression test fails on the behaviour it replaced (checked by mutating the fixed line back).\n\n**End-to-end on DGX Spark** (GB10, sm_121, TP=1, driver 580.178, CUDA 13.0, torch 2.13, this branch's code on\nthe `1ea7c63f4` nightly wheel). Qwen3.8-Flash-Next with an NVFP4 body, the FP8 PLE table (47.68 GiB,\n320,001,536 × 160 B in 128 shards / 10 files), MTP n=3. `--kv-cache-memory-bytes` 31 GiB unless noted.\nThese were measured before the rebase onto current main (below); the rebased head is covered by the unit tests.\n\n## Test Result\n\n**Unit tests:**\nHead rebased onto main `378504a54`, which includes #57497, #58489, #56926 and #58086.\n- `models_basic` Qwen4Exp job set (`test_config.py`, `test_ple.py`, `test_ple_pageable.py`): 53 passed,\n  42 skipped (GPU-only) on CPU.\n- `test_ple_pageable.py` on GB10: 28/28 (22 CPU + 6 GPU).\n- `tests/test_config.py -k engram`: 39 passed.\n- pre-commit clean on the changed files.\n\n**Memory.** There is no working baseline on unmodified main (see Purpose), so the reference is the previous\noffload implementation (#53899's worker, never merged) serving the same checkpoint:\n\n| | #53899 worker (reference) | `checkpoint_mapped` |\n|---|---|---|\n| swap used, steady state | 50–53 GiB | 5–6 GiB |\n| table-sized pinned allocation | none (anonymous table, 47.7 GiB) | none (4 small pinned staging slots) |\n| extra processes | 1 (offload worker) | 0 |\n\n**Speed**, two fresh starts per arm:\n\n| | reference | `checkpoint_mapped` |\n|---|---|---|\n| TTFT, 3 prompts of 24–29k tokens, sum | 32.99 / 33.47 s | 31.77 / 31.97 s |\n| TTFT, 3 prompts of 7–8k tokens, sum | 9.27 / 9.37 s | 9.01 / 9.02 s |\n| decode, c=16, tok/s | 197.6 / 201.1 | 199.1 / 198.7 |\n\n**Correctness:**\n- Rows handed to the model equal the checkpoint bytes: in-server check on 6 steps per start, including\n  4,096-token prefill chunks.\n- Every recorded serving step of a mixed prefill/decode workload: 2,500 steps, 11.36 M rows, recorded with\n  stream-ordered async copies and no sync before the consumer. The ids equal a CPU hash of the recorded inputs,\n  and the rows the model consumed equal the checkpoint bytes, **including all 255 mixed prefill+decode steps**.\n  The only id mismatches were 8 CUDA-graph capture-time calls, where the ids buffer is not yet computed; those\n  are not serving steps.\n- Greedy outputs are identical across fresh starts and cold vs warm (8/8, Δlogprob 0).\n- A BF16-table copy of the checkpoint (rows = the FP8 path's `fp8 * scale` in BF16, mapped as 320 B rows)\n  generates **bit-identical** output to the FP8 table: 8/8 sequential prompts and 8/8 determinism probes.\n\n**Auto KV sizing** (no `--kv-cache-memory-bytes`): KV sized itself to about 33 GiB. 20 min of c=8 diverse\ntraffic (2k–60k-token prompts): 248 requests, 0 errors, MemAvailable ≥ 2.0 GiB, swap ≤ 6.8 GiB, memory PSI\n`full avg10` ≤ 6.8 % (p90 3.3 %). The speed numbers above use an explicit 31 GiB KV cap, so both arms are\ncompared at equal KV.\n\n**Not covered:**\n- TP>1 on hardware (single-GPU box; the ETP range is unit-tested).\n- Grace Hopper / Grace Blackwell.\n- NVFP4 tables (main has no NVFP4 PLE method).\n- Model Runner V1: the lookup is correct there, but the host prefetch hooks into the MRV2 model state, so cold\n  prefill is slow.\n- Kernel-format weight reload (a full table cannot be copied into the mapping; this fails loudly).\n\n## Comparison with other PLE-table storage implementations\n\nWhat each implementation documents, plus what we measured ourselves on GB10. Other PRs' numbers are not repeated\nhere, and nothing was measured for #54129.\n\n| | where the table lives | who gathers rows | copies per step | extra process / privileges | target hardware | status |\n|---|---|---|---|---|---|---|\n| #54371 device | GPU memory | GPU kernel | — | — | any CUDA-alike | merged; on GB10 does not fit next to the weights |\n| #54371 pinned host (default) | pinned host memory (full table) | GPU kernel via UVA, on a side stream | — | — | UVA-capable | merged; on GB10 the 47.7 GiB pinned table plus weights plus KV exceeds the unified pool |\n| #53899 offload worker | anonymous host memory in a CPU worker process | CPU | rows over IPC to the GPU | 1 process, `CAP_SYS_PTRACE` | any | closed unmerged; **was our GB10 production path: 50–53 GiB swap** |\n| #54070 disk dir | file mapping of a table written at first boot to `VLLM_PLE_DISK_OFFLOAD_DIR` | CPU (the #53899 worker) | as #53899 | as #53899 | any | open, but built on the closed #53899 |\n| #54129 mmap | read-only mapping of the checkpoint safetensors (page cache) | CPU worker threads at input preparation | staged H2D copy into stable GPU buffers | — | any GPU (MRV2) | open |\n| #57497 ROCm | pinned host memory | GPU via UVA | — | — | AMD | merged |\n| **this PR** | read-only mapping of the checkpoint safetensors (page cache) | **GPU kernel reading the mapping directly**; CPU threads only fault pages in | none beyond the kernel writing the selected rows | — | GPUs that read pageable memory through host page tables (validated: DGX Spark) | — |\n\n**Relation to #54129.** Both keep the table file-backed and reclaimable in the page cache, and share the\ndiscovery and validation concerns; this PR borrows #54129's approach to resolving and validating checkpoint\nfiles.\n- **#54129** is the portable path: a CPU gather plus a host-to-device copy, which works on discrete GPUs.\n- **This PR** is the unified-memory variant: where the GPU can dereference pageable memory, the gather reads the\n  mapping directly, with no host-side gather or staging copy.\n\nThe two could share discovery code, or `checkpoint_mapped` could become the unified-memory mode of one\nfile-backed backend. We are happy to rebase onto #54129 if it lands first. SGLang has an NVMe-backed path for\nthe same table (sgl-project/sglang#36567).\n\n## Open design questions\n\n1. **File resolution.** It reuses `DefaultModelLoader._prepare_weights`, a private method, to get exactly the\n   files the loader read (download dir, index filter). Should the loader expose the resolved file list instead?\n   Its return value already changed once under this PR (#58086); a test now calls the real loader.\n2. **Host page prefetch.** A 64-thread CPU prefetcher lives in `Qwen4ExpModelState`. It is only a hint; the\n   lookup is correct without it, but cold prefill is about 50× slower. Is the model state the right home, or\n   should it hang off a runner hook?\n3. **Selection.** Opt-in today. Should it be auto-selected on integrated GPUs that report pageable host-page-table\n   access, where the pinned default does not fit?\n4. **Relation to #54129.** One file-backed backend with two gather modes, or two backends?\n\n## Related\n\n- **#54371:** the storage hierarchy this extends.\n- **#54129 (mmap PLE table, open):** also file-backed, via a CPU gather plus H2D copy. This PR is the\n  unified-memory variant: the GPU reads the mapping directly, so there is no host gather and no staging copy.\n  The validation approach borrows from it.\n- **#58441 (issue), #58489 (merged):** the graph-pool reuse of the side-stream ids, reported from this work\n  and fixed on main by #58489.\n- **#57785 (open):** eager-break side-stream work left unjoined at capture. Tested with the inherited\n  side-stream lookup on GB10: it did not remove the non-reproducibility above (1/8).\n- **#57497 (merged):** ROCm pinned-table offload; `checkpoint_mapped` is rejected there.\n- **#58310 (open), #56926 (merged):** host-memory guards, and serialization and huge pages for host-offloaded\n  tables. They are orthogonal.\n\n---\n\n<details>\n<summary> Essential Elements of an Effective PR Description Checklist </summary>\n\n- [x] The purpose of the PR.\n- [x] The test plan.\n- [x] The test results, before/after.\n- [x] Documentation update: `docs/features/engram.md`.\n- [ ] (Optional) Release notes update.\n</details>\n\ncc @peakcrosser7 (#54371) @Trosfy (#54129)\n\n**AI assistance:** this PR was developed with Claude (Anthropic). The human submitter reviewed every changed\nline, ran the tests and measurements above on the hardware named, and takes responsibility for the change.\n\n",
+      "changedFiles": 8,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--58439.org.readthedocs.build/en/58439/",
+            "createdAt": "2026-09-23T19:58:32Z",
+            "databaseId": 5801971067,
+            "updatedAt": "2026-09-23T19:58:32Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5801971067"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jschmied"
+            },
+            "body": "Related: #58441, the graph-pool reuse race in the pinned side-stream lookup. It is the reason this backend looks up on the current stream.\n",
+            "createdAt": "2026-09-23T20:07:22Z",
+            "databaseId": 5802099365,
+            "updatedAt": "2026-09-23T20:07:22Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5802099365"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Haven't read the 1398 lines, so this isn't a review of the implementation. But the whole design rests on one device capability, and I have the device, so here's an independent confirmation of the gate — queried through the same driver-API path your `_query_device_attribute` uses, not a parallel runtime-API check:\n\n```\ndriver sees: NVIDIA GB10                                   (sm_121, CUDA 13.0)\nCU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS                       -> 1\nCU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES -> 1\n```\n\nSo the opt-in gate is satisfied on the device the PR targets, on a second Spark. I checked the driver enums (88 / 100) specifically because the runtime `cudaDevAttr*` values aren't guaranteed to match the `CU_DEVICE_ATTRIBUTE_*` ones — they do agree here, but your code path is the driver one and that's what I wanted to confirm.\n\nTwo adjacent attributes from the same box, in case they're useful for the doc section:\n\n```\nCU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING                -> 1\nCU_DEVICE_ATTRIBUTE_MANAGED_MEMORY                    -> 1\nCU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST -> 0\n```\n\nThat last one being 0 is worth knowing: GB10 is coherent for *pageable* host memory but does not advertise direct host access to *managed* allocations, so \"unified memory\" here doesn't imply the managed-allocation path is equivalent. Your approach sidesteps that entirely by mapping the files, which reads like the right call for this device rather than an incidental one.\n\nFor what it's worth I hit the same wall you describe from the other side — I couldn't run the pinned backend on my Spark either while looking at #58441, for exactly the reason in your Purpose section. So the motivating constraint isn't hypothetical.\n",
+            "createdAt": "2026-09-23T22:28:12Z",
+            "databaseId": 5803999780,
+            "updatedAt": "2026-09-23T22:28:12Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5803999780"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Ran your new commit on a second GB10 (sm_121, CUDA 13.0), since `cudaErrorStreamCaptureIsolation` is the kind of claim that's worth having on independent hardware.\n\nBoth halves reproduce.\n\n**At `be7a84fe`:**\n```\ntests/models/qwen4_exp/test_ple_pageable.py\n25 passed in 5.49s\n```\n\n**Same test file with only `ngram_embedding.py` reverted to `12689c16`** (`git checkout 12689c16 -- vllm/models/qwen4_exp/nvidia/ngram_embedding.py`, so the test is held constant and just the fix is removed):\n```\n1 failed, 24 passed\nFAILED test_full_graph_captures_prefetch_and_forward\n\nE  torch.AcceleratorError: CUDA error: dependency created on uncaptured work in another stream\nE  Search for `cudaErrorStreamCaptureIsolation' ...\nE  torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture\nE  Search for `cudaErrorStreamCaptureInvalidated' ...\n```\n\nSo the new test genuinely fails on the previous head with exactly the error you named, and the `_join_prefetch_stream()` no-op on the pageable backend is what fixes it — not an already-green test added alongside. The isolation error also arrives before the invalidation one, which matches the join being the trigger rather than a downstream casualty.\n\nOne note on scope, since it cost me nothing to check and might save you a round: 24 of the 25 pass on the old source, so the regression surface here really is just the FULL-capture path.\n",
+            "createdAt": "2026-09-24T19:27:28Z",
+            "databaseId": 5820763658,
+            "updatedAt": "2026-09-24T19:27:28Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5820763658"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-09-25T03:14:41Z",
+            "databaseId": 5826074885,
+            "updatedAt": "2026-09-25T03:14:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5826074885"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Rebased your branch locally to see how bad the conflict is — it's small, and the result is green on a GB10, so this should be quick for you.\n\n**One conflict, one file**, `vllm/config/engram.py`: `main` gained a `use_thp` check in `_validate_shared_memory` while you added the two `checkpoint_mapped` ones. Pure add/add — keeping all three in sequence is the whole resolution. Nothing in `ngram_embedding.py` conflicted, which I'd half expected given #58489 just landed there.\n\nAfter that, both PLE suites pass on GB10 (sm_121, CUDA 13.0), with `main` including #58489:\n\n```\ntests/models/qwen4_exp/test_ple_pageable.py + test_ple.py\n76 passed in 14s\n```\n\nSo your `_join_prefetch_stream()` no-op and #58489's persistent `_prefetch_ids` buffer coexist without stepping on each other — the `output=self._prefetch_ids[...]` call survives at `ngram_embedding.py:1145` alongside your change, and your FULL-capture test still passes.\n\nOne thing I checked and got wrong on the first pass, in case you try the same probe: `EngramConfig(use_thp=True)` does **not** raise, but that's correct rather than a bad merge — `cpu_offload` defaults to `True`, so the guard is inert with those args. Clean `upstream/main` behaves identically; I only trusted it after comparing against an unmodified checkout.\n",
+            "createdAt": "2026-09-25T03:29:05Z",
+            "databaseId": 5826194734,
+            "updatedAt": "2026-09-25T03:29:05Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5826194734"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jschmied"
+            },
+            "body": "Rebased onto main `378504a54` and force-pushed (head `86f103430`). Thanks @hclsys for the three GB10 runs, the attribute check and the trial rebase.\r\n\r\nMain moved again after your rebase, so there was more to it than the `engram.py` add/add:\r\n- **#57497** moved the device/pinned backends to `common/ngram_embedding.py`. The pageable backend stays in `nvidia/`. The post-load bind hook and `_join_prefetch_stream()` moved with the base classes.\r\n- **#58086** made `DefaultModelLoader._prepare_weights` return four values. The file resolution unpacked three, and the unit tests stubbed it, so they stayed green; mypy caught it. Fixed, and a new test calls the real loader (open design question 1).\r\n- **New commit:** `checkpoint_mapped` is rejected off CUDA. Since #57497 the ROCm path would ignore it and allocate the pinned table.\r\n- #58489's persistent `_prefetch_ids` is kept; this backend uses it too.\r\n- DCO: the second commit's author email now matches its sign-off.\r\n\r\n`test_ple_pageable.py` on GB10: 28/28. `models_basic` Qwen4Exp set on CPU: 53 passed, 42 skipped. pre-commit clean. The PR body is updated to match.\r\n",
+            "createdAt": "2026-09-25T09:56:02Z",
+            "databaseId": 5830452890,
+            "updatedAt": "2026-09-25T10:04:17Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5830452890"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-09-30T10:32:31Z",
+            "databaseId": 5909444827,
+            "updatedAt": "2026-09-30T10:32:31Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5909444827"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "waych"
+            },
+            "body": "I've been running a version of this patch locally, and through profiling discovered that this code was hard faulting the PLE pages from a CPU thread serially, leading to per pass stalling.  To resolve this, I changed things so that before we actually fault the pages, we call madvise(MADV_WILLNEED) which will cause the kernel to bring pages into page cache before interaction with the cpu page tables.  This reduced per step latency from 10.4ms -> 3.1ms for this phase.  \r\n\r\nThis was futher improved by then having the dispatch of these MADV_WILLNEED occur during the previous layer's loading. This overlap allows the next layers PLE to load concurrently wit hthe current layer's processing, reducing this PLE loading phase further from 3.1ms -> < 0.6ms on the critical path.\r\n\r\nTogether these two improvements unblocked performance / minimized stalling to near zero. https://github.com/jschmied/vllm/pull/4",
+            "createdAt": "2026-10-02T23:56:54Z",
+            "databaseId": 5963331125,
+            "updatedAt": "2026-10-02T23:56:54Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5963331125"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "@waych one number that might help separate the two effects. On a GB10 with the file fully page-cache-warm (`mincore` 1.000, 400 x 800 KB tensors, fresh process per run), `mmap -> copy_`:\n\n```\nplain                        4.70 / 4.71 ms/tensor\nmadvise(WILLNEED), whole file 4.80 / 4.40\ntouch 1 byte per page         0.132 / 0.126\n```\n\nSo WILLNEED on resident pages does nothing for me, which fits what it is: it queues readahead into the page cache and doesn't populate the process's page tables. The fresh-mapping minor faults are what cost 4.7 ms there, and only the touch removes them.\n\nThat means your 10.4 -> 3.1 ms is probably coming from pages that weren't resident, or from the fault-around that goes with the readahead. Worth checking `mincore` on the PLE file at the start of a step: if it's ~1.0 and WILLNEED still helps, then I'm missing something about your access pattern. Mine is H2D copy from a mmap view, not a CPU gather, so don't read it as the same workload.\n",
+            "createdAt": "2026-10-03T00:17:44Z",
+            "databaseId": 5963524943,
+            "updatedAt": "2026-10-03T00:17:44Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5963524943"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "waych"
+            },
+            "body": "@hclsys My comment is about addressing latencies introduced by the use case of NOT having the data be memory resident, and instead paged off disk.  The numbers I'm posting were measured via vLLM's torch profiler and represent the time spent per pass waiting for the PLE faults to finish on CPU.  \r\n\r\nI'm running with very little page cache available, ~4.5GiB runtime resident for PLE.  PLE is a giant hash table that is accessed with many small random reads (smaller than page size) sparsely per token. Using mmap and storing on nvme works great, as long as we dispatch the requests in concurrently, which my PR proposes. The goal is to have the kernel issue the requests to populate page cache via the MADV_WILLNEED advice (it doesn't \"read-ahead\", which means to read the _next_ blocks, which in this case is wrong, the next read is random!), and then to come back and actually read them from userland CPU so that the pages get faulted and page tables established as minor faults, making them available to the GPU.\r\n\r\nThe previous approach would loop and major fault serially PLE entries from the CPU, leading to slow serialized accesses to nvme with small bits of cpu in between. MADV_WILLNEED IO dispatch allows the nvme layer to dispatch multiple IO concurrently, resulting in a large reduction of major faults as many of the later pages are already in page cache by the time the page fault occurs. Performing this feed a layer early allows for a large distribution of IOs to come in before ~~page fault~~ *gpu use*, further reducing the perceived ~~cpu~~ *gpu* stall on IO. \r\n\r\n*Added: The second commit, the one that currently introduces the `prefetch_ahead` class attribute, keeps gpu-side prefetch stream one layer early, but avoids this early layered behavior for the mmapped approach. This assumes that someone using the mmaped approach is wanting to use paging, but perhaps there-in lies some confusion.  Maybe this layer-ahead behavior needs to be operator exposed?*\r\n\r\nI'm my case I'm serving the qwen3.8-flash-next PLE in fp8 as 51.2GB on disk, within 4.5GiB of usable pagecache and am now measuring a major fault rate of < 1.0 per pass with these changes.",
+            "createdAt": "2026-10-03T01:04:45Z",
+            "databaseId": 5963919987,
+            "updatedAt": "2026-10-03T02:21:38Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5963919987"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "waych"
+            },
+            "body": "I had claude make the following artifact explaining what we saw with profiled runs.\r\n\r\nhttps://claude.ai/code/artifact/f070c41b-c2e8-4666-8781-40f22a3010c2\r\n",
+            "createdAt": "2026-10-03T03:57:48Z",
+            "databaseId": 5965306048,
+            "updatedAt": "2026-10-03T03:57:48Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5965306048"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-08T17:07:38Z",
+            "databaseId": 6065068117,
+            "updatedAt": "2026-10-08T17:07:38Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-6065068117"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-12T13:11:43Z",
+            "databaseId": 6124967277,
+            "updatedAt": "2026-10-12T13:11:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-6124967277"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-14T00:31:27Z",
+            "databaseId": 6158151412,
+            "updatedAt": "2026-10-14T00:31:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-6158151412"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW8N7vQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 15
+      },
+      "headRefOid": "047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "headRepository": {
+        "nameWithOwner": "jschmied/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 58439,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5296098649,
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-23T19:58:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58439#pullrequestreview-5296098649"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wOS0yM1QxOTo1ODowMFq0MjAyNi0wOS0yM1QxOTo1ODowMFrPAAAAATusDVk=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Qwen4Exp] Checkpoint-mapped PLE storage for unified-memory GPUs (DGX Spark)",
+      "updatedAt": "2026-10-14T00:31:28Z",
+      "url": "https://github.com/vllm-project/vllm/pull/58439"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/58439/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/58439/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/58439"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/58439"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/58439/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/58439"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/047fc1ce7c825bd2dd4709bebcfdec042b27a15c"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 1510,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 23600,
+        "forks_count": 23600,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9092,
+        "open_issues_count": 9092,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-10-19T19:17:28Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 323941,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 94149,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-10-19T19:31:50Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 94149,
+        "watchers_count": 94149,
+        "web_commit_signoff_required": true
+      },
+      "sha": "4e4eab73ed2b4e00931a4636e926b8df1cb1fe50",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Purpose\n\nQwen3.8-Flash-Next cannot be served on a unified-memory GPU such as **DGX Spark (GB10, 128 GB shared by CPU\nand GPU)** with either of the storage options #54371 introduced for its 47.7 GiB FP8 PLE table:\n\n- **device-resident:** the table does not fit next to the ~72 GiB of weights;\n- **pinned host (`cpu_offload`, the default):** a 47.7 GiB anonymous host copy of the table, in the same physical\n  pool as the weights and the KV cache. It cannot be cheaply dropped and re-created under memory pressure. On a\n  128 GB Spark, the pinned table plus weights plus KV has hard-reset the machine.\n\nThis PR adds a third, opt-in option, `--engram-config '{\"checkpoint_mapped\": true}'`, which **reads the table\nin place from the checkpoint's safetensors files**. On GPUs that access pageable host memory through the host\npage tables (`CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`), the lookup kernel reads a\nread-only mapping of the files. There is no table-sized device or pinned allocation, no resident duplicate of\nthe table, and no CPU-gather/H2D staging path; the kernel still copies the selected rows into its output\nbuffer. The table's pages are clean, file-backed page-cache pages that the kernel can drop and re-read, shared\nby every process that maps the same files.\n\n**Design:**\n\n- **New backend.** `Qwen4ExpPLEPageableHostEmbedding`, a third backend in the #54371 hierarchy. It reuses the\n  pinned backend's buffer, ETP reduction and finalize path; only the storage and the gather differ.\n- **Gather.** A Triton kernel gathers rows byte-wise through a per-shard base-address table, because the\n  safetensors data offsets are not aligned. It writes zeros for rows outside the rank's ETP range; the\n  existing ETP all-reduce combines ranks.\n- **Current stream.** The lookup runs on the current stream, not the pinned backend's side stream. With the\n  inherited side-stream lookup, greedy outputs on GB10 were not reproducible within one server start\n  (identical prompts, cold vs warm: 2/8 equal, |Δlogprob| up to 1.41). The observed cause on GB10: the side\n  stream reads the ids tensor from the CUDA-graph memory pool after the graph has released it, and later\n  segments overwrite it at replay. Reading a persistent copy instead made it reproducible (8/8); #57785's capture-time sync did not\n  (1/8). On the current stream: 8/8, |Δlogprob| 0, and identical across fresh starts. That race (#58441) is\n  now fixed on main by #58489's persistent ids buffer, which this backend also uses. The lookup stays on the\n  current stream, which also keeps FULL CUDA-graph capture free of a second stream: this backend does not\n  join the pinned side stream (a GPU test captures `start_prefetch` + forward in one FULL graph). A side-stream\n  lookup on top of #58489 was not measured.\n- **Host-side page prefetch.** GPU faults on non-resident file pages are serviced one page at a time. A cold\n  30k-token prefill (≈480k rows) took **88 s** with GPU faults alone, and **1.6 s** when 64 CPU threads fault\n  the step's rows in first. The prefetch is driven from `Qwen4ExpModelState.prepare_inputs`, from a CPU hash\n  of the same inputs, and only when `checkpoint_mapped` is set. It is only a hint: the lookup is correct\n  whether or not it has finished.\n- **File resolution.** Files come from the default loader's preparation, so `--download-dir`, subfolders and\n  the `model.safetensors.index.json` filter apply exactly as for loading. Every shard that owns rows must exist\n  once, with its exact shape and dtype; nothing is truncated.\n- **Formats.** FP8 and unquantized (BF16) tables. `--load-format dummy` maps private anonymous zero pages.\n- **Reload.** On a reload every incoming PLE shard is compared **in full** with the newly mapped files.\n  `reload_weights(weights_path=...)` streams those files, so it matches and remaps the new checkpoint (during\n  reload processing, or at the latest on the next lookup). PLE weights delivered from memory (weight sync)\n  differ from the files and are rejected. A rejected load stays rejected rather than falling back to the\n  previous mapping, and binding commits its state only after the mapping succeeded. The cost is one extra\n  pass over the table, on reloads only.\n- **Guards.** Rejected with `dp_shared_memory` (mapped pages are already shared), with `embedding_across_dp`\n  (the host prefetch only sees this DP rank's requests), for architectures without this backend (DeepSeek\n  V4.1), and off CUDA (the ROCm Qwen4Exp path from #57497 has no mapped backend and would otherwise allocate the\n  pinned table silently). A warning is logged on non-integrated GPUs that report the attribute, such as Grace Hopper or Grace\n  Blackwell: **validated on DGX Spark only.**\n\n## Test Plan\n\n**Unit tests** (`tests/models/qwen4_exp/test_ple_pageable.py`, wired into the existing `models_basic` Qwen4Exp\njob):\n\n- CPU tests, 22:\n  - discovery across files, short last shard, other layers ignored;\n  - refusals: missing, short-coverage, extra, short-interior and duplicate shards, dtype mismatch;\n  - index-filtered discovery;\n  - file resolution through the real default loader, not a stub;\n  - CPU views address the checkpoint rows;\n  - the zero mapping commits no memory when read (RSS);\n  - config rejections (DeepSeek V4.1, off CUDA, `dp_shared_memory`, `embedding_across_dp`);\n  - reload A→B remaps to B; an in-memory reload is rejected, including one with a single changed row that\n    no sample would hit; a rejected load stays rejected and a later reload from disk recovers.\n- GPU tests, 6, skipped without pageable access (the prefetcher test without CUDA):\n  - bit-exact FP8/BF16 gather with an ETP range over a 0xFF-poisoned allocation;\n  - CUDA-graph replay switching valid ids to invalid ids yields zeros, not stale bytes;\n  - one FULL CUDA graph capturing `start_prefetch` + forward, replayed with new ids;\n  - the zero mapping;\n  - short-then-long steps through the host prefetcher's pinned staging.\n- Each regression test fails on the behaviour it replaced (checked by mutating the fixed line back).\n\n**End-to-end on DGX Spark** (GB10, sm_121, TP=1, driver 580.178, CUDA 13.0, torch 2.13, this branch's code on\nthe `1ea7c63f4` nightly wheel). Qwen3.8-Flash-Next with an NVFP4 body, the FP8 PLE table (47.68 GiB,\n320,001,536 × 160 B in 128 shards / 10 files), MTP n=3. `--kv-cache-memory-bytes` 31 GiB unless noted.\nThese were measured before the rebase onto current main (below); the rebased head is covered by the unit tests.\n\n## Test Result\n\n**Unit tests:**\nHead rebased onto main `378504a54`, which includes #57497, #58489, #56926 and #58086.\n- `models_basic` Qwen4Exp job set (`test_config.py`, `test_ple.py`, `test_ple_pageable.py`): 53 passed,\n  42 skipped (GPU-only) on CPU.\n- `test_ple_pageable.py` on GB10: 28/28 (22 CPU + 6 GPU).\n- `tests/test_config.py -k engram`: 39 passed.\n- pre-commit clean on the changed files.\n\n**Memory.** There is no working baseline on unmodified main (see Purpose), so the reference is the previous\noffload implementation (#53899's worker, never merged) serving the same checkpoint:\n\n| | #53899 worker (reference) | `checkpoint_mapped` |\n|---|---|---|\n| swap used, steady state | 50–53 GiB | 5–6 GiB |\n| table-sized pinned allocation | none (anonymous table, 47.7 GiB) | none (4 small pinned staging slots) |\n| extra processes | 1 (offload worker) | 0 |\n\n**Speed**, two fresh starts per arm:\n\n| | reference | `checkpoint_mapped` |\n|---|---|---|\n| TTFT, 3 prompts of 24–29k tokens, sum | 32.99 / 33.47 s | 31.77 / 31.97 s |\n| TTFT, 3 prompts of 7–8k tokens, sum | 9.27 / 9.37 s | 9.01 / 9.02 s |\n| decode, c=16, tok/s | 197.6 / 201.1 | 199.1 / 198.7 |\n\n**Correctness:**\n- Rows handed to the model equal the checkpoint bytes: in-server check on 6 steps per start, including\n  4,096-token prefill chunks.\n- Every recorded serving step of a mixed prefill/decode workload: 2,500 steps, 11.36 M rows, recorded with\n  stream-ordered async copies and no sync before the consumer. The ids equal a CPU hash of the recorded inputs,\n  and the rows the model consumed equal the checkpoint bytes, **including all 255 mixed prefill+decode steps**.\n  The only id mismatches were 8 CUDA-graph capture-time calls, where the ids buffer is not yet computed; those\n  are not serving steps.\n- Greedy outputs are identical across fresh starts and cold vs warm (8/8, Δlogprob 0).\n- A BF16-table copy of the checkpoint (rows = the FP8 path's `fp8 * scale` in BF16, mapped as 320 B rows)\n  generates **bit-identical** output to the FP8 table: 8/8 sequential prompts and 8/8 determinism probes.\n\n**Auto KV sizing** (no `--kv-cache-memory-bytes`): KV sized itself to about 33 GiB. 20 min of c=8 diverse\ntraffic (2k–60k-token prompts): 248 requests, 0 errors, MemAvailable ≥ 2.0 GiB, swap ≤ 6.8 GiB, memory PSI\n`full avg10` ≤ 6.8 % (p90 3.3 %). The speed numbers above use an explicit 31 GiB KV cap, so both arms are\ncompared at equal KV.\n\n**Not covered:**\n- TP>1 on hardware (single-GPU box; the ETP range is unit-tested).\n- Grace Hopper / Grace Blackwell.\n- NVFP4 tables (main has no NVFP4 PLE method).\n- Model Runner V1: the lookup is correct there, but the host prefetch hooks into the MRV2 model state, so cold\n  prefill is slow.\n- Kernel-format weight reload (a full table cannot be copied into the mapping; this fails loudly).\n\n## Comparison with other PLE-table storage implementations\n\nWhat each implementation documents, plus what we measured ourselves on GB10. Other PRs' numbers are not repeated\nhere, and nothing was measured for #54129.\n\n| | where the table lives | who gathers rows | copies per step | extra process / privileges | target hardware | status |\n|---|---|---|---|---|---|---|\n| #54371 device | GPU memory | GPU kernel | — | — | any CUDA-alike | merged; on GB10 does not fit next to the weights |\n| #54371 pinned host (default) | pinned host memory (full table) | GPU kernel via UVA, on a side stream | — | — | UVA-capable | merged; on GB10 the 47.7 GiB pinned table plus weights plus KV exceeds the unified pool |\n| #53899 offload worker | anonymous host memory in a CPU worker process | CPU | rows over IPC to the GPU | 1 process, `CAP_SYS_PTRACE` | any | closed unmerged; **was our GB10 production path: 50–53 GiB swap** |\n| #54070 disk dir | file mapping of a table written at first boot to `VLLM_PLE_DISK_OFFLOAD_DIR` | CPU (the #53899 worker) | as #53899 | as #53899 | any | open, but built on the closed #53899 |\n| #54129 mmap | read-only mapping of the checkpoint safetensors (page cache) | CPU worker threads at input preparation | staged H2D copy into stable GPU buffers | — | any GPU (MRV2) | open |\n| #57497 ROCm | pinned host memory | GPU via UVA | — | — | AMD | merged |\n| **this PR** | read-only mapping of the checkpoint safetensors (page cache) | **GPU kernel reading the mapping directly**; CPU threads only fault pages in | none beyond the kernel writing the selected rows | — | GPUs that read pageable memory through host page tables (validated: DGX Spark) | — |\n\n**Relation to #54129.** Both keep the table file-backed and reclaimable in the page cache, and share the\ndiscovery and validation concerns; this PR borrows #54129's approach to resolving and validating checkpoint\nfiles.\n- **#54129** is the portable path: a CPU gather plus a host-to-device copy, which works on discrete GPUs.\n- **This PR** is the unified-memory variant: where the GPU can dereference pageable memory, the gather reads the\n  mapping directly, with no host-side gather or staging copy.\n\nThe two could share discovery code, or `checkpoint_mapped` could become the unified-memory mode of one\nfile-backed backend. We are happy to rebase onto #54129 if it lands first. SGLang has an NVMe-backed path for\nthe same table (sgl-project/sglang#36567).\n\n## Open design questions\n\n1. **File resolution.** It reuses `DefaultModelLoader._prepare_weights`, a private method, to get exactly the\n   files the loader read (download dir, index filter). Should the loader expose the resolved file list instead?\n   Its return value already changed once under this PR (#58086); a test now calls the real loader.\n2. **Host page prefetch.** A 64-thread CPU prefetcher lives in `Qwen4ExpModelState`. It is only a hint; the\n   lookup is correct without it, but cold prefill is about 50× slower. Is the model state the right home, or\n   should it hang off a runner hook?\n3. **Selection.** Opt-in today. Should it be auto-selected on integrated GPUs that report pageable host-page-table\n   access, where the pinned default does not fit?\n4. **Relation to #54129.** One file-backed backend with two gather modes, or two backends?\n\n## Related\n\n- **#54371:** the storage hierarchy this extends.\n- **#54129 (mmap PLE table, open):** also file-backed, via a CPU gather plus H2D copy. This PR is the\n  unified-memory variant: the GPU reads the mapping directly, so there is no host gather and no staging copy.\n  The validation approach borrows from it.\n- **#58441 (issue), #58489 (merged):** the graph-pool reuse of the side-stream ids, reported from this work\n  and fixed on main by #58489.\n- **#57785 (open):** eager-break side-stream work left unjoined at capture. Tested with the inherited\n  side-stream lookup on GB10: it did not remove the non-reproducibility above (1/8).\n- **#57497 (merged):** ROCm pinned-table offload; `checkpoint_mapped` is rejected there.\n- **#58310 (open), #56926 (merged):** host-memory guards, and serialization and huge pages for host-offloaded\n  tables. They are orthogonal.\n\n---\n\n<details>\n<summary> Essential Elements of an Effective PR Description Checklist </summary>\n\n- [x] The purpose of the PR.\n- [x] The test plan.\n- [x] The test results, before/after.\n- [x] Documentation update: `docs/features/engram.md`.\n- [ ] (Optional) Release notes update.\n</details>\n\ncc @peakcrosser7 (#54371) @Trosfy (#54129)\n\n**AI assistance:** this PR was developed with Claude (Anthropic). The human submitter reviewed every changed\nline, ran the tests and measurements above on the hardware named, and takes responsibility for the change.\n\n",
+    "changed_files": 8,
+    "closed_at": null,
+    "comments": 15,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/58439/comments",
+    "commits": 6,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/58439/commits",
+    "created_at": "2026-09-23T19:57:56Z",
+    "deletions": 13,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/58439.diff",
+    "draft": false,
+    "head": {
+      "label": "jschmied:pr/ple-checkpoint-mapped",
+      "ref": "pr/ple-checkpoint-mapped",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/jschmied/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/jschmied/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/jschmied/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/jschmied/vllm/branches{/branch}",
+        "clone_url": "https://github.com/jschmied/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/jschmied/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/jschmied/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/jschmied/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/jschmied/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/jschmied/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/jschmied/vllm/contributors",
+        "created_at": "2026-07-13T18:01:29Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/jschmied/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/jschmied/vllm/downloads",
+        "events_url": "https://api.github.com/repos/jschmied/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/jschmied/vllm/forks",
+        "full_name": "jschmied/vllm",
+        "git_commits_url": "https://api.github.com/repos/jschmied/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/jschmied/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/jschmied/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/jschmied/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/jschmied/vllm/hooks",
+        "html_url": "https://github.com/jschmied/vllm",
+        "id": 1299590786,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/jschmied/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/jschmied/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/jschmied/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/jschmied/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/jschmied/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/jschmied/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/jschmied/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/jschmied/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOTXYugg",
+        "notifications_url": "https://api.github.com/repos/jschmied/vllm/notifications{?since,all,participating}",
+        "open_issues": 2,
+        "open_issues_count": 2,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/600316?v=4",
+          "events_url": "https://api.github.com/users/jschmied/events{/privacy}",
+          "followers_url": "https://api.github.com/users/jschmied/followers",
+          "following_url": "https://api.github.com/users/jschmied/following{/other_user}",
+          "gists_url": "https://api.github.com/users/jschmied/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/jschmied",
+          "id": 600316,
+          "login": "jschmied",
+          "node_id": "MDQ6VXNlcjYwMDMxNg==",
+          "organizations_url": "https://api.github.com/users/jschmied/orgs",
+          "received_events_url": "https://api.github.com/users/jschmied/received_events",
+          "repos_url": "https://api.github.com/users/jschmied/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/jschmied/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/jschmied/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/jschmied",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/jschmied/vllm/pulls{/number}",
+        "pushed_at": "2026-10-13T07:38:37Z",
+        "releases_url": "https://api.github.com/repos/jschmied/vllm/releases{/id}",
+        "size": 305006,
+        "ssh_url": "git@github.com:jschmied/vllm.git",
+        "stargazers_count": 2,
+        "stargazers_url": "https://api.github.com/repos/jschmied/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/jschmied/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/jschmied/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/jschmied/vllm/subscription",
+        "svn_url": "https://github.com/jschmied/vllm",
+        "tags_url": "https://api.github.com/repos/jschmied/vllm/tags",
+        "teams_url": "https://api.github.com/repos/jschmied/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/jschmied/vllm/git/trees{/sha}",
+        "updated_at": "2026-09-05T05:47:34Z",
+        "url": "https://api.github.com/repos/jschmied/vllm",
+        "visibility": "public",
+        "watchers": 2,
+        "watchers_count": 2,
+        "web_commit_signoff_required": true
+      },
+      "sha": "047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/600316?v=4",
+        "events_url": "https://api.github.com/users/jschmied/events{/privacy}",
+        "followers_url": "https://api.github.com/users/jschmied/followers",
+        "following_url": "https://api.github.com/users/jschmied/following{/other_user}",
+        "gists_url": "https://api.github.com/users/jschmied/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/jschmied",
+        "id": 600316,
+        "login": "jschmied",
+        "node_id": "MDQ6VXNlcjYwMDMxNg==",
+        "organizations_url": "https://api.github.com/users/jschmied/orgs",
+        "received_events_url": "https://api.github.com/users/jschmied/received_events",
+        "repos_url": "https://api.github.com/users/jschmied/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/jschmied/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/jschmied/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/jschmied",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/58439",
+    "id": 4618039756,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/58439",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "0075ca",
+        "default": true,
+        "description": "Improvements or additions to documentation",
+        "id": 5135047180,
+        "name": "documentation",
+        "node_id": "LA_kwDOI7xefs8AAAABMhKaDA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/documentation"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d4c5f9",
+        "default": false,
+        "description": "",
+        "id": 7614859318,
+        "name": "needs-rebase",
+        "node_id": "LA_kwDOI7xefs8AAAABxeGINg",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/needs-rebase"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "EF9EEA",
+        "default": false,
+        "description": "",
+        "id": 7614859685,
+        "name": "ci/build",
+        "node_id": "LA_kwDOI7xefs8AAAABxeGJpQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/ci/build"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "DBB0FE",
+        "default": false,
+        "description": "Related to Qwen models",
+        "id": 8745996664,
+        "name": "qwen",
+        "node_id": "LA_kwDOI7xefs8AAAACCU1ReA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/qwen"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABE0GxzA",
+    "number": 58439,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/58439.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1236979?v=4",
+        "events_url": "https://api.github.com/users/tlrmchlsmth/events{/privacy}",
+        "followers_url": "https://api.github.com/users/tlrmchlsmth/followers",
+        "following_url": "https://api.github.com/users/tlrmchlsmth/following{/other_user}",
+        "gists_url": "https://api.github.com/users/tlrmchlsmth/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/tlrmchlsmth",
+        "id": 1236979,
+        "login": "tlrmchlsmth",
+        "node_id": "MDQ6VXNlcjEyMzY5Nzk=",
+        "organizations_url": "https://api.github.com/users/tlrmchlsmth/orgs",
+        "received_events_url": "https://api.github.com/users/tlrmchlsmth/received_events",
+        "repos_url": "https://api.github.com/users/tlrmchlsmth/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/tlrmchlsmth/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/tlrmchlsmth/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/tlrmchlsmth",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/2819727?v=4",
+        "events_url": "https://api.github.com/users/Harry-Chen/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Harry-Chen/followers",
+        "following_url": "https://api.github.com/users/Harry-Chen/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Harry-Chen/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Harry-Chen",
+        "id": 2819727,
+        "login": "Harry-Chen",
+        "node_id": "MDQ6VXNlcjI4MTk3Mjc=",
+        "organizations_url": "https://api.github.com/users/Harry-Chen/orgs",
+        "received_events_url": "https://api.github.com/users/Harry-Chen/received_events",
+        "repos_url": "https://api.github.com/users/Harry-Chen/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Harry-Chen/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Harry-Chen/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Harry-Chen",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/3195154?v=4",
+        "events_url": "https://api.github.com/users/mgoin/events{/privacy}",
+        "followers_url": "https://api.github.com/users/mgoin/followers",
+        "following_url": "https://api.github.com/users/mgoin/following{/other_user}",
+        "gists_url": "https://api.github.com/users/mgoin/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/mgoin",
+        "id": 3195154,
+        "login": "mgoin",
+        "node_id": "MDQ6VXNlcjMxOTUxNTQ=",
+        "organizations_url": "https://api.github.com/users/mgoin/orgs",
+        "received_events_url": "https://api.github.com/users/mgoin/received_events",
+        "repos_url": "https://api.github.com/users/mgoin/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/mgoin/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/mgoin/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/mgoin",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/11367180?v=4",
+        "events_url": "https://api.github.com/users/ProExpertProg/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ProExpertProg/followers",
+        "following_url": "https://api.github.com/users/ProExpertProg/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ProExpertProg/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ProExpertProg",
+        "id": 11367180,
+        "login": "ProExpertProg",
+        "node_id": "MDQ6VXNlcjExMzY3MTgw",
+        "organizations_url": "https://api.github.com/users/ProExpertProg/orgs",
+        "received_events_url": "https://api.github.com/users/ProExpertProg/received_events",
+        "repos_url": "https://api.github.com/users/ProExpertProg/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ProExpertProg/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ProExpertProg/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ProExpertProg",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/23236638?v=4",
+        "events_url": "https://api.github.com/users/youkaichao/events{/privacy}",
+        "followers_url": "https://api.github.com/users/youkaichao/followers",
+        "following_url": "https://api.github.com/users/youkaichao/following{/other_user}",
+        "gists_url": "https://api.github.com/users/youkaichao/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/youkaichao",
+        "id": 23236638,
+        "login": "youkaichao",
+        "node_id": "MDQ6VXNlcjIzMjM2NjM4",
+        "organizations_url": "https://api.github.com/users/youkaichao/orgs",
+        "received_events_url": "https://api.github.com/users/youkaichao/received_events",
+        "repos_url": "https://api.github.com/users/youkaichao/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/youkaichao/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/youkaichao/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/youkaichao",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/26946864?v=4",
+        "events_url": "https://api.github.com/users/gau-nernst/events{/privacy}",
+        "followers_url": "https://api.github.com/users/gau-nernst/followers",
+        "following_url": "https://api.github.com/users/gau-nernst/following{/other_user}",
+        "gists_url": "https://api.github.com/users/gau-nernst/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/gau-nernst",
+        "id": 26946864,
+        "login": "gau-nernst",
+        "node_id": "MDQ6VXNlcjI2OTQ2ODY0",
+        "organizations_url": "https://api.github.com/users/gau-nernst/orgs",
+        "received_events_url": "https://api.github.com/users/gau-nernst/received_events",
+        "repos_url": "https://api.github.com/users/gau-nernst/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/gau-nernst/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/gau-nernst/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/gau-nernst",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/30275821?v=4",
+        "events_url": "https://api.github.com/users/houseroad/events{/privacy}",
+        "followers_url": "https://api.github.com/users/houseroad/followers",
+        "following_url": "https://api.github.com/users/houseroad/following{/other_user}",
+        "gists_url": "https://api.github.com/users/houseroad/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/houseroad",
+        "id": 30275821,
+        "login": "houseroad",
+        "node_id": "MDQ6VXNlcjMwMjc1ODIx",
+        "organizations_url": "https://api.github.com/users/houseroad/orgs",
+        "received_events_url": "https://api.github.com/users/houseroad/received_events",
+        "repos_url": "https://api.github.com/users/houseroad/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/houseroad/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/houseroad/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/houseroad",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42451412?v=4",
+        "events_url": "https://api.github.com/users/AndreasKaratzas/events{/privacy}",
+        "followers_url": "https://api.github.com/users/AndreasKaratzas/followers",
+        "following_url": "https://api.github.com/users/AndreasKaratzas/following{/other_user}",
+        "gists_url": "https://api.github.com/users/AndreasKaratzas/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/AndreasKaratzas",
+        "id": 42451412,
+        "login": "AndreasKaratzas",
+        "node_id": "MDQ6VXNlcjQyNDUxNDEy",
+        "organizations_url": "https://api.github.com/users/AndreasKaratzas/orgs",
+        "received_events_url": "https://api.github.com/users/AndreasKaratzas/received_events",
+        "repos_url": "https://api.github.com/users/AndreasKaratzas/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/AndreasKaratzas/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/AndreasKaratzas/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/AndreasKaratzas",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/44945378?v=4",
+        "events_url": "https://api.github.com/users/yewentao256/events{/privacy}",
+        "followers_url": "https://api.github.com/users/yewentao256/followers",
+        "following_url": "https://api.github.com/users/yewentao256/following{/other_user}",
+        "gists_url": "https://api.github.com/users/yewentao256/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/yewentao256",
+        "id": 44945378,
+        "login": "yewentao256",
+        "node_id": "MDQ6VXNlcjQ0OTQ1Mzc4",
+        "organizations_url": "https://api.github.com/users/yewentao256/orgs",
+        "received_events_url": "https://api.github.com/users/yewentao256/received_events",
+        "repos_url": "https://api.github.com/users/yewentao256/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/yewentao256/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/yewentao256/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/yewentao256",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/44970335?v=4",
+        "events_url": "https://api.github.com/users/DarkLight1337/events{/privacy}",
+        "followers_url": "https://api.github.com/users/DarkLight1337/followers",
+        "following_url": "https://api.github.com/users/DarkLight1337/following{/other_user}",
+        "gists_url": "https://api.github.com/users/DarkLight1337/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/DarkLight1337",
+        "id": 44970335,
+        "login": "DarkLight1337",
+        "node_id": "MDQ6VXNlcjQ0OTcwMzM1",
+        "organizations_url": "https://api.github.com/users/DarkLight1337/orgs",
+        "received_events_url": "https://api.github.com/users/DarkLight1337/received_events",
+        "repos_url": "https://api.github.com/users/DarkLight1337/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/DarkLight1337/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/DarkLight1337/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/DarkLight1337",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/46394894?v=4",
+        "events_url": "https://api.github.com/users/WoosukKwon/events{/privacy}",
+        "followers_url": "https://api.github.com/users/WoosukKwon/followers",
+        "following_url": "https://api.github.com/users/WoosukKwon/following{/other_user}",
+        "gists_url": "https://api.github.com/users/WoosukKwon/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/WoosukKwon",
+        "id": 46394894,
+        "login": "WoosukKwon",
+        "node_id": "MDQ6VXNlcjQ2Mzk0ODk0",
+        "organizations_url": "https://api.github.com/users/WoosukKwon/orgs",
+        "received_events_url": "https://api.github.com/users/WoosukKwon/received_events",
+        "repos_url": "https://api.github.com/users/WoosukKwon/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/WoosukKwon/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/WoosukKwon/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/WoosukKwon",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/51931015?v=4",
+        "events_url": "https://api.github.com/users/khluu/events{/privacy}",
+        "followers_url": "https://api.github.com/users/khluu/followers",
+        "following_url": "https://api.github.com/users/khluu/following{/other_user}",
+        "gists_url": "https://api.github.com/users/khluu/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/khluu",
+        "id": 51931015,
+        "login": "khluu",
+        "node_id": "MDQ6VXNlcjUxOTMxMDE1",
+        "organizations_url": "https://api.github.com/users/khluu/orgs",
+        "received_events_url": "https://api.github.com/users/khluu/received_events",
+        "repos_url": "https://api.github.com/users/khluu/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/khluu/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/khluu/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/khluu",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/114415538?v=4",
+        "events_url": "https://api.github.com/users/robertgshaw2-redhat/events{/privacy}",
+        "followers_url": "https://api.github.com/users/robertgshaw2-redhat/followers",
+        "following_url": "https://api.github.com/users/robertgshaw2-redhat/following{/other_user}",
+        "gists_url": "https://api.github.com/users/robertgshaw2-redhat/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/robertgshaw2-redhat",
+        "id": 114415538,
+        "login": "robertgshaw2-redhat",
+        "node_id": "U_kgDOBtHXsg",
+        "organizations_url": "https://api.github.com/users/robertgshaw2-redhat/orgs",
+        "received_events_url": "https://api.github.com/users/robertgshaw2-redhat/received_events",
+        "repos_url": "https://api.github.com/users/robertgshaw2-redhat/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/robertgshaw2-redhat/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/robertgshaw2-redhat/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/robertgshaw2-redhat",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136131678?v=4",
+        "events_url": "https://api.github.com/users/ywang96/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ywang96/followers",
+        "following_url": "https://api.github.com/users/ywang96/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ywang96/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ywang96",
+        "id": 136131678,
+        "login": "ywang96",
+        "node_id": "U_kgDOCB00Xg",
+        "organizations_url": "https://api.github.com/users/ywang96/orgs",
+        "received_events_url": "https://api.github.com/users/ywang96/received_events",
+        "repos_url": "https://api.github.com/users/ywang96/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ywang96/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ywang96/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ywang96",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/58439/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+    "title": "[Qwen4Exp] Checkpoint-mapped PLE storage for unified-memory GPUs (DGX Spark)",
+    "updated_at": "2026-10-14T00:31:28Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/58439",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/600316?v=4",
+      "events_url": "https://api.github.com/users/jschmied/events{/privacy}",
+      "followers_url": "https://api.github.com/users/jschmied/followers",
+      "following_url": "https://api.github.com/users/jschmied/following{/other_user}",
+      "gists_url": "https://api.github.com/users/jschmied/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/jschmied",
+      "id": 600316,
+      "login": "jschmied",
+      "node_id": "MDQ6VXNlcjYwMDMxNg==",
+      "organizations_url": "https://api.github.com/users/jschmied/orgs",
+      "received_events_url": "https://api.github.com/users/jschmied/received_events",
+      "repos_url": "https://api.github.com/users/jschmied/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/jschmied/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/jschmied/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/jschmied",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/.buildkite%2Ftest_areas%2Fmodels_basic.yaml",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/.buildkite%2Ftest_areas%2Fmodels_basic.yaml?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 1,
+      "filename": ".buildkite/test_areas/models_basic.yaml",
+      "patch": "@@ -237,7 +237,7 @@ steps:\n   - vllm/v1/attention/backends/short_conv_attn.py\n   - tests/models/qwen4_exp/\n   commands:\n-    - pytest -v -s models/qwen4_exp/test_config.py models/qwen4_exp/test_ple.py\n+    - pytest -v -s models/qwen4_exp/test_config.py models/qwen4_exp/test_ple.py models/qwen4_exp/test_ple_pageable.py\n \n - label: \":computer: (CPU) Basic Models Other\"\n   key: basic-models-test-other-cpu",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/.buildkite%2Ftest_areas%2Fmodels_basic.yaml",
+      "sha": "ec44bcaee8de7455d3e76f82466d9ae1c5b6da65",
+      "status": "modified"
+    },
+    {
+      "additions": 41,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/docs%2Ffeatures%2Fengram.md",
+      "changes": 42,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/docs%2Ffeatures%2Fengram.md?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 1,
+      "filename": "docs/features/engram.md",
+      "patch": "@@ -96,6 +96,42 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \\\n CPU offload requires a GPU with UVA support;\n vLLM fails fast when it is unavailable.\n \n+## Unified-memory systems: checkpoint-mapped tables (Qwen4Exp)\n+\n+On a unified-memory machine such as DGX Spark (GB10, 128 GB shared by CPU and\n+GPU), neither storage above suits Qwen3.8-Flash-Next: the device-resident table\n+does not fit next to the weights, and a 47.7 GiB host copy of its FP8 table is\n+anonymous memory in the same physical pool as the weights and the KV cache. It\n+cannot be cheaply dropped and recreated under memory pressure.\n+\n+`checkpoint_mapped` instead reads the table **in place from the checkpoint's\n+safetensors files**. The files are mapped read-only and the lookup kernel reads\n+the mapped rows directly, which requires a GPU that accesses pageable host\n+memory through the host page tables (checked at startup through\n+`CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`). There is\n+then no table-sized GPU or pinned allocation, no resident duplicate of the table\n+and no CPU-gather/host-to-device staging path: the rows live in the page cache\n+as clean, file-backed pages that the kernel can drop and re-read, shared by every\n+process that maps the same files. Because GPU page faults on rows that are not yet resident\n+are serviced one page at a time, CPU threads fault in each step's rows before\n+the forward pass reads them.\n+\n+```bash\n+vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \\\n+  --engram-config '{\"checkpoint_mapped\": true}'\n+```\n+\n+`checkpoint_mapped` overrides `cpu_offload`, is incompatible with\n+`dp_shared_memory` (mapped pages are already shared between processes) and with\n+`embedding_across_dp`, and requires a safetensors checkpoint whose PLE table is\n+stored in the dtype the model uses (FP8 or BF16). Reloading weights from disk\n+(`weights_path`) remaps the new checkpoint: every incoming PLE shard is compared\n+with the newly mapped files, and the new mapping takes effect during reload\n+processing or at the latest on the next lookup. PLE weights delivered from\n+memory (e.g. weight sync) differ from the files and are rejected. It is implemented for Qwen4Exp only and has been\n+validated only on DGX Spark; other GPUs that report the attribute (for example\n+Grace Hopper or Grace Blackwell over NVLink-C2C) are accepted with a warning.\n+\n ## Data-parallel topologies (DeepSeek V4.1)\n \n By default (`embedding_across_dp: false`), each DP replica keeps its own\n@@ -115,7 +151,8 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \\\n ```\n \n `embedding_across_dp` is not supported with elastic expert parallelism yet.\n-Qwen4Exp PLE tables are ETP-sharded instead and honor `cpu_offload` only.\n+Qwen4Exp PLE tables are ETP-sharded instead and honor `cpu_offload` and\n+`checkpoint_mapped` only.\n \n ## Sharing host tables across DP replicas\n \n@@ -143,3 +180,6 @@ IPC namespace across the co-located replicas.\n   `--enable-dbo` and set `--ubatch-size 0`.\n - `dp_shared_memory` requires `cpu_offload`, `data_parallel_size > 1`, and is\n   unsupported with elastic expert parallelism.\n+- `checkpoint_mapped` is Qwen4Exp-only and CUDA-only, requires a GPU that\n+  reads pageable host memory through the host page tables, and has been\n+  validated only on DGX Spark.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/docs%2Ffeatures%2Fengram.md",
+      "sha": "221619dd1841daef9638e0a5c1817bff64777fa7",
+      "status": "modified"
+    },
+    {
+      "additions": 565,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/tests%2Fmodels%2Fqwen4_exp%2Ftest_ple_pageable.py",
+      "changes": 565,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fmodels%2Fqwen4_exp%2Ftest_ple_pageable.py?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 0,
+      "filename": "tests/models/qwen4_exp/test_ple_pageable.py",
+      "patch": "@@ -0,0 +1,565 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Checkpoint-mapped (pageable-host) PLE storage.\"\"\"\n+\n+import glob\n+import json\n+import os\n+import struct\n+import time\n+from types import SimpleNamespace\n+\n+import numpy as np\n+import pytest\n+import torch\n+\n+import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module\n+from vllm.config.engram import EngramConfig\n+from vllm.model_executor.model_loader.weight_utils import (\n+    filter_duplicate_safetensors_files,\n+)\n+from vllm.models.qwen4_exp.nvidia.ngram_embedding import (\n+    Qwen4ExpPLEPageableHostEmbedding,\n+)\n+from vllm.models.qwen4_exp.nvidia.ple_pageable import (\n+    MappedTable,\n+    PagePrefetcher,\n+    PrefetchSource,\n+    discover_table_layout,\n+    require_pageable_access,\n+)\n+\n+ROW = 160\n+PREFIX = \"model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding\"\n+\n+\n+def _shard_bytes(\n+    layer: int, shard: int, rows: int, width: int, salt: int = 0\n+) -> np.ndarray:\n+    base = np.arange(rows * width, dtype=np.int64) * 7 + shard * 131 + layer * 17\n+    base += salt\n+    return base.astype(np.uint8).reshape(rows, width)\n+\n+\n+def _write(path, tensors: dict[str, tuple[str, list[int], bytes]], pad: int = 7):\n+    \"\"\"Write a safetensors file whose data section starts unaligned.\"\"\"\n+    header, blobs, offset = {}, [], 0\n+    for name, (dtype, shape, blob) in tensors.items():\n+        header[name] = {\n+            \"dtype\": dtype,\n+            \"shape\": shape,\n+            \"data_offsets\": [offset, offset + len(blob)],\n+        }\n+        offset += len(blob)\n+        blobs.append(blob)\n+    raw = json.dumps(header).encode() + b\" \" * pad\n+    with open(path, \"wb\") as f:\n+        f.write(struct.pack(\"<Q\", len(raw)))\n+        f.write(raw)\n+        f.write(b\"\".join(blobs))\n+\n+\n+def _checkpoint(tmp_path, shards_by_file, layer=1, dtype=\"F8_E4M3\", width=ROW, salt=0):\n+    \"\"\"shards_by_file: [{shard_index: rows}, ...], one dict per file.\"\"\"\n+    for i, shards in enumerate(shards_by_file):\n+        tensors = {\n+            f\"{PREFIX.format(layer=layer)}.shard_{s}.weight\": (\n+                dtype,\n+                [rows, width // (2 if dtype == \"BF16\" else 1)],\n+                _shard_bytes(layer, s, rows, width, salt).tobytes(),\n+            )\n+            for s, rows in shards.items()\n+        }\n+        _write(tmp_path / f\"model-{i:05d}.safetensors\", tensors, pad=5 + i)\n+    return str(tmp_path)\n+\n+\n+def _files(model: str) -> list[str]:\n+    \"\"\"What the loader hands over: every safetensors file, index-filtered.\"\"\"\n+    return filter_duplicate_safetensors_files(\n+        sorted(glob.glob(os.path.join(model, \"*.safetensors\"))),\n+        model,\n+        \"model.safetensors.index.json\",\n+    )\n+\n+\n+def _reference(shards: dict[int, int], layer=1, width=ROW) -> np.ndarray:\n+    return np.concatenate(\n+        [_shard_bytes(layer, s, r, width) for s, r in sorted(shards.items())]\n+    )\n+\n+\n+# ---------------------------------------------------------------- discovery\n+\n+\n+def test_layout_spans_files_and_accepts_short_last_shard(tmp_path):\n+    model = _checkpoint(tmp_path, [{0: 3, 2: 3}, {1: 3, 3: 2}])\n+    layout = discover_table_layout(_files(model), 1, 11, ROW, torch.float8_e4m3fn, 4)\n+    assert layout.rows_per_shard == 3\n+    assert [s.rows for s in layout.shards] == [3, 3, 3, 2]\n+    assert len({s.path for s in layout.shards}) == 2\n+\n+\n+def test_layout_ignores_other_layers(tmp_path):\n+    _checkpoint(tmp_path, [{0: 3, 1: 3, 2: 3, 3: 3}], layer=5)\n+    model = str(tmp_path)\n+    (tmp_path / \"model-00000.safetensors\").rename(tmp_path / \"other.safetensors\")\n+    _checkpoint(tmp_path, [{0: 3, 1: 3, 2: 3, 3: 3}], layer=1)\n+    layout = discover_table_layout(_files(model), 1, 12, ROW, torch.float8_e4m3fn, 4)\n+    assert all(\"model-00000\" in s.path for s in layout.shards)\n+\n+\n+@pytest.mark.parametrize(\n+    (\"shards\", \"rows\", \"match\"),\n+    [\n+        ({0: 3, 1: 3, 3: 3}, 12, \"missing \\\\[2\\\\]\"),\n+        ({0: 3, 1: 3, 2: 2}, 12, \"missing \\\\[3\\\\]\"),\n+        ({0: 3, 1: 3, 2: 3, 3: 3, 4: 3}, 12, \"unexpected \\\\[4\\\\]\"),\n+        ({0: 3, 1: 2, 2: 3, 3: 3}, 12, \"shard 1 has shape\"),\n+    ],\n+    ids=[\"missing\", \"short-coverage\", \"extra\", \"short-interior\"],\n+)\n+def test_layout_refuses_inconsistent_shards(tmp_path, shards, rows, match):\n+    model = _checkpoint(tmp_path, [shards])\n+    with pytest.raises(ValueError, match=match):\n+        discover_table_layout(_files(model), 1, rows, ROW, torch.float8_e4m3fn, 4)\n+\n+\n+def test_layout_refuses_duplicate_shard(tmp_path):\n+    model = _checkpoint(tmp_path, [{0: 3, 1: 3}, {1: 3, 2: 3, 3: 3}])\n+    with pytest.raises(ValueError, match=\"appears twice\"):\n+        discover_table_layout(_files(model), 1, 12, ROW, torch.float8_e4m3fn, 4)\n+\n+\n+def test_layout_refuses_dtype_mismatch(tmp_path):\n+    model = _checkpoint(tmp_path, [{0: 3, 1: 3, 2: 3, 3: 3}], dtype=\"BF16\", width=320)\n+    with pytest.raises(ValueError, match=\"cannot convert\"):\n+        discover_table_layout(_files(model), 1, 12, ROW, torch.float8_e4m3fn, 4)\n+\n+\n+def test_cpu_views_address_the_checkpoint_rows(tmp_path):\n+    shards = {0: 3, 1: 3, 2: 3, 3: 2}\n+    model = _checkpoint(tmp_path, [{0: 3, 3: 2}, {1: 3, 2: 3}])\n+    layout = discover_table_layout(_files(model), 1, 11, ROW, torch.float8_e4m3fn, 4)\n+    table = MappedTable(layout, torch.device(\"cpu\"))\n+    ref = _reference(shards)\n+    rows = np.arange(11)\n+    got = np.stack([table.views[r // 3][r % 3] for r in rows])\n+    np.testing.assert_array_equal(got, ref)\n+    table.touch(rows, pool=None)  # CPU fault-in path must not raise\n+\n+\n+def _indexed_checkpoint_with_stale_file(tmp_path) -> str:\n+    \"\"\"One indexed file plus a stale extra file holding the same four shards.\"\"\"\n+    model = _checkpoint(tmp_path, [{0: 3, 1: 3, 2: 3, 3: 3}])\n+    _write(\n+        tmp_path / \"model-stale.safetensors\",\n+        {\n+            f\"{PREFIX.format(layer=1)}.shard_{s}.weight\": (\n+                \"F8_E4M3\",\n+                [3, ROW],\n+                _shard_bytes(1, s, 3, ROW).tobytes(),\n+            )\n+            for s in range(4)\n+        },\n+    )\n+    weight_map = {\n+        f\"{PREFIX.format(layer=1)}.shard_{s}.weight\": \"model-00000.safetensors\"\n+        for s in range(4)\n+    }\n+    (tmp_path / \"model.safetensors.index.json\").write_text(\n+        json.dumps({\"weight_map\": weight_map})\n+    )\n+    return model\n+\n+\n+def test_layout_follows_the_safetensors_index(tmp_path):\n+    \"\"\"A stale extra file with duplicate shards is ignored when the index excludes it,\n+    exactly as the loader ignores it.\"\"\"\n+    model = _indexed_checkpoint_with_stale_file(tmp_path)\n+    layout = discover_table_layout(_files(model), 1, 12, ROW, torch.float8_e4m3fn, 4)\n+    assert all(s.path.endswith(\"model-00000.safetensors\") for s in layout.shards)\n+    all_files = sorted(glob.glob(os.path.join(model, \"*.safetensors\")))\n+    with pytest.raises(ValueError, match=\"appears twice\"):\n+        discover_table_layout(all_files, 1, 12, ROW, torch.float8_e4m3fn, 4)\n+\n+\n+def test_resolve_checkpoint_files_through_the_real_loader(tmp_path):\n+    \"\"\"The default loader's own preparation (not the test stand-in) resolves the\n+    files, so a change to its interface fails here rather than at serve time.\"\"\"\n+    from vllm.config.load import LoadConfig\n+\n+    model = _indexed_checkpoint_with_stale_file(tmp_path)\n+    model_config = SimpleNamespace(model=model, model_weights=None, revision=None)\n+    files = ngram_embedding_module.resolve_checkpoint_files(model_config, LoadConfig())\n+    assert [os.path.basename(f) for f in files] == [\"model-00000.safetensors\"]\n+\n+\n+def _rss_kib() -> int:\n+    with open(\"/proc/self/status\") as f:\n+        for line in f:\n+            if line.startswith(\"VmRSS:\"):\n+                return int(line.split()[1])\n+    return 0\n+\n+\n+def test_zero_mapping_commits_no_memory_when_read():\n+    rows, width = (32 << 20) // ROW, ROW\n+    table = MappedTable.zeros(rows, width, torch.device(\"cpu\"))\n+    before = _rss_kib()\n+    assert int(table.views[0][:: 4096 // width].sum()) == 0  # touch every page\n+    table.touch(np.arange(0, rows, 4096 // width), pool=None)\n+    grown_kib = _rss_kib() - before\n+    assert grown_kib < 4096, f\"touching 32 MiB of zeros committed {grown_kib} KiB\"\n+\n+\n+def _mapped_embedding(\n+    files_ref: dict, rows: int = 12, parts: int = 4\n+) -> Qwen4ExpPLEPageableHostEmbedding:\n+    \"\"\"A CPU-only embedding with just the state binding needs.\"\"\"\n+    emb = object.__new__(Qwen4ExpPLEPageableHostEmbedding)\n+    torch.nn.Module.__init__(emb)\n+    emb.register_parameter(\n+        \"weight\",\n+        torch.nn.Parameter(\n+            torch.empty(0, ROW, dtype=torch.float8_e4m3fn), requires_grad=False\n+        ),\n+    )\n+    emb.org_vocab_size, emb.embedding_dim, emb.layer_index = rows, ROW, 1\n+    emb.table, emb._rebind_pending = None, False\n+    emb._pending_table, emb._reload_error = None, None\n+    emb._prefetch_buffer = torch.empty(0)\n+    emb._device = emb._prefetch_buffer.device\n+    emb._load_format = \"auto\"\n+    emb._model_config = SimpleNamespace(\n+        hf_text_config=SimpleNamespace(split_ngram_parts=parts)\n+    )\n+    emb._load_config = None\n+    return emb\n+\n+\n+def _mapped_rows(emb) -> np.ndarray:\n+    t = emb.table\n+    return np.stack(\n+        [\n+            t.views[r // t.rows_per_shard][r % t.rows_per_shard]\n+            for r in range(emb.org_vocab_size)\n+        ]\n+    )\n+\n+\n+def test_reload_from_disk_remaps_to_the_new_checkpoint(tmp_path, monkeypatch):\n+    \"\"\"Load A, then reload_weights(weights_path=B): the table must follow B.\"\"\"\n+    shards = {0: 3, 1: 3, 2: 3, 3: 3}\n+    (tmp_path / \"a\").mkdir()\n+    (tmp_path / \"b\").mkdir()\n+    a = _checkpoint(tmp_path / \"a\", [shards])\n+    b = _checkpoint(tmp_path / \"b\", [shards], salt=97)\n+    source = {\"dir\": a}\n+    monkeypatch.setattr(\n+        ngram_embedding_module,\n+        \"resolve_checkpoint_files\",\n+        lambda model_config, load_config: _files(source[\"dir\"]),\n+    )\n+    emb = _mapped_embedding(source)\n+    emb.bind_storage_after_loading()  # first load: A\n+    np.testing.assert_array_equal(_mapped_rows(emb), _reference(shards))\n+    # The reload streams B's shards through load_weights, then rebinds.\n+    source[\"dir\"] = b\n+    for s, rows in shards.items():\n+        raw = torch.from_numpy(_shard_bytes(1, s, rows, ROW, salt=97).copy())\n+        emb.record_incoming_shard(s * 3, raw.view(torch.float8_e4m3fn))\n+    assert emb._rebind_pending\n+    emb.bind_storage_after_loading()\n+    np.testing.assert_array_equal(\n+        _mapped_rows(emb),\n+        np.concatenate([_shard_bytes(1, s, 3, ROW, salt=97) for s in range(4)]),\n+    )\n+    assert not emb._rebind_pending\n+\n+\n+def _shard_tensor(shard: int, rows: int, salt: int = 0) -> torch.Tensor:\n+    raw = torch.from_numpy(_shard_bytes(1, shard, rows, ROW, salt).copy())\n+    return raw.view(torch.float8_e4m3fn)\n+\n+\n+def test_reload_from_memory_is_rejected(tmp_path, monkeypatch):\n+    \"\"\"Weights delivered from memory cannot be mapped; never serve the old table.\"\"\"\n+    shards = {0: 3, 1: 3, 2: 3, 3: 3}\n+    a = _checkpoint(tmp_path, [shards])\n+    monkeypatch.setattr(\n+        ngram_embedding_module,\n+        \"resolve_checkpoint_files\",\n+        lambda model_config, load_config: _files(a),\n+    )\n+    emb = _mapped_embedding({})\n+    emb.bind_storage_after_loading()\n+    old = emb.table\n+    with pytest.raises(ValueError, match=\"differs from the mapped checkpoint\"):\n+        emb.record_incoming_shard(0, _shard_tensor(0, 3, salt=5))\n+    # A rejected reload stays rejected: binding again raises, and the previous\n+    # mapping is neither kept silently in use nor replaced.\n+    for _ in range(2):\n+        with pytest.raises(RuntimeError, match=\"rejected\"):\n+            emb.bind_storage_after_loading()\n+    assert emb.table is old\n+\n+\n+def test_reload_rejects_a_single_changed_row(tmp_path, monkeypatch):\n+    \"\"\"One changed row in the middle of a shard (no sample would hit it) is caught.\"\"\"\n+    shards = {0: 10, 1: 10}\n+    a = _checkpoint(tmp_path, [shards])\n+    monkeypatch.setattr(\n+        ngram_embedding_module,\n+        \"resolve_checkpoint_files\",\n+        lambda model_config, load_config: _files(a),\n+    )\n+    emb = _mapped_embedding({}, rows=20, parts=2)\n+    emb.bind_storage_after_loading()\n+    incoming = _shard_tensor(0, 10).view(torch.uint8).clone()\n+    incoming[3, 17] ^= 0x5A\n+    with pytest.raises(ValueError, match=\"PLE row 3 received\"):\n+        emb.record_incoming_shard(0, incoming.view(torch.float8_e4m3fn))\n+\n+\n+def test_reload_from_disk_after_a_rejection_recovers(tmp_path, monkeypatch):\n+    \"\"\"A new load attempt after a rejection is verified from scratch.\"\"\"\n+    shards = {0: 3, 1: 3, 2: 3, 3: 3}\n+    a = _checkpoint(tmp_path, [shards])\n+    monkeypatch.setattr(\n+        ngram_embedding_module,\n+        \"resolve_checkpoint_files\",\n+        lambda model_config, load_config: _files(a),\n+    )\n+    emb = _mapped_embedding({})\n+    emb.bind_storage_after_loading()\n+    with pytest.raises(ValueError):\n+        emb.record_incoming_shard(0, _shard_tensor(0, 3, salt=5))\n+    for s, rows in shards.items():  # reload from disk: the same files stream in\n+        emb.record_incoming_shard(s * 3, _shard_tensor(s, rows))\n+    emb.bind_storage_after_loading()\n+    np.testing.assert_array_equal(_mapped_rows(emb), _reference(shards))\n+\n+\n+# ------------------------------------------------------------------- config\n+\n+\n+@pytest.mark.parametrize(\n+    \"arch\",\n+    [\"DeepseekV41ForCausalLM\"],\n+)\n+def test_config_rejects_architectures_without_mapped_storage(arch, monkeypatch):\n+    import vllm.platforms\n+\n+    monkeypatch.setattr(\n+        vllm.platforms.current_platform, \"is_cuda_alike\", lambda: True, raising=False\n+    )\n+    model_config = SimpleNamespace(\n+        architecture=arch,\n+        hf_text_config=SimpleNamespace(engram_layer_ids=[1]),\n+    )\n+    EngramConfig(checkpoint_mapped=False).verify_model_config(model_config)\n+    with pytest.raises(ValueError, match=\"checkpoint_mapped is implemented for\"):\n+        EngramConfig(checkpoint_mapped=True).verify_model_config(model_config)\n+\n+\n+@pytest.mark.parametrize(\"is_cuda\", [True, False])\n+def test_config_rejects_mapping_off_cuda(is_cuda, monkeypatch):\n+    import vllm.platforms\n+\n+    platform = vllm.platforms.current_platform\n+    monkeypatch.setattr(platform, \"is_cuda_alike\", lambda: True, raising=False)\n+    monkeypatch.setattr(platform, \"is_cuda\", lambda: is_cuda, raising=False)\n+    model_config = SimpleNamespace(\n+        architecture=\"Qwen4ExpForCausalLM\",\n+        hf_text_config=SimpleNamespace(ple_layer_ids=[1]),\n+    )\n+    EngramConfig(checkpoint_mapped=False).verify_model_config(model_config)\n+    if is_cuda:\n+        EngramConfig(checkpoint_mapped=True).verify_model_config(model_config)\n+    else:\n+        with pytest.raises(ValueError, match=\"implemented for CUDA only\"):\n+            EngramConfig(checkpoint_mapped=True).verify_model_config(model_config)\n+\n+\n+def test_config_rejects_shared_memory_with_mapping():\n+    with pytest.raises(ValueError, match=\"checkpoint_mapped\"):\n+        EngramConfig(checkpoint_mapped=True, dp_shared_memory=True)\n+\n+\n+def test_config_rejects_embedding_across_dp_with_mapping():\n+    with pytest.raises(ValueError, match=\"embedding_across_dp\"):\n+        EngramConfig(checkpoint_mapped=True, embedding_across_dp=True)\n+\n+\n+def test_config_does_not_default_shared_memory_when_mapped():\n+    config = EngramConfig(checkpoint_mapped=True)\n+\n+    class _Parallel:\n+        data_parallel_size = 4\n+        enable_elastic_ep = False\n+\n+    config.resolve_dp_shared_memory(_Parallel())\n+    assert config.dp_shared_memory is False\n+\n+\n+# ---------------------------------------------------------------------- GPU\n+\n+\n+def _pageable_gpu() -> bool:\n+    if not torch.cuda.is_available():\n+        return False\n+    try:\n+        require_pageable_access(0)\n+    except RuntimeError:\n+        return False\n+    return True\n+\n+\n+requires_pageable = pytest.mark.skipif(\n+    not _pageable_gpu(), reason=\"needs a GPU with pageable host-page-table access\"\n+)\n+\n+\n+def _poison_allocator(rows: int, width: int) -> None:\n+    for _ in range(4):\n+        junk = torch.full((rows, width), 0xFF, dtype=torch.uint8, device=\"cuda\")\n+        del junk\n+\n+\n+@requires_pageable\n+@pytest.mark.parametrize(\n+    (\"dtype\", \"st_dtype\", \"width\"),\n+    [(torch.float8_e4m3fn, \"F8_E4M3\", ROW), (torch.bfloat16, \"BF16\", 2 * ROW)],\n+    ids=[\"fp8\", \"bf16\"],\n+)\n+def test_gather_is_bit_exact_with_etp_range(tmp_path, dtype, st_dtype, width):\n+    shards = {0: 3, 1: 3, 2: 3, 3: 2}\n+    model = _checkpoint(\n+        tmp_path, [{0: 3, 3: 2}, {1: 3, 2: 3}], dtype=st_dtype, width=width\n+    )\n+    layout = discover_table_layout(\n+        _files(model), 1, 11, width // dtype.itemsize, dtype, 4\n+    )\n+    table = MappedTable(layout, torch.device(\"cuda\"))\n+    ref = _reference(shards, width=width)\n+    ids = torch.tensor([0, 2, 3, 5, 9, 10, 11, 12, -1, 10**9], device=\"cuda\")\n+    _poison_allocator(ids.numel(), width)\n+    # This rank owns rows [3, 10): everything else must come back as zeros.\n+    out = torch.empty(ids.numel(), width, dtype=torch.uint8, device=\"cuda\")\n+    out.fill_(0xAB)\n+    table.gather_into(ids, out, 3, 10)\n+    got = out.cpu().numpy()\n+    owned = [i for i, r in enumerate(ids.tolist()) if 3 <= r < 10]\n+    np.testing.assert_array_equal(got[owned], ref[ids.cpu().numpy()[owned]])\n+    assert not np.delete(got, owned, axis=0).any()\n+\n+\n+@requires_pageable\n+def test_graph_replay_zeroes_rows_that_become_invalid(tmp_path):\n+    model = _checkpoint(tmp_path, [{0: 3, 1: 3, 2: 3, 3: 2}])\n+    layout = discover_table_layout(_files(model), 1, 11, ROW, torch.float8_e4m3fn, 4)\n+    table = MappedTable(layout, torch.device(\"cuda\"))\n+    ids = torch.tensor([0, 4, 8, 10], device=\"cuda\")\n+    out = torch.empty(4, ROW, dtype=torch.uint8, device=\"cuda\")\n+    stream = torch.cuda.Stream()\n+    stream.wait_stream(torch.cuda.current_stream())\n+    with torch.cuda.stream(stream):\n+        table.gather_into(ids, out, 0, 11)\n+    torch.cuda.current_stream().wait_stream(stream)\n+    graph = torch.cuda.CUDAGraph()\n+    with torch.cuda.graph(graph):\n+        table.gather_into(ids, out, 0, 11)\n+    graph.replay()\n+    torch.accelerator.synchronize()\n+    assert out.any()\n+    ids.copy_(torch.tensor([11, -5, 10**12, 10], device=\"cuda\"))\n+    graph.replay()\n+    torch.accelerator.synchronize()\n+    got = out.cpu().numpy()\n+    assert not got[:3].any()\n+    np.testing.assert_array_equal(got[3], _reference({0: 3, 1: 3, 2: 3, 3: 2})[10])\n+\n+\n+@requires_pageable\n+def test_full_graph_captures_prefetch_and_finalize(tmp_path, monkeypatch):\n+    \"\"\"start_prefetch + finalize_prefetch fit in one FULL cudagraph and replay new ids.\n+\n+    The pinned backend joins its side stream in _finalize_prefetch; this\n+    backend looks up on the current stream, and joining the (uncaptured) side\n+    stream anyway fails the capture with cudaErrorStreamCaptureIsolation.\n+    \"\"\"\n+    shards = {0: 3, 1: 3, 2: 3, 3: 3}\n+    model = _checkpoint(tmp_path, [shards])\n+    monkeypatch.setattr(\n+        ngram_embedding_module,\n+        \"resolve_checkpoint_files\",\n+        lambda model_config, load_config: _files(model),\n+    )\n+    emb = _mapped_embedding({\"dir\": model})\n+    heads, tokens = 2, 3\n+    emb._prefetch_buffer = torch.empty(\n+        4, heads, ROW, dtype=torch.float8_e4m3fn, device=\"cuda\"\n+    )\n+    emb._device = emb._prefetch_buffer.device\n+    emb._output_dim = heads * ROW\n+    emb._prefetch_stream = torch.cuda.Stream()\n+    emb.tp_size, emb.etp_data_parallel_size = 1, 1\n+    emb.reduce_results = True\n+    emb.shard_indices = SimpleNamespace(org_vocab_start_index=0, org_vocab_end_index=12)\n+    emb.bind_storage_after_loading()\n+    ids = torch.tensor([[0, 5], [7, 11], [3, 3]], device=\"cuda\")\n+\n+    def step():\n+        emb.start_prefetch(ids)\n+        return emb.finalize_prefetch(total_tokens=tokens)\n+\n+    ref = _reference(shards)\n+    eager = step().view(torch.uint8).cpu().numpy()\n+    np.testing.assert_array_equal(\n+        eager, ref[ids.cpu().numpy()].reshape(tokens, heads * ROW)\n+    )\n+    graph = torch.cuda.CUDAGraph()\n+    with torch.cuda.graph(graph):\n+        out = step()\n+    ids.copy_(torch.tensor([[1, 2], [4, 6], [9, 10]], device=\"cuda\"))\n+    graph.replay()\n+    torch.accelerator.synchronize()\n+    np.testing.assert_array_equal(\n+        out.view(torch.uint8).cpu().numpy(),\n+        ref[ids.cpu().numpy()].reshape(tokens, heads * ROW),\n+    )\n+\n+\n+@requires_pageable\n+def test_zero_mapping_reads_zeros_without_committing_memory():\n+    table = MappedTable.zeros(1 << 20, ROW, torch.device(\"cuda\"))\n+    ids = torch.tensor([0, 12345, (1 << 20) - 1], device=\"cuda\")\n+    out = torch.full((3, ROW), 0xFF, dtype=torch.uint8, device=\"cuda\")\n+    table.gather_into(ids, out, 0, 1 << 20)\n+    assert not out.any()\n+\n+\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"needs CUDA events\")\n+def test_prefetcher_staging_survives_short_then_long_steps():\n+    \"\"\"The per-step input_ids view changes size; staging must be at capacity.\"\"\"\n+    table = MappedTable.zeros(1000, ROW, torch.device(\"cuda\"))\n+    source = PrefetchSource(\n+        lambda: table,\n+        (0, 1000),\n+        lambda: (lambda ids, qsl, ctx: torch.zeros(ids.shape[0], 16, dtype=torch.long)),\n+    )\n+    prefetcher = PagePrefetcher([source], torch.device(\"cuda\"), 4096, 16, 2)\n+    qsl = torch.zeros(17, dtype=torch.int32, device=\"cuda\")\n+    ctx = torch.zeros(16, 2, dtype=torch.int32, device=\"cuda\")\n+    for num_tokens in (64, 4096, 7):\n+        ids = torch.zeros(num_tokens, dtype=torch.int32, device=\"cuda\")\n+        qsl[1:] = num_tokens\n+        prefetcher.prepare(ids, qsl, ctx, 1, num_tokens)\n+        torch.accelerator.synchronize()\n+        deadline = time.monotonic() + 10\n+        while prefetcher.free.qsize() < prefetcher.SLOTS:  # worker released the slot\n+            assert time.monotonic() < deadline\n+            time.sleep(0.01)\n+    assert prefetcher.slots[0][0].shape[0] == 4096\n+    assert prefetcher.skipped == 0",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/tests%2Fmodels%2Fqwen4_exp%2Ftest_ple_pageable.py",
+      "sha": "100c7d4631e5355eefa0b39d24dfd7000e0fefa7",
+      "status": "added"
+    },
+    {
+      "additions": 45,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fconfig%2Fengram.py",
+      "changes": 45,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fconfig%2Fengram.py?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 0,
+      "filename": "vllm/config/engram.py",
+      "patch": "@@ -20,6 +20,12 @@\n }\n \n \n+# Architectures whose Engram embedding implements checkpoint_mapped storage.\n+_CHECKPOINT_MAPPED_ARCHITECTURES = frozenset(\n+    {\"Qwen4ExpForCausalLM\", \"Qwen4ExpForConditionalGeneration\"}\n+)\n+\n+\n def model_has_engram_layers(model_config: \"ModelConfig | None\") -> bool:\n     \"\"\"Whether the model carries n-gram embedding layers.\"\"\"\n     if model_config is None:\n@@ -41,6 +47,16 @@ class EngramConfig:\n     \"\"\"Shard embeddings across TP and all DP ranks when enabled.\n     Otherwise, each DP rank has a separate TP-sharded embedding replica.\"\"\"\n \n+    checkpoint_mapped: bool = False\n+    \"\"\"Read embedding rows in place from the checkpoint's safetensors files\n+    instead of storing the table (overrides cpu_offload). Requires a GPU that\n+    reads pageable host memory through the host page tables (checked through\n+    the CUDA device attributes at startup): there is no table-sized device or\n+    pinned allocation, and the table's clean, file-backed page-cache pages can\n+    be dropped and re-read and are shared between processes. Qwen4Exp on CUDA\n+    only, not with embedding_across_dp; validated on DGX Spark (GB10, unified\n+    memory) only.\"\"\"\n+\n     dp_shared_memory: bool | None = None\n     \"\"\"Share CPU-offloaded embedding weights between co-located\n     DP replicas. Each node stores one copy of every TP shard, reducing host\n@@ -62,6 +78,16 @@ def _validate_shared_memory(self) -> Self:\n             raise ValueError(\n                 \"use_thp requires cpu_offload=True and dp_shared_memory=False\"\n             )\n+        if self.embedding_across_dp and self.checkpoint_mapped:\n+            raise ValueError(\n+                \"checkpoint_mapped does not support embedding_across_dp: its host \"\n+                \"page prefetch only sees this DP rank's requests.\"\n+            )\n+        if self.dp_shared_memory and self.checkpoint_mapped:\n+            raise ValueError(\n+                \"dp_shared_memory does not apply to checkpoint_mapped: mapped \"\n+                \"checkpoint pages are already shared between processes\"\n+            )\n         return self\n \n     def verify_model_config(self, model_config: \"ModelConfig | None\") -> None:\n@@ -80,13 +106,32 @@ def verify_model_config(self, model_config: \"ModelConfig | None\") -> None:\n                 \"EngramConfig requires a model with supported Engram \"\n                 \"embeddings and non-empty n-gram layer ids.\"\n             )\n+        if (\n+            self.checkpoint_mapped\n+            and model_config.architecture not in _CHECKPOINT_MAPPED_ARCHITECTURES\n+        ):\n+            raise ValueError(\n+                \"Engram checkpoint_mapped is implemented for \"\n+                f\"{sorted(_CHECKPOINT_MAPPED_ARCHITECTURES)} only, not \"\n+                f\"{model_config.architecture}.\"\n+            )\n+        if self.checkpoint_mapped:\n+            from vllm.platforms import current_platform\n+\n+            if not current_platform.is_cuda():\n+                # The ROCm Qwen4Exp path has no mapped backend and would\n+                # silently store the full pinned table instead.\n+                raise ValueError(\n+                    \"Engram checkpoint_mapped is implemented for CUDA only.\"\n+                )\n \n     def resolve_dp_shared_memory(self, parallel_config: \"ParallelConfig\") -> None:\n         \"\"\"Share host tables by default wherever the configuration permits.\"\"\"\n         if self.dp_shared_memory is None:\n             self.dp_shared_memory = (\n                 self.cpu_offload\n                 and not self.use_thp\n+                and not self.checkpoint_mapped\n                 and parallel_config.data_parallel_size > 1\n                 and not parallel_config.enable_elastic_ep\n             )",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fconfig%2Fengram.py",
+      "sha": "37b30a9544521ec623993cb19bbb4a5070fb2e34",
+      "status": "modified"
+    },
+    {
+      "additions": 14,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fcommon%2Fngram_embedding.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fqwen4_exp%2Fcommon%2Fngram_embedding.py?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 4,
+      "filename": "vllm/models/qwen4_exp/common/ngram_embedding.py",
+      "patch": "@@ -238,6 +238,12 @@ def apply(\n     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:\n         return F.embedding(input_, layer.weight)\n \n+    def process_weights_after_loading(self, layer: nn.Module) -> None:\n+        \"\"\"Let storage that is bound after loading (checkpoint-mapped) attach.\"\"\"\n+        bind = getattr(layer, \"bind_storage_after_loading\", None)\n+        if bind is not None:\n+            bind()\n+\n     @abstractmethod\n     def dequantize(\n         self,\n@@ -327,6 +333,7 @@ def process_weights_after_loading(self, layer: nn.Module) -> None:\n         sentinel = torch.finfo(torch.float32).min\n         if torch.any(layer.weight_scale == sentinel):\n             raise ValueError(\"FP8 PLE checkpoint is missing its global scale\")\n+        super().process_weights_after_loading(layer)\n \n     def dequantize(\n         self,\n@@ -576,10 +583,7 @@ def _finalize_prefetch(\n         output: torch.Tensor,\n     ) -> None:\n         \"\"\"Join the side stream, optionally reduce ETP shards, and select rows.\"\"\"\n-        prefetch_stream = self._prefetch_stream\n-        if prefetch_stream is None:\n-            raise RuntimeError(\"pinned PLE finalize requires a prior start_prefetch\")\n-        torch.cuda.current_stream().wait_stream(prefetch_stream)\n+        self._join_prefetch_stream()\n         slot_size, slot_offset = self._get_dp_gather_slot(output.shape[0])\n         embeddings = prefetch_output[: slot_size * self.etp_data_parallel_size]\n         if self.reduce_results:\n@@ -594,6 +598,12 @@ def _finalize_prefetch(\n         )\n         output.copy_(embeddings.flatten(-2))\n \n+    def _join_prefetch_stream(self) -> None:\n+        prefetch_stream = self._prefetch_stream\n+        if prefetch_stream is None:\n+            raise RuntimeError(\"pinned PLE finalize requires a prior start_prefetch\")\n+        torch.cuda.current_stream().wait_stream(prefetch_stream)\n+\n     def finalize_prefetch(self, total_tokens: int) -> torch.Tensor:\n         \"\"\"Finalize the full-token pinned lookup with optional ETP reduction.\"\"\"\n         buffer = self._prefetch_buffer",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fcommon%2Fngram_embedding.py",
+      "sha": "5753e454e1b4eff4945619024a6bf357a2f1da9b",
+      "status": "modified"
+    },
+    {
+      "additions": 61,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fmodel_state.py",
+      "changes": 62,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fmodel_state.py?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 1,
+      "filename": "vllm/models/qwen4_exp/nvidia/model_state.py",
+      "patch": "@@ -13,6 +13,12 @@\n from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState\n from vllm.v1.worker.gpu.states import RequestState\n \n+from .ngram_embedding import (\n+    Qwen4ExpNGramEmbedding,\n+    Qwen4ExpPLEPageableHostEmbedding,\n+)\n+from .ple_pageable import PagePrefetcher, PrefetchSource\n+\n \n class Qwen4ExpModelState(MambaHybridModelState):\n     \"\"\"Add rollback-safe PLE n-gram context to the model inputs.\"\"\"\n@@ -58,6 +64,13 @@ def __init__(\n             dtype=torch.int64,\n             device=self.device,\n         )\n+        engram_config = vllm_config.engram_config\n+        # Only checkpoint-mapped PLE tables are prefetched on the host.\n+        self._checkpoint_mapped = bool(\n+            engram_config is not None and engram_config.checkpoint_mapped\n+        )\n+        self._page_prefetcher: PagePrefetcher | None = None\n+        self._page_prefetcher_resolved = False\n         self.ple_query_start_loc = torch.zeros(\n             self.max_num_reqs + 1,\n             dtype=torch.int32,\n@@ -106,12 +119,59 @@ def prepare_inputs(\n         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)\n         # Represent unused capacity as trailing zero-length requests.\n         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])\n+        ngram_context = self._prepare_ngram_context(input_batch, req_states)\n         model_inputs.update(\n             query_start_loc=query_start_loc,\n-            ngram_context=self._prepare_ngram_context(input_batch, req_states),\n+            ngram_context=ngram_context,\n         )\n+        prefetcher = self._get_page_prefetcher()\n+        if prefetcher is not None:\n+            prefetcher.prepare(\n+                input_batch.input_ids,\n+                query_start_loc,\n+                ngram_context,\n+                num_reqs_padded,\n+                input_batch.input_ids.shape[0],\n+            )\n         return model_inputs\n \n+    def _get_page_prefetcher(self) -> PagePrefetcher | None:\n+        \"\"\"Fault in checkpoint-mapped PLE rows before the step reads them.\"\"\"\n+        if not getattr(self, \"_checkpoint_mapped\", False):\n+            return None\n+        if self._page_prefetcher_resolved:\n+            return self._page_prefetcher\n+        sources = []\n+        for module in self.model.modules():\n+            if not isinstance(module, Qwen4ExpNGramEmbedding):\n+                continue\n+            embedding = module.ngram_embedding\n+            if not isinstance(embedding, Qwen4ExpPLEPageableHostEmbedding):\n+                continue\n+            sources.append(\n+                PrefetchSource(\n+                    embedding.current_table,\n+                    (\n+                        embedding.shard_indices.org_vocab_start_index,\n+                        embedding.shard_indices.org_vocab_end_index,\n+                    ),\n+                    module.cpu_ngram_ids_fn,\n+                )\n+            )\n+        self._page_prefetcher_resolved = True\n+        self._page_prefetcher = (\n+            PagePrefetcher(\n+                sources,\n+                self.device,\n+                self.max_num_tokens,\n+                self.max_num_reqs,\n+                self.ngram_context_len,\n+            )\n+            if sources\n+            else None\n+        )\n+        return self._page_prefetcher\n+\n     def prepare_dummy_inputs(\n         self,\n         num_reqs: int,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fmodel_state.py",
+      "sha": "1e78a2338491787104f96d8d83a6f1f3b13be925",
+      "status": "modified"
+    },
+    {
+      "additions": 291,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fngram_embedding.py",
+      "changes": 297,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fngram_embedding.py?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 6,
+      "filename": "vllm/models/qwen4_exp/nvidia/ngram_embedding.py",
+      "patch": "@@ -1,13 +1,15 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n-\"\"\"Qwen4Exp n-gram embeddings with device and pinned-host storage.\"\"\"\n+\"\"\"Qwen4Exp n-gram embeddings with device, pinned-host and checkpoint-mapped storage.\"\"\"\n \n from collections.abc import Iterable\n \n+import regex as re\n import torch\n from torch import nn\n from transformers import Qwen4ExpTextConfig\n \n+from vllm.compilation.breakable_cudagraph import eager_break_during_capture\n from vllm.config import get_current_vllm_config\n from vllm.distributed import get_etp_group, get_tp_group\n from vllm.logger import init_logger\n@@ -27,6 +29,12 @@\n     Qwen4ExpPLEUnquantizedEmbeddingMethod,\n )\n from ..common.ops.ple import ple_ngram_ids\n+from .ple_pageable import (\n+    MappedTable,\n+    discover_table_layout,\n+    require_pageable_access,\n+    verify_shard_bytes,\n+)\n \n logger = init_logger(__name__)\n \n@@ -35,12 +43,258 @@\n     \"Qwen4ExpPLEEmbedding\",\n     \"Qwen4ExpPLEEmbeddingMethod\",\n     \"Qwen4ExpPLEFp8EmbeddingMethod\",\n+    \"Qwen4ExpPLEPageableHostEmbedding\",\n     \"Qwen4ExpPLEPinnedHostEmbedding\",\n     \"Qwen4ExpPLEUnquantizedEmbeddingMethod\",\n     \"Qwen4ExpNGramEmbedding\",\n ]\n \n \n+class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):\n+    \"\"\"PLE table read in place from the checkpoint's safetensors files.\n+\n+    For GPUs that dereference pageable host memory through the host page tables\n+    (e.g. unified-memory GB10). There is no table-sized device or pinned\n+    allocation and no resident duplicate of the table: its rows stay in the page\n+    cache as clean, file-backed pages that the kernel can drop and re-read, shared\n+    between processes. The prefetch buffer, ETP reduction and finalize path are\n+    inherited from the pinned-host backend; the lookup itself runs on the current\n+    stream (not the pinned backend's side stream) and gathers from the mapping.\n+    \"\"\"\n+\n+    def __init__(\n+        self,\n+        num_embeddings: int,\n+        embedding_dim: int,\n+        *,\n+        params_dtype: torch.dtype,\n+        padding_size: int,\n+        prefix: str,\n+        embedding_method: Qwen4ExpPLEEmbeddingMethod,\n+        num_ngram_heads: int = 1,\n+        max_total_tokens: int = 0,\n+        data_parallel_rank: int = 0,\n+        reduce_results: bool = True,\n+    ) -> None:\n+        device = torch.device(\"cuda\", torch.accelerator.current_device_index())\n+        require_pageable_access(device.index)\n+        if not torch.cuda.get_device_properties(device).is_integrated:\n+            logger.warning_once(\n+                \"Engram checkpoint_mapped has been validated only on integrated \"\n+                \"unified-memory GPUs (DGX Spark / GB10). This device also reads \"\n+                \"pageable host memory through the host page tables (e.g. Grace \"\n+                \"Hopper / Grace Blackwell over NVLink-C2C), but performance and \"\n+                \"correctness there are untested.\"\n+            )\n+        # Skip the pinned-host constructor: there is no host tensor to view.\n+        Qwen4ExpPLEEmbedding.__init__(\n+            self,\n+            num_embeddings,\n+            embedding_dim,\n+            params_dtype=params_dtype,\n+            padding_size=padding_size,\n+            prefix=prefix,\n+            embedding_method=embedding_method,\n+            num_ngram_heads=num_ngram_heads,\n+            max_total_tokens=max_total_tokens,\n+            data_parallel_rank=data_parallel_rank,\n+            reduce_results=reduce_results,\n+        )\n+        layer_match = re.search(r\"layers\\.(\\d+)\\.\", prefix)\n+        if layer_match is None:\n+            raise ValueError(f\"Cannot derive the decoder layer index from {prefix}\")\n+        self.layer_index = int(layer_match.group(1))\n+        vllm_config = get_current_vllm_config()\n+        self._model_config = vllm_config.model_config\n+        self._load_config = vllm_config.load_config\n+        self._load_format = str(vllm_config.load_config.load_format)\n+        self.table: MappedTable | None = None\n+        self._rebind_pending = False\n+        self._pending_table: MappedTable | None = None\n+        self._reload_error: Exception | None = None\n+        self._device = device\n+        self._prefetch_stream = torch.cuda.Stream(device=device)\n+        self._prefetch_buffer = torch.empty(\n+            max_total_tokens * self.etp_data_parallel_size,\n+            num_ngram_heads,\n+            self.embedding_dim,\n+            dtype=self.weight.dtype,\n+            device=device,\n+        )\n+        self._output_dim = num_ngram_heads * self.embedding_dim\n+\n+    def allocate_embedding_weight(\n+        self,\n+        num_embeddings: int,\n+        embedding_dim: int,\n+        dtype: torch.dtype,\n+    ) -> torch.Tensor:\n+        \"\"\"No storage: rows are read from the mapped checkpoint files.\"\"\"\n+        del num_embeddings\n+        return torch.empty(0, embedding_dim, dtype=dtype, device=\"cpu\")\n+\n+    def current_table(self) -> MappedTable | None:\n+        \"\"\"The mapping in use now (rebuilt when a reload remaps the files).\"\"\"\n+        return self.table\n+\n+    def record_incoming_shard(\n+        self, checkpoint_start: int, loaded_weight: torch.Tensor\n+    ) -> None:\n+        \"\"\"Account for a shard delivered by a (re)load.\n+\n+        On the first load the loader streams the very files that get mapped, so\n+        nothing is compared. On a reload (a table is already bound), the files\n+        the loader now points at are mapped and every incoming shard is compared\n+        with them in full: a reload from disk (``weights_path``) streams those\n+        same files and matches, while PLE weights delivered from memory (e.g.\n+        weight sync) cannot be served from a file mapping and are rejected.\n+        \"\"\"\n+        if self._reload_error is not None:\n+            # A rejected load raised out of load_weights; a shard arriving now\n+            # starts a new load attempt, verified from scratch.\n+            self._reload_error = None\n+            self._pending_table = None\n+        self._rebind_pending = True\n+        if self.table is None:\n+            return\n+        try:\n+            if self._pending_table is None:\n+                self._pending_table = self._map_checkpoint_files()\n+            verify_shard_bytes(self._pending_table, checkpoint_start, loaded_weight)\n+        except Exception as e:\n+            self._reload_error = e\n+            raise\n+\n+    def bind_storage_after_loading(self) -> None:\n+        \"\"\"(Re)map this layer's shards once the checkpoint is on local disk.\"\"\"\n+        if self.table is not None and not self._rebind_pending:\n+            return\n+        self._bind()\n+\n+    def _map_checkpoint_files(self) -> MappedTable:\n+        layout = discover_table_layout(\n+            resolve_checkpoint_files(self._model_config, self._load_config),\n+            self.layer_index,\n+            self.org_vocab_size,\n+            self.embedding_dim,\n+            self.weight.dtype,\n+            int(getattr(self._model_config.hf_text_config, \"split_ngram_parts\", 512)),\n+        )\n+        return MappedTable(layout, self._device)\n+\n+    def _bind(self) -> None:\n+        if self._reload_error is not None:\n+            # A rejected reload stays rejected until a load succeeds; never fall\n+            # back to the previous mapping.\n+            raise RuntimeError(\n+                \"The last weight load was rejected by checkpoint_mapped PLE storage\"\n+            ) from self._reload_error\n+        if self._load_format == \"dummy\":\n+            table = MappedTable.zeros(\n+                self.org_vocab_size,\n+                self.embedding_dim * self.weight.dtype.itemsize,\n+                self._device,\n+            )\n+        else:\n+            table = self._pending_table or self._map_checkpoint_files()\n+        # Commit only after everything above succeeded.\n+        self.table = table\n+        self._pending_table = None\n+        self._rebind_pending = False\n+        if table.layout is not None:\n+            logger.info(\n+                \"Mapped PLE table of layer %d in place: %d rows x %d B from %d \"\n+                \"files; no table-sized device or pinned allocation\",\n+                self.layer_index,\n+                table.layout.num_rows,\n+                table.layout.row_bytes,\n+                len({shard.path for shard in table.layout.shards}),\n+            )\n+\n+    def _lookup_on_current_stream(self, ngram_ids: torch.Tensor) -> None:\n+        if self._rebind_pending or self._reload_error is not None:\n+            # A reload delivered shards but its processing did not rebind (a\n+            # layer without loadable elements is only restored): rebind now,\n+            # or raise if that reload was rejected.\n+            self._bind()\n+        buffer = self._prefetch_buffer\n+        assert buffer is not None, \"allocated in __init__\"\n+        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])\n+        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)\n+        self._lookup(gathered_ids, output=buffer[: gathered_ids.shape[0]])\n+\n+    @eager_break_during_capture\n+    def start_prefetch(self, ngram_ids: torch.Tensor) -> None:\n+        \"\"\"Look up on the current stream, not the pinned backend's side stream.\n+\n+        With the side-stream lookup, greedy outputs on GB10 were not reproducible\n+        within one server start (identical prompts matched in 2 of 8, logprobs\n+        differed by up to 1.4); on the current stream they matched in 8 of 8 with\n+        zero logprob difference. The CPU page prefetch already runs ahead of the\n+        step, so the side stream buys no overlap worth keeping here.\n+        \"\"\"\n+        self._lookup_on_current_stream(ngram_ids)\n+\n+    def _join_prefetch_stream(self) -> None:\n+        \"\"\"Nothing to join: start_prefetch ran the lookup on the current stream.\n+\n+        Joining the side stream anyway fails a FULL cudagraph capture, because\n+        that stream is never part of the capture\n+        (cudaErrorStreamCaptureIsolation).\n+        \"\"\"\n+\n+    def _lookup(\n+        self,\n+        input_ids: torch.Tensor,\n+        output: torch.Tensor | None = None,\n+    ) -> torch.Tensor:\n+        \"\"\"Gather this rank's rows from the mapped files; zeros elsewhere.\"\"\"\n+        if self.table is None:\n+            raise RuntimeError(\"PLE checkpoint mapping was not bound after loading\")\n+        expected_shape = (*input_ids.shape, self.embedding_dim)\n+        if output is None:\n+            output = torch.empty(\n+                expected_shape, dtype=self.weight.dtype, device=input_ids.device\n+            )\n+        elif (\n+            tuple(output.shape) != expected_shape\n+            or output.dtype != self.weight.dtype\n+            or output.device != input_ids.device\n+        ):\n+            raise ValueError(\n+                \"PLE prefetch output must match the input shape, weight dtype, \"\n+                \"and input device\"\n+            )\n+        self.table.gather_into(\n+            input_ids.reshape(-1).long(),\n+            output.view(torch.uint8).reshape(-1, self.table.row_bytes),\n+            self.shard_indices.org_vocab_start_index,\n+            self.shard_indices.org_vocab_end_index,\n+        )\n+        return output\n+\n+\n+def resolve_checkpoint_files(model_config, load_config) -> list[str]:\n+    \"\"\"The safetensors files the loader read, resolved exactly as it resolves them.\n+\n+    Reuses the default loader's preparation so ``--download-dir``, subfolders\n+    and the ``model.safetensors.index.json`` filter all apply. The weights are\n+    already local by the time the storage is bound, so nothing is downloaded.\n+    \"\"\"\n+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader\n+\n+    _, files, use_safetensors, _ = DefaultModelLoader(load_config)._prepare_weights(\n+        model_config.model_weights or model_config.model,\n+        None,\n+        model_config.revision,\n+        fall_back_to_pt=False,\n+        allow_patterns_overrides=None,\n+    )\n+    if not use_safetensors:\n+        raise ValueError(\"Engram checkpoint_mapped requires a safetensors checkpoint\")\n+    return files\n+\n+\n class Qwen4ExpNGramEmbedding(nn.Module):\n     _MASK64 = (1 << 64) - 1\n     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15\n@@ -211,11 +465,13 @@ def __init__(\n         if params_dtype is None:\n             params_dtype = torch.get_default_dtype()\n         engram_config = get_current_vllm_config().engram_config\n-        embedding_cls = (\n-            Qwen4ExpPLEPinnedHostEmbedding\n-            if engram_config is not None and engram_config.cpu_offload\n-            else Qwen4ExpPLEDeviceEmbedding\n-        )\n+        embedding_cls: type[Qwen4ExpPLEEmbedding]\n+        if engram_config is not None and engram_config.checkpoint_mapped:\n+            embedding_cls = Qwen4ExpPLEPageableHostEmbedding\n+        elif engram_config is not None and engram_config.cpu_offload:\n+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding\n+        else:\n+            embedding_cls = Qwen4ExpPLEDeviceEmbedding\n         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.\n         self.use_reduce_scatter = (\n             self.use_sequence_parallel\n@@ -392,6 +648,13 @@ def forward(\n             return embeddings\n         return self._sp_shard_embeddings(embeddings)\n \n+    def cpu_ngram_ids_fn(self):\n+        \"\"\"A CPU-only ``compute_ngram_ids`` for host-side page prefetching.\"\"\"\n+        cpu = copy_module_for_cpu_ids(self)\n+        return lambda ids, qsl, ctx: Qwen4ExpNGramEmbedding.compute_ngram_ids(\n+            cpu, ids, qsl, ctx\n+        )\n+\n     def start_prefetch(\n         self,\n         input_ids: torch.Tensor,\n@@ -462,6 +725,12 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n                         f\"expected {expected_shape}, got \"\n                         f\"{tuple(loaded_weight.shape)}\"\n                     )\n+                if isinstance(embedding, Qwen4ExpPLEPageableHostEmbedding):\n+                    # Rows are read in place from the checkpoint files; sample\n+                    # this shard so the mapping can be checked against it.\n+                    embedding.record_incoming_shard(checkpoint_start, loaded_weight)\n+                    loaded.add(\"ngram_embedding.weight\")\n+                    continue\n                 embedding.weight.weight_loader(\n                     embedding.weight,\n                     loaded_weight,\n@@ -474,3 +743,19 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n         if regular_weights:\n             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))\n         return loaded\n+\n+\n+def copy_module_for_cpu_ids(module: \"Qwen4ExpNGramEmbedding\"):\n+    \"\"\"An object with CPU copies of the hash buffers ``compute_ngram_ids`` reads.\"\"\"\n+    from types import SimpleNamespace\n+\n+    return SimpleNamespace(\n+        layer_multipliers=module.layer_multipliers.cpu(),\n+        ngram_heads_vocab_sizes=module.ngram_heads_vocab_sizes.cpu(),\n+        ngram_heads_offsets=module.ngram_heads_offsets.cpu(),\n+        eos_token_id=module.eos_token_id,\n+        ngram_size=module.ngram_size,\n+        heads_per_ngram=module.heads_per_ngram,\n+        _shift_precompute=Qwen4ExpNGramEmbedding._shift_precompute,\n+        _shift_apply=Qwen4ExpNGramEmbedding._shift_apply,\n+    )",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fngram_embedding.py",
+      "sha": "db15d9108b3b49e3fe3c266aa5f8434bfab97335",
+      "status": "modified"
+    },
+    {
+      "additions": 492,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fple_pageable.py",
+      "changes": 492,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fple_pageable.py?ref=047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "deletions": 0,
+      "filename": "vllm/models/qwen4_exp/nvidia/ple_pageable.py",
+      "patch": "@@ -0,0 +1,492 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Read the Qwen4Exp PLE n-gram table in place from the checkpoint files.\n+\n+On GPUs that dereference pageable host memory through the host page tables\n+(``CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES``, e.g. the\n+unified-memory GB10), a kernel can read a read-only ``mmap`` of the checkpoint's\n+safetensors files directly. There is then no table-sized device or pinned\n+allocation, no resident duplicate of the table and no CPU-gather/host-to-device\n+staging path: its pages live in the page cache as clean, file-backed pages that\n+the kernel can drop and re-read, shared by every process mapping the same files.\n+\n+GPU faults on non-resident file pages are serviced one page at a time, so the\n+rows a step needs are faulted in ahead of the lookup by CPU threads\n+(:class:`PagePrefetcher`). The prefetch is only a hint: the lookup is correct\n+whether or not it has finished.\n+\"\"\"\n+\n+import ctypes\n+import json\n+import mmap\n+import os\n+import queue\n+import struct\n+import threading\n+from collections.abc import Callable\n+from concurrent.futures import ThreadPoolExecutor\n+from dataclasses import dataclass\n+\n+import numpy as np\n+import regex as re\n+import torch\n+\n+from vllm.logger import init_logger\n+from vllm.triton_utils import tl, triton\n+\n+logger = init_logger(__name__)\n+\n+_PAGE = 4096\n+_MADV_RANDOM = 1\n+_CU_PAGEABLE_MEMORY_ACCESS = 88\n+_CU_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100\n+_SAFETENSORS_DTYPES = {\n+    \"F8_E4M3\": torch.float8_e4m3fn,\n+    \"BF16\": torch.bfloat16,\n+    \"F16\": torch.float16,\n+    \"F32\": torch.float32,\n+}\n+_SHARD_RE = re.compile(\n+    r\"layers\\.(\\d+)\\.ple\\.ple_embedding\\.ngram_embedding\\.shard_(\\d+)\\.weight$\"\n+)\n+\n+\n+def require_pageable_access(device_index: int) -> None:\n+    \"\"\"Raise unless the GPU reads pageable host memory via host page tables.\n+\n+    Being an integrated GPU is not sufficient, and an attribute that cannot be\n+    queried is treated as unsupported.\n+    \"\"\"\n+    try:\n+        cuda = ctypes.CDLL(\"libcuda.so.1\")\n+    except OSError as e:\n+        raise RuntimeError(\"Cannot load the CUDA driver to query the GPU\") from e\n+    device = ctypes.c_int()\n+    if cuda.cuInit(0) != 0 or cuda.cuDeviceGet(ctypes.byref(device), device_index):\n+        raise RuntimeError(\"Cannot query the CUDA driver for the device\")\n+    for name, attribute in (\n+        (\"PAGEABLE_MEMORY_ACCESS\", _CU_PAGEABLE_MEMORY_ACCESS),\n+        (\n+            \"PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES\",\n+            _CU_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES,\n+        ),\n+    ):\n+        value = ctypes.c_int(0)\n+        rc = cuda.cuDeviceGetAttribute(ctypes.byref(value), attribute, device)\n+        if rc != 0 or value.value != 1:\n+            raise RuntimeError(\n+                \"Engram checkpoint_mapped requires a GPU that reads pageable host \"\n+                f\"memory through the host page tables; device {device_index} \"\n+                f\"reports CU_DEVICE_ATTRIBUTE_{name}={value.value} (rc={rc})\"\n+            )\n+\n+\n+@dataclass(frozen=True)\n+class ShardLocation:\n+    path: str\n+    offset: int\n+    rows: int\n+\n+\n+@dataclass(frozen=True)\n+class TableLayout:\n+    \"\"\"Where every checkpoint shard of one layer's table lives.\"\"\"\n+\n+    num_rows: int\n+    row_bytes: int\n+    rows_per_shard: int\n+    shards: tuple[ShardLocation, ...]\n+\n+\n+def discover_table_layout(\n+    files: list[str],\n+    layer_index: int,\n+    num_rows: int,\n+    embedding_dim: int,\n+    dtype: torch.dtype,\n+    split_parts: int,\n+) -> TableLayout:\n+    \"\"\"Locate and validate one layer's PLE shards among the loader's files.\n+\n+    Mirrors ``Qwen4ExpNGramEmbedding.load_weights``: shard ``i`` holds rows\n+    ``[i * S, min((i + 1) * S, num_rows))`` with ``S = ceil(num_rows /\n+    split_parts)``. Every shard that owns rows must exist exactly once, with\n+    exactly that shape and ``dtype``; nothing is truncated or padded.\n+    \"\"\"\n+    found: dict[int, tuple[str, int, list[int], str]] = {}\n+    if not files:\n+        raise FileNotFoundError(\"No safetensors files to map the PLE table from\")\n+    # ``files`` is the loader's list: already filtered by the safetensors index,\n+    # so files the index excludes are never considered.\n+    for path in sorted(files):\n+        with open(path, \"rb\") as f:\n+            header_len = struct.unpack(\"<Q\", f.read(8))[0]\n+            header = json.loads(f.read(header_len))\n+        for name, meta in header.items():\n+            match = _SHARD_RE.search(name)\n+            if match is None or int(match.group(1)) != layer_index:\n+                continue\n+            shard = int(match.group(2))\n+            if shard in found:\n+                raise ValueError(\n+                    f\"PLE shard {shard} of layer {layer_index} appears twice \"\n+                    f\"({found[shard][0]} and {path})\"\n+                )\n+            found[shard] = (\n+                path,\n+                8 + header_len + meta[\"data_offsets\"][0],\n+                meta[\"shape\"],\n+                meta[\"dtype\"],\n+            )\n+\n+    rows_per_shard = (num_rows + split_parts - 1) // split_parts\n+    needed = [i for i in range(split_parts) if i * rows_per_shard < num_rows]\n+    missing = [i for i in needed if i not in found]\n+    unexpected = sorted(set(found) - set(needed))\n+    if missing or unexpected:\n+        raise ValueError(\n+            f\"PLE shards of layer {layer_index} do not cover \"\n+            f\"{num_rows} rows in {split_parts} parts: missing {missing[:8]}, \"\n+            f\"unexpected {unexpected[:8]}\"\n+        )\n+    shards = []\n+    for i in needed:\n+        path, offset, shape, st_dtype = found[i]\n+        want = [min(rows_per_shard, num_rows - i * rows_per_shard), embedding_dim]\n+        if list(shape) != want:\n+            raise ValueError(f\"PLE shard {i} has shape {shape}, expected {want}\")\n+        if _SAFETENSORS_DTYPES.get(st_dtype) != dtype:\n+            raise ValueError(\n+                f\"PLE shard {i} is stored as {st_dtype}, but the embedding uses \"\n+                f\"{dtype}; checkpoint_mapped cannot convert rows\"\n+            )\n+        shards.append(ShardLocation(path, offset, want[0]))\n+    return TableLayout(\n+        num_rows=num_rows,\n+        row_bytes=embedding_dim * dtype.itemsize,\n+        rows_per_shard=rows_per_shard,\n+        shards=tuple(shards),\n+    )\n+\n+\n+@triton.jit\n+def _gather_mapped_rows_kernel(\n+    ids_ptr,\n+    shard_base_ptr,\n+    out_ptr,\n+    rows_per_shard,\n+    vocab_start,\n+    vocab_end,\n+    ROW_BYTES: tl.constexpr,\n+    BLOCK: tl.constexpr,\n+):\n+    \"\"\"Copy owned rows byte-wise from mapped shards; write zeros otherwise.\"\"\"\n+    pid = tl.program_id(0)\n+    row = tl.load(ids_ptr + pid).to(tl.int64)\n+    owned = (row >= vocab_start) & (row < vocab_end)\n+    row = tl.where(owned, row, 0)\n+    shard = row // rows_per_shard\n+    local = row - shard * rows_per_shard\n+    base = tl.load(shard_base_ptr + shard).to(tl.pointer_type(tl.uint8))\n+    offsets = tl.arange(0, BLOCK)\n+    in_row = offsets < ROW_BYTES\n+    values = tl.load(base + local * ROW_BYTES + offsets, mask=in_row & owned, other=0)\n+    # The store is unmasked by ownership so rows this rank does not own are zero,\n+    # never allocator residue or a previous graph replay's bytes.\n+    tl.store(out_ptr + pid.to(tl.int64) * ROW_BYTES + offsets, values, mask=in_row)\n+\n+\n+def verify_shard_bytes(\n+    table: \"MappedTable\",\n+    checkpoint_start: int,\n+    shard: torch.Tensor,\n+    chunk_rows: int = 65536,\n+) -> None:\n+    \"\"\"Raise unless an incoming checkpoint shard equals the mapped rows exactly.\n+\n+    Compares every byte, chunk by chunk, without copying the mapping. The\n+    mapping serves rows from the checkpoint files; weights that differ from\n+    those files (e.g. delivered from memory by a weight sync) cannot be served\n+    and must not be silently ignored.\n+    \"\"\"\n+    if shard.numel() == 0:\n+        return\n+    index, offset = divmod(checkpoint_start, table.rows_per_shard)\n+    view = table.views[index] if index < len(table.views) else None\n+    rows = shard.shape[0]\n+    if view is None or offset != 0 or view.shape[0] != rows:\n+        raise ValueError(\n+            f\"Incoming PLE shard at row {checkpoint_start} ({rows} rows) does not \"\n+            \"line up with the mapped checkpoint shards\"\n+        )\n+    raw = shard.detach().contiguous().view(torch.uint8).reshape(rows, -1)\n+    for start in range(0, rows, chunk_rows):\n+        end = min(rows, start + chunk_rows)\n+        incoming = raw[start:end].cpu().numpy()\n+        if not np.array_equal(view[start:end], incoming):\n+            bad = start + int(np.flatnonzero((view[start:end] != incoming).any(1))[0])\n+            raise ValueError(\n+                f\"PLE row {checkpoint_start + bad} received from the weights source \"\n+                \"differs from the mapped checkpoint files. checkpoint_mapped serves \"\n+                \"the table from disk and cannot load it from in-memory weights; \"\n+                \"reload from a checkpoint on disk (weights_path) or disable \"\n+                \"checkpoint_mapped.\"\n+            )\n+\n+\n+class MappedTable:\n+    \"\"\"Read-only mappings of a layer's shards plus the GPU and CPU accessors.\"\"\"\n+\n+    def __init__(self, layout: TableLayout, device: torch.device) -> None:\n+        self.layout: TableLayout | None = layout\n+        self.row_bytes = layout.row_bytes\n+        self.rows_per_shard = layout.rows_per_shard\n+        self.num_rows = layout.num_rows\n+        self._maps: dict[str, tuple[mmap.mmap, np.ndarray]] = {}\n+        libc = ctypes.CDLL(None, use_errno=True)\n+        for path in sorted({s.path for s in layout.shards}):\n+            fd = os.open(path, os.O_RDONLY)\n+            try:\n+                size = os.fstat(fd).st_size\n+                mapping = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)\n+            finally:\n+                os.close(fd)\n+            array = np.frombuffer(mapping, dtype=np.uint8)\n+            address = array.__array_interface__[\"data\"][0]\n+            # Rows are read at random; readahead would only evict useful pages.\n+            libc.madvise(ctypes.c_void_p(address), ctypes.c_size_t(size), _MADV_RANDOM)\n+            self._maps[path] = (mapping, array)\n+        self.views = [\n+            self._maps[s.path][1][\n+                s.offset : s.offset + s.rows * self.row_bytes\n+            ].reshape(s.rows, self.row_bytes)\n+            for s in layout.shards\n+        ]\n+        bases = [v.__array_interface__[\"data\"][0] for v in self.views]\n+        self.shard_base = torch.tensor(bases, dtype=torch.int64, device=device)\n+        self._block = triton.next_power_of_2(self.row_bytes)\n+\n+    @classmethod\n+    def zeros(\n+        cls, num_rows: int, row_bytes: int, device: torch.device\n+    ) -> \"MappedTable\":\n+        \"\"\"An anonymous, never-written mapping: every row reads as zero.\n+\n+        Used when no checkpoint is loaded (``--load-format dummy``); the zero\n+        page backs every read, so no memory is committed.\n+        \"\"\"\n+        self = cls.__new__(cls)\n+        self.row_bytes = row_bytes\n+        self.rows_per_shard = max(num_rows, 1)\n+        self.num_rows = num_rows\n+        # Private and anonymous: every read is served by the shared zero page, so\n+        # touching the table commits no memory (a MAP_SHARED anonymous mapping\n+        # would allocate shmem pages on read).\n+        mapping = mmap.mmap(\n+            -1,\n+            max(num_rows * row_bytes, _PAGE),\n+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,\n+            prot=mmap.PROT_READ,\n+        )\n+        array = np.frombuffer(mapping, dtype=np.uint8)\n+        self._maps = {\"<zeros>\": (mapping, array)}\n+        self.views = [array[: num_rows * row_bytes].reshape(num_rows, row_bytes)]\n+        self.layout = None\n+        self.shard_base = torch.tensor(\n+            [array.__array_interface__[\"data\"][0]], dtype=torch.int64, device=device\n+        )\n+        self._block = triton.next_power_of_2(row_bytes)\n+        return self\n+\n+    def gather_into(\n+        self,\n+        ids: torch.Tensor,\n+        out: torch.Tensor,\n+        vocab_start: int,\n+        vocab_end: int,\n+    ) -> None:\n+        \"\"\"Write rows ``ids`` into ``out`` (``[len(ids), row_bytes]`` uint8).\"\"\"\n+        if ids.numel() == 0:\n+            return\n+        _gather_mapped_rows_kernel[(ids.numel(),)](\n+            ids,\n+            self.shard_base,\n+            out,\n+            self.rows_per_shard,\n+            vocab_start,\n+            min(vocab_end, self.num_rows),\n+            ROW_BYTES=self.row_bytes,\n+            BLOCK=self._block,\n+        )\n+\n+    def touch(self, rows: np.ndarray, pool: ThreadPoolExecutor | None) -> None:\n+        \"\"\"Fault in both ends of every row (a row may straddle a page).\"\"\"\n+        rows = np.sort(rows)\n+        shard = rows // self.rows_per_shard\n+        local = rows - shard * self.rows_per_shard\n+        last = self.row_bytes - 1\n+\n+        def groups(index: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:\n+            s = shard[index]\n+            cuts = np.flatnonzero(np.diff(s)) + 1\n+            return [\n+                (self.views[int(group[0])], rows_in_shard)\n+                for group, rows_in_shard in zip(\n+                    np.split(s, cuts), np.split(local[index], cuts)\n+                )\n+                if group.size\n+            ]\n+\n+        # Index the per-shard 2-D views: fancy-indexing the flat byte arrays is\n+        # ~12x slower cold with identical tasks.\n+        def fault(task: tuple[np.ndarray, np.ndarray]) -> int:\n+            view, index = task\n+            return int(view[index, 0].sum()) + int(view[index, last].sum())\n+\n+        if pool is None or rows.size <= 4096:\n+            for task in groups(np.arange(rows.size)):\n+                fault(task)\n+            return\n+        tasks = []\n+        for chunk in np.array_split(np.arange(rows.size), 64):\n+            if chunk.size:\n+                tasks.extend(groups(chunk))\n+        list(pool.map(fault, tasks))\n+\n+\n+class PagePrefetcher:\n+    \"\"\"Fault in each step's PLE rows from CPU threads before the GPU reads them.\n+\n+    ``prepare`` copies the step's inputs to pinned staging buffers on the current\n+    stream and returns; a worker thread waits for the copy, computes the n-gram\n+    ids on the CPU, and touches the rows this rank owns. Each source's table is\n+    re-read on every step, so a remap (weight reload) takes effect here too.\n+    \"\"\"\n+\n+    SLOTS = 4\n+    THREADS = 64\n+\n+    def __init__(\n+        self,\n+        sources: list[\"PrefetchSource\"],\n+        device: torch.device,\n+        max_num_tokens: int,\n+        max_num_reqs: int,\n+        ngram_context_len: int,\n+    ) -> None:\n+        self.sources = sources\n+        if device.index is None:  # e.g. torch.device(\"cuda\"): pin to the current GPU\n+            device = torch.device(device.type, torch.accelerator.current_device_index())\n+        self.device = device\n+        self.capacity = (max_num_tokens, max_num_reqs, ngram_context_len)\n+        # Pinned staging slots at full capacity (allocated on the first step,\n+        # with the dtypes of the model state's buffers): the per-step input_ids\n+        # view changes size between steps.\n+        self.slots: list[tuple[torch.Tensor, ...]] = []\n+        self.free: queue.Queue[int] = queue.Queue()\n+        for i in range(self.SLOTS):\n+            self.free.put(i)\n+        self.work: queue.Queue = queue.Queue()\n+        self.pool = ThreadPoolExecutor(self.THREADS, thread_name_prefix=\"ple-touch\")\n+        self.skipped = 0\n+        threading.Thread(target=self._loop, name=\"ple-prefetch\", daemon=True).start()\n+\n+    def prepare(\n+        self,\n+        input_ids: torch.Tensor,\n+        query_start_loc: torch.Tensor,\n+        ngram_context: torch.Tensor,\n+        num_reqs: int,\n+        num_tokens: int,\n+    ) -> None:\n+        max_tokens, max_reqs, ctx_len = self.capacity\n+        if (\n+            num_tokens > max_tokens\n+            or num_reqs > max_reqs\n+            or ngram_context.shape[1] > ctx_len\n+        ):\n+            logger.warning_once(\n+                \"PLE page prefetch skipped a step larger than its staging \"\n+                \"capacity; lookups are unaffected\"\n+            )\n+            return\n+        if not self.slots:\n+            self.slots = [\n+                (\n+                    torch.empty(max_tokens, dtype=input_ids.dtype).pin_memory(),\n+                    torch.empty(max_reqs + 1, dtype=query_start_loc.dtype).pin_memory(),\n+                    torch.empty(\n+                        max_reqs, ctx_len, dtype=ngram_context.dtype\n+                    ).pin_memory(),\n+                )\n+                for _ in range(self.SLOTS)\n+            ]\n+        try:\n+            slot = self.free.get_nowait()\n+        except queue.Empty:\n+            self.skipped += 1  # a hint only: the lookup stays correct\n+            return\n+        ids, qsl, ctx = self.slots[slot]\n+        ids[:num_tokens].copy_(input_ids[:num_tokens], non_blocking=True)\n+        qsl[: num_reqs + 1].copy_(query_start_loc[: num_reqs + 1], non_blocking=True)\n+        ctx[:num_reqs, : ngram_context.shape[1]].copy_(\n+            ngram_context[:num_reqs], non_blocking=True\n+        )\n+        event = torch.cuda.Event()\n+        event.record(torch.cuda.current_stream(self.device))\n+        self.work.put((slot, event, num_reqs, num_tokens, ngram_context.shape[1]))\n+\n+    def _loop(self) -> None:\n+        try:\n+            self._serve()\n+        except Exception:\n+            # Never die silently: without the prefetch, cold rows fault one page\n+            # at a time on the GPU (correct, but slow).\n+            logger.exception(\"PLE page prefetch thread stopped\")\n+\n+    def _serve(self) -> None:\n+        torch.accelerator.set_device_index(self.device.index)\n+        while True:\n+            slot, event, num_reqs, num_tokens, ctx_len = self.work.get()\n+            try:\n+                event.synchronize()\n+                ids, qsl, ctx = self.slots[slot]\n+                ids = ids[:num_tokens].clone()\n+                qsl = qsl[: num_reqs + 1].clone()\n+                ctx = ctx[:num_reqs, :ctx_len].clone()\n+            finally:\n+                self.free.put(slot)\n+            try:\n+                for source in self.sources:\n+                    source.touch(ids, qsl, ctx, self.pool)\n+            except Exception:\n+                logger.exception(\"PLE page prefetch failed; lookups are unaffected\")\n+\n+\n+class PrefetchSource:\n+    \"\"\"One mapped embedding and a CPU hash of its ids, refreshed on remap.\"\"\"\n+\n+    def __init__(\n+        self,\n+        get_table: Callable[[], \"MappedTable | None\"],\n+        vocab_range: tuple[int, int],\n+        make_cpu_ids: Callable[[], Callable[..., torch.Tensor]],\n+    ) -> None:\n+        self.get_table = get_table\n+        self.vocab_range = vocab_range\n+        self.make_cpu_ids = make_cpu_ids\n+        self._table: MappedTable | None = None\n+        self._cpu_ids: Callable[..., torch.Tensor] | None = None\n+\n+    def touch(self, ids, qsl, ctx, pool: ThreadPoolExecutor) -> None:\n+        table = self.get_table()\n+        if table is None:\n+            return\n+        if table is not self._table or self._cpu_ids is None:\n+            # First step, or the mapping was rebuilt: refresh the CPU hash buffers.\n+            self._cpu_ids = self.make_cpu_ids()\n+            self._table = table\n+        rows = self._cpu_ids(ids, qsl, ctx).reshape(-1).numpy()\n+        start, end = self.vocab_range\n+        rows = rows[(rows >= start) & (rows < min(end, table.num_rows))]\n+        table.touch(rows, pool)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/047fc1ce7c825bd2dd4709bebcfdec042b27a15c/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fple_pageable.py",
+      "sha": "614f11d466c00ed0be750330ba419586d28ddabb",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Documentation preview: https://vllm--58439.org.readthedocs.build/en/58439/",
+      "created_at": "2026-09-23T19:58:32Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5801971067",
+      "id": 5801971067,
+      "updated_at": "2026-09-23T19:58:32Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "Related: #58441, the graph-pool reuse race in the pinned side-stream lookup. It is the reason this backend looks up on the current stream.\n",
+      "created_at": "2026-09-23T20:07:22Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5802099365",
+      "id": 5802099365,
+      "updated_at": "2026-09-23T20:07:22Z",
+      "user": {
+        "login": "jschmied"
+      }
+    },
+    {
+      "body": "Haven't read the 1398 lines, so this isn't a review of the implementation. But the whole design rests on one device capability, and I have the device, so here's an independent confirmation of the gate — queried through the same driver-API path your `_query_device_attribute` uses, not a parallel runtime-API check:\n\n```\ndriver sees: NVIDIA GB10                                   (sm_121, CUDA 13.0)\nCU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS                       -> 1\nCU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES -> 1\n```\n\nSo the opt-in gate is satisfied on the device the PR targets, on a second Spark. I checked the driver enums (88 / 100) specifically because the runtime `cudaDevAttr*` values aren't guaranteed to match the `CU_DEVICE_ATTRIBUTE_*` ones — they do agree here, but your code path is the driver one and that's what I wanted to confirm.\n\nTwo adjacent attributes from the same box, in case they're useful for the doc section:\n\n```\nCU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING                -> 1\nCU_DEVICE_ATTRIBUTE_MANAGED_MEMORY                    -> 1\nCU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST -> 0\n```\n\nThat last one being 0 is worth knowing: GB10 is coherent for *pageable* host memory but does not advertise direct host access to *managed* allocations, so \"unified memory\" here doesn't imply the managed-allocation path is equivalent. Your approach sidesteps that entirely by mapping the files, which reads like the right call for this device rather than an incidental one.\n\nFor what it's worth I hit the same wall you describe from the other side — I couldn't run the pinned backend on my Spark either while looking at #58441, for exactly the reason in your Purpose section. So the motivating constraint isn't hypothetical.\n",
+      "created_at": "2026-09-23T22:28:12Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5803999780",
+      "id": 5803999780,
+      "updated_at": "2026-09-23T22:28:12Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "Ran your new commit on a second GB10 (sm_121, CUDA 13.0), since `cudaErrorStreamCaptureIsolation` is the kind of claim that's worth having on independent hardware.\n\nBoth halves reproduce.\n\n**At `be7a84fe`:**\n```\ntests/models/qwen4_exp/test_ple_pageable.py\n25 passed in 5.49s\n```\n\n**Same test file with only `ngram_embedding.py` reverted to `12689c16`** (`git checkout 12689c16 -- vllm/models/qwen4_exp/nvidia/ngram_embedding.py`, so the test is held constant and just the fix is removed):\n```\n1 failed, 24 passed\nFAILED test_full_graph_captures_prefetch_and_forward\n\nE  torch.AcceleratorError: CUDA error: dependency created on uncaptured work in another stream\nE  Search for `cudaErrorStreamCaptureIsolation' ...\nE  torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture\nE  Search for `cudaErrorStreamCaptureInvalidated' ...\n```\n\nSo the new test genuinely fails on the previous head with exactly the error you named, and the `_join_prefetch_stream()` no-op on the pageable backend is what fixes it — not an already-green test added alongside. The isolation error also arrives before the invalidation one, which matches the join being the trigger rather than a downstream casualty.\n\nOne note on scope, since it cost me nothing to check and might save you a round: 24 of the 25 pass on the old source, so the regression surface here really is just the FULL-capture path.\n",
+      "created_at": "2026-09-24T19:27:28Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5820763658",
+      "id": 5820763658,
+      "updated_at": "2026-09-24T19:27:28Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-09-25T03:14:41Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5826074885",
+      "id": 5826074885,
+      "updated_at": "2026-09-25T03:14:41Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "Rebased your branch locally to see how bad the conflict is — it's small, and the result is green on a GB10, so this should be quick for you.\n\n**One conflict, one file**, `vllm/config/engram.py`: `main` gained a `use_thp` check in `_validate_shared_memory` while you added the two `checkpoint_mapped` ones. Pure add/add — keeping all three in sequence is the whole resolution. Nothing in `ngram_embedding.py` conflicted, which I'd half expected given #58489 just landed there.\n\nAfter that, both PLE suites pass on GB10 (sm_121, CUDA 13.0), with `main` including #58489:\n\n```\ntests/models/qwen4_exp/test_ple_pageable.py + test_ple.py\n76 passed in 14s\n```\n\nSo your `_join_prefetch_stream()` no-op and #58489's persistent `_prefetch_ids` buffer coexist without stepping on each other — the `output=self._prefetch_ids[...]` call survives at `ngram_embedding.py:1145` alongside your change, and your FULL-capture test still passes.\n\nOne thing I checked and got wrong on the first pass, in case you try the same probe: `EngramConfig(use_thp=True)` does **not** raise, but that's correct rather than a bad merge — `cpu_offload` defaults to `True`, so the guard is inert with those args. Clean `upstream/main` behaves identically; I only trusted it after comparing against an unmodified checkout.\n",
+      "created_at": "2026-09-25T03:29:05Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5826194734",
+      "id": 5826194734,
+      "updated_at": "2026-09-25T03:29:05Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "Rebased onto main `378504a54` and force-pushed (head `86f103430`). Thanks @hclsys for the three GB10 runs, the attribute check and the trial rebase.\r\n\r\nMain moved again after your rebase, so there was more to it than the `engram.py` add/add:\r\n- **#57497** moved the device/pinned backends to `common/ngram_embedding.py`. The pageable backend stays in `nvidia/`. The post-load bind hook and `_join_prefetch_stream()` moved with the base classes.\r\n- **#58086** made `DefaultModelLoader._prepare_weights` return four values. The file resolution unpacked three, and the unit tests stubbed it, so they stayed green; mypy caught it. Fixed, and a new test calls the real loader (open design question 1).\r\n- **New commit:** `checkpoint_mapped` is rejected off CUDA. Since #57497 the ROCm path would ignore it and allocate the pinned table.\r\n- #58489's persistent `_prefetch_ids` is kept; this backend uses it too.\r\n- DCO: the second commit's author email now matches its sign-off.\r\n\r\n`test_ple_pageable.py` on GB10: 28/28. `models_basic` Qwen4Exp set on CPU: 53 passed, 42 skipped. pre-commit clean. The PR body is updated to match.\r\n",
+      "created_at": "2026-09-25T09:56:02Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5830452890",
+      "id": 5830452890,
+      "updated_at": "2026-09-25T10:04:17Z",
+      "user": {
+        "login": "jschmied"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-09-30T10:32:31Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5909444827",
+      "id": 5909444827,
+      "updated_at": "2026-09-30T10:32:31Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "I've been running a version of this patch locally, and through profiling discovered that this code was hard faulting the PLE pages from a CPU thread serially, leading to per pass stalling.  To resolve this, I changed things so that before we actually fault the pages, we call madvise(MADV_WILLNEED) which will cause the kernel to bring pages into page cache before interaction with the cpu page tables.  This reduced per step latency from 10.4ms -> 3.1ms for this phase.  \r\n\r\nThis was futher improved by then having the dispatch of these MADV_WILLNEED occur during the previous layer's loading. This overlap allows the next layers PLE to load concurrently wit hthe current layer's processing, reducing this PLE loading phase further from 3.1ms -> < 0.6ms on the critical path.\r\n\r\nTogether these two improvements unblocked performance / minimized stalling to near zero. https://github.com/jschmied/vllm/pull/4",
+      "created_at": "2026-10-02T23:56:54Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5963331125",
+      "id": 5963331125,
+      "updated_at": "2026-10-02T23:56:54Z",
+      "user": {
+        "login": "waych"
+      }
+    },
+    {
+      "body": "@waych one number that might help separate the two effects. On a GB10 with the file fully page-cache-warm (`mincore` 1.000, 400 x 800 KB tensors, fresh process per run), `mmap -> copy_`:\n\n```\nplain                        4.70 / 4.71 ms/tensor\nmadvise(WILLNEED), whole file 4.80 / 4.40\ntouch 1 byte per page         0.132 / 0.126\n```\n\nSo WILLNEED on resident pages does nothing for me, which fits what it is: it queues readahead into the page cache and doesn't populate the process's page tables. The fresh-mapping minor faults are what cost 4.7 ms there, and only the touch removes them.\n\nThat means your 10.4 -> 3.1 ms is probably coming from pages that weren't resident, or from the fault-around that goes with the readahead. Worth checking `mincore` on the PLE file at the start of a step: if it's ~1.0 and WILLNEED still helps, then I'm missing something about your access pattern. Mine is H2D copy from a mmap view, not a CPU gather, so don't read it as the same workload.\n",
+      "created_at": "2026-10-03T00:17:44Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5963524943",
+      "id": 5963524943,
+      "updated_at": "2026-10-03T00:17:44Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "@hclsys My comment is about addressing latencies introduced by the use case of NOT having the data be memory resident, and instead paged off disk.  The numbers I'm posting were measured via vLLM's torch profiler and represent the time spent per pass waiting for the PLE faults to finish on CPU.  \r\n\r\nI'm running with very little page cache available, ~4.5GiB runtime resident for PLE.  PLE is a giant hash table that is accessed with many small random reads (smaller than page size) sparsely per token. Using mmap and storing on nvme works great, as long as we dispatch the requests in concurrently, which my PR proposes. The goal is to have the kernel issue the requests to populate page cache via the MADV_WILLNEED advice (it doesn't \"read-ahead\", which means to read the _next_ blocks, which in this case is wrong, the next read is random!), and then to come back and actually read them from userland CPU so that the pages get faulted and page tables established as minor faults, making them available to the GPU.\r\n\r\nThe previous approach would loop and major fault serially PLE entries from the CPU, leading to slow serialized accesses to nvme with small bits of cpu in between. MADV_WILLNEED IO dispatch allows the nvme layer to dispatch multiple IO concurrently, resulting in a large reduction of major faults as many of the later pages are already in page cache by the time the page fault occurs. Performing this feed a layer early allows for a large distribution of IOs to come in before ~~page fault~~ *gpu use*, further reducing the perceived ~~cpu~~ *gpu* stall on IO. \r\n\r\n*Added: The second commit, the one that currently introduces the `prefetch_ahead` class attribute, keeps gpu-side prefetch stream one layer early, but avoids this early layered behavior for the mmapped approach. This assumes that someone using the mmaped approach is wanting to use paging, but perhaps there-in lies some confusion.  Maybe this layer-ahead behavior needs to be operator exposed?*\r\n\r\nI'm my case I'm serving the qwen3.8-flash-next PLE in fp8 as 51.2GB on disk, within 4.5GiB of usable pagecache and am now measuring a major fault rate of < 1.0 per pass with these changes.",
+      "created_at": "2026-10-03T01:04:45Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5963919987",
+      "id": 5963919987,
+      "updated_at": "2026-10-03T02:21:38Z",
+      "user": {
+        "login": "waych"
+      }
+    },
+    {
+      "body": "I had claude make the following artifact explaining what we saw with profiled runs.\r\n\r\nhttps://claude.ai/code/artifact/f070c41b-c2e8-4666-8781-40f22a3010c2\r\n",
+      "created_at": "2026-10-03T03:57:48Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-5965306048",
+      "id": 5965306048,
+      "updated_at": "2026-10-03T03:57:48Z",
+      "user": {
+        "login": "waych"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-08T17:07:38Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-6065068117",
+      "id": 6065068117,
+      "updated_at": "2026-10-08T17:07:38Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-12T13:11:43Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-6124967277",
+      "id": 6124967277,
+      "updated_at": "2026-10-12T13:11:43Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @jschmied.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-14T00:31:27Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#issuecomment-6158151412",
+      "id": 6158151412,
+      "updated_at": "2026-10-14T00:31:27Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    }
+  ],
+  "number": 58439,
+  "refs": {
+    "base": {
+      "commit": "4e4eab73ed2b4e00931a4636e926b8df1cb1fe50",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "047fc1ce7c825bd2dd4709bebcfdec042b27a15c",
+      "repository": "jschmied/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58439#pullrequestreview-5296098649",
+      "id": 5296098649,
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-23T19:58:00Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ]
+}

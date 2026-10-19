@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/models/README.md
-raw_sha256: c8f50dedb90e280b96a6b0832c5cd76a7ae37daf1e11d18d70cca5407c281da6
+raw_sha256: 305862c59075c4425651256a40d0fa0c04f412eec5cbdc949a4769f49a0c1f2f
 sources: []
-generated_body_sha256: 6cb5f31530b18a3ef7a5a82b5f08381b9e02619dd2b6acbca2494a2a2cea3283
+generated_body_sha256: caaf1999afb2e2c852bcb1e4a15bd683d361ec8ceda5e63cdf12e03c7944fdf2
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -53,7 +53,7 @@ The folder should be organized as follows
   - This is optional for offline exploration.
 - `sharding.py`
   - Define declarative constructors that return the `ShardingConfig` (or `SpmdType`) of the model's own components. TP, SP, EP and inner-attention local SPMD regions are expressed this way instead of a runtime `parallelize_module` plan.
-  - Reuse the shared constructors in `torchtitan/models/common/decoder_sharding.py`, `moe_sharding.py` and `vision_encoder_sharding.py` (`token_embedding_sharding_config`, `norm_sharding_config`, `residual_activation_placement`, `colwise_sharding_config`, `rowwise_sharding_config`, `moe_sharding_config`, ...) where possible; skip this file when they cover the whole model.
+  - Reuse the shared constructors in `torchtitan/models/common/decoder_sharding.py`, `moe/sharding.py` and `vision_encoder_sharding.py` (`token_embedding_sharding_config`, `norm_sharding_config`, `residual_activation_placement`, `colwise_sharding_config`, `rowwise_sharding_config`, `moe_sharding_config`, ...) where possible; skip this file when they cover the whole model.
   - Declare the mesh axes in canonical outer-to-inner SPMD order: `(dp, cp, tp)` for dense (attention/MLP/norm/embed/lm_head) and `(dp_replicate, edp_shard, ep)` for sparse (MoE expert weights). `Module._parallelize` resolves the mesh from the declared axes.
 - `model.py`
   - `BaseModel.parallelize()` applies declarative model parallelism, activation checkpointing, and FSDP/HSDP in order.

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: 5a8ea03b12066067f39b1771782d12db236267ef
 path: docs/zh/pytorch/features/mcore/mc2.md
-raw_sha256: 64ce9e60d8d1c0c3c7992382ca1be59feb0a0d6ede1beb98af9d05d4d045bc34
+raw_sha256: cf6f5a6ea6d7807bdc4ae0a232e91bc5831f788075395c65360efea3720422a1
 sources: []
-generated_body_sha256: d77c8c5a37c05217378ed7ef4dfd738bd3d6dc92d6108578ed0bea8963d80b6c
+generated_body_sha256: b0098f1ced6b792081c97c1df0fcaf51a9520114f670fcf4ffc204a8265cdf21
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/mc2.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/features/mcore/mc2.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/zh/pytorch/features/mcore/mc2.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -71,4 +71,4 @@ MC2算子接口参见[torch_npu.npu_mm_all_reduce_base接口说明](https://www.
 
 1. mcore场景下（开启`--use-mcore-models`），MoE模型，MLP部分不使能MC2。
 
-2. A5机型暂不支持该特性。
+2. Ascend 950PR&950DT系列产品暂不支持该特性。

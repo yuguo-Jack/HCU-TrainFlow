@@ -9,24 +9,44 @@ stages:
 visibility: public
 review_level: selected-source-and-tests-reviewed
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-transformerengine
   path: transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 1383ee108b6ad04f51ff14b816f3966875acaac919dff6daa4e33f100d4f037f
 - source: nvidia-transformerengine
   path: transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 8910abcd3d930ab1ac47dbebd045f0727d54931f528baf6e778f7abe7fb62c3f
 - source: nvidia-transformerengine
   path: tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 52d1857a9a41e2a21a94957e82f9c4d3f1c82e5a41059c8180fb98f848385b2c
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/csrc/extensions/normalization.cpp
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 63b73d6823b013daf2c29d55ce1aa7be1849b59c43a74d476b15e8defef2d349
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/csrc/quantizer.cpp
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 1983d51ddcc5210618176cd10e07acaf633f55fd1147a89032ec738e407fa7d3
+- source: nvidia-transformerengine
+  path: transformer_engine/common/common.h
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 2f8a2fb5e6f9ad4d4a1117fcb0f81d107ad349210d236ba15ba4676d3a4abf46
+- source: nvidia-transformerengine
+  path: transformer_engine/common/transformer_engine.cpp
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 8a350cd395c10cb2f0c3b514111b8ade7b36c3336646b3bf48ec8d54e442198d
+- source: nvidia-transformerengine
+  path: transformer_engine/common/include/transformer_engine/transformer_engine.h
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 801c90c9a6ebd95ee02f32d0a757bee48eeaafca0d264d4a0baea87eaf73fa99
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/csrc/common.h
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: d1c958db87569b35117036ceb5e63e3e78566f40d3bd2a590b8b8c4c5dd778d8
 pr_sources:
 - pr-nvidia--transformerengine-3657
 ---
@@ -52,7 +72,7 @@ MXFP8 输出且实现支持时，默认可以走 TE 路径；显式请求 cuDNN 
 | 硬件 | 检查 `is_supported_by_CC_100()`，是 NVIDIA 目标条件，不等于任何 HCU gfx 能力 |
 | 行列 | 非空且均为 128 的倍数，并有整数/网格上限；完整 tile 避免 scale padding 歧义 |
 | 输入与 gamma | FP32/BF16/FP16；gamma 的 zero-centered 及加一精度约定需要一致 |
-| 输出 | E4M3/E5M2 的 rowwise/columnwise 表示，两者同时存在时 dtype 必须一致 |
+| 输出 | kernel 可处理 E4M3/E5M2 的 rowwise/columnwise 表示，两者同时存在时 dtype 必须一致；当前 Python column-only 入口另有下述前置检查缺口 |
 | scaling | 当前融合输出为 1D block scaling；2D quantization 另走 normalize 后再量化路径 |
 | 调度 | SM margin 改变每次 launch 的行块，offset 必须覆盖 data 和两套 scale 布局 |
 
@@ -60,7 +80,13 @@ MXFP8 输出且实现支持时，默认可以走 TE 路径；显式请求 cuDNN 
 
 测试先校验 `rsigma = rsqrt(mean(x.float()**2)+eps)`，再以 FP32 归一化结果构造 MXFP8 reference。rowwise/columnwise 数据字节、scale 和可选 swizzle 分别比较；若参考先把归一化结果舍入到 BF16，可能改变量化边界，不是同一契约。
 
-`test_rmsnorm_fwd_mxfp8` 覆盖输入 dtype、两种 FP8 输出、zero-centered gamma、GEMM scale 格式；`test_rmsnorm_fwd_mxfp8_sm_margin` 对照全部 SM 与保留到一个 SM 的输出；2D case 明确验证分离的 fallback。它们是测试代码提供的验收设计，本页没有运行或替它们宣布通过。
+`test_rmsnorm_fwd_mxfp8` 覆盖输入 dtype、两种 FP8 输出、zero-centered gamma、GEMM scale 格式，构造的是默认 row+column quantizer；`test_rmsnorm_fwd_mxfp8_sm_margin` 对照全部 SM 与保留到一个 SM 的输出；2D case 明确验证分离的 fallback。它们没有证明 column-only Python 入口可用，也不代表本页运行或替它们宣布通过。
+
+## 当前 Python column-only 入口的缺口
+
+固定 `eb3c860a4d33` 的 1D、完整128×128 tile 路径在 `out=None` 时直接由 `MXFP8Quantizer::create_tensor` 建输出。若 `rowwise=False, columnwise=True`，它仅设置 `columnwise_data`；未设置的 rowwise `data.shape` 仍是 SimpleTensor 的默认 `{0}`。C API 的 columnwise setter 不会补写 rowwise 元数据，而 `rmsnorm_api.cpp` 在 workspace query 中先检查 `z->data.shape == x.data.shape`，再判断 kernel 资格。因此静态调用链显示该 column-only 输入会在发射 kernel 前被拒绝，不能由内部 kernel 的 colwise 分支宣称公开入口已支持。这是源码复核结论，本轮未在设备上重现。
+
+不要为了消除报错伪造输出 shape 或丢弃布局约束；保留已有可靠的 normalize→量化路线，或在需要两向输出且满足合同的消费者中使用已测试的 row+column 形式，并计入额外存储。若采用 column-only，先修复实际包装/公共 API 并增加相应输出、scale 和异常输入测试；2D/unfused 路线应单独检查，不能由这个缺口推断全部量化路径均失败。
 
 ## HCU 借鉴与上限评估
 
@@ -74,9 +100,15 @@ MXFP8 输出且实现支持时，默认可以走 TE 路径；显式请求 cuDNN 
 
 ## 固定源码
 
-- [transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp)
-- [transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu)
-- [tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py)
-- [transformer_engine/pytorch/csrc/extensions/normalization.cpp](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/csrc/extensions/normalization.cpp)
+- [transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp)
+- [transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu)
+- [tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py)
+- [transformer_engine/pytorch/csrc/extensions/normalization.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/csrc/extensions/normalization.cpp)
+
+- [transformer_engine/pytorch/csrc/quantizer.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/csrc/quantizer.cpp)
+- [transformer_engine/common/common.h](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/common.h)
+- [transformer_engine/common/transformer_engine.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/transformer_engine.cpp)
+- [transformer_engine/common/include/transformer_engine/transformer_engine.h](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/include/transformer_engine/transformer_engine.h)
+- [transformer_engine/pytorch/csrc/common.h](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/csrc/common.h)
 
 本文为官方源码、接口与测试阅读，未运行这些 NVIDIA 实现，不声称 HCU 支持或获得相同性能。

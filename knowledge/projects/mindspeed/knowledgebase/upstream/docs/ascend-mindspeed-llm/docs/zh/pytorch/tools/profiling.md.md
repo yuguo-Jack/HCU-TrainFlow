@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: 5a8ea03b12066067f39b1771782d12db236267ef
 path: docs/zh/pytorch/tools/profiling.md
-raw_sha256: d731ce042c40fe2d3091c8a8fa74bdb25feca0de04f6a6b0421bb85f0448e3c5
+raw_sha256: ab5e2b99feb5ffa07e50a842ae91364b7b686e63b6fe5bff3e3dbc3fbf72ace8
 sources: []
-generated_body_sha256: ae04bb24ae088e9ee2d52c8761b93a01556b76b94c442e76fb0b990991605d58
+generated_body_sha256: 312110c2045979836a66a88bcbf47e6034483362047cac471362e2dbb7217817
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/tools/profiling.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/tools/profiling.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/zh/pytorch/tools/profiling.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -73,7 +73,7 @@ MindSpeed LLM支持基于昇腾芯片采集profiling数据，以提供对模型�
 | `--profile-step-start` | int | `0` | 指定开启采集数据的步骤（包含） |
 | `--profile-step-end` | int | `-1` | 指定结束采集数据的步骤（不包含）；设置为-1时表示采集到训练结束 |
 | `--profile-ranks` | List[int] | `0` | 指定采集数据的卡号，设置为 `-1` 时表示采集所有 rank 的 profiling 数据。多个卡号用空格分隔，例如 `--profile-ranks 0 1` |
-| `--profile-level` | string | `level0` | 数据采集水平：<br>• `level0`：基础算子耗时<br>• `level1`：增加AICore利用率、通信算子（推荐）<br>• `level2`：更详细（含缓存、内存等） |
+| `--profile-level` | string | `level0` | 数据采集水平：<br>• `level0`：基础算子耗时<br>• `level1`：增加AI Core利用率、通信算子（推荐）<br>• `level2`：更详细（含缓存、内存等） |
 | `--profile-export-type` | string | `text` | 指定性能数据结果文件导出格式：<br>• `text`：文本格式 <br>• `db`：数据库格式 |
 | `--profile-data-simplification` | bool | `false` | 是否启用数据精简模式（减小trace文件体积） |
 | `--profile-with-cpu` | bool | `false` | 是否同时采集CPU活动（如数据加载、调度） |
@@ -133,7 +133,7 @@ MindSpeed LLM支持基于昇腾芯片采集profiling数据，以提供对模型�
 | `profile_step_start` | int | `0` | 开始采集的 global step（包含） |
 | `profile_step_end` | int | `-1` | 结束采集的 global step（不包含）；`-1` 表示采集到训练结束 |
 | `profile_ranks` | List[int] | `[-1]` | 要采集的 rank 列表；`[-1]` 表示所有 rank |
-| `profile_level` | string | `level0` | 采集级别：<br>• `level_none`：关闭<br>• `level0`：基础算子耗时<br>• `level1`：增加 AI Core 利用率、通信算子（推荐）<br>• `level2`：更详细（含缓存、内存等） |
+| `profile_level` | string | `level0` | 采集级别：<br>• `level_none`：关闭<br>• `level0`：基础算子耗时<br>• `level1`：增加AI Core利用率、通信算子（推荐）<br>• `level2`：更详细（含缓存、内存等） |
 | `profile_export_type` | string | `text` | 导出格式：<br>• `text`：文本格式 <br>• `db`：数据库格式 |
 | `profile_data_simplification` | bool | `false` | 是否启用数据简化（减小 trace 文件体积） |
 | `profile_with_cpu` | bool | `false` | 是否同时采集 CPU 活动（如数据加载、调度） |

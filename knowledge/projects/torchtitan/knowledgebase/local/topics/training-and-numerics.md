@@ -9,38 +9,50 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: Curated source chains and official evidence at a fixed main commit; not
-  all models, backends or HCU runtime validated.
+reviewed_on: '2026-10-20'
+coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
+  or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/trainer.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: e7a7162304a1741cfa86ef7969d7619f985f2263f9aace617bdc6955185c41f4
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: c49922cf3d47918901135fc0b798141479cb16b24fb1004b19b255a663c13288
 - source: pytorch-torchtitan
   path: torchtitan/training_engine.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 9c6293218d8c0a6ea50e3e1ac060d8a78b6df8eae4156009f7868016f7b6cdfd
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 04d566f414d65830070069c7bde9eba232da16a23f329abc4446f565abb2006e
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/optim.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 64d864818e84d702cc4e517773cf153f2c4e74356d36987e40ae7a397b44845c
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 6303e04a5cac5781d3b9ac76fafb9ceaf509824b84e189d2aa1362f3cf3ffe24
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/optimizer.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
   sha256: 8ab40fd78a9f1c8509db8bd71b418bd2aeba3a57ba0666f5ec4de89e4aee8f4b
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/BF16_OPTIMIZER_STATES.md
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
   sha256: 4f0d88ff7b4b6149e86988f451b2698b6446ebf57b22fcb27f45d4ef671ac549
 - source: pytorch-torchtitan
   path: torchtitan/distributed/fsdp.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 572effd3ae6d6d0e65c436cac17fbeecbd0927a1c41eaa166bb98884da0b6377
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 397ee700761af56345048cb0e7ba5b120bbc2b57a94e02aebb1c4c8499b8846a
 - source: pytorch-torchtitan
   path: torchtitan/rl/BITWISE_PARITY.md
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: e2d8599828473b3abd1f7beb8db39606d27870602bbcc21279c072175dac0144
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 00e77fab6806fa0986f1f4b16ca3769ceee98f7959ea76680fd8ba81d064fce0
+- source: pytorch-torchtitan
+  path: torchtitan/config/configs.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: aaf73beb7efb044ac1978b3edb43b48db256ccd708660880d947bc70e9be3a2c
+- source: pytorch-torchtitan
+  path: tests/unit_tests/cpu/test_trainer.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 1882d21356427492dcfc7c160f842e6f18fe813fa565066e8b420741139d9d6b
+- source: pytorch-torchtitan
+  path: tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 999896227598f0af578966cb1b968f34a45e8b25dadd16568d26055a1600c35e
 pr_sources:
 - pr-pytorch--torchtitan-5250
 - pr-pytorch--torchtitan-5137
@@ -91,17 +103,33 @@ BF16 optimizer states 将 Adam/AdamW moment 与模型计算精度解耦：参数
 
 工作流中的 HCU Probe、阶段 loss 及上层精度诊断见 [模型精度排查](../../../../../../docs/practices/model-accuracy-diagnosis.md)。
 
+## PP loss 接口与首轮状态
+
+`ForwardBackwardResult.loss_metrics` 当前按 `[microbatch group][microbatch]` 嵌套；PP为每个 microbatch 单独传 loss kwargs（如advantages）与 metrics dict，非最后stage没有有效 loss metrics。pipeline 元数据初始化可能先调用一次 loss，wrapper对目标 metrics执行clear/update，不能把探测调用再累计进正式日志。自定义 loss/监控消费者若仍按每组一个dict读取会混淆统计。
+
+全局 routing-token counts 在 `preprocess_inputs` 中传入模型，不再依赖引擎事后修改特定 kwargs；loss-token 与 routing-token 分母仍分别计算。惰性预处理把每组输入/掩码临近前后向才物化，不能据此重算或改变全局分母。
+
+首个 WGRAD 也有精度变化：有更宽的 `weight.grad_dtype` 时，当前 Linear 直接让 GEMM输出该 dtype，跳过先舍入到 BF16再由autograd转FP32；`test_first_wgrad_is_produced_in_grad_dtype` 单独检查这一点。历史PR的首步bitwise结论不能覆盖这次变化，详见[案例](../cases/inplace-wgrad-accumulation.md)。
+
+每个新 `Optim` 实例第一次 `step()` 在更新图外先等待已有CUDA工作，再释放未使用的缓存，为NCCL外部分配让出空间；恢复到非零step也执行。它不释放live tensor/Graph pool、不减小通信buffer，也不能解决此前forward/backward或后续分配失败；性能基线应把这次首轮等待单列。
+
 ## 固定证据与使用边界
 
-本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/trainer.py)
-- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/training_engine.py)
-- [torchtitan/components/optim/optim.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/optim.py)
-- [torchtitan/components/optim/optimizer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/optimizer.py)
-- [torchtitan/components/optim/BF16_OPTIMIZER_STATES.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/components/optim/BF16_OPTIMIZER_STATES.md)
-- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/distributed/fsdp.py)
-- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/BITWISE_PARITY.md)
+- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/trainer.py)
+- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/training_engine.py)
+- [torchtitan/components/optim/optim.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/components/optim/optim.py)
+- [torchtitan/components/optim/optimizer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/components/optim/optimizer.py)
+- [torchtitan/components/optim/BF16_OPTIMIZER_STATES.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/components/optim/BF16_OPTIMIZER_STATES.md)
+- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/fsdp.py)
+- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/BITWISE_PARITY.md)
 
 - [PR #5250：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5250.md)
 - [PR #5137：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5137.md)
+
+## 本次补充的实现与测试依据
+
+- [torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/configs.py)
+- [tests/unit_tests/cpu/test_trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/unit_tests/cpu/test_trainer.py)
+- [tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py)

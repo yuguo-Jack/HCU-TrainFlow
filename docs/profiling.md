@@ -47,6 +47,8 @@ Graph、Roofline、原生 Agent、EventReplay、hipprof/pftrace 与 XProf/XCompu
 
 训练 Graph 的一次 launch 不等于一完整训练步：fwd/bwd/重算/更新及梯度累积可能分别捕获或重放。capture 只用于恢复调用映射，正式时间来自真实稳态 replay；核对精确图特化、phase、调用序列、参数/地址与 RNG/状态契约。推理 annotation、最近 batch bucket、CSV 非空或 sanity 日志没有报错均不能证明训练映射完整；根/特化未匹配及事件数/耗时不一致保持缺口。具体支持范围以锁定源码和目标 trace 资格结果为准。
 
+采集和诊断也可能改变执行资格：编译支持不等于可 capture，活跃 capture 中的 host event query/synchronize 在某些 runtime 会使 capture 失效。按目标版本使用框架已有的安全观察点；需要改变 Graph 模式定位时，另留有界复现并回到正式模式复验。具体检查见[编译与 Graph](../skills/hcu-train-analyze-and-optimize/references/torch-native-training.md#编译问题的定位顺序)和[通信卡住诊断](../skills/hcu-train-scale-and-stability/references/diagnosis.md)。
+
 EventReplay 的元数据 IR 或随机输入执行仅证明该范围的合成调用可用；真实数据依赖、梯度、alias 与原地状态需按[独立重放契约](../skills/hcu-train-analyze-and-optimize/references/operator-comparison.md)补齐。原生 Agent 的 top-10、空泡触发门槛及 `SUCCESS` 不替代本仓覆盖、因果和训练验收，见[证据闭环](../skills/hcu-train-analyze-and-optimize/references/evidence-driven-loop.md)。
 
 选窗口时以 CPU `user_annotation` 的完整 `ProfilerStep#` 为依据。HIP trace 还可能在多个 GPU stream 输出同名 `gpu_user_annotation`；这些是同一步的设备区间，不能当成额外训练步。inventory 分别记录 CPU/GPU step annotation 数目，同时保留原总数。必须对照实际训练循环调用 `prof.step()` 的位置和 profiler schedule，不能由命令的起止数字直接推断采了几步。

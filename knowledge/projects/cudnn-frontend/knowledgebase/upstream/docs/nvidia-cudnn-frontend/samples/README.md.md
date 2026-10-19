@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
 path: samples/README.md
-raw_sha256: 475c7814047e5d2691fa34986a6368e42934a30d8660f79cc2345ec004dfbf9d
+raw_sha256: cd7a22210206c01bbbbef02029b65a99c14264cc1e70911c3d4143b1d065ccb1
 sources: []
-generated_body_sha256: 540b4feae8edff348aa19c8b20d2bce706fb81f813dc6f4cd78f27b9128ce6b3
+generated_body_sha256: 65d389680a6730b49b29e295d3a2ceb8e81b3d375202c235dd93ff16bd9adb7d
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / samples/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/samples/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -51,7 +51,7 @@ Samples leveraging FE's Python interface are located in [samples/python](python/
 ## FROST Python Samples
 Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python API, each checked against a torch or fp64 reference:
 * [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul.
-* [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2 and GDP prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
+* [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2, GDP and Mamba-2 prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
 * [frost/gated_attention_block](frost/gated_attention_block/): the gated attention block's training forward (`save_for_backward=True`) -- the caller-owned `SavedForBackward` record and the zero-copy `saved_slab_views` of its projection slab, checked against torch (Rubin only).
 
 ```

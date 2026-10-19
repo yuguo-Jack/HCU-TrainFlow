@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
 path: docs/docs/advanced_features/hicache_best_practices.mdx
-raw_sha256: 1b23cd3668a11a1dce0f8be6104afdc9c8b735d14b86c3c36387f303c2daf31b
+raw_sha256: 68de42b66110fe0690d1fb0f8ec7b17db3197315225c574034e3dfd5eba6be16
 sources: []
-generated_body_sha256: f0fc7f9d0bb2bf838519cfa1be2ca6b7e55aebdde5ee74e62d3227d9a338a908
+generated_body_sha256: d4d559c6031a50d1af108d54ed8e2d386213a342ac06e0287a7fb9831ca10098
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/hicache_best_practices.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/hicache_best_practices.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/advanced_features/hicache_best_practices.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -59,6 +59,21 @@ Notes:
 - Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](./hicache_storage_runtime_attach_detach).
 
 ## Key Configurations with Storage Backends Enabled
+
+### Host Pool Sizing
+
+```bash Command
+# Recommended: size the host pool as a multiple of the GPU KV pool
+--hicache-ratio 2
+--hicache-size 0
+```
+
+Guidelines:
+
+- Storage (L3) hits are staged in the host pool before being loaded to the GPU, so the host pool needs free room at the time of the hit.
+- With `write_through`, every token cached on the GPU also keeps a host copy. Once the GPU pool is full, at most `host pool tokens - GPU pool tokens` is left for storage hits.
+- If the host pool is not larger than the GPU pool, storage hits are dropped and the prompt is recomputed. `sglang:storage_prefetch_unfulfilled_tokens_total{reason="host_capacity"}` grows.
+- `--hicache-size` sets the host pool in GB and overrides `--hicache-ratio`. If you set it, check that the host pool is larger than the GPU pool in tokens, as reported in the startup log.
 
 ### Memory Layout Optimization
 

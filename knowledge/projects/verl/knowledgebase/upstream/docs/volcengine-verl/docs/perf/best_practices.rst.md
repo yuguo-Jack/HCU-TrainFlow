@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: verl-project/verl
-commit: 5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d
+commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
 path: docs/perf/best_practices.rst
-raw_sha256: 37ede8da2d9efbc564bc9cb9f37e9d2f5a273e8eadb360b90e85166ebc1473cd
+raw_sha256: ce40babc9a9c45b9a80926509ffacc0697b753aae393e4c8bd00aa5e3f781af3
 sources: []
-generated_body_sha256: ea5eb8655f6ae10e8625adfe3b6a19618e86e895cf6ed79a0dcda9f3e44313ce
+generated_body_sha256: 113933f70fb479612d2463a2cee98a72100bf2f07a01bc5fce3512e135cea0fe
 source_state: current-scan
 ---
 
 # verl-project/verl / docs/perf/best_practices.rst
 
-[Original at fixed commit](https://github.com/verl-project/verl/blob/5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d/docs/perf/best_practices.rst)
+[Original at fixed commit](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/perf/best_practices.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -157,7 +157,7 @@ Parameter Reference
   - ``actor_rollout_ref.rollout.val_kwargs.temperature`` / ``top_p`` / ``top_k`` / ``do_sample`` / ``n``:
     Sampling options for validation. Set ``temperature > 0`` to prevent repetitive thinking chains. For small test sets (e.g., AIME24) raise ``n`` (64 is a common choice) to reduce variance. A practical starting point is ``temperature=1.0``, ``top_p=0.7``, ``top_k=-1``, ``do_sample=True``, ``n=1`` and then increase ``n`` as needed.
   - ``+actor_rollout_ref.rollout.engine_kwargs.vllm.*`` / ``+actor_rollout_ref.rollout.engine_kwargs.sglang.*``:
-    Extra backend options injected via the ``+`` syntax. Consult backend docs for exact semantics. Some switches (for example ``pipeline_parallel_size``) may not be supported yet; when TP=32, ``enable_expert_parallel=True`` can even slow down DeepSeek-V3 rollout, so benchmark carefully.
+    Extra backend options injected via the ``+`` syntax. Consult backend docs for exact semantics. Some switches (for example ``pipeline_parallel_size``) may not be supported yet; when TP=32, expert parallelism (``actor_rollout_ref.rollout.expert_parallel_size``) can even slow down DeepSeek-V3 rollout, so benchmark carefully.
 
 :math:`\pi_\theta`
   - ``data.train_batch_size``:

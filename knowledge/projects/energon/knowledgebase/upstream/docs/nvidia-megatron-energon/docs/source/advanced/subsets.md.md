@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/advanced/subsets.md
-raw_sha256: 210ea2f5c58241412096d9c745ee3ba8a50c6db210ebd961954c633115a507f6
+raw_sha256: 2c1c694c79a0d5e884bdff6f82b3d6dfb006bf5bd530d50b1346daec4d734311
 sources: []
-generated_body_sha256: da63d729a142fc8b84fb32da0739b6bf2f82da7e5c012fa0269183c4aa27b348
+generated_body_sha256: 69591137460e60db13d1efde88151f11ab41fd35f4046091ae06e6186473c8ce
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/subsets.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/advanced/subsets.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/subsets.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -31,7 +31,7 @@ SPDX-License-Identifier: BSD-3-Clause -->
 
 # Dataset Subsets
 
-Dataset subsets allow restricting a dataset (or parts of a metadataset hierarchy) to a specific portion of the available samples.
+Dataset subsets allow restricting a dataset (or parts of a recipe hierarchy) to a specific portion of the available samples.
 This is useful for rapid prototyping, ablation studies, different training stages, or constructing disjoint train/validation/test splits that differ from the original dataset configuration.
 
 A subset is defined by a two-element `range` list consisting of `[start, end]` (where `start` is inclusive, `end` exclusive).
@@ -49,7 +49,7 @@ evaluating on the remaining 20 % of the `train` split. Note how the `subset` key
 
 ```yaml
 __module__: megatron.energon
-__class__: MetadatasetV2
+__class__: Recipe
 splits:
   train:
     path: ./coyo
@@ -62,8 +62,8 @@ splits:
 
 ## Nested subsets and merging rules
 
-Subsets can appear at any level that ultimately yields samples
-(direct `path` reference to a prepared dataset containing `.nv-meta`, `join`, `blend`, `blend_epochized`).
+Subsets can appear on direct `path` references to prepared datasets and at any `blend` or
+`blend_epochized` level that ultimately yields samples.
 When multiple subsets are nested, the *inner* subset is applied first, then the portion selected by the *outer* subset is applied *within* the already selected range.
 For percentages the ranges are composed multiplicatively.
 
@@ -86,7 +86,7 @@ the first **500** samples of *COCO*, mixed with the first **50%** of the *COYO* 
 
 ```yaml
 __module__: megatron.energon
-__class__: MetadatasetV2
+__class__: Recipe
 splits:
   train:
     # The subset is applied to each blended dataset separately.
@@ -106,7 +106,7 @@ Absolute ranges can also be specified to run up to the end of the dataset using 
 
 ```yaml
 __module__: megatron.energon
-__class__: MetadatasetV2
+__class__: Recipe
 splits:
   train:
     path: ./coyo

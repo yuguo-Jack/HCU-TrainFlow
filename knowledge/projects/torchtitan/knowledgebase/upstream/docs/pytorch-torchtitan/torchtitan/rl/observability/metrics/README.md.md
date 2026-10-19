@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/rl/observability/metrics/README.md
-raw_sha256: 11b5fd3963900a52094028d4b2e35ee4ce1761d4f45d19e902052d1e74e9e1d6
+raw_sha256: df9c8957b9048a9739c617c6d339fd21efd3eb3606e416415f5b3c3f777b0885
 sources: []
-generated_body_sha256: a72ca5f68809f89d1274dd893ca74917a207fe7283138f206b3842b805d3c780
+generated_body_sha256: 75056f94bedb568b31697c3017e95f1ba0ba2b03874fed5dff8f8ef99756d48e
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/observability/metrics/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/observability/metrics/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/observability/metrics/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -177,7 +177,7 @@ passed to `MetricsProcessor.Config.build(...)`. `WANDB_PROJECT` defaults to
 
 `VllmOtelStatLogger` exports engine-level rollout metrics through
 [OpenTelemetry](https://opentelemetry.io/). The logger is disabled by default
-and is only registered when `generator.vllm_stat_logger` contains a
+and is only registered when `generator.engine.stat_logger` contains a
 `VllmOtelStatLogger.Config`. Once enabled, `OTEL_METRICS_EXPORTER` must select
 `jsonl` or `otlp`. This explicit gate prevents inherited OpenTelemetry
 environment variables from activating the logger accidentally. Only TP rank 0

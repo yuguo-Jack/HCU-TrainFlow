@@ -1,0 +1,804 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "24c1071a3880c04003525c1336f40b96e20abe6b7f951b87f8cadfb4d102bfa1",
+      "isPrivate": false,
+      "numbers": [
+        59634,
+        59628,
+        59625,
+        59620,
+        59617,
+        59616,
+        59611,
+        59610
+      ],
+      "observed_at": "2026-10-19T19:28:05.012530+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4720,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "78b32b3fdc47cbf097d982aed012fa9874431836",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nSleep mode with `MooncakeConnector` P/D disaggregation is silently wrong on main. Sleep unmaps the KV cache, and wake maps new physical pages at the same addresses. But the RDMA registration still points at the old pages. After a wake, transfers carry stale KV, so outputs are wrong with no error. The old pages also stay pinned.\n\nThis PR makes that combination work, including the pause/sleep lifecycle an RL trainer drives on both P and D. It is self-contained and includes the connector API from #59624.\n\n- **Connector API** (`KVConnectorBase_V1`):\n  - `supports_sleep_mode(kv_transfer_config)`, a classmethod. It defaults to `True` and returns `False` for a connector that hands KV device memory to a NIC or another process and cannot register it again;\n  - `release_kv_caches()` and `restore_kv_caches()`, which are no-ops by default.\n- **Worker**:\n  - `Worker.sleep` and `Worker.discard((\"kv_cache\",))` call `release_kv_caches()` before the KV cache is unmapped;\n  - `Worker.wake_up` calls `restore_kv_caches()` once the KV cache is mapped again.\n- **Config**: with `enable_sleep_mode`, a connector that does not support sleep mode is refused at startup, before any model is loaded. `MultiConnector` supports it only if every child does.\n  - Refused: NIXL and `MoRIIOConnector` (peers keep the stale registration), `MooncakeConnector` with a protocol other than RDMA, and `MooncakeStoreConnector`. On main, the last one gives wrong outputs after a wake and spreads them to other instances through the store; its fix is #59934, stacked on this PR.\n  - Every other connector behaves as before. `LMCacheMPConnector` and `FlexKVConnectorV1` hand the KV cache to another process; they are still accepted, but not verified with sleep mode.\n- **Mooncake sleep**:\n  - supports sleep mode with `mooncake_protocol: rdma` only, where a peer drops a stale remote key on the failed access and looks it up again;\n  - release waits until no ready block is waiting for D (expired sends excluded) and no pull that writes local blocks is in flight. The wait is bounded by `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`. Release then unregisters the KV cache memory;\n  - restore registers the same addresses and sizes again. Both are idempotent.\n\nBehavior change: sleep mode with NIXL, MoRIIO, Mooncake over a protocol other than RDMA, or MooncakeStore now fails at startup instead of silently corrupting KV after a wake. NIXL support is a follow-up (#59635).\n\nKnown limitation: if one TP/PP rank's release times out after the other ranks have already slept, the ranks end up in mixed states. This is the same as any partial sleep failure on main.\n\n### PD + RL lifecycle (last four commits)\n\nAn RL trainer pauses P and D, updates the weights, sleeps or releases KV memory, and resumes. On main plus the commits above, most of these operations fail under load:\n- An abort on P wedges D. P never notified D's waiting pulls, so each waited 480 s while holding one of P's `2 × num_workers` fixed sender tasks.\n- Every operation that resets the KV cache fails with \"Failed to reset KV cache\". Transfers still hold blocks: D's loads, and P's finished requests that D has not pulled yet.\n\n**[KV Connector][Mooncake] Answer every pull and free dropped transfers promptly**\n- **One task per pull.** A pull no longer delays others; it holds blocks only once one of `num_workers` senders is free.\n- **Explicit send state.** P's send state is `WAITING` (request running), `READY` (blocks held for D) or `DONE` (nothing more to send). `_end_send` is the only place that ends a send and frees blocks once no write reads them.\n- **Every pull gets one prompt answer.** This holds whether P aborted the transfer, D released it, it expired, or a send failed.\n- **Bounded pulls.** Each pull has a deadline (the abort timeout from receipt, 60 s before D's), so no write starts after D could give up.\n- **Safe load completion on D.** D asks P to drop a transfer whose request finished mid-load, and ends a load only after every producer answered.\n\n**[Core][KV Connector] Release transfer-held KV before a cache reset**\n- **Release, then reset.** A pause only stops compute. Once idle, an operation that resets the cache (pause with `clear_cache`, sleep, `release_kv_cache_memory`) calls `Scheduler.release_transfer_kv()` once, waits for the transfers to give back their blocks, then resets.\n  - It calls the new `KVConnectorBase_V1.abort_transfers()` hook. P stops holding finished requests' KV for D, and D asks P to drop loads still in flight. The hook is a no-op by default, MultiConnector fans it out, and Mooncake implements it.\n- **Single entry point.** This lives in one place, `EngineCoreProc._when_idle`. A resume fails any such operation still pending.\n- **Keep pauses do not wait for exports.**\n- **The reset recomputes waiting requests that hold KV**, including arrived remote loads. `reset_prefix_cache(reset_running_requests=True)` returns `False` instead of raising while transfers hold blocks.\n\n**[Core][KV Connector] Recompute remote loads cut short by a cache reset.** A D request whose KV was still arriving is no longer aborted. Its load is ended early and marked as a failed load with 0 computed tokens, so it recomputes after resume through the existing failed-load recovery, under either `kv_load_failure_policy`. This is like SGLang's retract, with D recomputing. RL rollouts in flight survive a weight update.\n\n**[Examples][Mooncake] Stop the decode stream when its prefill request fails.** The example proxy no longer leaves D waiting 480 s for KV that a failed P request never sends.\n\nNIXL keeps the default no-op hook: D reads one-sided and cannot see a revoked lease, so P waits out its 30 s lease. The in-process engine cannot wait for transfers; its cache reset fails while they hold blocks, as on main.\n\n## Test Plan\n\n- Unit:\n  - `test_mooncake_connector.py`: release/restore cycle for each role; waits for blocks ready to send and for a pull in flight, including one still querying the bootstrap server; an expired send or a notify-only pull does not block; timeout with its message, including a wedged transfer loop; idempotence.\n  - `test_config.py`: startup gate for each connector, with and without sleep mode, including the Mooncake protocol and `MultiConnector` combinations (model-free, CPU).\n  - `test_sleep_mode_backend.py`: the worker releases before unmap and restores after map, only when the KV cache is involved.\n  - `test_multi_connector.py`: release/restore are forwarded to every child.\n  - Mutation check: reverting each piece of the change makes at least one test fail.\n- Hardware, 1P1D, Mooncake over RDMA, outputs compared with the awake run (greedy, 30 requests after every wake):\n  - 2× GB300 nodes (P and D on different nodes, RoCE 400G), Qwen3-8B, Mooncake 0.3.13.post1 and v0.3.14-rc1;\n  - H200 single node, Qwen3-0.6B.\n\n## Test Result\n\nPD + RL lifecycle (last four commits):\n- **Hardware matrix:** GB300 1P1D Mooncake RDMA, Qwen3-8B, 27 cases under load (600 requests, concurrency 96, client disconnects). Cases: pause abort/wait/keep on P, D and both (with and without `clear_cache`), sleep L0/L1/L2, `abort_requests`, `reset_prefix_cache`, `release_kv_cache_memory`, in-place weight reload, client disconnects.\n  - This head on `ce49174247`: **27/27**, before and after the recompute commit.\n  - The same commits on main `18f8f96`: 27/27 on every revision.\n  - Main with the earlier commits: 6/22.\n  - NIXL: 19/19 (P pause bounded by its 30 s lease).\n- **Unit:** scheduler, engine core, Mooncake, MultiConnector and NIXL suites.\n  - 561 pass on `18f8f96`, including the NIXL suites. The rest fail identically without these commits (single GPU, gated models).\n  - 31/31 mutations caught.\n- **Review:** 6 rounds by three independent reviewers; all approve.\n\nSleep mode (earlier commits):\n\n- Unit (GB300 container, main `ce49174247` + this PR; config, Mooncake, MultiConnector, worker sleep mode and MoRIIO unit tests): 278 passed, 25 skipped, 2 failed. Both failures also happen without this PR: one needs a gated HF model, the other needs `ray`. The Mooncake and config tests were repeated 5 times with no flakes (160 passed each time).\n- Mutation check: 19 mutants, all killed.\n- Hardware, GB300 cross-node, both Mooncake versions:\n  - Sleep D, sleep P, or sleep both, 3 cycles each; selective wake in both orders; `release_kv_cache_memory`; P sleeping while D pulls under load: 30/30 after every wake, 0 failed transfers.\n  - Level 2 + `reload_weights` on D and on P: 30/30.\n  - TP2 P + TP2 D: 30/30, 0 failed transfers. Main gives 0/30 here with no error.\n  - `OffloadingConnector`, `SimpleCPUOffloadConnector`, and `MultiConnector(Mooncake + Offloading)` with sleep mode: start and match the control after every wake.\n  - Startup: NIXL, Mooncake over TCP, and Multi(Mooncake + NIXL) are refused before the model loads. Example, Offloading, Multi(Mooncake + Offloading), and NIXL without sleep mode start.\n  - GPU memory: 2,077 MiB asleep and 85,101 MiB awake, the same in every cycle.\n- H200: the registrations are deleted on sleep and created again on wake. 30/30 after every wake, including selective wake and `release_kv_cache_memory`.\n- At scale, this head (`d4bd6a6448`), GB300 cross-node, Mooncake 0.3.13.post1 over RDMA. Cycles rotate D, P and both, alternating full and selective wake:\n  - DeepSeek-V4-Flash, P TP4 + D TP4: 30/30 cycles. 900/900 probes after wake match the awake run, and 4,480/4,480 load requests (64-256 concurrent) succeed. 17,886 transfers, 0 failed. Asleep 8.2 GiB/GPU every cycle, no drift.\n  - Qwen3-8B 1P1D: 200/200 cycles. 600/600 probes match, and 29,760/29,760 load requests succeed. 22,278 transfers, 0 failed, no GPU drift.\n  - On main, the same V4-Flash setup keeps the KV cache pinned while asleep (198 GiB/GPU still in use), and the first wake runs out of GPU memory.\n- V4-Flash single node, P TP2 + D TP2, Mooncake 0.3.13.post1 and 0.3.14-rc1: sleep D / P / both ×3, selective wake in both orders, `release_kv_cache_memory` on D / P / both, and P `sleep(mode=wait)` under 128-concurrent load. 30/30 after every wake (36/36 rounds), 0 failed transfers, no GPU-memory drift.\n- Known: after D wakes, P's first write can hit the stale remote key once. Mooncake then refreshes it and retries, and outputs stay correct. The first request takes up to 3.3 s (TP2, GB300), about 1.5 s (V4-Flash TP4) or about 5 s (H200, Mooncake 0.3.13); on GB300 at TP1 it was not seen.\n\n---\nThis PR contains AI-assisted code (Claude Code); commits carry a `Co-authored-by` trailer.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+      "changedFiles": 14,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--59625.org.readthedocs.build/en/59625/",
+            "createdAt": "2026-10-01T15:08:36Z",
+            "databaseId": 5934263637,
+            "updatedAt": "2026-10-01T15:08:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-5934263637"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-02T02:18:16Z",
+            "databaseId": 5944381627,
+            "updatedAt": "2026-10-02T02:18:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-5944381627"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--59625.org.readthedocs.build/en/59625/",
+            "createdAt": "2026-10-04T08:33:07Z",
+            "databaseId": 5978141856,
+            "updatedAt": "2026-10-04T08:33:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-5978141856"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-06T21:28:15Z",
+            "databaseId": 6025786409,
+            "updatedAt": "2026-10-06T21:28:15Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6025786409"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "andakai"
+            },
+            "body": "I've narrowed this PR to sleep mode support only, moving out the Mooncake sender rewrite and the core changes. Mooncake now unregisters its RDMA KV registration before sleep and re-registers it after wake-up, and unsupported connectors are refused at startup. No Mooncake-side wait is needed, since sleep only proceeds once every KV block is freed, i.e. after in-flight P/D transfers finish.\r\n\r\n## Purpose\r\n\r\nSleep mode with `MooncakeConnector` is broken on main. Sleep remaps the KV cache to new physical pages at the same virtual addresses, but Mooncake's RDMA registration keeps pointing at the old pages: after a wake, P/D outputs are silently wrong, and the old pages stay pinned (wake-up can run out of memory).\r\n\r\nThis PR supports sleep mode for `MooncakeConnector` over RDMA and refuses it at startup for connectors that cannot follow the remap.\r\n\r\n## Test Result\r\n\r\n1P1D on H200, Qwen3-0.6B, Mooncake 0.3.13.post1 over RDMA:\r\n\r\n| | main (`bc3ddb198a`) | this PR |\r\n|---|---|---|\r\n| 30 prompts after sleep/wake of D, P, both (3 cycles each) | 0/30, no errors | 30/30 |\r\n| Slept GPU memory (awake → asleep → after wake, MiB) | 57,783 → 55,619 → 112,319 | 57,783 → 801 → 57,541 |\r\n| gsm8k with `SLEEP_WAKE=1` | `/wake_up` out of memory | 0.4223 (same as without sleep) |\r\n\r\n- Sleep with transfers in flight (64 × 2048-token prompts): P asleep while holding KV for D waits until D has pulled it, all 64 D outputs correct; D asleep with pulls in flight aborts them; 64/64 after wake-up in both cases.\r\n\r\n---\r\n\r\nAI assistance (Claude Code) was used for this PR; I reviewed the changes and ran the tests listed above.",
+            "createdAt": "2026-10-13T09:59:16Z",
+            "databaseId": 6143049824,
+            "updatedAt": "2026-10-13T09:59:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6143049824"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "andakai"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-13T15:33:24Z",
+            "databaseId": 6149174571,
+            "updatedAt": "2026-10-13T15:33:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6149174571"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "❌ @andakai, Only reviewers with write access can use CI commands before CI is delegated to the PR author.\n\n<!-- vllm-ci-command:6149174571 -->",
+            "createdAt": "2026-10-13T15:34:04Z",
+            "databaseId": 6149187288,
+            "updatedAt": "2026-10-13T15:34:04Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6149187288"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-13T22:47:21Z",
+            "databaseId": 6156834550,
+            "updatedAt": "2026-10-13T22:47:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6156834550"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94620](https://buildkite.com/vllm/ci/builds/94620) for commit `4d45158a3fca`.",
+            "createdAt": "2026-10-13T22:47:43Z",
+            "databaseId": 6156839609,
+            "updatedAt": "2026-10-13T22:47:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6156839609"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-14T04:05:00Z",
+            "databaseId": 6160633499,
+            "updatedAt": "2026-10-14T04:05:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6160633499"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #94620](https://buildkite.com/vllm/ci/builds/94620).",
+            "createdAt": "2026-10-14T04:05:19Z",
+            "databaseId": 6160637047,
+            "updatedAt": "2026-10-14T04:05:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6160637047"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW8z3Hc=",
+          "hasNextPage": false
+        },
+        "totalCount": 11
+      },
+      "headRefOid": "4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "headRepository": {
+        "nameWithOwner": "aoshen02/vllm"
+      },
+      "mergeCommit": {
+        "oid": "3ccc0a90b67321bee83a17c9d50f881452057995"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-14T04:18:48Z",
+      "number": 59625,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "andakai"
+            },
+            "body": "Generally LGTM! I have tested and it works well. \n\nOne point to discuss about: on main, P waits for D to pull the KV. With this PR, P drops it and D fails those requests under the default `kv_load_failure_policy=\"fail\"`. In a 1P1D test that pauses only P (mode=\"wait\") after its prefills finish and before D pulls the KV, main succeeds on 64/64 requests and this PR fails. Should `mode=\"wait\"` keep main’s behavior here?",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "andakai"
+                  },
+                  "body": "This function only unregisters the kvcache, can confuse with `release_kv_cache_memory`? Maybe all rename to `unregister_kv_caches()`?",
+                  "createdAt": "2026-10-11T16:15:14Z",
+                  "databaseId": 4242271613,
+                  "diffHunk": "@@ -251,6 +262,14 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):\n         for c in self._connectors:\n             c.register_kv_caches(kv_caches)\n \n+    def release_kv_caches(self) -> None:\n+        for c in self._connectors:\n+            c.release_kv_caches()",
+                  "line": null,
+                  "originalLine": 267,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+                  "updatedAt": "2026-10-11T16:21:22Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4242271613"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "andakai"
+                  },
+                  "body": "pull may be None when passed to asyncio.wait",
+                  "createdAt": "2026-10-11T16:21:10Z",
+                  "databaseId": 4242290575,
+                  "diffHunk": "@@ -1659,43 +1730,192 @@ async def test_kv_consumuer(monkeypatch):\n \n \n @pytest.mark.asyncio\n-async def test_worker_get_finished_timeout(monkeypatch):\n-    \"\"\"Tests the cleanup mechanism for requests.\"\"\"\n+@pytest.mark.parametrize(\n+    (\"events\", \"pull_ok\", \"freed\"),\n+    [\n+        ([\"claim\", \"ready\", \"pull\"], True, True),\n+        ([\"claim\", \"pull\", \"ready\"], True, True),\n+        ([\"claim\", \"pull\", \"abort\"], False, False),\n+        ([\"abort\", \"pull\"], False, False),\n+        ([\"pull\", \"expire\"], False, False),\n+        ([\"claim\", \"ready\", \"expire\"], None, True),\n+        ([\"claim\", \"expire\", \"pull\"], None, False),\n+        ([\"claim\", \"ready\", \"release\"], None, True),\n+        ([\"claim\", \"pull\", \"release\", \"ready\"], False, True),\n+        ([\"release\", \"claim\", \"ready\", \"pull\"], False, True),\n+        ([\"claim\", \"release\", \"expire\", \"ready\"], None, True),\n+        ([\"claim\", \"ready\", \"failing-pull\"], None, True),\n+        ([\"claim\", \"ready\", \"abort-all\"], None, True),\n+        ([\"claim\", \"pull\", \"abort-all\"], None, False),\n+        ([\"claim\", \"ready\", \"busy\", \"pull\", \"abort\", \"free\"], False, True),\n+        ([\"claim\", \"ready\", \"busy\", \"abort\", \"pull\"], False, True),\n+        ([\"claim\", \"abort\", \"neighbor\", \"busy\", \"pull\"], False, False),\n+        ([\"claim\", \"ready\", \"late-resume\", \"pull\"], False, True),\n+        (\n+            [\"claim\", \"ready\", \"busy\", \"short-timeout\", \"pull\", \"answered\"],\n+            False,\n+            False,\n+        ),\n+        (\n+            [\"claim\", \"ready\", \"slow-send\", \"pull\", \"writing\", \"abort\", \"write-ends\"],\n+            True,\n+            True,\n+        ),\n+    ],\n+    ids=[\n+        \"ready-then-pull\",\n+        \"pull-waits-for-ready\",\n+        \"abort-wakes-waiting-pull\",\n+        \"pull-after-unclaimed-abort\",\n+        \"unclaimed-pull-expires\",\n+        \"unpulled-kv-expires\",\n+        \"claimed-never-expires\",\n+        \"release-frees-ready-kv\",\n+        \"release-wakes-pull-then-frees-on-ready\",\n+        \"release-before-claim\",\n+        \"release-outlives-expiry-while-claimed\",\n+        \"failed-send-frees-kv\",\n+        \"abort-all-frees-ready-kv\",\n+        \"abort-all-spares-unfinished\",\n+        \"pull-waiting-for-a-sender-stays-abortable\",\n+        \"aborted-pull-answered-while-senders-are-busy\",\n+        \"aborted-pull-answered-before-its-batch-writes\",\n+        \"pull-resumed-past-its-deadline-never-writes\",\n+        \"pull-times-out-while-senders-are-busy\",\n+        \"abort-frees-only-after-the-write\",\n+    ],\n+)\n+async def test_send_state_answers_every_pull_once(monkeypatch, events, pull_ok, freed):\n+    \"\"\"In any order of P's scheduler, D's pulls and releases, and expiry, a pull\n+    gets one prompt answer and P frees ready blocks once nothing reads them.\"\"\"\n+    monkeypatch.setenv(\"VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\", \"60\")\n     vllm_config = create_vllm_config(\n         kv_connector=\"MooncakeConnector\", kv_role=\"kv_producer\"\n     )\n     with set_current_vllm_config(vllm_config), patch_worker_dependencies():\n-        prefill_connector = MooncakeConnector(\n-            vllm_config,\n-            KVConnectorRole.WORKER,\n-            _make_test_kv_cache_config(),\n-        )\n-        prefill_worker = prefill_connector.connector_worker\n-\n-        # Add an expired request (expire_time is in the past).\n-        prefill_worker.reqs_need_send[\"tx-expired\"] = SendBlockMeta(\n-            p_req_id=\"p-req-expired\",\n-            transfer_id=\"tx-expired\",\n-            local_block_ids=[[1, 2]],\n-            ready=MagicMock(),\n-            expire_time=time.perf_counter() - 100,\n+        worker = MooncakeConnector(\n+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()\n+        ).connector_worker\n+        worker.kv_caches_base_addr = [0x1000]\n+        worker.block_len_per_layer = worker.kv_block_len_per_layer = [4096]\n+        worker.registered_layer_names = [\"model.layers.0.self_attn\"]\n+        worker.registered_layer_indices = [0]\n+        sender_loop, worker.sender_loop = worker.sender_loop, asyncio.get_running_loop()\n+        worker._send_slots = asyncio.Semaphore(1)\n+        region = _region(\n+            0x2000, block_len=4096, row_offset=-1, layer_name=\"model.layers.0.self_attn\"\n         )\n-\n-        # Add a non-expired request.\n-        prefill_worker.reqs_need_send[\"tx-active\"] = SendBlockMeta(\n-            p_req_id=\"p-req-active\",\n-            transfer_id=\"tx-active\",\n-            local_block_ids=[[3, 4]],\n-            ready=MagicMock(),\n-            expire_time=time.perf_counter() + 100,\n+        xfer_meta = _xfer_meta([region], {\"d-req\": (\"tx\", [[20, 21]])})\n+        release_meta = _xfer_meta([region], {\"d-rel\": (\"tx\", [])})\n+        sock = AsyncMock(spec=zmq.asyncio.Socket)\n+        sock.send_multipart = AsyncMock()\n+        pull, freed_reqs = None, set()\n+        write_started, write_may_end = threading.Event(), threading.Event()\n+        take_sender = worker._send_slots.acquire\n+\n+        async def acquire_then_stall() -> bool:\n+            # The sender is free, but the event loop resumes the pull late.\n+            await take_sender()\n+            now[0] += 61\n+            return True\n+\n+        def slow_write(*_) -> int:\n+            write_started.set()\n+            write_may_end.wait(5)\n+            return 0\n+\n+        now = [time.perf_counter()]\n+        monkeypatch.setattr(mooncake_connector.time, \"perf_counter\", lambda: now[0])\n+\n+        def scheduler_meta(blocks=None, aborted=False, abort_all=False):\n+            meta = MooncakeConnectorMetadata()\n+            if blocks is not None:\n+                meta.reqs_to_send[\"p-req\"] = (\"tx\", blocks)\n+            if aborted:\n+                meta.reqs_not_processed = {\"tx\"}\n+            meta.abort_pending_sends = abort_all\n+            return meta\n+\n+        with patch.object(worker, \"_send_blocks\", return_value=0) as send_blocks:\n+            for event in events:\n+                if event == \"claim\":\n+                    await worker.record_send_reqs(scheduler_meta(blocks=[]))\n+                elif event == \"ready\":\n+                    await worker.record_send_reqs(scheduler_meta(blocks=[[10, 11]]))\n+                elif event == \"abort\":\n+                    await worker.record_send_reqs(scheduler_meta(aborted=True))\n+                elif event == \"slow-send\":\n+                    send_blocks.side_effect = slow_write\n+                elif event == \"writing\":\n+                    loop = asyncio.get_running_loop()\n+                    assert await loop.run_in_executor(None, write_started.wait, 5)\n+                elif event == \"write-ends\":\n+                    assert not await worker.fetch_finished_sending_reqs()\n+                    write_may_end.set()\n+                elif event == \"busy\":\n+                    await worker._send_slots.acquire()\n+                elif event == \"neighbor\":\n+                    # Another transfer, ready, pulled in the same message.\n+                    neighbor = MooncakeConnectorMetadata()\n+                    neighbor.reqs_to_send[\"p-other\"] = (\"tx2\", [[12, 13]])\n+                    await worker.record_send_reqs(neighbor)\n+                    xfer_meta.req_blocks[\"d-other\"] = (\"tx2\", [[22, 23]])\n+                elif event == \"late-resume\":\n+                    worker._send_slots.acquire = acquire_then_stall\n+                elif event == \"short-timeout\":\n+                    monkeypatch.setenv(\"VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\", \"1\")\n+                elif event == \"answered\":\n+                    await asyncio.wait([pull], timeout=3)",
+                  "line": null,
+                  "originalLine": 1868,
+                  "path": "tests/v1/kv_connector/unit/test_mooncake_connector.py",
+                  "updatedAt": "2026-10-11T16:21:22Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4242290575"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xMVQxNjoyMToxMFrO_Nw3jw==",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5484000657,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-11T16:21:22Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5484000657"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "aoshen02"
+                  },
+                  "body": "[P2] Support MNNVL sleep/wake fully, or reject the unsupported combination\n\nPlease either refresh peer mappings across MNNVL sleep/wake and validate that path, or reject the combination when sleep mode is enabled.\n\n`MC_USE_TENT=1` (or `MC_USE_TEV1=1`) together with `MC_ENABLE_MNNVL=1` currently passes this check with `mooncake_protocol=\"rdma\"`. In Mooncake 0.3.13, however, [TENT can enable MNNVL](https://github.com/kvcache-ai/Mooncake/blob/v0.3.13/mooncake-transfer-engine/tent/src/runtime/transport_loader.cpp#L77); the protocol string does not guarantee RDMA-only transfers. Its [peer mappings are cached by target and virtual address](https://github.com/kvcache-ai/Mooncake/blob/v0.3.13/mooncake-transfer-engine/tent/src/transport/mnnvl/mnnvl_transport.cpp#L639). After D sleeps and wakes with new physical backing at the same address, a warmed P can therefore keep writing through the old mapping. Local unregister/register does not invalidate that peer cache.\n\nThe smallest scoped fix is to reject these unsupported TENT/MNNVL configurations and add gate regression tests for both TENT selectors. Supporting them instead needs peer-mapping refresh plus a warm-transfer → sleep/wake → transfer correctness test.\n\nI reproduced the gate accepting these configurations on CPU; the stale-mapping risk is based on source inspection, not a GPU reproduction.\n",
+                  "createdAt": "2026-10-13T12:23:36Z",
+                  "databaseId": 4258561168,
+                  "diffHunk": "@@ -800,10 +801,27 @@ def request_finished_all_groups(\n     ############################################################\n     # Worker Side Methods\n     ############################################################\n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        # Only RDMA peers refresh a stale remote key. Either variable, set to any\n+        # value, switches Mooncake to its NVLink transport.\n+        if any(v in os.environ for v in (\"MC_FORCE_MNNVL\", \"MC_INTRANODE_NVLINK\")):\n+            return False\n+        extra_config = kv_transfer_config.kv_connector_extra_config\n+        return extra_config.get(\"mooncake_protocol\", \"rdma\") == \"rdma\"",
+                  "line": null,
+                  "originalLine": 811,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+                  "updatedAt": "2026-10-13T12:23:36Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4258561168"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QxMjoyMzozNlrO_dR8kA==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5503435758,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-13T12:23:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5503435758"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "andakai"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "andakai"
+                  },
+                  "body": "Thanks. Sleep mode is now refused when `MC_USE_TENT` or `MC_USE_TEV1` is set, with a gate test. Full NVLink/TENT support needs Mooncake to invalidate peer mappings, will leave it as a follow-up.",
+                  "createdAt": "2026-10-13T13:39:07Z",
+                  "databaseId": 4259347869,
+                  "diffHunk": "@@ -800,10 +801,27 @@ def request_finished_all_groups(\n     ############################################################\n     # Worker Side Methods\n     ############################################################\n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        # Only RDMA peers refresh a stale remote key. Either variable, set to any\n+        # value, switches Mooncake to its NVLink transport.\n+        if any(v in os.environ for v in (\"MC_FORCE_MNNVL\", \"MC_INTRANODE_NVLINK\")):\n+            return False\n+        extra_config = kv_transfer_config.kv_connector_extra_config\n+        return extra_config.get(\"mooncake_protocol\", \"rdma\") == \"rdma\"",
+                  "line": null,
+                  "originalLine": 811,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+                  "updatedAt": "2026-10-13T13:39:07Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4259347869"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QxMzozOTowN1rO_eB9nQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5504407366,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-13T13:39:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5504407366"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5504517351,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-13T13:46:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5504517351"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZJY0516"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5504540003,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-13T13:48:11Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5504540003"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xM1QxMzo0ODoxMVq0MjAyNi0xMC0xM1QxMzo0ODoxMlrPAAAAAUgYnWM=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "MERGED",
+      "title": "[KV Connector] Support sleep mode with MooncakeConnector over RDMA",
+      "updatedAt": "2026-10-14T04:18:48Z",
+      "url": "https://github.com/vllm-project/vllm/pull/59625"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "78b32b3fdc47cbf097d982aed012fa9874431836"
+    },
+    "body": "## Purpose\n\nSleep mode with `MooncakeConnector` P/D disaggregation is silently wrong on main. Sleep unmaps the KV cache, and wake maps new physical pages at the same addresses. But the RDMA registration still points at the old pages. After a wake, transfers carry stale KV, so outputs are wrong with no error. The old pages also stay pinned.\n\nThis PR makes that combination work, including the pause/sleep lifecycle an RL trainer drives on both P and D. It is self-contained and includes the connector API from #59624.\n\n- **Connector API** (`KVConnectorBase_V1`):\n  - `supports_sleep_mode(kv_transfer_config)`, a classmethod. It defaults to `True` and returns `False` for a connector that hands KV device memory to a NIC or another process and cannot register it again;\n  - `release_kv_caches()` and `restore_kv_caches()`, which are no-ops by default.\n- **Worker**:\n  - `Worker.sleep` and `Worker.discard((\"kv_cache\",))` call `release_kv_caches()` before the KV cache is unmapped;\n  - `Worker.wake_up` calls `restore_kv_caches()` once the KV cache is mapped again.\n- **Config**: with `enable_sleep_mode`, a connector that does not support sleep mode is refused at startup, before any model is loaded. `MultiConnector` supports it only if every child does.\n  - Refused: NIXL and `MoRIIOConnector` (peers keep the stale registration), `MooncakeConnector` with a protocol other than RDMA, and `MooncakeStoreConnector`. On main, the last one gives wrong outputs after a wake and spreads them to other instances through the store; its fix is #59934, stacked on this PR.\n  - Every other connector behaves as before. `LMCacheMPConnector` and `FlexKVConnectorV1` hand the KV cache to another process; they are still accepted, but not verified with sleep mode.\n- **Mooncake sleep**:\n  - supports sleep mode with `mooncake_protocol: rdma` only, where a peer drops a stale remote key on the failed access and looks it up again;\n  - release waits until no ready block is waiting for D (expired sends excluded) and no pull that writes local blocks is in flight. The wait is bounded by `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`. Release then unregisters the KV cache memory;\n  - restore registers the same addresses and sizes again. Both are idempotent.\n\nBehavior change: sleep mode with NIXL, MoRIIO, Mooncake over a protocol other than RDMA, or MooncakeStore now fails at startup instead of silently corrupting KV after a wake. NIXL support is a follow-up (#59635).\n\nKnown limitation: if one TP/PP rank's release times out after the other ranks have already slept, the ranks end up in mixed states. This is the same as any partial sleep failure on main.\n\n### PD + RL lifecycle (last four commits)\n\nAn RL trainer pauses P and D, updates the weights, sleeps or releases KV memory, and resumes. On main plus the commits above, most of these operations fail under load:\n- An abort on P wedges D. P never notified D's waiting pulls, so each waited 480 s while holding one of P's `2 × num_workers` fixed sender tasks.\n- Every operation that resets the KV cache fails with \"Failed to reset KV cache\". Transfers still hold blocks: D's loads, and P's finished requests that D has not pulled yet.\n\n**[KV Connector][Mooncake] Answer every pull and free dropped transfers promptly**\n- **One task per pull.** A pull no longer delays others; it holds blocks only once one of `num_workers` senders is free.\n- **Explicit send state.** P's send state is `WAITING` (request running), `READY` (blocks held for D) or `DONE` (nothing more to send). `_end_send` is the only place that ends a send and frees blocks once no write reads them.\n- **Every pull gets one prompt answer.** This holds whether P aborted the transfer, D released it, it expired, or a send failed.\n- **Bounded pulls.** Each pull has a deadline (the abort timeout from receipt, 60 s before D's), so no write starts after D could give up.\n- **Safe load completion on D.** D asks P to drop a transfer whose request finished mid-load, and ends a load only after every producer answered.\n\n**[Core][KV Connector] Release transfer-held KV before a cache reset**\n- **Release, then reset.** A pause only stops compute. Once idle, an operation that resets the cache (pause with `clear_cache`, sleep, `release_kv_cache_memory`) calls `Scheduler.release_transfer_kv()` once, waits for the transfers to give back their blocks, then resets.\n  - It calls the new `KVConnectorBase_V1.abort_transfers()` hook. P stops holding finished requests' KV for D, and D asks P to drop loads still in flight. The hook is a no-op by default, MultiConnector fans it out, and Mooncake implements it.\n- **Single entry point.** This lives in one place, `EngineCoreProc._when_idle`. A resume fails any such operation still pending.\n- **Keep pauses do not wait for exports.**\n- **The reset recomputes waiting requests that hold KV**, including arrived remote loads. `reset_prefix_cache(reset_running_requests=True)` returns `False` instead of raising while transfers hold blocks.\n\n**[Core][KV Connector] Recompute remote loads cut short by a cache reset.** A D request whose KV was still arriving is no longer aborted. Its load is ended early and marked as a failed load with 0 computed tokens, so it recomputes after resume through the existing failed-load recovery, under either `kv_load_failure_policy`. This is like SGLang's retract, with D recomputing. RL rollouts in flight survive a weight update.\n\n**[Examples][Mooncake] Stop the decode stream when its prefill request fails.** The example proxy no longer leaves D waiting 480 s for KV that a failed P request never sends.\n\nNIXL keeps the default no-op hook: D reads one-sided and cannot see a revoked lease, so P waits out its 30 s lease. The in-process engine cannot wait for transfers; its cache reset fails while they hold blocks, as on main.\n\n## Test Plan\n\n- Unit:\n  - `test_mooncake_connector.py`: release/restore cycle for each role; waits for blocks ready to send and for a pull in flight, including one still querying the bootstrap server; an expired send or a notify-only pull does not block; timeout with its message, including a wedged transfer loop; idempotence.\n  - `test_config.py`: startup gate for each connector, with and without sleep mode, including the Mooncake protocol and `MultiConnector` combinations (model-free, CPU).\n  - `test_sleep_mode_backend.py`: the worker releases before unmap and restores after map, only when the KV cache is involved.\n  - `test_multi_connector.py`: release/restore are forwarded to every child.\n  - Mutation check: reverting each piece of the change makes at least one test fail.\n- Hardware, 1P1D, Mooncake over RDMA, outputs compared with the awake run (greedy, 30 requests after every wake):\n  - 2× GB300 nodes (P and D on different nodes, RoCE 400G), Qwen3-8B, Mooncake 0.3.13.post1 and v0.3.14-rc1;\n  - H200 single node, Qwen3-0.6B.\n\n## Test Result\n\nPD + RL lifecycle (last four commits):\n- **Hardware matrix:** GB300 1P1D Mooncake RDMA, Qwen3-8B, 27 cases under load (600 requests, concurrency 96, client disconnects). Cases: pause abort/wait/keep on P, D and both (with and without `clear_cache`), sleep L0/L1/L2, `abort_requests`, `reset_prefix_cache`, `release_kv_cache_memory`, in-place weight reload, client disconnects.\n  - This head on `ce49174247`: **27/27**, before and after the recompute commit.\n  - The same commits on main `18f8f96`: 27/27 on every revision.\n  - Main with the earlier commits: 6/22.\n  - NIXL: 19/19 (P pause bounded by its 30 s lease).\n- **Unit:** scheduler, engine core, Mooncake, MultiConnector and NIXL suites.\n  - 561 pass on `18f8f96`, including the NIXL suites. The rest fail identically without these commits (single GPU, gated models).\n  - 31/31 mutations caught.\n- **Review:** 6 rounds by three independent reviewers; all approve.\n\nSleep mode (earlier commits):\n\n- Unit (GB300 container, main `ce49174247` + this PR; config, Mooncake, MultiConnector, worker sleep mode and MoRIIO unit tests): 278 passed, 25 skipped, 2 failed. Both failures also happen without this PR: one needs a gated HF model, the other needs `ray`. The Mooncake and config tests were repeated 5 times with no flakes (160 passed each time).\n- Mutation check: 19 mutants, all killed.\n- Hardware, GB300 cross-node, both Mooncake versions:\n  - Sleep D, sleep P, or sleep both, 3 cycles each; selective wake in both orders; `release_kv_cache_memory`; P sleeping while D pulls under load: 30/30 after every wake, 0 failed transfers.\n  - Level 2 + `reload_weights` on D and on P: 30/30.\n  - TP2 P + TP2 D: 30/30, 0 failed transfers. Main gives 0/30 here with no error.\n  - `OffloadingConnector`, `SimpleCPUOffloadConnector`, and `MultiConnector(Mooncake + Offloading)` with sleep mode: start and match the control after every wake.\n  - Startup: NIXL, Mooncake over TCP, and Multi(Mooncake + NIXL) are refused before the model loads. Example, Offloading, Multi(Mooncake + Offloading), and NIXL without sleep mode start.\n  - GPU memory: 2,077 MiB asleep and 85,101 MiB awake, the same in every cycle.\n- H200: the registrations are deleted on sleep and created again on wake. 30/30 after every wake, including selective wake and `release_kv_cache_memory`.\n- At scale, this head (`d4bd6a6448`), GB300 cross-node, Mooncake 0.3.13.post1 over RDMA. Cycles rotate D, P and both, alternating full and selective wake:\n  - DeepSeek-V4-Flash, P TP4 + D TP4: 30/30 cycles. 900/900 probes after wake match the awake run, and 4,480/4,480 load requests (64-256 concurrent) succeed. 17,886 transfers, 0 failed. Asleep 8.2 GiB/GPU every cycle, no drift.\n  - Qwen3-8B 1P1D: 200/200 cycles. 600/600 probes match, and 29,760/29,760 load requests succeed. 22,278 transfers, 0 failed, no GPU drift.\n  - On main, the same V4-Flash setup keeps the KV cache pinned while asleep (198 GiB/GPU still in use), and the first wake runs out of GPU memory.\n- V4-Flash single node, P TP2 + D TP2, Mooncake 0.3.13.post1 and 0.3.14-rc1: sleep D / P / both ×3, selective wake in both orders, `release_kv_cache_memory` on D / P / both, and P `sleep(mode=wait)` under 128-concurrent load. 30/30 after every wake (36/36 rounds), 0 failed transfers, no GPU-memory drift.\n- Known: after D wakes, P's first write can hit the stale remote key once. Mooncake then refreshes it and retries, and outputs stay correct. The first request takes up to 3.3 s (TP2, GB300), about 1.5 s (V4-Flash TP4) or about 5 s (H200, Mooncake 0.3.13); on GB300 at TP1 it was not seen.\n\n---\nThis PR contains AI-assisted code (Claude Code); commits carry a `Co-authored-by` trailer.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+    "changed_files": 14,
+    "head": {
+      "repo": {
+        "full_name": "aoshen02/vllm"
+      },
+      "sha": "4d45158a3fca8fe081ae961ea615965f1e5434cb"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/59625",
+    "merge_commit_sha": "3ccc0a90b67321bee83a17c9d50f881452057995",
+    "merged": true,
+    "merged_at": "2026-10-14T04:18:48Z",
+    "number": 59625,
+    "state": "closed",
+    "title": "[KV Connector] Support sleep mode with MooncakeConnector over RDMA",
+    "updated_at": "2026-10-14T04:18:48Z"
+  },
+  "files": [
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/docs%2Ffeatures%2Fnixl_connector_usage.md",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/docs%2Ffeatures%2Fnixl_connector_usage.md?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 1,
+      "filename": "docs/features/nixl_connector_usage.md",
+      "patch": "@@ -398,7 +398,7 @@ The `kv_load_failure_policy` setting controls how the system handles failures wh\n \n ### For NVIDIA GB-series GPUs\n \n-GB-series GPUs support multi-node NVLink. NIXL supports this capability, but KVCache must be registered as VMM during KVCache registration. To enable this feature, you need to set `--enable-cumem-allocator` or `--enable-sleep-mode` flags, and set `UCX_CUDA_IPC_ENABLE_MNNVL: 'y'` env. Otherwise, NIXL can only use RDMA/TCP for cross-node KVCache transfers.\n+GB-series GPUs support multi-node NVLink. NIXL supports this capability, but KVCache must be registered as VMM during KVCache registration. To enable this feature, you need to set the `--enable-cumem-allocator` flag, and set `UCX_CUDA_IPC_ENABLE_MNNVL: 'y'` env. Otherwise, NIXL can only use RDMA/TCP for cross-node KVCache transfers.\n \n ## Experimental Feature\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/docs%2Ffeatures%2Fnixl_connector_usage.md",
+      "sha": "4402095b2ec17d4aa812cd0cd8eac56c6e19135f",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Fconfig_sweep_accuracy_test.sh",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Fconfig_sweep_accuracy_test.sh?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/mooncake_integration/config_sweep_accuracy_test.sh",
+      "patch": "@@ -13,6 +13,7 @@ python3 -m pytest -s -x \"${IMPORT_CANARY}\"\n tp_configs=(\n   \"GPU_MEMORY_UTILIZATION=0.6 PREFILLER_TP_SIZE=1 DECODER_TP_SIZE=1\"\n   \"GPU_MEMORY_UTILIZATION=0.6 PREFILLER_TP_SIZE=2 DECODER_TP_SIZE=2\"\n+  \"GPU_MEMORY_UTILIZATION=0.6 PREFILLER_TP_SIZE=1 DECODER_TP_SIZE=1 SLEEP_WAKE=1\"\n )\n \n configs=(\"${tp_configs[@]}\")",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Fconfig_sweep_accuracy_test.sh",
+      "sha": "2779806dc9f336346d526a0cf65c64c8b7a28e80",
+      "status": "modified"
+    },
+    {
+      "additions": 15,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Frun_accuracy_test.sh",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Frun_accuracy_test.sh?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 1,
+      "filename": "tests/v1/kv_connector/mooncake_integration/run_accuracy_test.sh",
+      "patch": "@@ -59,6 +59,12 @@ GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.2}\n BLOCK_SIZE=${BLOCK_SIZE:-128}\n # Comma-separated extra args for vllm serve (e.g. --max-model-len,2048)\n VLLM_SERVE_EXTRA_ARGS=${VLLM_SERVE_EXTRA_ARGS:-}\n+# Set to 1 to put every instance to sleep and wake it up before the eval.\n+SLEEP_WAKE=${SLEEP_WAKE:-0}\n+if [[ \"$SLEEP_WAKE\" == \"1\" ]]; then\n+  export VLLM_SERVER_DEV_MODE=1\n+  VLLM_SERVE_EXTRA_ARGS=\"${VLLM_SERVE_EXTRA_ARGS:+${VLLM_SERVE_EXTRA_ARGS},}--enable-sleep-mode\"\n+fi\n \n # Resolve the repository root from the script location instead of `.git`.\n SCRIPT_DIR=\"$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")\" && pwd -P)\"\n@@ -226,9 +232,17 @@ run_tests_for_model() {\n   # Wait for the proxy to start\n   sleep 5\n \n+  SLEEP_WAKE_URLS=\"\"\n+  if [[ \"$SLEEP_WAKE\" == \"1\" ]]; then\n+    for PORT in \"${PREFILL_PORTS[@]}\" \"${DECODE_PORTS[@]}\"; do\n+      SLEEP_WAKE_URLS=\"${SLEEP_WAKE_URLS:+${SLEEP_WAKE_URLS},}http://localhost:${PORT}\"\n+    done\n+  fi\n+\n   # Run lm eval for this model\n   echo \"Running tests for $model_name\"\n-  TEST_MODEL=$model_name PROXY_PORT=$PROXY_PORT python3 -m pytest -s -x \\\n+  TEST_MODEL=$model_name PROXY_PORT=$PROXY_PORT SLEEP_WAKE_URLS=$SLEEP_WAKE_URLS \\\n+    python3 -m pytest -s -x \\\n     \"${GIT_ROOT}/tests/v1/kv_connector/mooncake_integration/test_accuracy.py\"\n \n   # Clean up before running next model",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Frun_accuracy_test.sh",
+      "sha": "8290bd655bdd5dda3434325589e05ef41052bf2d",
+      "status": "modified"
+    },
+    {
+      "additions": 14,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Ftest_accuracy.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Ftest_accuracy.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/mooncake_integration/test_accuracy.py",
+      "patch": "@@ -4,8 +4,13 @@\n \n import lm_eval\n import openai\n+import requests\n \n BASE_URL = f\"http://localhost:{os.environ.get('PROXY_PORT', 8192)}/v1\"\n+# Comma-separated server URLs to sleep and wake up before the eval.\n+SLEEP_WAKE_URLS = [\n+    url for url in os.environ.get(\"SLEEP_WAKE_URLS\", \"\").split(\",\") if url\n+]\n NUM_CONCURRENT = 100\n TASK = \"gsm8k\"\n FILTER = \"exact_match,strict-match\"\n@@ -35,9 +40,18 @@ def run_simple_prompt():\n     print(\"-\" * 50)\n \n \n+def sleep_and_wake_up(urls: list[str]):\n+    for url in urls:\n+        requests.post(f\"{url}/sleep\", params={\"level\": 1}).raise_for_status()\n+    for url in urls:\n+        requests.post(f\"{url}/wake_up\").raise_for_status()\n+\n+\n def test_accuracy():\n     \"\"\"Run the end to end accuracy test.\"\"\"\n     run_simple_prompt()\n+    if SLEEP_WAKE_URLS:\n+        sleep_and_wake_up(SLEEP_WAKE_URLS)\n \n     model_args = (\n         f\"model={MODEL_NAME},\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Fmooncake_integration%2Ftest_accuracy.py",
+      "sha": "0168471bd19c1f06938f9c1af17214c976a30c9f",
+      "status": "modified"
+    },
+    {
+      "additions": 28,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_config.py",
+      "changes": 30,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_config.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 2,
+      "filename": "tests/v1/kv_connector/unit/test_config.py",
+      "patch": "@@ -101,6 +101,7 @@ def test_kv_connector(\n def _build_config(\n     *,\n     kv_connector: str | None,\n+    kv_connector_extra_config: dict | None = None,\n     enable_sleep_mode: bool = False,\n     enable_cumem_allocator: bool = False,\n ) -> VllmConfig:\n@@ -109,7 +110,11 @@ def _build_config(\n     from types import SimpleNamespace\n \n     kv_transfer_config = (\n-        KVTransferConfig(kv_connector=kv_connector, kv_role=\"kv_both\")\n+        KVTransferConfig(\n+            kv_connector=kv_connector,\n+            kv_role=\"kv_both\",\n+            kv_connector_extra_config=kv_connector_extra_config or {},\n+        )\n         if kv_connector is not None\n         else None\n     )\n@@ -141,7 +146,7 @@ def test_kv_connector_allows_expandable_segments_with_sleep_mode(monkeypatch):\n     \"\"\"Sleep mode routes KV allocations through CuMemAllocator's pool, which\n     auto-disables expandable_segments (see #40812).\"\"\"\n     monkeypatch.setenv(\"PYTORCH_CUDA_ALLOC_CONF\", \"expandable_segments:True\")\n-    _build_config(kv_connector=\"NixlConnector\", enable_sleep_mode=True)\n+    _build_config(kv_connector=\"MooncakeConnector\", enable_sleep_mode=True)\n \n \n def test_kv_connector_allows_expandable_segments_with_cumem_allocator(\n@@ -152,6 +157,27 @@ def test_kv_connector_allows_expandable_segments_with_cumem_allocator(\n     _build_config(kv_connector=\"NixlConnector\", enable_cumem_allocator=True)\n \n \n+@pytest.mark.parametrize(\n+    (\"kv_connector\", \"extra_config\", \"env\"),\n+    [\n+        (\"NixlConnector\", {}, None),\n+        (\"MooncakeConnector\", {\"mooncake_protocol\": \"tcp\"}, None),\n+        (\"MooncakeConnector\", {}, \"MC_USE_TENT\"),\n+    ],\n+)\n+def test_sleep_mode_refuses_unsupported_kv_connector(\n+    monkeypatch, kv_connector, extra_config, env\n+):\n+    if env:\n+        monkeypatch.setenv(env, \"1\")\n+    with pytest.raises(ValueError, match=f\"^{kv_connector} does not support sleep\"):\n+        _build_config(\n+            kv_connector=kv_connector,\n+            kv_connector_extra_config=extra_config,\n+            enable_sleep_mode=True,\n+        )\n+\n+\n def test_kv_connector_allows_other_alloc_conf(monkeypatch):\n     \"\"\"Other PYTORCH_CUDA_ALLOC_CONF values must not be rejected.\"\"\"\n     monkeypatch.setenv(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_config.py",
+      "sha": "ad9bd18567062dda1139902a605a9d402a6b5475",
+      "status": "modified"
+    },
+    {
+      "additions": 29,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_mooncake_connector.py",
+      "changes": 29,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_mooncake_connector.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/test_mooncake_connector.py",
+      "patch": "@@ -232,6 +232,9 @@ def batch_transfer_sync_write(\n     def batch_register_memory(self, buffer_addresses, capacities) -> int:\n         return 0\n \n+    def batch_unregister_memory(self, buffer_addresses) -> int:\n+        return 0\n+\n \n def test_align_transfer_regions_uses_layer_name_occurrences():\n     \"\"\"Repeated layer names should align by occurrence order.\"\"\"\n@@ -2574,3 +2577,29 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):\n \n         prefill_worker.sender_loop = origin_sender_loop\n         prefill_worker.shutdown()\n+\n+\n+def test_sleep_unregisters_and_restores_kv_caches():\n+    spec = FullAttentionSpec(\n+        block_size=maybe_update_block_size(16),\n+        num_kv_heads=4,\n+        head_size=64,\n+        dtype=torch.float16,\n+    )\n+    layer_names = [\"model.layers.0.self_attn\", \"model.layers.1.self_attn\"]\n+    with mooncake_register_worker(_make_test_kv_cache_config()) as (worker, reg):\n+        for layer_name in layer_names:\n+            worker._layer_specs[layer_name] = spec\n+        raw = torch.zeros(2 * 2 * spec.page_size_bytes, dtype=torch.int8)\n+        views = dense_kv_cache_views(raw, spec, 2, 2, KVCacheLayout.LBHNC)\n+        worker.register_kv_caches(dict(zip(layer_names, views)))\n+        reg.reset_mock()\n+        with patch.object(\n+            worker.engine, \"batch_unregister_memory\", return_value=0\n+        ) as unreg:\n+            worker.unregister_kv_caches()\n+            worker.unregister_kv_caches()\n+        unreg.assert_called_once_with([raw.data_ptr()])\n+        worker.restore_kv_caches()\n+        worker.restore_kv_caches()\n+        reg.assert_called_once_with([raw.data_ptr()], [raw.nbytes])",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_mooncake_connector.py",
+      "sha": "2cbb9cc6705a54864de33d78007dc4e24418fb7c",
+      "status": "modified"
+    },
+    {
+      "additions": 15,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fconfig%2Fvllm.py",
+      "changes": 15,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fconfig%2Fvllm.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 0,
+      "filename": "vllm/config/vllm.py",
+      "patch": "@@ -1199,6 +1199,21 @@ def _verify_kv_transfer_compat(self) -> None:\n         ):\n             return\n \n+        if self.model_config is not None and self.model_config.enable_sleep_mode:\n+            # Lazy import to avoid circular dependencies\n+            from vllm.distributed.kv_transfer.kv_connector.factory import (\n+                KVConnectorFactory,\n+            )\n+\n+            connector_cls = KVConnectorFactory.get_connector_class(\n+                self.kv_transfer_config\n+            )\n+            if not connector_cls.supports_sleep_mode(self.kv_transfer_config):\n+                raise ValueError(\n+                    f\"{self.kv_transfer_config.kv_connector} does not support \"\n+                    \"sleep mode.\"\n+                )\n+\n         # PyTorch's expandable_segments allocator uses CUDA VMM, which can\n         # remap a virtual address range to different physical pages over the\n         # engine's lifetime. KV connectors that pin KV cache memory (e.g.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fconfig%2Fvllm.py",
+      "sha": "39015d4c32e6b76f51cd46aac9b867509c4754ee",
+      "status": "modified"
+    },
+    {
+      "additions": 15,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fbase.py",
+      "changes": 15,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fbase.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 0,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "patch": "@@ -56,6 +56,7 @@\n \n if TYPE_CHECKING:\n     from vllm.config import VllmConfig\n+    from vllm.config.kv_transfer import KVTransferConfig\n     from vllm.distributed.kv_events import KVCacheEvent, KVConnectorKVEvents\n     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (\n         KVConnectorPromMetrics,\n@@ -205,6 +206,11 @@ def requires_kv_delivery(self) -> bool:\n         \"\"\"\n         return self._kv_transfer_config.is_kv_producer\n \n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: \"KVTransferConfig\") -> bool:\n+        \"\"\"Whether the connector can follow the KV cache remap of sleep mode.\"\"\"\n+        return True\n+\n     def __init__(\n         self,\n         vllm_config: \"VllmConfig\",\n@@ -293,6 +299,15 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):\n         \"\"\"\n         return\n \n+    def unregister_kv_caches(self) -> None:\n+        \"\"\"Drop KV cache registrations before sleep. Transfers are already\n+        drained. Idempotent.\"\"\"\n+        return\n+\n+    def restore_kv_caches(self) -> None:\n+        \"\"\"Redo `unregister_kv_caches` after wake-up. Idempotent.\"\"\"\n+        return\n+\n     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):\n         \"\"\"Set the xPU-specific ops for copying KV between host and device.\n         Needed when host buffer is used for kv transfer (e.g., in NixlConnector)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fbase.py",
+      "sha": "8997571407d5c327fb9e35d709c2e43a1942f537",
+      "status": "modified"
+    },
+    {
+      "additions": 47,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fmooncake_connector.py",
+      "changes": 48,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fmooncake_connector.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 1,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+      "patch": "@@ -3,6 +3,7 @@\n import asyncio\n import itertools\n import logging\n+import os\n import queue\n import threading\n import time\n@@ -21,7 +22,7 @@\n from huggingface_hub.utils import httpx\n \n from vllm import envs\n-from vllm.config import VllmConfig\n+from vllm.config import KVTransferConfig, VllmConfig\n from vllm.distributed.kv_transfer.kv_connector.utils import (\n     EngineId,\n     TransferTopology,\n@@ -800,10 +801,34 @@ def request_finished_all_groups(\n     ############################################################\n     # Worker Side Methods\n     ############################################################\n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        # Sleep mode is only validated over RDMA, not NVLink or TENT.\n+        if any(\n+            v in os.environ\n+            for v in (\n+                \"MC_FORCE_MNNVL\",\n+                \"MC_INTRANODE_NVLINK\",\n+                \"MC_USE_TENT\",\n+                \"MC_USE_TEV1\",\n+            )\n+        ):\n+            return False\n+        extra_config = kv_transfer_config.kv_connector_extra_config\n+        return extra_config.get(\"mooncake_protocol\", \"rdma\") == \"rdma\"\n+\n     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):\n         assert self.connector_worker is not None\n         self.connector_worker.register_kv_caches(kv_caches)\n \n+    def unregister_kv_caches(self) -> None:\n+        assert self.connector_worker is not None\n+        self.connector_worker.unregister_kv_caches()\n+\n+    def restore_kv_caches(self) -> None:\n+        assert self.connector_worker is not None\n+        self.connector_worker.restore_kv_caches()\n+\n     def get_finished(\n         self, finished_req_ids: set[str]\n     ) -> tuple[set[str] | None, set[str] | None]:\n@@ -1239,6 +1264,8 @@ def __init__(\n         self.region_row_offsets: list[int] = []\n         self.opaque_packed_storages: set[int] = set()\n         self.seen_base_addresses: list[int] = []\n+        self._kv_data_lens: list[int] = []\n+        self._kv_unregistered = False\n         # Aligned regions depend only on the peer's registered layout.\n         # The third item is an error string when alignment cannot proceed.\n         self._prepared_transfer_regions: dict[\n@@ -2156,6 +2183,7 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):\n \n         self.kv_caches_base_addr = region_base_addresses\n         self.seen_base_addresses = kv_data_ptrs\n+        self._kv_data_lens = kv_data_lens\n \n         if not kv_data_ptrs:\n             raise RuntimeError(\"No KV cache tensors were registered with Mooncake.\")\n@@ -2211,6 +2239,24 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):\n                     f\"{ready_timeout:.0f}s.\"\n                 )\n \n+    def unregister_kv_caches(self) -> None:\n+        if self._kv_unregistered or not self.seen_base_addresses:\n+            return\n+        ret_value = self.engine.batch_unregister_memory(self.seen_base_addresses)\n+        if ret_value != 0:\n+            raise RuntimeError(\"Mooncake batch memory unregistration failed.\")\n+        self._kv_unregistered = True\n+\n+    def restore_kv_caches(self) -> None:\n+        if not self._kv_unregistered:\n+            return\n+        ret_value = self.engine.batch_register_memory(\n+            self.seen_base_addresses, self._kv_data_lens\n+        )\n+        if ret_value != 0:\n+            raise RuntimeError(\"Mooncake batch memory registration failed.\")\n+        self._kv_unregistered = False\n+\n     async def fetch_finished_recving_reqs(self) -> set[ReqId]:\n         finished_recving_reqs = self.finished_recving_reqs\n         self.finished_recving_reqs = set()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fmooncake_connector.py",
+      "sha": "bc70d7cba8a8a7d2b6172904c896c1ac2511f5b1",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fstore%2Fconnector.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fstore%2Fconnector.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 1,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py",
+      "patch": "@@ -18,7 +18,7 @@\n \n import torch\n \n-from vllm.config import VllmConfig\n+from vllm.config import KVTransferConfig, VllmConfig\n from vllm.distributed.kv_events import (\n     BlockStored,\n     KVCacheEvent,\n@@ -127,6 +127,10 @@ def __repr__(self) -> str:\n class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):\n     \"\"\"KV connector using MooncakeDistributedStore as shared KV pool.\"\"\"\n \n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        return False\n+\n     @staticmethod\n     def _validate_kv_cache_config(\n         vllm_config: VllmConfig, kv_cache_config: KVCacheConfig",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fstore%2Fconnector.py",
+      "sha": "a1e28b97d06a59367959a0c6d46aeabd116a3f2b",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmoriio%2Fmoriio_connector.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmoriio%2Fmoriio_connector.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 1,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py",
+      "patch": "@@ -16,7 +16,7 @@\n import torch\n import zmq\n \n-from vllm.config import CUDAGraphMode, VllmConfig\n+from vllm.config import CUDAGraphMode, KVTransferConfig, VllmConfig\n from vllm.distributed.kv_transfer.kv_connector.utils import (\n     BlockIds,\n     clip_ssm_state_blocks,\n@@ -229,6 +229,10 @@ def resolve_moriio_transfer_ack(\n class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):\n     _cache_hit_source = CacheHitSource.P2P\n \n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        return False\n+\n     @property\n     def supports_divergent_local_hybrid_hits(self) -> bool:\n         # The READ path always transfers the recurrent-state slot, including",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmoriio%2Fmoriio_connector.py",
+      "sha": "b81ace6f9fb0d914407e2673441fb13e81c2026a",
+      "status": "modified"
+    },
+    {
+      "additions": 19,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmulti_connector.py",
+      "changes": 19,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmulti_connector.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 0,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "patch": "@@ -222,6 +222,17 @@ def supports_divergent_local_hybrid_hits(self) -> bool:\n     def requires_kv_delivery(self) -> bool:\n         return any(c.requires_kv_delivery for c in self._connectors)\n \n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: \"KVTransferConfig\") -> bool:\n+        children = [\n+            KVTransferConfig(**{\"engine_id\": kv_transfer_config.engine_id, **c})\n+            for c in kv_transfer_config.kv_connector_extra_config.get(\"connectors\", [])\n+        ]\n+        return bool(children) and all(\n+            KVConnectorFactory.get_connector_class(c).supports_sleep_mode(c)\n+            for c in children\n+        )\n+\n     @classmethod\n     def _get_connector_classes_and_configs(\n         cls, vllm_config: \"VllmConfig\"\n@@ -252,6 +263,14 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):\n         for c in self._connectors:\n             c.register_kv_caches(kv_caches)\n \n+    def unregister_kv_caches(self) -> None:\n+        for c in self._connectors:\n+            c.unregister_kv_caches()\n+\n+    def restore_kv_caches(self) -> None:\n+        for c in self._connectors:\n+            c.restore_kv_caches()\n+\n     def bind_kv_cache_manager(self, kv_cache_manager: \"KVCacheManager\") -> None:\n         for connector in self._connectors:\n             connector.bind_kv_cache_manager(kv_cache_manager)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmulti_connector.py",
+      "sha": "bc59f3cb276f867d5ef211413cb4e951efa5f8c9",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fconnector.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fconnector.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 1,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+      "patch": "@@ -16,7 +16,7 @@\n \n import torch\n \n-from vllm.config import VllmConfig\n+from vllm.config import KVTransferConfig, VllmConfig\n from vllm.distributed.kv_transfer.kv_connector.utils import (\n     EngineId,\n )\n@@ -140,6 +140,10 @@ def __init__(\n     ############################################################\n     # Class Methods\n     ############################################################\n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        return False\n+\n     @classmethod\n     def get_required_kvcache_layout(cls, vllm_config: VllmConfig):\n         if vllm_config.model_config is None:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fconnector.py",
+      "sha": "5511edc580386170755f93be0694a994e17a9bb0",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fv1%2Fworker%2Fgpu_worker.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fworker%2Fgpu_worker.py?ref=4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "deletions": 0,
+      "filename": "vllm/v1/worker/gpu_worker.py",
+      "patch": "@@ -308,6 +308,8 @@ def sleep(self, level: int = 1) -> None:\n                     name: buffer.cpu().clone() for name, buffer in draft.named_buffers()\n                 }\n \n+        if has_kv_transfer_group():\n+            get_kv_transfer_group().unregister_kv_caches()\n         self.sleep_mode_backend.suspend(level)\n         if self.vllm_config.model_config.enable_nccl_comm_suspend:\n             suspend_device_comms()\n@@ -331,6 +333,8 @@ def sleep(self, level: int = 1) -> None:\n \n     def wake_up(self, tags: list[str] | None = None) -> None:\n         self.sleep_mode_backend.resume(tags)\n+        if has_kv_transfer_group() and (tags is None or \"kv_cache\" in tags):\n+            get_kv_transfer_group().restore_kv_caches()\n         if self.vllm_config.model_config.enable_nccl_comm_suspend:\n             resume_device_comms()\n \n@@ -356,6 +360,8 @@ def wake_up(self, tags: list[str] | None = None) -> None:\n         self.synchronize_device()\n \n     def discard(self, tags: tuple[str, ...]) -> None:\n+        if has_kv_transfer_group() and \"kv_cache\" in tags:\n+            get_kv_transfer_group().unregister_kv_caches()\n         self.sleep_mode_backend.discard(tags)\n \n     def checkpoint_prepare(self) -> None:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/4d45158a3fca8fe081ae961ea615965f1e5434cb/vllm%2Fv1%2Fworker%2Fgpu_worker.py",
+      "sha": "52cb43dcfd5d73f1d3234100b09299bc5c9b8fea",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "This function only unregisters the kvcache, can confuse with `release_kv_cache_memory`? Maybe all rename to `unregister_kv_caches()`?",
+      "created_at": "2026-10-11T16:15:14Z",
+      "diff_hunk": "@@ -251,6 +262,14 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):\n         for c in self._connectors:\n             c.register_kv_caches(kv_caches)\n \n+    def release_kv_caches(self) -> None:\n+        for c in self._connectors:\n+            c.release_kv_caches()",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4242271613",
+      "id": 4242271613,
+      "line": null,
+      "original_line": 267,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "updated_at": "2026-10-11T16:21:22Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "pull may be None when passed to asyncio.wait",
+      "created_at": "2026-10-11T16:21:10Z",
+      "diff_hunk": "@@ -1659,43 +1730,192 @@ async def test_kv_consumuer(monkeypatch):\n \n \n @pytest.mark.asyncio\n-async def test_worker_get_finished_timeout(monkeypatch):\n-    \"\"\"Tests the cleanup mechanism for requests.\"\"\"\n+@pytest.mark.parametrize(\n+    (\"events\", \"pull_ok\", \"freed\"),\n+    [\n+        ([\"claim\", \"ready\", \"pull\"], True, True),\n+        ([\"claim\", \"pull\", \"ready\"], True, True),\n+        ([\"claim\", \"pull\", \"abort\"], False, False),\n+        ([\"abort\", \"pull\"], False, False),\n+        ([\"pull\", \"expire\"], False, False),\n+        ([\"claim\", \"ready\", \"expire\"], None, True),\n+        ([\"claim\", \"expire\", \"pull\"], None, False),\n+        ([\"claim\", \"ready\", \"release\"], None, True),\n+        ([\"claim\", \"pull\", \"release\", \"ready\"], False, True),\n+        ([\"release\", \"claim\", \"ready\", \"pull\"], False, True),\n+        ([\"claim\", \"release\", \"expire\", \"ready\"], None, True),\n+        ([\"claim\", \"ready\", \"failing-pull\"], None, True),\n+        ([\"claim\", \"ready\", \"abort-all\"], None, True),\n+        ([\"claim\", \"pull\", \"abort-all\"], None, False),\n+        ([\"claim\", \"ready\", \"busy\", \"pull\", \"abort\", \"free\"], False, True),\n+        ([\"claim\", \"ready\", \"busy\", \"abort\", \"pull\"], False, True),\n+        ([\"claim\", \"abort\", \"neighbor\", \"busy\", \"pull\"], False, False),\n+        ([\"claim\", \"ready\", \"late-resume\", \"pull\"], False, True),\n+        (\n+            [\"claim\", \"ready\", \"busy\", \"short-timeout\", \"pull\", \"answered\"],\n+            False,\n+            False,\n+        ),\n+        (\n+            [\"claim\", \"ready\", \"slow-send\", \"pull\", \"writing\", \"abort\", \"write-ends\"],\n+            True,\n+            True,\n+        ),\n+    ],\n+    ids=[\n+        \"ready-then-pull\",\n+        \"pull-waits-for-ready\",\n+        \"abort-wakes-waiting-pull\",\n+        \"pull-after-unclaimed-abort\",\n+        \"unclaimed-pull-expires\",\n+        \"unpulled-kv-expires\",\n+        \"claimed-never-expires\",\n+        \"release-frees-ready-kv\",\n+        \"release-wakes-pull-then-frees-on-ready\",\n+        \"release-before-claim\",\n+        \"release-outlives-expiry-while-claimed\",\n+        \"failed-send-frees-kv\",\n+        \"abort-all-frees-ready-kv\",\n+        \"abort-all-spares-unfinished\",\n+        \"pull-waiting-for-a-sender-stays-abortable\",\n+        \"aborted-pull-answered-while-senders-are-busy\",\n+        \"aborted-pull-answered-before-its-batch-writes\",\n+        \"pull-resumed-past-its-deadline-never-writes\",\n+        \"pull-times-out-while-senders-are-busy\",\n+        \"abort-frees-only-after-the-write\",\n+    ],\n+)\n+async def test_send_state_answers_every_pull_once(monkeypatch, events, pull_ok, freed):\n+    \"\"\"In any order of P's scheduler, D's pulls and releases, and expiry, a pull\n+    gets one prompt answer and P frees ready blocks once nothing reads them.\"\"\"\n+    monkeypatch.setenv(\"VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\", \"60\")\n     vllm_config = create_vllm_config(\n         kv_connector=\"MooncakeConnector\", kv_role=\"kv_producer\"\n     )\n     with set_current_vllm_config(vllm_config), patch_worker_dependencies():\n-        prefill_connector = MooncakeConnector(\n-            vllm_config,\n-            KVConnectorRole.WORKER,\n-            _make_test_kv_cache_config(),\n-        )\n-        prefill_worker = prefill_connector.connector_worker\n-\n-        # Add an expired request (expire_time is in the past).\n-        prefill_worker.reqs_need_send[\"tx-expired\"] = SendBlockMeta(\n-            p_req_id=\"p-req-expired\",\n-            transfer_id=\"tx-expired\",\n-            local_block_ids=[[1, 2]],\n-            ready=MagicMock(),\n-            expire_time=time.perf_counter() - 100,\n+        worker = MooncakeConnector(\n+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()\n+        ).connector_worker\n+        worker.kv_caches_base_addr = [0x1000]\n+        worker.block_len_per_layer = worker.kv_block_len_per_layer = [4096]\n+        worker.registered_layer_names = [\"model.layers.0.self_attn\"]\n+        worker.registered_layer_indices = [0]\n+        sender_loop, worker.sender_loop = worker.sender_loop, asyncio.get_running_loop()\n+        worker._send_slots = asyncio.Semaphore(1)\n+        region = _region(\n+            0x2000, block_len=4096, row_offset=-1, layer_name=\"model.layers.0.self_attn\"\n         )\n-\n-        # Add a non-expired request.\n-        prefill_worker.reqs_need_send[\"tx-active\"] = SendBlockMeta(\n-            p_req_id=\"p-req-active\",\n-            transfer_id=\"tx-active\",\n-            local_block_ids=[[3, 4]],\n-            ready=MagicMock(),\n-            expire_time=time.perf_counter() + 100,\n+        xfer_meta = _xfer_meta([region], {\"d-req\": (\"tx\", [[20, 21]])})\n+        release_meta = _xfer_meta([region], {\"d-rel\": (\"tx\", [])})\n+        sock = AsyncMock(spec=zmq.asyncio.Socket)\n+        sock.send_multipart = AsyncMock()\n+        pull, freed_reqs = None, set()\n+        write_started, write_may_end = threading.Event(), threading.Event()\n+        take_sender = worker._send_slots.acquire\n+\n+        async def acquire_then_stall() -> bool:\n+            # The sender is free, but the event loop resumes the pull late.\n+            await take_sender()\n+            now[0] += 61\n+            return True\n+\n+        def slow_write(*_) -> int:\n+            write_started.set()\n+            write_may_end.wait(5)\n+            return 0\n+\n+        now = [time.perf_counter()]\n+        monkeypatch.setattr(mooncake_connector.time, \"perf_counter\", lambda: now[0])\n+\n+        def scheduler_meta(blocks=None, aborted=False, abort_all=False):\n+            meta = MooncakeConnectorMetadata()\n+            if blocks is not None:\n+                meta.reqs_to_send[\"p-req\"] = (\"tx\", blocks)\n+            if aborted:\n+                meta.reqs_not_processed = {\"tx\"}\n+            meta.abort_pending_sends = abort_all\n+            return meta\n+\n+        with patch.object(worker, \"_send_blocks\", return_value=0) as send_blocks:\n+            for event in events:\n+                if event == \"claim\":\n+                    await worker.record_send_reqs(scheduler_meta(blocks=[]))\n+                elif event == \"ready\":\n+                    await worker.record_send_reqs(scheduler_meta(blocks=[[10, 11]]))\n+                elif event == \"abort\":\n+                    await worker.record_send_reqs(scheduler_meta(aborted=True))\n+                elif event == \"slow-send\":\n+                    send_blocks.side_effect = slow_write\n+                elif event == \"writing\":\n+                    loop = asyncio.get_running_loop()\n+                    assert await loop.run_in_executor(None, write_started.wait, 5)\n+                elif event == \"write-ends\":\n+                    assert not await worker.fetch_finished_sending_reqs()\n+                    write_may_end.set()\n+                elif event == \"busy\":\n+                    await worker._send_slots.acquire()\n+                elif event == \"neighbor\":\n+                    # Another transfer, ready, pulled in the same message.\n+                    neighbor = MooncakeConnectorMetadata()\n+                    neighbor.reqs_to_send[\"p-other\"] = (\"tx2\", [[12, 13]])\n+                    await worker.record_send_reqs(neighbor)\n+                    xfer_meta.req_blocks[\"d-other\"] = (\"tx2\", [[22, 23]])\n+                elif event == \"late-resume\":\n+                    worker._send_slots.acquire = acquire_then_stall\n+                elif event == \"short-timeout\":\n+                    monkeypatch.setenv(\"VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\", \"1\")\n+                elif event == \"answered\":\n+                    await asyncio.wait([pull], timeout=3)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4242290575",
+      "id": 4242290575,
+      "line": null,
+      "original_line": 1868,
+      "path": "tests/v1/kv_connector/unit/test_mooncake_connector.py",
+      "updated_at": "2026-10-11T16:21:22Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "[P2] Support MNNVL sleep/wake fully, or reject the unsupported combination\n\nPlease either refresh peer mappings across MNNVL sleep/wake and validate that path, or reject the combination when sleep mode is enabled.\n\n`MC_USE_TENT=1` (or `MC_USE_TEV1=1`) together with `MC_ENABLE_MNNVL=1` currently passes this check with `mooncake_protocol=\"rdma\"`. In Mooncake 0.3.13, however, [TENT can enable MNNVL](https://github.com/kvcache-ai/Mooncake/blob/v0.3.13/mooncake-transfer-engine/tent/src/runtime/transport_loader.cpp#L77); the protocol string does not guarantee RDMA-only transfers. Its [peer mappings are cached by target and virtual address](https://github.com/kvcache-ai/Mooncake/blob/v0.3.13/mooncake-transfer-engine/tent/src/transport/mnnvl/mnnvl_transport.cpp#L639). After D sleeps and wakes with new physical backing at the same address, a warmed P can therefore keep writing through the old mapping. Local unregister/register does not invalidate that peer cache.\n\nThe smallest scoped fix is to reject these unsupported TENT/MNNVL configurations and add gate regression tests for both TENT selectors. Supporting them instead needs peer-mapping refresh plus a warm-transfer → sleep/wake → transfer correctness test.\n\nI reproduced the gate accepting these configurations on CPU; the stale-mapping risk is based on source inspection, not a GPU reproduction.\n",
+      "created_at": "2026-10-13T12:23:36Z",
+      "diff_hunk": "@@ -800,10 +801,27 @@ def request_finished_all_groups(\n     ############################################################\n     # Worker Side Methods\n     ############################################################\n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        # Only RDMA peers refresh a stale remote key. Either variable, set to any\n+        # value, switches Mooncake to its NVLink transport.\n+        if any(v in os.environ for v in (\"MC_FORCE_MNNVL\", \"MC_INTRANODE_NVLINK\")):\n+            return False\n+        extra_config = kv_transfer_config.kv_connector_extra_config\n+        return extra_config.get(\"mooncake_protocol\", \"rdma\") == \"rdma\"",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4258561168",
+      "id": 4258561168,
+      "line": null,
+      "original_line": 811,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+      "updated_at": "2026-10-13T12:23:36Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "Thanks. Sleep mode is now refused when `MC_USE_TENT` or `MC_USE_TEV1` is set, with a gate test. Full NVLink/TENT support needs Mooncake to invalidate peer mappings, will leave it as a follow-up.",
+      "created_at": "2026-10-13T13:39:07Z",
+      "diff_hunk": "@@ -800,10 +801,27 @@ def request_finished_all_groups(\n     ############################################################\n     # Worker Side Methods\n     ############################################################\n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        # Only RDMA peers refresh a stale remote key. Either variable, set to any\n+        # value, switches Mooncake to its NVLink transport.\n+        if any(v in os.environ for v in (\"MC_FORCE_MNNVL\", \"MC_INTRANODE_NVLINK\")):\n+            return False\n+        extra_config = kv_transfer_config.kv_connector_extra_config\n+        return extra_config.get(\"mooncake_protocol\", \"rdma\") == \"rdma\"",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#discussion_r4259347869",
+      "id": 4259347869,
+      "line": null,
+      "original_line": 811,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+      "updated_at": "2026-10-13T13:39:07Z",
+      "user": {
+        "login": "andakai"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Documentation preview: https://vllm--59625.org.readthedocs.build/en/59625/",
+      "created_at": "2026-10-01T15:08:36Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-5934263637",
+      "id": 5934263637,
+      "updated_at": "2026-10-01T15:08:36Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-02T02:18:16Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-5944381627",
+      "id": 5944381627,
+      "updated_at": "2026-10-02T02:18:16Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "Documentation preview: https://vllm--59625.org.readthedocs.build/en/59625/",
+      "created_at": "2026-10-04T08:33:07Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-5978141856",
+      "id": 5978141856,
+      "updated_at": "2026-10-04T08:33:07Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-06T21:28:15Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6025786409",
+      "id": 6025786409,
+      "updated_at": "2026-10-06T21:28:15Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "I've narrowed this PR to sleep mode support only, moving out the Mooncake sender rewrite and the core changes. Mooncake now unregisters its RDMA KV registration before sleep and re-registers it after wake-up, and unsupported connectors are refused at startup. No Mooncake-side wait is needed, since sleep only proceeds once every KV block is freed, i.e. after in-flight P/D transfers finish.\r\n\r\n## Purpose\r\n\r\nSleep mode with `MooncakeConnector` is broken on main. Sleep remaps the KV cache to new physical pages at the same virtual addresses, but Mooncake's RDMA registration keeps pointing at the old pages: after a wake, P/D outputs are silently wrong, and the old pages stay pinned (wake-up can run out of memory).\r\n\r\nThis PR supports sleep mode for `MooncakeConnector` over RDMA and refuses it at startup for connectors that cannot follow the remap.\r\n\r\n## Test Result\r\n\r\n1P1D on H200, Qwen3-0.6B, Mooncake 0.3.13.post1 over RDMA:\r\n\r\n| | main (`bc3ddb198a`) | this PR |\r\n|---|---|---|\r\n| 30 prompts after sleep/wake of D, P, both (3 cycles each) | 0/30, no errors | 30/30 |\r\n| Slept GPU memory (awake → asleep → after wake, MiB) | 57,783 → 55,619 → 112,319 | 57,783 → 801 → 57,541 |\r\n| gsm8k with `SLEEP_WAKE=1` | `/wake_up` out of memory | 0.4223 (same as without sleep) |\r\n\r\n- Sleep with transfers in flight (64 × 2048-token prompts): P asleep while holding KV for D waits until D has pulled it, all 64 D outputs correct; D asleep with pulls in flight aborts them; 64/64 after wake-up in both cases.\r\n\r\n---\r\n\r\nAI assistance (Claude Code) was used for this PR; I reviewed the changes and ran the tests listed above.",
+      "created_at": "2026-10-13T09:59:16Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6143049824",
+      "id": 6143049824,
+      "updated_at": "2026-10-13T09:59:16Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-13T15:33:24Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6149174571",
+      "id": 6149174571,
+      "updated_at": "2026-10-13T15:33:24Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "❌ @andakai, Only reviewers with write access can use CI commands before CI is delegated to the PR author.\n\n<!-- vllm-ci-command:6149174571 -->",
+      "created_at": "2026-10-13T15:34:04Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6149187288",
+      "id": 6149187288,
+      "updated_at": "2026-10-13T15:34:04Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-13T22:47:21Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6156834550",
+      "id": 6156834550,
+      "updated_at": "2026-10-13T22:47:21Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94620](https://buildkite.com/vllm/ci/builds/94620) for commit `4d45158a3fca`.",
+      "created_at": "2026-10-13T22:47:43Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6156839609",
+      "id": 6156839609,
+      "updated_at": "2026-10-13T22:47:43Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-14T04:05:00Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6160633499",
+      "id": 6160633499,
+      "updated_at": "2026-10-14T04:05:00Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #94620](https://buildkite.com/vllm/ci/builds/94620).",
+      "created_at": "2026-10-14T04:05:19Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#issuecomment-6160637047",
+      "id": 6160637047,
+      "updated_at": "2026-10-14T04:05:19Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 59625,
+  "refs": {
+    "base": {
+      "commit": "78b32b3fdc47cbf097d982aed012fa9874431836",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "4d45158a3fca8fe081ae961ea615965f1e5434cb",
+      "repository": "aoshen02/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "Generally LGTM! I have tested and it works well. \n\nOne point to discuss about: on main, P waits for D to pull the KV. With this PR, P drops it and D fails those requests under the default `kv_load_failure_policy=\"fail\"`. In a 1P1D test that pauses only P (mode=\"wait\") after its prefills finish and before D pulls the KV, main succeeds on 64/64 requests and this PR fails. Should `mode=\"wait\"` keep main’s behavior here?",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5484000657",
+      "id": 5484000657,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-11T16:21:22Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5503435758",
+      "id": 5503435758,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-13T12:23:36Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5504407366",
+      "id": 5504407366,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-13T13:39:07Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5504517351",
+      "id": 5504517351,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-13T13:46:36Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59625#pullrequestreview-5504540003",
+      "id": 5504540003,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-13T13:48:11Z",
+      "user": {
+        "login": "ZJY0516"
+      }
+    }
+  ]
+}

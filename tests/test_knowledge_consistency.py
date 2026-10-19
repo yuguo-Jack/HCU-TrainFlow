@@ -80,6 +80,26 @@ def errors(project):
     return validator.validate(project)['errors']
 
 
+def test_bracketed_pr_titles_do_not_hide_broken_authored_links(project):
+    path = project / 'knowledge/current.md'
+    body = '[PR: [dev] overlap](prs/gone.md)\n[PR: [PyTorch] linear](historical.md)'
+    found = validator.validate_authored_links(project, path, body)
+    assert len(found) == 1 and 'prs/gone.md' in found[0]
+
+
+def test_clickable_images_keep_authored_image_checks(project):
+    path = project / 'knowledge/current.md'
+    (path.parent / 'target.bin').write_bytes(b'data')
+    found = validator.validate_authored_links(project, path, '[![diagram](missing.svg)](target.bin)')
+    assert len(found) == 1 and 'missing.svg' in found[0]
+
+
+def test_invalid_outer_nested_authored_link_is_not_a_destination(project):
+    path = project / 'knowledge/current.md'
+    assert validator.validate_authored_links(
+        project, path, '[outer [inner](historical.md)](literal-text.md)') == []
+
+
 def test_external_hcu_source_cannot_be_registered_again(project):
     edit_json(project,'knowledge/sources.json',lambda rows:rows[0].update(repository='HYGON-AI/tool'))
     assert any('HCU-Knowledge' in e for e in errors(project))

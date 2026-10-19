@@ -1,0 +1,348 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "0c62ee999ceba16db25d79cebc700cd3364ceac54cbc131d399f19b216e30736",
+      "isPrivate": false,
+      "numbers": [
+        60948,
+        60946,
+        60945,
+        60943,
+        60942,
+        60941,
+        60940,
+        60939
+      ],
+      "observed_at": "2026-10-19T18:35:30.533028+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4921,
+        "resetAt": "2026-10-19T18:53:12Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "e0317b28ce3ba4c9bd2ff69d885e3f34688a6d71",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "\n\n## Overview\n\nWith a host pool shared across TP ranks (#56629), a TP group can hang forever on a step with no scheduled tokens. On such steps, every TP rank now waits at a CPU barrier right after its event wait.\n\n## Claims\n\n- Fixes a hang between TP rank 0 and a TP rank whose host is one step behind, on steps with no scheduled tokens (`no_forward`).\n- Steps with tokens are unchanged.\n\n## Validation\n\n**Reproducer.** The script below copies the shared-event protocol from `hisparse/worker.py` onto 2 GPUs and holds rank 1's host for 0.5 s before one wait. Run on H100s:\n\n```\ntorchrun --nproc-per-node 2 hisparse_event_hang.py {zero_next|zero_now|tokens} {none|sync|barrier}\n```\n\n| Case | `main` (`none`) | rank 0 host sync (`sync`) | this PR (`barrier`) |\n|---|---|---|---|\n| `zero_next`: rank 1 late, next step has no tokens | HANG 3/3 | PASS 3/3 | PASS 3/3 |\n| `zero_now`: rank 1 late on a step with no tokens, next step has tokens | HANG 3/3 | HANG 3/3 | PASS 3/3 |\n| `tokens`: rank 1 late, every step has tokens | PASS 3/3 | | |\n\nWhen it hangs, GPU 0 is at 100% (spinning in the all-reduce) and GPU 1 is at 0% (its stream is blocked on the event).\n\n**Unit test.** `test_zero_token_step_holds_tp_ranks_after_host_write_wait` checks that start_step waits at the TP barrier after the event wait on steps with no tokens, and only when the host region is shared.\n\n```\npytest tests/v1/kv_connector/unit/test_hisparse_connector.py -k \"zero_token_step or draft_layer or full_graph_step or no_forward\"\n```\n\n| | Result |\n|---|---|\n| `main` `worker.py` | 1 failed (`shared=True, num_tokens=0`), 7 passed |\n| this PR | 8 passed |\n\nThese tests ran in a vLLM 0.31.0 H100 image (`f6d5a33`) with this branch's `worker.py` and test file swapped in. The image has no pytest, so a small runner expanded the parametrization. `pre-commit run --files <changed files>` passes.\n\n**Production.** A P/D decode deployment hit this hang. It runs HiSparse and NIXL through `MultiConnector`, at TP8 x DP4 with EP32 and MTP:\n- One TP rank's GPU sat at 0% while its 7 TP peers sat at 100%.\n- The other DP ranks then hit DeepEP dispatch timeouts.\n- Each time, the engine was in its first minutes, when first contact with new prefill engines slows the NIXL read post on the main thread (0.1 to 2.4 s).\n\nThe reproducer shows the same GPU pattern. This patch has not yet run end to end on that deployment.\n\n## Details\n\nThe protocol uses two shared events, A and B:\n- Every step, each TP rank's stream waits on the event rank 0 recorded in the previous step.\n- Rank 0 then records the other event in `finish_forward`.\n- A stream wait binds to the most recent record at the time of the wait call.\n\n**Trigger.** A TP rank's host falls one step behind rank 0, and the next step has no scheduled tokens.\n\n**Mechanism:**\n\n| | TP rank 0 | TP rank 1 (host late) |\n|---|---|---|\n| 1 | step 5: wait A, launch forward 5, record B | still before its step 5 wait |\n| 2 | step 6, no tokens: wait B, record A right away | |\n| 3 | | step 5: wait A. The wait binds to rank 0's step 6 record |\n| 4 | GPU: the forward 5 all-reduce waits for rank 1 | GPU: waits for the step 6 record, which is queued behind rank 0's forward 5 |\n\n**Effect.** The TP group hangs and nothing times out. With DP and EP, the other DP ranks then block in their MoE collectives.\n\n**Why steps with tokens are safe.** Before recording, rank 0 host-syncs on staging (`_finish_mirror_phase`). That staging is queued behind the previous forward's TP collectives, and every rank joins those only after its wait. A step with no tokens has no forward, so nothing orders rank 0's record after the other ranks' waits.\n\n**Fix.** On steps with no tokens, every TP rank joins `get_tp_group().barrier()` (the CPU group) right after its wait. Every rank has then issued its wait before rank 0 can record again, on this step and the next.\n- `num_tokens` comes from the same scheduler output on every TP rank, so all ranks take the barrier on the same steps.\n- Without a shared host region, each rank uses its own local events, so there is no barrier.\n\n**Why not a host sync on rank 0 alone.** The `zero_now` row: a sync can only prove that the other ranks reached the last step with a forward. A step with no tokens followed by a step with tokens still hangs.\n\n**Cost.** One CPU barrier per step with no tokens. Those steps launch no forward.\n\n**Not a duplicate.** I checked the 30 open PRs matching `hisparse`, plus searches for `host_write_event`, `hisparse hang`, `hisparse deadlock` and `hisparse barrier`. None changes how the shared host write events are ordered. #59877 fixes a separate NIXL thread-safety bug found in the same investigation.\n\nAI assistance (Claude Code) was used for the investigation, the change, the test and the reproducer.\n\n<details>\n<summary>hisparse_event_hang.py</summary>\n\n```python\n\"\"\"Two-rank model of HiSparse's shared host write events (hisparse/worker.py).\n\nRank 0 creates two IPC events and shares them. Every step, each rank flips to the\nother event and its stream waits on the previous one (`start_step`). Rank 0 alone\nrecords the current event at the end of the step (`finish_forward`), after a host\nsync on staging queued before the step on steps with tokens (`_finish_mirror_phase`).\nThe forward is matmuls plus an all-reduce, standing in for the TP collectives.\nRank 1's host is held DELAY s before its step 5 wait.\n\n  PLAN  zero_next  step 6 has no tokens\n        zero_now   step 5 has no tokens, step 6 has tokens\n        tokens     every step has tokens\n  FIX   none       as on main\n        sync       rank 0 also host-syncs before recording on steps without tokens\n        barrier    every rank joins a CPU barrier after its wait on steps without tokens\n\ntorchrun --nproc-per-node 2 hisparse_event_hang.py PLAN FIX [DELAY]\nPrints PASS, or HANG with per-GPU utilization after 20 s.\n\"\"\"\nimport os, subprocess, sys, threading, time\n\nimport torch\nimport torch.distributed as dist\n\nplan, fix = sys.argv[1], sys.argv[2]\ndelay = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5\nzero_step = {\"zero_next\": 6, \"zero_now\": 5, \"tokens\": None}[plan]\nassert fix in (\"none\", \"sync\", \"barrier\")\nrank = int(os.environ[\"RANK\"])\ntorch.cuda.set_device(rank)\ndist.init_process_group(\"nccl\")\ncpu_group = dist.new_group(backend=\"gloo\")\nstream = torch.cuda.current_stream()\n\nhandles = [None]\nif rank == 0:\n    events = (torch.cuda.Event(interprocess=True), torch.cuda.Event(interprocess=True))\n    for e in events:\n        e.record(stream)\n    handles = [tuple(e.ipc_handle() for e in events)]\ndist.broadcast_object_list(handles, src=0)\nif rank != 0:\n    device = torch.device(\"cuda\", rank)\n    events = tuple(torch.cuda.Event.from_ipc_handle(device, h) for h in handles[0])\ntorch.cuda.synchronize()\ndist.barrier()\n\ndone = threading.Event()\n\n\ndef watchdog():\n    if not done.wait(20):\n        util = subprocess.run(\n            [\"nvidia-smi\", \"--query-gpu=index,utilization.gpu\", \"--format=csv,noheader\", \"-i\", \"0,1\"],\n            capture_output=True, text=True).stdout\n        print(f\"rank{rank} HANG at step {step}, GPU util: \" + util.strip().replace(\"\\n\", \" | \"), flush=True)\n        os._exit(2)\n\n\nthreading.Thread(target=watchdog, daemon=True).start()\na = torch.randn(4096, 4096, device=\"cuda\", dtype=torch.bfloat16)\ncur, nxt = events[1], 0\nfor step in range(10):\n    has_tokens = step != zero_step\n    staging = torch.cuda.Event()\n    staging.record(stream)\n    if rank == 1 and step == 5:\n        time.sleep(delay)  # e.g. a slow NIXL read post before start_step\n    prev, cur = cur, events[nxt]\n    nxt ^= 1\n    stream.wait_event(prev)\n    if not has_tokens and fix == \"barrier\":\n        dist.barrier(group=cpu_group)\n    if has_tokens:\n        y = a\n        for _ in range(8):\n            y = y @ a\n            dist.all_reduce(y)\n            y = y / 4096\n    if rank == 0:\n        if has_tokens or fix == \"sync\":\n            staging.synchronize()\n        cur.record(stream)\ntorch.cuda.synchronize()\ndone.set()\nprint(f\"rank{rank} PASS\", flush=True)\ndist.destroy_process_group()\n```\n\n</details>\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "robertgshaw2-redhat"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-12T14:30:37Z",
+            "databaseId": 6126333774,
+            "updatedAt": "2026-10-12T14:30:37Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6126333774"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ @vMaroon, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-10-12T14:30:46Z",
+            "databaseId": 6126336385,
+            "updatedAt": "2026-10-12T14:30:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6126336385"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94232](https://buildkite.com/vllm/ci/builds/94232) for commit `7d3793002f52`.",
+            "createdAt": "2026-10-12T14:30:57Z",
+            "databaseId": 6126339508,
+            "updatedAt": "2026-10-12T14:30:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6126339508"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "vllm-agent"
+            },
+            "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 4 test steps (7 jobs) instead of 8 (13 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 8 (13) | 4 (7) | 5 (7) | 1 (1) |\n| AMD mirrors | 16 (19) | 2 (5) | 14 (14) | 0 (0) |\n\n<details><summary>Selector would run (4)</summary>\n\n- `e2e-core-1-gpu`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-others-cpu`\n</details>\n\n<details><summary>Would skip (today's rules run them) (5)</summary>\n\n- `ascend-npu-test`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `v1-core`\n- `v1-kv-offload`\n- `v1-metrics-lmeval`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (1)</summary>\n\n- `e2e-core-1-gpu` (code map)\n</details>\n\n<details><summary>AMD mirrors: would skip (14)</summary>\n\n- `extract-hidden-states-integration-2-gpus`\n- `fault-tolerance-e2e-2xh100`\n- `fusion-and-compile-unit-tests-2xb200`\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `gemm-rs-ar-2xb200`\n- `kernels-fusedmoe-layer-test-2-b200s`\n- `kernels-fusedmoe-layer-test-2-h100s`\n- `kernels-minimax-reduce-rms-test-2-gpus`\n- `platform-tests`\n- `v1-core`\n- `v1-kv-offload`\n- `v1-metrics-lmeval`\n</details>\n\n<details><summary>AMD mirrors: would add (0)</summary>\n\nnone\n</details>\n\n<sub>2 changed files · base `e0317b28ce` · head `ca604800ef` · Python record: build 93039 at `1e5d0ea888` · kernel record: table 74f4404f58 (build 94125), map 74f4404f58 · not counted: 11 build steps, 5 A100 steps the generator no longer emits, 8 optional steps the selector would also run</sub>\n",
+            "createdAt": "2026-10-12T15:44:52Z",
+            "databaseId": 6127630742,
+            "updatedAt": "2026-10-12T16:50:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6127630742"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-12T15:56:41Z",
+            "databaseId": 6127825153,
+            "updatedAt": "2026-10-12T15:56:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6127825153"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94247](https://buildkite.com/vllm/ci/builds/94247) for commit `ca604800efe4`.",
+            "createdAt": "2026-10-12T15:57:03Z",
+            "databaseId": 6127831154,
+            "updatedAt": "2026-10-12T15:57:03Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6127831154"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW0_SHI=",
+          "hasNextPage": false
+        },
+        "totalCount": 6
+      },
+      "headRefOid": "ca604800efe41fdbbe987ad9089c8538ebf5866d",
+      "headRepository": {
+        "nameWithOwner": "vMaroon/vllm"
+      },
+      "mergeCommit": {
+        "oid": "5b0b8f251ea6b878a22d85baba56e127c66297c8"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-12T17:38:13Z",
+      "number": 60941,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5476883334,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-10T01:29:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#pullrequestreview-5476883334"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "LGTM for now, thanks! I might do a refactor but I'm fine with this in the meantime",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5492757247,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-12T15:19:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60941#pullrequestreview-5492757247"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMlQxNToxOTo1M1q0MjAyNi0xMC0xMlQxNToxOTo1M1rPAAAAAUdk0v8=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Bugfix][HiSparse] Fix TP group hang on steps without scheduled tokens",
+      "updatedAt": "2026-10-12T17:38:13Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60941"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "e0317b28ce3ba4c9bd2ff69d885e3f34688a6d71"
+    },
+    "body": "\n\n## Overview\n\nWith a host pool shared across TP ranks (#56629), a TP group can hang forever on a step with no scheduled tokens. On such steps, every TP rank now waits at a CPU barrier right after its event wait.\n\n## Claims\n\n- Fixes a hang between TP rank 0 and a TP rank whose host is one step behind, on steps with no scheduled tokens (`no_forward`).\n- Steps with tokens are unchanged.\n\n## Validation\n\n**Reproducer.** The script below copies the shared-event protocol from `hisparse/worker.py` onto 2 GPUs and holds rank 1's host for 0.5 s before one wait. Run on H100s:\n\n```\ntorchrun --nproc-per-node 2 hisparse_event_hang.py {zero_next|zero_now|tokens} {none|sync|barrier}\n```\n\n| Case | `main` (`none`) | rank 0 host sync (`sync`) | this PR (`barrier`) |\n|---|---|---|---|\n| `zero_next`: rank 1 late, next step has no tokens | HANG 3/3 | PASS 3/3 | PASS 3/3 |\n| `zero_now`: rank 1 late on a step with no tokens, next step has tokens | HANG 3/3 | HANG 3/3 | PASS 3/3 |\n| `tokens`: rank 1 late, every step has tokens | PASS 3/3 | | |\n\nWhen it hangs, GPU 0 is at 100% (spinning in the all-reduce) and GPU 1 is at 0% (its stream is blocked on the event).\n\n**Unit test.** `test_zero_token_step_holds_tp_ranks_after_host_write_wait` checks that start_step waits at the TP barrier after the event wait on steps with no tokens, and only when the host region is shared.\n\n```\npytest tests/v1/kv_connector/unit/test_hisparse_connector.py -k \"zero_token_step or draft_layer or full_graph_step or no_forward\"\n```\n\n| | Result |\n|---|---|\n| `main` `worker.py` | 1 failed (`shared=True, num_tokens=0`), 7 passed |\n| this PR | 8 passed |\n\nThese tests ran in a vLLM 0.31.0 H100 image (`f6d5a33`) with this branch's `worker.py` and test file swapped in. The image has no pytest, so a small runner expanded the parametrization. `pre-commit run --files <changed files>` passes.\n\n**Production.** A P/D decode deployment hit this hang. It runs HiSparse and NIXL through `MultiConnector`, at TP8 x DP4 with EP32 and MTP:\n- One TP rank's GPU sat at 0% while its 7 TP peers sat at 100%.\n- The other DP ranks then hit DeepEP dispatch timeouts.\n- Each time, the engine was in its first minutes, when first contact with new prefill engines slows the NIXL read post on the main thread (0.1 to 2.4 s).\n\nThe reproducer shows the same GPU pattern. This patch has not yet run end to end on that deployment.\n\n## Details\n\nThe protocol uses two shared events, A and B:\n- Every step, each TP rank's stream waits on the event rank 0 recorded in the previous step.\n- Rank 0 then records the other event in `finish_forward`.\n- A stream wait binds to the most recent record at the time of the wait call.\n\n**Trigger.** A TP rank's host falls one step behind rank 0, and the next step has no scheduled tokens.\n\n**Mechanism:**\n\n| | TP rank 0 | TP rank 1 (host late) |\n|---|---|---|\n| 1 | step 5: wait A, launch forward 5, record B | still before its step 5 wait |\n| 2 | step 6, no tokens: wait B, record A right away | |\n| 3 | | step 5: wait A. The wait binds to rank 0's step 6 record |\n| 4 | GPU: the forward 5 all-reduce waits for rank 1 | GPU: waits for the step 6 record, which is queued behind rank 0's forward 5 |\n\n**Effect.** The TP group hangs and nothing times out. With DP and EP, the other DP ranks then block in their MoE collectives.\n\n**Why steps with tokens are safe.** Before recording, rank 0 host-syncs on staging (`_finish_mirror_phase`). That staging is queued behind the previous forward's TP collectives, and every rank joins those only after its wait. A step with no tokens has no forward, so nothing orders rank 0's record after the other ranks' waits.\n\n**Fix.** On steps with no tokens, every TP rank joins `get_tp_group().barrier()` (the CPU group) right after its wait. Every rank has then issued its wait before rank 0 can record again, on this step and the next.\n- `num_tokens` comes from the same scheduler output on every TP rank, so all ranks take the barrier on the same steps.\n- Without a shared host region, each rank uses its own local events, so there is no barrier.\n\n**Why not a host sync on rank 0 alone.** The `zero_now` row: a sync can only prove that the other ranks reached the last step with a forward. A step with no tokens followed by a step with tokens still hangs.\n\n**Cost.** One CPU barrier per step with no tokens. Those steps launch no forward.\n\n**Not a duplicate.** I checked the 30 open PRs matching `hisparse`, plus searches for `host_write_event`, `hisparse hang`, `hisparse deadlock` and `hisparse barrier`. None changes how the shared host write events are ordered. #59877 fixes a separate NIXL thread-safety bug found in the same investigation.\n\nAI assistance (Claude Code) was used for the investigation, the change, the test and the reproducer.\n\n<details>\n<summary>hisparse_event_hang.py</summary>\n\n```python\n\"\"\"Two-rank model of HiSparse's shared host write events (hisparse/worker.py).\n\nRank 0 creates two IPC events and shares them. Every step, each rank flips to the\nother event and its stream waits on the previous one (`start_step`). Rank 0 alone\nrecords the current event at the end of the step (`finish_forward`), after a host\nsync on staging queued before the step on steps with tokens (`_finish_mirror_phase`).\nThe forward is matmuls plus an all-reduce, standing in for the TP collectives.\nRank 1's host is held DELAY s before its step 5 wait.\n\n  PLAN  zero_next  step 6 has no tokens\n        zero_now   step 5 has no tokens, step 6 has tokens\n        tokens     every step has tokens\n  FIX   none       as on main\n        sync       rank 0 also host-syncs before recording on steps without tokens\n        barrier    every rank joins a CPU barrier after its wait on steps without tokens\n\ntorchrun --nproc-per-node 2 hisparse_event_hang.py PLAN FIX [DELAY]\nPrints PASS, or HANG with per-GPU utilization after 20 s.\n\"\"\"\nimport os, subprocess, sys, threading, time\n\nimport torch\nimport torch.distributed as dist\n\nplan, fix = sys.argv[1], sys.argv[2]\ndelay = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5\nzero_step = {\"zero_next\": 6, \"zero_now\": 5, \"tokens\": None}[plan]\nassert fix in (\"none\", \"sync\", \"barrier\")\nrank = int(os.environ[\"RANK\"])\ntorch.cuda.set_device(rank)\ndist.init_process_group(\"nccl\")\ncpu_group = dist.new_group(backend=\"gloo\")\nstream = torch.cuda.current_stream()\n\nhandles = [None]\nif rank == 0:\n    events = (torch.cuda.Event(interprocess=True), torch.cuda.Event(interprocess=True))\n    for e in events:\n        e.record(stream)\n    handles = [tuple(e.ipc_handle() for e in events)]\ndist.broadcast_object_list(handles, src=0)\nif rank != 0:\n    device = torch.device(\"cuda\", rank)\n    events = tuple(torch.cuda.Event.from_ipc_handle(device, h) for h in handles[0])\ntorch.cuda.synchronize()\ndist.barrier()\n\ndone = threading.Event()\n\n\ndef watchdog():\n    if not done.wait(20):\n        util = subprocess.run(\n            [\"nvidia-smi\", \"--query-gpu=index,utilization.gpu\", \"--format=csv,noheader\", \"-i\", \"0,1\"],\n            capture_output=True, text=True).stdout\n        print(f\"rank{rank} HANG at step {step}, GPU util: \" + util.strip().replace(\"\\n\", \" | \"), flush=True)\n        os._exit(2)\n\n\nthreading.Thread(target=watchdog, daemon=True).start()\na = torch.randn(4096, 4096, device=\"cuda\", dtype=torch.bfloat16)\ncur, nxt = events[1], 0\nfor step in range(10):\n    has_tokens = step != zero_step\n    staging = torch.cuda.Event()\n    staging.record(stream)\n    if rank == 1 and step == 5:\n        time.sleep(delay)  # e.g. a slow NIXL read post before start_step\n    prev, cur = cur, events[nxt]\n    nxt ^= 1\n    stream.wait_event(prev)\n    if not has_tokens and fix == \"barrier\":\n        dist.barrier(group=cpu_group)\n    if has_tokens:\n        y = a\n        for _ in range(8):\n            y = y @ a\n            dist.all_reduce(y)\n            y = y / 4096\n    if rank == 0:\n        if has_tokens or fix == \"sync\":\n            staging.synchronize()\n        cur.record(stream)\ntorch.cuda.synchronize()\ndone.set()\nprint(f\"rank{rank} PASS\", flush=True)\ndist.destroy_process_group()\n```\n\n</details>\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "vMaroon/vllm"
+      },
+      "sha": "ca604800efe41fdbbe987ad9089c8538ebf5866d"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60941",
+    "merge_commit_sha": "5b0b8f251ea6b878a22d85baba56e127c66297c8",
+    "merged": true,
+    "merged_at": "2026-10-12T17:38:13Z",
+    "number": 60941,
+    "state": "closed",
+    "title": "[Bugfix][HiSparse] Fix TP group hang on steps without scheduled tokens",
+    "updated_at": "2026-10-12T17:38:13Z"
+  },
+  "files": [
+    {
+      "additions": 47,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/ca604800efe41fdbbe987ad9089c8538ebf5866d/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_hisparse_connector.py",
+      "changes": 47,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_hisparse_connector.py?ref=ca604800efe41fdbbe987ad9089c8538ebf5866d",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/test_hisparse_connector.py",
+      "patch": "@@ -401,6 +401,53 @@ def swap_blocks_batch(src, dst, sizes):\n     assert worker_meta.completed_transfer_counts == {transfer_id: 1}\n \n \n+@pytest.mark.parametrize(\"shared\", [True, False])\n+@pytest.mark.parametrize(\"num_tokens\", [0, 4])\n+def test_zero_token_step_holds_tp_ranks_after_host_write_wait(\n+    monkeypatch, shared, num_tokens\n+):\n+    \"\"\"Steps without tokens hold every TP rank after its shared event wait.\"\"\"\n+    calls: list[tuple[str, object]] = []\n+    compute_stream = MagicMock()\n+    compute_stream.wait_event.side_effect = lambda event: calls.append((\"wait\", event))\n+    tp_group = MagicMock()\n+    tp_group.barrier.side_effect = lambda: calls.append((\"barrier\", None))\n+    monkeypatch.setattr(worker_module, \"current_stream\", lambda: compute_stream)\n+    monkeypatch.setattr(worker_module, \"get_tp_group\", lambda: tp_group)\n+\n+    worker = object.__new__(HiSparseConnectorWorker)\n+    worker.shared_host_region = MagicMock() if shared else None\n+    worker.host_write_events = (MagicMock(), MagicMock())\n+    worker.host_write_event = worker.host_write_events[1]\n+    worker._next_host_write_event = 0\n+    worker._slot_mapping_staging = None\n+    worker.cache_handles = []\n+    worker._pending_invalid_block_ids = []\n+    for name in (\n+        \"_stage_row_mirror_mapping\",\n+        \"_finish_previous_step\",\n+        \"_release_completed_dma_descriptors\",\n+        \"_set_row_mirrors\",\n+        \"_clear_forward_mirror_state\",\n+        \"_copy_host_blocks\",\n+        \"_restore_pages\",\n+        \"_submit_transfers\",\n+    ):\n+        setattr(worker, name, MagicMock())\n+\n+    worker.start_step(\n+        HiSparseConnectorMetadata(None, (), (), {}, True, {}),\n+        None,\n+        [],\n+        num_tokens=num_tokens,\n+    )\n+\n+    expected = [(\"wait\", worker.host_write_events[1])]\n+    if shared and not num_tokens:\n+        expected.append((\"barrier\", None))\n+    assert calls == expected\n+\n+\n def test_scheduled_prefix_hit_publishes_adopted_copies():\n     \"\"\"Copies adopted after scheduling reach the worker as a residency update,\n     leaving the block-table row the scheduler output carries untouched.\"\"\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/ca604800efe41fdbbe987ad9089c8538ebf5866d/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_hisparse_connector.py",
+      "sha": "bdfbee28d4c05c99610e13a76c7666d80809401f",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/ca604800efe41fdbbe987ad9089c8538ebf5866d/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fhisparse%2Fworker.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fhisparse%2Fworker.py?ref=ca604800efe41fdbbe987ad9089c8538ebf5866d",
+      "deletions": 0,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py",
+      "patch": "@@ -416,6 +416,10 @@ def start_step(\n         self.host_write_event = self.host_write_events[self._next_host_write_event]\n         self._next_host_write_event ^= 1\n         current_stream().wait_event(previous_host_write_event)\n+        if self.shared_host_region is not None and not num_tokens:\n+            # Without a forward, no TP collective keeps rank 0 from recording\n+            # a shared event again before every rank has issued its wait.\n+            get_tp_group().barrier()\n         self._release_completed_dma_descriptors()\n         self._dma_submitted = False\n         mirrors = _flatten_row_mirrors(metadata.row_mirrors, request_ids)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/ca604800efe41fdbbe987ad9089c8538ebf5866d/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fhisparse%2Fworker.py",
+      "sha": "c53be27079fe09c656d39060af08393f58d5395e",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-12T14:30:37Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6126333774",
+      "id": 6126333774,
+      "updated_at": "2026-10-12T14:30:37Z",
+      "user": {
+        "login": "robertgshaw2-redhat"
+      }
+    },
+    {
+      "body": "✅ @vMaroon, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-10-12T14:30:46Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6126336385",
+      "id": 6126336385,
+      "updated_at": "2026-10-12T14:30:46Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94232](https://buildkite.com/vllm/ci/builds/94232) for commit `7d3793002f52`.",
+      "created_at": "2026-10-12T14:30:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6126339508",
+      "id": 6126339508,
+      "updated_at": "2026-10-12T14:30:57Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 4 test steps (7 jobs) instead of 8 (13 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 8 (13) | 4 (7) | 5 (7) | 1 (1) |\n| AMD mirrors | 16 (19) | 2 (5) | 14 (14) | 0 (0) |\n\n<details><summary>Selector would run (4)</summary>\n\n- `e2e-core-1-gpu`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-others-cpu`\n</details>\n\n<details><summary>Would skip (today's rules run them) (5)</summary>\n\n- `ascend-npu-test`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `v1-core`\n- `v1-kv-offload`\n- `v1-metrics-lmeval`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (1)</summary>\n\n- `e2e-core-1-gpu` (code map)\n</details>\n\n<details><summary>AMD mirrors: would skip (14)</summary>\n\n- `extract-hidden-states-integration-2-gpus`\n- `fault-tolerance-e2e-2xh100`\n- `fusion-and-compile-unit-tests-2xb200`\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `gemm-rs-ar-2xb200`\n- `kernels-fusedmoe-layer-test-2-b200s`\n- `kernels-fusedmoe-layer-test-2-h100s`\n- `kernels-minimax-reduce-rms-test-2-gpus`\n- `platform-tests`\n- `v1-core`\n- `v1-kv-offload`\n- `v1-metrics-lmeval`\n</details>\n\n<details><summary>AMD mirrors: would add (0)</summary>\n\nnone\n</details>\n\n<sub>2 changed files · base `e0317b28ce` · head `ca604800ef` · Python record: build 93039 at `1e5d0ea888` · kernel record: table 74f4404f58 (build 94125), map 74f4404f58 · not counted: 11 build steps, 5 A100 steps the generator no longer emits, 8 optional steps the selector would also run</sub>\n",
+      "created_at": "2026-10-12T15:44:52Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6127630742",
+      "id": 6127630742,
+      "updated_at": "2026-10-12T16:50:07Z",
+      "user": {
+        "login": "vllm-agent"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-12T15:56:41Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6127825153",
+      "id": 6127825153,
+      "updated_at": "2026-10-12T15:56:41Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94247](https://buildkite.com/vllm/ci/builds/94247) for commit `ca604800efe4`.",
+      "created_at": "2026-10-12T15:57:03Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#issuecomment-6127831154",
+      "id": 6127831154,
+      "updated_at": "2026-10-12T15:57:03Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 60941,
+  "refs": {
+    "base": {
+      "commit": "e0317b28ce3ba4c9bd2ff69d885e3f34688a6d71",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "ca604800efe41fdbbe987ad9089c8538ebf5866d",
+      "repository": "vMaroon/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#pullrequestreview-5476883334",
+      "id": 5476883334,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-10T01:29:58Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "LGTM for now, thanks! I might do a refactor but I'm fine with this in the meantime",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60941#pullrequestreview-5492757247",
+      "id": 5492757247,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-12T15:19:53Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    }
+  ]
+}

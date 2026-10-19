@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: README.md
-raw_sha256: 6309cd798e11e2f2b47d770eb0d3ebc24a34c1dc474c4ab8d86c7e923bb50b63
+raw_sha256: 12f1cfd4e11735ca54af34d48fcbd154d8dd08142dd65016308b516060acd6d0
 sources: []
-generated_body_sha256: 3bd9084f865c52dc933933b86f6eea41ec9bfa5607002f07d991a1d7a6ae029c
+generated_body_sha256: a5ed1bdffa60bff9e73986c75bf42373f79804c513cae3377a0f79496e66c3e8
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -91,8 +91,22 @@ Here are some examples for things you can do:
 
 | Command | Description  |
 |---|---|
-| `energon prepare DATASET_ROOT` | Take an existing WebDataset and add the required yaml files to turn it into an energon-compatible dataset |
-| `energon lint DATASET_ROOT` | Verify that the dataset complies with the energon dataset format and that all samples are loadable |
+| `energon prepare DATASET_ROOT` | Interactively prepare WebDataset indexes, splits, and configuration |
+| `energon prepare DATASET.jsonl` | Create an index for a single JSONL file |
+| `energon prepare-media --media-metadata-by-extension MEDIA_ROOT` | Collect media metadata, such as image dimensions and video duration |
+| `energon mount DATASET_ROOT MOUNTPOINT --sample-folders` | Browse a prepared WebDataset as a read-only virtual filesystem, grouped by sample |
+| `energon --help` | List available commands and options |
+
+For example, prepare a crude WebDataset without interactive prompts:
+
+```shell
+energon prepare /path/to/dataset \
+    --non-interactive \
+    --sample-type=CrudeWebdataset \
+    --split-ratio=98,1,1
+```
+
+Its samples are processed by cookers registered in your application's `TaskEncoder`.
 
 
 ## Usage of the library

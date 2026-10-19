@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 6b030f9a32e64da99e9852187a3a375b61ca3cef56322d82d8826472e4539c7d
+generated_body_sha256: d93bad190e593b54a89e7f76bcdcfb34eabcbb0b9c3ab2d08d4fb27c311cde00
 ---
 
 # cudnn-frontend
@@ -40,7 +40,7 @@ generated_body_sha256: 6b030f9a32e64da99e9852187a3a375b61ca3cef56322d82d8826472e
 ## 上游资料
 
 - [nvidia-cudnn-frontend](https://github.com/NVIDIA/cudnn-frontend)
-- [nvidia-cudnn-frontend-docs](https://docs.nvidia.com/deeplearning/cudnn/latest/)
+- [nvidia-cudnn-frontend-docs](https://docs.nvidia.com/cudnn/)
 - [官方文档原文](knowledgebase/upstream/docs/)
 - [PR 描述、review 与固定代码](knowledgebase/upstream/prs/)
 - [完整源码路径](knowledgebase/upstream/source-map/)

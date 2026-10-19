@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
 path: docs/quickstart.mdx
-raw_sha256: 93ed00e9f0f26ad5a4f31971b226ffaef47477e435e61cc66e4f9f9b47c456ea
+raw_sha256: b2d16117ddd1956a6b5fe4e231b5a9260dce41f6130b47627e77d2b77e8a378a
 sources: []
-generated_body_sha256: e33367a150dc7d0983b288281a9743bfd373b4565e67b53e388880083fe91055
+generated_body_sha256: 18abcb66226e7a17a2faad39cc4790d94f403ded99406908fff7094246be1e33
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / docs/quickstart.mdx
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/docs/quickstart.mdx)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/quickstart.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -147,8 +147,11 @@ The device tensors use `nv_bfloat16`. The host-side reference math uses `float` 
 
 ```cpp
 #include <iostream>
+#include <cmath>
+#include <memory>
 #include <random>
 #include <unordered_map>
+#include <vector>
 
 #include <cuda_runtime.h>   // from $CUDA_HOME/include
 #include <cudnn_frontend.h> // from $CUDNN_FRONTEND_HOME/include

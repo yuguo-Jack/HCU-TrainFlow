@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/02-user-guide/pretraining.md
-raw_sha256: b91a3379d1bcb8cb5b3f8d5f90e57031fef13c15e457f4e71b07a46fe72a3429
+raw_sha256: 580fa8fa9e76a53f594bb88e894f2c752589acff8880b481e6e335a73e7ea803
 sources: []
-generated_body_sha256: f1744a6ecaf24b19e4a1d2d6572f305953ed4d167e4080d966ecb247720386f2
+generated_body_sha256: 279bd6b055c618816cb6d2de8c08c941fe01510c59ddbd819d8bcb48ae0798ea
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/02-user-guide/pretraining.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/02-user-guide/pretraining.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/02-user-guide/pretraining.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -45,7 +45,7 @@ The following table describes the backends supported by Primus and their typical
 | MaxText (JAX) | `framework: maxtext` | JAX/MaxText single- and multi-node runs; parallelism via MaxText `ici_*` / `dcn_*` settings. |
 | MaxDiffusion (JAX) | `framework: maxdiffusion` | JAX/MaxDiffusion diffusion pretraining (WAN 2.1, FLUX.1-dev). Source is vendored as the `third_party/maxdiffusion` submodule; deps installed by the `train/pretrain/maxdiffusion` prepare hooks. |
 | Megatron Bridge | `framework: megatron_bridge` | Bridge-oriented workflows (configure like other backends; see parameter reference). |
-| SpecForge | `framework: specforge` | `specforge_mode: capture`, or `train` with required `specforge_train_mode: offline` / `online` (Mooncake + SGLang), on a ROCm SGLang Primus image. YAML / env / CLI: [SpecForge configuration reference](../../examples/specforge/CONFIGURATION.md). |
+| SpecForge | `framework: specforge` | `specforge_mode: capture`, or `train` with required `specforge_train_mode: offline` / `online` (Mooncake + SGLang), on a ROCm SGLang Primus image. YAML / env / CLI: [SpecForge configuration](../04-technical-guides/specforge/configuration.md). |
 
 > Several setup steps apply to **all** backends (mock vs. real data, Hugging Face tokens, scaling to multiple nodes, and HipBLASLt autotuning). After you read the backend section that applies to you, see [Common patterns](#common-patterns) below.
 

@@ -136,7 +136,9 @@ def validate_dependency_sources(root, sources, pages):
 def validate_authored_links(root, path, body):
     """Source copies retain upstream-relative links; only authored local links count."""
     body = re.sub(r'```.*?```|~~~.*?~~~', '', body, flags=re.S)
-    links = re.findall(r'!?\[[^\]\n]*\]\((<[^>\n]+>|[^\s)\n]+)(?:\s+[^)]*)?\)', body)
+    simple = r'!?\[[^\]\n]*\]\((<[^>\n]+>|[^\s)\n]+)(?:\s+[^)]*)?\)'
+    nested = r'!?\[(?:[^\[\]\n]|\[[^\[\]\n]*\](?!\())*\]\((<[^>\n]+>|[^\s)\n]+)(?:\s+[^)]*)?\)'
+    links = list(dict.fromkeys(re.findall(simple, body) + re.findall(nested, body)))
     errors = []
     for link in links:
         target = urlsplit(link.strip('<>'))

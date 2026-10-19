@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
 path: python/cudnn/README.md
-raw_sha256: 2b391282946f06e0294a8a80df541f13218a14765d0a35027f0c3892a5a58d0d
+raw_sha256: 7f0eb175c9808ebac49cd86e21a01c62a4dbc5ab01d8f9c25983d601428f5c6e
 sources: []
-generated_body_sha256: 10055e941e088c03d0c5eecaddbad1f98b78a914375deb7fbde88013648e0b55
+generated_body_sha256: 81792cbe69dae28192e8d3407d06a6da52cb193a03795f141c93fcb6b2e65dda
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / python/cudnn/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/python/cudnn/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -45,7 +45,6 @@ python/cudnn/
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
-├── api_base.py                     # Abstract API base class for frontend-only APIs
 ├── gemm/                           # GEMM operation family (operation-first layout)
 │   ├── ops/                        # Backend-independent contracts (torch custom ops)
 │   ├── frost/                      # FROST GEMM engine (graph analysis, codegen, JIT)
@@ -84,7 +83,7 @@ is the supported entry point — the directory layout is an implementation detai
 
 To add a new frontend-only API, follow these steps:
 1. Choose the operation family first. GEMM-family kernels go under `python/cudnn/gemm/cutedsl/{dense,grouped,discrete_grouped}/{api-name}/`; only non-GEMM families still use a top-level directory.
-2. Add your kernel implementation and implement the high level API implementation in `api.py`, extending the `APIBase` class in `api_base.py`.
+2. Add your kernel implementation and implement the public functions in `api.py`.
 3. Expose the API import in `python/cudnn/__init__.py` and register the folder in `pyproject.toml`. Register any optional dependences if required.
 4. Add a sample usage/test file in `test/python/{operation}/cutedsl/`.
 
@@ -121,8 +120,6 @@ To add a new frontend-only API, follow these steps:
 
 ## Discrete grouped API notes
 
-The discrete grouped APIs (`DiscreteGroupedGemmSwigluSm100` and `DiscreteGroupedGemmDswigluSm100`) use per-expert pointer arrays instead of a packed `B` tensor:
+The discrete grouped APIs use per-expert pointer arrays instead of a packed `B` tensor:
 
 - Runtime pointer inputs are CUDA `torch.int64` tensors (`b_ptrs`, `sfb_ptrs`) with shape `(num_experts,)`.
-- `compile()` is no-arg and compiles from descriptors captured in the constructor.
-- For CUDA graph capture, call `compile()` before capture and capture only `execute()` with preallocated tensors.

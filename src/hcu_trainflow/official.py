@@ -185,7 +185,7 @@ def pr_page_hashes(project, identity, repository, previous=()):
     source_ids={s['id'] for s in read_json(Path(project)/'knowledge/sources.json')
                 if s.get('repository','').lower()==repository.lower()}
     affected={}
-    for page in (Path(project)/'knowledge').rglob('*.md'):
+    for page in layout.review_page_candidates(project):
         meta,_=wiki.parse_page(page)
         if meta.get('kind') in {'source-pr','source-map','source-document'}:continue
         if identity in meta.get('pr_sources',[]) or any(r['source'] in source_ids for r in meta.get('sources',[])):
@@ -358,7 +358,7 @@ def triage_inventory(store, project, source_id, decisions):
 
 
 def sync_prs(store, project, source_id, token=None, max_prs=10, since=None):
-    """Bounded resumable refresh, preserving failed records and discussion audits."""
+    """Resume bounded discovery before retention; paginated observations are not atomic."""
     project=Path(project).resolve()
     if not 1<=max_prs<=100:raise FlowError('max-prs must be 1..100')
     source=source_for(project,source_id)
@@ -375,48 +375,84 @@ def sync_prs(store, project, source_id, token=None, max_prs=10, since=None):
         ledger['records'].setdefault(str(meta['pr_number']),{'id':meta['id'],'updated_at':meta['updated_at']})
     state_path=store.root/'wiki/pr-sync'/f'{source_id}.json'
     state=read_json(state_path) if state_path.exists() else {}
-    if not state.get('pending'):
+    if not state.get('pending') and not state.get('discovery'):
         cutoff=since or ((datetime.fromisoformat(ledger['discovered_through'])-timedelta(days=1)).isoformat() if ledger.get('discovered_through') else (datetime.now(timezone.utc)-timedelta(days=30)).isoformat())
         cutoff_dt=datetime.fromisoformat(cutoff.replace('Z','+00:00'))
         if cutoff_dt.tzinfo is None:raise FlowError('since requires timezone')
         started=utc(); audit_before=datetime.now(timezone.utc)-timedelta(days=7)
         pending={int(n) for n,r in ledger['records'].items() if not r.get('checked_at') or datetime.fromisoformat(r['checked_at'])<audit_before}
-        page=1; exhausted=False
-        while page<=20:
-            rows,links=api(repo,f'/pulls?state=all&sort=updated&direction=desc&per_page=100&page={page}',token)
-            if not isinstance(rows,list):raise FlowError('Expected PR list')
-            for row in rows:
-                retained=ledger['records'].get(str(row['number']),{})
-                if datetime.fromisoformat(row['updated_at'].replace('Z','+00:00'))>=cutoff_dt and retained.get('updated_at')!=row['updated_at']:
-                    pending.add(row['number'])
-            if not rows or datetime.fromisoformat(rows[-1]['updated_at'].replace('Z','+00:00'))<cutoff_dt or 'rel="next"' not in links:
-                exhausted=True;break
-            page+=1
-        if not exhausted:raise FlowError('Discovery exceeds bounded range; narrow --since; cursor unchanged')
-        state={'pending':sorted(pending,reverse=True),'started':started,'since':cutoff,'errors':[]}
+        state={'pending':sorted(pending,reverse=True),'started':started,'since':cutoff,'errors':[],
+               'discovery':{'status':'in-progress','next_page':1}}
+        # Persist before the first request too: even a page-one failure must
+        # retain the fixed window and the seven-day discussion audit queue.
         write_json(state_path,state)
     errors=[]; processed=[]
-    for number in state['pending'][:max_prs]:
-        try:
-            result=read_pr(store,repo,number,token)
-            record=retain_pr(store,project,result,engine,token)
-            ledger['records'][str(number)]={**record,'checked_at':utc()}
-            write_json(ledger_path,ledger)
-            state['pending'].remove(number)
+    if state.get('discovery'):
+        # Discovery takes precedence over an already nonempty pending queue.
+        # Do not restart its window or reset started when a caller resumes.
+        cutoff_dt=datetime.fromisoformat(state['since'].replace('Z','+00:00'))
+        if cutoff_dt.tzinfo is None:raise FlowError('since requires timezone')
+        pending={int(n) for n in state['pending']}
+        for _ in range(20):
+            page=state['discovery']['next_page']
+            try:
+                rows,links=api(repo,f'/pulls?state=all&sort=updated&direction=desc&per_page=100&page={page}',token)
+                if not isinstance(rows,list):raise FlowError('Expected PR list')
+                found=set(); updated=[]
+                # Validate the complete page before checkpointing any of it.
+                # An invalid response is not an empty page or an exhausted scan.
+                for row in rows:
+                    if (not isinstance(row,dict) or type(row.get('number')) is not int
+                            or row['number']<=0 or not isinstance(row.get('updated_at'),str)):
+                        raise FlowError('Expected numbered PR rows with updated_at')
+                    observed=datetime.fromisoformat(row['updated_at'].replace('Z','+00:00'))
+                    if observed.tzinfo is None:raise FlowError('PR updated_at requires timezone')
+                    updated.append(observed)
+                    retained=ledger['records'].get(str(row['number']),{})
+                    if observed>=cutoff_dt and retained.get('updated_at')!=row['updated_at']:
+                        found.add(row['number'])
+                if not isinstance(links,str):raise FlowError('Expected PR pagination links')
+            except (FlowError,OSError,ValueError) as exc:
+                errors.append({'phase':'discovery','page':page,'error':str(exc)[:240]})
+                break
+            pending.update(found)
+            state['pending']=sorted(pending,reverse=True)
+            state['errors']=[]
+            if not rows or updated[-1]<cutoff_dt or 'rel="next"' not in links:
+                state.pop('discovery')
+                write_json(state_path,state)
+                break
+            state['discovery']['next_page']=page+1
             write_json(state_path,state)
-            processed.append(number)
-        except (FlowError,OSError,ValueError) as exc:errors.append({'number':number,'error':str(exc)[:240]})
+    if not state.get('discovery'):
+        # Old states have only pending/started/since. Keep draining those
+        # without a new discovery pass, while removing duplicate queue entries.
+        state['pending']=sorted({int(n) for n in state['pending']},reverse=True)
+        for number in state['pending'][:max_prs]:
+            try:
+                result=read_pr(store,repo,number,token)
+                record=retain_pr(store,project,result,engine,token)
+                ledger['records'][str(number)]={**record,'checked_at':utc()}
+                write_json(ledger_path,ledger)
+                state['pending'].remove(number)
+                write_json(state_path,state)
+                processed.append(number)
+            except (FlowError,OSError,ValueError) as exc:errors.append({'number':number,'error':str(exc)[:240]})
+        if not state['pending']:
+            ledger['discovered_through']=state['started'];ledger['discovery_since']=state['since'];write_json(ledger_path,ledger)
     state['errors']=errors
-    if not state['pending']:
-        ledger['discovered_through']=state['started'];ledger['discovery_since']=state['since'];write_json(ledger_path,ledger)
     write_json(state_path,state)
     review_pending=[]
     for row in ledger['records'].values():
         pointer=store.root/'wiki/pr-review'/f'{row["id"]}.json'
         if pointer.exists() and read_json(pointer)['status']=='pending-content-review':review_pending.append(row['id'])
+    discovery=state.get('discovery')
     return {'source':source_id,'processed':processed,'pending':len(state['pending']),'errors':errors,'review_pending':review_pending,
-            'status':'partial' if state['pending'] or errors else 'collected-not-reviewed',
-            'scope_since':state['since'],'instruction':'Review related topics/cases; collection is not synthesis. Repeat the same command to resume.'}
+            'status':'partial' if discovery or state['pending'] or errors else 'collected-not-reviewed',
+            'discovery_pending':bool(discovery),'next_page':discovery['next_page'] if discovery else None,
+            'scope_since':state['since'],
+            'instruction':('Discovery is incomplete; repeat the same command to resume its fixed window. No PRs were retained or public cursor advanced. GitHub pagination is not an atomic snapshot.'
+                           if discovery else 'Review related topics/cases; collection is not synthesis. Repeat the same command to resume.')}
 
 
 def apply_refresh(store, project, stage_id):

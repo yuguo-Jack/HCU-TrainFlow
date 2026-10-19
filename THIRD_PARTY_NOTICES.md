@@ -51,7 +51,7 @@ Wiki 的 `knowledge/projects/*/knowledgebase/upstream/` 保留所选上游文档
 | [MindSpeed](https://github.com/Ascend/MindSpeed) / [MindSpeed-LLM](https://github.com/Ascend/MindSpeed-LLM) | 并行、MoE、流水、显存机制与模型配方 |
 | [LoongForge](https://github.com/baidu-baige/LoongForge) / [Loong-Megatron](https://github.com/baidu-baige/Loong-Megatron) | 模型适配、EP overlap、offload 及父工程固定子仓实现 |
 | [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) / [官方教程](https://docs.nvidia.com/deeplearning/transformer-engine/) | 低精度、融合算子、attention、缓存与前后向 |
-| [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) / [官方教程](https://docs.nvidia.com/deeplearning/cudnn/latest/) | Graph、plan、SDPA、开放融合 kernel 与数值契约；组件许可见该仓 LICENSING.md 和文件级声明 |
+| [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) / [官方教程](https://docs.nvidia.com/cudnn/) | Graph、plan、SDPA、开放融合 kernel 与数值契约；组件许可见该仓 LICENSING.md 和文件级声明 |
 
 官方工程用于语义、实现和优化思路查证，其 NVIDIA、AMD 或其他平台的能力不自动等于 HCU 分支已支持。按问题选择来源见 [优化参考图谱](docs/optimization-reference-map.md)。
 

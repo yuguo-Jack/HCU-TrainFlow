@@ -9,15 +9,15 @@ stages:
 visibility: public
 review_level: selected-source-and-document-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: bbuf-ai-infra-auto-driven-skills
   path: README.md
-  commit: 154cc565d0374746442bac17bd69368b888f4775
-  sha256: 3f4c7f87ad45e01449eb519a9f2a3fe302867ee221b9a234488d63def1193fff
+  commit: e51089a7b5b25939d5ab6f2216df0ba07be30225
+  sha256: 3b99889424fbaf96c02094b359469873890be51c9580c5c1204f30cc1c51e892
 - source: bbuf-ai-infra-auto-driven-skills
   path: skills/model-optimization/README.md
-  commit: 154cc565d0374746442bac17bd69368b888f4775
+  commit: e51089a7b5b25939d5ab6f2216df0ba07be30225
   sha256: 6b15b88e84baf06ebb67518c87cb614af7bd0d684dac4283ec1911b259544d3d
 ---
 
@@ -49,7 +49,7 @@ TrainFlow 将这一路线用于真实模型适配：优先当前 HCU 脚本与�
 
 ## 来源、PR 与更新
 
-- [README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/154cc565d0374746442bac17bd69368b888f4775/README.md)
-- [skills/model-optimization/README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/154cc565d0374746442bac17bd69368b888f4775/skills/model-optimization/README.md)
+- [README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/e51089a7b5b25939d5ab6f2216df0ba07be30225/README.md)
+- [skills/model-optimization/README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/e51089a7b5b25939d5ab6f2216df0ba07be30225/skills/model-optimization/README.md)
 
 按该仓完整目录与文档增量检查新增入口；通过 `wiki-search-pr` 搜索改动原因，再追当前实现和测试。正文是选定源码/官方文档解读，未在新现场运行。新 commit、接口、返回 schema 或依赖变化时，同时复核本页和相关工作流。

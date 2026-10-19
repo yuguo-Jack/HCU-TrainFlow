@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/models/common/dist_moe/README.md
-raw_sha256: ae08f8c77d5c44d937b0c82513998e441f534eed53b4b91110656fcb38eee658
+raw_sha256: 03d47172e2c7e13a7eda28d210745f5c8da680e3dee2f9f5c2bbab97af3ad897
 sources: []
-generated_body_sha256: 7e935a77ca3f408da93e25b35cc3d5c24707492551a705350e220dce6c317e83
+generated_body_sha256: 5a0db9621bb75ee29d11d3ba09440141e556797ff5313d3c8ede2a1192f88ef3
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/common/dist_moe/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/common/dist_moe/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/dist_moe/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -316,7 +316,7 @@ TorchTitan owns one optional Dist-MoE runtime through forward/backward setup:
 
 The RL vLLM generator owns an inference runtime
 (`DistMoeRuntime.Config(inference=True)`, passed as
-`VLLMGenerator.Config.dist_moe_runtime`): scratch-only planning, sized for
+`Generator.Config.dist_moe_runtime`): scratch-only planning, sized for
 vLLM's per-step token budget. vLLM pads every step at the end (TP rounding,
 CUDA-graph size, DP maximum); the runner publishes the unpadded count and the
 model passes a `padding_mask` down to the routed experts.

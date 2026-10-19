@@ -1,0 +1,588 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "f49bc0e06549c145ad20e0c5b31e97be160254a19da496374d47a4554f69d94f",
+      "isPrivate": false,
+      "numbers": [
+        60227,
+        60226,
+        60224,
+        60222,
+        60220,
+        60219,
+        60218,
+        60217
+      ],
+      "observed_at": "2026-10-19T19:25:00.758719+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4761,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "3313825983dad6fd4291986e7f9ba647c059d1ff",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "\n\n## Overview\n\nThe FlashMLA sparse `fp8_ds_mla` mixed-batch path now writes the head-padded query and the kernel output into the workspace buffers that `FlashMLASparseImpl` already reserves for `max_num_batched_tokens`, so it no longer allocates them on every call. This removes about 4.25 GiB of per-call allocation at 32K tokens per step. That allocation isn't counted by the startup memory profile, so it can cause runtime OOMs.\n\nRelated: #59305, #57878. Complements vllm-project/FlashMLA#29, which removes the kernel-internal fp32 split-KV `o_accum` buffer (the other 8 GiB at T=32K). This PR only covers the wrapper side.\n\n## Claims\n\n- On the fp8 mixed-batch path, the padded q (`T x 64 x 576` bf16) and the output (`T x 64 x 512` bf16) are written into the reserved workspace, and the output buffer is passed to the kernel via `out=`. At T=32768 this saves 4.25 GiB per call, measured. The workspace was already reserved, so KV cache capacity does not change.\n- Outputs and LSE are bit-identical to the allocating path.\n- GLM-5.3-Flash FP8 on 8xH100 (TP8, `max_num_batched_tokens=32768`, `gpu_memory_utilization=0.85`) previously hit a runtime OOM in `flash_mla_with_kvcache` during warmup. With this change it serves the same workload without errors, and GSM8K accuracy matches.\n\n## Validation\n\n**Per-call peak allocation.** Single H100. GLM-5.3-Flash TP8 shapes: 8 heads/rank padded to 64, topk 2048, `s_q = T`. Measured through `FlashMLASparseImpl._fp8_flash_mla_kernel`:\n\n| T | before (allocating path) | after (workspace path) | saved | outputs equal |\n|---|---|---|---|---|\n| 1024 | 0.384 GiB | 0.251 GiB | 0.133 GiB | yes |\n| 8192 | 3.068 GiB | 2.006 GiB | 1.063 GiB | yes |\n| 16384 | 6.137 GiB | 4.012 GiB | 2.125 GiB | yes |\n| 32768 | 12.273 GiB | 8.023 GiB | 4.250 GiB | yes |\n\nThe remaining ~8 GiB at T=32768 is the kernel's `o_accum`, which is addressed by vllm-project/FlashMLA#29.\n\n**End-to-end, previously crashing config.** GLM-5.3-Flash FP8, 8xH100, `--tensor-parallel-size 8 --max-num-seqs 256 --attention-backend FLASHMLA_SPARSE --kv-cache-dtype fp8_ds_mla --max-num-batched-tokens 32768 --gpu-memory-utilization 0.85 --max-model-len 131072`.\n- Before this change: during the warmup with 8K input and concurrency 256, the server failed with `torch.OutOfMemoryError` (tried to allocate 8 GiB with 5.29 GiB free), and 255 of 256 requests failed.\n- After this change: warmups at 8K/c256 and 64K/c64 completed with no errors, and there are no OOM lines in the server log. Peak `nvidia-smi` memory.used was 80923 / 81559 MiB. This is tight because `o_accum` is still allocated per call until FlashMLA#29 lands.\n\n`vllm bench serve` results, random dataset, `--ignore-eos`. The comparison is against the existing MNBT=16384 config, which has a larger KV pool (2.66M vs 1.88M tokens), so this is a sanity check rather than an A/B:\n\n| ISL/OSL, concurrency | completed | total tok/s, MNBT 32K + this PR | total tok/s, MNBT 16K baseline |\n|---|---|---|---|\n| 8192/1024, c64 | 192/192 | 16717 | 16424 |\n| 8192/1024, c256 | 768/768 | 20189 | 21522 (KV cache reached 100% at 32K) |\n| 65536/1024, c16 | 48/48 | 23357 | 23141 |\n| 65536/1024, c64 | 192/192 | 24263 | 25101 |\n\n**Accuracy.** GSM8K, 5-shot, all 1319 questions, using `tests/evals/gsm8k/gsm8k_eval.py` against the server:\n\n| config | accuracy | invalid |\n|---|---|---|\n| main, MNBT 8192 | 0.919 | 0.000 |\n| this PR, MNBT 32768 | 0.914 | 0.000 |\n\n**Tests.**\n- New test: `pytest tests/v1/attention/test_sparse_mla_backends.py -k test_flashmla_fp8_mixed_batch_stages_in_workspace` (H100). 2 passed.\n- Existing tests: `pytest tests/v1/attention/test_sparse_mla_backends.py -k \"test_sparse_backend_decode_correctness and FlashMLA and fp8_ds_mla\"` (H100). 84 passed, 84 skipped. These include the TP>1 cases that use the mixed-batch path, run with the workspace locked.\n\n## Details\n\n**Root cause.** For `fp8_ds_mla` with fewer than `MIN_HEADS_FOR_BF16_PREFILL` heads per rank (`fp8_use_mixed_batch`), every step makes a single `flash_mla_with_kvcache` call with `s_q = num_tokens`. The wrapper pads q to 64 heads with `new_zeros`, and the kernel allocates `out`, `lse` and `o_accum`, all O(T * 64). The profile run skips attention, so none of this is counted when the KV cache is sized. At large `max_num_batched_tokens`, a full step therefore OOMs after startup.\n\n**Fix.** `__init__` already reserves `(max_tokens, padded_heads, 576)` and `(max_tokens, padded_heads, 512)` bf16 workspace slots for the BF16 prefill path, which is not used in mixed-batch mode. `_fp8_flash_mla_kernel(use_workspace=True)` takes flat views of those slots sized for the FP8 decode padding (the reserved head padding is at least as wide). It zeroes only the padding heads and passes `out=` to the kernel.\n- Only the mixed-batch caller turns this on. Pure-decode, HiSparse and separate prefill/decode callers keep the allocating path, because their T is small.\n- The returned output aliases the workspace. It is consumed by the `v_up` projection or the DCP merge before any other workspace user runs. The separate prefill/decode path already returns workspace-backed output the same way.\n- The q input comes from workspace slot 0, the q-concat buffer, so it doesn't overlap the padded-q slot.\n- No new CPU/GPU synchronization: the added checks are host-side shape asserts.\n- `lse` is still allocated by the kernel (T x 64 x 4 B = 8 MiB at 32K).\n\n**Limitations.** The kernel-internal `o_accum` (2 x T x 64 x 512 x 4 B = 8 GiB at T=32K on SM90) is still allocated per call and isn't counted by the profile run. That is fixed in vllm-project/FlashMLA#29. This PR removes the wrapper-side share.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "drakosha"
+            },
+            "body": "#59319 (ours, open) stops reserving the bf16 prefill workspace on the fp8 mixed-batch path. Its first revision skipped the whole block, including the three `max_num_batched_tokens` buffers this PR stages q and out in. The two PRs merge without a conflict, but together `workspace_specs` on that path holds only `q_concat`, and the `get_simultaneous` unpack fails on the first forward with `ValueError: not enough values to unpack (expected at least 3, got 1)`.\n\nThe current revision of #59319 skips only the `5 * max_model_len` buffer (plus the PCP+DCP gather buffer) and keeps the three `max_num_batched_tokens` buffers, so either merge order works. On one H200 (nightly `af7f9488c` with both files swapped in), `test_sparse_backend_decode_correctness` for FlashMLA + `fp8_ds_mla` fails in all 14 TP=8 cases with the first revision plus this PR, and passes with the current one: 72 passed, including your two staging tests and the #59319 unit tests.\n\n`test_flashmla_fp8_mixed_batch_stages_in_workspace` builds `workspace_specs` by hand, so it won't catch a change in what `__init__` reserves. The TP=8 cases #59319 adds go through the real `__init__` and do.\n\nAI assistance was used for this comment.\n",
+            "createdAt": "2026-10-11T15:22:37Z",
+            "databaseId": 6110543897,
+            "updatedAt": "2026-10-11T15:22:37Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60220#issuecomment-6110543897"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @NickLucche.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-13T21:31:36Z",
+            "databaseId": 6155636163,
+            "updatedAt": "2026-10-13T21:31:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60220#issuecomment-6155636163"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW7njcM=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "72b64be82e0022a50765539a0d4ee63d79612fcd",
+      "headRepository": {
+        "nameWithOwner": "NickLucche/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 60220,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[Attention] FlashMLA sparse: stage fp8 mixed-batch q/out in the workspace",
+      "updatedAt": "2026-10-13T21:31:38Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60220"
+    },
+    "reused_files": {
+      "artifact_path": "knowledge/evidence/prs/vllm-project--vllm/60220-2d3b264741bcde91d143294b989ffe2455f6d4e54cfb22c48c4372b85d6bf581.json",
+      "artifact_sha256": "2d3b264741bcde91d143294b989ffe2455f6d4e54cfb22c48c4372b85d6bf581",
+      "reason": "Same immutable head/base repository+commit pair and changed_files; original fully paginated files response reused. Discussions are freshly queried.",
+      "refs": {
+        "base": {
+          "commit": "3313825983dad6fd4291986e7f9ba647c059d1ff",
+          "repository": "vllm-project/vllm"
+        },
+        "head": {
+          "commit": "72b64be82e0022a50765539a0d4ee63d79612fcd",
+          "repository": "NickLucche/vllm"
+        }
+      }
+    },
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/60220/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/60220/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/60220"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/60220"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/60220/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/60220"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/72b64be82e0022a50765539a0d4ee63d79612fcd"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 147,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "MEMBER",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 23600,
+        "forks_count": 23600,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9092,
+        "open_issues_count": 9092,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-10-19T19:17:28Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 323941,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 94148,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-10-19T19:18:34Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 94148,
+        "watchers_count": 94148,
+        "web_commit_signoff_required": true
+      },
+      "sha": "3313825983dad6fd4291986e7f9ba647c059d1ff",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "\n\n## Overview\n\nThe FlashMLA sparse `fp8_ds_mla` mixed-batch path now writes the head-padded query and the kernel output into the workspace buffers that `FlashMLASparseImpl` already reserves for `max_num_batched_tokens`, so it no longer allocates them on every call. This removes about 4.25 GiB of per-call allocation at 32K tokens per step. That allocation isn't counted by the startup memory profile, so it can cause runtime OOMs.\n\nRelated: #59305, #57878. Complements vllm-project/FlashMLA#29, which removes the kernel-internal fp32 split-KV `o_accum` buffer (the other 8 GiB at T=32K). This PR only covers the wrapper side.\n\n## Claims\n\n- On the fp8 mixed-batch path, the padded q (`T x 64 x 576` bf16) and the output (`T x 64 x 512` bf16) are written into the reserved workspace, and the output buffer is passed to the kernel via `out=`. At T=32768 this saves 4.25 GiB per call, measured. The workspace was already reserved, so KV cache capacity does not change.\n- Outputs and LSE are bit-identical to the allocating path.\n- GLM-5.3-Flash FP8 on 8xH100 (TP8, `max_num_batched_tokens=32768`, `gpu_memory_utilization=0.85`) previously hit a runtime OOM in `flash_mla_with_kvcache` during warmup. With this change it serves the same workload without errors, and GSM8K accuracy matches.\n\n## Validation\n\n**Per-call peak allocation.** Single H100. GLM-5.3-Flash TP8 shapes: 8 heads/rank padded to 64, topk 2048, `s_q = T`. Measured through `FlashMLASparseImpl._fp8_flash_mla_kernel`:\n\n| T | before (allocating path) | after (workspace path) | saved | outputs equal |\n|---|---|---|---|---|\n| 1024 | 0.384 GiB | 0.251 GiB | 0.133 GiB | yes |\n| 8192 | 3.068 GiB | 2.006 GiB | 1.063 GiB | yes |\n| 16384 | 6.137 GiB | 4.012 GiB | 2.125 GiB | yes |\n| 32768 | 12.273 GiB | 8.023 GiB | 4.250 GiB | yes |\n\nThe remaining ~8 GiB at T=32768 is the kernel's `o_accum`, which is addressed by vllm-project/FlashMLA#29.\n\n**End-to-end, previously crashing config.** GLM-5.3-Flash FP8, 8xH100, `--tensor-parallel-size 8 --max-num-seqs 256 --attention-backend FLASHMLA_SPARSE --kv-cache-dtype fp8_ds_mla --max-num-batched-tokens 32768 --gpu-memory-utilization 0.85 --max-model-len 131072`.\n- Before this change: during the warmup with 8K input and concurrency 256, the server failed with `torch.OutOfMemoryError` (tried to allocate 8 GiB with 5.29 GiB free), and 255 of 256 requests failed.\n- After this change: warmups at 8K/c256 and 64K/c64 completed with no errors, and there are no OOM lines in the server log. Peak `nvidia-smi` memory.used was 80923 / 81559 MiB. This is tight because `o_accum` is still allocated per call until FlashMLA#29 lands.\n\n`vllm bench serve` results, random dataset, `--ignore-eos`. The comparison is against the existing MNBT=16384 config, which has a larger KV pool (2.66M vs 1.88M tokens), so this is a sanity check rather than an A/B:\n\n| ISL/OSL, concurrency | completed | total tok/s, MNBT 32K + this PR | total tok/s, MNBT 16K baseline |\n|---|---|---|---|\n| 8192/1024, c64 | 192/192 | 16717 | 16424 |\n| 8192/1024, c256 | 768/768 | 20189 | 21522 (KV cache reached 100% at 32K) |\n| 65536/1024, c16 | 48/48 | 23357 | 23141 |\n| 65536/1024, c64 | 192/192 | 24263 | 25101 |\n\n**Accuracy.** GSM8K, 5-shot, all 1319 questions, using `tests/evals/gsm8k/gsm8k_eval.py` against the server:\n\n| config | accuracy | invalid |\n|---|---|---|\n| main, MNBT 8192 | 0.919 | 0.000 |\n| this PR, MNBT 32768 | 0.914 | 0.000 |\n\n**Tests.**\n- New test: `pytest tests/v1/attention/test_sparse_mla_backends.py -k test_flashmla_fp8_mixed_batch_stages_in_workspace` (H100). 2 passed.\n- Existing tests: `pytest tests/v1/attention/test_sparse_mla_backends.py -k \"test_sparse_backend_decode_correctness and FlashMLA and fp8_ds_mla\"` (H100). 84 passed, 84 skipped. These include the TP>1 cases that use the mixed-batch path, run with the workspace locked.\n\n## Details\n\n**Root cause.** For `fp8_ds_mla` with fewer than `MIN_HEADS_FOR_BF16_PREFILL` heads per rank (`fp8_use_mixed_batch`), every step makes a single `flash_mla_with_kvcache` call with `s_q = num_tokens`. The wrapper pads q to 64 heads with `new_zeros`, and the kernel allocates `out`, `lse` and `o_accum`, all O(T * 64). The profile run skips attention, so none of this is counted when the KV cache is sized. At large `max_num_batched_tokens`, a full step therefore OOMs after startup.\n\n**Fix.** `__init__` already reserves `(max_tokens, padded_heads, 576)` and `(max_tokens, padded_heads, 512)` bf16 workspace slots for the BF16 prefill path, which is not used in mixed-batch mode. `_fp8_flash_mla_kernel(use_workspace=True)` takes flat views of those slots sized for the FP8 decode padding (the reserved head padding is at least as wide). It zeroes only the padding heads and passes `out=` to the kernel.\n- Only the mixed-batch caller turns this on. Pure-decode, HiSparse and separate prefill/decode callers keep the allocating path, because their T is small.\n- The returned output aliases the workspace. It is consumed by the `v_up` projection or the DCP merge before any other workspace user runs. The separate prefill/decode path already returns workspace-backed output the same way.\n- The q input comes from workspace slot 0, the q-concat buffer, so it doesn't overlap the padded-q slot.\n- No new CPU/GPU synchronization: the added checks are host-side shape asserts.\n- `lse` is still allocated by the kernel (T x 64 x 4 B = 8 MiB at 32K).\n\n**Limitations.** The kernel-internal `o_accum` (2 x T x 64 x 512 x 4 B = 8 GiB at T=32K on SM90) is still allocated per call and isn't counted by the profile run. That is fixed in vllm-project/FlashMLA#29. This PR removes the wrapper-side share.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 2,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/60220/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/60220/commits",
+    "created_at": "2026-10-06T11:40:41Z",
+    "deletions": 2,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/60220.diff",
+    "draft": true,
+    "head": {
+      "label": "NickLucche:nicolo/flashmla-sparse-mixed-batch-workspace",
+      "ref": "nicolo/flashmla-sparse-mixed-batch-workspace",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NickLucche/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NickLucche/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NickLucche/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NickLucche/vllm/branches{/branch}",
+        "clone_url": "https://github.com/NickLucche/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/NickLucche/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NickLucche/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NickLucche/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NickLucche/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NickLucche/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NickLucche/vllm/contributors",
+        "created_at": "2024-06-28T12:43:04Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NickLucche/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NickLucche/vllm/downloads",
+        "events_url": "https://api.github.com/repos/NickLucche/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/NickLucche/vllm/forks",
+        "full_name": "NickLucche/vllm",
+        "git_commits_url": "https://api.github.com/repos/NickLucche/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NickLucche/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NickLucche/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/NickLucche/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.vllm.ai",
+        "hooks_url": "https://api.github.com/repos/NickLucche/vllm/hooks",
+        "html_url": "https://github.com/NickLucche/vllm",
+        "id": 821392205,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NickLucche/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NickLucche/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NickLucche/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NickLucche/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NickLucche/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NickLucche/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/NickLucche/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/NickLucche/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOMPVzTQ",
+        "notifications_url": "https://api.github.com/repos/NickLucche/vllm/notifications{?since,all,participating}",
+        "open_issues": 3,
+        "open_issues_count": 3,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/10706289?v=4",
+          "events_url": "https://api.github.com/users/NickLucche/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NickLucche/followers",
+          "following_url": "https://api.github.com/users/NickLucche/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NickLucche/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NickLucche",
+          "id": 10706289,
+          "login": "NickLucche",
+          "node_id": "MDQ6VXNlcjEwNzA2Mjg5",
+          "organizations_url": "https://api.github.com/users/NickLucche/orgs",
+          "received_events_url": "https://api.github.com/users/NickLucche/received_events",
+          "repos_url": "https://api.github.com/users/NickLucche/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NickLucche/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NickLucche/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/NickLucche",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NickLucche/vllm/pulls{/number}",
+        "pushed_at": "2026-10-18T19:20:28Z",
+        "releases_url": "https://api.github.com/repos/NickLucche/vllm/releases{/id}",
+        "size": 313492,
+        "ssh_url": "git@github.com:NickLucche/vllm.git",
+        "stargazers_count": 2,
+        "stargazers_url": "https://api.github.com/repos/NickLucche/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/NickLucche/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NickLucche/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/NickLucche/vllm/subscription",
+        "svn_url": "https://github.com/NickLucche/vllm",
+        "tags_url": "https://api.github.com/repos/NickLucche/vllm/tags",
+        "teams_url": "https://api.github.com/repos/NickLucche/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/NickLucche/vllm/git/trees{/sha}",
+        "updated_at": "2025-06-19T07:28:26Z",
+        "url": "https://api.github.com/repos/NickLucche/vllm",
+        "visibility": "public",
+        "watchers": 2,
+        "watchers_count": 2,
+        "web_commit_signoff_required": false
+      },
+      "sha": "72b64be82e0022a50765539a0d4ee63d79612fcd",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/10706289?v=4",
+        "events_url": "https://api.github.com/users/NickLucche/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NickLucche/followers",
+        "following_url": "https://api.github.com/users/NickLucche/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NickLucche/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NickLucche",
+        "id": 10706289,
+        "login": "NickLucche",
+        "node_id": "MDQ6VXNlcjEwNzA2Mjg5",
+        "organizations_url": "https://api.github.com/users/NickLucche/orgs",
+        "received_events_url": "https://api.github.com/users/NickLucche/received_events",
+        "repos_url": "https://api.github.com/users/NickLucche/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NickLucche/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NickLucche/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/NickLucche",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60220",
+    "id": 4758170159,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/60220",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d4c5f9",
+        "default": false,
+        "description": "",
+        "id": 7614859318,
+        "name": "needs-rebase",
+        "node_id": "LA_kwDOI7xefs8AAAABxeGINg",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/needs-rebase"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABG5vqLw",
+    "number": 60220,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/60220.patch",
+    "rebaseable": null,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/60220/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/72b64be82e0022a50765539a0d4ee63d79612fcd",
+    "title": "[Attention] FlashMLA sparse: stage fp8 mixed-batch q/out in the workspace",
+    "updated_at": "2026-10-13T21:31:38Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/60220",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/10706289?v=4",
+      "events_url": "https://api.github.com/users/NickLucche/events{/privacy}",
+      "followers_url": "https://api.github.com/users/NickLucche/followers",
+      "following_url": "https://api.github.com/users/NickLucche/following{/other_user}",
+      "gists_url": "https://api.github.com/users/NickLucche/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/NickLucche",
+      "id": 10706289,
+      "login": "NickLucche",
+      "node_id": "MDQ6VXNlcjEwNzA2Mjg5",
+      "organizations_url": "https://api.github.com/users/NickLucche/orgs",
+      "received_events_url": "https://api.github.com/users/NickLucche/received_events",
+      "repos_url": "https://api.github.com/users/NickLucche/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/NickLucche/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/NickLucche/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/NickLucche",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 101,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/72b64be82e0022a50765539a0d4ee63d79612fcd/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py",
+      "changes": 101,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py?ref=72b64be82e0022a50765539a0d4ee63d79612fcd",
+      "deletions": 0,
+      "filename": "tests/v1/attention/test_sparse_mla_backends.py",
+      "patch": "@@ -110,6 +110,7 @@\n     hisparse_prefill_staging_remap,\n )\n from vllm.v1.hisparse.types import SparseKVRowMirror\n+from vllm.v1.worker.workspace import current_workspace_manager\n \n SPARSE_BACKEND_BATCH_SPECS = {\n     name: BATCH_SPECS[name]\n@@ -1208,6 +1209,106 @@ def _convert_topk(indices, metadata, **kwargs):\n     torch.testing.assert_close(captured[\"indices\"], reference, rtol=0, atol=0)\n \n \n+@pytest.mark.parametrize(\"num_heads\", [8, 64])\n+def test_flashmla_fp8_mixed_batch_stages_in_workspace(workspace_init, num_heads):\n+    \"\"\"The FP8 mixed-batch path runs the decode kernel with s_q = all tokens of\n+    the step, so its padded q and output scale with max_num_batched_tokens.\n+    Staging them in the workspace reserved at init must give bit-identical\n+    results to the allocating path, alias the workspace, and not allocate\n+    them per call (the startup memory profile never sees those allocations).\n+    \"\"\"\n+    ok, reason = flashmla.is_flashmla_sparse_supported()\n+    if not ok:\n+        pytest.skip(reason)\n+\n+    device = torch.device(DEVICE_TYPE)\n+    dtype = torch.bfloat16\n+    num_tokens, max_tokens, topk = 512, 1024, 128\n+    num_blocks, block_size = 16, 64\n+    num_slots = num_blocks * block_size\n+    kv_lora_rank, rope_dim = 512, 64\n+    head_size = kv_lora_rank + rope_dim\n+    padded_heads = FlashMLASparseImpl._compute_fp8_decode_padded_heads(num_heads)\n+\n+    # Same layout FlashMLASparseImpl.__init__ reserves for fp8_ds_mla.\n+    workspace_specs = [\n+        ((max_tokens, num_heads, head_size), dtype),\n+        ((num_slots, head_size), dtype),\n+        ((max_tokens, padded_heads, head_size), dtype),\n+        ((max_tokens, padded_heads, kv_lora_rank), dtype),\n+        ((max_tokens, num_heads, kv_lora_rank), dtype),\n+    ]\n+    manager = current_workspace_manager()\n+    workspaces = manager.get_simultaneous(*workspace_specs)\n+    manager.lock()\n+\n+    torch.manual_seed(0)\n+    kv_cache = torch.zeros(\n+        (num_blocks, block_size, 656), dtype=torch.uint8, device=device\n+    )\n+    ops.concat_and_cache_mla(\n+        torch.randn(num_slots, kv_lora_rank, dtype=dtype, device=device),\n+        torch.randn(num_slots, rope_dim, dtype=dtype, device=device),\n+        kv_cache,\n+        torch.arange(num_slots, dtype=torch.int64, device=device),\n+        \"fp8_ds_mla\",\n+        torch.ones(1, dtype=torch.float32, device=device),\n+    )\n+    q = torch.randn(1, num_tokens, num_heads, head_size, dtype=dtype, device=device)\n+    topk_indices = torch.randint(\n+        0, num_slots, (1, num_tokens, topk), dtype=torch.int32, device=device\n+    )\n+    topk_indices[..., topk // 2 :] = -1\n+\n+    scheduler_metadata, _ = flashmla.get_mla_metadata()\n+    kernel_metadata = FlashMLASparseMetadata.FP8KernelMetadata(\n+        scheduler_metadata=scheduler_metadata,\n+        cache_lens=torch.tensor([num_slots], dtype=torch.int32, device=device),\n+        dummy_block_table=torch.zeros((1, 1), dtype=torch.int32, device=device),\n+    )\n+    stub_impl = SimpleNamespace(\n+        fp8_decode_padded_heads=padded_heads,\n+        workspace_specs=workspace_specs,\n+        softmax_scale=head_size**-0.5,\n+    )\n+\n+    def run(use_workspace: bool) -> tuple[torch.Tensor, torch.Tensor, int]:\n+        torch.accelerator.synchronize()\n+        torch.accelerator.reset_peak_memory_stats()\n+        before = torch.accelerator.memory_allocated()\n+        out, lse = FlashMLASparseImpl._fp8_flash_mla_kernel(\n+            stub_impl,\n+            q=q,\n+            kv_c_and_k_pe_cache=kv_cache,\n+            topk_indices=topk_indices,\n+            kernel_metadata=kernel_metadata,\n+            use_workspace=use_workspace,\n+        )\n+        torch.accelerator.synchronize()\n+        return out, lse, torch.accelerator.max_memory_allocated() - before\n+\n+    ref_out, ref_lse, ref_peak = run(use_workspace=False)\n+    ref_out = ref_out.clone()\n+    # Stale workspace contents (e.g. from another layer) must not leak in.\n+    for workspace in workspaces[2:4]:\n+        workspace.fill_(float(\"nan\"))\n+    out, lse, peak = run(use_workspace=True)\n+\n+    assert out.shape == ref_out.shape == (1, num_tokens, num_heads, kv_lora_rank)\n+    torch.testing.assert_close(out, ref_out, rtol=0, atol=0)\n+    torch.testing.assert_close(lse, ref_lse, rtol=0, atol=0)\n+    padded_out = workspaces[3]\n+    assert out.data_ptr() == padded_out.data_ptr()\n+\n+    staged_bytes = num_tokens * padded_heads * kv_lora_rank * dtype.itemsize\n+    if num_heads < padded_heads:\n+        staged_bytes += num_tokens * padded_heads * head_size * dtype.itemsize\n+    assert ref_peak - peak >= staged_bytes, (\n+        f\"workspace staging saved {ref_peak - peak} bytes, expected at least \"\n+        f\"{staged_bytes} (padded q + output)\"\n+    )\n+\n+\n @pytest.mark.parametrize(\n     \"seq_lens,max_buf,expected\",\n     [",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/72b64be82e0022a50765539a0d4ee63d79612fcd/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py",
+      "sha": "6861511d04eac465702a32941a0f469537d89e8a",
+      "status": "modified"
+    },
+    {
+      "additions": 46,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/72b64be82e0022a50765539a0d4ee63d79612fcd/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Fflashmla_sparse.py",
+      "changes": 48,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Fflashmla_sparse.py?ref=72b64be82e0022a50765539a0d4ee63d79612fcd",
+      "deletions": 2,
+      "filename": "vllm/v1/attention/backends/mla/flashmla_sparse.py",
+      "patch": "@@ -1221,6 +1221,8 @@ def _forward_fp8_kv_mixed_batch(\n             kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,\n             topk_indices=topk_indices.unsqueeze(0),  # (T, topk) -> (1, T, topk)\n             kernel_metadata=fp8_metadata,\n+            # s_q = T can reach max_num_batched_tokens: reuse the workspace.\n+            use_workspace=True,\n         )\n         # Output is (1, T, H, D_v), squeeze back to (T, H, D_v)\n         out = _attn_out.squeeze(0)\n@@ -1246,18 +1248,59 @@ def _fp8_flash_mla_kernel(\n         kv_c_and_k_pe_cache: torch.Tensor,\n         topk_indices: torch.Tensor,\n         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,\n+        use_workspace: bool = False,\n     ) -> tuple[torch.Tensor, torch.Tensor]:\n+        \"\"\"Run the FP8 sparse decode kernel, padding heads to 64/128.\n+\n+        With ``use_workspace`` the padded q and the kernel output live in the\n+        workspace reserved in ``__init__`` (sized for max_num_batched_tokens), so\n+        large mixed batches do not allocate O(T * padded_heads) per call. The\n+        returned ``out`` then aliases the workspace and must be consumed before\n+        the workspace is reused (e.g. by the next layer).\n+        \"\"\"\n         # q shape: (batch, seq_len, num_heads, head_dim)\n-        actual_num_heads = q.size(2)\n+        batch, seq_len, actual_num_heads, head_dim = q.shape\n         padded_num_heads = self.fp8_decode_padded_heads\n \n+        out: torch.Tensor | None = None\n+        padded_q_ws: torch.Tensor | None = None\n+        if use_workspace:\n+            *_, padded_q_ws, padded_out_ws, _ = (\n+                current_workspace_manager().get_simultaneous(*self.workspace_specs)\n+            )\n+            assert q.dtype == padded_out_ws.dtype, (\n+                f\"Workspace staging expects a {padded_out_ws.dtype} query, got \"\n+                f\"{q.dtype}\"\n+            )\n+            # Flat views: the reserved buffers are head-padded for the BF16\n+            # prefill kernel, which may be wider than the FP8 decode padding.\n+            out_numel = batch * seq_len * padded_num_heads * 512\n+            assert padded_out_ws.numel() >= out_numel, (\n+                f\"FP8 mixed-batch output ({batch=}, {seq_len=}, \"\n+                f\"{padded_num_heads=}) exceeds the reserved workspace \"\n+                f\"{tuple(padded_out_ws.shape)}\"\n+            )\n+            out = padded_out_ws.view(-1)[:out_numel].view(\n+                batch, seq_len, padded_num_heads, 512\n+            )\n+\n         # Pad query if needed (kernel only supports h_q = 64 or 128)\n         if actual_num_heads < padded_num_heads:\n             logger.warning_once(\n                 f\"Padding num_heads from {actual_num_heads} to \"\n                 f\"{padded_num_heads} for FP8 sparse decode kernel\"\n             )\n-            q_padded = q.new_zeros((q.size(0), q.size(1), padded_num_heads, q.size(3)))\n+            padded_shape = (batch, seq_len, padded_num_heads, head_dim)\n+            if padded_q_ws is not None:\n+                q_numel = batch * seq_len * padded_num_heads * head_dim\n+                assert padded_q_ws.numel() >= q_numel, (\n+                    f\"Padded FP8 query {padded_shape} exceeds the reserved \"\n+                    f\"workspace {tuple(padded_q_ws.shape)}\"\n+                )\n+                q_padded = padded_q_ws.view(-1)[:q_numel].view(padded_shape)\n+                q_padded[:, :, actual_num_heads:].zero_()\n+            else:\n+                q_padded = q.new_zeros(padded_shape)\n             q_padded[:, :, :actual_num_heads, :] = q\n             q = q_padded\n \n@@ -1271,6 +1314,7 @@ def _fp8_flash_mla_kernel(\n             is_fp8_kvcache=True,\n             indices=topk_indices,\n             softmax_scale=self.softmax_scale,\n+            out=out,\n         )\n \n         # Slice output and lse back to actual head count if we padded",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/72b64be82e0022a50765539a0d4ee63d79612fcd/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Fflashmla_sparse.py",
+      "sha": "6522bf594dc7e373eb1b599f1e3f1e1b8c24bab7",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "#59319 (ours, open) stops reserving the bf16 prefill workspace on the fp8 mixed-batch path. Its first revision skipped the whole block, including the three `max_num_batched_tokens` buffers this PR stages q and out in. The two PRs merge without a conflict, but together `workspace_specs` on that path holds only `q_concat`, and the `get_simultaneous` unpack fails on the first forward with `ValueError: not enough values to unpack (expected at least 3, got 1)`.\n\nThe current revision of #59319 skips only the `5 * max_model_len` buffer (plus the PCP+DCP gather buffer) and keeps the three `max_num_batched_tokens` buffers, so either merge order works. On one H200 (nightly `af7f9488c` with both files swapped in), `test_sparse_backend_decode_correctness` for FlashMLA + `fp8_ds_mla` fails in all 14 TP=8 cases with the first revision plus this PR, and passes with the current one: 72 passed, including your two staging tests and the #59319 unit tests.\n\n`test_flashmla_fp8_mixed_batch_stages_in_workspace` builds `workspace_specs` by hand, so it won't catch a change in what `__init__` reserves. The TP=8 cases #59319 adds go through the real `__init__` and do.\n\nAI assistance was used for this comment.\n",
+      "created_at": "2026-10-11T15:22:37Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60220#issuecomment-6110543897",
+      "id": 6110543897,
+      "updated_at": "2026-10-11T15:22:37Z",
+      "user": {
+        "login": "drakosha"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @NickLucche.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-13T21:31:36Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60220#issuecomment-6155636163",
+      "id": 6155636163,
+      "updated_at": "2026-10-13T21:31:36Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    }
+  ],
+  "number": 60220,
+  "refs": {
+    "base": {
+      "commit": "3313825983dad6fd4291986e7f9ba647c059d1ff",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "72b64be82e0022a50765539a0d4ee63d79612fcd",
+      "repository": "NickLucche/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": []
+}

@@ -1,0 +1,256 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "c4a5762352a00d4f26b1415c15b141a6a432e2616b2e422f7921ae657a949cce",
+      "isPrivate": false,
+      "numbers": [
+        44623,
+        44622,
+        44621,
+        44620,
+        44619,
+        44618,
+        44617,
+        44616
+      ],
+      "observed_at": "2026-10-19T18:24:49.400217+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4781,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "377cd867fd13a51a63c2b67e95d1febdd23fd68a",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\r\n\r\nIn short: the DeepSeek-V4 masked SiLU-mul-quant kernel runs on every MoE layer of DeepEP low-latency decode, and it launches one CTA for every row the padded DeepEP buffer could hold. At decode almost none of those rows are real, so most CTAs only scan the per-expert counts and exit. On the Flash TP4 shape that is 24,576 CTAs for about 400 real rows, and on H100 the kernel takes 15.9 us even with zero real rows. This PR sizes the grid to the GPU instead: 17.1 -> 3.3 us at 64 decode tokens per GPU, with bit-identical output.\r\n\r\n<img width=\"1754\" height=\"562\" alt=\"pr_overview\" src=\"https://github.com/user-attachments/assets/2097cef0-fdac-4040-99cf-50a84ad364ff\" />\r\n\r\nDetails:\r\n\r\n`silu_and_mul_masked_post_quant` (`python/sglang/kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh`) runs the SiLU-mul + FP8 quant between the two masked DeepGEMM GEMMs on the DeepEP low-latency path. DeepSeek-V4 takes it on every decode MoE layer because of its `swiglu_limit` (10.0 in the Flash config), through `_varlen_deep_gemm_silu_mul_quant` in `moe_runner/deep_gemm.py`. That covers the DeepEP balanced and high-throughput recipes in the DSV4 cookbook (B200/B300/GB200/GB300 FP4 with `--moe-a2a-backend deepep`, and the H200 FP8 ones).\r\n\r\nThe input is the DeepEP buffer `[E_local, T, 2D]`, where T is the padded per-expert capacity (`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` x ranks) and `masked_m[e]` (on the GPU) says how many rows of expert e are real. The host can't read `masked_m` without a sync, so the kernel launched `T * topk` CTAs, one per possible real row. Every CTA loads `masked_m`, does a block prefix scan with 2 `__syncthreads`, and then all but the CTAs that own a real row exit.\r\n\r\nOn the Flash B200 TP4 recipe that is `4096 * 6 = 24,576` CTAs per call, for about 400 real rows at 64 decode tokens per GPU. On H100 the kernel costs 15.9 us with zero real rows and 17.1 us at 64 tokens per GPU; almost all of it is empty CTAs going through the scheduler.\r\n\r\n## Modifications\r\n\r\nIn short: launch only as many CTAs as the GPU can hold at once, instead of one per possible row, and let each CTA loop over the real rows. The output is bit-identical to main. On H100 the kernel goes from 15.9 to 1.6 us with no real rows and from 17.1 to 3.3 us at 64 decode tokens per GPU (Flash TP4 shape), and every decode point up to the dispatch cap is faster (1.09x-16.25x). The one slower case is when every one of the `T * topk` rows is real, 2-4%, which uniform routing doesn't get near (details in Speed Tests).\r\n\r\nHow it works: the host still can't read `masked_m`, so the grid stays fixed, but it is now one resident wave (1,056 CTAs on H100) instead of `T * topk` (24,576 on the Flash TP4 shape). Each CTA prefix-scans `masked_m` once, keeps the result in shared memory, and then takes rows `b, b + grid, b + 2 * grid, ...` of the flattened real-row list. At decode there are fewer real rows than CTAs, so each CTA handles at most one row, exactly like before, just without the other ~23,500 CTAs (24,576 - 1,056) that found no row.\r\n\r\nChanges, in simple terms:\r\n\r\n- Smaller grid: sized to the GPU, not to the padded capacity.\r\n- One `masked_m` scan per CTA, kept in shared memory, instead of one scan per possible row.\r\n- A loop over real rows in each CTA; the per-row math is the same code as before.\r\n- A new test that checks every real row matches the contig kernel and no padded row is written.\r\n\r\nDetails:\r\n\r\n- Launch `min(SMs x resident CTAs, T * topk)` CTAs instead of `T * topk` (1,056 on H100 at 256 threads; about 1,184 on B200, not measured). Occupancy comes from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, cached per block size.\r\n- Each CTA scans `masked_m` once into shared memory (`s_row_end`, inclusive prefix, 1 KB), exits before the PDL wait if it has no row, then walks the flattened real rows with a grid stride. A row's expert comes from a binary search over `s_row_end`.\r\n- The per-row body moved verbatim into `silu_mul_quant_varlen_row`, so the math and the output bytes don't change. The PDL wait now runs once before the loop; the trigger stays where it was in the row body.\r\n- `max_rows = T * topk` keeps the old implicit cap (rows past it were never processed before and still aren't).\r\n- New test `test_masked_post_quant_writes_exactly_the_real_rows`: masked vs contig kernel byte-equal on real rows, sentinel untouched on padded rows, for both scale layouts and all-zero / one hot expert / uneven / full `masked_m`. Capacity is 4x the resident CTAs so \"full\" makes each CTA loop over several rows.\r\n\r\nSame idea as vLLM's Silu v2 `persistent_masked_m_silu_mul_quant` ([vllm-project/vllm#25074](https://github.com/vllm-project/vllm/pull/25074)): fixed grid, one scan of the counts per CTA into shared memory, then each CTA walks the real rows.\r\n\r\nNot a duplicate: no open PR touches this kernel's grid (searched `silu_and_mul_masked_post_quant`, `masked silu quant`, `silu_mul_quant_varlen`). [sgl-project/sglang#32066](https://github.com/sgl-project/sglang/pull/32066) adds a launch guard on the same launcher lines, so whichever lands second needs a small rebase.\r\n\r\n## Accuracy Tests\r\n\r\nThe output is bit-identical to main, so model accuracy can't change. I checked it at the kernel level instead of with an e2e eval:\r\n\r\n- Bitwise vs main, in one process (main's kernel built from the base file under its own namespace), CPU-seeded inputs, outputs pre-filled with a sentinel and compared as whole buffers including padded rows: **464 identical, 0 mismatched**. Matrix: 5 shapes (up to 256 experts, and a `full` case where `sum(masked_m) > T * topk` to check the cap), group size 32 and 128, 3 scale layouts (fp32, UE8M0, transposed packed UE8M0), swizzle on/off, swiglu_limit on/off, 4 `masked_m` patterns.\r\n- `test_per_token_group_quant.py`: 121 passed (8 new). `test_humming_fp8_dispatch.py` (the other caller): 2 passed.\r\n- The new test fails on each of 3 broken mappings (wrong loop stride, `>=` in the binary search, wrong row offset).\r\n- Registers: 32/thread before and after (`__launch_bounds__(1024, 2)` cap), 0 spills.\r\n\r\n## Speed Tests and Profiling\r\n\r\nH100 80GB HBM3, driver 595.71.05, nvcc 13.2, torch 2.14.1+cu130, triton 3.8.0. Validated on main 97d3150a6a; the branch is rebased onto ed8c3139f1 and neither the kernel nor the test file changed upstream in between. `triton.testing.do_bench_cudagraph` on the op, 2 interleaved rounds (main, PR, main, PR) in one process. Shapes from the DSV4 cookbook DeepEP recipes, group 128, swiglu_limit 10. Real rows come from uniform top-6 routing at the given decode tokens per GPU, up to the dispatch cap; \"all real\" sets every one of the `T * topk` rows real. On H100 the kernel takes the fp32-scale layout; I didn't have a B200 for the transposed UE8M0 layout.\r\n\r\nAll numbers are from one H100. The GPU in brackets is the cookbook recipe the shape comes from, not where it ran.\r\n\r\n| shape (cookbook recipe it comes from) | 0 rows | 64 tok/GPU | dispatch cap | all real |\r\n|---|---|---|---|---|\r\n| Flash EP4, T=4096 (B200/B300/GB200 TP4) | 15.92 -> 1.63 us (9.74x) | 17.10 -> 3.26 us (5.25x) | 1024 tok: 49.89 -> 45.89 us (1.09x) | 176.07 -> 180.88 us (0.97x) |\r\n| Flash EP8, T=8192 (B200 TP8) | 31.27 -> 1.92 us (16.25x) | 32.19 -> 3.32 us (9.70x) | 1024 tok: 61.68 -> 44.85 us (1.38x) | 350.95 -> 356.45 us (0.98x) |\r\n| Pro EP4, T=1024 (GB300 TP4) | 6.52 -> 1.57 us (4.15x) | 8.64 -> 4.32 us (2.00x) | 256 tok: 15.31 -> 11.50 us (1.33x) | 65.92 -> 68.74 us (0.96x) |\r\n| Flash EP4, T=1024 (H200 FP8 TP4) | 4.92 -> 1.96 us (2.52x) | 5.84 -> 3.17 us (1.84x) | 256 tok: 10.15 -> 8.24 us (1.23x) | 43.34 -> 44.38 us (0.98x) |\r\n| Pro EP16, T=2048 (H200 FP8 TP16) | 12.01 -> 1.66 us (7.25x) | 14.33 -> 4.29 us (3.34x) | 128 tok: 16.35 -> 6.01 us (2.72x) | 130.82 -> 132.89 us (0.98x) |\r\n\r\nEvery decode point up to the dispatch cap is faster (1.09x-16.25x). The one slower regime is \"all real\", 2-4%: every token on every rank routing all 6 experts to the same rank, which uniform routing doesn't get near. There each CTA loops over about 9-47 rows and pays a binary search per row. A contiguous per-CTA split (search once, then step forward) brings it to 1.00-1.03x but is 2-5% slower at decode and more code, so I kept the stride loop; happy to switch if you'd rather have no regime below 1.0x.\r\n\r\nFor the Flash B200 TP4 recipe at 64 decode tokens per GPU, the H100 number is 13.8 us saved per call, so about 0.6 ms per decode step over 43 MoE layers. That's arithmetic from the microbench, not an e2e measurement; e2e needs 4x B200 with DeepEP, which I haven't run.\r\n\r\n<details>\r\n<summary>Full sweep (H100)</summary>\r\n\r\n| shape (all on H100) | tokens/GPU | real rows | main us | PR us | speedup |\r\n|---|---|---|---|---|---|\r\n| Flash EP4, T=4096 | 0 | 0 | 15.92 | 1.63 | 9.74x |\r\n| Flash EP4, T=4096 | 1 | 7 | 15.94 | 1.90 | 8.41x |\r\n| Flash EP4, T=4096 | 8 | 56 | 16.01 | 1.98 | 8.09x |\r\n| Flash EP4, T=4096 | 32 | 186 | 16.24 | 2.58 | 6.30x |\r\n| Flash EP4, T=4096 | 64 | 400 | 17.10 | 3.26 | 5.25x |\r\n| Flash EP4, T=4096 | 128 | 811 | 18.53 | 4.99 | 3.72x |\r\n| Flash EP4, T=4096 | 256 | 1556 | 20.89 | 7.79 | 2.68x |\r\n| Flash EP4, T=4096 | 512 | 3049 | 27.99 | 15.70 | 1.78x |\r\n| Flash EP4, T=4096 | 1024 | 6196 | 49.89 | 45.89 | 1.09x |\r\n| Flash EP4, T=4096 | all real | 24576 | 176.07 | 180.88 | 0.97x |\r\n| Flash EP8, T=8192 | 0 | 0 | 31.27 | 1.92 | 16.25x |\r\n| Flash EP8, T=8192 | 1 | 9 | 31.28 | 2.16 | 14.51x |\r\n| Flash EP8, T=8192 | 8 | 53 | 31.37 | 2.26 | 13.86x |\r\n| Flash EP8, T=8192 | 32 | 192 | 31.56 | 2.57 | 12.27x |\r\n| Flash EP8, T=8192 | 64 | 420 | 32.19 | 3.32 | 9.70x |\r\n| Flash EP8, T=8192 | 128 | 784 | 33.58 | 4.90 | 6.85x |\r\n| Flash EP8, T=8192 | 256 | 1496 | 35.78 | 7.39 | 4.84x |\r\n| Flash EP8, T=8192 | 512 | 3063 | 43.97 | 16.41 | 2.68x |\r\n| Flash EP8, T=8192 | 1024 | 6232 | 61.68 | 44.85 | 1.38x |\r\n| Flash EP8, T=8192 | all real | 49152 | 350.95 | 356.45 | 0.98x |\r\n| Pro EP4, T=1024 | 0 | 0 | 6.52 | 1.57 | 4.15x |\r\n| Pro EP4, T=1024 | 1 | 4 | 6.55 | 2.09 | 3.14x |\r\n| Pro EP4, T=1024 | 8 | 38 | 6.72 | 2.23 | 3.01x |\r\n| Pro EP4, T=1024 | 32 | 186 | 7.49 | 2.88 | 2.60x |\r\n| Pro EP4, T=1024 | 64 | 409 | 8.64 | 4.32 | 2.00x |\r\n| Pro EP4, T=1024 | 128 | 729 | 10.20 | 5.74 | 1.78x |\r\n| Pro EP4, T=1024 | 256 | 1558 | 15.31 | 11.50 | 1.33x |\r\n| Pro EP4, T=1024 | all real | 6144 | 65.92 | 68.74 | 0.96x |\r\n| Flash EP4, T=1024 | 0 | 0 | 4.92 | 1.96 | 2.52x |\r\n| Flash EP4, T=1024 | 1 | 7 | 5.01 | 2.12 | 2.37x |\r\n| Flash EP4, T=1024 | 8 | 51 | 5.08 | 2.28 | 2.23x |\r\n| Flash EP4, T=1024 | 32 | 188 | 5.38 | 2.64 | 2.03x |\r\n| Flash EP4, T=1024 | 64 | 384 | 5.84 | 3.17 | 1.84x |\r\n| Flash EP4, T=1024 | 128 | 780 | 7.01 | 5.00 | 1.40x |\r\n| Flash EP4, T=1024 | 256 | 1559 | 10.15 | 8.24 | 1.23x |\r\n| Flash EP4, T=1024 | all real | 6144 | 43.34 | 44.38 | 0.98x |\r\n| Pro EP16, T=2048 | 0 | 0 | 12.01 | 1.66 | 7.25x |\r\n| Pro EP16, T=2048 | 1 | 5 | 12.07 | 2.22 | 5.44x |\r\n| Pro EP16, T=2048 | 8 | 46 | 12.29 | 2.35 | 5.24x |\r\n| Pro EP16, T=2048 | 32 | 209 | 13.33 | 3.04 | 4.38x |\r\n| Pro EP16, T=2048 | 64 | 394 | 14.33 | 4.29 | 3.34x |\r\n| Pro EP16, T=2048 | 128 | 781 | 16.35 | 6.01 | 2.72x |\r\n| Pro EP16, T=2048 | all real | 12288 | 130.82 | 132.89 | 0.98x |\r\n\r\n</details>\r\n\r\n## Checklist\r\n\r\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\r\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\r\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (no user-facing change)\r\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed). (kernel-level: bitwise and microbench; no e2e)\r\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\r\n\r\nI used Claude Code for this change. I reviewed every line and ran the tests and benchmarks above myself.\r\n\r\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #39187385312](https://github.com/sgl-project/sglang/actions/runs/39187385312)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #39187385225](https://github.com/sgl-project/sglang/actions/runs/39187385225)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #39187385279](https://github.com/sgl-project/sglang/actions/runs/39187385279)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Monishver11"
+            },
+            "body": "Hi @BBuf, can you pls review this when you get some time? It sizes the DSV4 masked silu-mul-quant grid to the GPU instead of T * topk, so DeepEP low-latency decode stops launching ~23k empty CTAs per MoE layer. On H100 the kernel goes from 17.1 to 3.3 us at 64 tokens/GPU on the Flash TP4 shape, with bit-identical output (details in the description).\r\n\r\nOne ask on e2e: I don't have a multi-GPU setup right now, and this path needs 4x B200 with DeepEP. The per-commit `test_deepseek_v4_flash_fp4_b200.py` (`TestDSV4FlashFP4NonSpecB200`, TP4 + DP4 + DeepEP) runs this kernel, so CI will cover correctness and GSM8K on B200, but it has no speed metric. If someone with a 4x B200 box could run a quick main vs PR comparison with that recipe (e.g., `bench_serving` decode-heavy, or a profile of one decode step), that would give the e2e number. Happy to share the exact commands.\r\n\r\nOnce we have the e2e numbers and they show a gain, could you pls run /tag-and-rerun-ci so CI starts on the current commit? And if you see more improvements for this kernel, pls let me know; I'm happy to work on it. Thanks.",
+            "createdAt": "2026-10-16T16:16:46Z",
+            "databaseId": 6219756782,
+            "updatedAt": "2026-10-16T16:16:46Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44618#issuecomment-6219756782"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "Please rebase onto main to unblock CI. A B200/DeepEP benchmark is still needed to validate the target workload.",
+            "createdAt": "2026-10-18T11:38:06Z",
+            "databaseId": 6249457184,
+            "updatedAt": "2026-10-18T11:38:06Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44618#issuecomment-6249457184"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Monishver11"
+            },
+            "body": "Thanks for the review @BBuf. I don't have a 4x B200 box for the e2e validation right now. If I share the commands (cookbook B200 Flash balanced recipe: TP4 + DP4 + DeepEP; this kernel runs on the DeepEP low-latency decode steps with or without EAGLE, so either works), main vs PR with bench_serving and a decode-step profile, would it be possible for you or someone on your side to run them? Otherwise I'll rent a box and post the numbers here.",
+            "createdAt": "2026-10-18T16:09:47Z",
+            "databaseId": 6252104114,
+            "updatedAt": "2026-10-18T16:09:47Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44618#issuecomment-6252104114"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXSnibI=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7",
+      "headRepository": {
+        "nameWithOwner": "Monishver11/sglang"
+      },
+      "mergeCommit": {
+        "oid": "806e7423af8c2ab3dd364f1501b5d3f69e1d83d5"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-19T15:07:13Z",
+      "number": 44618,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "LGTM. Thanks for reducing the launch overhead and adding coverage for the real-row mapping and untouched padding.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5562340305,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-18T09:26:09Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44618#pullrequestreview-5562340305"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xOFQwOToyNjowOVq0MjAyNi0xMC0xOFQwOToyNjowOVrPAAAAAUuKk9E=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "MERGED",
+      "title": "[Perf] deepseek_v4: size the masked silu-mul-quant grid to the GPU, not the padded capacity",
+      "updatedAt": "2026-10-19T15:07:13Z",
+      "url": "https://github.com/sgl-project/sglang/pull/44618"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "377cd867fd13a51a63c2b67e95d1febdd23fd68a"
+    },
+    "body": "## Motivation\r\n\r\nIn short: the DeepSeek-V4 masked SiLU-mul-quant kernel runs on every MoE layer of DeepEP low-latency decode, and it launches one CTA for every row the padded DeepEP buffer could hold. At decode almost none of those rows are real, so most CTAs only scan the per-expert counts and exit. On the Flash TP4 shape that is 24,576 CTAs for about 400 real rows, and on H100 the kernel takes 15.9 us even with zero real rows. This PR sizes the grid to the GPU instead: 17.1 -> 3.3 us at 64 decode tokens per GPU, with bit-identical output.\r\n\r\n<img width=\"1754\" height=\"562\" alt=\"pr_overview\" src=\"https://github.com/user-attachments/assets/2097cef0-fdac-4040-99cf-50a84ad364ff\" />\r\n\r\nDetails:\r\n\r\n`silu_and_mul_masked_post_quant` (`python/sglang/kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh`) runs the SiLU-mul + FP8 quant between the two masked DeepGEMM GEMMs on the DeepEP low-latency path. DeepSeek-V4 takes it on every decode MoE layer because of its `swiglu_limit` (10.0 in the Flash config), through `_varlen_deep_gemm_silu_mul_quant` in `moe_runner/deep_gemm.py`. That covers the DeepEP balanced and high-throughput recipes in the DSV4 cookbook (B200/B300/GB200/GB300 FP4 with `--moe-a2a-backend deepep`, and the H200 FP8 ones).\r\n\r\nThe input is the DeepEP buffer `[E_local, T, 2D]`, where T is the padded per-expert capacity (`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` x ranks) and `masked_m[e]` (on the GPU) says how many rows of expert e are real. The host can't read `masked_m` without a sync, so the kernel launched `T * topk` CTAs, one per possible real row. Every CTA loads `masked_m`, does a block prefix scan with 2 `__syncthreads`, and then all but the CTAs that own a real row exit.\r\n\r\nOn the Flash B200 TP4 recipe that is `4096 * 6 = 24,576` CTAs per call, for about 400 real rows at 64 decode tokens per GPU. On H100 the kernel costs 15.9 us with zero real rows and 17.1 us at 64 tokens per GPU; almost all of it is empty CTAs going through the scheduler.\r\n\r\n## Modifications\r\n\r\nIn short: launch only as many CTAs as the GPU can hold at once, instead of one per possible row, and let each CTA loop over the real rows. The output is bit-identical to main. On H100 the kernel goes from 15.9 to 1.6 us with no real rows and from 17.1 to 3.3 us at 64 decode tokens per GPU (Flash TP4 shape), and every decode point up to the dispatch cap is faster (1.09x-16.25x). The one slower case is when every one of the `T * topk` rows is real, 2-4%, which uniform routing doesn't get near (details in Speed Tests).\r\n\r\nHow it works: the host still can't read `masked_m`, so the grid stays fixed, but it is now one resident wave (1,056 CTAs on H100) instead of `T * topk` (24,576 on the Flash TP4 shape). Each CTA prefix-scans `masked_m` once, keeps the result in shared memory, and then takes rows `b, b + grid, b + 2 * grid, ...` of the flattened real-row list. At decode there are fewer real rows than CTAs, so each CTA handles at most one row, exactly like before, just without the other ~23,500 CTAs (24,576 - 1,056) that found no row.\r\n\r\nChanges, in simple terms:\r\n\r\n- Smaller grid: sized to the GPU, not to the padded capacity.\r\n- One `masked_m` scan per CTA, kept in shared memory, instead of one scan per possible row.\r\n- A loop over real rows in each CTA; the per-row math is the same code as before.\r\n- A new test that checks every real row matches the contig kernel and no padded row is written.\r\n\r\nDetails:\r\n\r\n- Launch `min(SMs x resident CTAs, T * topk)` CTAs instead of `T * topk` (1,056 on H100 at 256 threads; about 1,184 on B200, not measured). Occupancy comes from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, cached per block size.\r\n- Each CTA scans `masked_m` once into shared memory (`s_row_end`, inclusive prefix, 1 KB), exits before the PDL wait if it has no row, then walks the flattened real rows with a grid stride. A row's expert comes from a binary search over `s_row_end`.\r\n- The per-row body moved verbatim into `silu_mul_quant_varlen_row`, so the math and the output bytes don't change. The PDL wait now runs once before the loop; the trigger stays where it was in the row body.\r\n- `max_rows = T * topk` keeps the old implicit cap (rows past it were never processed before and still aren't).\r\n- New test `test_masked_post_quant_writes_exactly_the_real_rows`: masked vs contig kernel byte-equal on real rows, sentinel untouched on padded rows, for both scale layouts and all-zero / one hot expert / uneven / full `masked_m`. Capacity is 4x the resident CTAs so \"full\" makes each CTA loop over several rows.\r\n\r\nSame idea as vLLM's Silu v2 `persistent_masked_m_silu_mul_quant` ([vllm-project/vllm#25074](https://github.com/vllm-project/vllm/pull/25074)): fixed grid, one scan of the counts per CTA into shared memory, then each CTA walks the real rows.\r\n\r\nNot a duplicate: no open PR touches this kernel's grid (searched `silu_and_mul_masked_post_quant`, `masked silu quant`, `silu_mul_quant_varlen`). [sgl-project/sglang#32066](https://github.com/sgl-project/sglang/pull/32066) adds a launch guard on the same launcher lines, so whichever lands second needs a small rebase.\r\n\r\n## Accuracy Tests\r\n\r\nThe output is bit-identical to main, so model accuracy can't change. I checked it at the kernel level instead of with an e2e eval:\r\n\r\n- Bitwise vs main, in one process (main's kernel built from the base file under its own namespace), CPU-seeded inputs, outputs pre-filled with a sentinel and compared as whole buffers including padded rows: **464 identical, 0 mismatched**. Matrix: 5 shapes (up to 256 experts, and a `full` case where `sum(masked_m) > T * topk` to check the cap), group size 32 and 128, 3 scale layouts (fp32, UE8M0, transposed packed UE8M0), swizzle on/off, swiglu_limit on/off, 4 `masked_m` patterns.\r\n- `test_per_token_group_quant.py`: 121 passed (8 new). `test_humming_fp8_dispatch.py` (the other caller): 2 passed.\r\n- The new test fails on each of 3 broken mappings (wrong loop stride, `>=` in the binary search, wrong row offset).\r\n- Registers: 32/thread before and after (`__launch_bounds__(1024, 2)` cap), 0 spills.\r\n\r\n## Speed Tests and Profiling\r\n\r\nH100 80GB HBM3, driver 595.71.05, nvcc 13.2, torch 2.14.1+cu130, triton 3.8.0. Validated on main 97d3150a6a; the branch is rebased onto ed8c3139f1 and neither the kernel nor the test file changed upstream in between. `triton.testing.do_bench_cudagraph` on the op, 2 interleaved rounds (main, PR, main, PR) in one process. Shapes from the DSV4 cookbook DeepEP recipes, group 128, swiglu_limit 10. Real rows come from uniform top-6 routing at the given decode tokens per GPU, up to the dispatch cap; \"all real\" sets every one of the `T * topk` rows real. On H100 the kernel takes the fp32-scale layout; I didn't have a B200 for the transposed UE8M0 layout.\r\n\r\nAll numbers are from one H100. The GPU in brackets is the cookbook recipe the shape comes from, not where it ran.\r\n\r\n| shape (cookbook recipe it comes from) | 0 rows | 64 tok/GPU | dispatch cap | all real |\r\n|---|---|---|---|---|\r\n| Flash EP4, T=4096 (B200/B300/GB200 TP4) | 15.92 -> 1.63 us (9.74x) | 17.10 -> 3.26 us (5.25x) | 1024 tok: 49.89 -> 45.89 us (1.09x) | 176.07 -> 180.88 us (0.97x) |\r\n| Flash EP8, T=8192 (B200 TP8) | 31.27 -> 1.92 us (16.25x) | 32.19 -> 3.32 us (9.70x) | 1024 tok: 61.68 -> 44.85 us (1.38x) | 350.95 -> 356.45 us (0.98x) |\r\n| Pro EP4, T=1024 (GB300 TP4) | 6.52 -> 1.57 us (4.15x) | 8.64 -> 4.32 us (2.00x) | 256 tok: 15.31 -> 11.50 us (1.33x) | 65.92 -> 68.74 us (0.96x) |\r\n| Flash EP4, T=1024 (H200 FP8 TP4) | 4.92 -> 1.96 us (2.52x) | 5.84 -> 3.17 us (1.84x) | 256 tok: 10.15 -> 8.24 us (1.23x) | 43.34 -> 44.38 us (0.98x) |\r\n| Pro EP16, T=2048 (H200 FP8 TP16) | 12.01 -> 1.66 us (7.25x) | 14.33 -> 4.29 us (3.34x) | 128 tok: 16.35 -> 6.01 us (2.72x) | 130.82 -> 132.89 us (0.98x) |\r\n\r\nEvery decode point up to the dispatch cap is faster (1.09x-16.25x). The one slower regime is \"all real\", 2-4%: every token on every rank routing all 6 experts to the same rank, which uniform routing doesn't get near. There each CTA loops over about 9-47 rows and pays a binary search per row. A contiguous per-CTA split (search once, then step forward) brings it to 1.00-1.03x but is 2-5% slower at decode and more code, so I kept the stride loop; happy to switch if you'd rather have no regime below 1.0x.\r\n\r\nFor the Flash B200 TP4 recipe at 64 decode tokens per GPU, the H100 number is 13.8 us saved per call, so about 0.6 ms per decode step over 43 MoE layers. That's arithmetic from the microbench, not an e2e measurement; e2e needs 4x B200 with DeepEP, which I haven't run.\r\n\r\n<details>\r\n<summary>Full sweep (H100)</summary>\r\n\r\n| shape (all on H100) | tokens/GPU | real rows | main us | PR us | speedup |\r\n|---|---|---|---|---|---|\r\n| Flash EP4, T=4096 | 0 | 0 | 15.92 | 1.63 | 9.74x |\r\n| Flash EP4, T=4096 | 1 | 7 | 15.94 | 1.90 | 8.41x |\r\n| Flash EP4, T=4096 | 8 | 56 | 16.01 | 1.98 | 8.09x |\r\n| Flash EP4, T=4096 | 32 | 186 | 16.24 | 2.58 | 6.30x |\r\n| Flash EP4, T=4096 | 64 | 400 | 17.10 | 3.26 | 5.25x |\r\n| Flash EP4, T=4096 | 128 | 811 | 18.53 | 4.99 | 3.72x |\r\n| Flash EP4, T=4096 | 256 | 1556 | 20.89 | 7.79 | 2.68x |\r\n| Flash EP4, T=4096 | 512 | 3049 | 27.99 | 15.70 | 1.78x |\r\n| Flash EP4, T=4096 | 1024 | 6196 | 49.89 | 45.89 | 1.09x |\r\n| Flash EP4, T=4096 | all real | 24576 | 176.07 | 180.88 | 0.97x |\r\n| Flash EP8, T=8192 | 0 | 0 | 31.27 | 1.92 | 16.25x |\r\n| Flash EP8, T=8192 | 1 | 9 | 31.28 | 2.16 | 14.51x |\r\n| Flash EP8, T=8192 | 8 | 53 | 31.37 | 2.26 | 13.86x |\r\n| Flash EP8, T=8192 | 32 | 192 | 31.56 | 2.57 | 12.27x |\r\n| Flash EP8, T=8192 | 64 | 420 | 32.19 | 3.32 | 9.70x |\r\n| Flash EP8, T=8192 | 128 | 784 | 33.58 | 4.90 | 6.85x |\r\n| Flash EP8, T=8192 | 256 | 1496 | 35.78 | 7.39 | 4.84x |\r\n| Flash EP8, T=8192 | 512 | 3063 | 43.97 | 16.41 | 2.68x |\r\n| Flash EP8, T=8192 | 1024 | 6232 | 61.68 | 44.85 | 1.38x |\r\n| Flash EP8, T=8192 | all real | 49152 | 350.95 | 356.45 | 0.98x |\r\n| Pro EP4, T=1024 | 0 | 0 | 6.52 | 1.57 | 4.15x |\r\n| Pro EP4, T=1024 | 1 | 4 | 6.55 | 2.09 | 3.14x |\r\n| Pro EP4, T=1024 | 8 | 38 | 6.72 | 2.23 | 3.01x |\r\n| Pro EP4, T=1024 | 32 | 186 | 7.49 | 2.88 | 2.60x |\r\n| Pro EP4, T=1024 | 64 | 409 | 8.64 | 4.32 | 2.00x |\r\n| Pro EP4, T=1024 | 128 | 729 | 10.20 | 5.74 | 1.78x |\r\n| Pro EP4, T=1024 | 256 | 1558 | 15.31 | 11.50 | 1.33x |\r\n| Pro EP4, T=1024 | all real | 6144 | 65.92 | 68.74 | 0.96x |\r\n| Flash EP4, T=1024 | 0 | 0 | 4.92 | 1.96 | 2.52x |\r\n| Flash EP4, T=1024 | 1 | 7 | 5.01 | 2.12 | 2.37x |\r\n| Flash EP4, T=1024 | 8 | 51 | 5.08 | 2.28 | 2.23x |\r\n| Flash EP4, T=1024 | 32 | 188 | 5.38 | 2.64 | 2.03x |\r\n| Flash EP4, T=1024 | 64 | 384 | 5.84 | 3.17 | 1.84x |\r\n| Flash EP4, T=1024 | 128 | 780 | 7.01 | 5.00 | 1.40x |\r\n| Flash EP4, T=1024 | 256 | 1559 | 10.15 | 8.24 | 1.23x |\r\n| Flash EP4, T=1024 | all real | 6144 | 43.34 | 44.38 | 0.98x |\r\n| Pro EP16, T=2048 | 0 | 0 | 12.01 | 1.66 | 7.25x |\r\n| Pro EP16, T=2048 | 1 | 5 | 12.07 | 2.22 | 5.44x |\r\n| Pro EP16, T=2048 | 8 | 46 | 12.29 | 2.35 | 5.24x |\r\n| Pro EP16, T=2048 | 32 | 209 | 13.33 | 3.04 | 4.38x |\r\n| Pro EP16, T=2048 | 64 | 394 | 14.33 | 4.29 | 3.34x |\r\n| Pro EP16, T=2048 | 128 | 781 | 16.35 | 6.01 | 2.72x |\r\n| Pro EP16, T=2048 | all real | 12288 | 130.82 | 132.89 | 0.98x |\r\n\r\n</details>\r\n\r\n## Checklist\r\n\r\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\r\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\r\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (no user-facing change)\r\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed). (kernel-level: bitwise and microbench; no e2e)\r\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\r\n\r\nI used Claude Code for this change. I reviewed every line and ran the tests and benchmarks above myself.\r\n\r\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #39187385312](https://github.com/sgl-project/sglang/actions/runs/39187385312)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #39187385225](https://github.com/sgl-project/sglang/actions/runs/39187385225)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #39187385279](https://github.com/sgl-project/sglang/actions/runs/39187385279)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "Monishver11/sglang"
+      },
+      "sha": "2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/44618",
+    "merge_commit_sha": "806e7423af8c2ab3dd364f1501b5d3f69e1d83d5",
+    "merged": true,
+    "merged_at": "2026-10-19T15:07:13Z",
+    "number": 44618,
+    "state": "closed",
+    "title": "[Perf] deepseek_v4: size the masked silu-mul-quant grid to the GPU, not the padded capacity",
+    "updated_at": "2026-10-19T15:07:13Z"
+  },
+  "files": [
+    {
+      "additions": 72,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7/python%2Fsglang%2Fkernels%2Fjit%2Fcsrc%2Fdeepseek_v4%2Fsilu_and_mul_masked_post_quant.cuh",
+      "changes": 103,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fkernels%2Fjit%2Fcsrc%2Fdeepseek_v4%2Fsilu_and_mul_masked_post_quant.cuh?ref=2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7",
+      "deletions": 31,
+      "filename": "python/sglang/kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh",
+      "patch": "@@ -2,6 +2,7 @@\n #include <sgl_kernel/utils.h>\n \n #include <sgl_kernel/math.cuh>\n+#include <sgl_kernel/runtime.cuh>\n #include <sgl_kernel/tile.cuh>\n #include <sgl_kernel/type.cuh>\n #include <sgl_kernel/utils.cuh>\n@@ -11,6 +12,7 @@\n #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>\n \n #include <algorithm>\n+#include <atomic>\n #include <cstdint>\n #include <cuda_fp8.h>\n #include <type_traits>\n@@ -29,16 +31,11 @@ struct SiluMulQuantVarlenParams {\n   int64_t hidden_dim;\n   uint32_t num_tokens;\n   uint32_t num_experts;\n+  uint32_t max_rows;  // num_tokens * topk; rows past it are left unwritten\n };\n \n constexpr uint32_t kMaxExperts = 256;\n \n-struct alignas(16) CTAWork {\n-  uint32_t expert_id;\n-  uint32_t expert_token_id;\n-  bool valid;\n-};\n-\n template <bool kApplySwigluLimit, bool kPrecise = true, typename DType2>\n SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {\n   using namespace device;\n@@ -63,18 +60,14 @@ SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {\n   }\n }\n \n-[[maybe_unused]]\n-SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {\n-  // Preconditions:\n-  // 1. blockDim.x >= params.num_experts\n-  // 2. params.num_experts <= kMaxExperts\n+// Writes the inclusive prefix sum of `masked_m` to `s_row_end` and returns the total row count.\n+// Expert e owns rows [s_row_end[e - 1], s_row_end[e]) of the flattened real-row index.\n+// Requires blockDim.x >= params.num_experts and params.num_experts <= kMaxExperts.\n+SGL_DEVICE uint32_t scan_masked_m(const SiluMulQuantVarlenParams& params, uint32_t* s_row_end) {\n   using namespace device;\n   static_assert(kWarpThreads == 32);\n \n   static __shared__ uint32_t s_warp_sum[32];\n-  static __shared__ CTAWork result;\n-\n-  result.valid = false;\n \n   const uint32_t tx = threadIdx.x;\n   const uint32_t lane_id = tx % kWarpThreads;\n@@ -84,24 +77,34 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {\n \n   // Per-warp inclusive scan of masked_m.\n   const uint32_t warp_inclusive = warp::inclusive_sum(val, lane_id);\n-  const uint32_t warp_exclusive = warp_inclusive - val;\n \n   // Write each warp total.\n   if (lane_id == kWarpThreads - 1) s_warp_sum[warp_id] = warp_inclusive;\n   __syncthreads();\n   const auto tmp_val = lane_id < warp_id ? s_warp_sum[lane_id] : 0u;\n-  const auto prefix_exclusive = warp::reduce_sum(tmp_val) + warp_exclusive;\n-  const auto bx = blockIdx.x;\n-  if (prefix_exclusive <= bx && bx < prefix_exclusive + val) {\n-    result = {tx, bx - prefix_exclusive, true};\n-  }\n+  const auto prefix_inclusive = warp::reduce_sum(tmp_val) + warp_inclusive;\n+  if (tx < params.num_experts) s_row_end[tx] = prefix_inclusive;\n   __syncthreads();\n-  return result;\n+  return params.num_experts == 0 ? 0u : s_row_end[params.num_experts - 1];\n+}\n+\n+// Returns the expert that owns flattened real row `row`, which must be below s_row_end[num_experts - 1].\n+SGL_DEVICE uint32_t find_expert(const uint32_t* s_row_end, uint32_t num_experts, uint32_t row) {\n+  uint32_t lo = 0, hi = num_experts - 1;\n+  while (lo < hi) {\n+    const uint32_t mid = (lo + hi) / 2;\n+    if (s_row_end[mid] > row) {\n+      hi = mid;\n+    } else {\n+      lo = mid + 1;\n+    }\n+  }\n+  return lo;\n }\n \n template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>\n-__global__ __launch_bounds__(1024, 2) void  // maximize occupancy\n-    silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {\n+SGL_DEVICE void\n+silu_mul_quant_varlen_row(const SiluMulQuantVarlenParams& params, const uint32_t expert_id, const uint32_t token_id) {\n   using namespace device;\n \n   constexpr uint32_t kWorkThreads = kGroupSize / 8u;\n@@ -111,10 +114,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy\n   static_assert(kGroupSize == 32 || kGroupSize == 128, \"unsupported group_size\");\n   static_assert(!(kTransposed && !kScaleUE8M0), \"transposed layout only supports ue8m0\");\n \n-  const auto [expert_id, token_id, valid] = get_work(params);\n-\n-  if (!valid) return;\n-\n   const auto work_id = threadIdx.x / kWorkThreads;\n \n   const auto offset = expert_id * params.num_tokens + token_id;\n@@ -135,8 +134,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy\n     }\n   }();\n \n-  PDLWaitPrimary<kUsePDL>();\n-\n   InputVec gate_vec, up_vec;\n   if constexpr (kSwizzle) {\n     // gran=8 interleaved: every 16-element chunk on the N axis is\n@@ -194,6 +191,27 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy\n   }\n }\n \n+// Persistent: the host sizes the grid to the resident CTAs, not to num_tokens * topk,\n+// because masked_m lives on the device and most of the padded capacity is empty.\n+template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>\n+__global__ __launch_bounds__(1024, 2) void  // maximize occupancy\n+    silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {\n+  using namespace device;\n+\n+  __shared__ uint32_t s_row_end[kMaxExperts];\n+  const uint32_t num_rows = min(scan_masked_m(params, s_row_end), params.max_rows);\n+  if (blockIdx.x >= num_rows) return;\n+\n+  PDLWaitPrimary<kUsePDL>();\n+\n+  for (uint32_t row = blockIdx.x; row < num_rows; row += gridDim.x) {\n+    const uint32_t expert_id = find_expert(s_row_end, params.num_experts, row);\n+    const uint32_t row_begin = expert_id == 0 ? 0u : s_row_end[expert_id - 1];\n+    silu_mul_quant_varlen_row<kGroupSize, kScaleUE8M0, kTransposed, kSwizzle, kUsePDL, kApplySwigluLimit>(\n+        params, expert_id, row - row_begin);\n+  }\n+}\n+\n struct SiluAndMulClampParams {\n   const void* __restrict__ input;\n   void* __restrict__ output;\n@@ -319,15 +337,38 @@ struct SiluAndMulMaskedPostQuantKernel {\n         .hidden_dim = hidden_dim,\n         .num_tokens = num_tokens,\n         .num_experts = num_experts,\n+        .max_rows = num_tokens * topk,\n     };\n \n-    const auto num_threads = hidden_dim / 8;\n+    const auto num_threads = static_cast<uint32_t>(hidden_dim / 8);\n     RuntimeCheck(num_threads % device::kWarpThreads == 0);\n+    RuntimeCheck(num_threads <= kMaxThreads, \"hidden_dim / 8 exceeds 1024 threads\");\n     RuntimeCheck(num_threads >= num_experts);\n+    const auto num_sm = runtime::get_sm_count(device.unwrap().device_id);\n+    const auto num_blocks = transposed ? num_sm * blocks_per_sm<kernel_transposed>(num_threads)\n+                                       : num_sm * blocks_per_sm<kernel_normal>(num_threads);\n     const auto kernel = transposed ? kernel_transposed : kernel_normal;\n-    LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //\n+    LaunchKernel(std::min(num_blocks, params.max_rows), num_threads, device.unwrap())  //\n         .enable_pdl(kUsePDL)(kernel, params);\n   }\n+\n+ private:\n+  static constexpr uint32_t kMaxThreads = 1024;\n+\n+  // Occupancy depends on the kernel and the block size only; a JIT module targets one arch,\n+  // so one slot per block size serves every device.\n+  template <auto kernel>\n+  static uint32_t blocks_per_sm(const uint32_t num_threads) {\n+    static std::atomic_uint32_t s_cache[kMaxThreads / device::kWarpThreads + 1]{};\n+    auto& slot = s_cache[num_threads / device::kWarpThreads];\n+    auto value = slot.load(std::memory_order_relaxed);\n+    if (value == 0) {\n+      value = host::runtime::get_blocks_per_sm(kernel, num_threads);\n+      host::RuntimeCheck(value > 0, \"silu_mul_quant_varlen_kernel cannot run with \", num_threads, \" threads\");\n+      slot.store(value, std::memory_order_relaxed);\n+    }\n+    return value;\n+  }\n };\n \n template <typename DType, bool kUsePDL>",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7/python%2Fsglang%2Fkernels%2Fjit%2Fcsrc%2Fdeepseek_v4%2Fsilu_and_mul_masked_post_quant.cuh",
+      "sha": "dddbb379207427cbb2ed3111b0e03d153bfaa9fa",
+      "status": "modified"
+    },
+    {
+      "additions": 80,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7/test%2Fregistered%2Fkernels%2Fops%2Fquantization%2Ftest_per_token_group_quant.py",
+      "changes": 80,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fkernels%2Fops%2Fquantization%2Ftest_per_token_group_quant.py?ref=2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7",
+      "deletions": 0,
+      "filename": "test/registered/kernels/ops/quantization/test_per_token_group_quant.py",
+      "patch": "@@ -411,6 +411,86 @@ def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):\n             assert mismatch.item() < 1e-4\n \n \n+@pytest.mark.parametrize(\"counts_kind\", [\"all_zero\", \"one_hot\", \"uneven\", \"full\"])\n+@pytest.mark.parametrize(\"transposed\", [False, True])\n+def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind):\n+    \"\"\"The masked kernel's grid is capped at the resident CTAs, so one CTA may walk\n+    several real rows of masked_m. Every real row must match the contig kernel\n+    byte for byte, and no padded row may be written.\"\"\"\n+    from sglang.kernels.ops.moe.dsv4 import (\n+        silu_and_mul_contig_post_quant,\n+        silu_and_mul_masked_post_quant,\n+    )\n+\n+    group_size, hidden, experts, topk = 128, 2048, 8, 8\n+    scale_ue8m0 = transposed\n+    # 4x the resident CTAs at hidden 2048 (256 threads, at most 8 CTAs per SM).\n+    capacity = 4 * torch.cuda.get_device_properties(0).multi_processor_count\n+    counts = {\n+        \"all_zero\": [0] * experts,\n+        \"one_hot\": [0, 0, 0, 0, 0, capacity, 0, 0],\n+        \"uneven\": [0, capacity, 1, 0, 0, capacity - 1, 37, 2],\n+        \"full\": [capacity] * experts,\n+    }[counts_kind]\n+    masked_m = torch.tensor(counts, device=\"cuda\", dtype=torch.int32)\n+    groups = hidden // group_size\n+    rows = experts * capacity\n+\n+    torch.manual_seed(7)\n+    x = torch.randn(experts, capacity, 2 * hidden, device=\"cuda\").bfloat16() * 5\n+\n+    sentinel = 0x5A5A5A5A\n+    q = torch.full((experts, capacity, hidden // 4), sentinel, dtype=torch.int32)\n+    q = q.cuda().view(fp8_dtype)\n+    scale_shape = (\n+        (experts, groups // 4, capacity) if transposed else (experts, capacity, groups)\n+    )\n+    scale = torch.full(scale_shape, sentinel, device=\"cuda\", dtype=torch.int32)\n+    silu_and_mul_masked_post_quant(\n+        x,\n+        q,\n+        scale if transposed else scale.view(torch.float32),\n+        group_size,\n+        masked_m,\n+        scale_ue8m0=scale_ue8m0,\n+        topk=topk,\n+        transposed=transposed,\n+    )\n+\n+    q_ref = torch.empty(rows, hidden, device=\"cuda\", dtype=fp8_dtype)\n+    if transposed:\n+        scale_ref = torch.empty(groups // 4, rows, device=\"cuda\", dtype=torch.int32)\n+        scale_ref_arg = scale_ref.T\n+    else:\n+        scale_ref = torch.empty(rows, groups, device=\"cuda\", dtype=torch.float32)\n+        scale_ref_arg = scale_ref\n+    silu_and_mul_contig_post_quant(\n+        x.flatten(0, 1),\n+        q_ref,\n+        scale_ref_arg,\n+        group_size,\n+        scale_ue8m0=scale_ue8m0,\n+        transposed=transposed,\n+    )\n+    torch.cuda.synchronize()\n+\n+    q_bytes = q.view(torch.uint8)\n+    q_ref_bytes = q_ref.view(torch.uint8).view(experts, capacity, hidden)\n+    if transposed:\n+        scale_ref = scale_ref.view(groups // 4, experts, capacity).permute(1, 0, 2)\n+    else:\n+        scale_ref = scale_ref.view(torch.int32).view(experts, capacity, groups)\n+    for expert, count in enumerate(counts):\n+        assert torch.equal(q_bytes[expert, :count], q_ref_bytes[expert, :count])\n+        assert (q_bytes[expert, count:] == 0x5A).all()\n+        if transposed:\n+            assert torch.equal(scale[expert, :, :count], scale_ref[expert, :, :count])\n+            assert (scale[expert, :, count:] == sentinel).all()\n+        else:\n+            assert torch.equal(scale[expert, :count], scale_ref[expert, :count])\n+            assert (scale[expert, count:] == sentinel).all()\n+\n+\n @pytest.mark.parametrize(\"column_major\", [True, False])\n @pytest.mark.parametrize(\"scale_ue8m0\", [True, False])\n def test_fused_silu(scale_ue8m0, column_major):",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7/test%2Fregistered%2Fkernels%2Fops%2Fquantization%2Ftest_per_token_group_quant.py",
+      "sha": "5e2e1127e8b36a7a4478e690e78269d3dbf6fa11",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Hi @BBuf, can you pls review this when you get some time? It sizes the DSV4 masked silu-mul-quant grid to the GPU instead of T * topk, so DeepEP low-latency decode stops launching ~23k empty CTAs per MoE layer. On H100 the kernel goes from 17.1 to 3.3 us at 64 tokens/GPU on the Flash TP4 shape, with bit-identical output (details in the description).\r\n\r\nOne ask on e2e: I don't have a multi-GPU setup right now, and this path needs 4x B200 with DeepEP. The per-commit `test_deepseek_v4_flash_fp4_b200.py` (`TestDSV4FlashFP4NonSpecB200`, TP4 + DP4 + DeepEP) runs this kernel, so CI will cover correctness and GSM8K on B200, but it has no speed metric. If someone with a 4x B200 box could run a quick main vs PR comparison with that recipe (e.g., `bench_serving` decode-heavy, or a profile of one decode step), that would give the e2e number. Happy to share the exact commands.\r\n\r\nOnce we have the e2e numbers and they show a gain, could you pls run /tag-and-rerun-ci so CI starts on the current commit? And if you see more improvements for this kernel, pls let me know; I'm happy to work on it. Thanks.",
+      "created_at": "2026-10-16T16:16:46Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44618#issuecomment-6219756782",
+      "id": 6219756782,
+      "updated_at": "2026-10-16T16:16:46Z",
+      "user": {
+        "login": "Monishver11"
+      }
+    },
+    {
+      "body": "Please rebase onto main to unblock CI. A B200/DeepEP benchmark is still needed to validate the target workload.",
+      "created_at": "2026-10-18T11:38:06Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44618#issuecomment-6249457184",
+      "id": 6249457184,
+      "updated_at": "2026-10-18T11:38:06Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "Thanks for the review @BBuf. I don't have a 4x B200 box for the e2e validation right now. If I share the commands (cookbook B200 Flash balanced recipe: TP4 + DP4 + DeepEP; this kernel runs on the DeepEP low-latency decode steps with or without EAGLE, so either works), main vs PR with bench_serving and a decode-step profile, would it be possible for you or someone on your side to run them? Otherwise I'll rent a box and post the numbers here.",
+      "created_at": "2026-10-18T16:09:47Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44618#issuecomment-6252104114",
+      "id": 6252104114,
+      "updated_at": "2026-10-18T16:09:47Z",
+      "user": {
+        "login": "Monishver11"
+      }
+    }
+  ],
+  "number": 44618,
+  "refs": {
+    "base": {
+      "commit": "377cd867fd13a51a63c2b67e95d1febdd23fd68a",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "2b6fc6e3d056ec82c3f20a37b79dbf9648a4afe7",
+      "repository": "Monishver11/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "LGTM. Thanks for reducing the launch overhead and adding coverage for the real-row mapping and untouched padding.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44618#pullrequestreview-5562340305",
+      "id": 5562340305,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-18T09:26:09Z",
+      "user": {
+        "login": "BBuf"
+      }
+    }
+  ]
+}

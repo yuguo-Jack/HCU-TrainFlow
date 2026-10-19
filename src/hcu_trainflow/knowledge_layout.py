@@ -5,6 +5,8 @@ resolve live maintenance records, never certify an old content-review receipt.
 """
 from pathlib import Path
 from functools import lru_cache
+import fnmatch
+import os
 import re
 
 from .core import FlowError, child, read_json
@@ -86,3 +88,21 @@ def current_path(project, name):
 
 def current_hashes(project, hashes):
     return {current_path(project, name): sha for name, sha in hashes.items()}
+
+
+def review_page_candidates(project):
+    """Read live authored/experience routes without traversing generated sources.
+
+    The canonical upstream subtree contains acquisition copies, not conclusions.
+    Do not cache the remaining inventory: new pages and removed citations must
+    invalidate reviews even when acquisition is a long-running batch.
+    """
+    root = Path(project) / 'knowledge'
+    for directory, children, files in os.walk(root):
+        parts = Path(directory).relative_to(root).parts
+        if len(parts) == 4 and parts[0] == 'projects' and parts[2:] == ('knowledgebase', 'upstream'):
+            children.clear()
+            continue
+        for name in files:
+            if fnmatch.fnmatch(name, '*.md'):
+                yield Path(directory) / name

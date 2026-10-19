@@ -10,34 +10,42 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/moe.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 004d1c2bc849bb6a96e77099872a1cb282907e28be774953c2ae40aa39b094c6
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/paged_stash.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 053fecb7a457408c19a5c44322c2dfd6a50a3d27e49786ddc6192b503c6d96a1
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/moe_layer.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 99d18814749a6ba9ecca2cca1875e0c723eff1c06d328768ac6570f1641c0e2e
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: bfe309cdb8d30fbbde4a202a047f30e343c0b3e08c3f89e822ed15780f369a7c
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/token_dispatcher.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 518636f7fdd774247796ad5dc4ddcfd85be4e20b755e85ac763bf1a53d898a31
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 7f3e33027136df240426614ee65a3c149d7a2c4361eda3b62cc6123af1bd9c6e
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/paged_stash.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 950b8c72253b90e8b6936a5aa8532120bd8e056f6cc88807efa4c818d88d4efc
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/moe/virtual_expert_load_balancer.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: d4ea965c28c26e37386a76a1c1453386abef2e1dab8bbb4947594fc7be67dd91
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/transformer/moe/test_virtual_experts.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 3a56ef29ac6b286ef881603b1d480e5fcf9a43eb7d47ed42368ac8f8e7bb4a8f
 ---
 
 # Megatron MoE：路由、dispatcher、grouped GEMM与容量控制
@@ -72,6 +80,16 @@ layer forward仅是一半，dispatch/combine反向、wgrad/dgrad、auxloss scali
 
 给更大headroom可减少rerun却占更多显存；更小page不一定降低time，可能增加metadata/launch。优化因素应由真实skew/peak与copy/pop profile决定，见[memory](memory.md)和[launch案例](../cases/paged-stash-launch.md)。
 
+## MoonEP：把负载搬到虚拟专家的训练契约
+
+当前 `moe_virtual_expert_load_balance` 通过 HybridEP 接入：规划 runtime expert IDs，向额外 slot 推送 FC1/FC2 权重，再将虚拟 slot 的梯度回并到真实 owner。TE 的额外 runtime GEMM slot 不注册为可初始化/保存的模型权重，checkpoint 只枚举 owned experts；slot 内容每微批可变，不能沿用 owned 权重的 first-microbatch 量化缓存标记。
+
+该路径限制 flex+hybridep、indices routing、BF16 参数、grouped-tensor、FP32 router、已分配 main_grad 和固定 token 数；原生 MXFP8 还要求 param gather 与相应 grad-buffer 复用。EP/top-k/对齐及激活等检查以固定 TransformerConfig 为准。Paged Stash、delay-wgrad、跨微批 EP-overlap、shared-expert-overlap 等组合在当前检查中被拒绝，不能把各自可用能力直接叠加。
+
+规划先在独立 stream 启动，shared expert 等独立计算可覆盖其时间；消费 dispatch 前等待 planning event。forward 结束保存本次 plan，backward 先重新推权重并 wait，FC2/FC1 梯度各启动一次回并，最后在计算 stream 等完成、清 slot 并交接真实梯度。重复 push、遗留 plan、token 数漂移或未完成两路规约都有显式失败；释放对称内存必须早于销毁其 EP group。
+
+`plan_dispatch` 显式退出 Dynamo tracing，TE 图 scope 也有 whole-MoE 与 router/preprocess 的不同限制；compile 支持不等于全部规划过程 Graph-safe。上游虚拟专家测试覆盖路由/peer transport/训练对照，并区分 Blackwell MXFP8 与其他设备 skip。本轮只审阅源码和测试设计，没有运行这些多 GPU 测试。评估时分别测 planning、权重搬运、专家偏斜改善、梯度回并和额外峰值，再验证完整微批累积及阶段 loss；失败回退常规已验证 dispatcher。
+
 ## 融合与 1F1B overlap 的真实契约
 
 核对NV实际granularity：permute/pad、scale/quantize、expertlinear/activation、combine/sharedexpert、残差与backward缓存。HCU优先已有TE/Flash-Train/PrimusTurbo实现，再按backend责任补HIP/Triton等；初版融合仍按高占比、同shape效率和上限继续优化。
@@ -88,11 +106,11 @@ PR #7897与#7534为已登记机制入口；进一步搜索`wiki-search-pr "MoE g
 
 ## 固定源码与维护边界
 
-- [docs/user-guide/features/moe.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/user-guide/features/moe.md)
-- [docs/user-guide/features/paged_stash.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/user-guide/features/paged_stash.md)
-- [megatron/core/transformer/moe/moe_layer.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/moe_layer.py)
-- [megatron/core/transformer/moe/token_dispatcher.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/token_dispatcher.py)
-- [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/paged_stash.py)
-- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/transformer_config.py)
+- [docs/user-guide/features/moe.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/features/moe.md)
+- [docs/user-guide/features/paged_stash.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/features/paged_stash.md)
+- [megatron/core/transformer/moe/moe_layer.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/moe_layer.py)
+- [megatron/core/transformer/moe/token_dispatcher.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/token_dispatcher.py)
+- [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/paged_stash.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/transformer_config.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

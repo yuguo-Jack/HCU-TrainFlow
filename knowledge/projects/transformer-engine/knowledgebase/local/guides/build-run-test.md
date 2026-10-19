@@ -9,32 +9,32 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-transformerengine
   path: docs/installation.rst
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: e572fc6ba65d15e9092baa71c3e09e724ad344b52d7c4a28a4e854e58d36093e
 - source: nvidia-transformerengine
   path: docs/envvars.rst
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
-  sha256: adf0db6d74919217dfd3879578f63e2ffa5c4925795c7bec5cd2d8ee6862e30e
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 7d0f440d41ba1122259bbc2d5daaf7892fd0e87de1fa17a79c2f185b1c8adf2d
 - source: nvidia-transformerengine
   path: setup.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 7329a6981de6e6fa50a86971fd914a0a3db2f08b47287694c00e468a59a32dac
 - source: nvidia-transformerengine
   path: .gitmodules
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: f59cb931b9c260f59fdf31beaf800a8df536fa50eec9470b381d3bf7b1e62986
 - source: nvidia-transformerengine
   path: tests/pytorch/test_numerics.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 2752df5c59a5f9dd2ff5d44c8babe7d1f9bde48931311c4a0f228298c46ec35f
 - source: nvidia-transformerengine
   path: tests/pytorch/attention/test_attention_backend_selection.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
-  sha256: e0ee6f26e308ab0481f6bb7a12f88b1a1ffdf4a4a19f9e294ace495cab2de252
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 351675d17a4fa6dabca0a0540c4b6c28ec6aa67bd9d78c207fee478a98d9ad90
 - source: nvidia-transformerengine-docs
   path: installation
   commit: 7d26f4a31e4eae8c11f1eadb6a5deee3f2123b88ac0397752c1fe8d1d2a41878
@@ -49,12 +49,16 @@ sources:
   revision_kind: web-content-fingerprint
 - source: nvidia-transformerengine
   path: transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 81b878962638eb81c571a5930e2b856f82299a40b6e5fb0040df97d2a6a30c9e
 - source: nvidia-transformerengine
   path: tests/cpp/operator/test_swizzle.cu
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 3d9909e1dc3729afbf6667169bf9e89a26f1a982afd822b44dd82da881c18d59
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/ops/basic/grouped_linear.py
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: eee951ca3e44e2569e87fb093dd9bd13278af19c5b5beff680023c0e71341143
 ---
 
 # TE 安装、运行、单测与 HCU 环境接入
@@ -85,12 +89,14 @@ sources:
 
 ## 来源与版本复核
 
-- [nvidia-transformerengine: docs/installation.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/installation.rst)
-- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/envvars.rst)
-- [nvidia-transformerengine: setup.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/setup.py)
-- [nvidia-transformerengine: .gitmodules](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/.gitmodules)
-- [nvidia-transformerengine: tests/pytorch/test_numerics.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/pytorch/test_numerics.py)
-- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/pytorch/attention/test_attention_backend_selection.py)
+当前 grouped fusion 的旧环境门禁已改为 ops.GroupedLinear 显式 `split_alignment` 合同，单 grouped 参数也不再由旧环境变量授权；设备/recipe/native GroupedTensor 能力仍是独立门禁。升级时同时看[融合专题](../topics/fusion-and-profiling.md)与 [attention 选择条件](../topics/attention.md)，不能因旧变量消失就推断新路径无约束。测试存在和 host monkeypatch 选择测试都不替代实际 GPU 数值回归。
+
+- [nvidia-transformerengine: docs/installation.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/installation.rst)
+- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/envvars.rst)
+- [nvidia-transformerengine: setup.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/setup.py)
+- [nvidia-transformerengine: .gitmodules](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/.gitmodules)
+- [nvidia-transformerengine: tests/pytorch/test_numerics.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/test_numerics.py)
+- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/attention/test_attention_backend_selection.py)
 - [nvidia-transformerengine-docs: installation](https://docs.nvidia.com/deeplearning/transformer-engine/installation.html)
 - [nvidia-transformerengine-docs: environment-variables](https://docs.nvidia.com/deeplearning/transformer-engine/envvars.html)
 
@@ -102,5 +108,9 @@ sources:
 
 补充固定证据：
 
-- [transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh)
-- [tests/cpp/operator/test_swizzle.cu](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/tests/cpp/operator/test_swizzle.cu)
+- [transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh)
+- [tests/cpp/operator/test_swizzle.cu](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/cpp/operator/test_swizzle.cu)
+
+## 本次补充的实现与测试依据
+
+- [nvidia-transformerengine: transformer_engine/pytorch/ops/basic/grouped_linear.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/ops/basic/grouped_linear.py)

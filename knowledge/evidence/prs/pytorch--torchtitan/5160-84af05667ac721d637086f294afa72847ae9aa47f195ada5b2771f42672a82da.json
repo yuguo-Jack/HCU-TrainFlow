@@ -1,0 +1,590 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "77d16fe92720f546407488721dd969a517704107fe98f298268f10875bda3036",
+      "isPrivate": false,
+      "numbers": [
+        5166,
+        5164,
+        5163,
+        5162,
+        5161,
+        5160,
+        5158,
+        5157
+      ],
+      "observed_at": "2026-10-19T18:05:51.887252+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4878,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "4e0bccb8c9bdb90ad5d572b093b3043499e2df1a",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** under the `moe_dispatch_combine` region, MoE combine becomes one fused fp32 gather per token and both backwards become gathers: DSv3 16k step -6.4%.\n\n**Problem**\n1. **Combine today.** Multiply `[R, D]` expert rows by scores in fp32, then `deterministic_scatter_add` (a sort-based accumulating `index_put`).\n2. **Dispatch backward.** Another accumulating `index_put`.\n3. **Cost.** ~16 ms per MoE layer at 16k vs ~1.5 ms ideal. Op level: combine 13.47 ms, dispatch 3.39 ms.\n\n**Solution**\n1. **Gather-sum.** Under compile, combine sums each token's K rows (score-weighted, fp32, top-k order) in one fused gather kernel.\n2. **Backwards are gathers** for both the dispatch gather and the combine.\n3. **Row order.** Each token's rows come from the inverse of the expert sort `_local_reorder` already runs: one scatter, stored in the dispatch metadata, returned through AllToAll's `_dispatch` remat region.\n4. **Gate.** Eager is unchanged behind `is_compiling()`: the unfused gathers are slower in eager. Eager path is upstream's `_score_and_combine`.\n5. **Enabled** in `DeepSeekV3Model.Config.local_compile_regions`.\n\n```text\nbefore:  y[R,D] * score (fp32) --deterministic_scatter_add--> out[T,D]\nafter:   out[t] = sum_k score[t,k] * y[row(t,k)]   (one fused gather, fp32, top-k order)\n```\n\n**Results**\n```text\nDSv3 671B layers 2-3, flex attention, fwd+bwd wall, 1x GB300 (shared), median [range] of 3 fresh processes, no AC\n16k            185.78 [185.62-186.05] -> 173.80 [173.29-173.99] ms  (-6.4%)\npeak             42.7 -> 40.3 GB\n4k              46.76 -> 42.94 ms   (blind-phase tree, same code)\n32k            354.56 -> 328.56 ms  (blind-phase tree)\n16k SAC         216.3 -> 199.9 ms   (blind-phase tree, 1 process)\n\nop level, T=16k, K=8, D=7168, fwd+bwd kernel\ncombine         13.47 -> 1.40 ms  (ideal 0.86)\ndispatch         3.39 -> 0.91 ms  (ideal 0.60)\n\ncorrectness\nlayer vs eager, bf16, 4k: max rel L2 7.4e-3 over output and all grads (0.19x the 1-ulp noise band); routed expert grads bitwise\nop vs fp64, 4k, bf16: out 4.9e-3 -> 3.3e-3, x.grad 4.9e-3 -> 3.7e-3, score grad equal; fp32 equal or better\ngraphs: 3 per function (T 4k static, 8k/16k dynamic, no_grad), shared across MoE layers (limit 8)\n```\n\nYou may ask:\n- Why not compile combine as written? 4.4 vs 1.4 ms op level.\n- Why not a plain compiled gather with autograd's backward? Its backward is an `index_put`: 7.4 ms.\n- Why not apply scores inside SwiGLU? Under all-to-all EP the scores live on the source rank.\n\nNOTE:\n- Reaches every recipe built from the DSv3 model config: deepseek_v3_671b, 16B/236B flavors, Kimi K2.x (inherits the config). Local, AllToAll and TorchAO (EP=1) dispatchers; not Dist-MoE/DeepEP/HybridEP.\n- Not tested: multi-GPU EP (the AllToAll combine relies on the combine all-to-all returning rows in sent order), GraphTrainer, CUDA graphs, loss curves, H100.\n- The Kimi K3 stack carries a variant of this change; land one.\n\n**Test plan**\n`pytest tests/unit_tests/cpu/test_token_dispatcher_compile.py` (fails before, passes after)\n\n**Stack summary**\n\n```text\nDeepSeek-V3 671B layers 2 (dense) + 3 (MoE), native dims, 128 local experts (one EP2 rank), local dispatcher\nflex attention, fwd+bwd wall, 1x GB300 (shared), upstream main 2154d68a9, median of 3 fresh processes\n\nupstream regions -> stack   16k no AC   184.49 -> 159.58 ms  (-13.5%)\n  with fused_mla instead of mla_qk      184.49 -> 156.24 ms  (-15.3%)\nEP>1 only (op level): EP permutes -5.3 ms per MoE layer at 16k\n\nstack (biggest first; per-PR deltas measured one base earlier, same code)\n1 moe_dispatch_combine      -6.4%   <- this PR\n2 mla_qk                    -7.5%\n3 EP permute gathers        EP>1 only\n4 router region             -0.2% (EP2 width; -0.65 ms per MoE layer at 256 experts)\n5 int16 sort keys           within noise (bitwise, 4 lines)\nMade with the local_compile_perf skill: https://github.com/pytorch/torchtitan/pull/5155\n```\n\nRejected:\n- scores inside SwiGLU: under all-to-all EP the scores live on the source rank\n- gather form in eager: combine 20.7 vs 13.5 ms, dispatch bwd 7.1 vs 3.4 ms, so gated on `is_compiling()`\n- real-arithmetic RoPE: ties complex RoPE with ConcatKernel (53.35 vs 53.48 ms per attention module)\n- gate/up packed + unbind in a region: 2.26 vs 2.30 ms at 16k, worse at 4k\n- RMSNorm, residual adds, unbind stacks: each < 1%\n\nCompile limits hit:\n- Per-block compile inlines flex attention and drops its max_autotune options: attention 82 -> 105 ms at 16k. Attention stays outside regions.\n- A region returning a strided view (`v = kv[..., 128:]`) gets its grad from flex in another layout; AOTAutograd copies it first (556 us): return v dense under compile (PR 2).\n- `torch.topk` is an ATen fallback in Inductor: the router uses masked argmax rounds under compile (PR 4).\n- Inductor has no codegen for complex multiply: RoPE's `q_pe * freqs_cis` stays an ATen kernel inside the `mla_qk` region (2 x 212 us at 16k). Real arithmetic (#5196) plus plain cat lowering takes the layer 46.34 -> 45.85 ms (PR 2, second commit).\n\nNot tested: multi-GPU EP, GraphTrainer, CUDA graphs, loss curves, H100, TorchAO/MXFP8, full AC, MTP/loss paths.\n\nStack: 1 of 5.\n\n\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Follow-up after this lands: Muse Spark doesn't enable `moe_dispatch_combine` yet, so it needs a one-line addition to `MuseSparkModel.Config.local_compile_regions`. Measured on top of the Muse Spark stack (#5432-#5434), with #5164: 2-layer fwd+bwd at 4k, -4.6 ms (combine's fp32 score multiply over `[T*8, 4096]`, ~2.5 ms per 2 layers).\n",
+            "createdAt": "2026-10-15T23:30:59Z",
+            "databaseId": 6204452868,
+            "updatedAt": "2026-10-15T23:30:59Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5160#issuecomment-6204452868"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Closing: replaced by the any-EP gather-sum training change plus a small change that turns its dispatch / combine regions on for DeepSeek-V3 and Kimi K3. One DeepSeek-V3 MoE layer, fwd + bwd at 16k tokens: −23%.",
+            "createdAt": "2026-10-18T23:11:22Z",
+            "databaseId": 6256345932,
+            "updatedAt": "2026-10-18T23:11:22Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5160#issuecomment-6256345932"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXToQ0w=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "e78177360432f7a88fcd2f0249cca2188bb69234",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 5160,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "CLOSED",
+      "title": "[moe][perf] Gather-based dispatch backward and combine under local compile",
+      "updatedAt": "2026-10-18T23:11:23Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5160"
+    },
+    "reused_files": {
+      "artifact_path": "knowledge/evidence/prs/pytorch--torchtitan/5160-35bf89bbfb63213a1310cb311b863d0a0305209a0cc61e2ab98569feb88ba2e5.json",
+      "artifact_sha256": "35bf89bbfb63213a1310cb311b863d0a0305209a0cc61e2ab98569feb88ba2e5",
+      "reason": "Same immutable head/base repository+commit pair and changed_files; original fully paginated files response reused. Discussions are freshly queried.",
+      "refs": {
+        "base": {
+          "commit": "4e0bccb8c9bdb90ad5d572b093b3043499e2df1a",
+          "repository": "pytorch/torchtitan"
+        },
+        "head": {
+          "commit": "e78177360432f7a88fcd2f0249cca2188bb69234",
+          "repository": "pytorch/torchtitan"
+        }
+      }
+    },
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5160/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5160/commits"
+      },
+      "html": {
+        "href": "https://github.com/pytorch/torchtitan/pull/5160"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5160"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5160/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5160"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/statuses/e78177360432f7a88fcd2f0249cca2188bb69234"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 221,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "pytorch:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "4e0bccb8c9bdb90ad5d572b093b3043499e2df1a",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "body": "**TLDR:** under the `moe_dispatch_combine` region, MoE combine becomes one fused fp32 gather per token and both backwards become gathers: DSv3 16k step -6.4%.\n\n**Problem**\n1. **Combine today.** Multiply `[R, D]` expert rows by scores in fp32, then `deterministic_scatter_add` (a sort-based accumulating `index_put`).\n2. **Dispatch backward.** Another accumulating `index_put`.\n3. **Cost.** ~16 ms per MoE layer at 16k vs ~1.5 ms ideal. Op level: combine 13.47 ms, dispatch 3.39 ms.\n\n**Solution**\n1. **Gather-sum.** Under compile, combine sums each token's K rows (score-weighted, fp32, top-k order) in one fused gather kernel.\n2. **Backwards are gathers** for both the dispatch gather and the combine.\n3. **Row order.** Each token's rows come from the inverse of the expert sort `_local_reorder` already runs: one scatter, stored in the dispatch metadata, returned through AllToAll's `_dispatch` remat region.\n4. **Gate.** Eager is unchanged behind `is_compiling()`: the unfused gathers are slower in eager. Eager path is upstream's `_score_and_combine`.\n5. **Enabled** in `DeepSeekV3Model.Config.local_compile_regions`.\n\n```text\nbefore:  y[R,D] * score (fp32) --deterministic_scatter_add--> out[T,D]\nafter:   out[t] = sum_k score[t,k] * y[row(t,k)]   (one fused gather, fp32, top-k order)\n```\n\n**Results**\n```text\nDSv3 671B layers 2-3, flex attention, fwd+bwd wall, 1x GB300 (shared), median [range] of 3 fresh processes, no AC\n16k            185.78 [185.62-186.05] -> 173.80 [173.29-173.99] ms  (-6.4%)\npeak             42.7 -> 40.3 GB\n4k              46.76 -> 42.94 ms   (blind-phase tree, same code)\n32k            354.56 -> 328.56 ms  (blind-phase tree)\n16k SAC         216.3 -> 199.9 ms   (blind-phase tree, 1 process)\n\nop level, T=16k, K=8, D=7168, fwd+bwd kernel\ncombine         13.47 -> 1.40 ms  (ideal 0.86)\ndispatch         3.39 -> 0.91 ms  (ideal 0.60)\n\ncorrectness\nlayer vs eager, bf16, 4k: max rel L2 7.4e-3 over output and all grads (0.19x the 1-ulp noise band); routed expert grads bitwise\nop vs fp64, 4k, bf16: out 4.9e-3 -> 3.3e-3, x.grad 4.9e-3 -> 3.7e-3, score grad equal; fp32 equal or better\ngraphs: 3 per function (T 4k static, 8k/16k dynamic, no_grad), shared across MoE layers (limit 8)\n```\n\nYou may ask:\n- Why not compile combine as written? 4.4 vs 1.4 ms op level.\n- Why not a plain compiled gather with autograd's backward? Its backward is an `index_put`: 7.4 ms.\n- Why not apply scores inside SwiGLU? Under all-to-all EP the scores live on the source rank.\n\nNOTE:\n- Reaches every recipe built from the DSv3 model config: deepseek_v3_671b, 16B/236B flavors, Kimi K2.x (inherits the config). Local, AllToAll and TorchAO (EP=1) dispatchers; not Dist-MoE/DeepEP/HybridEP.\n- Not tested: multi-GPU EP (the AllToAll combine relies on the combine all-to-all returning rows in sent order), GraphTrainer, CUDA graphs, loss curves, H100.\n- The Kimi K3 stack carries a variant of this change; land one.\n\n**Test plan**\n`pytest tests/unit_tests/cpu/test_token_dispatcher_compile.py` (fails before, passes after)\n\n**Stack summary**\n\n```text\nDeepSeek-V3 671B layers 2 (dense) + 3 (MoE), native dims, 128 local experts (one EP2 rank), local dispatcher\nflex attention, fwd+bwd wall, 1x GB300 (shared), upstream main 2154d68a9, median of 3 fresh processes\n\nupstream regions -> stack   16k no AC   184.49 -> 159.58 ms  (-13.5%)\n  with fused_mla instead of mla_qk      184.49 -> 156.24 ms  (-15.3%)\nEP>1 only (op level): EP permutes -5.3 ms per MoE layer at 16k\n\nstack (biggest first; per-PR deltas measured one base earlier, same code)\n1 moe_dispatch_combine      -6.4%   <- this PR\n2 mla_qk                    -7.5%\n3 EP permute gathers        EP>1 only\n4 router region             -0.2% (EP2 width; -0.65 ms per MoE layer at 256 experts)\n5 int16 sort keys           within noise (bitwise, 4 lines)\nMade with the local_compile_perf skill: https://github.com/pytorch/torchtitan/pull/5155\n```\n\nRejected:\n- scores inside SwiGLU: under all-to-all EP the scores live on the source rank\n- gather form in eager: combine 20.7 vs 13.5 ms, dispatch bwd 7.1 vs 3.4 ms, so gated on `is_compiling()`\n- real-arithmetic RoPE: ties complex RoPE with ConcatKernel (53.35 vs 53.48 ms per attention module)\n- gate/up packed + unbind in a region: 2.26 vs 2.30 ms at 16k, worse at 4k\n- RMSNorm, residual adds, unbind stacks: each < 1%\n\nCompile limits hit:\n- Per-block compile inlines flex attention and drops its max_autotune options: attention 82 -> 105 ms at 16k. Attention stays outside regions.\n- A region returning a strided view (`v = kv[..., 128:]`) gets its grad from flex in another layout; AOTAutograd copies it first (556 us): return v dense under compile (PR 2).\n- `torch.topk` is an ATen fallback in Inductor: the router uses masked argmax rounds under compile (PR 4).\n- Inductor has no codegen for complex multiply: RoPE's `q_pe * freqs_cis` stays an ATen kernel inside the `mla_qk` region (2 x 212 us at 16k). Real arithmetic (#5196) plus plain cat lowering takes the layer 46.34 -> 45.85 ms (PR 2, second commit).\n\nNot tested: multi-GPU EP, GraphTrainer, CUDA graphs, loss curves, H100, TorchAO/MXFP8, full AC, MTP/loss paths.\n\nStack: 1 of 5.\n\n\n",
+    "changed_files": 3,
+    "closed_at": "2026-10-18T23:11:23Z",
+    "comments": 2,
+    "comments_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5160/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5160/commits",
+    "created_at": "2026-10-08T15:15:17Z",
+    "deletions": 10,
+    "diff_url": "https://github.com/pytorch/torchtitan/pull/5160.diff",
+    "draft": true,
+    "head": {
+      "label": "pytorch:felipemello1/lcp/dsv3-1-moe-gather-dispatch-combine",
+      "ref": "felipemello1/lcp/dsv3-1-moe-gather-dispatch-combine",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "e78177360432f7a88fcd2f0249cca2188bb69234",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5160",
+    "id": 4788935638,
+    "issue_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5160",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "009900",
+        "default": false,
+        "description": "This label is managed by the Meta Open Source bot.",
+        "id": 6319105129,
+        "name": "CLA Signed",
+        "node_id": "LA_kwDOK5EkJM8AAAABeKXkaQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/CLA%20Signed"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10889347594,
+        "name": "ciflow/rl",
+        "node_id": "LA_kwDOK5EkJM8AAAACiQ5CCg",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/rl"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": null,
+    "mergeable": false,
+    "mergeable_state": "dirty",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOK5EkJM8AAAABHXFb1g",
+    "number": 5160,
+    "patch_url": "https://github.com/pytorch/torchtitan/pull/5160.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5160/comments",
+    "state": "closed",
+    "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/e78177360432f7a88fcd2f0249cca2188bb69234",
+    "title": "[moe][perf] Gather-based dispatch backward and combine under local compile",
+    "updated_at": "2026-10-18T23:11:23Z",
+    "url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5160",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+      "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+      "followers_url": "https://api.github.com/users/felipemello1/followers",
+      "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+      "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/felipemello1",
+      "id": 23004953,
+      "login": "felipemello1",
+      "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+      "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+      "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+      "repos_url": "https://api.github.com/users/felipemello1/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/felipemello1",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 69,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e78177360432f7a88fcd2f0249cca2188bb69234/tests%2Funit_tests%2Fcpu%2Ftest_token_dispatcher_compile.py",
+      "changes": 69,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Ftest_token_dispatcher_compile.py?ref=e78177360432f7a88fcd2f0249cca2188bb69234",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/test_token_dispatcher_compile.py",
+      "patch": "@@ -0,0 +1,69 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import pytest\n+import torch\n+\n+from torchtitan.distributed.local_compile import apply_local_compile\n+from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher\n+\n+\n+@pytest.fixture(autouse=True)\n+def reset_local_compile():\n+    apply_local_compile([])\n+    torch._dynamo.reset()\n+    yield\n+    apply_local_compile([])\n+\n+\n+def _dispatch_expert_combine(dispatcher, x_TD, scores_TK, expert_ids_TK, weight_ND):\n+    routed_input_ND, num_tokens_per_expert_E, metadata = dispatcher.dispatch(\n+        x_TD,\n+        scores_TK,\n+        expert_ids_TK,\n+        torch.bincount(expert_ids_TK.flatten(), minlength=dispatcher.num_experts),\n+    )\n+    # A per-row \"expert\" so every routed row gets a distinct gradient.\n+    return dispatcher.combine(routed_input_ND * weight_ND, metadata, x_TD)\n+\n+\n+def test_inverse_row_indices_match_docstring_example() -> None:\n+    dispatcher = LocalTokenDispatcher.Config(num_experts=2, top_k=2).build()\n+    x_TD = torch.arange(2, dtype=torch.float32).unsqueeze(-1)\n+    _, token_indices_N, _, row_indices_TK = dispatcher._local_reorder(\n+        x_TD, torch.ones(2, 2), torch.tensor([[1, 0], [0, 1]])\n+    )\n+    assert token_indices_N.tolist() == [0, 1, 0, 1]\n+    assert row_indices_TK.tolist() == [[2, 0], [1, 3]]\n+\n+\n+def test_compiled_dispatch_and_combine_match_eager() -> None:\n+    torch.manual_seed(0)\n+    num_tokens, top_k, dim, num_experts = 16, 3, 8, 5\n+    dispatcher = LocalTokenDispatcher.Config(\n+        num_experts=num_experts, top_k=top_k\n+    ).build()\n+    expert_ids_TK = torch.stack(\n+        [torch.randperm(num_experts)[:top_k] for _ in range(num_tokens)]\n+    )\n+    x_TD = torch.randn(num_tokens, dim)\n+    scores_TK = torch.rand(num_tokens, top_k)\n+    weight_ND = torch.randn(num_tokens * top_k, dim)\n+    grad_TD = torch.randn(num_tokens, dim)\n+\n+    results = []\n+    for regions in ([], [\"moe_dispatch_combine\"]):\n+        apply_local_compile(regions)\n+        x = x_TD.clone().requires_grad_(True)\n+        scores = scores_TK.clone().requires_grad_(True)\n+        out_TD = _dispatch_expert_combine(\n+            dispatcher, x, scores, expert_ids_TK, weight_ND\n+        )\n+        out_TD.backward(grad_TD)\n+        results.append((out_TD.detach(), x.grad, scores.grad))\n+\n+    for eager, compiled in zip(*results, strict=True):\n+        torch.testing.assert_close(compiled, eager)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e78177360432f7a88fcd2f0249cca2188bb69234/tests%2Funit_tests%2Fcpu%2Ftest_token_dispatcher_compile.py",
+      "sha": "1863122d0d41365a823de617b99404fd11bd83dd",
+      "status": "added"
+    },
+    {
+      "additions": 151,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e78177360432f7a88fcd2f0249cca2188bb69234/torchtitan%2Fmodels%2Fcommon%2Ftoken_dispatcher.py",
+      "changes": 161,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fcommon%2Ftoken_dispatcher.py?ref=e78177360432f7a88fcd2f0249cca2188bb69234",
+      "deletions": 10,
+      "filename": "torchtitan/models/common/token_dispatcher.py",
+      "patch": "@@ -13,6 +13,7 @@\n from torch.distributed._functional_collectives import all_to_all_single\n from torch.distributed.tensor import DeviceMesh\n \n+from torchtitan.distributed.local_compile import local_compile\n from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_sparse_mesh\n from torchtitan.ops.scatter_add import deterministic_scatter_add\n from torchtitan.protocols.module import Module\n@@ -24,6 +25,7 @@ class LocalDispatchMetadata:\n \n     token_indices_experts_sorted_N: torch.Tensor  # noqa: N815\n     topk_scores_experts_sorted_N: torch.Tensor  # noqa: N815\n+    experts_sorted_row_indices_TK: torch.Tensor  # noqa: N815\n \n \n @dataclass(frozen=True, kw_only=True)\n@@ -56,12 +58,13 @@ def __init__(self, config: Config):\n     def init_buffer(self) -> None:\n         \"\"\"Initialize backend communication buffers, if any.\"\"\"\n \n+    @local_compile(\"moe_dispatch_combine\", batch_invariant=True)\n     def _local_reorder(\n         self,\n         x_TD: torch.Tensor,\n         topk_scores_TK: torch.Tensor,\n         topk_expert_ids_TK: torch.Tensor,\n-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n         \"\"\"Reorder tokens by expert assignment for local expert computation.\n \n         Groups tokens by expert index via argsort. Routing scores are applied\n@@ -77,21 +80,44 @@ def _local_reorder(\n                 order.\n             token_indices_experts_sorted_N: ``(N,)`` token-to-original mapping\n             topk_scores_experts_sorted_N: ``(N,)`` scores in expert-sorted order\n+            experts_sorted_row_indices_TK: ``(T, K)`` row of each token's k-th\n+                expert assignment in expert-sorted order (the inverse mapping).\n+\n+        Example:\n+            K=2, topk_expert_ids_TK=[[1, 0], [0, 1]] sorts the assignments\n+            (t0,k0), (t0,k1), (t1,k0), (t1,k1) into rows [t0, t1, t0, t1]:\n+            token_indices_experts_sorted_N=[0, 1, 0, 1] and\n+            experts_sorted_row_indices_TK=[[2, 0], [1, 3]].\n         \"\"\"\n         # Reorder the token indices to match the order of the experts where N = T*K\n-        token_indices_experts_sorted_N = torch.argsort(\n+        sorted_assignment_indices_N = torch.argsort(\n             topk_expert_ids_TK.view(-1), stable=True\n         )\n         topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[\n-            token_indices_experts_sorted_N\n+            sorted_assignment_indices_N\n         ]\n-        token_indices_experts_sorted_N = token_indices_experts_sorted_N // self.top_k\n-        routed_input_ND = x_TD[token_indices_experts_sorted_N]\n+        experts_sorted_row_indices_N = torch.empty_like(sorted_assignment_indices_N)\n+        experts_sorted_row_indices_N[sorted_assignment_indices_N] = torch.arange(\n+            sorted_assignment_indices_N.numel(), device=x_TD.device\n+        )\n+        experts_sorted_row_indices_TK = experts_sorted_row_indices_N.view(\n+            topk_expert_ids_TK.shape\n+        )\n+        token_indices_experts_sorted_N = sorted_assignment_indices_N // self.top_k\n+        # The gather backward only pays off once Inductor fuses it; eager keeps\n+        # the indexing backward (an accumulating index_put).\n+        if torch.compiler.is_compiling():\n+            routed_input_ND = _GatherTokenRows.apply(\n+                x_TD, token_indices_experts_sorted_N, experts_sorted_row_indices_TK\n+            )\n+        else:\n+            routed_input_ND = x_TD[token_indices_experts_sorted_N]\n \n         return (\n             routed_input_ND,\n             token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK,\n         )\n \n     def dispatch(\n@@ -126,10 +152,12 @@ def dispatch(\n             routed_input_RD,\n             token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK,\n         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)\n         metadata = LocalDispatchMetadata(\n             token_indices_experts_sorted_N=token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK=experts_sorted_row_indices_TK,\n         )\n         return routed_input_RD, num_local_tokens_per_expert_E, metadata\n \n@@ -150,21 +178,38 @@ def combine(\n         \"\"\"\n         # The scatter-add reads the expert outputs with bare ops.\n         remat.recompute_needs_tensor(routed_output_RD)\n-        return self._score_and_scatter_add(\n+        return self._score_and_combine(\n             routed_output_RD,\n             metadata.topk_scores_experts_sorted_N,\n             metadata.token_indices_experts_sorted_N,\n+            metadata.experts_sorted_row_indices_TK,\n             x_TD,\n         )\n \n-    def _score_and_scatter_add(\n+    @local_compile(\"moe_dispatch_combine\", batch_invariant=True)\n+    def _score_and_combine(\n         self,\n         routed_output_ND: torch.Tensor,\n         topk_scores_N: torch.Tensor,\n         token_indices_N: torch.Tensor,\n+        experts_sorted_row_indices_TK: torch.Tensor,\n         x_TD: torch.Tensor,\n     ) -> torch.Tensor:\n-        \"\"\"Weight expert-sorted outputs by their router scores and sum them per token.\"\"\"\n+        \"\"\"Weight expert-sorted outputs by their router scores and sum them per token.\n+\n+        Eager scales the rows and scatter-adds them by token. Compiled, each token\n+        gathers its K rows instead (``_SumTokenRows``): Inductor fuses the gathers,\n+        scaling and fp32 sum into one kernel, and the backward is a gather too.\n+        Eager keeps the scatter because the unfused gathers are slower. Both are\n+        deterministic.\n+        \"\"\"\n+        if torch.compiler.is_compiling():\n+            return _SumTokenRows.apply(\n+                routed_output_ND,\n+                topk_scores_N,\n+                token_indices_N,\n+                experts_sorted_row_indices_TK,\n+            )\n         # Type promotion computes the product in float32 without materializing a\n         # float32 copy of the routed output, which the multiply would save for\n         # backward (twice the bytes of the routed output itself).\n@@ -178,6 +223,92 @@ def _score_and_scatter_add(\n         )\n \n \n+def _sum_rows_per_token(\n+    rows_ND: torch.Tensor,\n+    experts_sorted_row_indices_TK: torch.Tensor,\n+    scores_N: torch.Tensor | None = None,\n+) -> torch.Tensor:\n+    \"\"\"Return ``out[t] = sum_k scores[r] * rows[r]`` with ``r = row_indices[t, k]``.\n+\n+    Accumulates in fp32 and returns ``rows_ND.dtype``.\n+    \"\"\"\n+    out_TD = rows_ND.new_zeros(\n+        experts_sorted_row_indices_TK.shape[0], rows_ND.shape[-1], dtype=torch.float32\n+    )\n+    # A Python loop over the static top-k unrolls into one fused gather kernel;\n+    # a sum over a [T, K, D] gather lowers to a strided reduction instead.\n+    for row_indices_T in experts_sorted_row_indices_TK.unbind(-1):\n+        row_TD = rows_ND[row_indices_T].float()\n+        if scores_N is not None:\n+            row_TD = row_TD * scores_N[row_indices_T, None]\n+        out_TD = out_TD + row_TD\n+    return out_TD.to(rows_ND.dtype)\n+\n+\n+class _GatherTokenRows(torch.autograd.Function):\n+    \"\"\"``x_TD[token_indices_N]`` whose backward gathers each token's K grads.\n+\n+    The default backward is an accumulating ``index_put`` (sort + scatter).\n+    \"\"\"\n+\n+    @staticmethod\n+    def forward(  # pyrefly: ignore[bad-override]\n+        ctx,\n+        x_TD: torch.Tensor,\n+        token_indices_experts_sorted_N: torch.Tensor,\n+        experts_sorted_row_indices_TK: torch.Tensor,\n+    ) -> torch.Tensor:\n+        ctx.save_for_backward(experts_sorted_row_indices_TK)\n+        return x_TD[token_indices_experts_sorted_N]\n+\n+    @staticmethod\n+    def backward(  # pyrefly: ignore[bad-override]\n+        ctx, grad_routed_input_ND: torch.Tensor\n+    ):\n+        (experts_sorted_row_indices_TK,) = ctx.saved_tensors\n+        grad_x_TD = _sum_rows_per_token(\n+            grad_routed_input_ND, experts_sorted_row_indices_TK\n+        )\n+        return grad_x_TD, None, None\n+\n+\n+class _SumTokenRows(torch.autograd.Function):\n+    \"\"\"Score-weighted sum of each token's K rows, with gather-only backward.\"\"\"\n+\n+    @staticmethod\n+    def forward(  # pyrefly: ignore[bad-override]\n+        ctx,\n+        routed_output_ND: torch.Tensor,\n+        topk_scores_experts_sorted_N: torch.Tensor,\n+        token_indices_experts_sorted_N: torch.Tensor,\n+        experts_sorted_row_indices_TK: torch.Tensor,\n+    ) -> torch.Tensor:\n+        ctx.save_for_backward(\n+            routed_output_ND,\n+            topk_scores_experts_sorted_N,\n+            token_indices_experts_sorted_N,\n+        )\n+        return _sum_rows_per_token(\n+            routed_output_ND,\n+            experts_sorted_row_indices_TK,\n+            topk_scores_experts_sorted_N,\n+        )\n+\n+    @staticmethod\n+    def backward(ctx, grad_out_TD: torch.Tensor):  # pyrefly: ignore[bad-override]\n+        (\n+            routed_output_ND,\n+            topk_scores_experts_sorted_N,\n+            token_indices_experts_sorted_N,\n+        ) = ctx.saved_tensors\n+        grad_out_ND = grad_out_TD[token_indices_experts_sorted_N].float()\n+        grad_routed_output_ND = (\n+            grad_out_ND * topk_scores_experts_sorted_N[:, None]\n+        ).to(routed_output_ND.dtype)\n+        grad_scores_N = (grad_out_ND * routed_output_ND.float()).sum(-1)\n+        return grad_routed_output_ND, grad_scores_N, None, None\n+\n+\n class BaseEPTokenDispatcher(LocalTokenDispatcher, ABC):\n     \"\"\"Base class for EP token dispatchers.\n \n@@ -417,6 +548,7 @@ def dispatch(\n             num_global_tokens_per_local_expert_e,\n             token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK,\n             permuted_indices,\n             input_splits,\n             output_splits,\n@@ -443,6 +575,7 @@ def dispatch(\n         metadata = AllToAllDispatchMetadata(\n             token_indices_experts_sorted_N=token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK=experts_sorted_row_indices_TK,\n             # Pre-permute shape: the all-to-all output, which padding\n             # dispatchers (TorchAO) may grow in _permute.\n             input_shape=torch.Size((sum(output_splits_list), x_TD.shape[-1])),\n@@ -473,6 +606,7 @@ def _dispatch(\n             routed_input_ND,\n             token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK,\n         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)\n \n         with maybe_set_sparse_mesh():\n@@ -527,6 +661,7 @@ def _dispatch(\n             num_global_tokens_per_local_expert_e,\n             token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK,\n             permuted_indices,\n             input_splits,\n             output_splits,\n@@ -625,6 +760,7 @@ def combine(\n             routed_output_RD,\n             metadata.topk_scores_experts_sorted_N,\n             metadata.token_indices_experts_sorted_N,\n+            metadata.experts_sorted_row_indices_TK,\n             metadata.permuted_indices,\n             metadata.input_shape,\n             metadata.input_splits,\n@@ -638,6 +774,7 @@ def _combine(\n         routed_output_RD: torch.Tensor,\n         topk_scores_experts_sorted_N: torch.Tensor,\n         token_indices_experts_sorted_N: torch.Tensor,\n+        experts_sorted_row_indices_TK: torch.Tensor,\n         permuted_indices: torch.Tensor,\n         input_shape: torch.Size,\n         input_splits: list[int],\n@@ -659,10 +796,11 @@ def _combine(\n             routed_output_RD = spmd.reinterpret_mesh(\n                 routed_output_RD, spmd.current_mesh()\n             )\n-        return self._score_and_scatter_add(\n+        return self._score_and_combine(\n             routed_output_RD,\n             topk_scores_experts_sorted_N,\n             token_indices_experts_sorted_N,\n+            experts_sorted_row_indices_TK,\n             x_TD,\n         )\n \n@@ -714,6 +852,7 @@ def dispatch(\n             routed_input_ND,\n             token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK,\n         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)\n \n         input_shape = routed_input_ND.shape\n@@ -726,6 +865,7 @@ def dispatch(\n         metadata = AllToAllDispatchMetadata(\n             token_indices_experts_sorted_N=token_indices_experts_sorted_N,\n             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,\n+            experts_sorted_row_indices_TK=experts_sorted_row_indices_TK,\n             input_shape=input_shape,\n             permuted_indices=permuted_indices,\n             # Unused in the EP=1 combine path (no all-to-all to reverse).\n@@ -757,10 +897,11 @@ def combine(\n             routed_output_RD, metadata.input_shape, metadata.permuted_indices\n         )\n \n-        return self._score_and_scatter_add(\n+        return self._score_and_combine(\n             routed_output_RD,\n             metadata.topk_scores_experts_sorted_N,\n             metadata.token_indices_experts_sorted_N,\n+            metadata.experts_sorted_row_indices_TK,\n             x_TD,\n         )\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e78177360432f7a88fcd2f0249cca2188bb69234/torchtitan%2Fmodels%2Fcommon%2Ftoken_dispatcher.py",
+      "sha": "d7d44cd37d57a3757e1aee6f80839ddaf39ade86",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e78177360432f7a88fcd2f0249cca2188bb69234/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py?ref=e78177360432f7a88fcd2f0249cca2188bb69234",
+      "deletions": 0,
+      "filename": "torchtitan/models/deepseek_v3/model.py",
+      "patch": "@@ -278,6 +278,7 @@ class Config(MTPDecoder.Config):\n                 \"loss\",\n                 \"fused_binary_activation\",\n                 \"fp32_to_bf16_split\",\n+                \"moe_dispatch_combine\",\n             ]\n         )\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e78177360432f7a88fcd2f0249cca2188bb69234/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "sha": "3b3137bc4e4d8ae922413457fd587b6a2b9846d8",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Follow-up after this lands: Muse Spark doesn't enable `moe_dispatch_combine` yet, so it needs a one-line addition to `MuseSparkModel.Config.local_compile_regions`. Measured on top of the Muse Spark stack (#5432-#5434), with #5164: 2-layer fwd+bwd at 4k, -4.6 ms (combine's fp32 score multiply over `[T*8, 4096]`, ~2.5 ms per 2 layers).\n",
+      "created_at": "2026-10-15T23:30:59Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5160#issuecomment-6204452868",
+      "id": 6204452868,
+      "updated_at": "2026-10-15T23:30:59Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Closing: replaced by the any-EP gather-sum training change plus a small change that turns its dispatch / combine regions on for DeepSeek-V3 and Kimi K3. One DeepSeek-V3 MoE layer, fwd + bwd at 16k tokens: −23%.",
+      "created_at": "2026-10-18T23:11:22Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5160#issuecomment-6256345932",
+      "id": 6256345932,
+      "updated_at": "2026-10-18T23:11:22Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5160,
+  "refs": {
+    "base": {
+      "commit": "4e0bccb8c9bdb90ad5d572b093b3043499e2df1a",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "e78177360432f7a88fcd2f0249cca2188bb69234",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": []
+}

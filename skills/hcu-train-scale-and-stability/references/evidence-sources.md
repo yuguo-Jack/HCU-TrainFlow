@@ -1,6 +1,6 @@
 # 排障的知识检索与源码查证
 
-诊断指南的参考复核日期：2026-10-12（HCU-Knowledge `4596fd436`）。以下 ID/路径属于独立的 **HCU-Knowledge**，不是本 Skill 安装目录；按 `$hcu-knowledge-search` 的 `workspace.json` 找实际 KB_ROOT。路径只是导航，最新索引与当前部署版本须另核对。不复制内部原始材料到公开 Skill，也不因查询触发全库更新。
+诊断指南的参考复核日期：2026-10-20（HCU-Knowledge `3829ef06e7c7`）。以下 ID/路径属于独立的 **HCU-Knowledge**，不是本 Skill 安装目录；按 `$hcu-knowledge-search` 的 `workspace.json` 找实际 KB_ROOT。路径只是导航，最新索引与当前部署版本须另核对。不复制内部原始材料到公开 Skill，也不因查询触发全库更新。未变的手册/固定测试继续复用，其原硬件验证日期不因本次阅读而刷新。
 
 ## 按问题查证
 
@@ -33,10 +33,12 @@ python -X utf8 <KB_ROOT>/kb.py --root <KB_ROOT> search-pr "graph proxy hang" --p
 | 数值偏差 | `dcu_probe-engineering-handbook`、`hcuprobe-hook-tensor-lifecycle`、`hcuprobe-cross-rank-first-diff` | 采集当时的 tensor、跨 rank 首次分歧、空匹配/缺 rank 的误判 |
 | RL 阶段阻塞/同步/恢复 | `verl-ppo-grpo-worker-chain`、`verl-weight-sync-checkpoint-lifecycle` | 按实际 worker/可选角色、权重传输 backend、sleep/wake 内存和保存完成状态追因，不只看 step 标签 |
 | 异步通信/graph 完成 | `torchcomms-async-functional-watchdog`、`pytorch-memory-stream-graph-lifecycle` | host 返回、设备完成、消费依赖和 watchdog 时间不同，按实际后端分支检查 |
+| 低精度通信或 EP 生命周期 | `aiter-int8-fp8-collective-contract`、`rocshmem-hcu-engineering`、`moonep-g1-contributor-capacity`、`ultraep-replica-gradient-lifecycle` | 位复制/数值 SUM/量化分别判读；provider、父仓固定依赖、plan/generation、清零副作用和真实消费 join |
+| 编译后同步、Graph 或版本回归 | `dcc-engineering-handbook`、`galaxy-engineering-handbook`、`triton-hcu-mls-pipeline-contract`、`tilelang-hcu-pass-ownership` | 编译器前端/所选后端/runtime/制品分开；memory scope 宏、同步 owner、event capture 限制及 launch ABI |
 | 性能/驻留与采集副作用 | `xprof-xcompute-workflow`、`hipprof-2610-metrics`、`infra-resource-critical-path` | 资源/依赖、指标层级和 replay 扰动，防止把采集伪影当硬件瓶颈 |
 | 容错和健康重入 | `cluster-manager-engineering-handbook`、`cluster-fault-taint-recovery`，以及 `knowledge/projects/primus-safe/` | 区分子工程/部署入口，检测、处置、重建和解除隔离的独立条件 |
 
-例：本次 KB 中 RCCL 总览对应 `80b1215701a8cb657c9ec5f2aab37cd8a7086727`，Cluster Manager 主题对应 `438847c1877cdce17cb524cb8825d49bd6917d6a`，hcuprobe 对应 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5`。这些用于说明参考快照，**不是工作流依赖锁或推荐部署版本**；现场另行固定。大库已记录的未合入 PR 与已部署的自定义分支分别检查。
+例：KB 保留的 RCCL 总览参考为 `80b1215701a8cb657c9ec5f2aab37cd8a7086727`，Cluster Manager 主题对应 `438847c1877cdce17cb524cb8825d49bd6917d6a`；hcuprobe 内部主来源仍为 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5`，新增可读公开参考 `de68655e9bd3a3678fd29889982135c473d25f94`。公开参考含更多包装器/接入资料，不能据此假定完全等价或已安装。其 `python/hcuprobe/tools/compare.py` 还存在旧 namespace 导入，实际以安装后的 `hcuprobe --help`、子命令及包路径核对，不复制历史包装器命令。核心 hook/异步快照/flush 与空匹配规则继续有效，元数据存在或退出0均不证明采集/比较完成。上述提交**不是工作流依赖锁或推荐部署版本**；现场另行固定。大库已记录的未合入 PR 与已部署的自定义分支分别检查。
 
 ## 公开官方补充
 

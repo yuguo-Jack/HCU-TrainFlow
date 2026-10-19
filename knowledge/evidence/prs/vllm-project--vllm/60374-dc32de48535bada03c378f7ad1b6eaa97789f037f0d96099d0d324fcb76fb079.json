@@ -1,0 +1,934 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "c7ae14ae717a8dc805f4e1be2e1f1d0317993fee9d44667687ed402f36d42a5e",
+      "isPrivate": false,
+      "numbers": [
+        60384,
+        60382,
+        60380,
+        60376,
+        60375,
+        60374,
+        60373,
+        60372
+      ],
+      "observed_at": "2026-10-19T19:24:04.628218+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4779,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "fc47cc8fff8282b7fa2b257468b8595f91a1a741",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Overview\n\nThis PR fixes two P2P data-plane failures and adds a reconnect backoff. Each part is its own commit (the backoff plus a follow-up that counts faults in its log, then a commit addressing review), so they can be reviewed, or split, independently:\n\n1. **Submission failures are reported to the fetching peer** (fixes #60204). A NIXL error raised while submitting a fetch's WRITE escaped to the session dispatcher, so the peer waited its full 30 s load timeout before recomputing.\n2. **Persistent NIXL faults end the session** (fixes #60205 together with #60279). A peer with a stale NIXL registration but a healthy control plane failed every WRITE for the rest of the process. This also answers @snadampal's review question on this PR about recovering the peer instead of fast-failing forever.\n3. **Reconnect backoff.** A peer that faults again right after each re-handshake backs off before the next reconnect, as the NixlConnector does for invalid peers.\n\n#61500 independently traces the same root cause in NIXL 1.5.0 for the NixlConnector's pull path: after one `REMOTE_DISCONNECT`, the UCX endpoint stays `FAILED` until the remote agent is re-added. Its production numbers show the before/after effect.\n\nReplaces #55553 (closed in favour of this, by @Etelis). Together with #60279 it covers #55181.\n\n## Claims\n\n**Commit 1 (transfer scope)**\n- An error from `make_prepped_xfer` / `transfer` takes the existing fail-fast path. The round fails, the peer gets `TransferDoneMsg(success=False)`, the store job fails at once, and the created handle is released.\n- `transfer()` returning `\"ERR\"` (how the bindings report a failed post) is a failed submission. Previously it was ignored and the handle parked inflight.\n- `on_fetch` no longer finalizes a round a second time after a failed submission. That raised `KeyError` in the store-first and finish-before-fetch orderings.\n\n**Commit 2 (escalation)**\n- `NixlTransport` classifies each NIXL failure in one place:\n  - `nixlRemoteDisconnectError` / `nixlNotFoundError` fault the peer at once.\n  - A `check_xfer_state` that raises faults the peer at once (commit 5). NIXL's binding raises for every error status (only `SUCCESS` / `IN_PROG` are returned), so a raise is how a failed WRITE is reported, e.g. `nixlBackendError` for a UCX error.\n  - Any other failure (a failed submission, or a transfer in state `\"ERR\"`) is a strike, and 3 consecutive strikes with no success between them fault the peer. Strikes from one `poll()` batch are applied after the batch is classified, so a `DONE` for the peer anywhere in it counts as the success between (commit 5).\n  - Only `nixlRemoteDisconnectError` ends a transfer whose state check raised. Any other raise keeps it inflight, because its WRITE may still be landing (#59790 measured bytes landing while the handle raised `nixlNotFoundError`); the peer fault and the drain cap below bound it.\n  - The fault is reported through a new `PollResult.peer_fault`.\n- After a fault, no new WRITE goes to that peer. Once its inflight WRITEs drain (capped at 10 s), the session sends `DisconnectMsg`. The existing reap then tears down both sides, and the next request re-registers them.\n- Every session death records a reason, and the manager's `peer X down (<reason>)` log reports it. Examples: `data plane: NIXL_ERR_REMOTE_DISCONNECT`, `protocol error: …`, `handshake timed out`, `lookup response timed out`, `control connection lost`.\n\n**Commits 3–4 (reconnect backoff)**\n- After reaping a session that ended on a data-plane fault, the faulting side records a per-peer backoff. The first fault reconnects at once. A repeat fault within 60 s of the previous wait expiring doubles the wait, from 1 s up to 60 s, as in the NixlConnector (#55471, #61500). Expiry is by time alone: no successful transfer is required, so a peer that is only idle for 60 s starts over at an immediate reconnect. Control-plane deaths don't back off.\n- During the wait, outbound connects to the peer are skipped, so lookups fall back to local prefill. An inbound connect from the peer gets `DisconnectMsg` and is closed, so the peer falls back at once instead of waiting for its handshake deadline. There is no protocol change.\n- The peer-down log carries a per-peer lifetime count of data-plane faults, e.g. `peer X down (data plane: …); data-plane fault #7; reconnect backoff 8s`. Unlike the backoff it never expires, so a peer that keeps faulting under traffic too sparse to escalate shows up as a rising count rather than as a series of unrelated faults.\n\n## Validation\n\n```\npytest tests/v1/kv_offload/tiering/p2p/ -q    # 308 passed (commit 1 alone: 281)\npytest tests/v1/kv_offload/tiering/ -q        # 554 passed, 12 skipped\npre-commit run --files <changed files>        # passed, incl. mypy\n```\n\n| Scenario | Before | After | Test |\n| --- | --- | --- | --- |\n| `transfer` / `make_prepped_xfer` raises, including when the release also fails | escapes to the dispatcher; no `TransferDoneMsg`; round stays alive | `None`, handle released, no inflight leak | `test_write_blocks_submission_exception_returns_failure` |\n| `transfer()` returns `\"ERR\"` | handle parked inflight | `None`, handle released | `test_write_blocks_transfer_err_status_returns_failure` |\n| Failed submit, store-first or finish-before-fetch | `KeyError` from double finalize | one finalize, one `TransferDoneMsg(False)` | `test_write_blocks_failure_finalizes_with_failure[*]`; fails without the `on_fetch` change |\n| 3 failed WRITEs to a peer whose control plane is healthy (#60205) | every later WRITE fails, session never ends | peer faulted → drain → `DisconnectMsg` → reap | `TestNixlPeerFaults`, `TestPeerFaultEscalation` |\n| `check_xfer_state` raises (`nixlBackendError`) while other WRITEs to the peer succeed | one strike, reset by the successes; transfer stays inflight for good: ~40 s consumer stall, pins and session held | peer faulted at once; transfer kept until it drains or the 10 s drain cap, then reaped | `test_raising_state_check_faults_the_peer_and_keeps_the_transfer`, `test_raise_faults_despite_a_success_in_the_batch` |\n| `check_xfer_state` raises `nixlNotFoundError` | peer faulted; transfer kept, warning on every poll | peer faulted; transfer kept (not terminal, per #59790); warns once | `test_not_found_state_check_keeps_the_transfer`, `test_not_found_in_cancel_keeps_the_transfer`, `test_raising_state_check_warns_once` |\n| strikes=2, one poll batch with `ERR` iterated before 3 `DONE`s | peer faulted, session torn down | strikes reset, no fault | `test_success_in_the_same_batch_prevents_the_fault`; fails on the previous code |\n| Fault while WRITEs are inflight | — | new rounds fail fast; disconnect only after the drain or the 10 s cap | `test_fault_waits_for_inflight_then_disconnects`, `test_fault_disconnects_after_drain_deadline` |\n| Peer faults again right after each re-handshake | reconnect, register and fail on every request | waits 0, 1, 2, 4 … 60 s; outbound skipped, inbound told to disconnect; resets 60 s after the last wait expires; the logged fault count keeps growing across the reset | `TestReconnectBackoff` |\n\n**End to end on real NIXL** (two H200 pods, PDConnector + P2P tier, Llama-3.2-1B, NIXL 1.5.0, commit dc2d0b94fc). Happy path in both proxy modes: correct output and a 95–96 % external prefix-cache hit rate (240 of 254 prompt tokens pulled per request). A persistent fault was then forced with a test-only hook (not in this PR) that makes the prefiller's `transfer()` return `\"ERR\"` while a flag file exists:\n- Every fetch failed fast: 20 consecutive requests finished in 1.6–2.3 s with correct output (recomputed locally), with no 30 s load timeout.\n- Each 3 strikes ended the session: prefiller `peer D down (data plane: 3 consecutive transfer failures …); data-plane fault #1 … #6`, decoder `peer P down (peer disconnected)`; both sides re-registered on the next request.\n- The backoff grew 0, 1, 2, 4, 8, 16 s; during the 8 s and 16 s waits the prefiller logged `rejecting inbound peer … (2.5s / 10.6s left)` and the decoder fell back at once.\n- After the flag was cleared, hits returned (240/254) on the fresh session, with no crash, `KeyError` or segfault on either side.\n\n**State-check faults, end to end** (same setup, commit a1cc819cb6). A second test-only hook makes the prefiller's `check_xfer_state` raise an exception named after the real binding class while a flag file exists. That is how NIXL 1.5.0 reports a failed WRITE: the binding raises for every error status.\n\n| Injected fault | Faulted request | Prefiller log | After clearing |\n| --- | --- | --- | --- |\n| every check raises `nixlBackendError` | 11.7–11.9 s, correct output (recomputed) | peer faulted on the first raise; `disconnecting once inflight transfers drain`; `peer D down (data plane: check_xfer_state raised nixlBackendError …)` exactly 10 s later; backoff 0, 1, 2 s over three faults | 240/254 hits |\n| every check raises `nixlNotFoundError` | 11.6–11.8 s, correct output | peer faulted (`NIXL_ERR_NOT_FOUND`); the transfer stays inflight (not terminal, per #59790) until the 10 s drain cap, then teardown | 256/256 hits |\n| one transfer keeps raising while all others succeed | 12.2 s for that request; the next two 1.8 s with 240/254 hits | one fault, teardown at the 10 s cap, reconnect 6 s later | 256/256 hits |\n\n- The last row is the case the previous revision left unbounded: its single strike was reset by the other successes, so the transfer stayed inflight for good, holding its pins and session. It is now torn down within the 10 s drain cap. Each faulted request costs the cap plus normal latency, versus an expected ~40 s (load timeout plus abort-ack timeout) before; that before-number was not measured.\n- One `check_xfer_state failed` warning per transfer, not one per poll.\n- One EngineCore per pod throughout; no crash, `KeyError` or segfault. Happy path afterwards in PD mode with the hook removed: 95.9 % hit rate.\n\nThese exercise faults that leave both processes alive. A genuinely restarted peer still can't be tested here: restarting either P2P peer segfaults the survivor in NIXL `loadRemoteMD`, a pre-existing problem (see #60205).\n\n## Details\n\n**Root cause (commit 1).** `_submit_transfer` fails fast only when `write_blocks` *returns* `None`. `NixlTransport.write_blocks` caught nothing, so a NIXL error reached `P2PSession._on_message`, which only logs. The dispatcher's disconnect-after-5-errors guard doesn't fire either, because successful messages in between reset its counter.\n\n**Root cause (commit 2).** Only control-plane signals can mark a peer dead: heartbeat, protocol error, handshake, registration, and lookup timeout (#56836). Data-plane failures were never an input. In #60205 the heartbeats and lookups stay healthy while NIXL's endpoints for the peer are stale.\n\n**Flow after a persistent fault (prefiller P writes into decoder D):**\n1. D sends `FetchMsg`. P's `write_blocks` fails, or `check_xfer_state` raises in `poll`. The round fails with `TransferDone(False)` and D recomputes.\n2. After 3 strikes, or one decisive error, P's `poll(D)` returns `peer_fault`. P's server role stops submitting, so later fetches from D fail fast.\n3. Once P's inflight WRITEs to D drain, P sends `DisconnectMsg` and marks the connection dead with reason `data plane: …`.\n4. P's manager reaps the session: it fails its jobs and calls `remove_remote_peer(D)`. D receives `DisconnectMsg` and runs the same reap for P.\n5. D's next request opens a new connection, `ConnectMsg` goes both ways, and both sides register fresh. The registration generation keeps a late async registration from reviving the old peer.\n\n**Design choice: one death path.** A data-plane fault ends a peer the same way a control-plane fault does. The transport never re-registers a peer in place. The alternative was `remove_remote_peer` after N failures, inside the transport. That tears down only one side: the session still believes the peer is registered, and the peer keeps *our* stale registration. It also cannot work for a restarted peer. Reusing the reap means no new teardown code.\n\n**Tradeoffs and limitations.**\n- A `check_xfer_state` that raises with anything but `REMOTE_DISCONNECT` stays inflight, as #59790 established: it isn't provably terminal, and its WRITE may still be landing. It faults the peer at once, so the session's 10 s drain cap bounds how long it can last. The cost is that one failed state check tears down a peer that is otherwise working (a re-handshake, plus the backoff if it repeats). Treating `nixlBackendError` / `nixlCancelledError` as terminal (the UCX request finished with an error) would avoid the drain wait, but needs evidence that NIXL's UCX backend reports a handle's error only once all of its requests are done; left for a follow-up.\n- The disconnect waits for inflight WRITEs because D frees their destination blocks on `DisconnectMsg`. The 10 s cap trades that guarantee for not hanging on a stuck transfer, the same exposure a heartbeat death has today.\n- The thresholds (3 strikes, 10 s drain, 1→60 s backoff) are conservative constants, not measured values. The backoff uses the NixlConnector's numbers.\n- The backoff forgets a peer by time, not by a successful transfer, matching the NixlConnector. Under sparse traffic a persistently broken peer therefore cycles at a 0 s backoff (3 fast-failing requests that recompute locally, plus one re-registration per cycle); the fault count in the log makes that visible. Requiring a success before forgetting would close the gap but needs a transport→manager success signal, and is better done for both connectors together.\n- Only the faulting side knows about the backoff. During the wait, the other peer still tries to connect on each new request and is turned away within one round trip; concurrent requests share the pending attempt. A retry-after hint in `DisconnectMsg` would remove that, at the cost of a protocol change.\n\n**Relation to other PRs.**\n- #59790 (merged) provides the sibling drain before `TransferDone(False)`; this PR builds on it.\n- #60279 (narrowed to `remove_remote_peer` teardown robustness) is complementary. Expect a one-line conflict in `remove_remote_peer` for whichever lands second.\n- #61500 (NixlConnector, pull mode) releases a peer after a failed read, with the same backoff. It touches no shared code. That connector's teardown is one-sided because only the decoder holds the remote registration; P2P registers both ways, so here both sides tear down.\n- #49632 marks any `check_xfer_state` raise as failed and releases the handle, which can free a handle whose WRITE is still landing. Here such a transfer stays inflight and is bounded by the escalation instead.\n\n**Changes since the previous revision.**\n- Rebased onto main, which now includes #59790, #56836 and #58168.\n- Dropped the `try/except` around `write_blocks` in `_submit_transfer`, and its test. The contract, now documented in `data/base.py`, is that transports don't raise for NIXL errors.\n- Added commits 2–5. Commit 4 adds the per-peer fault count to the peer-down log and corrects the description of when the backoff resets (time since the last wait expired, not time healthy); behaviour is unchanged. Commit 5 addresses review of `poll()`: strikes per batch, and any raising state check faults the peer (`NOT_FOUND` is deliberately not terminal; see the review thread).\n- About 330 source lines are added, comments and docstrings included: roughly 30 in commit 1, 190 in commit 2, 60 in commit 3, 20 in commit 4 and 30 in commit 5. Each commit stands alone, so the PR can be split along those lines if reviewers prefer.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n\n",
+      "changedFiles": 8,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-15T09:24:22Z",
+            "databaseId": 6188835115,
+            "updatedAt": "2026-10-15T09:24:22Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6188835115"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "❌ @liranschour, A reviewer with write access must run `/ci run`, approve the PR, or add the `ready` label first.\n\n<!-- vllm-ci-command:6188835115 -->",
+            "createdAt": "2026-10-15T09:26:01Z",
+            "databaseId": 6188865086,
+            "updatedAt": "2026-10-15T09:26:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6188865086"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ @liranschour, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-10-18T06:00:39Z",
+            "databaseId": 6246344130,
+            "updatedAt": "2026-10-18T06:00:39Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6246344130"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "orozery"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-18T06:00:50Z",
+            "databaseId": 6246345639,
+            "updatedAt": "2026-10-18T06:00:50Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6246345639"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #95664](https://buildkite.com/vllm/ci/builds/95664) for commit `94b3a091af0c`.",
+            "createdAt": "2026-10-18T06:01:09Z",
+            "databaseId": 6246348194,
+            "updatedAt": "2026-10-18T06:01:09Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6246348194"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-18T09:23:38Z",
+            "databaseId": 6248201647,
+            "updatedAt": "2026-10-18T09:23:38Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6248201647"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #95688](https://buildkite.com/vllm/ci/builds/95688) for commit `11e2d5cc5e5c`.",
+            "createdAt": "2026-10-18T09:23:57Z",
+            "databaseId": 6248204500,
+            "updatedAt": "2026-10-18T09:23:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6248204500"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "orozery"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-18T12:06:38Z",
+            "databaseId": 6249715041,
+            "updatedAt": "2026-10-18T12:06:38Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6249715041"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #95688](https://buildkite.com/vllm/ci/builds/95688).",
+            "createdAt": "2026-10-18T12:06:55Z",
+            "databaseId": 6249717718,
+            "updatedAt": "2026-10-18T12:06:55Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6249717718"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-18T12:56:22Z",
+            "databaseId": 6250177706,
+            "updatedAt": "2026-10-18T12:56:22Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6250177706"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #95710](https://buildkite.com/vllm/ci/builds/95710) for commit `212927ce437a`.",
+            "createdAt": "2026-10-18T12:56:41Z",
+            "databaseId": 6250180855,
+            "updatedAt": "2026-10-18T12:56:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6250180855"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-18T17:05:25Z",
+            "databaseId": 6252676007,
+            "updatedAt": "2026-10-18T17:05:25Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6252676007"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #95732](https://buildkite.com/vllm/ci/builds/95732) for commit `6e968a3ab4ea`.",
+            "createdAt": "2026-10-18T17:05:57Z",
+            "databaseId": 6252681507,
+            "updatedAt": "2026-10-18T17:05:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6252681507"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-19T06:56:19Z",
+            "databaseId": 6261537596,
+            "updatedAt": "2026-10-19T06:56:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6261537596"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #95847](https://buildkite.com/vllm/ci/builds/95847) for commit `a70688b07255`.",
+            "createdAt": "2026-10-19T06:57:00Z",
+            "databaseId": 6261547190,
+            "updatedAt": "2026-10-19T06:57:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6261547190"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXU3oLY=",
+          "hasNextPage": false
+        },
+        "totalCount": 15
+      },
+      "headRefOid": "a70688b07255fc0caeead992af1fca36e9a29671",
+      "headRepository": {
+        "nameWithOwner": "liranschour/vllm"
+      },
+      "mergeCommit": {
+        "oid": "4bd75e952a9f423742223c97c8cc9fc6db362950"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-19T14:31:51Z",
+      "number": 60374,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5440250832,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-07T09:22:28Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5440250832"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "snadampal"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "snadampal"
+                  },
+                  "body": "Since `_release_handles` only releases the per-transfer handle but the `_remote_dlists[peer_id]` and the remote agent will still be valid, so the next fetch may fail the same way. Would it make sense to call `remove_remote_peer` after N consecutive submission failures, so the peer's NIXL state is re-exchanged instead of staying stale? Or is permanent fast-fail the intended behavior here?",
+                  "createdAt": "2026-10-13T18:33:03Z",
+                  "databaseId": 4262524966,
+                  "diffHunk": "@@ -175,14 +176,28 @@ def write_blocks(\n             peer_id,\n             len(local_idxs),\n         )\n-        handle = self._agent.make_prepped_xfer(\n-            \"WRITE\",\n-            self._local_dlist,\n-            np.asarray(local_idxs, dtype=np.int32),\n-            remote_dlist,\n-            np.asarray(remote_idxs, dtype=np.int32),\n-        )\n-        self._agent.transfer(handle)\n+        local_arr = np.asarray(local_idxs, dtype=np.int32)\n+        remote_arr = np.asarray(remote_idxs, dtype=np.int32)\n+        handle = None\n+        try:\n+            handle = self._agent.make_prepped_xfer(\n+                \"WRITE\",\n+                self._local_dlist,\n+                local_arr,\n+                remote_dlist,\n+                remote_arr,\n+            )\n+            self._agent.transfer(handle)\n+        except Exception as exc:\n+            logger.warning(\n+                \"NixlTransport %s: write_blocks failed for peer=%s: %s\",\n+                self._agent_name,\n+                peer_id,\n+                exc,\n+            )\n+            if handle is not None:\n+                self._release_handles([handle])",
+                  "line": 403,
+                  "originalLine": 199,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+                  "updatedAt": "2026-10-13T18:33:19Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4262524966"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QxODozMzowM1rO_hD4Jg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5508213203,
+            "state": "CHANGES_REQUESTED",
+            "submittedAt": "2026-10-13T18:33:18Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5508213203"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "liranschour"
+                  },
+                  "body": "Thanks, good catch. The stale state is real, and permanent fast-fail isn't the intent. I've reworked the PR to handle it, but not by calling `remove_remote_peer` from inside the transport: that would tear down only this side. The session would still believe the peer is registered, and the peer would keep *our* stale registration.\n\nThe second commit (`5a2c650419`) instead has the transport classify and count, and the session react:\n\n- `NIXL_ERR_REMOTE_DISCONNECT` / `NIXL_ERR_NOT_FOUND`, or 3 consecutive transfer failures with no success between them, mark the peer faulted (`PollResult.peer_fault`).\n- The session stops submitting to that peer, waits for its inflight WRITEs to drain (capped at 10 s), sends `DisconnectMsg`, and marks the connection dead.\n- The existing reap then runs `remove_remote_peer` on both sides, and the next request re-handshakes with fresh registrations.\n\nSo a data-plane fault now ends a peer through the same path as a heartbeat or protocol failure, and there is no second recovery mechanism. The first commit is still just the submit-leg fix, so the two can be split if you'd prefer. The PR description has the details.\n",
+                  "createdAt": "2026-10-15T07:43:35Z",
+                  "databaseId": 4280357878,
+                  "diffHunk": "@@ -175,14 +176,28 @@ def write_blocks(\n             peer_id,\n             len(local_idxs),\n         )\n-        handle = self._agent.make_prepped_xfer(\n-            \"WRITE\",\n-            self._local_dlist,\n-            np.asarray(local_idxs, dtype=np.int32),\n-            remote_dlist,\n-            np.asarray(remote_idxs, dtype=np.int32),\n-        )\n-        self._agent.transfer(handle)\n+        local_arr = np.asarray(local_idxs, dtype=np.int32)\n+        remote_arr = np.asarray(remote_idxs, dtype=np.int32)\n+        handle = None\n+        try:\n+            handle = self._agent.make_prepped_xfer(\n+                \"WRITE\",\n+                self._local_dlist,\n+                local_arr,\n+                remote_dlist,\n+                remote_arr,\n+            )\n+            self._agent.transfer(handle)\n+        except Exception as exc:\n+            logger.warning(\n+                \"NixlTransport %s: write_blocks failed for peer=%s: %s\",\n+                self._agent_name,\n+                peer_id,\n+                exc,\n+            )\n+            if handle is not None:\n+                self._release_handles([handle])",
+                  "line": 403,
+                  "originalLine": 199,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+                  "updatedAt": "2026-10-15T07:43:35Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4280357878"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwNzo0MzozNVrO_yET9g==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5529757797,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T07:43:35Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5529757797"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "orozery"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "orozery"
+                  },
+                  "body": "Claude:\n\n    the strike reset is applied\n    inline during iteration, so a success in the same poll batch does not prevent a\n    fault that the batch's earlier failures trigger. This contradicts\n    data/base.py:62 and the _MAX_CONSECUTIVE_TRANSFER_FAILURES comment (\"with no\n    success between\"). Failure: peer has strikes=2 and 4 inflight transfers; one\n    poll sees ERR on the lowest tid and DONE on the other three. The ERR hits\n    strike 3 → _set_peer_fault; the three DONEs then pop _peer_strikes, but the\n    fault is sticky, so the session stops submitting, sends DisconnectMsg, and both\n    sides tear down and re-register (O(num_blocks) NIXL work) in the same tick that\n    3 of 4 WRITEs to that peer completed. Fix: classify the whole batch, reset\n    strikes if it contained any DONE, then count the failures.",
+                  "createdAt": "2026-10-15T10:49:04Z",
+                  "databaseId": 4282035407,
+                  "diffHunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.\n                     continue\n                 state = \"ERR\"\n             if state == \"DONE\":\n                 if done_ids is None:\n                     done_ids = []\n                 done_ids.append(transfer_id)\n+                self._peer_strikes.pop(entry.peer_id, None)\n             elif state not in (\"PROC\", \"PEND\"):\n                 if failed_ids is None:\n                     failed_ids = []\n                 failed_ids.append(transfer_id)\n+                if not entry.struck:\n+                    self._record_transfer_failure(entry.peer_id, f\"state {state}\")",
+                  "line": null,
+                  "originalLine": 436,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+                  "updatedAt": "2026-10-15T10:51:14Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4282035407"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "orozery"
+                  },
+                  "body": "Claude:\n\n    nixlNotFoundError from\n    check_xfer_state faults the peer immediately (_record_failure → _set_peer_fault)\n    but _is_remote_disconnect is False, so the transfer is kept inflight. Every later\n    poll re-raises, so it never drains: has_inflight_transfers stays true and the\n    session always waits the full _PEER_FAULT_DRAIN_S (10 s) before DisconnectMsg,\n    logging one WARNING per stuck transfer per engine step for that window\n    (~thousands of lines). #60205 reports NIXL_ERR_NOT_FOUND alongside\n    REMOTE_DISCONNECT, so this is the common shape, not an edge case. Since NOT_FOUND\n    is already judged decisive at peer scope, make it terminal at transfer scope too\n    — set state = \"ERR\" whenever _peer_fault_status(exc) is not None, not only for\n    REMOTE_DISCONNECT. The round then fails at once and the teardown is immediate.",
+                  "createdAt": "2026-10-15T10:50:36Z",
+                  "databaseId": 4282048638,
+                  "diffHunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.",
+                  "line": null,
+                  "originalLine": 423,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+                  "updatedAt": "2026-10-15T10:51:14Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4282048638"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQxMDo1MDozNlrO_zrgfg==",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5531922479,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T10:51:14Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5531922479"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "liranschour"
+                  },
+                  "body": "Agreed, fixed in 7bb0f96fb5. `poll()` now classifies the whole batch before touching strikes. A `DONE` for the peer anywhere in the batch resets its strikes, then the batch's failures count. `poll()` observes completions, not the order they happened in, so iteration order no longer decides the outcome. `test_success_in_the_same_batch_prevents_the_fault` is your scenario (strikes=2, the `ERR` iterated first, three `DONE`s); it fails on the previous code.\n\nOne deliberate edge: a batch with 3 or more failures still faults the peer even when it also holds a `DONE` (`test_batch_of_failures_still_faults_despite_a_success`). Order inside a batch can't be told, and three failures at once is enough on its own.\n\nWhile checking this I found that with NIXL 1.5.0 a failed WRITE never shows up as the `\"ERR\"` state. The binding's `getXferStatus` calls `throw_nixl_exception` on every error status, so the failure arrives as an exception (`nixlBackendError` for a UCX error). Those raises are now decisive (see the other thread), so in practice strikes come from failed submissions, and this fix keeps `poll()` consistent with the contract in `data/base.py` for transports that do report `\"ERR\"`.\n\n",
+                  "createdAt": "2026-10-15T12:45:39Z",
+                  "databaseId": 4283108191,
+                  "diffHunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.\n                     continue\n                 state = \"ERR\"\n             if state == \"DONE\":\n                 if done_ids is None:\n                     done_ids = []\n                 done_ids.append(transfer_id)\n+                self._peer_strikes.pop(entry.peer_id, None)\n             elif state not in (\"PROC\", \"PEND\"):\n                 if failed_ids is None:\n                     failed_ids = []\n                 failed_ids.append(transfer_id)\n+                if not entry.struck:\n+                    self._record_transfer_failure(entry.peer_id, f\"state {state}\")",
+                  "line": null,
+                  "originalLine": 436,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+                  "updatedAt": "2026-10-15T12:45:39Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4283108191"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQxMjo0NTozOVrO_0sLXw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5533297300,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T12:45:39Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5533297300"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "liranschour"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "liranschour"
+                  },
+                  "body": "Thanks, the symptom is real, but I fixed it differently, because making `NOT_FOUND` terminal reopens the hazard #59790 closed. #59790 measured a 512 MiB WRITE that kept landing after `remove_remote_agent` while its handle raised `nixlNotFoundError` (5/5 runs). If `NOT_FOUND` ends the transfer, the round fails with `TransferDone(False)` and D may reuse the destination blocks while those bytes are still arriving: silent KV corruption for another request. The 10 s drain is what gives such a WRITE time to land, so I'd rather keep it.\n\nWhat 7bb0f96fb5 does:\n- **Log spam:** a state check that keeps raising warns once, then logs at debug (`test_raising_state_check_warns_once`).\n- **`NOT_FOUND`:** still faults the peer at once and stays inflight. The session disconnects when the transfer drains or at the 10 s cap (`test_not_found_state_check_keeps_the_transfer`, `test_not_found_in_cancel_keeps_the_transfer`).\n- **A related gap this led me to:** the binding raises for every NIXL error status (`getXferStatus` → `throw_nixl_exception`; only `SUCCESS` and `IN_PROG` are returned). So any other raise, most commonly `nixlBackendError` for a UCX transport error, used to cost one strike and stay inflight. Successes to the same peer kept resetting that strike, so the transfer never drained. Its round stalled the consumer for about 40 s (load timeout plus abort-ack timeout), and its pins, handle and session were held for good. Now any raise faults the peer, so it's bounded by the same drain cap (`test_raising_state_check_faults_the_peer_and_keeps_the_transfer`, `test_raise_faults_despite_a_success_in_the_batch`). Only `nixlRemoteDisconnectError` still ends the transfer, as in #59790.\n\nThe cost is that one failed state check tears down a peer that is otherwise working: a re-handshake, plus the reconnect backoff if it repeats. The alternatives are a pin leak or a possible corruption, so that seemed the right side to err on. Making `BACKEND` / `CANCELED` terminal (the UCX request finished with an error) is plausible, but I couldn't confirm from NIXL's UCX backend that a handle reports an error only once all of its requests are done. I've left that for a follow-up with evidence.\n",
+                  "createdAt": "2026-10-15T12:45:42Z",
+                  "databaseId": 4283108610,
+                  "diffHunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.",
+                  "line": null,
+                  "originalLine": 423,
+                  "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+                  "updatedAt": "2026-10-15T12:45:42Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4283108610"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQxMjo0NTo0MlrO_0sNAg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5533297873,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T12:45:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5533297873"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "orozery"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5562924062,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-18T12:06:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5562924062"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xOFQxMjowNjo0N1q0MjAyNi0xMC0xOFQxMjowNjo0N1rPAAAAAUuTfB4=",
+          "hasNextPage": false
+        },
+        "totalCount": 7
+      },
+      "state": "MERGED",
+      "title": "[Bugfix][KV Offload][P2P] Report NIXL submission failures and escalate persistent faults to session teardown",
+      "updatedAt": "2026-10-19T14:31:51Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60374"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "fc47cc8fff8282b7fa2b257468b8595f91a1a741"
+    },
+    "body": "## Overview\n\nThis PR fixes two P2P data-plane failures and adds a reconnect backoff. Each part is its own commit (the backoff plus a follow-up that counts faults in its log, then a commit addressing review), so they can be reviewed, or split, independently:\n\n1. **Submission failures are reported to the fetching peer** (fixes #60204). A NIXL error raised while submitting a fetch's WRITE escaped to the session dispatcher, so the peer waited its full 30 s load timeout before recomputing.\n2. **Persistent NIXL faults end the session** (fixes #60205 together with #60279). A peer with a stale NIXL registration but a healthy control plane failed every WRITE for the rest of the process. This also answers @snadampal's review question on this PR about recovering the peer instead of fast-failing forever.\n3. **Reconnect backoff.** A peer that faults again right after each re-handshake backs off before the next reconnect, as the NixlConnector does for invalid peers.\n\n#61500 independently traces the same root cause in NIXL 1.5.0 for the NixlConnector's pull path: after one `REMOTE_DISCONNECT`, the UCX endpoint stays `FAILED` until the remote agent is re-added. Its production numbers show the before/after effect.\n\nReplaces #55553 (closed in favour of this, by @Etelis). Together with #60279 it covers #55181.\n\n## Claims\n\n**Commit 1 (transfer scope)**\n- An error from `make_prepped_xfer` / `transfer` takes the existing fail-fast path. The round fails, the peer gets `TransferDoneMsg(success=False)`, the store job fails at once, and the created handle is released.\n- `transfer()` returning `\"ERR\"` (how the bindings report a failed post) is a failed submission. Previously it was ignored and the handle parked inflight.\n- `on_fetch` no longer finalizes a round a second time after a failed submission. That raised `KeyError` in the store-first and finish-before-fetch orderings.\n\n**Commit 2 (escalation)**\n- `NixlTransport` classifies each NIXL failure in one place:\n  - `nixlRemoteDisconnectError` / `nixlNotFoundError` fault the peer at once.\n  - A `check_xfer_state` that raises faults the peer at once (commit 5). NIXL's binding raises for every error status (only `SUCCESS` / `IN_PROG` are returned), so a raise is how a failed WRITE is reported, e.g. `nixlBackendError` for a UCX error.\n  - Any other failure (a failed submission, or a transfer in state `\"ERR\"`) is a strike, and 3 consecutive strikes with no success between them fault the peer. Strikes from one `poll()` batch are applied after the batch is classified, so a `DONE` for the peer anywhere in it counts as the success between (commit 5).\n  - Only `nixlRemoteDisconnectError` ends a transfer whose state check raised. Any other raise keeps it inflight, because its WRITE may still be landing (#59790 measured bytes landing while the handle raised `nixlNotFoundError`); the peer fault and the drain cap below bound it.\n  - The fault is reported through a new `PollResult.peer_fault`.\n- After a fault, no new WRITE goes to that peer. Once its inflight WRITEs drain (capped at 10 s), the session sends `DisconnectMsg`. The existing reap then tears down both sides, and the next request re-registers them.\n- Every session death records a reason, and the manager's `peer X down (<reason>)` log reports it. Examples: `data plane: NIXL_ERR_REMOTE_DISCONNECT`, `protocol error: …`, `handshake timed out`, `lookup response timed out`, `control connection lost`.\n\n**Commits 3–4 (reconnect backoff)**\n- After reaping a session that ended on a data-plane fault, the faulting side records a per-peer backoff. The first fault reconnects at once. A repeat fault within 60 s of the previous wait expiring doubles the wait, from 1 s up to 60 s, as in the NixlConnector (#55471, #61500). Expiry is by time alone: no successful transfer is required, so a peer that is only idle for 60 s starts over at an immediate reconnect. Control-plane deaths don't back off.\n- During the wait, outbound connects to the peer are skipped, so lookups fall back to local prefill. An inbound connect from the peer gets `DisconnectMsg` and is closed, so the peer falls back at once instead of waiting for its handshake deadline. There is no protocol change.\n- The peer-down log carries a per-peer lifetime count of data-plane faults, e.g. `peer X down (data plane: …); data-plane fault #7; reconnect backoff 8s`. Unlike the backoff it never expires, so a peer that keeps faulting under traffic too sparse to escalate shows up as a rising count rather than as a series of unrelated faults.\n\n## Validation\n\n```\npytest tests/v1/kv_offload/tiering/p2p/ -q    # 308 passed (commit 1 alone: 281)\npytest tests/v1/kv_offload/tiering/ -q        # 554 passed, 12 skipped\npre-commit run --files <changed files>        # passed, incl. mypy\n```\n\n| Scenario | Before | After | Test |\n| --- | --- | --- | --- |\n| `transfer` / `make_prepped_xfer` raises, including when the release also fails | escapes to the dispatcher; no `TransferDoneMsg`; round stays alive | `None`, handle released, no inflight leak | `test_write_blocks_submission_exception_returns_failure` |\n| `transfer()` returns `\"ERR\"` | handle parked inflight | `None`, handle released | `test_write_blocks_transfer_err_status_returns_failure` |\n| Failed submit, store-first or finish-before-fetch | `KeyError` from double finalize | one finalize, one `TransferDoneMsg(False)` | `test_write_blocks_failure_finalizes_with_failure[*]`; fails without the `on_fetch` change |\n| 3 failed WRITEs to a peer whose control plane is healthy (#60205) | every later WRITE fails, session never ends | peer faulted → drain → `DisconnectMsg` → reap | `TestNixlPeerFaults`, `TestPeerFaultEscalation` |\n| `check_xfer_state` raises (`nixlBackendError`) while other WRITEs to the peer succeed | one strike, reset by the successes; transfer stays inflight for good: ~40 s consumer stall, pins and session held | peer faulted at once; transfer kept until it drains or the 10 s drain cap, then reaped | `test_raising_state_check_faults_the_peer_and_keeps_the_transfer`, `test_raise_faults_despite_a_success_in_the_batch` |\n| `check_xfer_state` raises `nixlNotFoundError` | peer faulted; transfer kept, warning on every poll | peer faulted; transfer kept (not terminal, per #59790); warns once | `test_not_found_state_check_keeps_the_transfer`, `test_not_found_in_cancel_keeps_the_transfer`, `test_raising_state_check_warns_once` |\n| strikes=2, one poll batch with `ERR` iterated before 3 `DONE`s | peer faulted, session torn down | strikes reset, no fault | `test_success_in_the_same_batch_prevents_the_fault`; fails on the previous code |\n| Fault while WRITEs are inflight | — | new rounds fail fast; disconnect only after the drain or the 10 s cap | `test_fault_waits_for_inflight_then_disconnects`, `test_fault_disconnects_after_drain_deadline` |\n| Peer faults again right after each re-handshake | reconnect, register and fail on every request | waits 0, 1, 2, 4 … 60 s; outbound skipped, inbound told to disconnect; resets 60 s after the last wait expires; the logged fault count keeps growing across the reset | `TestReconnectBackoff` |\n\n**End to end on real NIXL** (two H200 pods, PDConnector + P2P tier, Llama-3.2-1B, NIXL 1.5.0, commit dc2d0b94fc). Happy path in both proxy modes: correct output and a 95–96 % external prefix-cache hit rate (240 of 254 prompt tokens pulled per request). A persistent fault was then forced with a test-only hook (not in this PR) that makes the prefiller's `transfer()` return `\"ERR\"` while a flag file exists:\n- Every fetch failed fast: 20 consecutive requests finished in 1.6–2.3 s with correct output (recomputed locally), with no 30 s load timeout.\n- Each 3 strikes ended the session: prefiller `peer D down (data plane: 3 consecutive transfer failures …); data-plane fault #1 … #6`, decoder `peer P down (peer disconnected)`; both sides re-registered on the next request.\n- The backoff grew 0, 1, 2, 4, 8, 16 s; during the 8 s and 16 s waits the prefiller logged `rejecting inbound peer … (2.5s / 10.6s left)` and the decoder fell back at once.\n- After the flag was cleared, hits returned (240/254) on the fresh session, with no crash, `KeyError` or segfault on either side.\n\n**State-check faults, end to end** (same setup, commit a1cc819cb6). A second test-only hook makes the prefiller's `check_xfer_state` raise an exception named after the real binding class while a flag file exists. That is how NIXL 1.5.0 reports a failed WRITE: the binding raises for every error status.\n\n| Injected fault | Faulted request | Prefiller log | After clearing |\n| --- | --- | --- | --- |\n| every check raises `nixlBackendError` | 11.7–11.9 s, correct output (recomputed) | peer faulted on the first raise; `disconnecting once inflight transfers drain`; `peer D down (data plane: check_xfer_state raised nixlBackendError …)` exactly 10 s later; backoff 0, 1, 2 s over three faults | 240/254 hits |\n| every check raises `nixlNotFoundError` | 11.6–11.8 s, correct output | peer faulted (`NIXL_ERR_NOT_FOUND`); the transfer stays inflight (not terminal, per #59790) until the 10 s drain cap, then teardown | 256/256 hits |\n| one transfer keeps raising while all others succeed | 12.2 s for that request; the next two 1.8 s with 240/254 hits | one fault, teardown at the 10 s cap, reconnect 6 s later | 256/256 hits |\n\n- The last row is the case the previous revision left unbounded: its single strike was reset by the other successes, so the transfer stayed inflight for good, holding its pins and session. It is now torn down within the 10 s drain cap. Each faulted request costs the cap plus normal latency, versus an expected ~40 s (load timeout plus abort-ack timeout) before; that before-number was not measured.\n- One `check_xfer_state failed` warning per transfer, not one per poll.\n- One EngineCore per pod throughout; no crash, `KeyError` or segfault. Happy path afterwards in PD mode with the hook removed: 95.9 % hit rate.\n\nThese exercise faults that leave both processes alive. A genuinely restarted peer still can't be tested here: restarting either P2P peer segfaults the survivor in NIXL `loadRemoteMD`, a pre-existing problem (see #60205).\n\n## Details\n\n**Root cause (commit 1).** `_submit_transfer` fails fast only when `write_blocks` *returns* `None`. `NixlTransport.write_blocks` caught nothing, so a NIXL error reached `P2PSession._on_message`, which only logs. The dispatcher's disconnect-after-5-errors guard doesn't fire either, because successful messages in between reset its counter.\n\n**Root cause (commit 2).** Only control-plane signals can mark a peer dead: heartbeat, protocol error, handshake, registration, and lookup timeout (#56836). Data-plane failures were never an input. In #60205 the heartbeats and lookups stay healthy while NIXL's endpoints for the peer are stale.\n\n**Flow after a persistent fault (prefiller P writes into decoder D):**\n1. D sends `FetchMsg`. P's `write_blocks` fails, or `check_xfer_state` raises in `poll`. The round fails with `TransferDone(False)` and D recomputes.\n2. After 3 strikes, or one decisive error, P's `poll(D)` returns `peer_fault`. P's server role stops submitting, so later fetches from D fail fast.\n3. Once P's inflight WRITEs to D drain, P sends `DisconnectMsg` and marks the connection dead with reason `data plane: …`.\n4. P's manager reaps the session: it fails its jobs and calls `remove_remote_peer(D)`. D receives `DisconnectMsg` and runs the same reap for P.\n5. D's next request opens a new connection, `ConnectMsg` goes both ways, and both sides register fresh. The registration generation keeps a late async registration from reviving the old peer.\n\n**Design choice: one death path.** A data-plane fault ends a peer the same way a control-plane fault does. The transport never re-registers a peer in place. The alternative was `remove_remote_peer` after N failures, inside the transport. That tears down only one side: the session still believes the peer is registered, and the peer keeps *our* stale registration. It also cannot work for a restarted peer. Reusing the reap means no new teardown code.\n\n**Tradeoffs and limitations.**\n- A `check_xfer_state` that raises with anything but `REMOTE_DISCONNECT` stays inflight, as #59790 established: it isn't provably terminal, and its WRITE may still be landing. It faults the peer at once, so the session's 10 s drain cap bounds how long it can last. The cost is that one failed state check tears down a peer that is otherwise working (a re-handshake, plus the backoff if it repeats). Treating `nixlBackendError` / `nixlCancelledError` as terminal (the UCX request finished with an error) would avoid the drain wait, but needs evidence that NIXL's UCX backend reports a handle's error only once all of its requests are done; left for a follow-up.\n- The disconnect waits for inflight WRITEs because D frees their destination blocks on `DisconnectMsg`. The 10 s cap trades that guarantee for not hanging on a stuck transfer, the same exposure a heartbeat death has today.\n- The thresholds (3 strikes, 10 s drain, 1→60 s backoff) are conservative constants, not measured values. The backoff uses the NixlConnector's numbers.\n- The backoff forgets a peer by time, not by a successful transfer, matching the NixlConnector. Under sparse traffic a persistently broken peer therefore cycles at a 0 s backoff (3 fast-failing requests that recompute locally, plus one re-registration per cycle); the fault count in the log makes that visible. Requiring a success before forgetting would close the gap but needs a transport→manager success signal, and is better done for both connectors together.\n- Only the faulting side knows about the backoff. During the wait, the other peer still tries to connect on each new request and is turned away within one round trip; concurrent requests share the pending attempt. A retry-after hint in `DisconnectMsg` would remove that, at the cost of a protocol change.\n\n**Relation to other PRs.**\n- #59790 (merged) provides the sibling drain before `TransferDone(False)`; this PR builds on it.\n- #60279 (narrowed to `remove_remote_peer` teardown robustness) is complementary. Expect a one-line conflict in `remove_remote_peer` for whichever lands second.\n- #61500 (NixlConnector, pull mode) releases a peer after a failed read, with the same backoff. It touches no shared code. That connector's teardown is one-sided because only the decoder holds the remote registration; P2P registers both ways, so here both sides tear down.\n- #49632 marks any `check_xfer_state` raise as failed and releases the handle, which can free a handle whose WRITE is still landing. Here such a transfer stays inflight and is bounded by the escalation instead.\n\n**Changes since the previous revision.**\n- Rebased onto main, which now includes #59790, #56836 and #58168.\n- Dropped the `try/except` around `write_blocks` in `_submit_transfer`, and its test. The contract, now documented in `data/base.py`, is that transports don't raise for NIXL errors.\n- Added commits 2–5. Commit 4 adds the per-peer fault count to the peer-down log and corrects the description of when the backoff resets (time since the last wait expired, not time healthy); behaviour is unchanged. Commit 5 addresses review of `poll()`: strikes per batch, and any raising state check faults the peer (`NOT_FOUND` is deliberately not terminal; see the review thread).\n- About 330 source lines are added, comments and docstrings included: roughly 30 in commit 1, 190 in commit 2, 60 in commit 3, 20 in commit 4 and 30 in commit 5. Each commit stands alone, so the PR can be split along those lines if reviewers prefer.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n\n",
+    "changed_files": 8,
+    "head": {
+      "repo": {
+        "full_name": "liranschour/vllm"
+      },
+      "sha": "a70688b07255fc0caeead992af1fca36e9a29671"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60374",
+    "merge_commit_sha": "4bd75e952a9f423742223c97c8cc9fc6db362950",
+    "merged": true,
+    "merged_at": "2026-10-19T14:31:51Z",
+    "number": 60374,
+    "state": "closed",
+    "title": "[Bugfix][KV Offload][P2P] Report NIXL submission failures and escalate persistent faults to session teardown",
+    "updated_at": "2026-10-19T14:31:51Z"
+  },
+  "files": [
+    {
+      "additions": 256,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_data_transport.py",
+      "changes": 256,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_data_transport.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 0,
+      "filename": "tests/v1/kv_offload/tiering/p2p/test_data_transport.py",
+      "patch": "@@ -187,6 +187,48 @@ def test_write_blocks_returns_transfer_id(self):\n         assert tid is not None\n         assert isinstance(tid, int)\n \n+    @pytest.mark.parametrize(\n+        \"failure_method,release_fails\",\n+        [\n+            (\"make_prepped_xfer\", False),\n+            (\"transfer\", False),\n+            (\"transfer\", True),\n+        ],\n+    )\n+    def test_write_blocks_submission_exception_returns_failure(\n+        self, failure_method, release_fails\n+    ):\n+        \"\"\"Setup failures surface even if releasing a created handle also fails.\"\"\"\n+        transport = self._make_transport()\n+        transport.add_remote_peer(\"peer:1\", b\"meta\", 0x1000, 8, 1024)\n+        agent = transport._agent\n+        getattr(agent, failure_method).side_effect = RuntimeError(\"submission failed\")\n+        if release_fails:\n+            agent.release_xfer_handle.side_effect = RuntimeError(\"release failed\")\n+\n+        assert transport.write_blocks(\"peer:1\", [0], [1]) is None\n+        assert not transport._inflight\n+        assert transport.poll() == PollResult(done=(), failed=())\n+        if failure_method == \"make_prepped_xfer\":\n+            agent.transfer.assert_not_called()\n+            agent.release_xfer_handle.assert_not_called()\n+        else:\n+            agent.release_xfer_handle.assert_called_once_with(\n+                agent.make_prepped_xfer.return_value\n+            )\n+\n+    def test_write_blocks_transfer_err_status_returns_failure(self):\n+        \"\"\"transfer() reports a failed post as \"ERR\" instead of raising.\"\"\"\n+        transport = self._make_transport()\n+        transport.add_remote_peer(\"peer:1\", b\"meta\", 0x1000, 8, 1024)\n+        transport._agent.transfer.return_value = \"ERR\"\n+\n+        assert transport.write_blocks(\"peer:1\", [0], [1]) is None\n+        assert not transport._inflight\n+        transport._agent.release_xfer_handle.assert_called_once_with(\n+            transport._agent.make_prepped_xfer.return_value\n+        )\n+\n     def test_write_blocks_increments_transfer_id(self):\n         \"\"\"Each write_blocks call gets a unique transfer_id.\"\"\"\n         transport = self._make_transport()\n@@ -503,6 +545,220 @@ def test_close_releases_everything(self):\n         assert transport._remote_dlists == {}\n \n \n+# ---------------------------------------------------------------------------\n+# Failure escalation: transfer scope vs peer scope\n+# ---------------------------------------------------------------------------\n+\n+\n+class nixlNotFoundError(Exception):  # noqa: N801\n+    \"\"\"Stand-in for NIXL's binding exception of the same name.\"\"\"\n+\n+\n+class nixlBackendError(Exception):  # noqa: N801\n+    \"\"\"Stand-in for NIXL's binding exception of the same name: what a failed\n+    UCX transfer raises from check_xfer_state (the bindings raise for every\n+    NIXL error status rather than return \"ERR\").\"\"\"\n+\n+\n+class TestNixlPeerFaults:\n+    \"\"\"The transport classifies each failure and reports a peer fault.\n+\n+    See \"Failure model\" in data/base.py: a peer-scope NIXL error faults the\n+    peer at once; transfer-scope failures fault it only after\n+    _MAX_CONSECUTIVE_TRANSFER_FAILURES of them with no success between.\n+    \"\"\"\n+\n+    def _make_transport(self) -> NixlTransport:\n+        transport = TestNixlTransportWithMockedAgent()._make_transport()\n+        transport.add_remote_peer(\"peer:1\", b\"meta\", 0x1000, 8, 1024)\n+        transport.add_remote_peer(\"peer:2\", b\"meta\", 0x2000, 8, 1024)\n+        return transport\n+\n+    def _fail_one(self, transport: NixlTransport, peer_id: str = \"peer:1\"):\n+        \"\"\"One transfer reported in state \"ERR\": the transport contract's\n+        transfer-scope failure (NIXL 1.5.0 raises instead; see below).\"\"\"\n+        tid = transport.write_blocks(peer_id, [0], [1])\n+        transport._agent.check_xfer_state.return_value = \"ERR\"\n+        result = transport.poll(peer_id=peer_id)\n+        assert tid in result.failed\n+        return result\n+\n+    def test_consecutive_transfer_failures_fault_the_peer(self):\n+        transport = self._make_transport()\n+        assert self._fail_one(transport).peer_fault is None\n+        assert self._fail_one(transport).peer_fault is None\n+        fault = self._fail_one(transport).peer_fault\n+        assert fault is not None and \"3 consecutive\" in fault\n+        # Reported on every scoped poll, even with nothing inflight, and\n+        # never on a sibling's or the unscoped poll.\n+        assert transport.poll(peer_id=\"peer:1\").peer_fault == fault\n+        assert transport.poll(peer_id=\"peer:2\").peer_fault is None\n+        assert transport.poll().peer_fault is None\n+\n+    def test_success_resets_the_strike_count(self):\n+        transport = self._make_transport()\n+        self._fail_one(transport)\n+        self._fail_one(transport)\n+        transport.write_blocks(\"peer:1\", [0], [1])\n+        transport._agent.check_xfer_state.return_value = \"DONE\"\n+        transport.poll(peer_id=\"peer:1\")\n+        self._fail_one(transport)\n+        assert self._fail_one(transport).peer_fault is None\n+\n+    def test_strikes_are_per_peer(self):\n+        transport = self._make_transport()\n+        self._fail_one(transport, \"peer:1\")\n+        self._fail_one(transport, \"peer:2\")\n+        self._fail_one(transport, \"peer:1\")\n+        assert self._fail_one(transport, \"peer:2\").peer_fault is None\n+\n+    def test_remote_disconnect_faults_at_once(self):\n+        transport = self._make_transport()\n+        tid = transport.write_blocks(\"peer:1\", [0], [1])\n+        transport._agent.check_xfer_state.side_effect = _remote_disconnect()\n+        result = transport.poll(peer_id=\"peer:1\")\n+        assert tid in result.failed\n+        assert result.peer_fault == \"NIXL_ERR_REMOTE_DISCONNECT\"\n+\n+    def test_remote_disconnect_in_cancel_faults_the_peer(self):\n+        transport = self._make_transport()\n+        tid = transport.write_blocks(\"peer:1\", [0], [1])\n+        transport._agent.check_xfer_state.side_effect = _remote_disconnect()\n+        assert transport.cancel([tid], mode=\"wait\") == []\n+        transport._agent.check_xfer_state.side_effect = None\n+        fault = transport.poll(peer_id=\"peer:1\").peer_fault\n+        assert fault == \"NIXL_ERR_REMOTE_DISCONNECT\"\n+\n+    def test_submit_not_found_faults_at_once(self):\n+        transport = self._make_transport()\n+        transport._agent.make_prepped_xfer.side_effect = nixlNotFoundError(\n+            \"NIXL_ERR_NOT_FOUND\"\n+        )\n+        assert transport.write_blocks(\"peer:1\", [0], [1]) is None\n+        assert transport._inflight == {}\n+        fault = transport.poll(peer_id=\"peer:1\").peer_fault\n+        assert fault == \"NIXL_ERR_NOT_FOUND\"\n+\n+    def test_failed_submissions_fault_the_peer(self):\n+        transport = self._make_transport()\n+        transport._agent.transfer.side_effect = RuntimeError(\"post failed\")\n+        for _ in range(2):\n+            assert transport.write_blocks(\"peer:1\", [0], [1]) is None\n+            assert transport.poll(peer_id=\"peer:1\").peer_fault is None\n+        assert transport.write_blocks(\"peer:1\", [0], [1]) is None\n+        assert transport.poll(peer_id=\"peer:1\").peer_fault is not None\n+\n+    def test_raising_state_check_faults_the_peer_and_keeps_the_transfer(self):\n+        \"\"\"A failed transfer's state check raises. The WRITE may still be\n+        landing, so the transfer stays inflight, but its peer is faulted at\n+        once: strikes could be reset by other successes forever.\"\"\"\n+        transport = self._make_transport()\n+        tid = transport.write_blocks(\"peer:1\", [0], [1])\n+        transport._agent.check_xfer_state.side_effect = nixlBackendError(\n+            \"NIXL_ERR_BACKEND\"\n+        )\n+        for _ in range(3):\n+            result = transport.poll(peer_id=\"peer:1\")\n+            assert result.failed == ()\n+            assert result.peer_fault == (\n+                \"check_xfer_state raised nixlBackendError: NIXL_ERR_BACKEND\"\n+            )\n+        assert tid in transport._inflight\n+        assert transport.poll(peer_id=\"peer:2\").peer_fault is None\n+\n+    def test_raise_faults_despite_a_success_in_the_batch(self):\n+        transport = self._make_transport()\n+        self._distinct_handles(\n+            transport, [\"DONE\", nixlBackendError(\"NIXL_ERR_BACKEND\"), \"DONE\"]\n+        )\n+        result = transport.poll(peer_id=\"peer:1\")\n+        assert len(result.done) == 2\n+        assert result.peer_fault is not None\n+\n+    def _distinct_handles(self, transport: NixlTransport, states: list):\n+        \"\"\"Submit one transfer per entry in *states* to peer:1; each one's\n+        check_xfer_state returns (or raises) its entry. Returns the tids.\"\"\"\n+        handles = [object() for _ in states]\n+        transport._agent.make_prepped_xfer.side_effect = handles\n+        tids = [transport.write_blocks(\"peer:1\", [0], [1]) for _ in states]\n+        by_handle = dict(zip(map(id, handles), states))\n+\n+        def check(handle):\n+            state = by_handle[id(handle)]\n+            if isinstance(state, Exception):\n+                raise state\n+            return state\n+\n+        transport._agent.check_xfer_state.side_effect = check\n+        return tids\n+\n+    def test_success_in_the_same_batch_prevents_the_fault(self):\n+        \"\"\"A DONE in the batch that also holds the failure reaching the\n+        threshold resets the strikes first, whatever the iteration order.\"\"\"\n+        transport = self._make_transport()\n+        self._fail_one(transport)\n+        self._fail_one(transport)\n+        # The ERR is the oldest transfer, so it is iterated first.\n+        tids = self._distinct_handles(transport, [\"ERR\", \"DONE\", \"DONE\", \"DONE\"])\n+        result = transport.poll(peer_id=\"peer:1\")\n+        assert result.failed == [tids[0]]\n+        assert sorted(result.done) == sorted(tids[1:])\n+        assert result.peer_fault is None\n+        assert transport._peer_strikes == {\"peer:1\": 1}\n+\n+    def test_batch_of_failures_still_faults_despite_a_success(self):\n+        transport = self._make_transport()\n+        self._distinct_handles(transport, [\"ERR\", \"ERR\", \"ERR\", \"DONE\"])\n+        assert transport.poll(peer_id=\"peer:1\").peer_fault is not None\n+\n+    def test_not_found_state_check_keeps_the_transfer(self):\n+        \"\"\"#59790 measured a WRITE still landing while its handle raised\n+        NOT_FOUND, so NOT_FOUND faults the peer but is not terminal.\"\"\"\n+        transport = self._make_transport()\n+        tid = transport.write_blocks(\"peer:1\", [0], [1])\n+        transport._agent.check_xfer_state.side_effect = nixlNotFoundError(\n+            \"NIXL_ERR_NOT_FOUND\"\n+        )\n+        result = transport.poll(peer_id=\"peer:1\")\n+        assert result.failed == ()\n+        assert result.peer_fault == \"NIXL_ERR_NOT_FOUND\"\n+        assert tid in transport._inflight\n+\n+    def test_not_found_in_cancel_keeps_the_transfer(self):\n+        transport = self._make_transport()\n+        tid = transport.write_blocks(\"peer:1\", [0], [1])\n+        transport._agent.check_xfer_state.side_effect = nixlNotFoundError(\n+            \"NIXL_ERR_NOT_FOUND\"\n+        )\n+        assert transport.cancel([tid], mode=\"wait\") == [tid]\n+        assert tid in transport._inflight\n+        transport._agent.check_xfer_state.side_effect = None\n+        assert transport.poll(peer_id=\"peer:1\").peer_fault == \"NIXL_ERR_NOT_FOUND\"\n+\n+    def test_raising_state_check_warns_once(self, monkeypatch):\n+        warnings: list[str] = []\n+        monkeypatch.setattr(\n+            nixl_module.logger, \"warning\", lambda msg, *a, **k: warnings.append(msg)\n+        )\n+        transport = self._make_transport()\n+        transport.write_blocks(\"peer:1\", [0], [1])\n+        transport._agent.check_xfer_state.side_effect = nixlBackendError(\n+            \"NIXL_ERR_BACKEND\"\n+        )\n+        for _ in range(5):\n+            transport.poll(peer_id=\"peer:1\")\n+        assert sum(\"check_xfer_state failed\" in w for w in warnings) == 1\n+\n+    def test_remove_remote_peer_clears_the_fault(self):\n+        transport = self._make_transport()\n+        for _ in range(3):\n+            self._fail_one(transport)\n+        transport.remove_remote_peer(\"peer:1\")\n+        transport.add_remote_peer(\"peer:1\", b\"meta\", 0x1000, 8, 1024)\n+        assert transport.poll(peer_id=\"peer:1\").peer_fault is None\n+        assert self._fail_one(transport).peer_fault is None\n+\n+\n # ---------------------------------------------------------------------------\n # NIXL agent-config selection\n # ---------------------------------------------------------------------------",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_data_transport.py",
+      "sha": "74a4b11938f61378751140e6591436b5dc639644",
+      "status": "modified"
+    },
+    {
+      "additions": 121,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_manager.py",
+      "changes": 121,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_manager.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 0,
+      "filename": "tests/v1/kv_offload/tiering/p2p/test_manager.py",
+      "patch": "@@ -32,6 +32,7 @@\n from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager\n from vllm.v1.kv_offload.tiering.p2p import manager as manager_module\n from vllm.v1.kv_offload.tiering.p2p.manager import (\n+    _RECONNECT_MAX_BACKOFF_S,\n     _UNBOUND_STORE_TIMEOUT_S,\n     P2PSecondaryTierManager,\n     _annotate_req_context,\n@@ -43,6 +44,7 @@\n     StoreResult,\n )\n from vllm.v1.kv_offload.tiering.p2p.session.client import _LOOKUP_TIMEOUT_S\n+from vllm.v1.kv_offload.tiering.p2p.session.protocol import TYPE_KEY, DisconnectMsg\n \n # ---------------------------------------------------------------------------\n # Helpers\n@@ -124,6 +126,8 @@ def _make_manager() -> P2PSecondaryTierManager:\n     mgr._finished_jobs = []\n     mgr._failed_req_ids = set()\n     mgr._sessions = {}\n+    mgr._reconnect_backoff = {}\n+    mgr._data_plane_faults = {}\n     mgr._kv_to_session = {}\n     mgr._unbound_stores = {}\n     mgr._reaped_stores = {}\n@@ -722,6 +726,8 @@ def __init__(\n         self.alive = alive\n         self.connected = connected\n         self.ready = True\n+        self.death_reason = \"control connection lost\"\n+        self.data_plane_fault: str | None = None\n         self._loads = loads or []\n         self._stores = stores or []\n         self._new_fetch_ids = new_fetch_ids or []\n@@ -2301,3 +2307,118 @@ def test_disabled_when_zero(self, monkeypatch):\n \n         mgr._reap_idle_sessions()\n         assert \"old:1\" in mgr._sessions\n+\n+\n+# ---------------------------------------------------------------------------\n+# Reconnect backoff after a data-plane fault\n+# ---------------------------------------------------------------------------\n+\n+\n+class TestReconnectBackoff:\n+    \"\"\"A peer whose session ended on a data-plane fault reconnects at once the\n+    first time; repeats back off from 1 s up to _RECONNECT_MAX_BACKOFF_S.\"\"\"\n+\n+    PEER = \"10.0.0.1:8000\"\n+\n+    def _reap(self, mgr: P2PSecondaryTierManager, fault: str | None) -> None:\n+        class FakeData:\n+            def remove_remote_peer(self, pid):\n+                pass\n+\n+        mgr._data = FakeData()  # type: ignore[assignment]\n+        session = _FakeSession(peer_id=self.PEER, alive=False, connected=True)\n+        session.data_plane_fault = fault\n+        mgr._sessions[self.PEER] = session  # type: ignore[assignment]\n+        mgr._reap_dead_sessions()\n+\n+    def test_backoff_doubles_up_to_max(self):\n+        mgr = _make_manager()\n+        waits = []\n+        for _ in range(9):\n+            self._reap(mgr, \"NIXL_ERR_REMOTE_DISCONNECT\")\n+            waits.append(mgr._reconnect_backoff[self.PEER][0])\n+        assert waits == [0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]\n+        assert waits[-1] == _RECONNECT_MAX_BACKOFF_S\n+\n+    def test_first_fault_reconnects_at_once(self):\n+        mgr = _make_manager()\n+        self._reap(mgr, \"NIXL_ERR_REMOTE_DISCONNECT\")\n+        assert mgr._reconnect_wait(self.PEER) <= 0\n+\n+    def test_control_plane_death_does_not_back_off(self):\n+        mgr = _make_manager()\n+        for _ in range(3):\n+            self._reap(mgr, None)\n+        assert self.PEER not in mgr._reconnect_backoff\n+\n+    def test_healthy_peer_resets_backoff(self):\n+        mgr = _make_manager()\n+        self._reap(mgr, \"fault\")\n+        self._reap(mgr, \"fault\")\n+        backoff, _ = mgr._reconnect_backoff[self.PEER]\n+        assert backoff == 1.0\n+        # The previous wait then expired more than the max ago (no fault\n+        # since; no successful transfer is required).\n+        mgr._reconnect_backoff[self.PEER] = (\n+            backoff,\n+            time.monotonic() - _RECONNECT_MAX_BACKOFF_S - 1.0,\n+        )\n+        self._reap(mgr, \"fault\")\n+        assert mgr._reconnect_backoff[self.PEER][0] == 0.0\n+\n+    def test_peer_down_log_counts_faults_across_backoff_reset(self, monkeypatch):\n+        warnings: list[str] = []\n+\n+        def record_warning(msg, *args, **_kwargs):\n+            warnings.append(msg % args if args else msg)\n+\n+        monkeypatch.setattr(manager_module.logger, \"warning\", record_warning)\n+        mgr = _make_manager()\n+        self._reap(mgr, \"fault\")\n+        self._reap(mgr, \"fault\")\n+        # Let the backoff expire: the count must keep growing regardless.\n+        backoff, _ = mgr._reconnect_backoff[self.PEER]\n+        mgr._reconnect_backoff[self.PEER] = (\n+            backoff,\n+            time.monotonic() - _RECONNECT_MAX_BACKOFF_S - 1.0,\n+        )\n+        self._reap(mgr, \"fault\")\n+        self._reap(mgr, None)\n+\n+        assert mgr._data_plane_faults[self.PEER] == 3\n+        assert warnings[0].endswith(\"; data-plane fault #1\")\n+        assert warnings[1].endswith(\"; data-plane fault #2; reconnect backoff 1s\")\n+        assert warnings[2].endswith(\"; data-plane fault #3\")\n+        # A control-plane death neither counts nor reports a fault.\n+        assert \"data-plane fault\" not in warnings[3]\n+\n+    def test_outbound_connect_is_skipped_during_backoff(self):\n+        mgr = _make_manager()\n+        self._reap(mgr, \"fault\")\n+        self._reap(mgr, \"fault\")\n+\n+        class NoConnect:\n+            def connect(self, peer_id):\n+                raise AssertionError(\"connect() during reconnect backoff\")\n+\n+        mgr._control = NoConnect()  # type: ignore[assignment]\n+        assert mgr._get_or_create_session(self.PEER) is None\n+\n+    def test_inbound_is_told_to_disconnect_during_backoff(self):\n+        mgr = _make_manager()\n+        self._reap(mgr, \"fault\")\n+        self._reap(mgr, \"fault\")\n+\n+        class Conn(_RecordingConn):\n+            def __init__(self, peer_id: str) -> None:\n+                super().__init__(peer_id)\n+                self.sent: list[dict] = []\n+\n+            def send(self, msg: dict) -> None:\n+                self.sent.append(msg)\n+\n+        conn = Conn(self.PEER)\n+        mgr._accept_new_peers([conn])  # type: ignore[list-item]\n+        assert conn.sent == [{TYPE_KEY: DisconnectMsg.TYPE}]\n+        assert conn.close_calls == 1\n+        assert self.PEER not in mgr._sessions",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_manager.py",
+      "sha": "a8c53d2715959f6db0ac339cff7d37464e52b57c",
+      "status": "modified"
+    },
+    {
+      "additions": 129,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_sessions.py",
+      "changes": 149,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_sessions.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 20,
+      "filename": "tests/v1/kv_offload/tiering/p2p/test_sessions.py",
+      "patch": "@@ -57,6 +57,7 @@\n )\n from vllm.v1.kv_offload.tiering.p2p.session.session import (\n     _MAX_CONSECUTIVE_DISPATCH_ERRORS,\n+    _PEER_FAULT_DRAIN_S,\n )\n \n # ---------------------------------------------------------------------------\n@@ -96,6 +97,8 @@ def __init__(\n         self._poll_failed: list[int] = []\n         self._cancel_still_inflight: set[int] = set()\n         self._cancel_calls: list[tuple[list[int], str]] = []\n+        # peer_id → cause, reported by scoped poll() like NixlTransport.\n+        self._peer_faults: dict[str, str] = {}\n \n     @property\n     def base_addr(self) -> int:\n@@ -160,6 +163,7 @@ def complete_registrations(self, exc: Exception | None = None) -> int:\n \n     def remove_remote_peer(self, peer_id: str) -> None:\n         self._remote_peers.pop(peer_id, None)\n+        self._peer_faults.pop(peer_id, None)\n \n     def write_blocks(self, peer_id, local_idxs, remote_idxs) -> int | None:\n         if peer_id not in self._remote_peers:\n@@ -172,7 +176,11 @@ def write_blocks(self, peer_id, local_idxs, remote_idxs) -> int | None:\n     def poll(self, peer_id=None):\n         from vllm.v1.kv_offload.tiering.p2p.data.base import PollResult\n \n-        result = PollResult(done=list(self._poll_done), failed=list(self._poll_failed))\n+        result = PollResult(\n+            done=list(self._poll_done),\n+            failed=list(self._poll_failed),\n+            peer_fault=self._peer_faults.get(peer_id) if peer_id else None,\n+        )\n         self._poll_done.clear()\n         self._poll_failed.clear()\n         return result\n@@ -888,6 +896,7 @@ def test_partial_response_rearms_lookup_deadline(self, lookup_clock):\n         lookup_clock.now += _LOOKUP_TIMEOUT_S - 1\n         session.poll()\n         assert not session.alive\n+        assert session.death_reason == \"lookup response timed out\"\n         assert session.close().failed_req_ids == [\"req-1\"]\n \n     def test_lookup_progress_keeps_overlapping_batches_alive(self, lookup_clock):\n@@ -2600,18 +2609,22 @@ def test_finish_request_remaining_zero_emits_success_via_inflight(self):\n         assert StoreResult(job_id=7, success=True) in stores\n         assert _srv_outbound(session, \"req-1\") is None\n \n-    def test_write_blocks_failure_finalizes_with_failure(self):\n-        \"\"\"write_blocks returning None must not leave the request hanging.\n-\n-        The matched blocks are gone from req.demanded but no inflight\n-        will satisfy them, so remaining > 0 forever. Setting finishing\n-        and calling _finalize_outbound(success=False) immediately (no\n-        other inflight) tells the peer + emits StoreResult(success=False)\n-        without waiting on _STORE_TIMEOUT_S or _LOAD_TIMEOUT_S.\n-        \"\"\"\n+    @pytest.mark.parametrize(\n+        \"store_first,finish_before_fetch\",\n+        [(False, False), (True, False), (True, True)],\n+        ids=[\"fetch-first\", \"store-first\", \"finish-before-fetch\"],\n+    )\n+    def test_write_blocks_failure_finalizes_with_failure(\n+        self, store_first, finish_before_fetch\n+    ):\n+        \"\"\"Submission failure finalizes once in either store/fetch ordering.\"\"\"\n         session, conn, transport = _make_session()\n         _activate(session, conn)\n-        # Decoder demands b\"k1\".\n+        transport.write_blocks = lambda *a, **kw: None  # type: ignore[method-assign]\n+        if store_first:\n+            session.add_stored_blocks(\"req-1\", [b\"k1\"], [0], job_id=42)\n+            if finish_before_fetch:\n+                session.finish_request(\"req-1\")\n         conn.enqueue(\n             {\n                 TYPE_KEY: FetchMsg.TYPE,\n@@ -2621,21 +2634,22 @@ def test_write_blocks_failure_finalizes_with_failure(self):\n                 FetchMsg.BLOCK_INDEXES: [10],\n             }\n         )\n-        session.poll()\n-        # Force write_blocks to fail on the next call.\n-        transport.write_blocks = lambda *a, **kw: None  # type: ignore[method-assign]\n-\n-        session.add_stored_blocks(\"req-1\", [b\"k1\"], [0], job_id=42)\n+        stores = session.poll().stores\n+        if not store_first:\n+            session.add_stored_blocks(\"req-1\", [b\"k1\"], [0], job_id=42)\n+        stores.extend(session.poll().stores)\n \n         # Outbound was finalized immediately (no other inflight).\n         assert _srv_outbound(session, \"req-1\") is None\n+        assert session._dispatch_error_count == 0\n+        assert stores == [StoreResult(job_id=42, success=False)]\n+        assert session.poll().stores == []\n         # Peer notified with success=False.\n-        msg = next(m for m in conn._sent if m[TYPE_KEY] == TransferDoneMsg.TYPE)\n+        done = [m for m in conn._sent if m[TYPE_KEY] == TransferDoneMsg.TYPE]\n+        assert len(done) == 1\n+        msg = done[0]\n         assert msg[TransferDoneMsg.KV_REQUEST_ID] == \"req-1\"\n         assert msg[TransferDoneMsg.SUCCESS] is False\n-        # Local store job surfaces on the next poll.\n-        stores = session.poll().stores\n-        assert StoreResult(job_id=42, success=False) in stores\n         assert 42 not in session._server._store_jobs\n \n     def test_partial_match_completes_in_two_rounds(self):\n@@ -3507,3 +3521,98 @@ def test_activity_timestamp_updated_on_recv(self):\n         ]\n         session.poll()\n         assert session._last_activity_at >= before\n+\n+\n+# ---------------------------------------------------------------------------\n+# Data-plane peer fault → connection death\n+# ---------------------------------------------------------------------------\n+\n+\n+def _fetch(conn: FakeConnection, kv_request_id: str, keys, idxs) -> None:\n+    conn.enqueue(\n+        {\n+            TYPE_KEY: FetchMsg.TYPE,\n+            FetchMsg.ROUND_SEQ: 0,\n+            FetchMsg.KV_REQUEST_ID: kv_request_id,\n+            FetchMsg.KEYS: keys,\n+            FetchMsg.BLOCK_INDEXES: idxs,\n+        }\n+    )\n+\n+\n+class TestPeerFaultEscalation:\n+    \"\"\"A transport peer fault ends the session through the normal reap\n+    path (see \"Failure model\" in data/base.py): no new WRITE is submitted,\n+    inflight ones drain, then DisconnectMsg and a dead connection.\"\"\"\n+\n+    def test_fault_with_nothing_inflight_disconnects(self):\n+        session, conn, transport = _make_session()\n+        _activate(session, conn)\n+        transport._peer_faults[\"peer:8000\"] = \"NIXL_ERR_REMOTE_DISCONNECT\"\n+        session.poll()\n+        assert not session.alive\n+        assert conn._sent[-1] == {TYPE_KEY: DisconnectMsg.TYPE}\n+        assert session.death_reason == \"data plane: NIXL_ERR_REMOTE_DISCONNECT\"\n+        assert session.data_plane_fault == \"NIXL_ERR_REMOTE_DISCONNECT\"\n+\n+    def test_fault_waits_for_inflight_then_disconnects(self):\n+        session, conn, transport = _make_session()\n+        _activate(session, conn)\n+        session.add_stored_blocks(\"req-1\", [b\"k1\"], [0], job_id=1)\n+        _fetch(conn, \"req-1\", [b\"k1\"], [5])\n+        session.poll()\n+        (tid,) = transport._transfers\n+\n+        transport._peer_faults[\"peer:8000\"] = \"3 consecutive transfer failures\"\n+        session.poll()\n+        assert session.alive\n+\n+        # A new round while draining is failed fast, without a WRITE.\n+        session.add_stored_blocks(\"req-2\", [b\"k2\"], [1], job_id=2)\n+        _fetch(conn, \"req-2\", [b\"k2\"], [6])\n+        stores = session.poll().stores\n+        assert len(transport._transfers) == 1\n+        assert StoreResult(job_id=2, success=False) in stores\n+        assert any(\n+            m[TYPE_KEY] == TransferDoneMsg.TYPE\n+            and m[TransferDoneMsg.KV_REQUEST_ID] == \"req-2\"\n+            and m[TransferDoneMsg.SUCCESS] is False\n+            for m in conn._sent\n+        )\n+        assert session.alive\n+\n+        # The last inflight WRITE drains; only now does the session go.\n+        transport._poll_done.append(tid)\n+        session.poll()\n+        assert not session.alive\n+        assert conn._sent[-1] == {TYPE_KEY: DisconnectMsg.TYPE}\n+        assert session.death_reason.startswith(\"data plane: 3 consecutive\")\n+\n+    def test_fault_disconnects_after_drain_deadline(self):\n+        session, conn, transport = _make_session()\n+        _activate(session, conn)\n+        session.add_stored_blocks(\"req-1\", [b\"k1\"], [0], job_id=1)\n+        _fetch(conn, \"req-1\", [b\"k1\"], [5])\n+        session.poll()\n+        transport._peer_faults[\"peer:8000\"] = \"stuck\"\n+        session.poll()\n+        assert session.alive\n+        session._peer_fault_at = time.monotonic() - _PEER_FAULT_DRAIN_S - 1.0\n+        session.poll()\n+        assert not session.alive\n+\n+    def test_death_reasons(self):\n+        session, conn, _ = _make_session()\n+        _activate(session, conn)\n+        assert session.death_reason == \"control connection lost\"\n+        conn.enqueue({TYPE_KEY: DisconnectMsg.TYPE})\n+        session.poll()\n+        assert session.death_reason == \"peer disconnected\"\n+\n+    def test_first_death_reason_wins(self):\n+        session, conn, transport = _make_session()\n+        _activate(session, conn)\n+        conn.enqueue({TYPE_KEY: DisconnectMsg.TYPE})\n+        transport._peer_faults[\"peer:8000\"] = \"late\"\n+        session.poll()\n+        assert session.death_reason == \"peer disconnected\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/tests%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Ftest_sessions.py",
+      "sha": "b5a314ddfaf5181fc9a0197aaceeb366e3f2cc50",
+      "status": "modified"
+    },
+    {
+      "additions": 26,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py",
+      "changes": 26,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 0,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/data/base.py",
+      "patch": "@@ -51,6 +51,28 @@\n    - mode=\"wait\" returns ids still in PROC/PEND so the caller can poll\n      them to completion\n \n+Failure model\n+-------------\n+\n+The transport decides each failure's scope:\n+\n+- Transfer: write_blocks() returned None or poll() listed the id in\n+  ``failed``. The caller fails that round; the peer recomputes.\n+- Peer: the registration for a peer is unusable (one decisive error, such\n+  as any failed state check of an inflight transfer, or repeated transfer\n+  failures with no success between). poll(peer_id) reports the cause in\n+  ``PollResult.peer_fault`` until remove_remote_peer(). A transfer whose\n+  state check failed stays inflight unless the failure proves it can no\n+  longer write, so the peer's teardown is what bounds it.\n+\n+The transport never recovers a peer itself. The session turns a peer\n+fault into the same connection death as a missed heartbeat, so the\n+manager's reap is the only teardown: DisconnectMsg makes the peer tear\n+down too, and the next connection re-registers both sides.\n+\n+write_blocks() and poll() report failures through their return values\n+and must not raise for them.\n+\n Implementor contracts\n ---------------------\n \n@@ -92,11 +114,15 @@ class PollResult(NamedTuple):\n     Attributes:\n         done: Transfer IDs that completed successfully.\n         failed: Transfer IDs that failed (error, timeout, etc.).\n+        peer_fault: Set only on a peer-scoped poll() once the transport\n+            has judged the peer unusable (see \"Failure model\"); a short\n+            human-readable cause. None while the peer is healthy.\n \n     \"\"\"\n \n     done: Sequence[int]\n     failed: Sequence[int]\n+    peer_fault: str | None = None\n \n \n class DataTransport(ABC):",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fbase.py",
+      "sha": "30456ca2e22d15f31c6bb4647a99947b2829b1b9",
+      "status": "modified"
+    },
+    {
+      "additions": 158,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py",
+      "changes": 189,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 31,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "patch": "@@ -59,32 +59,57 @@\n # callers only iterate / membership-test / equality-check.\n _EMPTY_POLL_RESULT: PollResult = PollResult(done=(), failed=())\n \n+# Consecutive transfer-scope failures, with no success between, that fault\n+# a peer (see \"Failure model\" in data/base.py).\n+_MAX_CONSECUTIVE_TRANSFER_FAILURES = 3\n \n-def _is_remote_disconnect(exc: Exception) -> bool:\n-    \"\"\"True if a NIXL state check failed because the peer disconnected.\n+# NIXL errors that fault the peer's registration at once, even when raised\n+# at submission, by exception name → status: the remote endpoint is gone,\n+# or the remote agent is unknown.\n+_PEER_FAULT_ERRORS = {\n+    \"nixlRemoteDisconnectError\": \"NIXL_ERR_REMOTE_DISCONNECT\",\n+    \"nixlNotFoundError\": \"NIXL_ERR_NOT_FOUND\",\n+}\n \n-    NIXL raises ``nixlRemoteDisconnectError`` (NIXL_ERR_REMOTE_DISCONNECT)\n-    from ``check_xfer_state`` once the target endpoint is gone, e.g. after\n-    the peer process died, instead of reporting an ``\"ERR\"`` state. Matched\n-    by name and status code so the bindings need not be imported here; an\n-    unrecognized error keeps the transfer inflight, the conservative side.\n+\n+def _peer_fault_status(exc: Exception) -> str | None:\n+    \"\"\"The NIXL status of *exc* if it is a peer-scope failure, else None.\n+\n+    Matched by name and status string so the bindings need not be imported.\n     \"\"\"\n-    return type(\n-        exc\n-    ).__name__ == \"nixlRemoteDisconnectError\" or \"NIXL_ERR_REMOTE_DISCONNECT\" in str(\n-        exc\n-    )\n+    status = _PEER_FAULT_ERRORS.get(type(exc).__name__)\n+    if status is not None:\n+        return status\n+    text = str(exc)\n+    return next((s for s in _PEER_FAULT_ERRORS.values() if s in text), None)\n+\n+\n+def _is_terminal_state_error(exc: Exception) -> bool:\n+    \"\"\"True if a failed NIXL state check ends the transfer.\n+\n+    Only ``nixlRemoteDisconnectError`` does: NIXL raises it once the target\n+    endpoint is gone, so nothing more can land. Any other raise says nothing\n+    about the WRITE itself; #59790 measured a WRITE that kept landing after\n+    ``remove_remote_agent`` while its handle raised ``nixlNotFoundError``.\n+    Such a transfer stays inflight, so its pins and the peer's destination\n+    blocks are not reused under it. The raise still faults its peer (see\n+    ``_record_state_check_failure``), which bounds how long it stays.\n+    \"\"\"\n+    return _peer_fault_status(exc) == \"NIXL_ERR_REMOTE_DISCONNECT\"\n \n \n class _Inflight(NamedTuple):\n     \"\"\"A submitted-but-not-yet-drained transfer.\n \n     ``peer_id`` lets poll() scope to a single owning session, since the\n     transport is shared across all peer sessions of the engine.\n+    ``struck`` is set once the transfer has counted against its peer, so a\n+    state check that keeps raising charges it once, not once per poll.\n     \"\"\"\n \n     peer_id: str\n     handle: object\n+    struck: bool = False\n \n \n class NixlTransport(DataTransport):\n@@ -115,6 +140,10 @@ def __init__(\n         # transfer_id → _Inflight(peer_id, handle).\n         self._inflight: dict[int, _Inflight] = {}\n         self._next_id = itertools.count()\n+        # peer_id → transfer-scope failures since its last success.\n+        self._peer_strikes: dict[str, int] = {}\n+        # peer_id → fault cause; reported by poll(peer_id) until removal.\n+        self._peer_faults: dict[str, str] = {}\n         # Registration is O(num_blocks) NIXL work — add_remote_agent plus a\n         # prep_xfer_dlist over every block of the peer's region — so it runs\n         # off the scheduler thread, mirroring the NIXL connector's\n@@ -227,6 +256,8 @@ def remove_remote_peer(self, peer_id: str) -> None:\n             self._peer_gen[peer_id] = self._peer_gen.get(peer_id, 0) + 1\n             nixl_name = self._peer_nixl_names.pop(peer_id, None)\n             dlist = self._remote_dlists.pop(peer_id, None)\n+        self._peer_strikes.pop(peer_id, None)\n+        self._peer_faults.pop(peer_id, None)\n         if self._agent is not None:\n             self._release_remote_handles(peer_id, dlist, nixl_name)\n \n@@ -331,8 +362,9 @@ def write_blocks(\n     ) -> int | None:\n         \"\"\"Submit a WRITE transfer to *peer_id*.\n \n-        Returns a transfer ID, or None if the peer is not registered.\n-        The ID is returned via poll() when the transfer completes or fails.\n+        Returns a transfer ID, or None if the peer is not registered or\n+        submission fails. The ID is returned via poll() when the transfer\n+        completes or fails.\n         \"\"\"\n         remote_dlist = self._remote_dlists.get(peer_id)\n         if remote_dlist is None:\n@@ -350,14 +382,27 @@ def write_blocks(\n             peer_id,\n             len(local_idxs),\n         )\n-        handle = self._agent.make_prepped_xfer(\n-            \"WRITE\",\n-            self._local_dlist,\n-            np.asarray(local_idxs, dtype=np.int32),\n-            remote_dlist,\n-            np.asarray(remote_idxs, dtype=np.int32),\n-        )\n-        self._agent.transfer(handle)\n+        local_arr = np.asarray(local_idxs, dtype=np.int32)\n+        remote_arr = np.asarray(remote_idxs, dtype=np.int32)\n+        handle = None\n+        try:\n+            handle = self._agent.make_prepped_xfer(\n+                \"WRITE\", self._local_dlist, local_arr, remote_dlist, remote_arr\n+            )\n+            # transfer() reports a failed post as \"ERR\" instead of raising.\n+            if self._agent.transfer(handle) == \"ERR\":\n+                raise RuntimeError(\"transfer() posted with status ERR\")\n+        except Exception as exc:\n+            logger.warning(\n+                \"NixlTransport %s: write_blocks failed for peer=%s: %s\",\n+                self._agent_name,\n+                peer_id,\n+                exc,\n+            )\n+            if handle is not None:\n+                self._release_handles([handle])\n+            self._record_failure(peer_id, exc)\n+            return None\n         transfer_id = next(self._next_id)\n         self._inflight[transfer_id] = _Inflight(peer_id, handle)\n         return transfer_id\n@@ -370,41 +415,66 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n         an unscoped poll by one session would consume and discard siblings'\n         completions. *peer_id* None polls every peer (shutdown drain only).\n \n-        Returns PollResult(done=..., failed=...) with transfer IDs.\n-        Completed handles are released automatically.\n+        Returns PollResult(done=..., failed=..., peer_fault=...) with\n+        transfer IDs. Completed handles are released automatically.\n+        ``peer_fault`` is set on a scoped poll once *peer_id* is faulted.\n         \"\"\"\n         if not self._inflight:\n-            return _EMPTY_POLL_RESULT\n+            return self._poll_result(peer_id, None, None)\n \n         done_ids: list[int] | None = None\n         failed_ids: list[int] | None = None\n+        # Strikes are applied once the batch is classified: poll() sees\n+        # completions, not their order, so a DONE anywhere in the batch is\n+        # the success \"between\" its peer's earlier failures.\n+        succeeded: set[str] | None = None\n+        failures: list[tuple[str, str]] | None = None\n \n         for transfer_id, entry in self._inflight.items():\n             if peer_id is not None and entry.peer_id != peer_id:\n                 continue\n             try:\n                 state = self._agent.check_xfer_state(entry.handle)\n             except Exception as exc:\n-                logger.warning(\n+                # A check that keeps raising warns once, then at debug.\n+                (logger.debug if entry.struck else logger.warning)(\n                     \"NixlTransport %s: check_xfer_state failed for transfer_id=%d: %s\",\n                     self._agent_name,\n                     transfer_id,\n                     exc,\n                 )\n-                if not _is_remote_disconnect(exc):\n+                if not entry.struck:\n+                    self._record_state_check_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n+                if not _is_terminal_state_error(exc):\n+                    # Kept: the WRITE may still be landing. Its peer is now\n+                    # faulted, so the session disconnects once this drains\n+                    # or at its drain cap, and the teardown reclaims it.\n                     continue\n                 state = \"ERR\"\n             if state == \"DONE\":\n                 if done_ids is None:\n                     done_ids = []\n                 done_ids.append(transfer_id)\n+                if succeeded is None:\n+                    succeeded = set()\n+                succeeded.add(entry.peer_id)\n             elif state not in (\"PROC\", \"PEND\"):\n                 if failed_ids is None:\n                     failed_ids = []\n                 failed_ids.append(transfer_id)\n+                if not entry.struck:\n+                    if failures is None:\n+                        failures = []\n+                    failures.append((entry.peer_id, f\"state {state}\"))\n+\n+        for pid in succeeded or ():\n+            self._peer_strikes.pop(pid, None)\n+        for pid, cause in failures or ():\n+            self._record_transfer_failure(pid, cause)\n \n         if done_ids is None and failed_ids is None:\n-            return _EMPTY_POLL_RESULT\n+            return self._poll_result(peer_id, None, None)\n \n         handles_to_release = []\n         for tid in done_ids or ():\n@@ -413,9 +483,21 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n             handles_to_release.append(self._inflight.pop(tid).handle)\n         self._release_handles(handles_to_release)\n \n+        return self._poll_result(peer_id, done_ids, failed_ids)\n+\n+    def _poll_result(\n+        self,\n+        peer_id: str | None,\n+        done_ids: list[int] | None,\n+        failed_ids: list[int] | None,\n+    ) -> PollResult:\n+        fault = self._peer_faults.get(peer_id) if peer_id is not None else None\n+        if done_ids is None and failed_ids is None and fault is None:\n+            return _EMPTY_POLL_RESULT\n         return PollResult(\n             done=done_ids if done_ids is not None else _EMPTY_POLL_RESULT.done,\n             failed=failed_ids if failed_ids is not None else _EMPTY_POLL_RESULT.failed,\n+            peer_fault=fault,\n         )\n \n     def cancel(\n@@ -431,8 +513,9 @@ def cancel(\n         the request without cancelling RMA, and the bytes keep landing. So\n         PROC/PEND transfers, and those whose state check or\n         ``release_xfer_handle`` raises, stay in ``self._inflight`` for a\n-        later ``poll()`` to observe. A state check that fails because the\n-        peer disconnected counts as terminal.\n+        later ``poll()`` to observe. A state check that raises faults the\n+        peer; only a remote disconnect also counts as terminal (see\n+        ``_is_terminal_state_error``).\n         \"\"\"\n         if mode == \"immediate\":\n             handles = [\n@@ -458,7 +541,8 @@ def cancel(\n                     tid,\n                     exc,\n                 )\n-                if not _is_remote_disconnect(exc):\n+                self._record_state_check_failure(entry.peer_id, exc)\n+                if not _is_terminal_state_error(exc):\n                     still_inflight.append(tid)\n                     continue\n                 # The handle may no longer be releasable; it is terminal\n@@ -509,6 +593,49 @@ def close(self) -> None:\n     # Internal\n     # ------------------------------------------------------------------\n \n+    def _record_failure(self, peer_id: str, exc: Exception) -> None:\n+        \"\"\"Classify a NIXL exception: a peer fault, or one strike.\"\"\"\n+        status = _peer_fault_status(exc)\n+        if status is not None:\n+            self._set_peer_fault(peer_id, status)\n+        else:\n+            self._record_transfer_failure(peer_id, f\"{type(exc).__name__}: {exc}\")\n+\n+    def _record_state_check_failure(self, peer_id: str, exc: Exception) -> None:\n+        \"\"\"Fault *peer_id* for a ``check_xfer_state`` that raised.\n+\n+        The bindings raise for every NIXL error status (only success and\n+        in-progress are returned), so a raise is a failure NIXL reported,\n+        not a flaky check. A peer whose transfer state can't be trusted is\n+        torn down rather than given strikes: with strikes, successes to the\n+        same peer could keep resetting them while the transfer stays\n+        inflight, holding its pins, for good.\n+        \"\"\"\n+        self._set_peer_fault(\n+            peer_id,\n+            _peer_fault_status(exc)\n+            or f\"check_xfer_state raised {type(exc).__name__}: {exc}\",\n+        )\n+\n+    def _record_transfer_failure(self, peer_id: str, cause: str) -> None:\n+        strikes = self._peer_strikes.get(peer_id, 0) + 1\n+        self._peer_strikes[peer_id] = strikes\n+        if strikes >= _MAX_CONSECUTIVE_TRANSFER_FAILURES:\n+            self._set_peer_fault(\n+                peer_id, f\"{strikes} consecutive transfer failures (last: {cause})\"\n+            )\n+\n+    def _set_peer_fault(self, peer_id: str, cause: str) -> None:\n+        if peer_id in self._peer_faults:\n+            return\n+        self._peer_faults[peer_id] = cause\n+        logger.warning(\n+            \"NixlTransport %s: registration for peer=%s judged unusable: %s\",\n+            self._agent_name,\n+            peer_id,\n+            cause,\n+        )\n+\n     def _release_handles(self, handles: list[object]) -> None:\n         if self._agent is None:\n             return",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fdata%2Fnixl.py",
+      "sha": "d55899ead95560b4ca65b58d6fe1211d3b917d97",
+      "status": "modified"
+    },
+    {
+      "additions": 72,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fmanager.py",
+      "changes": 73,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fmanager.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 1,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/manager.py",
+      "patch": "@@ -7,6 +7,7 @@\n \n from __future__ import annotations\n \n+import contextlib\n import time\n import uuid\n from collections.abc import Iterable, Sequence\n@@ -35,6 +36,7 @@\n from vllm.v1.kv_offload.tiering.p2p.control import ControlTransport, ZmqTransport\n from vllm.v1.kv_offload.tiering.p2p.data import DataTransport, NixlTransport\n from vllm.v1.kv_offload.tiering.p2p.session import P2PSession\n+from vllm.v1.kv_offload.tiering.p2p.session.protocol import TYPE_KEY, DisconnectMsg\n from vllm.v1.metrics.cache_hit_source import CacheHitSource\n \n if TYPE_CHECKING:\n@@ -74,6 +76,14 @@\n # peers so a later burst does not pay handshake again.\n _IDLE_REAP_HEADROOM = 8\n \n+# Reconnect backoff after a session ends on a data-plane fault, as for\n+# NixlConnector's invalid peers: the first fault reconnects at once; a\n+# repeat within the max of the previous wait expiring doubles the wait.\n+# Expiry is by time alone: no successful transfer is required, so a peer\n+# that is merely idle for the max starts over at an immediate reconnect.\n+_RECONNECT_MIN_BACKOFF_S = 1.0\n+_RECONNECT_MAX_BACKOFF_S = 60.0\n+\n \n def _remote_prefiller_params(kv_params: dict | None) -> dict | None:\n     \"\"\"Return the ``remote_prefiller`` sub-dict, or None if absent.\n@@ -354,6 +364,12 @@ def __init__(\n         self._control: ControlTransport = ZmqTransport(self._local_id, host, port)\n \n         self._sessions: dict[str, P2PSession] = {}\n+        # peer_id → (backoff, retry_at); see _schedule_reconnect_backoff.\n+        self._reconnect_backoff: dict[str, tuple[float, float]] = {}\n+        # peer_id → data-plane faults over this process's lifetime. Unlike\n+        # the backoff it never expires, so the peer-down log shows a peer\n+        # that keeps faulting under traffic too sparse to escalate.\n+        self._data_plane_faults: dict[str, int] = {}\n         # kv_request_id → session, set when the bound session has received\n         # FetchMsg for that id. submit_store after binding routes directly\n         # to the session; before binding, batches are parked in\n@@ -714,6 +730,8 @@ def _get_or_create_session(self, peer_id: str) -> P2PSession | None:\n         session = self._sessions.get(peer_id)\n         if session is not None:\n             return session\n+        if self._reconnect_wait(peer_id) > 0:\n+            return None\n \n         max_peers = envs.VLLM_P2P_MAX_PEERS\n         if len(self._sessions) >= max_peers:\n@@ -770,6 +788,21 @@ def _accept_new_peers(self, new_connections: Sequence[ControlConnection]) -> Non\n                 )\n                 conn.close()\n                 continue\n+            wait = self._reconnect_wait(conn.peer_id)\n+            if wait > 0:\n+                logger.info(\n+                    \"P2P %s: rejecting inbound peer %s — reconnect backoff \"\n+                    \"after a data-plane fault (%.1fs left)\",\n+                    self._local_id,\n+                    conn.peer_id,\n+                    wait,\n+                )\n+                # Tell the peer, so its lookups fall back now rather than\n+                # at the handshake deadline.\n+                with contextlib.suppress(Exception):\n+                    conn.send({TYPE_KEY: DisconnectMsg.TYPE})\n+                conn.close()\n+                continue\n             try:\n                 existing = self._sessions.get(conn.peer_id)\n                 if existing is not None:\n@@ -828,7 +861,45 @@ def _reap_dead_sessions(self) -> None:\n             # dead session's synthetic lookups on the next serve_external_requests.\n             self._failed_serve_ctxs.extend(close_result.failed_serves)\n             self._data.remove_remote_peer(pid)\n-            logger.warning(\"P2P %s: peer %s down\", self._local_id, pid)\n+            fault_info = \"\"\n+            if session.data_plane_fault is not None:\n+                faults = self._data_plane_faults.get(pid, 0) + 1\n+                self._data_plane_faults[pid] = faults\n+                fault_info = f\"; data-plane fault #{faults}\"\n+                backoff = self._schedule_reconnect_backoff(pid)\n+                if backoff:\n+                    fault_info += f\"; reconnect backoff {backoff:.0f}s\"\n+            logger.warning(\n+                \"P2P %s: peer %s down (%s)%s\",\n+                self._local_id,\n+                pid,\n+                session.death_reason,\n+                fault_info,\n+            )\n+\n+    def _schedule_reconnect_backoff(self, peer_id: str) -> float:\n+        \"\"\"Record a data-plane fault for *peer_id*; return its reconnect wait.\n+\n+        The wait doubles (1 s up to the max) when the previous fault's wait\n+        expired less than the max ago, and is 0 otherwise. Only time is\n+        checked, not whether any transfer succeeded in between.\n+        \"\"\"\n+        now = time.monotonic()\n+        for pid, (_, retry_at) in list(self._reconnect_backoff.items()):\n+            if now - retry_at > _RECONNECT_MAX_BACKOFF_S:\n+                del self._reconnect_backoff[pid]\n+        prev = self._reconnect_backoff.get(peer_id)\n+        backoff = 0.0\n+        if prev is not None:\n+            backoff = min(\n+                max(2 * prev[0], _RECONNECT_MIN_BACKOFF_S), _RECONNECT_MAX_BACKOFF_S\n+            )\n+        self._reconnect_backoff[peer_id] = (backoff, now + backoff)\n+        return backoff\n+\n+    def _reconnect_wait(self, peer_id: str) -> float:\n+        entry = self._reconnect_backoff.get(peer_id)\n+        return 0.0 if entry is None else entry[1] - time.monotonic()\n \n     def _reap_unbound_stores(self) -> None:\n         \"\"\"Time out submit_store batches that no peer has ever fetched.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fmanager.py",
+      "sha": "d24593ec6bcbddd2ff65630b43d9c625169e306f",
+      "status": "modified"
+    },
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fserver.py",
+      "changes": 23,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fserver.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 6,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/session/server.py",
+      "patch": "@@ -286,6 +286,8 @@ def __init__(\n         # Parked aborts already warned about for exceeding\n         # _CANCEL_DRAIN_TIMEOUT_S.\n         self._slow_aborts: set[tuple[str, int]] = set()\n+        # PollResult.peer_fault, once reported; no new WRITE after that.\n+        self.peer_fault: str | None = None\n \n     # ------------------------------------------------------------------\n     # State helpers\n@@ -405,11 +407,14 @@ def on_fetch(\n             self._finalize_outbound(kv_request_id, round_seq, success=False)\n             return\n         if result.local_idxs:\n+            # _submit_transfer owns the round from here: on a failed\n+            # submission it finalizes the round itself, so the finishing\n+            # check below must not finalize it a second time.\n             self._submit_transfer(kv_request_id, result, req, round_seq)\n-        # Prefiller-first mode: finish_request may have run before\n-        # fetch arrived. If so, finalize once we know what was\n-        # demanded — fully satisfied → success, else early-fail.\n-        if req.finishing and req.inflight == 0:\n+        elif req.finishing and req.inflight == 0:\n+            # Prefiller-first mode: finish_request may have run before\n+            # fetch arrived. If so, finalize once we know what was\n+            # demanded — fully satisfied → success, else early-fail.\n             self._finalize_outbound(kv_request_id, round_seq)\n \n     def on_abort_fetch(self, kv_request_id: str, round_seq: int = 0) -> None:\n@@ -763,6 +768,8 @@ def collect_results(self) -> list[StoreResult]:\n         # unscoped poll here would consume sibling sessions' completions and\n         # report them as \"unknown transfer_id\", starving those sessions.\n         poll_result = self._transport.poll(self._peer_id)\n+        if poll_result.peer_fault is not None:\n+            self.peer_fault = poll_result.peer_fault\n \n         for tid in poll_result.done:\n             xfer = self._inflight_pop(tid)\n@@ -1164,8 +1171,12 @@ def _submit_transfer(\n             len(result.local_idxs),\n             len(result.remote_idxs),\n         )\n-        transfer_id = self._transport.write_blocks(\n-            self._peer_id, result.local_idxs, result.remote_idxs\n+        transfer_id = (\n+            self._transport.write_blocks(\n+                self._peer_id, result.local_idxs, result.remote_idxs\n+            )\n+            if self.peer_fault is None\n+            else None\n         )\n         if transfer_id is not None:\n             logger.debug(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fserver.py",
+      "sha": "641a725dc1f70a0bc1875e58c6167982844d9520",
+      "status": "modified"
+    },
+    {
+      "additions": 68,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fsession.py",
+      "changes": 80,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fsession.py?ref=a70688b07255fc0caeead992af1fca36e9a29671",
+      "deletions": 12,
+      "filename": "vllm/v1/kv_offload/tiering/p2p/session/session.py",
+      "patch": "@@ -62,6 +62,11 @@\n # successful dispatch.\n _MAX_CONSECUTIVE_DISPATCH_ERRORS = 5\n \n+# Cap on how long a data-plane fault waits for inflight WRITEs to drain\n+# before disconnecting: the peer frees their destination blocks on\n+# DisconnectMsg, but a stuck transfer must not hold the session open.\n+_PEER_FAULT_DRAIN_S = 10.0\n+\n \n class SessionPollResult(NamedTuple):\n     \"\"\"Result of one P2PSession.poll() tick.\n@@ -136,6 +141,10 @@ def __init__(\n         # Consecutive non-protocol dispatch errors. Reset on success.\n         self._dispatch_error_count: int = 0\n \n+        # First cause recorded by _mark_dead; see death_reason.\n+        self._death_reason: str | None = None\n+        self._peer_fault_at: float | None = None\n+\n         now = time.monotonic()\n         self._connected_at: float | None = None\n         self._last_activity_at: float = now\n@@ -191,6 +200,20 @@ def has_pending_work(self) -> bool:\n             or self._server.has_inflight_transfers\n         )\n \n+    @property\n+    def death_reason(self) -> str:\n+        \"\"\"Why the connection died, for the manager's peer-down log.\n+\n+        A connection the control transport marked dead itself (heartbeat\n+        timeout, socket closed) has no recorded cause.\n+        \"\"\"\n+        return self._death_reason or \"control connection lost\"\n+\n+    @property\n+    def data_plane_fault(self) -> str | None:\n+        \"\"\"The transport's peer fault, if one was reported (see server role).\"\"\"\n+        return self._server.peer_fault\n+\n     @property\n     def last_activity_at(self) -> float:\n         \"\"\"Monotonic timestamp of the last meaningful session activity.\"\"\"\n@@ -322,11 +345,12 @@ def poll(self) -> SessionPollResult:\n                 self.peer_id,\n                 envs.VLLM_P2P_HANDSHAKE_TIMEOUT_S,\n             )\n-            self._conn.mark_dead()\n+            self._mark_dead(\"handshake timed out\")\n \n         loads = self._client.collect_results()\n         stores = self._server.collect_results()\n         self._server.drain_pending_aborts()\n+        self._escalate_peer_fault()\n \n         # Drain buffered replies and completed transfers before expiring a peer.\n         expired_lookup = self._client.get_expired_lookup()\n@@ -339,9 +363,7 @@ def poll(self) -> SessionPollResult:\n                 req_id,\n                 elapsed,\n             )\n-            with contextlib.suppress(Exception):\n-                self._conn.send({TYPE_KEY: DisconnectMsg.TYPE})\n-            self._conn.mark_dead()\n+            self._disconnect(\"lookup response timed out\")\n \n         new_fetch_ids = self._new_fetch_ids\n         self._new_fetch_ids = []\n@@ -435,10 +457,47 @@ def _protocol_error(self, reason: str) -> None:\n             self.peer_id,\n             reason,\n         )\n+        self._disconnect(f\"protocol error: {reason}\")\n+\n+    def _escalate_peer_fault(self) -> None:\n+        \"\"\"Disconnect once a data-plane peer fault's inflight WRITEs drain.\n+\n+        See \"Failure model\" in data/base.py: the fault ends the session\n+        through the same reap as a control-plane failure.\n+        \"\"\"\n+        fault = self._server.peer_fault\n+        if fault is None or self._conn is None or not self._conn.alive:\n+            return\n+        now = time.monotonic()\n+        if self._peer_fault_at is None:\n+            self._peer_fault_at = now\n+            logger.warning(\n+                \"P2PSession %s: data plane faulted (%s); disconnecting once \"\n+                \"inflight transfers drain\",\n+                self.peer_id,\n+                fault,\n+            )\n+        if (\n+            self._server.has_inflight_transfers\n+            and now - self._peer_fault_at < _PEER_FAULT_DRAIN_S\n+        ):\n+            return\n+        self._disconnect(f\"data plane: {fault}\")\n+\n+    def _disconnect(self, reason: str) -> None:\n+        \"\"\"Best-effort DisconnectMsg, then mark the connection dead.\"\"\"\n         if self._conn is not None:\n             with contextlib.suppress(Exception):\n                 self._conn.send({TYPE_KEY: DisconnectMsg.TYPE})\n-            self._conn.mark_dead()\n+        self._mark_dead(reason)\n+\n+    def _mark_dead(self, reason: str) -> None:\n+        \"\"\"Mark the connection dead, recording the first cause.\"\"\"\n+        if self._conn is None:\n+            return\n+        if self._death_reason is None:\n+            self._death_reason = reason\n+        self._conn.mark_dead()\n \n     def _dispatch_message(self, msg: dict) -> None:\n         # Drop messages buffered before disconnect: a poll batch can\n@@ -506,8 +565,7 @@ def _dispatch_message(self, msg: dict) -> None:\n             hits = msg[LookupRespMsg.HITS]\n             self._client.on_lookup_resp(kv_request_id, keys, hits)\n         elif msg_type == DisconnectMsg.TYPE:\n-            if self._conn is not None:\n-                self._conn.mark_dead()\n+            self._mark_dead(\"peer disconnected\")\n         else:\n             logger.warning(\n                 \"P2PSession %s: unknown message type %r\", self.peer_id, msg_type\n@@ -559,8 +617,7 @@ def _on_connect(self, msg: dict) -> None:\n             )\n         except ValueError as exc:\n             logger.error(\"P2PSession %s: rejecting peer connect: %s\", self.peer_id, exc)\n-            if self._conn is not None:\n-                self._conn.mark_dead()\n+            self._mark_dead(f\"rejected peer connect: {exc}\")\n             return\n \n         # ConnectAckMsg is deferred to _poll_registration once the\n@@ -588,8 +645,7 @@ def _poll_registration(self) -> None:\n                 self.peer_id,\n                 exc,\n             )\n-            if self._conn is not None:\n-                self._conn.mark_dead()\n+            self._mark_dead(f\"peer registration failed: {exc}\")\n             return\n         if self._conn is not None and self._conn.alive:\n             self._conn.send(\n@@ -663,4 +719,4 @@ def _do_send(self, msg: dict) -> None:\n                 self.peer_id,\n                 msg.get(TYPE_KEY),\n             )\n-            self._conn.mark_dead()\n+            self._mark_dead(f\"send of {msg.get(TYPE_KEY)} failed\")",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a70688b07255fc0caeead992af1fca36e9a29671/vllm%2Fv1%2Fkv_offload%2Ftiering%2Fp2p%2Fsession%2Fsession.py",
+      "sha": "4a0347db67e36dfc58c6cc1274069f197f129f77",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "Since `_release_handles` only releases the per-transfer handle but the `_remote_dlists[peer_id]` and the remote agent will still be valid, so the next fetch may fail the same way. Would it make sense to call `remove_remote_peer` after N consecutive submission failures, so the peer's NIXL state is re-exchanged instead of staying stale? Or is permanent fast-fail the intended behavior here?",
+      "created_at": "2026-10-13T18:33:03Z",
+      "diff_hunk": "@@ -175,14 +176,28 @@ def write_blocks(\n             peer_id,\n             len(local_idxs),\n         )\n-        handle = self._agent.make_prepped_xfer(\n-            \"WRITE\",\n-            self._local_dlist,\n-            np.asarray(local_idxs, dtype=np.int32),\n-            remote_dlist,\n-            np.asarray(remote_idxs, dtype=np.int32),\n-        )\n-        self._agent.transfer(handle)\n+        local_arr = np.asarray(local_idxs, dtype=np.int32)\n+        remote_arr = np.asarray(remote_idxs, dtype=np.int32)\n+        handle = None\n+        try:\n+            handle = self._agent.make_prepped_xfer(\n+                \"WRITE\",\n+                self._local_dlist,\n+                local_arr,\n+                remote_dlist,\n+                remote_arr,\n+            )\n+            self._agent.transfer(handle)\n+        except Exception as exc:\n+            logger.warning(\n+                \"NixlTransport %s: write_blocks failed for peer=%s: %s\",\n+                self._agent_name,\n+                peer_id,\n+                exc,\n+            )\n+            if handle is not None:\n+                self._release_handles([handle])",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4262524966",
+      "id": 4262524966,
+      "line": 403,
+      "original_line": 199,
+      "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "updated_at": "2026-10-13T18:33:19Z",
+      "user": {
+        "login": "snadampal"
+      }
+    },
+    {
+      "body": "Thanks, good catch. The stale state is real, and permanent fast-fail isn't the intent. I've reworked the PR to handle it, but not by calling `remove_remote_peer` from inside the transport: that would tear down only this side. The session would still believe the peer is registered, and the peer would keep *our* stale registration.\n\nThe second commit (`5a2c650419`) instead has the transport classify and count, and the session react:\n\n- `NIXL_ERR_REMOTE_DISCONNECT` / `NIXL_ERR_NOT_FOUND`, or 3 consecutive transfer failures with no success between them, mark the peer faulted (`PollResult.peer_fault`).\n- The session stops submitting to that peer, waits for its inflight WRITEs to drain (capped at 10 s), sends `DisconnectMsg`, and marks the connection dead.\n- The existing reap then runs `remove_remote_peer` on both sides, and the next request re-handshakes with fresh registrations.\n\nSo a data-plane fault now ends a peer through the same path as a heartbeat or protocol failure, and there is no second recovery mechanism. The first commit is still just the submit-leg fix, so the two can be split if you'd prefer. The PR description has the details.\n",
+      "created_at": "2026-10-15T07:43:35Z",
+      "diff_hunk": "@@ -175,14 +176,28 @@ def write_blocks(\n             peer_id,\n             len(local_idxs),\n         )\n-        handle = self._agent.make_prepped_xfer(\n-            \"WRITE\",\n-            self._local_dlist,\n-            np.asarray(local_idxs, dtype=np.int32),\n-            remote_dlist,\n-            np.asarray(remote_idxs, dtype=np.int32),\n-        )\n-        self._agent.transfer(handle)\n+        local_arr = np.asarray(local_idxs, dtype=np.int32)\n+        remote_arr = np.asarray(remote_idxs, dtype=np.int32)\n+        handle = None\n+        try:\n+            handle = self._agent.make_prepped_xfer(\n+                \"WRITE\",\n+                self._local_dlist,\n+                local_arr,\n+                remote_dlist,\n+                remote_arr,\n+            )\n+            self._agent.transfer(handle)\n+        except Exception as exc:\n+            logger.warning(\n+                \"NixlTransport %s: write_blocks failed for peer=%s: %s\",\n+                self._agent_name,\n+                peer_id,\n+                exc,\n+            )\n+            if handle is not None:\n+                self._release_handles([handle])",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4280357878",
+      "id": 4280357878,
+      "line": 403,
+      "original_line": 199,
+      "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "updated_at": "2026-10-15T07:43:35Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "Claude:\n\n    the strike reset is applied\n    inline during iteration, so a success in the same poll batch does not prevent a\n    fault that the batch's earlier failures trigger. This contradicts\n    data/base.py:62 and the _MAX_CONSECUTIVE_TRANSFER_FAILURES comment (\"with no\n    success between\"). Failure: peer has strikes=2 and 4 inflight transfers; one\n    poll sees ERR on the lowest tid and DONE on the other three. The ERR hits\n    strike 3 → _set_peer_fault; the three DONEs then pop _peer_strikes, but the\n    fault is sticky, so the session stops submitting, sends DisconnectMsg, and both\n    sides tear down and re-register (O(num_blocks) NIXL work) in the same tick that\n    3 of 4 WRITEs to that peer completed. Fix: classify the whole batch, reset\n    strikes if it contained any DONE, then count the failures.",
+      "created_at": "2026-10-15T10:49:04Z",
+      "diff_hunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.\n                     continue\n                 state = \"ERR\"\n             if state == \"DONE\":\n                 if done_ids is None:\n                     done_ids = []\n                 done_ids.append(transfer_id)\n+                self._peer_strikes.pop(entry.peer_id, None)\n             elif state not in (\"PROC\", \"PEND\"):\n                 if failed_ids is None:\n                     failed_ids = []\n                 failed_ids.append(transfer_id)\n+                if not entry.struck:\n+                    self._record_transfer_failure(entry.peer_id, f\"state {state}\")",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4282035407",
+      "id": 4282035407,
+      "line": null,
+      "original_line": 436,
+      "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "updated_at": "2026-10-15T10:51:14Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "Claude:\n\n    nixlNotFoundError from\n    check_xfer_state faults the peer immediately (_record_failure → _set_peer_fault)\n    but _is_remote_disconnect is False, so the transfer is kept inflight. Every later\n    poll re-raises, so it never drains: has_inflight_transfers stays true and the\n    session always waits the full _PEER_FAULT_DRAIN_S (10 s) before DisconnectMsg,\n    logging one WARNING per stuck transfer per engine step for that window\n    (~thousands of lines). #60205 reports NIXL_ERR_NOT_FOUND alongside\n    REMOTE_DISCONNECT, so this is the common shape, not an edge case. Since NOT_FOUND\n    is already judged decisive at peer scope, make it terminal at transfer scope too\n    — set state = \"ERR\" whenever _peer_fault_status(exc) is not None, not only for\n    REMOTE_DISCONNECT. The round then fails at once and the teardown is immediate.",
+      "created_at": "2026-10-15T10:50:36Z",
+      "diff_hunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4282048638",
+      "id": 4282048638,
+      "line": null,
+      "original_line": 423,
+      "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "updated_at": "2026-10-15T10:51:14Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "Agreed, fixed in 7bb0f96fb5. `poll()` now classifies the whole batch before touching strikes. A `DONE` for the peer anywhere in the batch resets its strikes, then the batch's failures count. `poll()` observes completions, not the order they happened in, so iteration order no longer decides the outcome. `test_success_in_the_same_batch_prevents_the_fault` is your scenario (strikes=2, the `ERR` iterated first, three `DONE`s); it fails on the previous code.\n\nOne deliberate edge: a batch with 3 or more failures still faults the peer even when it also holds a `DONE` (`test_batch_of_failures_still_faults_despite_a_success`). Order inside a batch can't be told, and three failures at once is enough on its own.\n\nWhile checking this I found that with NIXL 1.5.0 a failed WRITE never shows up as the `\"ERR\"` state. The binding's `getXferStatus` calls `throw_nixl_exception` on every error status, so the failure arrives as an exception (`nixlBackendError` for a UCX error). Those raises are now decisive (see the other thread), so in practice strikes come from failed submissions, and this fix keeps `poll()` consistent with the contract in `data/base.py` for transports that do report `\"ERR\"`.\n\n",
+      "created_at": "2026-10-15T12:45:39Z",
+      "diff_hunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.\n                     continue\n                 state = \"ERR\"\n             if state == \"DONE\":\n                 if done_ids is None:\n                     done_ids = []\n                 done_ids.append(transfer_id)\n+                self._peer_strikes.pop(entry.peer_id, None)\n             elif state not in (\"PROC\", \"PEND\"):\n                 if failed_ids is None:\n                     failed_ids = []\n                 failed_ids.append(transfer_id)\n+                if not entry.struck:\n+                    self._record_transfer_failure(entry.peer_id, f\"state {state}\")",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4283108191",
+      "id": 4283108191,
+      "line": null,
+      "original_line": 436,
+      "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "updated_at": "2026-10-15T12:45:39Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "Thanks, the symptom is real, but I fixed it differently, because making `NOT_FOUND` terminal reopens the hazard #59790 closed. #59790 measured a 512 MiB WRITE that kept landing after `remove_remote_agent` while its handle raised `nixlNotFoundError` (5/5 runs). If `NOT_FOUND` ends the transfer, the round fails with `TransferDone(False)` and D may reuse the destination blocks while those bytes are still arriving: silent KV corruption for another request. The 10 s drain is what gives such a WRITE time to land, so I'd rather keep it.\n\nWhat 7bb0f96fb5 does:\n- **Log spam:** a state check that keeps raising warns once, then logs at debug (`test_raising_state_check_warns_once`).\n- **`NOT_FOUND`:** still faults the peer at once and stays inflight. The session disconnects when the transfer drains or at the 10 s cap (`test_not_found_state_check_keeps_the_transfer`, `test_not_found_in_cancel_keeps_the_transfer`).\n- **A related gap this led me to:** the binding raises for every NIXL error status (`getXferStatus` → `throw_nixl_exception`; only `SUCCESS` and `IN_PROG` are returned). So any other raise, most commonly `nixlBackendError` for a UCX transport error, used to cost one strike and stay inflight. Successes to the same peer kept resetting that strike, so the transfer never drained. Its round stalled the consumer for about 40 s (load timeout plus abort-ack timeout), and its pins, handle and session were held for good. Now any raise faults the peer, so it's bounded by the same drain cap (`test_raising_state_check_faults_the_peer_and_keeps_the_transfer`, `test_raise_faults_despite_a_success_in_the_batch`). Only `nixlRemoteDisconnectError` still ends the transfer, as in #59790.\n\nThe cost is that one failed state check tears down a peer that is otherwise working: a re-handshake, plus the reconnect backoff if it repeats. The alternatives are a pin leak or a possible corruption, so that seemed the right side to err on. Making `BACKEND` / `CANCELED` terminal (the UCX request finished with an error) is plausible, but I couldn't confirm from NIXL's UCX backend that a handle reports an error only once all of its requests are done. I've left that for a follow-up with evidence.\n",
+      "created_at": "2026-10-15T12:45:42Z",
+      "diff_hunk": "@@ -372,20 +414,29 @@ def poll(self, peer_id: str | None = None) -> PollResult:\n                     transfer_id,\n                     exc,\n                 )\n+                if not entry.struck:\n+                    self._record_failure(entry.peer_id, exc)\n+                    entry = self._inflight[transfer_id] = entry._replace(struck=True)\n                 if not _is_remote_disconnect(exc):\n+                    # Kept: the WRITE may still be landing. The strike\n+                    # bounds this, since a faulted peer's session is torn\n+                    # down and its teardown reclaims the handle.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#discussion_r4283108610",
+      "id": 4283108610,
+      "line": null,
+      "original_line": 423,
+      "path": "vllm/v1/kv_offload/tiering/p2p/data/nixl.py",
+      "updated_at": "2026-10-15T12:45:42Z",
+      "user": {
+        "login": "liranschour"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-15T09:24:22Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6188835115",
+      "id": 6188835115,
+      "updated_at": "2026-10-15T09:24:22Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "❌ @liranschour, A reviewer with write access must run `/ci run`, approve the PR, or add the `ready` label first.\n\n<!-- vllm-ci-command:6188835115 -->",
+      "created_at": "2026-10-15T09:26:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6188865086",
+      "id": 6188865086,
+      "updated_at": "2026-10-15T09:26:01Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "✅ @liranschour, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-10-18T06:00:39Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6246344130",
+      "id": 6246344130,
+      "updated_at": "2026-10-18T06:00:39Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-18T06:00:50Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6246345639",
+      "id": 6246345639,
+      "updated_at": "2026-10-18T06:00:50Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #95664](https://buildkite.com/vllm/ci/builds/95664) for commit `94b3a091af0c`.",
+      "created_at": "2026-10-18T06:01:09Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6246348194",
+      "id": 6246348194,
+      "updated_at": "2026-10-18T06:01:09Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-18T09:23:38Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6248201647",
+      "id": 6248201647,
+      "updated_at": "2026-10-18T09:23:38Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #95688](https://buildkite.com/vllm/ci/builds/95688) for commit `11e2d5cc5e5c`.",
+      "created_at": "2026-10-18T09:23:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6248204500",
+      "id": 6248204500,
+      "updated_at": "2026-10-18T09:23:57Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-18T12:06:38Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6249715041",
+      "id": 6249715041,
+      "updated_at": "2026-10-18T12:06:38Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #95688](https://buildkite.com/vllm/ci/builds/95688).",
+      "created_at": "2026-10-18T12:06:55Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6249717718",
+      "id": 6249717718,
+      "updated_at": "2026-10-18T12:06:55Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-18T12:56:22Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6250177706",
+      "id": 6250177706,
+      "updated_at": "2026-10-18T12:56:22Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #95710](https://buildkite.com/vllm/ci/builds/95710) for commit `212927ce437a`.",
+      "created_at": "2026-10-18T12:56:41Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6250180855",
+      "id": 6250180855,
+      "updated_at": "2026-10-18T12:56:41Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-18T17:05:25Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6252676007",
+      "id": 6252676007,
+      "updated_at": "2026-10-18T17:05:25Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #95732](https://buildkite.com/vllm/ci/builds/95732) for commit `6e968a3ab4ea`.",
+      "created_at": "2026-10-18T17:05:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6252681507",
+      "id": 6252681507,
+      "updated_at": "2026-10-18T17:05:57Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-19T06:56:19Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6261537596",
+      "id": 6261537596,
+      "updated_at": "2026-10-19T06:56:19Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #95847](https://buildkite.com/vllm/ci/builds/95847) for commit `a70688b07255`.",
+      "created_at": "2026-10-19T06:57:00Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#issuecomment-6261547190",
+      "id": 6261547190,
+      "updated_at": "2026-10-19T06:57:00Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 60374,
+  "refs": {
+    "base": {
+      "commit": "fc47cc8fff8282b7fa2b257468b8595f91a1a741",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "a70688b07255fc0caeead992af1fca36e9a29671",
+      "repository": "liranschour/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5440250832",
+      "id": 5440250832,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-07T09:22:28Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5508213203",
+      "id": 5508213203,
+      "state": "CHANGES_REQUESTED",
+      "submitted_at": "2026-10-13T18:33:18Z",
+      "user": {
+        "login": "snadampal"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5529757797",
+      "id": 5529757797,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T07:43:35Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5531922479",
+      "id": 5531922479,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T10:51:14Z",
+      "user": {
+        "login": "orozery"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5533297300",
+      "id": 5533297300,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T12:45:39Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5533297873",
+      "id": 5533297873,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T12:45:42Z",
+      "user": {
+        "login": "liranschour"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60374#pullrequestreview-5562924062",
+      "id": 5562924062,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-18T12:06:47Z",
+      "user": {
+        "login": "orozery"
+      }
+    }
+  ]
+}

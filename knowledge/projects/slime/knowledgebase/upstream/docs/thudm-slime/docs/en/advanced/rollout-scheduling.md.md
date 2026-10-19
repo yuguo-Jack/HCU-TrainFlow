@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/advanced/rollout-scheduling.md
-raw_sha256: 5499464c9d309c8e6829e80f24f3af02bd44697452d1a5aa03c256c8cbb6d651
+raw_sha256: 1043c706d1ccdea90dbce6fa66d3a97ce07670a1384265d006e7ee1d02feb897
 sources: []
-generated_body_sha256: b0a06469ee7987719ff49204baac3d649f3bc381bea6eb81fc584d99dd3c5523
+generated_body_sha256: 17bcfd5ce322efd8d4fcc18bf697b23c8a6570406dc97a72b2ad772dc1baad8d
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/rollout-scheduling.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/advanced/rollout-scheduling.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/rollout-scheduling.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -121,6 +121,6 @@ The lab asks for a shared JuiceFS directory, run ID, and deployment declaration,
 
 Install the same `straw-queue` version on all nodes; mount the verified storage at the same absolute path. The declaration records mount/durability properties, it does not create the mount. straw stores prompt tasks, partial/ready groups, training batches and packed tensors. Leases allow unfinished work from lost workers to become available again. R3 and SC tensor records can be shared across stages without copying their bytes.
 
-The short straw recipe saves every round. Recovery needs a completed **model/optimizer plus rollout-state checkpoint** and the referenced storage pool. It does not restore GPU KV cache or guarantee identical future random generations. Keep dataset, tokenizer, run ID, storage settings and fully async worker topology compatible. Stop the previous job before a whole-job restart; coordinator failover is not automatic. For retained serving, follow [fault tolerance](fault-tolerance.md). Full setup, leases, GC and branch/rollback semantics are in [the straw guide](straw.md) and [straw's filesystem contract](https://github.com/zhuzilin/straw/blob/main/docs/FILESYSTEM.md).
+The short straw recipe saves every round. Whole-job recovery loads the selected **model/optimizer checkpoint** and regenerates saved rollout inputs. Missing or unreadable rollout state produces a warning and falls back to a readable dataset cursor, or the dataset beginning. It does not restore GPU KV cache or guarantee identical future random generations. Keep dataset, tokenizer, run ID and storage settings compatible. Stop the previous job before a whole-job restart; coordinator failover is not automatic. For retained serving, follow [fault tolerance](fault-tolerance.md). Full setup, leases, GC and rollback behavior are in [the straw guide](straw.md) and [straw's filesystem contract](https://github.com/zhuzilin/straw/blob/main/docs/FILESYSTEM.md).
 
 The continuous async path does not support inline evaluation or `--rollout-all-samples-process-path`; evaluate separately. straw does not support `--buffer-filter-path`, and uses its own persisted ordering. See [debugging](../developer_guide/debug.md) for replay and [profiling](../developer_guide/profiling.md) before changing concurrency.

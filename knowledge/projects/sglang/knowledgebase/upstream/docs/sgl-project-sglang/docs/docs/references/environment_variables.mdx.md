@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
+commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
 path: docs/docs/references/environment_variables.mdx
-raw_sha256: 1894131c3e7fe8ad7a30a2f68b7181f472b902fa2890de31f73c3a16f102d19b
+raw_sha256: adb71f0b85ba3c7147d2e899d280f2a36f2345e95b769bdc3edfc5dfdecf615a
 sources: []
-generated_body_sha256: 1ec03e592b8175612e8bcfb790834843a3ddaad97783a2f80a706e7d4ea4d202
+generated_body_sha256: 576fe2a294aed3eb8ea4739375d675766c812ee0c662bbe6aaa67d3aec455f55
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/references/environment_variables.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/docs/docs/references/environment_variables.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/references/environment_variables.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -192,7 +192,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_AUTOTUNE_CACHE`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs. Set to `0` to force re-autotuning on every startup; the fresh result is written to a `runs/<rank>.<timestamp>.json` sibling file (the canonical cache is left untouched).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs, including MegaMoE capacity profiles. Set to `0` to disable disk-cache reuse; the fresh result is written to a `runs/<rank>.<timestamp>.<uuid>.json` sibling file (the canonical cache is left untouched). Target MegaMoE rank files include the physical GPU UUID. Use separate `SGLANG_CACHE_DIR` roots for engines sharing physical GPUs; a running process retains tactics for already-pooled workspaces.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
@@ -321,11 +321,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"true"`</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of workers for parallel DeepGEMM kernel compilation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`4`</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Indicator flag used during the DeepGEMM precompile script</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"false"`</td>
@@ -337,7 +332,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DG_USE_NVRTC</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use NVRTC (instead of Triton) for JIT compilation (Experimental)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use NVRTC instead of NVCC for DeepGEMM JIT compilation (Experimental)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
@@ -391,7 +386,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the CuTe DSL MegaMOE in-kernel FC2 reduction. This can reduce workspace size and improve large-batch performance, but BF16 atomic accumulation is nondeterministic. It is incompatible with quantized combine dtypes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Permit CuTe DSL MegaMOE in-kernel FC2 reduction for NVFP4 W4A4, NVFP4 W4A16, and MXFP8. FlashInfer's tuning profile may still select external reduction. BF16 atomic accumulation is nondeterministic; leave disabled for reproducibility. Requires BF16 combine.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
@@ -849,7 +844,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. MoE layers use it with <code>--moe-runner-backend flashinfer_cutedsl</code>; the MoE path supports online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honors <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. With <code>--moe-runner-backend flashinfer_cutedsl</code>, MoE layers support online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honor <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>. With <code>--moe-runner-backend flashinfer_megamoe --moe-a2a-backend flashinfer_megamoe</code>, MoE layers support serialized ModelOpt NVFP4 weights and <code>--quantization nvfp4_online</code> for gated SiLU/SwiGLU or SiTU. MegaMOE uses BF16 activations and combine, with equal TP, attention-DP, and EP sizes.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -955,11 +950,6 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CPU_QUANTIZATION</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable CPU-side quantization.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_DYNAMIC_MXFP4_LINEAR</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use dynamic MXFP4 quantization for linear layers.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -2234,6 +2224,11 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>10</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HTTP_SERVER_APP_PATH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ASGI import string (<code>module:attr</code>) that Uvicorn and Granian worker processes load when <code>--tokenizer-worker-num</code> is greater than 1. Point it at an app that extends the SGLang app with extra routes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>sglang.srt.entrypoints.http_server:app</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Have the <code>/health</code> endpoint run a generation as part of the check.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
@@ -2279,7 +2274,7 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AUTO_NUMA_BIND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Without <code>CAP_SYS_NICE</code>, only CPU affinity is set. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>

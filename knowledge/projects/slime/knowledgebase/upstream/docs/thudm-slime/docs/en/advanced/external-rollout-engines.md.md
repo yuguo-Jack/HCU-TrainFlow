@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/advanced/external-rollout-engines.md
-raw_sha256: 89a2d93ad4438206cca4ba3a57a84dd33d991f8f245bedf370ae68728ecac682
+raw_sha256: 2c985beb59faaa1b04962416536c8cbcd3fe457f26981d80d0380bca4f70e7af
 sources: []
-generated_body_sha256: f663f18972ffff1922c9abb8cee4e031292dce2e15d56715241b6bc1eea84295
+generated_body_sha256: 86fa0f92041a55bf40ae6f58f52a45b8afc3a030027967b186dcfb8438fa8977
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/external-rollout-engines.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/external-rollout-engines.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/external-rollout-engines.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,6 +38,7 @@ This page is a roadmap. Use it to decide when to use `--rollout-external-engine-
 | :--- | :--- |
 | Engines are already launched externally and slime should only connect for rollout | `--rollout-external-engine-addrs` |
 | slime should still launch engines, but you need PD disaggregation, multi-model serving, heterogeneous server groups, or per-group overrides | [SGLang Config](sglang-config.md) |
+| slime should launch engines using a separate Python or activated conda environment | [`--sglang-python-executable`](sglang-config.md#independent-sglang-python-environment) |
 | Trainer and external engines can form an NCCL group | Default `--update-weight-mode full --update-weight-transport nccl` |
 | Trainer and external engines cannot form an NCCL group, but can see the same filesystem path | `--update-weight-mode full --update-weight-transport disk` |
 | Full checkpoints are too heavy for large-model cross-cluster or cross-DC sync | `--update-weight-mode delta --update-weight-transport disk` |

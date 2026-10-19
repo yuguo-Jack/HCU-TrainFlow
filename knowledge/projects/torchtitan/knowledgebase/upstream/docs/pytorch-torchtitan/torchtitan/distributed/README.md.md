@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/distributed/README.md
-raw_sha256: 92cfc9a282f2afbd4975f8a769a854bd7fcce444f85011206835db414bc9cbe0
+raw_sha256: 0f091154d9ad220ef32ad01b62d3ea1a422840689bc4b9f5d8200c62e83c3124
 sources: []
-generated_body_sha256: f4cd0c31280badbe5f938203ae8e2391e98c98e3e765b6af3f5132768a2b9676
+generated_body_sha256: 14c02ed1501a2c7af0ca14b4edfce3b031c60d59945f7ec14360afcd67c37839
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/distributed/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -51,11 +51,33 @@ is applied during model parallelization.
 
 | Module | Purpose |
 | --- | --- |
-| `activation_checkpoint.py` | Activation checkpointing policies (full, selective, regional `torch_remat`). See [REMAT.md](REMAT.md). |
+| `activation_remat.py` | Activation remat (activation checkpointing) configs on `torch_remat`. See [REMAT.md](REMAT.md). |
 | `cuda_graph.py` | CUDA graph capture and replay of the training step. |
 | `local_compile.py` | `torch.compile` of named model regions. |
 | `batch_invariant.py` | Batch-invariant (bitwise-reproducible) kernels. |
 | `offloading.py` | NUMA binding of each rank to the CPU node local to its GPU. |
+
+## First optimizer update
+
+`Optim.step()` releases unused CUDA cache on its first call, before gradient
+clipping. Each new `Optim` instance tracks its own first call, so a restored
+step number does not skip the release. It waits for GPU work to finish before
+releasing cache. Both calls run outside optimizer CUDA graph capture.
+
+NCCL allocates its internal communication buffers outside PyTorch's caching
+allocator. Unused PyTorch cache can block those allocations even when the live
+tensors and NCCL buffers would fit after releasing the cache. See
+[issue #5019](https://github.com/pytorch/torchtitan/issues/5019).
+
+This workaround requires:
+
+- Forward and backward to complete successfully.
+- Enough unused CUDA cache that can be released for the NCCL buffers.
+- The affected NCCL allocation to happen during the first optimizer call.
+
+The release keeps live tensors and active CUDA graph pools. It does not reduce
+NCCL buffer sizes or prevent allocation failures during forward or backward,
+or later in the run. It does not release NCCL host shared memory.
 
 ## Environment settings
 

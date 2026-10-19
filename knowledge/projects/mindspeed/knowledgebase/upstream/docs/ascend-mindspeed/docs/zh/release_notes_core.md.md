@@ -10,25 +10,23 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed
-commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
 path: docs/zh/release_notes_core.md
-raw_sha256: 53675e4721ff0804e597a6fbdf8f1e887e41d95a6f30c6004ed2b324fbaa2890
+raw_sha256: 696f066046db4913016d423377a159e49fc4c05c555836a130eddcb00daf3937
 sources: []
-generated_body_sha256: a213fdcf6f953139059c5e4b48fe0e183e0a7d7103bd1b15bbd591839274f7df
+generated_body_sha256: 8e08ab7aa1d445574d9e63d90045f6b92161391addf95ac988006891459d2fd9
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed / docs/zh/release_notes_core.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/release_notes_core.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/zh/release_notes_core.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
 ---
 
 # 版本说明
-
-## 关键特性
 
 ## 版本配套说明
 
@@ -42,11 +40,11 @@ Upstream source document; original commands, claims and links require their stat
     </tr>
     <tr>
       <th class="firstcol" valign="top" width="26.25%"><p>产品版本</p></th>
-      <td class="cellrowborder" valign="top" width="73.75%"><p>26.1.0</p></td>
+      <td class="cellrowborder" valign="top" width="73.75%"><p>26.2.0</p></td>
     </tr>
     <tr>
       <th class="firstcol" valign="top" width="26.25%"><p>版本类型</p></th>
-      <td class="cellrowborder" valign="top" width="73.75%"><p>正式版本</p></td>
+      <td class="cellrowborder" valign="top" width="73.75%"><p>release版本</p></td>
     </tr>
     <tr>
       <th class="firstcol" valign="top" width="26.25%"><p>组件名称</p></th>
@@ -74,6 +72,7 @@ Upstream source document; original commands, claims and links require their stat
 |MindSpeed Core代码分支名称|CANN版本|TorchNPU版本|Python版本|PyTorch版本|
 |--|--|--|--|--|
 |master（在研版本）|在研版本|在研版本|Python3.12|2.10.0|
+|26.2.0_core_r0.12.1|9.2.0|26.2.0|Python3.10|2.10.0|
 |26.1.0_core_r0.12.1|9.1.0|26.1.0|Python3.10|2.7.1|
 |26.0.0_core_r0.12.1|9.0.0|26.0.0|Python3.10|2.7.1|
 
@@ -96,17 +95,19 @@ Upstream source document; original commands, claims and links require their stat
     <col style="width: 150px">
     <col style="width: 150px">
     <col style="width: 150px">
+    <col style="width: 150px">
   </colgroup>
   <thead>
     <tr>
       <th rowspan="2">MindSpeed Core</th>
-      <th colspan="4">TorchNPU版本</th>
+      <th colspan="5">TorchNPU版本</th>
     </tr>
     <tr>
       <th>7.2.0</th>
       <th>7.3.0</th>
       <th>26.0.0</th>
       <th>26.1.0</th>
+      <th>26.2.0</th>
     </tr>
   </thead>
   <tbody>
@@ -115,10 +116,20 @@ Upstream source document; original commands, claims and links require their stat
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
-      <td>/</td>
+      <td>Y</td>
+      <td>Y</td>
     </tr>
     <tr>
       <td>26.1.0_core_r0.12.1</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+    </tr>
+      <tr>
+      <td>26.2.0_core_r0.12.1</td>
+      <td>Y</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -147,6 +158,7 @@ Upstream source document; original commands, claims and links require their stat
       <th>8.5.X</th>
       <th>9.0.X</th>
       <th>9.1.X</th>
+      <th>9.2.X</th>
     </tr>
   </thead>
   <tbody>
@@ -164,6 +176,13 @@ Upstream source document; original commands, claims and links require their stat
       <td>Y</td>
       <td>Y</td>
     </tr>
+      <tr>
+      <td>26.2.0_core_r0.12.1</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+    </tr>
   </tbody>
 </table>
 
@@ -175,16 +194,11 @@ Upstream source document; original commands, claims and links require their stat
 
 ### 新增特性
 
-- 新增FP8/MXFP8/HiFloat8低精格式训练支持，以及w8a16量化支持。
-- 新增MXFP8-32x32量化及FSDP支持，量化后释放bf16权重优化内存。
-- 新增SwapMuon及mcore muon特性，支持checkpoint保存与加载。
-- 新增DeepSeek V4模型适配及自定义PP布局支持。
-- 新增TE算子层Hamilton attention实现。
+无
 
 ### 删除特性
 
-- 删除SFA/SFAG/SLI临时版本算子适配，相关功能通过正式算子承载。
-- 删除mindspeed/lite模块，Triton算子迁移至mindspeed/ops/triton目录。
+无
 
 ### 接口变更说明
 
@@ -192,10 +206,7 @@ Upstream source document; original commands, claims and links require their stat
 
 ### 已解决问题
 
-- 修复TE分支LayerNormLinear初始化权重顺序与NVTE不一致问题，以及LayerNorm偏置未初始化为零的问题。
-- 修复GMM算子、NPU sparse_attn_sharedkv算子异常，以及l2norm批量一致性和recompute_w_u_fwd的NaN错误。
-- 修复fboverlap场景下异常内存占用问题，以及Triton算子chunk_bwd_dqkwg时间退化问题。
-- 修复VeRL场景下HCCL缓冲区错误。
+无
 
 ### 遗留问题
 
@@ -228,6 +239,18 @@ Upstream source document; original commands, claims and links require their stat
 
 ### 病毒扫描结果
 
+|防病毒软件名称|防病毒软件版本|病毒库版本|扫描时间|扫描结果|
+|---|---|---|---|---|
+|QiAnXin|8.0.5.5260|2026-09-27 08:00:00.0|2026-09-28|无病毒，无恶意|
+|Kaspersky|12.0.0.6672|2026-09-28 10:09:00|2026-09-28|无病毒，无恶意|
+|Bitdefender|7.5.1.200224|7.101487|2026-09-28|无病毒，无恶意|
+
 ### 漏洞修补列表
 
 无
+
+## 修订记录
+
+|文档版本|发布日期|修改说明|
+|--|--|--|
+|01|2026-10-15|第一次正式发布|

@@ -1,0 +1,306 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "7aac0c4f2abe0b747e9b65a805a78b618e3303b93dbdef07920a5810dbd05443",
+      "isPrivate": false,
+      "numbers": [
+        58914,
+        58908,
+        58907,
+        58898,
+        58897,
+        58885,
+        58883,
+        58872
+      ],
+      "observed_at": "2026-10-19T19:30:40.041798+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4683,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "8530aed2b78a19eb00e242031c22bb78d615eea2",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nWithout sequence parallelism, every TP rank computes DeepSeek-V4.1's `fused_wqa_wkv` (5120 → 1280 + 512) for all tokens, so all ranks do the same work. The checkpoint stores this weight as FP8 with UE8M0 block scales, which vLLM runs through its MXFP8 path. On SM90 that path is a W8A16 Marlin GEMM: on H20 it takes 1.79 ms per layer for an 8192-token prefill chunk, 72 ms per chunk over the 40 layers.\n\nThis PR splits the projection by token for batches of at least 2048 tokens. Each rank projects its token shard (`sp_shard`), and `sp_all_gather` rebuilds `qr_kv`. The change is confined to `DeepseekV4Attention._fused_wqa_wkv_gemm`:\n- `_run_parallel_input_projections` is unchanged, so the multi-stream decision is the same as on main.\n- The all-gather is issued on the current stream, right after the GEMM that produces its input.\n\n`_shard_fused_wqa_wkv` in the NVIDIA decoder layer enables the split only when all of the following hold:\n- **SM90.** On SM100, `fused_wqa_wkv` runs as a native MXFP8 GEMM, far cheaper than W8A16 Marlin, so the gather would be a much larger share of the cost. I have not measured SM100, and the H20 results below do not carry over to it.\n- **No sequence parallelism.** There the hidden states are already sharded, and #57257 splits this projection for that case.\n- **No LoRA.** The LoRA wrapper maps every token of the batch.\n- **No micro-batching.** Two micro-batches would share the custom all-gather buffer.\n- **No batch invariance.** Whether a token takes the split depends on the batch size.\n- **The custom all-reduce is enabled and fully connected.** This serves only as a proxy for NVLink between all TP ranks. From 6144 tokens at TP8, the shard exceeds the custom all-gather's 2 MiB limit, so the gather itself runs on NCCL.\n\nTP4 and TP2 take the same gate but were not measured. On Hopper they need pipeline parallelism to hold the checkpoint.\n\nThe compressor's `fused_wkv_wgate` and the indexer's `weights_proj` stay replicated, and `_run_parallel_input_projections`, which can run them on separate streams, is unchanged. They appear in only a few layers:\n- the compressor in the 4 KV-source layers (2, 8, 14, 20);\n- the indexer in the 8 index-source layers, which are those four plus 24, 28, 32 and 36.\n\nAt 8192 tokens, splitting them as well would save at most another 457 µs in a KV-source layer (last column of the second table; layer 20's compressor is half as wide). In the four indexer-only layers the projection is only 5120 → 32. This PR saves about 1.45 ms in each of the 40 layers, so it limits the split to this dominant projection.\n\n**Why 2048 tokens.** On H20 the split is faster from 48 tokens (first table below). H100 and H200 have about 6.7 times H20's dense throughput with the same 900 GB/s NVLink, so the replicated GEMM costs much less there while the gather costs the same.\n\nI have no H100 or H200 to measure on, so I scaled the H20 numbers pessimistically:\n- a GEMM of 1024 rows or more runs 6.7 times faster than on H20;\n- one of 512 rows runs 3.7 times faster, and one of 256 rows or fewer only twice as fast;\n- the gather runs no faster.\n\nUnder these assumptions the break-even is about 1450 tokens, and 2048 is the next power of two. A measurement on H100 or H200 would confirm or retune it.\n\n**Related work.** I found no upstream PR for the case without sequence parallelism. The fork commit bytedance-iaas/vllm@383776ac20 splits `fused_wqa_wkv` the same way, but behind an environment variable that is off by default, and not when speculative decoding is on.\n\n## Test Plan\n\n**Kernel benchmark.** Setup:\n- Hardware: 8× H20 (SM90, 96 GB, NVLink), TP8.\n- Software: torch 2.13.0+cu130, NCCL 2.29.7, vLLM nightly `0.30.1rc1.dev85+g8b84e1506` with this diff applied as a Python overlay.\n- What it runs: `fused_wqa_wkv` is built as the model builds it, with random weights and the checkpoint's quantization, so SM90 runs Marlin. The second table times `_run_parallel_input_projections` from this branch, which calls `_fused_wqa_wkv_gemm`, with the model's projection shapes and three aux streams.\n\nTiming follows `.agents/skills/kernel-microbenchmark`:\n- One CUDA graph per candidate.\n- Before every measured replay, an L2 flush (twice the L2 size) and a device-side barrier, both outside the timed interval.\n- The time of a replay is the CUPTI span of its kernels. Each sample is the maximum over the 8 ranks, and the tables report the median of 50 samples.\n- Candidates alternate within every round, and correctness is checked before timing.\n\nThe benchmark script is not part of this PR; I can add it under `benchmarks/kernels/` if that helps.\n\n**Serving.** TP8 without expert parallelism. DSpark uses synthetic acceptance with a mean acceptance length of 3.51, the same distribution in both arms:\n\n```bash\nvllm serve deepseek-ai/DeepSeek-V4.1-Flash --revision dba1be0a40aa45a94ad051997016db3960a90277 \\\n  --tensor-parallel-size 8 \\\n  --language-model-only --tokenizer-mode deepseek_v41 --max-model-len 262144 \\\n  --max-num-batched-tokens 8192 --max-num-seqs 128 --gpu-memory-utilization 0.90 \\\n  --no-enable-prefix-caching --engram-config '{\"cpu_offload\":false}' \\\n  --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":3.51,\"enable_adaptive_verification\":false}'\n```\n\nOne `vllm bench serve` call per point:\n\n| Point | ISL | OSL | C | N |\n|---|---:|---:|---:|---:|\n| 8K / 32K / 128K prompt TTFT | 8192 / 32768 / 131072 | 1 | 1 | 5 / 3 / 2 |\n| 1K in / 1K out, C1 | 1024 | 1024 | 1 | 6 |\n| 1K in / 1K out, C64 | 1024 | 1024 | 64 | 192 |\n| 8K in / 1K out, C16 | 8192 | 1024 | 16 | 48 |\n| 8K in / 1K out, C64 | 8192 | 1024 | 64 | 128 |\n\n```bash\nvllm bench serve --backend openai --endpoint /v1/completions --dataset-name random \\\n  --random-input-len <ISL> --random-output-len <OSL> --random-range-ratio 0 --ignore-eos \\\n  --max-concurrency <C> --num-prompts <N> --num-warmups <C> --seed 1\n```\n\nEach arm ran on a fresh server, in the order this PR (B1), main (A1), main (A2), this PR (B2).\n\n**Accuracy.** Full GSM8K (1,319 questions) through `/v1/chat/completions`, with real DSpark verification (`rejection_sample_method: block`) instead of synthetic acceptance:\n- 5-shot multi-turn chat with thinking off (`chat_template_kwargs: {\"thinking\": false}`);\n- temperature 0, seed 123, `max_tokens` 1024, 32 concurrent requests;\n- each reply is scored by the number after `####`, or else by its last number.\n\n## Test Result\n\n**`fused_wqa_wkv`, split vs replicated** (µs per call, TP8, every batch size split so the crossover is visible):\n\n| Tokens | Rows per rank | Replicated | Split + all-gather | Speedup |\n|---:|---:|---:|---:|---:|\n| 6 | 1 | 14.1 | 23.2 | 0.61x |\n| 12 | 2 | 14.6 | 23.1 | 0.63x |\n| 24 | 3 | 19.2 | 21.1 | 0.91x |\n| 48 | 6 | 25.9 | 20.3 | 1.28x |\n| 96 | 12 | 49.6 | 21.5 | 2.31x |\n| 384 | 48 | 99.7 | 35.8 | 2.78x |\n| 1024 | 128 | 239.4 | 66.8 | 3.58x |\n| 2048 | 256 | 458.5 | 99.7 | 4.60x |\n| 4096 | 512 | 903.6 | 173.3 | 5.22x |\n| 8192 | 1024 | 1794.7 | 346.9 | 5.17x |\n| 16384 | 2048 | 3570.8 | 635.4 | 5.62x |\n\nUp to 4096 tokens the gather is the custom all-reduce's all-gather; from 6144 tokens it is NCCL. From 4096 tokens on, the replicated Marlin GEMM runs at 83–84 TFLOPS.\n\n**Input projections of one attention layer, main vs this PR** (µs; only this stage is timed, not the whole layer):\n\n| Tokens | Layer without compressor or indexer (32 layers): main | This PR | Speedup | Layer with compressor and indexer (layers 2, 8, 14): main | This PR | Speedup | If compressor and indexer were also split |\n|---:|---:|---:|---:|---:|---:|---:|---:|\n| 1024 | 236.7 | 236.5 | same code | 337.6 | 337.7 | same code | 337.5 |\n| 1536 | 351.1 | 348.8 | same code | 478.5 | 480.6 | same code | 481.1 |\n| 2048 | 458.1 | 99.9 | 4.59x | 660.4 | 301.8 | 2.19x | 198.3 |\n| 4096 | 903.0 | 172.7 | 5.23x | 1276.2 | 545.9 | 2.34x | 343.5 |\n| 8192 | 1794.2 | 346.0 | 5.19x | 2473.9 | 1028.4 | 2.41x | 571.6 |\n| 16384 | 3569.4 | 635.6 | 5.62x | 4902.1 | 1976.6 | 2.48x | 1052.3 |\n\n- **Estimate per 8K prefill chunk:** this stage gets about 1.45 ms faster in every layer, about 58 ms over the 40 layers. The serving results below are the measurement.\n- **Correctness:** `qr_kv` differs from the replicated projection by at most 0.031 across two sweeps with different inputs. That is bf16 rounding from Marlin's M-dependent tiling. `kv_score` and `indexer_weights` are bitwise identical to main.\n\n**Serving and accuracy.** The serving numbers are a sanity check with two servers per arm, not a precise measurement. Lower TTFT and higher output throughput are better, and Change compares the means of the two arms.\n\n| Point | Metric | main A1 | main A2 | this PR B1 | this PR B2 | Change |\n|---|---|---:|---:|---:|---:|---:|\n| TTFT, 8K prompt, C1 | ms | 1117.8 | 1117.8 | 1066.5 | 1075.2 | −4.2% |\n| TTFT, 32K prompt, C1 | ms | 4535.6 | 4559.3 | 4320.5 | 4322.3 | −5.0% |\n| TTFT, 128K prompt, C1 | ms | 19648 | 19680 | 18859 | 18807 | −4.2% |\n| 8K in / 1K out, C16 | output tok/s | 601.1 | 602.1 | 621.4 | 620.8 | +3.2% |\n| 8K in / 1K out, C64 | output tok/s | 709.9 | 709.4 | 739.0 | 739.4 | +4.2% |\n| 1K in / 1K out, C64 | output tok/s | 1983.8 | 1987.6 | 2014.9 | 2010.1 | +1.4% |\n| 1K in / 1K out, C1 | output tok/s | 335.2 | 335.2 | 338.0 | 334.1 | +0.2% |\n\nAt 1K in / 1K out, C1, no batch reaches 2048 tokens, so both arms run main's kernels. The two servers of this PR differ by 1.2% there, more than the gap between the arms.\n\n| GSM8K, 5-shot chat, greedy (1,319 questions) | main | this PR |\n|---|---:|---:|\n| Accuracy | 96.59% (1274) | 96.97% (1279) |\n| DSpark acceptance length | 3.867 | 3.863 |\n\nIn three runs of main on the same nightly, one of them the run above, GSM8K accuracy ranged from 96.36% to 96.97%.\n\nAI assistance: Claude Code helped with the implementation and ran the benchmarks. I reviewed every changed line and checked the results above.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "zyongye"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-15T00:50:47Z",
+            "databaseId": 6181809179,
+            "updatedAt": "2026-10-15T00:50:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6181809179"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94982](https://buildkite.com/vllm/ci/builds/94982) for commit `df929699b597`.",
+            "createdAt": "2026-10-15T00:51:08Z",
+            "databaseId": 6181813368,
+            "updatedAt": "2026-10-15T00:51:08Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6181813368"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ShuoleiWang"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-16T02:05:42Z",
+            "databaseId": 6206402648,
+            "updatedAt": "2026-10-16T02:05:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6206402648"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #94982](https://buildkite.com/vllm/ci/builds/94982).",
+            "createdAt": "2026-10-16T02:06:01Z",
+            "databaseId": 6206406912,
+            "updatedAt": "2026-10-16T02:06:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6206406912"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXHuQQA=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "df929699b597d040141623dc1b02e22dc89cb24f",
+      "headRepository": {
+        "nameWithOwner": "ShuoleiWang/vllm"
+      },
+      "mergeCommit": {
+        "oid": "05ad0a8ace9bfdbf29acb0554c80d6c4895a215b"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-16T02:31:35Z",
+      "number": 58872,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5499521534,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-13T06:17:09Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58872#pullrequestreview-5499521534"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "zyongye"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5526608691,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-15T00:50:10Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58872#pullrequestreview-5526608691"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNVQwMDo1MDoxMFq0MjAyNi0xMC0xNVQwMDo1MDoxMFrPAAAAAUlpWzM=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Perf][DSv4.1] Split fused_wqa_wkv by token across TP ranks on SM90",
+      "updatedAt": "2026-10-16T02:31:35Z",
+      "url": "https://github.com/vllm-project/vllm/pull/58872"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "8530aed2b78a19eb00e242031c22bb78d615eea2"
+    },
+    "body": "## Purpose\n\nWithout sequence parallelism, every TP rank computes DeepSeek-V4.1's `fused_wqa_wkv` (5120 → 1280 + 512) for all tokens, so all ranks do the same work. The checkpoint stores this weight as FP8 with UE8M0 block scales, which vLLM runs through its MXFP8 path. On SM90 that path is a W8A16 Marlin GEMM: on H20 it takes 1.79 ms per layer for an 8192-token prefill chunk, 72 ms per chunk over the 40 layers.\n\nThis PR splits the projection by token for batches of at least 2048 tokens. Each rank projects its token shard (`sp_shard`), and `sp_all_gather` rebuilds `qr_kv`. The change is confined to `DeepseekV4Attention._fused_wqa_wkv_gemm`:\n- `_run_parallel_input_projections` is unchanged, so the multi-stream decision is the same as on main.\n- The all-gather is issued on the current stream, right after the GEMM that produces its input.\n\n`_shard_fused_wqa_wkv` in the NVIDIA decoder layer enables the split only when all of the following hold:\n- **SM90.** On SM100, `fused_wqa_wkv` runs as a native MXFP8 GEMM, far cheaper than W8A16 Marlin, so the gather would be a much larger share of the cost. I have not measured SM100, and the H20 results below do not carry over to it.\n- **No sequence parallelism.** There the hidden states are already sharded, and #57257 splits this projection for that case.\n- **No LoRA.** The LoRA wrapper maps every token of the batch.\n- **No micro-batching.** Two micro-batches would share the custom all-gather buffer.\n- **No batch invariance.** Whether a token takes the split depends on the batch size.\n- **The custom all-reduce is enabled and fully connected.** This serves only as a proxy for NVLink between all TP ranks. From 6144 tokens at TP8, the shard exceeds the custom all-gather's 2 MiB limit, so the gather itself runs on NCCL.\n\nTP4 and TP2 take the same gate but were not measured. On Hopper they need pipeline parallelism to hold the checkpoint.\n\nThe compressor's `fused_wkv_wgate` and the indexer's `weights_proj` stay replicated, and `_run_parallel_input_projections`, which can run them on separate streams, is unchanged. They appear in only a few layers:\n- the compressor in the 4 KV-source layers (2, 8, 14, 20);\n- the indexer in the 8 index-source layers, which are those four plus 24, 28, 32 and 36.\n\nAt 8192 tokens, splitting them as well would save at most another 457 µs in a KV-source layer (last column of the second table; layer 20's compressor is half as wide). In the four indexer-only layers the projection is only 5120 → 32. This PR saves about 1.45 ms in each of the 40 layers, so it limits the split to this dominant projection.\n\n**Why 2048 tokens.** On H20 the split is faster from 48 tokens (first table below). H100 and H200 have about 6.7 times H20's dense throughput with the same 900 GB/s NVLink, so the replicated GEMM costs much less there while the gather costs the same.\n\nI have no H100 or H200 to measure on, so I scaled the H20 numbers pessimistically:\n- a GEMM of 1024 rows or more runs 6.7 times faster than on H20;\n- one of 512 rows runs 3.7 times faster, and one of 256 rows or fewer only twice as fast;\n- the gather runs no faster.\n\nUnder these assumptions the break-even is about 1450 tokens, and 2048 is the next power of two. A measurement on H100 or H200 would confirm or retune it.\n\n**Related work.** I found no upstream PR for the case without sequence parallelism. The fork commit bytedance-iaas/vllm@383776ac20 splits `fused_wqa_wkv` the same way, but behind an environment variable that is off by default, and not when speculative decoding is on.\n\n## Test Plan\n\n**Kernel benchmark.** Setup:\n- Hardware: 8× H20 (SM90, 96 GB, NVLink), TP8.\n- Software: torch 2.13.0+cu130, NCCL 2.29.7, vLLM nightly `0.30.1rc1.dev85+g8b84e1506` with this diff applied as a Python overlay.\n- What it runs: `fused_wqa_wkv` is built as the model builds it, with random weights and the checkpoint's quantization, so SM90 runs Marlin. The second table times `_run_parallel_input_projections` from this branch, which calls `_fused_wqa_wkv_gemm`, with the model's projection shapes and three aux streams.\n\nTiming follows `.agents/skills/kernel-microbenchmark`:\n- One CUDA graph per candidate.\n- Before every measured replay, an L2 flush (twice the L2 size) and a device-side barrier, both outside the timed interval.\n- The time of a replay is the CUPTI span of its kernels. Each sample is the maximum over the 8 ranks, and the tables report the median of 50 samples.\n- Candidates alternate within every round, and correctness is checked before timing.\n\nThe benchmark script is not part of this PR; I can add it under `benchmarks/kernels/` if that helps.\n\n**Serving.** TP8 without expert parallelism. DSpark uses synthetic acceptance with a mean acceptance length of 3.51, the same distribution in both arms:\n\n```bash\nvllm serve deepseek-ai/DeepSeek-V4.1-Flash --revision dba1be0a40aa45a94ad051997016db3960a90277 \\\n  --tensor-parallel-size 8 \\\n  --language-model-only --tokenizer-mode deepseek_v41 --max-model-len 262144 \\\n  --max-num-batched-tokens 8192 --max-num-seqs 128 --gpu-memory-utilization 0.90 \\\n  --no-enable-prefix-caching --engram-config '{\"cpu_offload\":false}' \\\n  --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":3.51,\"enable_adaptive_verification\":false}'\n```\n\nOne `vllm bench serve` call per point:\n\n| Point | ISL | OSL | C | N |\n|---|---:|---:|---:|---:|\n| 8K / 32K / 128K prompt TTFT | 8192 / 32768 / 131072 | 1 | 1 | 5 / 3 / 2 |\n| 1K in / 1K out, C1 | 1024 | 1024 | 1 | 6 |\n| 1K in / 1K out, C64 | 1024 | 1024 | 64 | 192 |\n| 8K in / 1K out, C16 | 8192 | 1024 | 16 | 48 |\n| 8K in / 1K out, C64 | 8192 | 1024 | 64 | 128 |\n\n```bash\nvllm bench serve --backend openai --endpoint /v1/completions --dataset-name random \\\n  --random-input-len <ISL> --random-output-len <OSL> --random-range-ratio 0 --ignore-eos \\\n  --max-concurrency <C> --num-prompts <N> --num-warmups <C> --seed 1\n```\n\nEach arm ran on a fresh server, in the order this PR (B1), main (A1), main (A2), this PR (B2).\n\n**Accuracy.** Full GSM8K (1,319 questions) through `/v1/chat/completions`, with real DSpark verification (`rejection_sample_method: block`) instead of synthetic acceptance:\n- 5-shot multi-turn chat with thinking off (`chat_template_kwargs: {\"thinking\": false}`);\n- temperature 0, seed 123, `max_tokens` 1024, 32 concurrent requests;\n- each reply is scored by the number after `####`, or else by its last number.\n\n## Test Result\n\n**`fused_wqa_wkv`, split vs replicated** (µs per call, TP8, every batch size split so the crossover is visible):\n\n| Tokens | Rows per rank | Replicated | Split + all-gather | Speedup |\n|---:|---:|---:|---:|---:|\n| 6 | 1 | 14.1 | 23.2 | 0.61x |\n| 12 | 2 | 14.6 | 23.1 | 0.63x |\n| 24 | 3 | 19.2 | 21.1 | 0.91x |\n| 48 | 6 | 25.9 | 20.3 | 1.28x |\n| 96 | 12 | 49.6 | 21.5 | 2.31x |\n| 384 | 48 | 99.7 | 35.8 | 2.78x |\n| 1024 | 128 | 239.4 | 66.8 | 3.58x |\n| 2048 | 256 | 458.5 | 99.7 | 4.60x |\n| 4096 | 512 | 903.6 | 173.3 | 5.22x |\n| 8192 | 1024 | 1794.7 | 346.9 | 5.17x |\n| 16384 | 2048 | 3570.8 | 635.4 | 5.62x |\n\nUp to 4096 tokens the gather is the custom all-reduce's all-gather; from 6144 tokens it is NCCL. From 4096 tokens on, the replicated Marlin GEMM runs at 83–84 TFLOPS.\n\n**Input projections of one attention layer, main vs this PR** (µs; only this stage is timed, not the whole layer):\n\n| Tokens | Layer without compressor or indexer (32 layers): main | This PR | Speedup | Layer with compressor and indexer (layers 2, 8, 14): main | This PR | Speedup | If compressor and indexer were also split |\n|---:|---:|---:|---:|---:|---:|---:|---:|\n| 1024 | 236.7 | 236.5 | same code | 337.6 | 337.7 | same code | 337.5 |\n| 1536 | 351.1 | 348.8 | same code | 478.5 | 480.6 | same code | 481.1 |\n| 2048 | 458.1 | 99.9 | 4.59x | 660.4 | 301.8 | 2.19x | 198.3 |\n| 4096 | 903.0 | 172.7 | 5.23x | 1276.2 | 545.9 | 2.34x | 343.5 |\n| 8192 | 1794.2 | 346.0 | 5.19x | 2473.9 | 1028.4 | 2.41x | 571.6 |\n| 16384 | 3569.4 | 635.6 | 5.62x | 4902.1 | 1976.6 | 2.48x | 1052.3 |\n\n- **Estimate per 8K prefill chunk:** this stage gets about 1.45 ms faster in every layer, about 58 ms over the 40 layers. The serving results below are the measurement.\n- **Correctness:** `qr_kv` differs from the replicated projection by at most 0.031 across two sweeps with different inputs. That is bf16 rounding from Marlin's M-dependent tiling. `kv_score` and `indexer_weights` are bitwise identical to main.\n\n**Serving and accuracy.** The serving numbers are a sanity check with two servers per arm, not a precise measurement. Lower TTFT and higher output throughput are better, and Change compares the means of the two arms.\n\n| Point | Metric | main A1 | main A2 | this PR B1 | this PR B2 | Change |\n|---|---|---:|---:|---:|---:|---:|\n| TTFT, 8K prompt, C1 | ms | 1117.8 | 1117.8 | 1066.5 | 1075.2 | −4.2% |\n| TTFT, 32K prompt, C1 | ms | 4535.6 | 4559.3 | 4320.5 | 4322.3 | −5.0% |\n| TTFT, 128K prompt, C1 | ms | 19648 | 19680 | 18859 | 18807 | −4.2% |\n| 8K in / 1K out, C16 | output tok/s | 601.1 | 602.1 | 621.4 | 620.8 | +3.2% |\n| 8K in / 1K out, C64 | output tok/s | 709.9 | 709.4 | 739.0 | 739.4 | +4.2% |\n| 1K in / 1K out, C64 | output tok/s | 1983.8 | 1987.6 | 2014.9 | 2010.1 | +1.4% |\n| 1K in / 1K out, C1 | output tok/s | 335.2 | 335.2 | 338.0 | 334.1 | +0.2% |\n\nAt 1K in / 1K out, C1, no batch reaches 2048 tokens, so both arms run main's kernels. The two servers of this PR differ by 1.2% there, more than the gap between the arms.\n\n| GSM8K, 5-shot chat, greedy (1,319 questions) | main | this PR |\n|---|---:|---:|\n| Accuracy | 96.59% (1274) | 96.97% (1279) |\n| DSpark acceptance length | 3.867 | 3.863 |\n\nIn three runs of main on the same nightly, one of them the run above, GSM8K accuracy ranged from 96.36% to 96.97%.\n\nAI assistance: Claude Code helped with the implementation and ran the benchmarks. I reviewed every changed line and checked the results above.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "ShuoleiWang/vllm"
+      },
+      "sha": "df929699b597d040141623dc1b02e22dc89cb24f"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/58872",
+    "merge_commit_sha": "05ad0a8ace9bfdbf29acb0554c80d6c4895a215b",
+    "merged": true,
+    "merged_at": "2026-10-16T02:31:35Z",
+    "number": 58872,
+    "state": "closed",
+    "title": "[Perf][DSv4.1] Split fused_wqa_wkv by token across TP ranks on SM90",
+    "updated_at": "2026-10-16T02:31:35Z"
+  },
+  "files": [
+    {
+      "additions": 15,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/df929699b597d040141623dc1b02e22dc89cb24f/vllm%2Fmodels%2Fdeepseek_v41%2Fattention.py",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fdeepseek_v41%2Fattention.py?ref=df929699b597d040141623dc1b02e22dc89cb24f",
+      "deletions": 1,
+      "filename": "vllm/models/deepseek_v41/attention.py",
+      "patch": "@@ -27,7 +27,11 @@\n from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer\n from vllm.model_executor.model_loader.weight_utils import make_attention_sink\n from vllm.models.common.ops import fused_q_kv_rmsnorm\n-from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter\n+from vllm.models.common.ops.sequence_parallel import (\n+    sp_all_gather,\n+    sp_reduce_scatter,\n+    sp_shard,\n+)\n from vllm.models.deepseek_v41.common.ops import (\n     MXFP4_BLOCK_SIZE,\n     fused_indexer_q_rope_quant,\n@@ -82,6 +86,10 @@\n \n logger = init_logger(__name__)\n \n+# From this many tokens, a layer with shard_fused_wqa_wkv set projects one token\n+# shard per TP rank and all-gathers the result.\n+_SHARD_FUSED_WQA_WKV_MIN_TOKENS = 2048\n+\n \n def _replace_layer_index(prefix: str, layer_id: int) -> str:\n     \"\"\"Swap the layer index inside a ``...layers.<idx>...`` prefix.\"\"\"\n@@ -402,6 +410,8 @@ def __init__(\n         # Set by ``bind_gemm_rs`` when the decoder layer runs sequence\n         # parallel and the fused GEMM + reduce-scatter kernel accepts wo_b.\n         self.gemm_rs: GemmRsAr | None = None\n+        # Set by the NVIDIA decoder layer from _shard_fused_wqa_wkv.\n+        self.shard_fused_wqa_wkv = False\n \n         # Initialize rotary embedding before the indexer/compressor consume it.\n         self.rotary_emb = build_deepseek_v4_rope(\n@@ -914,7 +924,11 @@ def prepare_indexer():\n     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:\n         # Override point: the ROCm layer preshuffles this weight in place, so\n         # it cannot go through fused_wqa_wkv directly.\n+        num_tokens = hidden_states.shape[0]\n         # MergedColumnParallelLinear returns (output, bias); bias is None.\n+        if self.shard_fused_wqa_wkv and num_tokens >= _SHARD_FUSED_WQA_WKV_MIN_TOKENS:\n+            qr_kv, _ = self.fused_wqa_wkv(sp_shard(hidden_states))\n+            return sp_all_gather(qr_kv)[:num_tokens]\n         qr_kv, _ = self.fused_wqa_wkv(hidden_states)\n         return qr_kv\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/df929699b597d040141623dc1b02e22dc89cb24f/vllm%2Fmodels%2Fdeepseek_v41%2Fattention.py",
+      "sha": "f26c0341940fbd6bf7d9270bfe8d823ea587a38c",
+      "status": "modified"
+    },
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/df929699b597d040141623dc1b02e22dc89cb24f/vllm%2Fmodels%2Fdeepseek_v41%2Fnvidia%2Fmodel.py",
+      "changes": 17,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fdeepseek_v41%2Fnvidia%2Fmodel.py?ref=df929699b597d040141623dc1b02e22dc89cb24f",
+      "deletions": 0,
+      "filename": "vllm/models/deepseek_v41/nvidia/model.py",
+      "patch": "@@ -16,6 +16,7 @@\n     get_engram_dp_size,\n     get_pp_group,\n     get_tensor_model_parallel_world_size,\n+    get_tp_group,\n     tensor_model_parallel_all_reduce,\n )\n from vllm.forward_context import (\n@@ -255,6 +256,21 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:\n     )\n \n \n+def _shard_fused_wqa_wkv(vllm_config: VllmConfig) -> bool:\n+    \"\"\"Whether large batches shard fused_wqa_wkv by token and all-gather the output.\"\"\"\n+    ca_comm = getattr(get_tp_group().device_communicator, \"ca_comm\", None)\n+    return (\n+        current_platform.is_device_capability(90)\n+        and not _use_sequence_parallel(vllm_config)\n+        and vllm_config.lora_config is None\n+        and not vllm_config.parallel_config.use_ubatching\n+        and not envs.VLLM_BATCH_INVARIANT\n+        and ca_comm is not None\n+        and not ca_comm.disabled\n+        and ca_comm.fully_connected\n+    )\n+\n+\n def maybe_init_gemm_rs(vllm_config: VllmConfig, use_sequence_parallel: bool) -> bool:\n     \"\"\"Set up the fused ``wo_b`` GEMM + reduce-scatter when opted in.\n \n@@ -329,6 +345,7 @@ def __init__(\n                 # Binds only when wo_b's kernel and shape qualify; otherwise\n                 # forward keeps the separate reduce-scatter below.\n                 self.attn.bind_gemm_rs()\n+        self.attn.shard_fused_wqa_wkv = _shard_fused_wqa_wkv(vllm_config)\n         self.ffn = DeepseekV4MoE(\n             vllm_config,\n             prefix=f\"{prefix}.ffn\",",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/df929699b597d040141623dc1b02e22dc89cb24f/vllm%2Fmodels%2Fdeepseek_v41%2Fnvidia%2Fmodel.py",
+      "sha": "3946058de0f853c8f49c3ab0bc36175565959c23",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-15T00:50:47Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6181809179",
+      "id": 6181809179,
+      "updated_at": "2026-10-15T00:50:47Z",
+      "user": {
+        "login": "zyongye"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94982](https://buildkite.com/vllm/ci/builds/94982) for commit `df929699b597`.",
+      "created_at": "2026-10-15T00:51:08Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6181813368",
+      "id": 6181813368,
+      "updated_at": "2026-10-15T00:51:08Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-16T02:05:42Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6206402648",
+      "id": 6206402648,
+      "updated_at": "2026-10-16T02:05:42Z",
+      "user": {
+        "login": "ShuoleiWang"
+      }
+    },
+    {
+      "body": "✅ Queued 1 failed job(s) for retry in [Buildkite CI #94982](https://buildkite.com/vllm/ci/builds/94982).",
+      "created_at": "2026-10-16T02:06:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58872#issuecomment-6206406912",
+      "id": 6206406912,
+      "updated_at": "2026-10-16T02:06:01Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 58872,
+  "refs": {
+    "base": {
+      "commit": "8530aed2b78a19eb00e242031c22bb78d615eea2",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "df929699b597d040141623dc1b02e22dc89cb24f",
+      "repository": "ShuoleiWang/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58872#pullrequestreview-5499521534",
+      "id": 5499521534,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-13T06:17:09Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58872#pullrequestreview-5526608691",
+      "id": 5526608691,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-15T00:50:10Z",
+      "user": {
+        "login": "zyongye"
+      }
+    }
+  ]
+}

@@ -1,0 +1,348 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "598d20d12e07e44d6fb6744f31cf8d958494e46284ec43e233c714dd15304c3f",
+      "isPrivate": false,
+      "numbers": [
+        42834,
+        42833,
+        42820,
+        42818,
+        42811,
+        42803,
+        42790,
+        42787
+      ],
+      "observed_at": "2026-10-19T19:24:07.094839+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4778,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "456231e2517dd29e78c77d20126c893b3f1a6675",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\n`CustomAllReduceV2` has no good option between about 0.5 MB and 8 MB at TP4 and TP8 on Blackwell: `1shot_push` moves `W` copies of the tensor per rank and runs out of steam, while `2shot_pull` pays two barriers and remote loads. A push-plane two-shot (Lamport markers, no barriers) beats both across that band. This PR adds it as `2shot_push` and retunes the SM100 world 4 / 8 rows from a B300 sweep.\n\nThe kernel follows the design in #35192 by @lyppg (rotated per-peer scatter and gather, owner reads its own partial from the input, split reduce and gather loops). The difference is the plane layout: this PR keeps both halves of a chunk in one existing push slot, so the push plane, its workspace and the `PushPlane` constructor are unchanged, and no multicast variant is added. @lyppg is a co-author on the kernel commit.\n\n## Modifications\n\n**Kernel** (`custom_all_reduce.cuh`): `all_reduce_2shot_push_kernel`, next to `all_reduce_1shot_push_kernel`.\n- The flat tensor is split into `W` chunks of `ceil(num_vecs / W)` 16 B vectors; rank `c` owns chunk `c`.\n- Reduce-scatter: each rank pushes chunk `c` only to its owner. The owner polls its own slots, reduces in rank order, keeps the sum, and pushes it to every other rank. All-gather: each rank drains the peers' sums into its output.\n- Same bytes on the wire as `2shot_pull`, but every remote operation is a posted store and every wait is a local poll: no barriers, no remote loads, no staging copies.\n- A slot `(dst, src)` holds `[partial of chunk dst | reduced chunk src]`, two `chunk_vecs` halves. The `(r, r)` slot is unused.\n- Scatter and gather give each warp one peer, starting at `r + 1`, so every peer's ingress is busy from the first wave and the slot pointer is warp-uniform. The host raises the block size when a small grid has fewer warps than peers.\n- Reduction order is rank order on every rank, so all ranks hold identical bits, and `2shot_push` matches `1shot_push` bit for bit.\n\n**Push-plane sizing** (`configs/custom_all_reduce_v2.py`, `custom_all_reduce_v2.py`):\n- A 2shot slot needs `2N / W` bytes instead of `N`. `Heuristic.max_push_bytes(world_size)` sizes the slot for both push algorithms; `clip()` caps the 2shot threshold at what the slot fits (`two_shot_push_slot_bytes` and its inverse `two_shot_push_max_bytes`).\n- Symmetric memory per rank with the new rows: TP4 24 MB to 32 MB, TP8 12 MB to 32 MB.\n\n**Picker**:\n- New `AllReduceAlgo.TWO_SHOT_PUSH`; it is a push algorithm (`is_push()`), needs no graph pointer table, and behaves the same in eager mode and under CUDA-graph capture.\n- `Heuristic.two_shot_push_threshold` defaults to 0, so untuned (arch, world size) rows are unchanged. Table rows set it by keyword (`two_shot_push=`).\n- Order of preference is now `1shot_push -> 2shot_push -> 1shot_pull -> 2shot_pull mc -> 2shot_pull`.\n\n**SM100 table** (graph and eager use the same thresholds):\n\n| World size | `1shot_push` up to | `2shot_push` up to |\n|---|---|---|\n| TP4 | 640 KB (was 2.25 MB graph / 3 MB eager) | 8 MB |\n| TP8 | 256 KB (was 0.5 MB graph / 0.75 MB eager) | 8 MB |\n\nMulticast `2shot_pull` still takes over above 8 MB at TP8 where it was configured. The rows were swept on B300; B200 and GB200 inherit them as SM100 (see follow-ups).\n\n**Tests** (`test_custom_all_reduce.py`): `TWO_SHOT_PUSH` joins the algorithm matrix, with an odd size (3 MiB + 24 elements, uneven chunks).\n\n## Accuracy Tests\n\n- `test_custom_all_reduce.py` with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1`: 264 passed at each of TP2, TP4 and TP8 on the kernel commit; 264 passed again at each of TP2, TP4 and TP8 after merging main. Exact equality against NCCL; fp16, bf16, fp32; eager and CUDA graph; 11 sizes from 16 elements to 4 Mi elements, including sizes that leave chunks empty.\n- In the sweeps below (bf16 randn, 64 KB to 16 MB), `2shot_push` matches `1shot_push` bit for bit at every size and world size.\n\n## Speed Tests and Profiling\n\nSetup: 8x B300 (sm_103, 148 SMs), bf16. Each timing is one CUDA-graph replay of 100 back-to-back all-reduces, max over ranks, median of 9 replays. Graph mode captures under `comm.capture()`; eager mode captures the eager dispatch path (staging copies included) without Python launch overhead. **this PR** is the tuned picker end to end; **today** is the upstream picker from an earlier sweep on the same box (`1shot_push` was rerun in both and agrees within 0.97-1.08x). `2shot_pull mc` is forced on at TP4 to show the crossover.\n\nSpeedup of this PR's pick over today's, over the sizes where the pick changes (768 KB to 8 MB at TP4, 384 KB to 8 MB at TP8):\n\n| | Graph | Eager |\n|---|---|---|\n| TP4 | 1.11-1.52x (best 1.52x at 2 MB) | 1.10-1.70x |\n| TP8 | 1.19-2.01x (1.76-2.01x from 640 KB to 2 MB) | 1.19-1.95x |\n\nWhere the pick is unchanged the ratio is 0.96-1.04, the noise floor.\n\n**TP4, graph** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 4.3 (1shot_push) | 4.5 (1shot_push) | 0.96x | 4.5 | 5.3 | 10.2 | 12.2 | 19.4 |\n| 384 KB | 4.9 (1shot_push) | 4.9 (1shot_push) | 0.99x | 5.0 | 5.5 | 10.1 | 12.3 | 19.6 |\n| 512 KB | 5.6 (1shot_push) | 5.6 (1shot_push) | 1.00x | 5.8 | 5.7 | 10.1 | 12.8 | 19.8 |\n| 640 KB | 6.1 (1shot_push) | 6.2 (1shot_push) | 0.99x | 6.3 | 5.9 | 10.1 | 13.2 | 21.0 |\n| 768 KB | 6.8 (1shot_push) | 6.1 (2shot_push) | 1.11x | 6.9 | 5.9 | 10.7 | 13.5 | 20.9 |\n| 1 MB | 8.1 (1shot_push) | 6.3 (2shot_push) | 1.28x | 7.9 | 6.4 | 12.5 | 13.8 | 21.6 |\n| 1.5 MB | 10.5 (1shot_push) | 7.4 (2shot_push) | 1.41x | 10.2 | 7.3 | 11.9 | 15.0 | 24.0 |\n| 2 MB | 12.7 (1shot_push) | 8.3 (2shot_push) | 1.52x | 12.7 | 8.3 | 14.0 | 16.3 | 26.9 |\n| 2.75 MB | 14.9 (2shot_pull) | 9.8 (2shot_push) | 1.51x | 16.5 | 9.8 | 14.9 | 18.3 | 31.9 |\n| 3 MB | 15.5 (2shot_pull) | 10.3 (2shot_push) | 1.50x | 17.8 | 10.4 | 15.5 | 18.5 | 32.8 |\n| 4 MB | 18.3 (2shot_pull) | 12.9 (2shot_push) | 1.42x | 22.6 | 12.9 | 18.1 | 21.0 | 39.1 |\n| 6 MB | 23.0 (2shot_pull) | 17.5 (2shot_push) | 1.31x | 33.5 | 17.6 | 22.7 | 26.3 | 43.3 |\n| 8 MB | 28.2 (2shot_pull) | 22.2 (2shot_push) | 1.27x | 44.5 | 22.4 | 27.9 | 31.5 | 45.3 |\n\n**TP8, graph** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 6.9 (1shot_push) | 6.6 (1shot_push) | 1.04x | 6.5 | 6.0 | 12.4 | 12.8 | 30.2 |\n| 384 KB | 8.3 (1shot_push) | 6.2 (2shot_push) | 1.33x | 8.0 | 6.2 | 12.7 | 13.0 | 31.8 |\n| 512 KB | 9.5 (1shot_push) | 6.3 (2shot_push) | 1.52x | 9.4 | 6.3 | 12.7 | 13.1 | 31.9 |\n| 640 KB | 13.1 (2shot_pull) | 6.5 (2shot_push) | 2.01x | 11.1 | 6.6 | 12.9 | 13.4 | 31.9 |\n| 768 KB | 13.3 (2shot_pull) | 6.8 (2shot_push) | 1.96x | 12.3 | 6.9 | 13.3 | 13.8 | 31.9 |\n| 1 MB | 14.0 (2shot_pull) | 7.4 (2shot_push) | 1.89x | 15.3 | 7.5 | 13.9 | 14.1 | 32.0 |\n| 1.5 MB | 15.3 (2shot_pull) | 8.7 (2shot_push) | 1.76x | 21.5 | 8.8 | 15.3 | 15.2 | 34.0 |\n| 2 MB | 19.2 (2shot_pull) | 9.8 (2shot_push) | 1.97x | 27.8 | 9.8 | 18.7 | 16.8 | 35.2 |\n| 2.75 MB | 18.1 (2shot_pull) | 11.4 (2shot_push) | 1.60x | 37.2 | 11.4 | 18.4 | 19.1 | 48.8 |\n| 3 MB | 19.2 (2shot_pull) | 11.8 (2shot_push) | 1.63x | 39.6 | 11.8 | 19.4 | 19.3 | 49.3 |\n| 4 MB | 23.8 (2shot_pull) | 14.7 (2shot_push) | 1.62x | 50.6 | 14.7 | 23.7 | 21.1 | 55.9 |\n| 6 MB | 27.7 (2shot_pull) | 20.4 (2shot_push) | 1.36x | 75.4 | 20.6 | 27.6 | 26.0 | 61.2 |\n| 8 MB | 31.3 (2shot_pull+mc) | 26.2 (2shot_push) | 1.19x | 100.1 | 26.3 | 34.8 | 31.1 | 73.7 |\n\n<details><summary>Eager-path tables</summary>\n\n**TP4, eager** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 4.4 (1shot_push) | 4.6 (1shot_push) | 0.96x | 4.5 | 5.3 | 12.1 | 12.1 | 19.0 |\n| 384 KB | 4.8 (1shot_push) | 5.0 (1shot_push) | 0.96x | 4.9 | 5.4 | 12.4 | 12.3 | 19.3 |\n| 512 KB | 5.6 (1shot_push) | 5.6 (1shot_push) | 0.99x | 5.9 | 5.6 | 12.8 | 12.9 | 19.4 |\n| 640 KB | 6.1 (1shot_push) | 6.2 (1shot_push) | 0.99x | 6.4 | 5.9 | 12.8 | 13.2 | 20.8 |\n| 768 KB | 6.7 (1shot_push) | 6.1 (2shot_push) | 1.10x | 6.8 | 6.0 | 13.0 | 13.5 | 21.0 |\n| 1 MB | 8.0 (1shot_push) | 6.4 (2shot_push) | 1.26x | 8.0 | 6.2 | 14.8 | 13.9 | 21.3 |\n| 1.5 MB | 10.4 (1shot_push) | 7.4 (2shot_push) | 1.40x | 10.3 | 7.3 | 14.4 | 14.9 | 23.7 |\n| 2 MB | 12.8 (1shot_push) | 8.3 (2shot_push) | 1.54x | 12.6 | 8.1 | 16.6 | 16.3 | 27.0 |\n| 2.75 MB | 16.5 (1shot_push) | 9.7 (2shot_push) | 1.70x | 16.5 | 9.7 | 17.9 | 18.5 | 31.2 |\n| 3 MB | 17.6 (1shot_push) | 10.3 (2shot_push) | 1.70x | 17.7 | 10.4 | 18.6 | 18.6 | 32.3 |\n| 4 MB | 21.8 (2shot_pull) | 14.3 (2shot_push) | 1.53x | 22.6 | 13.1 | 21.7 | 21.2 | 39.0 |\n| 6 MB | 27.6 (2shot_pull) | 17.3 (2shot_push) | 1.59x | 33.6 | 17.6 | 27.6 | 26.2 | 43.4 |\n| 8 MB | 33.3 (2shot_pull) | 22.3 (2shot_push) | 1.50x | 44.4 | 22.3 | 32.8 | 31.4 | 45.5 |\n\n**TP8, eager** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 6.6 (1shot_push) | 6.5 (1shot_push) | 1.02x | 6.5 | 5.9 | 14.6 | 12.7 | 30.1 |\n| 384 KB | 8.2 (1shot_push) | 6.1 (2shot_push) | 1.35x | 7.9 | 6.1 | 14.9 | 12.9 | 31.6 |\n| 512 KB | 9.6 (1shot_push) | 6.3 (2shot_push) | 1.53x | 9.6 | 6.4 | 15.0 | 13.1 | 31.8 |\n| 640 KB | 11.2 (1shot_push) | 6.5 (2shot_push) | 1.72x | 10.9 | 6.5 | 15.1 | 13.4 | 31.8 |\n| 768 KB | 12.5 (1shot_push) | 6.9 (2shot_push) | 1.81x | 12.5 | 6.8 | 15.4 | 13.9 | 31.9 |\n| 1 MB | 14.4 (2shot_pull+mc) | 7.4 (2shot_push) | 1.95x | 15.4 | 7.4 | 16.1 | 14.3 | 31.9 |\n| 1.5 MB | 15.4 (2shot_pull+mc) | 8.8 (2shot_push) | 1.76x | 21.6 | 8.6 | 17.9 | 15.4 | 33.5 |\n| 2 MB | 16.9 (2shot_pull+mc) | 9.8 (2shot_push) | 1.72x | 27.8 | 9.8 | 21.5 | 16.9 | 35.1 |\n| 2.75 MB | 19.4 (2shot_pull+mc) | 11.2 (2shot_push) | 1.73x | 37.1 | 11.4 | 21.2 | 19.0 | 48.9 |\n| 3 MB | 19.9 (2shot_pull+mc) | 12.0 (2shot_push) | 1.65x | 39.8 | 11.8 | 22.2 | 19.5 | 49.2 |\n| 4 MB | 21.3 (2shot_pull+mc) | 14.7 (2shot_push) | 1.45x | 50.5 | 14.8 | 26.9 | 21.2 | 56.0 |\n| 6 MB | 26.4 (2shot_pull+mc) | 20.5 (2shot_push) | 1.29x | 75.2 | 20.7 | 31.9 | 26.0 | 61.4 |\n| 8 MB | 31.3 (2shot_pull+mc) | 26.3 (2shot_push) | 1.19x | 100.1 | 26.4 | 39.1 | 31.1 | 73.7 |\n\n</details>\n\n**Where it does not win.** `1shot_push` still leads up to 384 KB at TP4 (4.5 vs 5.3 µs at 256 KB); they tie at 512 KB. At TP8 `2shot_push` already wins at 256 KB, so the `1shot_push` threshold there could move down (follow-up). It never lost to multicast `2shot_pull` up to 8 MB.\n\n## Follow-ups (not in this PR)\n\n- Retune the small-size crossovers for the final kernel (TP4 512-640 KB, TP8 below 256 KB).\n- Sweep above 8 MB: the 8 MB cap is the largest size swept, not a measured crossover; at 16 MB `2shot_push` is still well ahead of `1shot_push`.\n- World sizes 2, 3, 5, 6, 7, and B200 / GB200 rows.\n- Server-level A/B (TP4 / TP8 decode).\n\n## Checklist\n\n- [x] Format your code according to pre-commit.\n- [x] Add unit tests.\n- [x] Provide accuracy and speed results.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38947735466](https://github.com/sgl-project/sglang/actions/runs/38947735466)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38947735383](https://github.com/sgl-project/sglang/actions/runs/38947735383)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38947735442](https://github.com/sgl-project/sglang/actions/runs/38947735442)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=38944512969 -->\nRequired checks failed on 427c934; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38944512969))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+            "createdAt": "2026-10-16T18:08:36Z",
+            "databaseId": 6221764988,
+            "updatedAt": "2026-10-16T18:32:31Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42811#issuecomment-6221764988"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=38947874712 -->\nRequired checks failed on 96f9eb8; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38947874712))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+            "createdAt": "2026-10-16T18:32:29Z",
+            "databaseId": 6222172682,
+            "updatedAt": "2026-10-16T20:32:58Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42811#issuecomment-6222172682"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXLe0go=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "96f9eb8592ad788c594561be3fc2ef87480e2c59",
+      "headRepository": {
+        "nameWithOwner": "zcnrex/sglang"
+      },
+      "mergeCommit": {
+        "oid": "07950be745136dc90de8a6f7f61d6fc734ae1858"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-16T20:43:19Z",
+      "number": 42811,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5529783015,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-15T07:46:05Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42811#pullrequestreview-5529783015"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "DarkSharpness"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "this is a bit weird. do we still need to keep it?",
+                  "createdAt": "2026-10-16T18:22:28Z",
+                  "databaseId": 4297943678,
+                  "diffHunk": "@@ -186,9 +192,33 @@ def test_custom_all_reduce(\n     dtype: torch.dtype,\n     algo: AllReduceAlgo,\n     use_graph: bool,\n+) -> None:\n+    _check_custom_all_reduce(size, dtype, algo, use_graph, _init_comm_once())\n+\n+\n+@pytest.mark.parametrize(\"use_graph\", USE_GRAPH_OPTIONS)\n+@pytest.mark.parametrize(\"dtype\", TEST_DTYPES)\n+@pytest.mark.parametrize(\"nbytes\", [32, 288 * 1024])\n+@torch.inference_mode()\n+def test_two_shot_push_single_block(\n+    nbytes: int, dtype: torch.dtype, use_graph: bool\n+) -> None:\n+    # At TP8 a 128-thread block has only four warps for seven peers. Both\n+    # sizes used to hang; the larger one also falls in SM100's tuned range.\n+    size = nbytes // torch.tensor([], dtype=dtype).element_size()\n+    _check_custom_all_reduce(\n+        size, dtype, AllReduceAlgo.TWO_SHOT_PUSH, use_graph, _init_comm_once(1)\n+    )",
+                  "line": null,
+                  "originalLine": 211,
+                  "path": "test/registered/kernels/ops/communication/test_custom_all_reduce.py",
+                  "updatedAt": "2026-10-16T18:22:28Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42811#discussion_r4297943678"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNlQxODoyMjoyOFrPAAAAAQAtan4=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5552011849,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-16T18:22:28Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42811#pullrequestreview-5552011849"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "DarkSharpness"
+            },
+            "body": "LGTM",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5552020583,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-16T18:23:16Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42811#pullrequestreview-5552020583"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNlQxODoyMzoxNlq0MjAyNi0xMC0xNlQxODoyMzoxNlrPAAAAAUrtHGc=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "MERGED",
+      "title": "[Perf] [NVIDIA] custom-all-reduce: Add 2shot_push all-reduce and retune SM100 TP4/TP8",
+      "updatedAt": "2026-10-16T20:43:19Z",
+      "url": "https://github.com/sgl-project/sglang/pull/42811"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "456231e2517dd29e78c77d20126c893b3f1a6675"
+    },
+    "body": "## Motivation\n\n`CustomAllReduceV2` has no good option between about 0.5 MB and 8 MB at TP4 and TP8 on Blackwell: `1shot_push` moves `W` copies of the tensor per rank and runs out of steam, while `2shot_pull` pays two barriers and remote loads. A push-plane two-shot (Lamport markers, no barriers) beats both across that band. This PR adds it as `2shot_push` and retunes the SM100 world 4 / 8 rows from a B300 sweep.\n\nThe kernel follows the design in #35192 by @lyppg (rotated per-peer scatter and gather, owner reads its own partial from the input, split reduce and gather loops). The difference is the plane layout: this PR keeps both halves of a chunk in one existing push slot, so the push plane, its workspace and the `PushPlane` constructor are unchanged, and no multicast variant is added. @lyppg is a co-author on the kernel commit.\n\n## Modifications\n\n**Kernel** (`custom_all_reduce.cuh`): `all_reduce_2shot_push_kernel`, next to `all_reduce_1shot_push_kernel`.\n- The flat tensor is split into `W` chunks of `ceil(num_vecs / W)` 16 B vectors; rank `c` owns chunk `c`.\n- Reduce-scatter: each rank pushes chunk `c` only to its owner. The owner polls its own slots, reduces in rank order, keeps the sum, and pushes it to every other rank. All-gather: each rank drains the peers' sums into its output.\n- Same bytes on the wire as `2shot_pull`, but every remote operation is a posted store and every wait is a local poll: no barriers, no remote loads, no staging copies.\n- A slot `(dst, src)` holds `[partial of chunk dst | reduced chunk src]`, two `chunk_vecs` halves. The `(r, r)` slot is unused.\n- Scatter and gather give each warp one peer, starting at `r + 1`, so every peer's ingress is busy from the first wave and the slot pointer is warp-uniform. The host raises the block size when a small grid has fewer warps than peers.\n- Reduction order is rank order on every rank, so all ranks hold identical bits, and `2shot_push` matches `1shot_push` bit for bit.\n\n**Push-plane sizing** (`configs/custom_all_reduce_v2.py`, `custom_all_reduce_v2.py`):\n- A 2shot slot needs `2N / W` bytes instead of `N`. `Heuristic.max_push_bytes(world_size)` sizes the slot for both push algorithms; `clip()` caps the 2shot threshold at what the slot fits (`two_shot_push_slot_bytes` and its inverse `two_shot_push_max_bytes`).\n- Symmetric memory per rank with the new rows: TP4 24 MB to 32 MB, TP8 12 MB to 32 MB.\n\n**Picker**:\n- New `AllReduceAlgo.TWO_SHOT_PUSH`; it is a push algorithm (`is_push()`), needs no graph pointer table, and behaves the same in eager mode and under CUDA-graph capture.\n- `Heuristic.two_shot_push_threshold` defaults to 0, so untuned (arch, world size) rows are unchanged. Table rows set it by keyword (`two_shot_push=`).\n- Order of preference is now `1shot_push -> 2shot_push -> 1shot_pull -> 2shot_pull mc -> 2shot_pull`.\n\n**SM100 table** (graph and eager use the same thresholds):\n\n| World size | `1shot_push` up to | `2shot_push` up to |\n|---|---|---|\n| TP4 | 640 KB (was 2.25 MB graph / 3 MB eager) | 8 MB |\n| TP8 | 256 KB (was 0.5 MB graph / 0.75 MB eager) | 8 MB |\n\nMulticast `2shot_pull` still takes over above 8 MB at TP8 where it was configured. The rows were swept on B300; B200 and GB200 inherit them as SM100 (see follow-ups).\n\n**Tests** (`test_custom_all_reduce.py`): `TWO_SHOT_PUSH` joins the algorithm matrix, with an odd size (3 MiB + 24 elements, uneven chunks).\n\n## Accuracy Tests\n\n- `test_custom_all_reduce.py` with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1`: 264 passed at each of TP2, TP4 and TP8 on the kernel commit; 264 passed again at each of TP2, TP4 and TP8 after merging main. Exact equality against NCCL; fp16, bf16, fp32; eager and CUDA graph; 11 sizes from 16 elements to 4 Mi elements, including sizes that leave chunks empty.\n- In the sweeps below (bf16 randn, 64 KB to 16 MB), `2shot_push` matches `1shot_push` bit for bit at every size and world size.\n\n## Speed Tests and Profiling\n\nSetup: 8x B300 (sm_103, 148 SMs), bf16. Each timing is one CUDA-graph replay of 100 back-to-back all-reduces, max over ranks, median of 9 replays. Graph mode captures under `comm.capture()`; eager mode captures the eager dispatch path (staging copies included) without Python launch overhead. **this PR** is the tuned picker end to end; **today** is the upstream picker from an earlier sweep on the same box (`1shot_push` was rerun in both and agrees within 0.97-1.08x). `2shot_pull mc` is forced on at TP4 to show the crossover.\n\nSpeedup of this PR's pick over today's, over the sizes where the pick changes (768 KB to 8 MB at TP4, 384 KB to 8 MB at TP8):\n\n| | Graph | Eager |\n|---|---|---|\n| TP4 | 1.11-1.52x (best 1.52x at 2 MB) | 1.10-1.70x |\n| TP8 | 1.19-2.01x (1.76-2.01x from 640 KB to 2 MB) | 1.19-1.95x |\n\nWhere the pick is unchanged the ratio is 0.96-1.04, the noise floor.\n\n**TP4, graph** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 4.3 (1shot_push) | 4.5 (1shot_push) | 0.96x | 4.5 | 5.3 | 10.2 | 12.2 | 19.4 |\n| 384 KB | 4.9 (1shot_push) | 4.9 (1shot_push) | 0.99x | 5.0 | 5.5 | 10.1 | 12.3 | 19.6 |\n| 512 KB | 5.6 (1shot_push) | 5.6 (1shot_push) | 1.00x | 5.8 | 5.7 | 10.1 | 12.8 | 19.8 |\n| 640 KB | 6.1 (1shot_push) | 6.2 (1shot_push) | 0.99x | 6.3 | 5.9 | 10.1 | 13.2 | 21.0 |\n| 768 KB | 6.8 (1shot_push) | 6.1 (2shot_push) | 1.11x | 6.9 | 5.9 | 10.7 | 13.5 | 20.9 |\n| 1 MB | 8.1 (1shot_push) | 6.3 (2shot_push) | 1.28x | 7.9 | 6.4 | 12.5 | 13.8 | 21.6 |\n| 1.5 MB | 10.5 (1shot_push) | 7.4 (2shot_push) | 1.41x | 10.2 | 7.3 | 11.9 | 15.0 | 24.0 |\n| 2 MB | 12.7 (1shot_push) | 8.3 (2shot_push) | 1.52x | 12.7 | 8.3 | 14.0 | 16.3 | 26.9 |\n| 2.75 MB | 14.9 (2shot_pull) | 9.8 (2shot_push) | 1.51x | 16.5 | 9.8 | 14.9 | 18.3 | 31.9 |\n| 3 MB | 15.5 (2shot_pull) | 10.3 (2shot_push) | 1.50x | 17.8 | 10.4 | 15.5 | 18.5 | 32.8 |\n| 4 MB | 18.3 (2shot_pull) | 12.9 (2shot_push) | 1.42x | 22.6 | 12.9 | 18.1 | 21.0 | 39.1 |\n| 6 MB | 23.0 (2shot_pull) | 17.5 (2shot_push) | 1.31x | 33.5 | 17.6 | 22.7 | 26.3 | 43.3 |\n| 8 MB | 28.2 (2shot_pull) | 22.2 (2shot_push) | 1.27x | 44.5 | 22.4 | 27.9 | 31.5 | 45.3 |\n\n**TP8, graph** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 6.9 (1shot_push) | 6.6 (1shot_push) | 1.04x | 6.5 | 6.0 | 12.4 | 12.8 | 30.2 |\n| 384 KB | 8.3 (1shot_push) | 6.2 (2shot_push) | 1.33x | 8.0 | 6.2 | 12.7 | 13.0 | 31.8 |\n| 512 KB | 9.5 (1shot_push) | 6.3 (2shot_push) | 1.52x | 9.4 | 6.3 | 12.7 | 13.1 | 31.9 |\n| 640 KB | 13.1 (2shot_pull) | 6.5 (2shot_push) | 2.01x | 11.1 | 6.6 | 12.9 | 13.4 | 31.9 |\n| 768 KB | 13.3 (2shot_pull) | 6.8 (2shot_push) | 1.96x | 12.3 | 6.9 | 13.3 | 13.8 | 31.9 |\n| 1 MB | 14.0 (2shot_pull) | 7.4 (2shot_push) | 1.89x | 15.3 | 7.5 | 13.9 | 14.1 | 32.0 |\n| 1.5 MB | 15.3 (2shot_pull) | 8.7 (2shot_push) | 1.76x | 21.5 | 8.8 | 15.3 | 15.2 | 34.0 |\n| 2 MB | 19.2 (2shot_pull) | 9.8 (2shot_push) | 1.97x | 27.8 | 9.8 | 18.7 | 16.8 | 35.2 |\n| 2.75 MB | 18.1 (2shot_pull) | 11.4 (2shot_push) | 1.60x | 37.2 | 11.4 | 18.4 | 19.1 | 48.8 |\n| 3 MB | 19.2 (2shot_pull) | 11.8 (2shot_push) | 1.63x | 39.6 | 11.8 | 19.4 | 19.3 | 49.3 |\n| 4 MB | 23.8 (2shot_pull) | 14.7 (2shot_push) | 1.62x | 50.6 | 14.7 | 23.7 | 21.1 | 55.9 |\n| 6 MB | 27.7 (2shot_pull) | 20.4 (2shot_push) | 1.36x | 75.4 | 20.6 | 27.6 | 26.0 | 61.2 |\n| 8 MB | 31.3 (2shot_pull+mc) | 26.2 (2shot_push) | 1.19x | 100.1 | 26.3 | 34.8 | 31.1 | 73.7 |\n\n<details><summary>Eager-path tables</summary>\n\n**TP4, eager** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 4.4 (1shot_push) | 4.6 (1shot_push) | 0.96x | 4.5 | 5.3 | 12.1 | 12.1 | 19.0 |\n| 384 KB | 4.8 (1shot_push) | 5.0 (1shot_push) | 0.96x | 4.9 | 5.4 | 12.4 | 12.3 | 19.3 |\n| 512 KB | 5.6 (1shot_push) | 5.6 (1shot_push) | 0.99x | 5.9 | 5.6 | 12.8 | 12.9 | 19.4 |\n| 640 KB | 6.1 (1shot_push) | 6.2 (1shot_push) | 0.99x | 6.4 | 5.9 | 12.8 | 13.2 | 20.8 |\n| 768 KB | 6.7 (1shot_push) | 6.1 (2shot_push) | 1.10x | 6.8 | 6.0 | 13.0 | 13.5 | 21.0 |\n| 1 MB | 8.0 (1shot_push) | 6.4 (2shot_push) | 1.26x | 8.0 | 6.2 | 14.8 | 13.9 | 21.3 |\n| 1.5 MB | 10.4 (1shot_push) | 7.4 (2shot_push) | 1.40x | 10.3 | 7.3 | 14.4 | 14.9 | 23.7 |\n| 2 MB | 12.8 (1shot_push) | 8.3 (2shot_push) | 1.54x | 12.6 | 8.1 | 16.6 | 16.3 | 27.0 |\n| 2.75 MB | 16.5 (1shot_push) | 9.7 (2shot_push) | 1.70x | 16.5 | 9.7 | 17.9 | 18.5 | 31.2 |\n| 3 MB | 17.6 (1shot_push) | 10.3 (2shot_push) | 1.70x | 17.7 | 10.4 | 18.6 | 18.6 | 32.3 |\n| 4 MB | 21.8 (2shot_pull) | 14.3 (2shot_push) | 1.53x | 22.6 | 13.1 | 21.7 | 21.2 | 39.0 |\n| 6 MB | 27.6 (2shot_pull) | 17.3 (2shot_push) | 1.59x | 33.6 | 17.6 | 27.6 | 26.2 | 43.4 |\n| 8 MB | 33.3 (2shot_pull) | 22.3 (2shot_push) | 1.50x | 44.4 | 22.3 | 32.8 | 31.4 | 45.5 |\n\n**TP8, eager** (µs)\n\n| size | today (pick) | this PR (pick) | speedup | 1shot_push | 2shot_push | 2shot_pull | 2shot_pull mc | NCCL |\n|---|---|---|---|---|---|---|---|---|\n| 256 KB | 6.6 (1shot_push) | 6.5 (1shot_push) | 1.02x | 6.5 | 5.9 | 14.6 | 12.7 | 30.1 |\n| 384 KB | 8.2 (1shot_push) | 6.1 (2shot_push) | 1.35x | 7.9 | 6.1 | 14.9 | 12.9 | 31.6 |\n| 512 KB | 9.6 (1shot_push) | 6.3 (2shot_push) | 1.53x | 9.6 | 6.4 | 15.0 | 13.1 | 31.8 |\n| 640 KB | 11.2 (1shot_push) | 6.5 (2shot_push) | 1.72x | 10.9 | 6.5 | 15.1 | 13.4 | 31.8 |\n| 768 KB | 12.5 (1shot_push) | 6.9 (2shot_push) | 1.81x | 12.5 | 6.8 | 15.4 | 13.9 | 31.9 |\n| 1 MB | 14.4 (2shot_pull+mc) | 7.4 (2shot_push) | 1.95x | 15.4 | 7.4 | 16.1 | 14.3 | 31.9 |\n| 1.5 MB | 15.4 (2shot_pull+mc) | 8.8 (2shot_push) | 1.76x | 21.6 | 8.6 | 17.9 | 15.4 | 33.5 |\n| 2 MB | 16.9 (2shot_pull+mc) | 9.8 (2shot_push) | 1.72x | 27.8 | 9.8 | 21.5 | 16.9 | 35.1 |\n| 2.75 MB | 19.4 (2shot_pull+mc) | 11.2 (2shot_push) | 1.73x | 37.1 | 11.4 | 21.2 | 19.0 | 48.9 |\n| 3 MB | 19.9 (2shot_pull+mc) | 12.0 (2shot_push) | 1.65x | 39.8 | 11.8 | 22.2 | 19.5 | 49.2 |\n| 4 MB | 21.3 (2shot_pull+mc) | 14.7 (2shot_push) | 1.45x | 50.5 | 14.8 | 26.9 | 21.2 | 56.0 |\n| 6 MB | 26.4 (2shot_pull+mc) | 20.5 (2shot_push) | 1.29x | 75.2 | 20.7 | 31.9 | 26.0 | 61.4 |\n| 8 MB | 31.3 (2shot_pull+mc) | 26.3 (2shot_push) | 1.19x | 100.1 | 26.4 | 39.1 | 31.1 | 73.7 |\n\n</details>\n\n**Where it does not win.** `1shot_push` still leads up to 384 KB at TP4 (4.5 vs 5.3 µs at 256 KB); they tie at 512 KB. At TP8 `2shot_push` already wins at 256 KB, so the `1shot_push` threshold there could move down (follow-up). It never lost to multicast `2shot_pull` up to 8 MB.\n\n## Follow-ups (not in this PR)\n\n- Retune the small-size crossovers for the final kernel (TP4 512-640 KB, TP8 below 256 KB).\n- Sweep above 8 MB: the 8 MB cap is the largest size swept, not a measured crossover; at 16 MB `2shot_push` is still well ahead of `1shot_push`.\n- World sizes 2, 3, 5, 6, 7, and B200 / GB200 rows.\n- Server-level A/B (TP4 / TP8 decode).\n\n## Checklist\n\n- [x] Format your code according to pre-commit.\n- [x] Add unit tests.\n- [x] Provide accuracy and speed results.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38947735466](https://github.com/sgl-project/sglang/actions/runs/38947735466)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38947735383](https://github.com/sgl-project/sglang/actions/runs/38947735383)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38947735442](https://github.com/sgl-project/sglang/actions/runs/38947735442)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n\n",
+    "changed_files": 4,
+    "head": {
+      "repo": {
+        "full_name": "zcnrex/sglang"
+      },
+      "sha": "96f9eb8592ad788c594561be3fc2ef87480e2c59"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/42811",
+    "merge_commit_sha": "07950be745136dc90de8a6f7f61d6fc734ae1858",
+    "merged": true,
+    "merged_at": "2026-10-16T20:43:19Z",
+    "number": 42811,
+    "state": "closed",
+    "title": "[Perf] [NVIDIA] custom-all-reduce: Add 2shot_push all-reduce and retune SM100 TP4/TP8",
+    "updated_at": "2026-10-16T20:43:19Z"
+  },
+  "files": [
+    {
+      "additions": 21,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/96f9eb8592ad788c594561be3fc2ef87480e2c59/python%2Fsglang%2Fkernels%2Fjit%2Fcsrc%2Fdistributed%2Fcustom_all_reduce.cuh",
+      "changes": 43,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fkernels%2Fjit%2Fcsrc%2Fdistributed%2Fcustom_all_reduce.cuh?ref=96f9eb8592ad788c594561be3fc2ef87480e2c59",
+      "deletions": 22,
+      "filename": "python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh",
+      "patch": "@@ -136,7 +136,7 @@ struct MultiCastImpl {\n \n #define ALL_REDUCE_KERNEL __global__ __launch_bounds__(1024, 1)\n \n-template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>\n+template <typename T, uint32_t kWorldSize, bool kUsePDL>\n ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {\n   using namespace device;\n   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);\n@@ -224,25 +224,26 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR\n   using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;\n   const auto r = params.rank;\n   const auto num_vecs = params.num_vecs;\n-  const auto chunk_vecs = (num_vecs + kWorldSize - 1) / kWorldSize;\n-  const auto chunk_len = [&](uint32_t c) { return min(chunk_vecs, num_vecs - min(num_vecs, c * chunk_vecs)); };\n+  const auto chunk_vecs = div_ceil(num_vecs, kWorldSize);\n+  const auto get_chunk_len = [&](uint32_t c) {  //\n+    return min(chunk_vecs, num_vecs - min(num_vecs, c * chunk_vecs));\n+  };\n   const auto num_threads = blockDim.x * gridDim.x;\n   const auto num_warps = num_threads / kWarpThreads;\n   const auto warp_in_block = threadIdx.x / kWarpThreads;\n   const auto lane_id = threadIdx.x % kWarpThreads;\n   const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;\n   const auto global_tid = global_warp_id * kWarpThreads + lane_id;\n-  PDLWaitPrimary<kUsePDL>();\n-  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};\n \n-  // Each warp serves one peer, starting at r + 1 so every peer's ingress is\n-  // busy from the first wave and the slot pointer stays warp-uniform.\n-  auto peer = r + 1 + global_warp_id % kFan;\n-  if (peer >= kWorldSize) peer -= kWorldSize;\n+  // peer will cover 0..kWorldSize - 1, except for local rank `r`\n+  const auto peer = (r + 1 + global_warp_id % kFan) % kWorldSize;\n   const auto group_warps = num_warps / kFan + (global_warp_id % kFan < num_warps % kFan ? 1 : 0);\n   const auto group_tid = (global_warp_id / kFan) * kWarpThreads + lane_id;\n   const auto group_stride = group_warps * kWarpThreads;\n-  const auto peer_len = chunk_len(peer);\n+  const auto peer_len = get_chunk_len(peer);\n+\n+  PDLWaitPrimary<kUsePDL>();\n+  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};\n \n   // reduce-scatter: my partial of the peer's chunk to its owner\n   {\n@@ -265,17 +266,12 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR\n   }\n \n   // reduce my chunk, keep it and fan it out\n-  const auto my_len = chunk_len(r);\n+  const auto my_len = get_chunk_len(r);\n   for (auto j = global_tid; j < my_len; j += num_threads) {\n     const auto vid = r * chunk_vecs + j;\n     vec_t vec[kWorldSize];\n-#pragma unroll\n-    for (uint32_t i = 0; i < kWorldSize; ++i) {\n-      if (i == r) {\n-        vec[i].load(params.input, vid);\n-        Lamport::clear_pos_zero(vec[i].data());\n-      }\n-    }\n+    vec_t local_vec;\n+    local_vec.load(params.input, vid);\n     do {\n       bool has_zero = false;\n #pragma unroll\n@@ -284,10 +280,14 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR\n       }\n #pragma unroll\n       for (uint32_t i = 0; i < kWorldSize; ++i) {\n-        if (i != r) has_zero |= Lamport::has_pos_zero(vec[i].data());\n+        has_zero |= ((i != r) & Lamport::has_pos_zero(vec[i].data()));\n       }\n       if (!has_zero) break;\n     } while (true);\n+#pragma unroll\n+    for (uint32_t i = 0; i < kWorldSize; ++i) {\n+      if (i == r) vec[i] = local_vec;\n+    }\n     auto out_vec = reduce_vec(vec);\n     // remap before the local store too, so every rank holds identical bits\n     Lamport::clear_pos_zero(out_vec.data());\n@@ -451,13 +451,12 @@ struct AllReduceKernel {\n           .rank = push.rank,\n           .ws = push.get_workspace<kWorldSize>(two_shot ? int64_t{2} * chunk_vecs * 16 : nbytes),\n       };\n-      using Impl = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;\n       const auto kernel = two_shot ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>\n-                                   : all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>;\n+                                   : all_reduce_1shot_push_kernel<T, kWorldSize, kUsePDL>;\n       // the grid is bound to the counter array and must stay constant\n       auto block_size = choose_block_size(num_vecs);\n       if (two_shot) {\n-        // Every peer needs a warp, including when callers use a small grid.\n+        // at least `kWorldSize - 1` warps in all, 1 for each peer\n         block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));\n       }\n       LaunchKernel(push.num_blocks, block_size, stream)  //",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/96f9eb8592ad788c594561be3fc2ef87480e2c59/python%2Fsglang%2Fkernels%2Fjit%2Fcsrc%2Fdistributed%2Fcustom_all_reduce.cuh",
+      "sha": "724d80f86862cb673c26b6e42821c0626ce2d2ba",
+      "status": "modified"
+    },
+    {
+      "additions": 64,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/96f9eb8592ad788c594561be3fc2ef87480e2c59/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fconfigs%2Fcustom_all_reduce_v2.py",
+      "changes": 95,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fconfigs%2Fcustom_all_reduce_v2.py?ref=96f9eb8592ad788c594561be3fc2ef87480e2c59",
+      "deletions": 31,
+      "filename": "python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py",
+      "patch": "@@ -31,26 +31,36 @@ def clip(self, max_bytes: int) -> \"Range\":\n class Heuristic(NamedTuple):\n     \"\"\"Self-contained algo ranges for one dispatch context (graph or eager).\n \n-    Four algos are tried in order of preference (fastest first):\n+    Five algos are tried in order of preference (fastest first):\n       1. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``\n-      2. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``\n-      3. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``\n+      2. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``\n+      3. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``\n+      4. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``\n                             (only when multicast is enabled at runtime)\n-      4. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``\n+      5. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``\n     Above all of these, the caller falls back to NCCL.\n \n     Setting two adjacent thresholds equal effectively disables the middle\n-    algo; leaving ``mc`` at the default disables multicast.\n+    algo; leaving ``mc`` / ``two_shot_push_threshold`` at the default\n+    disables that algo.\n+\n+    The field order below is the positional layout of the table rows\n+    (``1shot_push, 1shot_pull, 2shot_pull, mc``); ``two_shot_push_threshold``\n+    is set by keyword, see ``_sm100_configs``.\n     \"\"\"\n \n     one_shot_push_threshold: int\n     one_shot_pull_threshold: int\n     two_shot_pull_threshold: int\n     mc: Range = Range(0, 0)  # default: multicast disabled in this context\n+    two_shot_push_threshold: int = 0  # default: 2shot_push disabled\n \n-    @property\n-    def max_push_bytes(self) -> int:\n-        return self.one_shot_push_threshold\n+    def max_push_bytes(self, world_size: int) -> int:\n+        \"\"\"Per-slot push plane bytes this heuristic needs.\"\"\"\n+        return max(\n+            self.one_shot_push_threshold,\n+            two_shot_push_slot_bytes(self.two_shot_push_threshold, world_size),\n+        )\n \n     @property\n     def max_pull_bytes(self) -> int:\n@@ -62,15 +72,32 @@ def max_pull_bytes(self) -> int:\n             self.mc.max_bytes,\n         )\n \n-    def clip(self, *, max_push_bytes: int, max_pull_bytes: int) -> \"Heuristic\":\n+    def clip(\n+        self, *, max_push_bytes: int, max_pull_bytes: int, world_size: int\n+    ) -> \"Heuristic\":\n         return Heuristic(\n-            min(self.one_shot_push_threshold, max_push_bytes),\n-            min(self.one_shot_pull_threshold, max_pull_bytes),\n-            min(self.two_shot_pull_threshold, max_pull_bytes),\n-            self.mc.clip(max_pull_bytes),\n+            one_shot_push_threshold=min(self.one_shot_push_threshold, max_push_bytes),\n+            one_shot_pull_threshold=min(self.one_shot_pull_threshold, max_pull_bytes),\n+            two_shot_pull_threshold=min(self.two_shot_pull_threshold, max_pull_bytes),\n+            mc=self.mc.clip(max_pull_bytes),\n+            two_shot_push_threshold=min(\n+                self.two_shot_push_threshold,\n+                two_shot_push_max_bytes(max_push_bytes, world_size),\n+            ),\n         )\n \n \n+def two_shot_push_slot_bytes(nbytes: int, world_size: int) -> int:\n+    \"\"\"A 2shot_push slot holds a partial half and a gathered half of one\n+    ``ceil(nbytes / world_size)`` chunk, in 16 B vectors.\"\"\"\n+    return 32 * -(-nbytes // (16 * world_size))\n+\n+\n+def two_shot_push_max_bytes(slot_bytes: int, world_size: int) -> int:\n+    \"\"\"Inverse of ``two_shot_push_slot_bytes``: the largest tensor a slot fits.\"\"\"\n+    return world_size * 16 * (slot_bytes // 32)\n+\n+\n class AllReduceConfig(NamedTuple):\n     \"\"\"All tuning knobs for a single (arch, world_size).\n \n@@ -88,22 +115,19 @@ class AllReduceConfig(NamedTuple):\n     num_pull_blocks: int\n     num_mc_blocks: Optional[int]\n \n-    @property\n-    def max_push_bytes(self) -> int:\n-        return max(self.graph.max_push_bytes, self.eager.max_push_bytes)\n+    def max_push_bytes(self, world_size: int) -> int:\n+        return max(\n+            self.graph.max_push_bytes(world_size),\n+            self.eager.max_push_bytes(world_size),\n+        )\n \n     @property\n     def max_pull_bytes(self) -> int:\n         return max(self.graph.max_pull_bytes, self.eager.max_pull_bytes)\n \n-    def clip(self, *, max_push_bytes: int, max_pull_bytes: int) -> \"AllReduceConfig\":\n+    def clip(self, **kwargs) -> \"AllReduceConfig\":\n         return self._replace(\n-            graph=self.graph.clip(\n-                max_push_bytes=max_push_bytes, max_pull_bytes=max_pull_bytes\n-            ),\n-            eager=self.eager.clip(\n-                max_push_bytes=max_push_bytes, max_pull_bytes=max_pull_bytes\n-            ),\n+            graph=self.graph.clip(**kwargs), eager=self.eager.clip(**kwargs)\n         )\n \n \n@@ -112,15 +136,22 @@ def _pack_heuristic(*args) -> Heuristic:\n     return Heuristic(*arg_list)\n \n \n-# SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200.\n+# SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200;\n+# the 2shot_push rows (world 4 / 8) on B300.\n @cache\n def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:\n     mc_blocks = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}\n \n-    def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:\n+    def config(\n+        world_size: int, *, graph: tuple, eager: tuple, two_shot_push: int = 0\n+    ) -> AllReduceConfig:\n         return AllReduceConfig(\n-            graph=_pack_heuristic(*graph),\n-            eager=_pack_heuristic(*eager),\n+            graph=_pack_heuristic(*graph)._replace(\n+                two_shot_push_threshold=two_shot_push\n+            ),\n+            eager=_pack_heuristic(*eager)._replace(\n+                two_shot_push_threshold=two_shot_push\n+            ),\n             num_push_blocks=num_sm,\n             num_pull_blocks=num_sm if world_size == 2 else 96,\n             num_mc_blocks=mc_blocks.get(world_size),\n@@ -139,8 +170,9 @@ def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:\n         ),\n         4: config(\n             4,\n-            graph=(2.250 * MB, 2.250 * MB, 128.0 * MB),\n-            eager=(3.000 * MB, 3.000 * MB, 32.00 * MB),\n+            graph=(0.625 * MB, 0.625 * MB, 128.0 * MB),\n+            eager=(0.625 * MB, 0.625 * MB, 32.00 * MB),\n+            two_shot_push=8 * MB,\n         ),\n         5: config(\n             5,\n@@ -159,8 +191,9 @@ def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:\n         ),\n         8: config(\n             8,\n-            graph=(0.500 * MB, 0.500 * MB, 128.0 * MB, Range(8 * MB, 128 * MB)),\n-            eager=(0.750 * MB, 0.750 * MB, 128.0 * MB, Range(0, 128 * MB)),\n+            graph=(256 * KB, 256 * KB, 128.0 * MB, Range(8 * MB, 128 * MB)),\n+            eager=(256 * KB, 256 * KB, 128.0 * MB, Range(0, 128 * MB)),\n+            two_shot_push=8 * MB,\n         ),\n         16: config(\n             16,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/96f9eb8592ad788c594561be3fc2ef87480e2c59/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fconfigs%2Fcustom_all_reduce_v2.py",
+      "sha": "26ffd5503dcee53e8add1c50904d4056e76f89df",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/96f9eb8592ad788c594561be3fc2ef87480e2c59/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_v2.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_v2.py?ref=96f9eb8592ad788c594561be3fc2ef87480e2c59",
+      "deletions": 2,
+      "filename": "python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py",
+      "patch": "@@ -145,7 +145,7 @@ def __init__(\n         if max_pull_size is None:\n             max_pull_size = min(base_config.max_pull_bytes, max_size)\n         if max_push_size is None:\n-            max_push_size = min(base_config.max_push_bytes, max_size)\n+            max_push_size = min(base_config.max_push_bytes(self.world_size), max_size)\n         if _FORCE_PULL_SIZE_KB is not None:\n             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024\n         if _FORCE_PUSH_SIZE_KB is not None:\n@@ -185,7 +185,9 @@ def force_thresholds(heuristic):\n         if max_push_blocks is not None:\n             num_push_blocks = max(max_push_blocks, 1)\n         self.config = base_config.clip(\n-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size\n+            max_push_bytes=self.max_push_size,\n+            max_pull_bytes=self.max_pull_size,\n+            world_size=self.world_size,\n         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)\n         self.override_algo: Optional[AllReduceAlgo] = None\n         # On a multi-node (MNNVL) group the symm-mem workspace plane works\n@@ -338,6 +340,8 @@ def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | No\n         can_use_multicast = self.config.num_mc_blocks is not None\n         if nbytes <= heuristic.one_shot_push_threshold:\n             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)\n+        if nbytes <= heuristic.two_shot_push_threshold:\n+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH)\n         if nbytes <= heuristic.one_shot_pull_threshold:\n             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)\n         if can_use_multicast and heuristic.mc.contains(nbytes):",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/96f9eb8592ad788c594561be3fc2ef87480e2c59/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_v2.py",
+      "sha": "9109f1bc896d8affe08ca6ea162b1cee27d06462",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/96f9eb8592ad788c594561be3fc2ef87480e2c59/test%2Fregistered%2Fkernels%2Fops%2Fcommunication%2Ftest_custom_all_reduce.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fkernels%2Fops%2Fcommunication%2Ftest_custom_all_reduce.py?ref=96f9eb8592ad788c594561be3fc2ef87480e2c59",
+      "deletions": 0,
+      "filename": "test/registered/kernels/ops/communication/test_custom_all_reduce.py",
+      "patch": "@@ -63,12 +63,14 @@\n     32 * 1024,\n     256 * 1024,\n     2 * 1024 * 1024,\n+    3 * 1024 * 1024 + 24,  # chunks not a multiple of world_size\n     4 * 1024 * 1024,\n ]\n TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]\n TEST_ALGOS = [\n     AllReduceAlgo.ONE_SHOT_PULL,\n     AllReduceAlgo.ONE_SHOT_PUSH,\n+    AllReduceAlgo.TWO_SHOT_PUSH,\n     AllReduceAlgo.TWO_SHOT_PULL,\n ]\n USE_GRAPH_OPTIONS = [False, True]",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/96f9eb8592ad788c594561be3fc2ef87480e2c59/test%2Fregistered%2Fkernels%2Fops%2Fcommunication%2Ftest_custom_all_reduce.py",
+      "sha": "941fdf444ba2681af961576fc89b95311ae69b2c",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "this is a bit weird. do we still need to keep it?",
+      "created_at": "2026-10-16T18:22:28Z",
+      "diff_hunk": "@@ -186,9 +192,33 @@ def test_custom_all_reduce(\n     dtype: torch.dtype,\n     algo: AllReduceAlgo,\n     use_graph: bool,\n+) -> None:\n+    _check_custom_all_reduce(size, dtype, algo, use_graph, _init_comm_once())\n+\n+\n+@pytest.mark.parametrize(\"use_graph\", USE_GRAPH_OPTIONS)\n+@pytest.mark.parametrize(\"dtype\", TEST_DTYPES)\n+@pytest.mark.parametrize(\"nbytes\", [32, 288 * 1024])\n+@torch.inference_mode()\n+def test_two_shot_push_single_block(\n+    nbytes: int, dtype: torch.dtype, use_graph: bool\n+) -> None:\n+    # At TP8 a 128-thread block has only four warps for seven peers. Both\n+    # sizes used to hang; the larger one also falls in SM100's tuned range.\n+    size = nbytes // torch.tensor([], dtype=dtype).element_size()\n+    _check_custom_all_reduce(\n+        size, dtype, AllReduceAlgo.TWO_SHOT_PUSH, use_graph, _init_comm_once(1)\n+    )",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42811#discussion_r4297943678",
+      "id": 4297943678,
+      "line": null,
+      "original_line": 211,
+      "path": "test/registered/kernels/ops/communication/test_custom_all_reduce.py",
+      "updated_at": "2026-10-16T18:22:28Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "<!-- pr-check-comment runs=38944512969 -->\nRequired checks failed on 427c934; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38944512969))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+      "created_at": "2026-10-16T18:08:36Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42811#issuecomment-6221764988",
+      "id": 6221764988,
+      "updated_at": "2026-10-16T18:32:31Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "<!-- pr-check-comment runs=38947874712 -->\nRequired checks failed on 96f9eb8; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38947874712))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+      "created_at": "2026-10-16T18:32:29Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42811#issuecomment-6222172682",
+      "id": 6222172682,
+      "updated_at": "2026-10-16T20:32:58Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 42811,
+  "refs": {
+    "base": {
+      "commit": "456231e2517dd29e78c77d20126c893b3f1a6675",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "96f9eb8592ad788c594561be3fc2ef87480e2c59",
+      "repository": "zcnrex/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42811#pullrequestreview-5529783015",
+      "id": 5529783015,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-15T07:46:05Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42811#pullrequestreview-5552011849",
+      "id": 5552011849,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-16T18:22:28Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "LGTM",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42811#pullrequestreview-5552020583",
+      "id": 5552020583,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-16T18:23:16Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    }
+  ]
+}

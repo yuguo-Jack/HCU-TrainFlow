@@ -1,0 +1,587 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "d50c736e78c7c020d386e7dec28bdc40394add88f103a6001fe6dab96b4600bf",
+      "isPrivate": false,
+      "numbers": [
+        58354,
+        58352,
+        58349,
+        58334,
+        58328,
+        58326,
+        58308,
+        58305
+      ],
+      "observed_at": "2026-10-19T19:32:43.286438+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4658,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "7173c64e2ec8763c6d8ddd5c3ff9cb6fc92e2da8",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\n`ROCMAiterMLASparseMetadataBuilder.build()` runs once per KV-cache group per scheduler step and launches two GPU ops whose results are not needed:\n\n1. **Unused `query_lens`.** `build()` computes `query_start_loc[1:] - query_start_loc[:-1]`, but `generate_sparse_seqlen_triton` only reads its size and device; the kernel derives per-request lengths from `cu_query_lens`. The parameter is dropped and `num_seqs` is taken as `cu_query_lens.size(0) - 1`.\n2. **Self-aliasing `fill_`.** `paged_kv_indptr[n + 1:].fill_(paged_kv_indptr[n])` passes a view of the tensor being filled, so ATen clones the value first. A broadcast `copy_` from the same element writes the same values without the clone.\n\n| op | aten ops | GPU kernels |\n|---|---|---|\n| `x[n+1:].fill_(x[n])` | `fill_` → `clone` (`empty_strided` + copy) → `copy_` | 2 |\n| `t.copy_(x[n].expand_as(t))` | `copy_` | 1 |\n| `qsl[1:] - qsl[:-1]` | `sub` (+ alloc) | 1 |\n\nEach `build()` launches two fewer kernels and makes two fewer device allocations, with no change in output. #57885 removed a similar dead op from the DSA indexer builder.\n\nOn ROCm, sparse-MLA layers that do not bring their own backend select `ROCM_AITER_MLA_SPARSE`. Of 18 current checkpoints probed on main (dummy weights, 8 layers, TP=1), three reach this `build()`:\n\n| model | binding | `build()` per decode step |\n|---|---|---:|\n| GLM-5.3 (`glm_moe_dsa`) | `DeepseekV32MLAAttention` → `ROCMAiterMLASparseBackend` | 2 |\n| GLM-5.3-Quark-MXFP4-AttnFP8 (`glm_moe_dsa`) | same | 2 |\n| GLM-5.3-Flash (`glm5_next`, DSA every 4th layer) | `MLAAttention` → `ROCMAiterMLASparseBackend` | 1 |\n\nDeepSeek-V4-Flash/Pro and V4.1-Flash use their own builders, and the other 12 have no sparse MLA. CUDA never selects this backend.\n\n## Test Plan\n\n- `pytest tests/kernels/attention/test_rocm_aiter_mla_sparse_metadata_sync.py`. The new `test_build_fills_paged_kv_indptr_tail` poisons the `paged_kv_indptr` tail and checks that it reads as the running total; it fails if the tail copy is removed.\n- Output equivalence: every benchmark run hashes the full `paged_kv_indptr` buffer (tail poisoned first), the returned metadata tensors and the AITER work/reduce metadata.\n- Micro: the real `build()` on a builder constructed from a real `VllmConfig` (`max_num_batched_tokens=8192`, top-k 2048, decode B ∈ {1, 7, 29, 61, 127}). Both implementations alternate on one builder, order flipped every pair, 300 warmup + 3000 pairs, in 3 processes. *Steady*: contexts > top-k, so the persistent-metadata key hits. *Growing*: the key misses, so `get_mla_metadata_v1` and a stream sync run on every build.\n- e2e: GLM-5.3-Flash, TP=2, `--kv-cache-dtype auto` (fp8 KV faults on main with `HSA_STATUS_ERROR_MEMORY_FAULT`, before and independent of this PR), a fresh server per run, 4 runs per arm with the first discarded.\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --max-model-len 8192 --no-enable-prefix-caching --trust-remote-code\nvllm bench serve --model zai-org/GLM-5.3-Flash --dataset-name random --random-input-len 1031 --random-output-len 509 \\\n    --random-range-ratio 0.25 --num-prompts 509 --max-concurrency 61 --request-rate inf --ignore-eos --seed 1234\n```\n- e2e: GLM-5.3-Flash, TP=2, `--kv-cache-dtype auto` (fp8 KV faults on main with `HSA_STATUS_ERROR_MEMORY_FAULT`, before and independent of this PR), a fresh server per run, 4 runs per arm with the first discarded.\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --max-model-len 8192 --no-enable-prefix-caching --trust-remote-code\nvllm bench serve --model zai-org/GLM-5.3-Flash --dataset-name random --random-input-len 1031 --random-output-len 509 \\\n    --random-range-ratio 0.25 --num-prompts 509 --max-concurrency 61 --request-rate inf --ignore-eos --seed 1234\n```\n- Accuracy: `lm_eval --model local-completions --tasks gsm8k --num_fewshot 5`, GLM-5.3-Flash, TP=2, `max_model_len=4096`, `--kv-cache-dtype auto`, `seed=1234`.\n\n## Test Result\n\n**Unit:** 5 passed on MI355X (gfx950), main `863475eb9c`. Output hashes match between the arms for every config and batch size.\n\n**Micro**, MI355X (gfx950), torch 2.12.0, main `c961121519`:\n\n| config | B | main (µs) | PR (µs) | paired Δ per call (µs), median [min, max] of 3 processes | gain |\n|---|---:|---:|---:|---|---:|\n| GLM-5.3, steady (AITER persistent path) | 1 | 91.48 | 80.68 | 10.82 [9.71, 10.89] | +11.2 % |\n| | 29 | 91.29 | 81.22 | 10.12 [9.71, 10.66] | +11.0 % |\n| | 127 | 91.62 | 81.22 | 10.55 [10.00, 10.59] | +11.1 % |\n| GLM-5.3, growing (metadata recompute every build) | 1 | 162.81 | 149.77 | 12.81 [11.92, 13.91] | +8.3 % |\n| | 29 | 170.80 | 158.44 | 12.03 [11.94, 13.72] | +7.5 % |\n| | 127 | 200.38 | 191.20 | 10.41 [9.88, 15.20] | +5.3 % |\n| GLM-5.3-Flash, steady (Triton sparse path) | 1 | 72.75 | 62.01 | 10.70 [10.41, 11.06] | +14.8 % |\n| | 29 | 72.80 | 61.98 | 10.83 [10.69, 11.37] | +15.0 % |\n| | 127 | 73.13 | 62.33 | 10.83 [10.79, 10.86] | +14.8 % |\n\nThe saving is a flat ~10.5 µs per call, independent of batch size and decode path; this PR is faster in 88–99 % of pairs. A blocked cross-process A/B on main `72e7874fa6` (4 runs per arm, the first discarded, median of runs 2–4) agrees: 10.6–12.3 µs saved when steady, 13.0–15.8 µs when growing, 12.9–13.4 µs on the non-persistent path, with identical output hashes. At one or two builds per decode step this is under 0.1 % of a GLM-5.3 decode step, below end-to-end noise.\n\n**e2e**, GLM-5.3-Flash (Triton sparse path), TP=2, 509 prompts in 1031 / out 509, concurrency 61, main `72e7874fa6`. The difference is within run-to-run spread, so no end-to-end speedup is claimed; per-run numbers are in the first comment.\n\n| GLM-5.3-Flash, TP=2, bf16 KV: median of runs 2–4 (range) | main | PR | Δ |\n|---|---:|---:|---:|\n| Total tok/s | 4509 (4492–4537) | 4534 (4493–4544) | +0.6 % |\n| Mean TTFT (ms) | 409.8 (406.4–430.2) | 407.9 (407.0–410.4) | -0.5 % |\n| Median TTFT (ms) | 170.2 (168.2–171.4) | 168.5 (167.1–171.4) | -1.0 % |\n| Mean TPOT (ms) | 38.96 (38.74–39.08) | 38.75 (38.66–39.13) | -0.6 % |\n| Median TPOT (ms) | 39.82 (39.67–39.97) | 39.73 (39.63–40.15) | -0.2 % |\n\n**GSM8K** (strict-match), GLM-5.3-Flash, TP=2, main `72e7874fa6`:\n\n| model | main | PR |\n|---|---:|---:|\n| GLM-5.3-Flash | 0.9105 | 0.9181 |\n\nPer-sample strict-match agreement with main is 1235/1319.\n\n---\n\nFound by [Hyperloom](https://github.com/AMD-AGI/Hyperloom); reviewed and measured by hand.\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhengGong-amd"
+            },
+            "body": "## e2e results, per run\n\nMI355X (gfx950), torch `2.12.0+rocm10.0.0`, aiter `0.1.23`, `VLLM_ROCM_USE_AITER=1`. Both arms run upstream main `72e7874fa6` Python on the image's compiled build (vLLM `0.30.1rc1.dev312+g36768d1bf`); the PR arm adds this diff only.\n\nEvery run starts a fresh server and waits for `/health`:\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --kv-cache-dtype auto --max-model-len 8192 \\\n    --no-enable-prefix-caching --gpu-memory-utilization 0.90 --trust-remote-code\nvllm bench serve --backend vllm --model zai-org/GLM-5.3-Flash --dataset-name random --random-input-len 1031 \\\n    --random-output-len 509 --random-range-ratio 0.25 --num-prompts 509 --max-concurrency 61 \\\n    --request-rate inf --ignore-eos --seed 1234\n```\n\n- Each arm runs in one block of 4 consecutive runs. The first run warms the compile caches and is not listed.\n- Host load is the 1-minute load average when the bench started → when it ended.\n- TTFT and TPOT are in ms.\n- fp8 KV is not used: on main, GLM-5.3-Flash with `--kv-cache-dtype fp8` hits `HSA_STATUS_ERROR_MEMORY_FAULT` during CUDA graph capture (and on the first decode with `--enforce-eager`).\n\n| arm | run | start (UTC) | total tok/s | mean TTFT | median TTFT | mean TPOT | median TPOT | host load |\n|---|---:|---|---:|---:|---:|---:|---:|---:|\n| main | 2 | 18:47 | 4492.0 | 430.2 | 171.4 | 39.08 | 39.97 | 50 → 9 |\n| main | 3 | 18:55 | 4509.0 | 409.8 | 170.2 | 38.96 | 39.82 | 114 → 12 |\n| main | 4 | 19:02 | 4536.7 | 406.4 | 168.2 | 38.74 | 39.67 | 98 → 11 |\n| PR | 2 | 19:19 | 4493.3 | 410.4 | 171.4 | 39.13 | 40.15 | 93 → 10 |\n| PR | 3 | 19:27 | 4533.9 | 407.9 | 168.5 | 38.75 | 39.73 | 98 → 11 |\n| PR | 4 | 19:34 | 4544.1 | 407.0 | 167.1 | 38.66 | 39.63 | 111 → 12 |\n",
+            "createdAt": "2026-10-01T01:45:05Z",
+            "databaseId": 5923051805,
+            "updatedAt": "2026-10-01T01:45:05Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-5923051805"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhengGong-amd"
+            },
+            "body": "@simondanielsson — GSM8K on the only end-to-end model that reaches this `build()` path.\n\n## GSM8K results\n\nMI355X (gfx950), torch `2.12.0+rocm10.0.0`, aiter `0.1.23`, `VLLM_ROCM_USE_AITER=1`. Both arms run upstream main `72e7874fa6` Python on the image's compiled build (vLLM `0.30.1rc1.dev312+g36768d1bf`); the PR arm adds this diff only.\n\nEach arm starts a fresh server, waits for `/health`, then runs lm_eval once:\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --kv-cache-dtype auto \\\n    --max-model-len 4096 --no-enable-prefix-caching --gpu-memory-utilization 0.90 --trust-remote-code\nlm_eval --model local-completions --tasks gsm8k --num_fewshot 5 --batch_size 1 --seed 1234 \\\n    --model_args model=/shared_nfs/models/GLM-5.3-Flash,base_url=http://127.0.0.1:PORT/v1/completions,\\\ntokenizer=/shared_nfs/models/GLM-5.3-Flash,tokenizer_backend=huggingface,trust_remote_code=True,\\\ntokenized_requests=False,num_concurrent=64,max_retries=5,max_gen_toks=256,timeout=3600 \\\n    --log_samples\n```\n\n- Host load is the 1-minute load average when the run started → when it ended.\n- `--kv-cache-dtype auto` (bf16 KV): fp8 KV faults on main with `HSA_STATUS_ERROR_MEMORY_FAULT` during graph capture, independent of this PR.\n\n| arm | start (UTC) | strict-match | flexible-extract | host load |\n|---|---|---:|---:|---|\n| main | 02:36 | 0.9105 | 0.9113 | 32 → 8 |\n| PR | 02:45 | 0.9181 | 0.9189 | 35 → 8 |\n\nPer-sample strict-match agreement with main: **1235 / 1319** (84 differ).\n",
+            "createdAt": "2026-10-01T02:56:13Z",
+            "databaseId": 5923808382,
+            "updatedAt": "2026-10-01T02:56:13Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-5923808382"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ @ZhengGong-amd, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-10-09T16:48:00Z",
+            "databaseId": 6085278973,
+            "updatedAt": "2026-10-09T16:48:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6085278973"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "simondanielsson"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-09T16:48:01Z",
+            "databaseId": 6085279367,
+            "updatedAt": "2026-10-09T16:48:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6085279367"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #93880](https://buildkite.com/vllm/ci/builds/93880) for commit `5303695524ca`.",
+            "createdAt": "2026-10-09T16:48:21Z",
+            "databaseId": 6085284397,
+            "updatedAt": "2026-10-09T16:48:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6085284397"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhengGong-amd"
+            },
+            "body": "Thank you @simondanielsson ! The CI test passed. Could you please merge this PR if you think this is ready :-)",
+            "createdAt": "2026-10-12T09:07:38Z",
+            "databaseId": 6121161423,
+            "updatedAt": "2026-10-12T09:07:38Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6121161423"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "vllm-agent"
+            },
+            "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 3 test steps (10 jobs) instead of 75 (99 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 75 (99) | 3 (10) | 74 (92) | 2 (3) |\n| AMD mirrors | 74 (96) | 10 (18) | 67 (81) | 3 (3) |\n\n<details><summary>Selector would run (3)</summary>\n\n- `cpu-kernel-tests` ×2\n- `dsv41-mono-decode-numerics-amd`\n- `kernels-attention-test` ×7\n</details>\n\n<details><summary>Would skip (today's rules run them) (74)</summary>\n\n- `amd-lm-eval-small-models-harness`\n- `amd-qwen3-next-mtp-async-eplb-accuracy`\n- `ascend-npu-test`\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-test-other-cpu`\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `batch-invariance-b200`\n- `batch-invariance-h100`\n- `benchmarks-cli-test`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `cpu-multimodal-config`\n- `cpu-params-env-tokenizers-parser`\n- `cpu-reasoning-renderers`\n- `cpu-tool-parsers`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `fusion-e2e-quick-h100`\n- `fusion-e2e-tp2-ar-rms-dynamo-partition-amd`\n- `fusion-e2e-tp2-ar-rms-inductor-partition-amd`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `metrics-tracing-2-gpus`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `multi-modal-processor-cpu` ×4\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `regression`\n- `rl-entrypoints-tests`\n- `spec-decode-mtp-deepseek-mimo`\n- `spec-decode-mtp-gemma4`\n- `spec-decode-mtp-qwen3-5`\n- `spec-decode-speculators`\n- `v1-attention-b200` ×2\n- `v1-attention-h100-mi300` ×2\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-kv-offload`\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-others-cpu`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (2)</summary>\n\n- `cpu-kernel-tests` ×2 (code map)\n- `dsv41-mono-decode-numerics-amd` (code map)\n</details>\n\n<details><summary>AMD mirrors: would skip (67)</summary>\n\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-tests-initialization`\n- `benchmarks-cli-test`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `extract-hidden-states-integration-2-gpus`\n- `fusion-and-compile-unit-tests-2xb200`\n- `fusion-e2e-quick-h100`\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `language-models-tests-extra-standard` ×2\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `lm-eval-small-models`\n- `metrics-tracing-2-gpus`\n- `mrcr-eval-small-models`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `openai-api-correctness`\n- `pipeline-context-parallelism-4-gpus`\n- `platform-tests`\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `quantized-moe-test-b200`\n- `regression`\n- `spec-decode-mtp-deepseek-mimo`\n- `spec-decode-mtp-gemma4`\n- `spec-decode-mtp-qwen3-5`\n- `spec-decode-speculators`\n- `v1-attention-b200` ×2\n- `v1-attention-h100-mi300` ×2\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-kv-offload`\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>AMD mirrors: would add (3)</summary>\n\n- `pytorch-nightly-dependency-override-check` (code map)\n- `ray-dependency-compatibility-check` (code map)\n- `torch-stable-abi-audit` (code map)\n</details>\n\n<sub>2 changed files · base `f47792af7f` · head `6586df210b` · Python record: build 93039 at `1e5d0ea888` · kernel record: table fe341a53dd (build 94315), map fe341a53dd · not counted: 11 build steps, 5 A100 steps the generator no longer emits, 11 optional steps the selector would also run</sub>\n",
+            "createdAt": "2026-10-12T09:49:46Z",
+            "databaseId": 6121822764,
+            "updatedAt": "2026-10-13T03:16:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6121822764"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "simondanielsson"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-12T13:25:52Z",
+            "databaseId": 6125209310,
+            "updatedAt": "2026-10-12T13:25:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6125209310"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "❌ This PR is 1 commit behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:6125209310 -->",
+            "createdAt": "2026-10-12T13:27:40Z",
+            "databaseId": 6125239223,
+            "updatedAt": "2026-10-12T13:27:40Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6125239223"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @ZhengGong-amd.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-12T16:24:39Z",
+            "databaseId": 6128286063,
+            "updatedAt": "2026-10-12T16:24:39Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6128286063"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhengGong-amd"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-13T02:05:26Z",
+            "databaseId": 6136563684,
+            "updatedAt": "2026-10-13T02:05:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6136563684"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94351](https://buildkite.com/vllm/ci/builds/94351) for commit `6586df210bac`.",
+            "createdAt": "2026-10-13T02:05:46Z",
+            "databaseId": 6136570695,
+            "updatedAt": "2026-10-13T02:05:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6136570695"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhengGong-amd"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-13T08:57:13Z",
+            "databaseId": 6141997980,
+            "updatedAt": "2026-10-13T08:57:13Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6141997980"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94426](https://buildkite.com/vllm/ci/builds/94426) for commit `fcf66a3cfd59`.",
+            "createdAt": "2026-10-13T08:57:34Z",
+            "databaseId": 6142003644,
+            "updatedAt": "2026-10-13T08:57:34Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6142003644"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhengGong-amd"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-13T10:20:25Z",
+            "databaseId": 6143408260,
+            "updatedAt": "2026-10-13T10:20:25Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6143408260"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #94455](https://buildkite.com/vllm/ci/builds/94455) for commit `aa7438fa42ba`.",
+            "createdAt": "2026-10-13T10:21:00Z",
+            "databaseId": 6143417844,
+            "updatedAt": "2026-10-13T10:21:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6143417844"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW4tHfQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 16
+      },
+      "headRefOid": "aa7438fa42ba3fc319d368154ae1e31e60ac6f2b",
+      "headRepository": {
+        "nameWithOwner": "ZhengGong-amd/vllm"
+      },
+      "mergeCommit": {
+        "oid": "355553ac22dca4080929ea8f88a446f15df1f3ba"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-14T16:15:51Z",
+      "number": 58354,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5365428860,
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-30T11:16:56Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#pullrequestreview-5365428860"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "simondanielsson"
+            },
+            "body": "LGTM, can we attach gsm8k before and after just to validate we're not breaking anything (even though I doubt it :) ) ",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5366848350,
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-30T13:29:11Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#pullrequestreview-5366848350"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "simondanielsson"
+            },
+            "body": "LGTM\n\nI'm aware this small perf change can't really be measured e2e but imo it's good we're cleaning up the metadata build (as e.g. for GLM-5.3-Flash it's taking a non-trivial amount of time per step)",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5380403063,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-01T14:05:33Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58354#pullrequestreview-5380403063"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wMVQxNDowNTozM1q0MjAyNi0xMC0wMVQxNDowNTozM1rPAAAAAUCyb3c=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "MERGED",
+      "title": "[ROCm][Perf] Drop two dead per-step ops from the AITER sparse MLA metadata build",
+      "updatedAt": "2026-10-14T16:15:52Z",
+      "url": "https://github.com/vllm-project/vllm/pull/58354"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "7173c64e2ec8763c6d8ddd5c3ff9cb6fc92e2da8"
+    },
+    "body": "## Purpose\n\n`ROCMAiterMLASparseMetadataBuilder.build()` runs once per KV-cache group per scheduler step and launches two GPU ops whose results are not needed:\n\n1. **Unused `query_lens`.** `build()` computes `query_start_loc[1:] - query_start_loc[:-1]`, but `generate_sparse_seqlen_triton` only reads its size and device; the kernel derives per-request lengths from `cu_query_lens`. The parameter is dropped and `num_seqs` is taken as `cu_query_lens.size(0) - 1`.\n2. **Self-aliasing `fill_`.** `paged_kv_indptr[n + 1:].fill_(paged_kv_indptr[n])` passes a view of the tensor being filled, so ATen clones the value first. A broadcast `copy_` from the same element writes the same values without the clone.\n\n| op | aten ops | GPU kernels |\n|---|---|---|\n| `x[n+1:].fill_(x[n])` | `fill_` → `clone` (`empty_strided` + copy) → `copy_` | 2 |\n| `t.copy_(x[n].expand_as(t))` | `copy_` | 1 |\n| `qsl[1:] - qsl[:-1]` | `sub` (+ alloc) | 1 |\n\nEach `build()` launches two fewer kernels and makes two fewer device allocations, with no change in output. #57885 removed a similar dead op from the DSA indexer builder.\n\nOn ROCm, sparse-MLA layers that do not bring their own backend select `ROCM_AITER_MLA_SPARSE`. Of 18 current checkpoints probed on main (dummy weights, 8 layers, TP=1), three reach this `build()`:\n\n| model | binding | `build()` per decode step |\n|---|---|---:|\n| GLM-5.3 (`glm_moe_dsa`) | `DeepseekV32MLAAttention` → `ROCMAiterMLASparseBackend` | 2 |\n| GLM-5.3-Quark-MXFP4-AttnFP8 (`glm_moe_dsa`) | same | 2 |\n| GLM-5.3-Flash (`glm5_next`, DSA every 4th layer) | `MLAAttention` → `ROCMAiterMLASparseBackend` | 1 |\n\nDeepSeek-V4-Flash/Pro and V4.1-Flash use their own builders, and the other 12 have no sparse MLA. CUDA never selects this backend.\n\n## Test Plan\n\n- `pytest tests/kernels/attention/test_rocm_aiter_mla_sparse_metadata_sync.py`. The new `test_build_fills_paged_kv_indptr_tail` poisons the `paged_kv_indptr` tail and checks that it reads as the running total; it fails if the tail copy is removed.\n- Output equivalence: every benchmark run hashes the full `paged_kv_indptr` buffer (tail poisoned first), the returned metadata tensors and the AITER work/reduce metadata.\n- Micro: the real `build()` on a builder constructed from a real `VllmConfig` (`max_num_batched_tokens=8192`, top-k 2048, decode B ∈ {1, 7, 29, 61, 127}). Both implementations alternate on one builder, order flipped every pair, 300 warmup + 3000 pairs, in 3 processes. *Steady*: contexts > top-k, so the persistent-metadata key hits. *Growing*: the key misses, so `get_mla_metadata_v1` and a stream sync run on every build.\n- e2e: GLM-5.3-Flash, TP=2, `--kv-cache-dtype auto` (fp8 KV faults on main with `HSA_STATUS_ERROR_MEMORY_FAULT`, before and independent of this PR), a fresh server per run, 4 runs per arm with the first discarded.\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --max-model-len 8192 --no-enable-prefix-caching --trust-remote-code\nvllm bench serve --model zai-org/GLM-5.3-Flash --dataset-name random --random-input-len 1031 --random-output-len 509 \\\n    --random-range-ratio 0.25 --num-prompts 509 --max-concurrency 61 --request-rate inf --ignore-eos --seed 1234\n```\n- e2e: GLM-5.3-Flash, TP=2, `--kv-cache-dtype auto` (fp8 KV faults on main with `HSA_STATUS_ERROR_MEMORY_FAULT`, before and independent of this PR), a fresh server per run, 4 runs per arm with the first discarded.\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --max-model-len 8192 --no-enable-prefix-caching --trust-remote-code\nvllm bench serve --model zai-org/GLM-5.3-Flash --dataset-name random --random-input-len 1031 --random-output-len 509 \\\n    --random-range-ratio 0.25 --num-prompts 509 --max-concurrency 61 --request-rate inf --ignore-eos --seed 1234\n```\n- Accuracy: `lm_eval --model local-completions --tasks gsm8k --num_fewshot 5`, GLM-5.3-Flash, TP=2, `max_model_len=4096`, `--kv-cache-dtype auto`, `seed=1234`.\n\n## Test Result\n\n**Unit:** 5 passed on MI355X (gfx950), main `863475eb9c`. Output hashes match between the arms for every config and batch size.\n\n**Micro**, MI355X (gfx950), torch 2.12.0, main `c961121519`:\n\n| config | B | main (µs) | PR (µs) | paired Δ per call (µs), median [min, max] of 3 processes | gain |\n|---|---:|---:|---:|---|---:|\n| GLM-5.3, steady (AITER persistent path) | 1 | 91.48 | 80.68 | 10.82 [9.71, 10.89] | +11.2 % |\n| | 29 | 91.29 | 81.22 | 10.12 [9.71, 10.66] | +11.0 % |\n| | 127 | 91.62 | 81.22 | 10.55 [10.00, 10.59] | +11.1 % |\n| GLM-5.3, growing (metadata recompute every build) | 1 | 162.81 | 149.77 | 12.81 [11.92, 13.91] | +8.3 % |\n| | 29 | 170.80 | 158.44 | 12.03 [11.94, 13.72] | +7.5 % |\n| | 127 | 200.38 | 191.20 | 10.41 [9.88, 15.20] | +5.3 % |\n| GLM-5.3-Flash, steady (Triton sparse path) | 1 | 72.75 | 62.01 | 10.70 [10.41, 11.06] | +14.8 % |\n| | 29 | 72.80 | 61.98 | 10.83 [10.69, 11.37] | +15.0 % |\n| | 127 | 73.13 | 62.33 | 10.83 [10.79, 10.86] | +14.8 % |\n\nThe saving is a flat ~10.5 µs per call, independent of batch size and decode path; this PR is faster in 88–99 % of pairs. A blocked cross-process A/B on main `72e7874fa6` (4 runs per arm, the first discarded, median of runs 2–4) agrees: 10.6–12.3 µs saved when steady, 13.0–15.8 µs when growing, 12.9–13.4 µs on the non-persistent path, with identical output hashes. At one or two builds per decode step this is under 0.1 % of a GLM-5.3 decode step, below end-to-end noise.\n\n**e2e**, GLM-5.3-Flash (Triton sparse path), TP=2, 509 prompts in 1031 / out 509, concurrency 61, main `72e7874fa6`. The difference is within run-to-run spread, so no end-to-end speedup is claimed; per-run numbers are in the first comment.\n\n| GLM-5.3-Flash, TP=2, bf16 KV: median of runs 2–4 (range) | main | PR | Δ |\n|---|---:|---:|---:|\n| Total tok/s | 4509 (4492–4537) | 4534 (4493–4544) | +0.6 % |\n| Mean TTFT (ms) | 409.8 (406.4–430.2) | 407.9 (407.0–410.4) | -0.5 % |\n| Median TTFT (ms) | 170.2 (168.2–171.4) | 168.5 (167.1–171.4) | -1.0 % |\n| Mean TPOT (ms) | 38.96 (38.74–39.08) | 38.75 (38.66–39.13) | -0.6 % |\n| Median TPOT (ms) | 39.82 (39.67–39.97) | 39.73 (39.63–40.15) | -0.2 % |\n\n**GSM8K** (strict-match), GLM-5.3-Flash, TP=2, main `72e7874fa6`:\n\n| model | main | PR |\n|---|---:|---:|\n| GLM-5.3-Flash | 0.9105 | 0.9181 |\n\nPer-sample strict-match agreement with main is 1235/1319.\n\n---\n\nFound by [Hyperloom](https://github.com/AMD-AGI/Hyperloom); reviewed and measured by hand.\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "ZhengGong-amd/vllm"
+      },
+      "sha": "aa7438fa42ba3fc319d368154ae1e31e60ac6f2b"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/58354",
+    "merge_commit_sha": "355553ac22dca4080929ea8f88a446f15df1f3ba",
+    "merged": true,
+    "merged_at": "2026-10-14T16:15:51Z",
+    "number": 58354,
+    "state": "closed",
+    "title": "[ROCm][Perf] Drop two dead per-step ops from the AITER sparse MLA metadata build",
+    "updated_at": "2026-10-14T16:15:52Z"
+  },
+  "files": [
+    {
+      "additions": 25,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/aa7438fa42ba3fc319d368154ae1e31e60ac6f2b/tests%2Fkernels%2Fattention%2Ftest_rocm_aiter_mla_sparse_metadata_sync.py",
+      "changes": 31,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fattention%2Ftest_rocm_aiter_mla_sparse_metadata_sync.py?ref=aa7438fa42ba3fc319d368154ae1e31e60ac6f2b",
+      "deletions": 6,
+      "filename": "tests/kernels/attention/test_rocm_aiter_mla_sparse_metadata_sync.py",
+      "patch": "@@ -223,7 +223,7 @@ def _patch_build_deps(monkeypatch, events=None):\n     on CPU.\"\"\"\n \n     def fake_generate_sparse_seqlen_triton(\n-        query_lens, seq_lens, cu_query_lens, topk_token, num_tokens, max_query_len\n+        seq_lens, cu_query_lens, topk_token, num_tokens, max_query_len\n     ):\n         return torch.zeros(num_tokens, dtype=torch.int32, device=\"cpu\")\n \n@@ -276,6 +276,25 @@ def test_build_populates_mixed_split_fields(monkeypatch):\n     assert md.prefill is None\n \n \n+def test_build_fills_paged_kv_indptr_tail(monkeypatch):\n+    \"\"\"Rows past num_tokens must read as empty: the tail repeats the total.\"\"\"\n+    builder = _make_builder()\n+    _patch_build_deps(monkeypatch)\n+    monkeypatch.setattr(\n+        sparse_mod,\n+        \"generate_sparse_seqlen_triton\",\n+        lambda *args, **kwargs: torch.tensor([3, 5], dtype=torch.int32),\n+    )\n+    builder.paged_kv_indptr[1:].fill_(-1)\n+\n+    md = builder.build(\n+        common_prefix_len=0, common_attn_metadata=_make_common_metadata()\n+    )\n+\n+    assert md.paged_kv_indptr.tolist() == [0, 3, 8]\n+    assert builder.paged_kv_indptr.tolist() == [0, 3, 8, 8, 8, 8, 8, 8, 8]\n+\n+\n def test_sink_build_skips_persistent_metadata(monkeypatch):\n     builder = _make_builder()\n     builder._use_persistent_metadata = False\n@@ -385,10 +404,10 @@ def test_dense_prefill_builds_sparse_metadata_for_decode_subset(monkeypatch):\n     sparse_call: dict[str, torch.Tensor] = {}\n \n     def fake_generate_sparse_seqlen(\n-        query_lens, sparse_seq_lens, sparse_query_start_loc, topk, num_tokens, max_q\n+        sparse_seq_lens, sparse_query_start_loc, topk, num_tokens, max_q\n     ):\n         sparse_call.update(\n-            query_lens=query_lens.clone(),\n+            query_lens=torch.diff(sparse_query_start_loc),\n             seq_lens=sparse_seq_lens.clone(),\n             query_start_loc=sparse_query_start_loc.clone(),\n             num_tokens=num_tokens,\n@@ -471,10 +490,10 @@ def test_long_prefill_shares_full_sparse_metadata_with_decode(monkeypatch):\n     sparse_call: dict[str, torch.Tensor] = {}\n \n     def fake_generate_sparse_seqlen(\n-        query_lens, sparse_seq_lens, sparse_query_start_loc, topk, num_tokens, max_q\n+        sparse_seq_lens, sparse_query_start_loc, topk, num_tokens, max_q\n     ):\n         sparse_call.update(\n-            query_lens=query_lens.clone(),\n+            query_lens=torch.diff(sparse_query_start_loc),\n             seq_lens=sparse_seq_lens.clone(),\n             query_start_loc=sparse_query_start_loc.clone(),\n             num_tokens=num_tokens,\n@@ -699,7 +718,7 @@ def test_sparse_metadata_workload_length_dtype_matrix(\n     monkeypatch.setattr(\n         sparse_mod,\n         \"generate_sparse_seqlen_triton\",\n-        lambda *args, **kwargs: torch.ones(args[4], dtype=torch.int32),\n+        lambda *args, **kwargs: torch.ones(args[3], dtype=torch.int32),\n     )\n     get_persistent_metadata = Mock()\n     fake_aiter = _FakeAiter(\"aiter\")",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/aa7438fa42ba3fc319d368154ae1e31e60ac6f2b/tests%2Fkernels%2Fattention%2Ftest_rocm_aiter_mla_sparse_metadata_sync.py",
+      "sha": "b92f09388015cef74987a7440998cb35230cb07d",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/aa7438fa42ba3fc319d368154ae1e31e60ac6f2b/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Frocm_aiter_mla_sparse.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Frocm_aiter_mla_sparse.py?ref=aa7438fa42ba3fc319d368154ae1e31e60ac6f2b",
+      "deletions": 6,
+      "filename": "vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py",
+      "patch": "@@ -322,16 +322,15 @@ def generate_sparse_seqlen_kernel(\n \n \n def generate_sparse_seqlen_triton(\n-    query_lens: torch.Tensor,\n     seq_lens: torch.Tensor,\n     cu_query_lens: torch.Tensor,\n     topk_token: int,\n     num_tokens: int,\n     max_query_len: int,\n ):\n-    num_seqs = query_lens.size(0)\n+    num_seqs = cu_query_lens.size(0) - 1\n     # zero initialize the tensor to make sure invalid positions will be zero\n-    out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)\n+    out = torch.zeros([num_tokens], dtype=torch.int32, device=cu_query_lens.device)\n     block_size = 64\n     num_block_per_row = triton.cdiv(max_query_len, block_size)\n     grid = (\n@@ -627,10 +626,8 @@ def build(\n             np_to_pinned_tensor(req_id_per_token), non_blocking=True\n         )\n         query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]\n-        query_lens = query_start_loc[1:] - query_start_loc[:-1]\n         seq_lens = common_attn_metadata.seq_lens[:num_reqs]\n         sparse_seqlen = generate_sparse_seqlen_triton(\n-            query_lens,\n             seq_lens,\n             query_start_loc,\n             self.topk_tokens,\n@@ -639,7 +636,9 @@ def build(\n         )\n \n         torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])\n-        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])\n+        # fill_() with a value that aliases the destination clones it first.\n+        indptr_tail = self.paged_kv_indptr[num_tokens + 1 :]\n+        indptr_tail.copy_(self.paged_kv_indptr[num_tokens].expand_as(indptr_tail))\n \n         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]\n         qo_indptr = self.qo_indptr[: num_tokens + 1]",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/aa7438fa42ba3fc319d368154ae1e31e60ac6f2b/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Frocm_aiter_mla_sparse.py",
+      "sha": "be05fba63c51c40233ad0bbdbfcda208e4dd588d",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "## e2e results, per run\n\nMI355X (gfx950), torch `2.12.0+rocm10.0.0`, aiter `0.1.23`, `VLLM_ROCM_USE_AITER=1`. Both arms run upstream main `72e7874fa6` Python on the image's compiled build (vLLM `0.30.1rc1.dev312+g36768d1bf`); the PR arm adds this diff only.\n\nEvery run starts a fresh server and waits for `/health`:\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --kv-cache-dtype auto --max-model-len 8192 \\\n    --no-enable-prefix-caching --gpu-memory-utilization 0.90 --trust-remote-code\nvllm bench serve --backend vllm --model zai-org/GLM-5.3-Flash --dataset-name random --random-input-len 1031 \\\n    --random-output-len 509 --random-range-ratio 0.25 --num-prompts 509 --max-concurrency 61 \\\n    --request-rate inf --ignore-eos --seed 1234\n```\n\n- Each arm runs in one block of 4 consecutive runs. The first run warms the compile caches and is not listed.\n- Host load is the 1-minute load average when the bench started → when it ended.\n- TTFT and TPOT are in ms.\n- fp8 KV is not used: on main, GLM-5.3-Flash with `--kv-cache-dtype fp8` hits `HSA_STATUS_ERROR_MEMORY_FAULT` during CUDA graph capture (and on the first decode with `--enforce-eager`).\n\n| arm | run | start (UTC) | total tok/s | mean TTFT | median TTFT | mean TPOT | median TPOT | host load |\n|---|---:|---|---:|---:|---:|---:|---:|---:|\n| main | 2 | 18:47 | 4492.0 | 430.2 | 171.4 | 39.08 | 39.97 | 50 → 9 |\n| main | 3 | 18:55 | 4509.0 | 409.8 | 170.2 | 38.96 | 39.82 | 114 → 12 |\n| main | 4 | 19:02 | 4536.7 | 406.4 | 168.2 | 38.74 | 39.67 | 98 → 11 |\n| PR | 2 | 19:19 | 4493.3 | 410.4 | 171.4 | 39.13 | 40.15 | 93 → 10 |\n| PR | 3 | 19:27 | 4533.9 | 407.9 | 168.5 | 38.75 | 39.73 | 98 → 11 |\n| PR | 4 | 19:34 | 4544.1 | 407.0 | 167.1 | 38.66 | 39.63 | 111 → 12 |\n",
+      "created_at": "2026-10-01T01:45:05Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-5923051805",
+      "id": 5923051805,
+      "updated_at": "2026-10-01T01:45:05Z",
+      "user": {
+        "login": "ZhengGong-amd"
+      }
+    },
+    {
+      "body": "@simondanielsson — GSM8K on the only end-to-end model that reaches this `build()` path.\n\n## GSM8K results\n\nMI355X (gfx950), torch `2.12.0+rocm10.0.0`, aiter `0.1.23`, `VLLM_ROCM_USE_AITER=1`. Both arms run upstream main `72e7874fa6` Python on the image's compiled build (vLLM `0.30.1rc1.dev312+g36768d1bf`); the PR arm adds this diff only.\n\nEach arm starts a fresh server, waits for `/health`, then runs lm_eval once:\n\n```bash\nvllm serve zai-org/GLM-5.3-Flash --tensor-parallel-size 2 --kv-cache-dtype auto \\\n    --max-model-len 4096 --no-enable-prefix-caching --gpu-memory-utilization 0.90 --trust-remote-code\nlm_eval --model local-completions --tasks gsm8k --num_fewshot 5 --batch_size 1 --seed 1234 \\\n    --model_args model=/shared_nfs/models/GLM-5.3-Flash,base_url=http://127.0.0.1:PORT/v1/completions,\\\ntokenizer=/shared_nfs/models/GLM-5.3-Flash,tokenizer_backend=huggingface,trust_remote_code=True,\\\ntokenized_requests=False,num_concurrent=64,max_retries=5,max_gen_toks=256,timeout=3600 \\\n    --log_samples\n```\n\n- Host load is the 1-minute load average when the run started → when it ended.\n- `--kv-cache-dtype auto` (bf16 KV): fp8 KV faults on main with `HSA_STATUS_ERROR_MEMORY_FAULT` during graph capture, independent of this PR.\n\n| arm | start (UTC) | strict-match | flexible-extract | host load |\n|---|---|---:|---:|---|\n| main | 02:36 | 0.9105 | 0.9113 | 32 → 8 |\n| PR | 02:45 | 0.9181 | 0.9189 | 35 → 8 |\n\nPer-sample strict-match agreement with main: **1235 / 1319** (84 differ).\n",
+      "created_at": "2026-10-01T02:56:13Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-5923808382",
+      "id": 5923808382,
+      "updated_at": "2026-10-01T02:56:13Z",
+      "user": {
+        "login": "ZhengGong-amd"
+      }
+    },
+    {
+      "body": "✅ @ZhengGong-amd, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Your branch must contain every commit currently on its upstream target branch. Merge or rebase onto the latest target branch, then rerun the command. Append `--allow-stale` to a run command to test an outdated branch at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-10-09T16:48:00Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6085278973",
+      "id": 6085278973,
+      "updated_at": "2026-10-09T16:48:00Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-09T16:48:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6085279367",
+      "id": 6085279367,
+      "updated_at": "2026-10-09T16:48:01Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #93880](https://buildkite.com/vllm/ci/builds/93880) for commit `5303695524ca`.",
+      "created_at": "2026-10-09T16:48:21Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6085284397",
+      "id": 6085284397,
+      "updated_at": "2026-10-09T16:48:21Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "Thank you @simondanielsson ! The CI test passed. Could you please merge this PR if you think this is ready :-)",
+      "created_at": "2026-10-12T09:07:38Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6121161423",
+      "id": 6121161423,
+      "updated_at": "2026-10-12T09:07:38Z",
+      "user": {
+        "login": "ZhengGong-amd"
+      }
+    },
+    {
+      "body": "<!-- ci-selector-shadow -->\n### CI selector (shadow): 3 test steps (10 jobs) instead of 75 (99 jobs)\n\nShadow mode: this changes nothing about what CI runs. It shows what the evidence-based selector would pick for this PR, next to today's rules. [How it works](https://github.com/vllm-project/ci-infra/tree/main/buildkite/ci_selector).\n\n**Feedback welcome:** reply here if it would skip a step this change needs, or runs something unrelated.\n\n| steps (jobs) | Today's rules | Selector | Would skip | Would add |\n|---|---|---|---|---|\n| NVIDIA, CPU and others | 75 (99) | 3 (10) | 74 (92) | 2 (3) |\n| AMD mirrors | 74 (96) | 10 (18) | 67 (81) | 3 (3) |\n\n<details><summary>Selector would run (3)</summary>\n\n- `cpu-kernel-tests` ×2\n- `dsv41-mono-decode-numerics-amd`\n- `kernels-attention-test` ×7\n</details>\n\n<details><summary>Would skip (today's rules run them) (74)</summary>\n\n- `amd-lm-eval-small-models-harness`\n- `amd-qwen3-next-mtp-async-eplb-accuracy`\n- `ascend-npu-test`\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-test-other-cpu`\n- `basic-models-tests-initialization`\n- `basic-models-tests-other`\n- `batch-invariance-b200`\n- `batch-invariance-h100`\n- `benchmarks-cli-test`\n- `cpu-language-generation-and-pooling-model-tests` ×3\n- `cpu-multimodal-config`\n- `cpu-params-env-tokenizers-parser`\n- `cpu-reasoning-renderers`\n- `cpu-tool-parsers`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `fusion-e2e-quick-h100`\n- `fusion-e2e-tp2-ar-rms-dynamo-partition-amd`\n- `fusion-e2e-tp2-ar-rms-inductor-partition-amd`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `metrics-tracing-2-gpus`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `multi-modal-processor-cpu` ×4\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `regression`\n- `rl-entrypoints-tests`\n- `spec-decode-mtp-deepseek-mimo`\n- `spec-decode-mtp-gemma4`\n- `spec-decode-mtp-qwen3-5`\n- `spec-decode-speculators`\n- `v1-attention-b200` ×2\n- `v1-attention-h100-mi300` ×2\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-kv-offload`\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-others-cpu`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>Would add (today's rules do not run them) (2)</summary>\n\n- `cpu-kernel-tests` ×2 (code map)\n- `dsv41-mono-decode-numerics-amd` (code map)\n</details>\n\n<details><summary>AMD mirrors: would skip (67)</summary>\n\n- `async-engine-inputs-utils-worker`\n- `basic-correctness` ×2\n- `basic-correctness-cpu-offload`\n- `basic-correctness-cumem`\n- `basic-correctness-prefetch-offload`\n- `basic-correctness-sleep-mode`\n- `basic-models-tests-initialization`\n- `benchmarks-cli-test`\n- `e2e-core-1-gpu`\n- `e2e-core-large-memory`\n- `e2e-scheduling-1-gpu`\n- `e2e-scheduling-accuracy-1-gpu`\n- `entrypoints-integration-api-server` ×4\n- `entrypoints-integration-api-server-generate`\n- `entrypoints-integration-api-server-openai-chat_completion`\n- `entrypoints-integration-api-server-openai-completion`\n- `entrypoints-integration-llm`\n- `entrypoints-integration-multimodal`\n- `entrypoints-integration-pooling`\n- `entrypoints-integration-responses-api`\n- `entrypoints-integration-speech_to_text`\n- `extract-hidden-states-integration-2-gpus`\n- `fusion-and-compile-unit-tests-2xb200`\n- `fusion-e2e-quick-h100`\n- `fusion-e2e-tp2-ar-rms-config-sweep-h100`\n- `fusion-e2e-tp2-b200`\n- `fusion-e2e-tp2-quick-h100`\n- `kernels-fla-ops-test-b200`\n- `kernels-mhc-test-b200`\n- `kernels-root-misc-test-b200`\n- `language-models-tests-extra-standard` ×2\n- `language-models-tests-granite-l4-compatibility`\n- `language-models-tests-hybrid` ×2\n- `language-models-tests-standard`\n- `lm-eval-small-models`\n- `metrics-tracing-2-gpus`\n- `mrcr-eval-small-models`\n- `multi-modal-models-standard-1-qwen2`\n- `multi-modal-models-standard-2-qwen3-gemma`\n- `multi-modal-models-standard-3-llava-qwen2-vl`\n- `multi-modal-models-standard-4-other-whisper`\n- `multi-modal-processor` ×4\n- `openai-api-correctness`\n- `pipeline-context-parallelism-4-gpus`\n- `platform-tests`\n- `pytorch-compilation-dynamic-shapes`\n- `pytorch-compilation-passes-unit-tests`\n- `pytorch-compilation-unit-tests`\n- `pytorch-compilation-unit-tests-h100`\n- `pytorch-fullgraph-cudagraph-l4-compatibility`\n- `pytorch-fullgraph-test`\n- `quantized-moe-test-b200`\n- `regression`\n- `spec-decode-mtp-deepseek-mimo`\n- `spec-decode-mtp-gemma4`\n- `spec-decode-mtp-qwen3-5`\n- `spec-decode-speculators`\n- `v1-attention-b200` ×2\n- `v1-attention-h100-mi300` ×2\n- `v1-core`\n- `v1-executor-worker`\n- `v1-kv-connectors` ×4\n- `v1-kv-offload`\n- `v1-logits-oracle`\n- `v1-metrics-lmeval`\n- `v1-sample`\n- `v1-spec-decode`\n</details>\n\n<details><summary>AMD mirrors: would add (3)</summary>\n\n- `pytorch-nightly-dependency-override-check` (code map)\n- `ray-dependency-compatibility-check` (code map)\n- `torch-stable-abi-audit` (code map)\n</details>\n\n<sub>2 changed files · base `f47792af7f` · head `6586df210b` · Python record: build 93039 at `1e5d0ea888` · kernel record: table fe341a53dd (build 94315), map fe341a53dd · not counted: 11 build steps, 5 A100 steps the generator no longer emits, 11 optional steps the selector would also run</sub>\n",
+      "created_at": "2026-10-12T09:49:46Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6121822764",
+      "id": 6121822764,
+      "updated_at": "2026-10-13T03:16:46Z",
+      "user": {
+        "login": "vllm-agent"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-12T13:25:52Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6125209310",
+      "id": 6125209310,
+      "updated_at": "2026-10-12T13:25:52Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    },
+    {
+      "body": "❌ This PR is 1 commit behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:6125209310 -->",
+      "created_at": "2026-10-12T13:27:40Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6125239223",
+      "id": 6125239223,
+      "updated_at": "2026-10-12T13:27:40Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @ZhengGong-amd.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-12T16:24:39Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6128286063",
+      "id": 6128286063,
+      "updated_at": "2026-10-12T16:24:39Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-13T02:05:26Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6136563684",
+      "id": 6136563684,
+      "updated_at": "2026-10-13T02:05:26Z",
+      "user": {
+        "login": "ZhengGong-amd"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94351](https://buildkite.com/vllm/ci/builds/94351) for commit `6586df210bac`.",
+      "created_at": "2026-10-13T02:05:46Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6136570695",
+      "id": 6136570695,
+      "updated_at": "2026-10-13T02:05:46Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-13T08:57:13Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6141997980",
+      "id": 6141997980,
+      "updated_at": "2026-10-13T08:57:13Z",
+      "user": {
+        "login": "ZhengGong-amd"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94426](https://buildkite.com/vllm/ci/builds/94426) for commit `fcf66a3cfd59`.",
+      "created_at": "2026-10-13T08:57:34Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6142003644",
+      "id": 6142003644,
+      "updated_at": "2026-10-13T08:57:34Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-13T10:20:25Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6143408260",
+      "id": 6143408260,
+      "updated_at": "2026-10-13T10:20:25Z",
+      "user": {
+        "login": "ZhengGong-amd"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #94455](https://buildkite.com/vllm/ci/builds/94455) for commit `aa7438fa42ba`.",
+      "created_at": "2026-10-13T10:21:00Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#issuecomment-6143417844",
+      "id": 6143417844,
+      "updated_at": "2026-10-13T10:21:00Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 58354,
+  "refs": {
+    "base": {
+      "commit": "7173c64e2ec8763c6d8ddd5c3ff9cb6fc92e2da8",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "aa7438fa42ba3fc319d368154ae1e31e60ac6f2b",
+      "repository": "ZhengGong-amd/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#pullrequestreview-5365428860",
+      "id": 5365428860,
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-30T11:16:56Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "LGTM, can we attach gsm8k before and after just to validate we're not breaking anything (even though I doubt it :) ) ",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#pullrequestreview-5366848350",
+      "id": 5366848350,
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-30T13:29:11Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    },
+    {
+      "body": "LGTM\n\nI'm aware this small perf change can't really be measured e2e but imo it's good we're cleaning up the metadata build (as e.g. for GLM-5.3-Flash it's taking a non-trivial amount of time per step)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58354#pullrequestreview-5380403063",
+      "id": 5380403063,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-01T14:05:33Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    }
+  ]
+}

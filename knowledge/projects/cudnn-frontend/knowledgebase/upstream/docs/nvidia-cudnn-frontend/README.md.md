@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
 path: README.md
-raw_sha256: 4cabe0bbf2a76d4b5bbb1b06eae8d1de73aaf8cddb756e38903b6f62689b9279
+raw_sha256: f4e2131aeab9f5f6697805b9546aef78544370a6950a5c046ff3637b066ed4fa
 sources: []
-generated_body_sha256: c88e06d1ccc660aecb7547148cc27ba2e772e09a772394be670178a44800b5fd
+generated_body_sha256: 5e24a23ea9566669308e59e2e98b77e23220e6d155ac81d8eb4b6897836622dd
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -119,10 +119,16 @@ Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgemen
   <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdp/gb300/gdp_fixed_batch_flops.webp" alt="GDP Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
+#### Mamba-2 Forward and Bprop (GB300)
+
+<p align="center">
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/mamba2/gb300/mamba2_fixed_batch_flops.webp" alt="Mamba-2 Linear Attention Benchmark on GB300" width="600"/>
+</p>
+
 ## Key Features
 
 *   **Unified Graph API:** Create reusable, persistent `cudnn_frontend::graph::Graph` objects to describe complex subgraphs.
-*   **Ease of Use:** Simplified C++ and Python bindings (via `pybind11`) that abstract away the boilerplate of the backend API.
+*   **Ease of Use:** Simplified C++ and Python bindings (via `nanobind`) that abstract away the boilerplate of the backend API.
 *   **Performance:** Built-in autotuning and support for the latest NVIDIA GPU architectures.
 
 ## Installation

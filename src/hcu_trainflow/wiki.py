@@ -312,7 +312,7 @@ def collect_web_documents(store, source):
 
 def source_page_hashes(project, source_id):
     result = {}
-    for path in (Path(project) / 'knowledge').rglob('*.md'):
+    for path in layout.review_page_candidates(project):
         meta, _ = parse_page(path)
         if any(ref.get('source') == source_id for ref in meta.get('sources', [])):
             result[path.relative_to(project).as_posix()] = digest(path.read_bytes())

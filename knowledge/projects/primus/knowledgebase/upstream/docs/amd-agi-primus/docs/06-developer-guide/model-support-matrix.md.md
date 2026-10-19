@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/06-developer-guide/model-support-matrix.md
-raw_sha256: 491d7036d0fe38cff637f118d07ae32625863777fd5ae546aa69d0c1d49620eb
+raw_sha256: 6a011307aff6d7d94ee26caf0947a70760f9c39136bfa53da3a0c7454a8e83f4
 sources: []
-generated_body_sha256: 23b93d59ff62ee398d4cc1fa3d61cdd45573ba2ac5c0a5c0706f9b817e848b8f
+generated_body_sha256: 564af27f18c03f2eba0adecb6dbd867f2bc1f1eef3d7d0631addc26042ee3819
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/06-developer-guide/model-support-matrix.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/06-developer-guide/model-support-matrix.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/06-developer-guide/model-support-matrix.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -45,6 +45,7 @@ The following aligns with the backend overview and the configs present in this t
 | **MaxText (JAX)** | LLaMA2 / LLaMA3 / LLaMA3.3, DeepSeek-V2 16B, Mixtral-8x7B, Grok1, Qwen3 14B / 30B-A3B (per presets and examples). Broader coverage may exist in upstream MaxText; see [MaxText](https://github.com/AI-Hypercomputer/maxtext). |
 | **Megatron Bridge** | Qwen3 pretraining and post-training examples, plus post-training examples for Zebra LLaMA and Mamba where present. LLaMA 3.1 70B Bridge examples appear under MI355X. |
 | **Diffusion** | Flux.1 (`schnell` / `dev`) text-to-image and Wan 2.1 / 2.2 text- and image-to-video presets under `primus/configs/models/diffusion/`, with examples under `examples/diffusion/configs/` and `examples/megatron/configs/*/diffusion/`. See [Diffusion models](../04-technical-guides/diffusion-models/README.md). |
+| **World Mirror** | HunyuanWorld-Mirror geometry training and Gaussian-head post-training. The model checkout is the unmodified submodule `third_party/HunyuanWorld-Mirror-rocm`, tracking `main` from [HunyuanWorld-Mirror](https://github.com/Tencent-Hunyuan/HunyuanWorld-Mirror). Both stages use `train posttrain`. Stage 1 starts from the public Hugging Face weights and trains the geometry heads. Stage 2 loads the stage-1 checkpoint and freezes the backbone while training the Gaussian head. The official stage configs, the Hypersim-only configs, aiter attention, the float32 raster cast, and the depth-mask fix live in Primus and are applied in memory. Examples live under `examples/worldmirror/configs/MI355X/`. |
 | **HummingbirdXT** | Registered backend with a post-training trainer and one checked-in example; user-facing support level still needs maintainer confirmation. |
 
 **Interpretation:** “Supported” in upstream code can exceed what this repository ships as YAML. Rows below reference representative files that exist under `primus/configs/models/` and `examples/`; they should not be treated as a complete generated inventory.

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/advanced/remote_dataset.md
-raw_sha256: efaea89c8be18b41863a7d01cd800f3599d88ce8359283b2a084fbd8df8aced1
+raw_sha256: b3718e38a89a745e4c09d77a28a19040a3103e13d920acc1f6bf9a78827b9e99
 sources: []
-generated_body_sha256: 59ed26826ffe99209ef611c8c78227780ae8542662fada20c70880e12206700b
+generated_body_sha256: 9e303e28d2315046425c0d9c9d6024a269ed73c8cad6f7cbd9f1057e6a1b099f
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/remote_dataset.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/advanced/remote_dataset.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/remote_dataset.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -88,8 +88,8 @@ msc://coolstore/mainbucket/datasets/somedata
 You can use this URL instead of paths to datasets in
 
 * Functions like `get_train_dataset`, `get_val_dataset`
-* Inside [metadataset](../basic/metadataset) specifications
-* As arguments to `energon prepare`, `energon prepare-media`, or `energon lint`. Note that those may be slow for remote locations.
+* Inside [recipe](../basic/recipe) specifications
+* As arguments to `energon prepare` or `energon prepare-media`. Note that those may be slow for remote locations.
 * Or as a path to [`energon mount`](energon-mount) to locally inspect your remote dataset 😎
 
 Example usage:

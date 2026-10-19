@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.6.10 — 2026-10-20
+
+- Align adaptation, capacity, numerical diagnosis, optimization and recovery guidance with the independently published HCU-Knowledge snapshot. Keep consumer-selected dependencies, in-place outputs, low-precision state and asynchronous completion contracts explicit.
+- Refresh the 24 registered official sources at fixed revisions, review affected authored pages and preserve acquisition gaps separately from content and runtime validation. Follow LoongForge's actual child gitlink and the migrated canonical cuDNN documentation.
+- Update current engine interfaces and mechanisms, including Energon recipes/tags, Megatron configuration/state and virtual-expert lifecycles, Bridge preference training, TorchTitan rematerialization/RL, and LoongForge variable-length ChunkPipe. Retain the observed TorchTitan PP capture input mismatch as an unresolved upstream limitation.
+- Avoid scanning immutable upstream copies for authored-page review dependencies; retain live hash invalidation and migration checks. Detect bracketed PR titles in local-link validation and repair obsolete navigation.
+- Resume large PR-discovery windows in bounded page batches, persisting each complete page before retention. Interrupted or malformed pages leave the public cursor unchanged; continue the original window without silently narrowing it.
+- Keep the validated HCU TraceLens fork and existing kernel Skill pins; reconcile package and selected local Skill installations without changing active training environments. No new hardware qualification is implied.
+
 - Reconcile current Markdown with installation, Skill names, environment-tool discovery and guidance handling; separate historical plans and pinned evidence from current instructions.
 - Check authored documentation links/anchors, CLI and JSON examples, release-version declarations and registered third-party attribution in CI and installation preflight. Keep the existing Skill reading-route check.
 

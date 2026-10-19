@@ -10,46 +10,49 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime
-  execution
+reviewed_on: '2026-10-20'
+coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/config.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
   sha256: cf8beb53835f192afdf5a0c8a4b5bbf3fb09d1fdc767a0f46f66b1cdf38c650a
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/stage_1_and_2.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
-  sha256: aa9556509f8249b9e82f6208297311c69e25eb6e560e64c7670fe3bb928436b3
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
+  sha256: 752235af95d0de6f5fe6322b13409c736abe9d0c77be24f85d87489cc41489cb
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/stage3.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
-  sha256: ccee95e1b4c7d43cb3523bc94a793411dafe15bd23c3cb7c348cb093168c7d42
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
+  sha256: 4ff3fdb4cbabaddfeaa866e43785b49a69cdfe35db4e0ceda6f1b432b6fbf9d7
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/partition_parameters.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
   sha256: c7866c302ef1a9757b0c437254e369f8934a2f7ceb371f6f7e54a5391d10c311
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/partitioned_param_coordinator.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
-  sha256: a52014bb6bb754ba315c9f58eb6d5ee52781e7da154f939c7d0c70eb9cbf5e2a
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
+  sha256: a43fd966c88dc3699f5b18e2bfe51fac222e79365664addce9ed485d617a78d0
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/parameter_offload.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
   sha256: 7fec7e04a5d00a56ff88029242ea12c3dcd1a48d1c08aa868137d24f01efe340
 - source: deepspeedai-deepspeed
   path: tests/unit/runtime/zero/test_zero_config.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
   sha256: 3e240d16f1581bc1e8db115f211bcfb2f395d58e39b0a43ef7fa3e6c4bfb8545
 - source: deepspeedai-deepspeed
   path: tests/unit/runtime/zero/test_zero_context.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
   sha256: 0942060bc6e3c121e6dde772dc1757b577021f327b6072743e9a9fa61c39a651
 - source: deepspeedai-deepspeed
   path: tests/unit/runtime/zero/test_zero_stale_handle_wait.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
   sha256: a06caf747dd654b3cda2559cb8de569ac7769d690a6bd2bd30f20134e4e78f73
+- source: deepspeedai-deepspeed
+  path: tests/unit/runtime/zero/test_zero_tensor_fragment.py
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
+  sha256: ebbd12aa05d351d3d0c76b559acaaff219ea6b4830cee1b47ea4d8a5883f3cd5
 ---
 
 # DeepSpeed ZeRO：分片、参数预取与 offload 生命周期
@@ -64,15 +67,15 @@ ZeRO 要减少的是模型训练状态的重复驻留，但训练时仍有全量
 | 2 | optimizer state、gradients | 反向归约/分片，参数仍有复制 |
 | 3 | 再加 parameters | 模块执行前 gather；trace/prefetch/release 对性能及峰值重要 |
 
-[`DeepSpeedZeroConfig`](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/deepspeed/runtime/zero/config.py)限定 `offload_param` 只适用 stage 3，`offload_optimizer` 支持 1/2/3；部分 optimizer offload 的 ratio<1 只支持 stage 3。旧 CPU offload 布尔项有弃用路径，优先使用结构化配置，不同时混搭两代字段。
+[`DeepSpeedZeroConfig`](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/deepspeed/runtime/zero/config.py)限定 `offload_param` 只适用 stage 3，`offload_optimizer` 支持 1/2/3；部分 optimizer offload 的 ratio<1 只支持 stage 3。旧 CPU offload 布尔项有弃用路径，优先使用结构化配置，不同时混搭两代字段。
 
 `reduce_bucket_size`、`allgather_bucket_size`、`stage3_prefetch_bucket_size` 是**参数元素数量**；按对应 dtype 计算 byte，另记并发 buffer、精度转换与 state。`contiguous_gradients` 让连续 buffer 避免碎片/便于归约，offload 路径也强制这一布局；它不是“无需额外 buffer”。
 
 ## 参数状态和实际执行顺序
 
-[`partition_parameters.py`](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/deepspeed/runtime/zero/partition_parameters.py)以 `NOT_AVAILABLE`、`INFLIGHT`、`AVAILABLE` 跟踪分片参数。完整参数只在相应执行生命周期可用。共享参数/external parameter、重算和 leaf module 会延长或改变释放时机。
+[`partition_parameters.py`](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/deepspeed/runtime/zero/partition_parameters.py)以 `NOT_AVAILABLE`、`INFLIGHT`、`AVAILABLE` 跟踪分片参数。完整参数只在相应执行生命周期可用。共享参数/external parameter、重算和 leaf module 会延长或改变释放时机。
 
-[`PartitionedParameterCoordinator.fetch_sub_module`](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/deepspeed/runtime/zero/partitioned_param_coordinator.py)的固定实现大致为：
+[`PartitionedParameterCoordinator.fetch_sub_module`](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/deepspeed/runtime/zero/partitioned_param_coordinator.py)的固定实现大致为：
 
 1. leaf backward 需要时通过锁和完成事件协调并发 fetch。
 2. 找出当前模块尚未可用的参数并发起 gather；在使用前等待各参数对应 handle，校验状态为 AVAILABLE，并处理当前计算流与 gather 流依赖。
@@ -98,14 +101,29 @@ ZeRO 要减少的是模型训练状态的重复驻留，但训练时仍有全量
 
 ## 异步所有权与局部验证
 
-[`stage_1_and_2.py`](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/deepspeed/runtime/zero/stage_1_and_2.py)有 reduce stream 的 `wait_stream`、`record_stream` 和 CPU 梯度累计/拷贝路径。不能把 Python 引用消失、`param.grad=None` 或 step 结束当成异步设备消费者完成。关 overlap 之后也可能保留异步 copy，因此是定位对照，不能证明所有权安全。
+[`stage_1_and_2.py`](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/deepspeed/runtime/zero/stage_1_and_2.py)有 reduce stream 的 `wait_stream`、`record_stream` 和 CPU 梯度累计/拷贝路径。不能把 Python 引用消失、`param.grad=None` 或 step 结束当成异步设备消费者完成。关 overlap 之后也可能保留异步 copy，因此是定位对照，不能证明所有权安全。
 
-一个容易遗漏的 ZeRO-3 状态问题是 **同一个 coalesced gather handle 被多个参数引用**：第一次 wait 使参数可用，模块结束重新分片后，第二次 wait 不能把已释放参数再次标为 AVAILABLE。否则下一次 fetch 可能跳过 gather，计算在空参数上执行。[`test_zero_stale_handle_wait.py`](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/tests/unit/runtime/zero/test_zero_stale_handle_wait.py)直接构造这个循环，分别覆盖 gather 与单 rank no-gather，是真实状态契约测试。
+一个容易遗漏的 ZeRO-3 状态问题是 **同一个 coalesced gather handle 被多个参数引用**：第一次 wait 使参数可用，模块结束重新分片后，第二次 wait 不能把已释放参数再次标为 AVAILABLE。否则下一次 fetch 可能跳过 gather，计算在空参数上执行。[`test_zero_stale_handle_wait.py`](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/tests/unit/runtime/zero/test_zero_stale_handle_wait.py)直接构造这个循环，分别覆盖 gather 与单 rank no-gather，是真实状态契约测试。
 
 验证从 `test_zero_config.py` 的解析、`test_zero_context.py` 的 gather/修改/重新分片到所用 stage 的多 rank forward/backward/step；共享参数、无 grad 的 block input、重算、MoE leaf 与 offload 必须纳入使用该特性时的回归。数值对照保留无 offload/无 overlap 基线，记录 norm、更新后的参数及阶段 loss，性能记录分片总量和 dtype。
+
+## FP32 累积的归约结果与 compact partition
+
+当参数是低精度、`gradient_accumulation_dtype==torch.float32` 且不属于排除的 Muon group 时，`_use_compact_grad_partition_buffer` 启用 owned local FP32 partition。`get_gradient_for_reduction` 不再把 `grad_accum` 先转换为参数 dtype；`_gradient_reduction_buffer_dtype` 区分 ZeRO-1 累积 staging 和 ZeRO-2 低精度 staging。`allreduce_bucket` 返回通信结果 tensor，各 allreduce/reduce-scatter 路径在回写低精度 staging 之前把属于本 rank 的片段加到 FP32 partition；noncontiguous fallback 也有单独的 preserving-FP32 路径。
+
+这同时是精度与所有权契约：通信 dtype 为 FP32 并不保证中间保存不会丢精度，不能只检查 JSON。`GradPartitionBufferGroup` 用一个 flat partition 和多个 view 表达有效梯度/对齐 padding；动态 offload/reload 调用 `move_flat_partition` 搬迁整块并重建 view，避免一组 tensor 和 optimizer 消费的底层存储脱节。CPU optimizer offload 在累积边界从 owned FP32 slice 计算 norm、跟踪 overflow 并向 CPU 目标拷贝，保留既有 copy 完成等待。
+
+复用时逐项记录参数/累积/通信 dtype、ZeRO stage、contiguous 与 reduce-scatter/overlap、CPU offload、累积 microbatch 数和实际 optimizer。FP32 partition 仍占本 rank 的状态内存，不能当成零额外缓存；Muon 例外、其它 dtype 和 stage-3 的不同代码路径不能混作同一分支。现有 `check_grad_overflow` 对 BF16 的判断也保留配置条件，不能从代码里出现 overflow tracker 推导所有配置都强制检查 NaN。
+
+固定上游 `TestZeroBf16Fp32GradAccum` 用两 rank、BF16 参数、FP32 通信/累积与四次 microbatch，构造 BF16 无法精确表示的平均梯度并要求 `safe_get_full_grad` 返回逐位精确 FP32 结果；覆盖 stage1、stage2、stage2 CPU offload、非连续梯度及 stage3。另一测试 offload/reload 梯度后用 `safe_set_full_grad` 置零，再验 optimizer 不更新权重，直接检查 view/消费者身份。本轮仅阅读这些测试，未执行分布式或 HCU 回归。除局部梯度外仍需实际参数更新、恢复和阶段 loss 验收。
 
 ## 回退与更新
 
 出现 trace/stream/state 问题，先缩成相同控制流的局部用例，保留各 rank 的访问顺序和状态日志。可回退预取/overlap/leaf 优化或换保守 stage；不要删除必要同步以掩盖错误。HCU 上还需查该分支 accelerator、collective 和 allocator 语义，不能由官方 CUDA 测试推断通过。
 
 本页未在 HCU 实测。更新 coordinator、partition handle、offload buffer 或配置字段时，联动[总览](../overview/engineering-guide.md)、checkpoint 专题和对应 PR；固定旧证据完整不表示最新分支仍有相同生命周期。
+
+
+## 本轮补充固定证据
+
+- [tests/unit/runtime/zero/test_zero_tensor_fragment.py](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/tests/unit/runtime/zero/test_zero_tensor_fragment.py)

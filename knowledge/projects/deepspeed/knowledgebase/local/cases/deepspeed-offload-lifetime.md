@@ -13,9 +13,9 @@ pr_sources:
 sources:
 - source: deepspeedai-deepspeed
   path: deepspeed/runtime/zero/stage_1_and_2.py
-  commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
-  sha256: aa9556509f8249b9e82f6208297311c69e25eb6e560e64c7670fe3bb928436b3
-reviewed_on: '2026-10-12'
+  commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
+  sha256: 752235af95d0de6f5fe6322b13409c736abe9d0c77be24f85d87489cc41489cb
+reviewed_on: '2026-10-20'
 ---
 
 # DeepSpeed ZeRO-1/2 offload：梯度所有权与流顺序
@@ -52,6 +52,8 @@ PR 保留原 overlap barrier，并在其上增加约束；修改后也没有一�
 
 ## 当前源码与更新范围
 
-2026-10-12 复核官方 master 固定提交 `1c862f7df93f0345b977c67f5408d967b94bf4ae` 的 [`stage_1_and_2.py`](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/deepspeed/runtime/zero/stage_1_and_2.py)：大梯度独立存储、bucket ready/reuse event 和 offload copy 等待仍有实现依据。事件/record_stream 路径还检查 accelerator 的 `resolves_data_dependency()`；不能把某后端的显式事件数当成所有设备的执行模式。
+2026-10-20 复核官方 master 固定提交 `0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c` 的 [`stage_1_and_2.py`](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/deepspeed/runtime/zero/stage_1_and_2.py)：大梯度独立存储、bucket ready/reuse event 和 offload copy 等待仍有实现依据。事件/record_stream 路径还检查 accelerator 的 `resolves_data_dependency()`；不能把某后端的显式事件数当成所有设备的执行模式。
+
+本轮同文件增加 compact FP32 gradient partition 与动态 offload 的 view 重建，详见[ZeRO 专题](../topics/zero-state-lifecycle.md)。这些精度/存储改动不撤销本案例的 ready/reuse/record-stream/copy 完成保护；复核时应分别检查“数值保存在哪里”和“谁何时能重写该存储”，不能拿 FP32 累积替代流顺序验收。
 
 更新时联动 [DeepSpeed 总览](../overview/engineering-guide.md)、[ZeRO 生命周期专题](../topics/zero-state-lifecycle.md)、本案例与实际调用方。PR 的改因、当前主干和现场所用 HCU 分支分别查证。

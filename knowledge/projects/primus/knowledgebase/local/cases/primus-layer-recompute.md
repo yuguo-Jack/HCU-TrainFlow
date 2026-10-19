@@ -8,9 +8,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
 sources:
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/recompute_layer_patches.py
@@ -20,17 +19,25 @@ sources:
   path: tests/unit_tests/backends/megatron/test_recompute_layer_patches.py
   commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
   sha256: 6c3f9d188b4237b6e2b8954840c2803ff63be090e976ad696fbcceb5e90d22e0
+- source: amd-agi-primus
+  path: primus/backends/megatron/patches/recompute_layer_patches.py
+  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  sha256: 5909bb386bf88bdb57d4b0b582db7f218a6fb66365783b2d4b042cb32e996ca4
+- source: amd-agi-primus
+  path: tests/unit_tests/backends/megatron/test_recompute_layer_patches.py
+  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  sha256: 6c3f9d188b4237b6e2b8954840c2803ff63be090e976ad696fbcceb5e90d22e0
 ---
 
 # 案例：精确逐层重算及上游源码指纹约束
 
 ## 问题与瓶颈
 
-少数层决定激活峰值时，统一整段重算可能多付计算。当前 Primus patch 仍按全局 layer ID 选择重算；不指定集合时调用原实现，保留上游已有功能。本轮重读源码及相邻单测，机制继续存在，案例仍有效。
+少数层决定激活峰值时，统一整段重算可能多付计算。当前 Primus patch 仍按全局 layer ID 选择重算；不指定集合时调用原实现，保留上游已有功能。2026-10-20 核对 `main@8e7a2406111e`：wrapper 与相邻单测原件均与历史 `ab873556` 相同；保留本案例及其未验证边界。
 
 ## 实现、依赖与适用条件
 
-`validate_specified_recompute_layers` 检查 ID、full granularity、method 组合与并行条件。wrapper 同时处理 TransformerBlock 与 MTP，decoder 之后的 MTP 层不是同一 local 索引；PP/VPP offset 需按真实模型布局解释。低精度用相应 TE checkpoint/context，普通路径用 tensor-parallel checkpoint，tensor 参数与非 tensor kwargs 的包装不能破坏 autograd/RNG。[机制专题](../topics/primus-recompute-memory.md)展开调用链与显存代价。
+`validate_specified_recompute_layers` 检查 ID、full granularity、method 组合与并行条件。wrapper 同时处理 TransformerBlock 与 MTP，decoder 之后的 MTP 层不是同一 local 索引；PP/VPP offset 需按真实模型布局解释。decoder 和 MTP 对低精度 checkpoint 的选择并不完全相同；MTP 的 FP4 覆盖不能由 decoder 分支推导。tensor 参数与非 tensor kwargs 的包装不能破坏 autograd/RNG。[机制专题](../topics/primus-recompute-memory.md)展开实际分派与显存代价。
 
 单测对上游被包装方法签名/源码指纹的约束用来暴露依赖变化。签名或指纹通过不表示所有模型、FP8/FP4、MTP 和 checkpoint 组合已在 HCU 验证。
 

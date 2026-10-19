@@ -2,6 +2,23 @@
 
 > 本文件是按任务保留的历史记录；每段计数、版本、完成状态和限制仅对应当时的检查。现行用法见 README、AGENTS.md 与对应 Skill/docs，当前任务见 task_plan.md；不将旧安装或发布计划当作当前要求。
 
+## 2026-10-20：独立知识库发布后的维护复核
+
+- 前置 HCU-Knowledge 已独立发布 v0.5.6 / 3829ef06。TrainFlow 只对齐依赖锁和使用契约；大库源码、数据、索引与远端不再次更新。只读 doctor 的 generation 为 f2ec7e14bb4648baae74c18f1bb404fb，索引 current、LFS 齐全。
+- 24 个登记来源覆盖 20 个官方工程；Git 来源均保留本轮固定完整树，Loong 子仓使用父仓 gitlink cfcdede，TE/cuDNN 官网单独保留内容指纹。cuDNN 迁站沿 canonical 节点更新登记和声明，没有放宽重定向/抓取保护。
+- 全部 11,488 个变更路径完成相关性分类：318 个已有作者内容承接，4,506 个不在采用范围，6,664 个保留新机制或多功能文件未读分支的待审。完整树、原件采集、选段精读与设备验证分别计数；全文未读路径没有靠链接到 source-map 改成完成。
+- 98 个作者页的 117 组来源绑定、814 个当前固定文件与 35 项维护目标均已核对；独立校验检查 829 个原件及全部当前回执/哈希，零错误。9 个有意义的历史来源身份继续保留。
+- 实际消费者复核修正了通用说法：M2N 本地分片与接收端 fallback、RDT 成功 finish/drain、SGLang derived/shared cache 与部分失败副作用、AReaL v2 HTTP200 业务 error 的错误版本发布链，以及 Swift Ray/非 Ray 的不同异常收尾。现存上游缺口保留，没有改写为本次已修复或已实测。
+- TE 内部 columnwise kernel 不保证 Python column-only 分配入口可用；Primus 显式词表与自动减 EOD 的差别、try 外 schema 错误；TorchTitan PP capture 的 3/4 项输入错配均沿实际调用链界定。开放的 TorchTitan #4760 新方案只按候选说明输入/输出通信与模型限制，不归给固定 main。
+- 作者页直接引用的 46 项 PR 当前描述、三类讨论及文件清单已复核；170 个完整相关 patch 已读，1 个 TE kernel 仅选段，138 个 API 缺 patch 继续注明。无关 PR 原件仍是 source-reported，不将原件数量当作策展完成。
+- 维护程序修复超过 20 页的 PR 发现无法续接、作者依赖扫描被上游原文拖慢，以及含方括号 PR 标签的失效链接漏检；失败页、原窗口、旧游标与活跃哈希检查继续保留。独立复核与针对性回归覆盖中断、格式错误、空队列续扫、旧状态和可点击图片链接。
+- HCU TraceLens 继续锁定已验证 fork 22786b1，三项 Hygon Skill 继续 f39ba95；没有按官方新功能自动升级活动训练依赖。完整安装协议和本机最终六项同步均成功，11 个必需 Skill 与绑定一致。可选 KernelWiki b6b4301 的 1,589 个文件逐项比较，保留原有 scripts/validate.py 自定义差异。
+- CPU 测试 1,312 passed / 4 platform skips；知识、文档、阅读路线和 Wiki 覆盖检查通过。12 组真实问题先跨资料类型搜索，必要时按已文档化的作者页 kind 细化，实际读取完整当前正文；保留宽查询未直接定位到目标专题的观察，不把默认排序等同于完整答案。所有硬件、训练质量、RDMA 和新增上游设备测试仍未执行。
+
+公共PR原窗口的全部可访问条目已完成采集；最终22项Git来源的798份登记源码、1,218份选定文档和9,359条PR记录验收无错误。249条PR仍含缺失或二进制patch等来源报告的diff边界，不能把API未返回的patch算作已审代码。10,736页知识校验与12组新索引检索/完整正文读取通过，46项引用的原件/当前作者页绑定均有效。配额耗尽时保持checkpoint，未缩窄窗口或将pending改成成功。细粒度原件、逐页说明、独立报告和操作日志留在私有任务目录。
+
+本轮发现Swift历史PR #10260与vLLM历史PR #48358的GraphQL入口无法解析，认证REST的PR/Issue两入口也分别都返回404；不据此断言删除。其他可访问条目完成后，原生采集器又各实际确认一次仅有该ID的404，随后统一添加availability注释并通过来源验收。分别保留原有2026-10-09与2026-10-10来源快照、原始哈希和正文；失败pending、原公共游标及旧记录的checked_at均保持不变。这些状态属于来源新鲜度缺口，没有据旧来源编造新的优化结论；后续从保留的原生队列重试，不手改游标。
+
 ## 2026-10-12: Check/adapt naming and optional KernelWiki
 
 - Runtime stage codes stay unchanged; Skill routing, display name, directory, reading links and Wiki maintenance targets use hcu-train-check-and-adapt. Previous names remain only in installer migration and migration tests.

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/api/cli.md
-raw_sha256: 9d15d17a62334bd49d054db85c1dd581687fb4d8e728b890c58ccd727ad5e1ba
+raw_sha256: eb565200496f70c6b7366541261438d207efcee272d1fde7b3a8bf51c814ed60
 sources: []
-generated_body_sha256: 0c03a032ba603c14dadf56de2190939848b699d407b07d10a82bd6a46bd8cfde
+generated_body_sha256: 5804f723e8e90c599aa86ac48652210ccad52f21a2cee85b423fca08972e9a0f
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/api/cli.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/api/cli.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/api/cli.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -32,7 +32,7 @@ SPDX-License-Identifier: BSD-3-Clause -->
 # Command-Line Interface
 
 After you [installed](../intro/installation) energon, a script called `energon` will be added to your PATH.
-It provides commands to prepare, preview, or lint datasets on disk.
+It provides commands to prepare, preview, or inspect datasets on disk.
 
 Here's a simple example:
 
@@ -70,11 +70,6 @@ See [Data Preparation](../basic/data_prep) for more details on how to use this c
 Prints information about the dataset such as overall number of samples and size.
 It also prints the energon version that was used to prepare the dataset, if a recent version was used.
 
-
-## energon lint
-
-You can execute this tool on the prepared dataset to check if the data is valid and loadable.
-It will report any problems such as non-readable images.
 
 (energon-mount)=
 ## energon mount

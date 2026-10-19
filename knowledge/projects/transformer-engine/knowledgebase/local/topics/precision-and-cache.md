@@ -9,35 +9,35 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-transformerengine
   path: transformer_engine/common/recipe/__init__.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 086710097a7df57c68c281dd520a3e559817ffec8b44906eac98a399061e7586
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/quantization.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: d8f2cd4fa72d8343eaca912cad0d89c4f39ff5828849cda3904c640aa587a943
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/fp8.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 54a2967ad103ddcffcaf7a1d10e7d9fcfa3a290772d9239c416fff391349f3a1
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/module/base.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
-  sha256: be890a1c51dba21de4f22f126060191f572c51b37f803e9eb2a7d9f7f8a67d22
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 14d5362f005d800f598b64adfc503aa7b074feb9cb66327b5115bbe2c23f3bd5
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/module/linear.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
-  sha256: a7b63f31f9607c71f71c0a93e3e90239194d63601b72aab7875dd5b57c75617e
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 83b361dd4a911ff727010ff9794d47179ac23f60d15c3025dd8a7d033fc92248
 - source: nvidia-transformerengine
   path: docs/examples/advanced_optimizations.ipynb
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 0d5d703679a7d3c16773112e8879879560a945600c168a95b27b22bc44f9a22a
 - source: nvidia-transformerengine
   path: docs/features/low_precision_training/fp8_delayed_scaling/fp8_delayed_scaling.rst
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: e3930744fe783fa2311224d3d746cf15a10c3cee7fc46a9a27e4c6e8f99671d4
 - source: nvidia-transformerengine-docs
   path: fp8-primer
@@ -51,6 +51,10 @@ sources:
   sha256: 6d7c1eff4937a379e6a812783e475f8b10971eda810b532c43db35e81bd1a162
   url: https://docs.nvidia.com/deeplearning/transformer-engine/examples/advanced_optimizations.html
   revision_kind: web-content-fingerprint
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/module/layernorm_mlp.py
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  sha256: 6c2667e8935cb0fe54dd200edd2f8efe4685b63f403ef3c93b76741d78822002
 ---
 # TE 低精度训练：recipe、amax、权重缓存与反向状态
 
@@ -81,20 +85,30 @@ sources:
 
 **回退**：恢复原模块的每次量化策略及相同数值基线，并确认没有残留缓存/graph 状态。若收益小于噪声或显存代价抵消收益，则保留原实现。
 
+## 主梯度 dummy 的存储与设备
+
+当前 `get_dummy_wgrad` 的普通缓存将当前 CUDA device 纳入 key，避免同 shape/dtype 的不同设备拿到同一 dummy。`zero_out_wgrad` 要求真实清零；另有参数属性 `zero_tensor_dummy_wgrad` 可请求无底层 storage 的 ZeroTensor，让同一权重在一次 backward 被多次使用时减少无意义的 dummy 加法。两者不是主梯度本身；实际 GEMM/主梯度累加和 hook 标志仍须正确执行。
+
+`Linear`、`LayerNormMLP` 与 GroupedLinear 的结束路径要一起看，不能将 dummy 返回值当作 optimizer 消费的真实 wgrad。缓存优化仍需覆盖复用权重、多 microbatch、跨设备和 zero-out；当前源码改动不等于这些组合已在目标 HCU 上执行。
+
 ## 精度诊断
 
 固定输入、RNG、mask、归约方式和初始权重，从首个发生偏差的层开始检查 scale/amax、饱和、舍入、cast 与累积精度。启用 FP32 主梯度融合时检查 `main_grad` 的分配、累加和清零时点。每轮做局部回归；较长 loss 在稳定的优化阶段验收，符合训练工作流原约定。
 
 ## 来源与版本复核
 
-- [nvidia-transformerengine: transformer_engine/common/recipe/__init__.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/common/recipe/__init__.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/quantization.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/quantization.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/fp8.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/fp8.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/module/base.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/module/base.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/module/linear.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/transformer_engine/pytorch/module/linear.py)
-- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/advanced_optimizations.ipynb)
-- [nvidia-transformerengine: docs/features/low_precision_training/fp8_delayed_scaling/fp8_delayed_scaling.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/features/low_precision_training/fp8_delayed_scaling/fp8_delayed_scaling.rst)
+- [nvidia-transformerengine: transformer_engine/common/recipe/__init__.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/recipe/__init__.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/quantization.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/quantization.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/fp8.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/fp8.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/module/base.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/module/base.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/module/linear.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/module/linear.py)
+- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/advanced_optimizations.ipynb)
+- [nvidia-transformerengine: docs/features/low_precision_training/fp8_delayed_scaling/fp8_delayed_scaling.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/features/low_precision_training/fp8_delayed_scaling/fp8_delayed_scaling.rst)
 - [nvidia-transformerengine-docs: fp8-primer](https://docs.nvidia.com/deeplearning/transformer-engine/examples/fp8_primer.html)
 - [nvidia-transformerengine-docs: advanced-optimizations](https://docs.nvidia.com/deeplearning/transformer-engine/examples/advanced_optimizations.html)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
+
+## 本次补充的实现与测试依据
+
+- [nvidia-transformerengine: transformer_engine/pytorch/module/layernorm_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/module/layernorm_mlp.py)

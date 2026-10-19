@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
 path: README.md
-raw_sha256: e2f2dad685784770f1cd1fe72ba3be22788864ddf9234a899b75fb7dbdd15151
+raw_sha256: 5cc9ec8143564f0d56764b9c09fdc6086a8c6fac0e42d5130666605815e60ac7
 sources: []
-generated_body_sha256: 9996bfc43e9012612bf7122cee11e1e8d4dfbf1d9e7849d9763a30bb151af16b
+generated_body_sha256: e07b264a16ea3fb1c75ae9f748f0a49c1a4718d880c1a02e4dcfdb283b3a6722
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / README.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/README.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -176,6 +176,7 @@ dynamically link them at runtime.
 | Intel       | Intel(R) Xeon(R) Processors         | cpu              | Yes | Yes                |
 | Intel       | Intel(R) Data Center GPU Max series | xpu              | Yes | Yes                |
 | Tecorigin   | Scalable Data Analytics Accelerator | sdaa             | Yes | No                 |
+| KUNLUNXIN   | KUNLUNXIN XPU                      | klxpu            | Yes | No                 |
 
 ## PyPI
 We regularly push releases to [PyPI](https://pypi.org/project/deepspeed/) and encourage users to install from there in most cases.

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/get_started/usage.md
-raw_sha256: 1305d31cb0489966b3f793630b7cbae72b50353ecede6c3a4100f211d186f044
+raw_sha256: 47a3a0cc04d9e575a9379024e75e9d75e5a0c69eb19e134a59d98e7c4ca76d86
 sources: []
-generated_body_sha256: 2d253a6eb65760ca4aef9382536dd8f69f64c72aa3dac980ee80e2c4d9978dd4
+generated_body_sha256: 7cd7d75329890b10b0af69c7192937e3ca24d56399186494d56314c8673ff25e
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/get_started/usage.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/get_started/usage.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/get_started/usage.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -434,7 +434,7 @@ To enable distributed fully async rollout with straw, add:
 
 All nodes must mount the directory at the same absolute path and have
 `straw-queue` installed. The standard slime installation includes it; for an
-existing environment, run `pip install 'straw-queue>=0.1.2'`. Configure the JuiceFS
+existing environment, run `pip install 'straw-queue>=0.1.3'`. Configure the JuiceFS
 storage profile and deployment declaration as described in the
 [straw guide](../advanced/straw.md#enable-it). Selecting straw alone uses the
 synchronous rollout entrypoint. For a fresh run, omitting `--rollout-data-dir`

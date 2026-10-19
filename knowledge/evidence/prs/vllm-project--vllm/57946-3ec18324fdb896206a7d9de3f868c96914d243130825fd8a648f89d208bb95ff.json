@@ -1,0 +1,911 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "a65eea6ea5a7464357d60e5d913f5fcb8a6f60eede255c2ead073bfd76bec97f",
+      "isPrivate": false,
+      "numbers": [
+        57946,
+        57942,
+        57926,
+        57925,
+        57924,
+        57916,
+        57912,
+        57911
+      ],
+      "observed_at": "2026-10-19T19:33:54.165411+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4643,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "db7f1f671419535b85fa73e29ff061e287e39459",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\n`VLLM_MOE_SKIP_PADDING` (on by default) makes the topk kernels write `-1` into `topk_ids` for\ncudagraph padding rows, so downstream MoE kernels can skip work for them. `FlashInferB12xExperts`\nnever handled that sentinel and passed `topk_ids` straight into `B12xMoEWrapper.run()`, where the\nb12x kernels index the expert state with the raw id. A value of `-1` writes outside the workspace\nand trips an MMU fault:\n\n```\nNVRM: Xid (PCI:000f:01:00): 31, pid=..., name=python3, MMU Fault: ENGINE GRAPHICS GPC1\n      FAULT_PDE ACCESS_TYPE_VIRT_WRITE\nRuntimeError: Triton Error [CUDA]: an illegal memory access was encountered\n```\n\nChronology, since the base has moved: on the build this was isolated on (`5db652225`) the\nprofiling run marked every row as padding, so all 40960 routing indices were `-1` and the engine\nfaulted in `determine_available_memory()` before the server could start. Current `main` no longer\ndoes that — `is_padding=not is_profile` in the V2 runner (#57270) deliberately routes profiling\ntokens to experts so MoE memory is measured — so the startup repro no longer applies as written.\nThe bug itself is unchanged: cudagraph padding, idle-DP dummy batches and trailing padded rows on\nreal batches all still emit the same sentinel, so b12x remains unsafe on current `main`.\n\nNote the reported traceback is misleading. Without `CUDA_LAUNCH_BLOCKING=1` the fault surfaces at\nthe *next* Triton `load_binary`, which for this model is `_hc_combine_kernel` in layer 0's\nattention — before any MoE has run. With blocking launches the faulting call is\n`flashinfer_b12x_moe.py:288`, `wrapper.run(...)`.\n\nNeutralize the sentinel where the other routing fixups happen: route padding rows to expert 0 with\nzero weight, contributing nothing to the output. The router's mask is per row (`is_padding[:num_tokens]`), so a marked\nrow is `-1` in every slot, and no live row loses a single expert. Unguarded, b12x never gets as far as producing\ndiscardable output for those rows: it indexes expert state with the `-1`, an out-of-bounds access that kills\nthe CUDA context. The guard\nruns only when `VLLM_MOE_SKIP_PADDING` is on: every sentinel writer is gated on that flag and b12x takes no\nexpert map, so with the flag off no `-1` can arrive (a static read, resolved while the graph is traced). The rewrite is branchless so it remains\ncudagraph-capturable. This mirrors the AITER fix in #57036 and the XPU gating in #55231.\n\nFixes #50189.\n\n## Test Plan\n\n- New regression test `test_flashinfer_b12x_moe_tolerates_padding_sentinel` in\n  `tests/kernels/moe/test_flashinfer_b12x_moe.py`, three cases: `(32, 2, half)` -> 64 routed rows,\n  the static b12x path; `(384, 2, all)` -> 768 routed rows, every row padded, crossing the 640-row\n  static/dynamic cutover; `(32, 2, nan)` -> padded activations poisoned with NaN, since cudagraph\n  padding rows may carry NaN/Inf. Asserts padding rows are exactly zero and finite, and that real\n  rows match a run without padding. The test is skipped when `VLLM_MOE_SKIP_PADDING` is off, since no\n  sentinel is written and the guard is skipped then.\n- Hot-path cost of the guard, measured with CUDA events at the model's real shapes\n  (E=512, k=2560, n=640, topk=10), eager and inside a CUDA graph.\n- End-to-end: serve Qwen3.8-Flash-Next NVFP4 with `--moe-backend flashinfer_b12x` on GB10 and\n  confirm the engine starts and generates.\n- Isolated repro against FlashInfer directly (no vLLM), varying only the routing table.\n\n## Test Result\n\nBox: DGX Spark GB10, sm_121, 128 GB unified, TP=1. FlashInfer 0.6.18.post1.\n\nUnit test, against the installed build:\n\n```\n$ pytest tests/kernels/moe/test_flashinfer_b12x_moe.py -k padding_sentinel\n\n# before this patch\nFAILED test_flashinfer_b12x_moe_tolerates_padding_sentinel - AcceleratorError:\n    CUDA error: an illegal memory access was encountered\n1 failed in 3.09s\n\n# with this patch\n1 passed in 1.77s\n```\n\nWhole file with this patch: 51 passed with the flag on; 48 passed, 3 skipped with\n`VLLM_MOE_SKIP_PADDING=0`.\n\nEnd-to-end, same checkpoint and flags:\n\n| build | result |\n| --- | --- |\n| before | engine dies in `determine_available_memory()`, Xid 31 |\n| after  | serves in 660 s; `\"Name the four seasons\"` -> `\"spring, summer, autumn, winter\"` |\n\nIsolated FlashInfer repro, same process, same shapes (E=512, k=2560, n=640, topk=10, 40960 routed\nrows) — only the routing table differs:\n\n| `topk_ids` | result |\n| --- | --- |\n| all `-1` | illegal memory access |\n| padding masked to expert 0, weight 0 | clean, finite output |\n\nHot-path cost of the guard (E=512, k=2560, n=640, topk=10), CUDA events, vs the b12x MoE call\nat the same shape:\n\n| M | sentinel eager us | sentinel graphed us | MoE graphed us | guard, % of graphed MoE |\n| ---: | ---: | ---: | ---: | ---: |\n| 1 | 22.25 | 6.33 | 117.92 | 5.4% |\n| 2 | 21.68 | 6.86 | 284.53 | 2.4% |\n| 4 | 22.05 | 6.74 | 482.11 | 1.4% |\n| 8 | 21.09 | 6.34 | 1045.32 | 0.6% |\n\nThe eager cost is flat at ~21 us across every M, i.e. it is kernel-launch overhead on a `[M, topk]`\ntensor rather than work. Decode runs under CUDA graphs, where the three ops replay in ~6.3 us --\n5.4% of the MoE call at M=1 and under 1.5% from M=4 up. Both sides are captured here; the MoE call\nis only ~11% faster graphed than eager, so it is GPU-bound rather than launch-bound. At ~2 us per replayed kernel this is near the\nfloor for elementwise ops on this device; going lower means handling `topk_id < 0` inside the\nFlashInfer b12x kernel, which would also avoid computing expert 0 for padded routes at all.\n\nNote there is no b12x \"before\" number for end-to-end decode: without this patch the backend faults,\nso the unpatched configuration cannot be benchmarked. `VLLM_MOE_SKIP_PADDING=0` is the way to\nisolate the guard's end-to-end cost, and I can add that measurement if it would help.\n\nOn NaN: padded rows whose activations were set to NaN still produce exactly zero, finite output\n(0 NaN of 40960 elements), so the zero route weight is not defeated by `0 * NaN` here.\n\nRouting measured at the router's return: the 4096-token profiling batch is 40960/40960 negative,\nwhile the 32-token warmup a few calls later routes normally (ids 1..504), with finite inputs in\nboth cases — i.e. legitimate sentinel values, not corrupted memory. `FLASHINFER_CUTLASS` tolerates\nthem on the same checkpoint, which is why only the b12x path faulted.\n\n---\n<details>\n<summary> Essential Elements of an Effective PR Description Checklist </summary>\n\n- [x] The purpose of the PR, such as \"Fix some issue (link existing issues this PR will resolve)\".\n- [x] The test plan, such as providing test command.\n- [x] The test results, such as pasting the results comparison before and after, or e2e results\n- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model.\n</details>\n\n*This PR was prepared with AI assistance (Claude Code). All logs and numbers come from real runs on\nthe hardware described, and I have reviewed every line.*\n\n\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jschmied"
+            },
+            "body": "Hot-path cost of the guard vs the b12x MoE call at the model's real shapes (E=512, k=2560, n=640,\r\ntopk=10), CUDA events, GB10 / sm_121. Both are captured, since that is what a decode step replays:\r\n\r\n| M | sentinel eager us | sentinel graphed us | MoE graphed us | guard, % of graphed MoE |\r\n| ---: | ---: | ---: | ---: | ---: |\r\n| 1 | 22.25 | 6.33 | 117.92 | 5.4% |\r\n| 2 | 21.68 | 6.86 | 284.53 | 2.4% |\r\n| 4 | 22.05 | 6.74 | 482.11 | 1.4% |\r\n| 8 | 21.09 | 6.34 | 1045.32 | 0.6% |\r\n\r\nThe eager cost is flat at ~21 us across every M, so it is kernel-launch overhead on a `[M, topk]`\r\ntensor, not work. Under CUDA graphs the three ops replay in ~6.3 us: 5.4% of the MoE call at M=1,\r\nunder 1.5% from M=4. (The MoE call is only ~11% faster graphed than eager -- 132 us vs 118 us at\r\nM=1 -- so it is GPU-bound rather than launch-bound.) At ~2 us per replayed kernel that is close to\r\nthe floor for elementwise ops here, so the remaining win is native `topk_id < 0` handling inside b12x — which, as\r\nyou say, would also stop padded routes computing expert 0 at all. Happy to take that route instead\r\nif you would rather have it there than in vLLM.\r\n\r\nOn end-to-end before/after: there is no b12x \"before\" to measure, because the unpatched backend\r\nfaults. `VLLM_MOE_SKIP_PADDING=0` isolates the guard cost end-to-end and I can run that if useful.\r\n\r\nAlso applied from your review:\r\n\r\n- dropped the two `zeros_like` allocations\r\n- the test now covers three cases: `(32, 2)` half-padded = 64 routed rows on the static path,\r\n  `(384, 2)` all-padded = 768 routed rows, crossing the 640-row static/dynamic cutover, and a case\r\n  where the padded rows' activations are NaN\r\n- **NaN is safe**: padded rows still produce exactly zero, finite output (0 NaN of 40960 elements),\r\n  so the zero route weight is not defeated by `0 * NaN` on this path\r\n- corrected the chronology in the description. Current `main` no longer marks\r\n  profiling rows as padding (`is_padding=not is_profile`, #57270); the all `-1` profiling batch was\r\n  specific to the `5db652225` build this was isolated on. Cudagraph/DP padding still emits the\r\n  sentinel, so the fix stands, but the startup repro no longer reads correctly against `main` and\r\n  the description now says so.\r\n\r\n*Prepared with AI assistance (Claude Code); all numbers are from real runs on the hardware named.*\r\n",
+            "createdAt": "2026-09-21T13:58:59Z",
+            "databaseId": 5761695151,
+            "updatedAt": "2026-09-21T14:29:29Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5761695151"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jschmied"
+            },
+            "body": "Asking for SM120 numbers, and flagging that mine are probably the favourable case.\n\nAll the cost figures above are GB10 (`sm_121`): 48 SMs, 24 MiB L2, LPDDR5X shared with the CPU.\nThe guard is a fixed ~6.3 us under cudagraphs regardless of M, so its *share* is set by how fast the\nMoE call it sits in front of is. On SM120 (GB202: far more SMs, GDDR7) the b12x MoE should be\nconsiderably faster than the 118 us I measure at M=1 — which makes the same 6.3 us a **larger**\nfraction there, not a smaller one. I would rather say that up front than have GB10-only numbers\nstand in for the arch where flashinfer actually prefers b12x\n(`gemm/gemm_base.py:6924`: *\"SM120 + CUDA 13: prefer b12x ... SM121 (GB10) is intentionally\nexcluded\"*).\n\nIf someone with a 5090 / PRO 6000 Blackwell can run it, the two useful datapoints are:\n\n1. **Cost.** For M = 1, 2, 4, 8 at your model's `topk`: time the three guard ops and the b12x MoE\n   call at the same shape, both inside a CUDA graph (comparing a graphed guard against an eager MoE\n   call flatters the guard — I made that mistake and corrected it above).\n2. **That the bug and the fix both reproduce.** I cannot test SM120. The faulting code is\n   arch-independent Python, so it should, but that is an inference, not a measurement.\n\nNote b12x MoE is opt-in today, so only `--moe-backend flashinfer_b12x` users are exposed. #54669 and\n#54719 would make it automatically selected — on SM120 first — at which point this fault becomes a\ndefault-path crash, which is the main reason I think it is worth fixing now rather than later.\n\nOn where the fix belongs: I traced it to the kernel and reported it at\nflashinfer-ai/flashinfer#3170 (comment). The generic dynamic kernel histograms with\n`atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), 1)` and `expert_id` can be `-1`,\nwhich is why the Xid is a *write* fault. Handling `topk_id < 0` natively there would remove this\nguard entirely and also stop padded routes computing expert 0. I did not attempt that patch: the id\nreaches seven indexing sites across two phases and is cached into shared memory, so a partial guard\nwould turn a clean fault into silent corruption. This PR stays useful regardless, since vLLM pins\n`flashinfer-python==0.6.18.post1` and a kernel fix reaches no one until that pin moves.\n\n*Prepared with AI assistance (Claude Code); all numbers are from real runs on the box named.*\n",
+            "createdAt": "2026-09-21T15:30:39Z",
+            "databaseId": 5763067897,
+            "updatedAt": "2026-09-21T15:30:39Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5763067897"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Can't give you SM120 numbers — I'm on a GB10 too, so mine would be the same favourable case you already flagged. Two things from reading it instead.\n\n**The thing a reviewer would stop on, and it's fine.** Zeroing `topk_weights` where `topk_ids < 0` is only safe if the sentinel is written per *row*, not per slot — otherwise you'd be dropping one expert from a live row and silently changing the remaining weights' normalization. It is per row: `_get_padding_mask()` in `router/fused_topk_router.py` returns `is_padding[:num_tokens]`, a `[num_tokens]` mask, and that's what `ops.topk_softmax` takes. So a marked row is fully `-1` and the whole row's output is zero and discarded. Worth stating explicitly in the PR body, since the guard itself is written elementwise and reads as if per-slot sentinels were possible.\n\n**One way to make the cost you're worried about disappear where it doesn't apply.** The guard runs unconditionally, but with `VLLM_MOE_SKIP_PADDING=0` no `-1` can ever reach here — the routers only mark padding under that flag. Gating it:\n\n```python\nif envs.VLLM_MOE_SKIP_PADDING:\n    topk_ids = topk_ids.to(torch.int32)\n    ...\nelse:\n    topk_ids = topk_ids.to(torch.int32)\n```\n\nis a Python-level read of a static env, resolved while the graph is being traced, so it doesn't cost you capturability. That doesn't help the default path, which is the one your table measures — but it does mean the 6.3 us is only ever paid by configurations that can actually produce the sentinel, which seems worth having given the SM120 share you're raising yourself.\n\nThe `torch.where` pair itself looks right to me: both operate on `[M, topk]`, the scalar `0.0` stays weakly typed so `topk_weights` keeps its dtype, and routing to expert 0 with zero weight is a no-op in an accumulate-style MoE.\n",
+            "createdAt": "2026-09-23T15:27:59Z",
+            "databaseId": 5797663608,
+            "updatedAt": "2026-09-23T15:27:59Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5797663608"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jschmied"
+            },
+            "body": "@hclsys thanks, both are in `da6d4a0068`.\n\n- **Per row, not per slot.** The comment and the PR description now say it: the router's mask is `is_padding[:num_tokens]`, so a marked row is `-1` in every slot and its whole output is discarded, and no live row loses a single expert.\n- **The guard is skipped when `VLLM_MOE_SKIP_PADDING` is off.** Every writer of the sentinel is gated on that flag. b12x also refuses expert parallelism and expert maps (`supports_expert_map()` returns `False`), so no other path can hand it a `-1`. With the flag off, the guard is skipped by a static read resolved while the graph is traced.\n\n`tests/kernels/moe/test_flashinfer_b12x_moe.py` on GB10 (sm_121): 51 passed with the flag on, 48 passed with `VLLM_MOE_SKIP_PADDING=0` (the three sentinel cases deselected).\n\nWritten with AI assistance (Claude Code).\n",
+            "createdAt": "2026-09-30T11:57:55Z",
+            "databaseId": 5910775978,
+            "updatedAt": "2026-09-30T11:57:55Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5910775978"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Both points look right to me now. Checked the parts that are checkable without the model, on a GB10 (sm_121):\n\n**The guard is identity on the happy path.** Ran the exact code from `da6d4a0068` against sentinel-free routing:\n\n```\nno -1 anywhere:   ids identical True,  weights identical True   (flag on vs off)\nrows 3 and 77 = -1: routed to expert [0,0,0...], weights [0.0,0.0,0.0...]\nlive row 4:         untouched\n```\n\nSo with the flag on and no padding present it costs two no-op `where`s and changes nothing, which is what makes it safe to leave unconditional inside the flag.\n\n**One thing I went looking for and did not find**, in case anyone else wonders: `torch.where(is_padding, 0.0, topk_weights)` with a Python `0.0` does **not** promote — bf16 in, bf16 out, and bitwise identity when the mask is all-False. Python scalars are weak-typed in the promotion rules, so the kernel still receives its original dtype. I expected an fp32 upcast and was wrong.\n\n`if envs.VLLM_MOE_SKIP_PADDING:` reading a module-level env value also does what your comment claims under tracing — it's a Python-level constant at trace time, so the flag-off path has no branch in the captured graph rather than a predicated one.\n\nI'm also running `tests/kernels/moe/test_flashinfer_b12x_moe.py` here to put a second GB10 against your 51/48, but the b12x CuteDSL JIT is still compiling on this box and I'd rather not quote a number before it finishes. Nothing in what I've checked so far contradicts it.\n",
+            "createdAt": "2026-09-30T12:21:27Z",
+            "databaseId": 5911194787,
+            "updatedAt": "2026-09-30T12:21:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5911194787"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Suite finished. Your ON number reproduces exactly, and the OFF leg found something.\n\n```\ndefault (flag on)                    51 passed in 163 s        <- same 51 as you\nVLLM_MOE_SKIP_PADDING=0, whole file  27 failed, 24 passed in 23 s\n```\n\nThe first failure is the sentinel test itself, and it isn't an assertion — it's a hard fault:\n\n```\ntests/kernels/moe/test_flashinfer_b12x_moe.py:340\n    assert torch.equal(out[num_real:], torch.zeros_like(out[num_real:]))\nE   torch.AcceleratorError: CUDA error: an illegal memory access was encountered\n```\n\nThat poisons the context, which is where the other 26 failures come from — they're collateral, not 27 separate problems.\n\nThe cause is just that **nothing deselects it for you**. `test_flashinfer_b12x_moe_tolerates_padding_sentinel` is one function (3 params) with no flag guard; the two `pytest.skip` calls at the top of the file are the CUDA/family gates. `vllm.envs` does pick the shell variable up correctly (`VLLM_MOE_SKIP_PADDING = False`), so with the flag off the test feeds `-1`, the guard is skipped by design, and b12x indexes expert state with it. Your 48 must have come from deselecting by hand rather than from the file doing it — worth a `skipif` so the next person doesn't get an illegal access instead of a skip:\n\n```python\n@pytest.mark.skipif(\n    not envs.VLLM_MOE_SKIP_PADDING,\n    reason=\"the sentinel is only written when VLLM_MOE_SKIP_PADDING is on\",\n)\n```\n\nIncidentally this makes the PR's case stronger than the description does. The body reads as if an unguarded `-1` gives wrong-but-finite output that the router discards; on sm_121 it's an out-of-bounds access that kills the context. \"Its whole output is discarded\" is true of the *router's* mask, but the kernel never gets that far.\n",
+            "createdAt": "2026-09-30T12:23:43Z",
+            "databaseId": 5911230822,
+            "updatedAt": "2026-09-30T12:23:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5911230822"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jschmied"
+            },
+            "body": "@hclsys right, my 48 came from `-k`, not from the file. `a2c8e66411` adds your `skipif`: whole file on GB10 now gives 51 passed with the flag on, 48 passed and 3 skipped with it off. The description now says an unguarded `-1` is an out-of-bounds access that kills the context. Thanks for running both legs.\n\nWritten with AI assistance (Claude Code).\n",
+            "createdAt": "2026-09-30T12:32:45Z",
+            "databaseId": 5911371374,
+            "updatedAt": "2026-09-30T12:32:45Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5911371374"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "adi-suresh01"
+            },
+            "body": "@jschmied SM120 data point for this, correctness only. I didn't measure the guard's hot-path cost, so this doesn't answer the timing question.\n\n1x RTX PRO 6000 Blackwell Server Edition (sm_120), `vllm/vllm-openai:v0.31.0` (FlashInfer 0.7.0.post1), `nvidia/Qwen3.6-35B-A3B-NVFP4`, `--moe-backend=flashinfer_b12x`, CUDA graphs, capture sizes [1, 2, 4, 8, 16, 24, 32]:\n\n- Without this PR: `CUDA error: an illegal memory access` in `profile_cudagraph_memory` at capture size 2, in all 3 runs (with and without #60069, full 96 GB and a 31.45 GiB memory cap).\n- With this PR (head a2c8e66 applied to v0.31.0): both capture passes finish, the server boots in 70 s, output is coherent.\n- With this PR + #60069 under the 31.45 GiB cap: 13 concurrent requests, all coherent, no faults.\n\nWorth knowing for review: FlashInfer 0.7.1 (flashinfer-ai/flashinfer#5451) fixes the same crash on the kernel side. Unpatched v0.31.0 with FlashInfer 0.7.1 boots and serves with graphs on the same card, and `main` already pins 0.7.1. Full table in #49476.\n",
+            "createdAt": "2026-10-15T07:01:07Z",
+            "databaseId": 6186436246,
+            "updatedAt": "2026-10-15T07:01:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-6186436246"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Followed up on the 0.7.1 point on a GB10 (sm_121). This PR's test file with the product change reverted, `-k \"sentinel or padding\"`:\n\n```\nflashinfer 0.7.0.post1   1 failed  (padded rows not zero, test:347)\nflashinfer 0.7.1         3 passed\n```\n\nSo flashinfer#5451 already skips the -1 ids here too, and main pins 0.7.1. The guard looks redundant on main now, only older flashinfer needs it.\n",
+            "createdAt": "2026-10-15T07:21:18Z",
+            "databaseId": 6186762122,
+            "updatedAt": "2026-10-15T07:21:18Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-6186762122"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXDCf4o=",
+          "hasNextPage": false
+        },
+        "totalCount": 9
+      },
+      "headRefOid": "a2c8e6641171f4759f5fd5d024366b61ccbc0f83",
+      "headRepository": {
+        "nameWithOwner": "jschmied/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 57946,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5266887252,
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-21T13:01:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/57946#pullrequestreview-5266887252"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wOS0yMVQxMzowMToxOVq0MjAyNi0wOS0yMVQxMzowMToxOVrPAAAAATnuUlQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Bugfix] Handle MoE padding sentinel in FlashInfer b12x experts",
+      "updatedAt": "2026-10-15T07:21:18Z",
+      "url": "https://github.com/vllm-project/vllm/pull/57946"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/57946/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/57946/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/57946"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/57946"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/57946/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/57946"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/a2c8e6641171f4759f5fd5d024366b61ccbc0f83"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 149,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 23600,
+        "forks_count": 23600,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9092,
+        "open_issues_count": 9092,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-10-19T19:17:28Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 323941,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 94149,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-10-19T19:31:50Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 94149,
+        "watchers_count": 94149,
+        "web_commit_signoff_required": true
+      },
+      "sha": "db7f1f671419535b85fa73e29ff061e287e39459",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Purpose\n\n`VLLM_MOE_SKIP_PADDING` (on by default) makes the topk kernels write `-1` into `topk_ids` for\ncudagraph padding rows, so downstream MoE kernels can skip work for them. `FlashInferB12xExperts`\nnever handled that sentinel and passed `topk_ids` straight into `B12xMoEWrapper.run()`, where the\nb12x kernels index the expert state with the raw id. A value of `-1` writes outside the workspace\nand trips an MMU fault:\n\n```\nNVRM: Xid (PCI:000f:01:00): 31, pid=..., name=python3, MMU Fault: ENGINE GRAPHICS GPC1\n      FAULT_PDE ACCESS_TYPE_VIRT_WRITE\nRuntimeError: Triton Error [CUDA]: an illegal memory access was encountered\n```\n\nChronology, since the base has moved: on the build this was isolated on (`5db652225`) the\nprofiling run marked every row as padding, so all 40960 routing indices were `-1` and the engine\nfaulted in `determine_available_memory()` before the server could start. Current `main` no longer\ndoes that — `is_padding=not is_profile` in the V2 runner (#57270) deliberately routes profiling\ntokens to experts so MoE memory is measured — so the startup repro no longer applies as written.\nThe bug itself is unchanged: cudagraph padding, idle-DP dummy batches and trailing padded rows on\nreal batches all still emit the same sentinel, so b12x remains unsafe on current `main`.\n\nNote the reported traceback is misleading. Without `CUDA_LAUNCH_BLOCKING=1` the fault surfaces at\nthe *next* Triton `load_binary`, which for this model is `_hc_combine_kernel` in layer 0's\nattention — before any MoE has run. With blocking launches the faulting call is\n`flashinfer_b12x_moe.py:288`, `wrapper.run(...)`.\n\nNeutralize the sentinel where the other routing fixups happen: route padding rows to expert 0 with\nzero weight, contributing nothing to the output. The router's mask is per row (`is_padding[:num_tokens]`), so a marked\nrow is `-1` in every slot, and no live row loses a single expert. Unguarded, b12x never gets as far as producing\ndiscardable output for those rows: it indexes expert state with the `-1`, an out-of-bounds access that kills\nthe CUDA context. The guard\nruns only when `VLLM_MOE_SKIP_PADDING` is on: every sentinel writer is gated on that flag and b12x takes no\nexpert map, so with the flag off no `-1` can arrive (a static read, resolved while the graph is traced). The rewrite is branchless so it remains\ncudagraph-capturable. This mirrors the AITER fix in #57036 and the XPU gating in #55231.\n\nFixes #50189.\n\n## Test Plan\n\n- New regression test `test_flashinfer_b12x_moe_tolerates_padding_sentinel` in\n  `tests/kernels/moe/test_flashinfer_b12x_moe.py`, three cases: `(32, 2, half)` -> 64 routed rows,\n  the static b12x path; `(384, 2, all)` -> 768 routed rows, every row padded, crossing the 640-row\n  static/dynamic cutover; `(32, 2, nan)` -> padded activations poisoned with NaN, since cudagraph\n  padding rows may carry NaN/Inf. Asserts padding rows are exactly zero and finite, and that real\n  rows match a run without padding. The test is skipped when `VLLM_MOE_SKIP_PADDING` is off, since no\n  sentinel is written and the guard is skipped then.\n- Hot-path cost of the guard, measured with CUDA events at the model's real shapes\n  (E=512, k=2560, n=640, topk=10), eager and inside a CUDA graph.\n- End-to-end: serve Qwen3.8-Flash-Next NVFP4 with `--moe-backend flashinfer_b12x` on GB10 and\n  confirm the engine starts and generates.\n- Isolated repro against FlashInfer directly (no vLLM), varying only the routing table.\n\n## Test Result\n\nBox: DGX Spark GB10, sm_121, 128 GB unified, TP=1. FlashInfer 0.6.18.post1.\n\nUnit test, against the installed build:\n\n```\n$ pytest tests/kernels/moe/test_flashinfer_b12x_moe.py -k padding_sentinel\n\n# before this patch\nFAILED test_flashinfer_b12x_moe_tolerates_padding_sentinel - AcceleratorError:\n    CUDA error: an illegal memory access was encountered\n1 failed in 3.09s\n\n# with this patch\n1 passed in 1.77s\n```\n\nWhole file with this patch: 51 passed with the flag on; 48 passed, 3 skipped with\n`VLLM_MOE_SKIP_PADDING=0`.\n\nEnd-to-end, same checkpoint and flags:\n\n| build | result |\n| --- | --- |\n| before | engine dies in `determine_available_memory()`, Xid 31 |\n| after  | serves in 660 s; `\"Name the four seasons\"` -> `\"spring, summer, autumn, winter\"` |\n\nIsolated FlashInfer repro, same process, same shapes (E=512, k=2560, n=640, topk=10, 40960 routed\nrows) — only the routing table differs:\n\n| `topk_ids` | result |\n| --- | --- |\n| all `-1` | illegal memory access |\n| padding masked to expert 0, weight 0 | clean, finite output |\n\nHot-path cost of the guard (E=512, k=2560, n=640, topk=10), CUDA events, vs the b12x MoE call\nat the same shape:\n\n| M | sentinel eager us | sentinel graphed us | MoE graphed us | guard, % of graphed MoE |\n| ---: | ---: | ---: | ---: | ---: |\n| 1 | 22.25 | 6.33 | 117.92 | 5.4% |\n| 2 | 21.68 | 6.86 | 284.53 | 2.4% |\n| 4 | 22.05 | 6.74 | 482.11 | 1.4% |\n| 8 | 21.09 | 6.34 | 1045.32 | 0.6% |\n\nThe eager cost is flat at ~21 us across every M, i.e. it is kernel-launch overhead on a `[M, topk]`\ntensor rather than work. Decode runs under CUDA graphs, where the three ops replay in ~6.3 us --\n5.4% of the MoE call at M=1 and under 1.5% from M=4 up. Both sides are captured here; the MoE call\nis only ~11% faster graphed than eager, so it is GPU-bound rather than launch-bound. At ~2 us per replayed kernel this is near the\nfloor for elementwise ops on this device; going lower means handling `topk_id < 0` inside the\nFlashInfer b12x kernel, which would also avoid computing expert 0 for padded routes at all.\n\nNote there is no b12x \"before\" number for end-to-end decode: without this patch the backend faults,\nso the unpatched configuration cannot be benchmarked. `VLLM_MOE_SKIP_PADDING=0` is the way to\nisolate the guard's end-to-end cost, and I can add that measurement if it would help.\n\nOn NaN: padded rows whose activations were set to NaN still produce exactly zero, finite output\n(0 NaN of 40960 elements), so the zero route weight is not defeated by `0 * NaN` here.\n\nRouting measured at the router's return: the 4096-token profiling batch is 40960/40960 negative,\nwhile the 32-token warmup a few calls later routes normally (ids 1..504), with finite inputs in\nboth cases — i.e. legitimate sentinel values, not corrupted memory. `FLASHINFER_CUTLASS` tolerates\nthem on the same checkpoint, which is why only the b12x path faulted.\n\n---\n<details>\n<summary> Essential Elements of an Effective PR Description Checklist </summary>\n\n- [x] The purpose of the PR, such as \"Fix some issue (link existing issues this PR will resolve)\".\n- [x] The test plan, such as providing test command.\n- [x] The test results, such as pasting the results comparison before and after, or e2e results\n- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model.\n</details>\n\n*This PR was prepared with AI assistance (Claude Code). All logs and numbers come from real runs on\nthe hardware described, and I have reviewed every line.*\n\n\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 9,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/57946/comments",
+    "commits": 5,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/57946/commits",
+    "created_at": "2026-09-21T13:01:16Z",
+    "deletions": 1,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/57946.diff",
+    "draft": false,
+    "head": {
+      "label": "jschmied:bugfix/b12x-moe-padding-sentinel",
+      "ref": "bugfix/b12x-moe-padding-sentinel",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/jschmied/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/jschmied/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/jschmied/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/jschmied/vllm/branches{/branch}",
+        "clone_url": "https://github.com/jschmied/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/jschmied/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/jschmied/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/jschmied/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/jschmied/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/jschmied/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/jschmied/vllm/contributors",
+        "created_at": "2026-07-13T18:01:29Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/jschmied/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/jschmied/vllm/downloads",
+        "events_url": "https://api.github.com/repos/jschmied/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/jschmied/vllm/forks",
+        "full_name": "jschmied/vllm",
+        "git_commits_url": "https://api.github.com/repos/jschmied/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/jschmied/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/jschmied/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/jschmied/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/jschmied/vllm/hooks",
+        "html_url": "https://github.com/jschmied/vllm",
+        "id": 1299590786,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/jschmied/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/jschmied/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/jschmied/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/jschmied/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/jschmied/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/jschmied/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/jschmied/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/jschmied/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOTXYugg",
+        "notifications_url": "https://api.github.com/repos/jschmied/vllm/notifications{?since,all,participating}",
+        "open_issues": 2,
+        "open_issues_count": 2,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/600316?v=4",
+          "events_url": "https://api.github.com/users/jschmied/events{/privacy}",
+          "followers_url": "https://api.github.com/users/jschmied/followers",
+          "following_url": "https://api.github.com/users/jschmied/following{/other_user}",
+          "gists_url": "https://api.github.com/users/jschmied/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/jschmied",
+          "id": 600316,
+          "login": "jschmied",
+          "node_id": "MDQ6VXNlcjYwMDMxNg==",
+          "organizations_url": "https://api.github.com/users/jschmied/orgs",
+          "received_events_url": "https://api.github.com/users/jschmied/received_events",
+          "repos_url": "https://api.github.com/users/jschmied/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/jschmied/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/jschmied/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/jschmied",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/jschmied/vllm/pulls{/number}",
+        "pushed_at": "2026-10-13T07:38:37Z",
+        "releases_url": "https://api.github.com/repos/jschmied/vllm/releases{/id}",
+        "size": 305006,
+        "ssh_url": "git@github.com:jschmied/vllm.git",
+        "stargazers_count": 2,
+        "stargazers_url": "https://api.github.com/repos/jschmied/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/jschmied/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/jschmied/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/jschmied/vllm/subscription",
+        "svn_url": "https://github.com/jschmied/vllm",
+        "tags_url": "https://api.github.com/repos/jschmied/vllm/tags",
+        "teams_url": "https://api.github.com/repos/jschmied/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/jschmied/vllm/git/trees{/sha}",
+        "updated_at": "2026-09-05T05:47:34Z",
+        "url": "https://api.github.com/repos/jschmied/vllm",
+        "visibility": "public",
+        "watchers": 2,
+        "watchers_count": 2,
+        "web_commit_signoff_required": true
+      },
+      "sha": "a2c8e6641171f4759f5fd5d024366b61ccbc0f83",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/600316?v=4",
+        "events_url": "https://api.github.com/users/jschmied/events{/privacy}",
+        "followers_url": "https://api.github.com/users/jschmied/followers",
+        "following_url": "https://api.github.com/users/jschmied/following{/other_user}",
+        "gists_url": "https://api.github.com/users/jschmied/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/jschmied",
+        "id": 600316,
+        "login": "jschmied",
+        "node_id": "MDQ6VXNlcjYwMDMxNg==",
+        "organizations_url": "https://api.github.com/users/jschmied/orgs",
+        "received_events_url": "https://api.github.com/users/jschmied/received_events",
+        "repos_url": "https://api.github.com/users/jschmied/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/jschmied/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/jschmied/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/jschmied",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/57946",
+    "id": 4591766365,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/57946",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d73a4a",
+        "default": true,
+        "description": "Something isn't working",
+        "id": 5135047172,
+        "name": "bug",
+        "node_id": "LA_kwDOI7xefs8AAAABMhKaBA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/bug"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "76B900",
+        "default": false,
+        "description": "",
+        "id": 9543357705,
+        "name": "nvidia",
+        "node_id": "LA_kwDOI7xefs8AAAACONQVCQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/nvidia"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "3239a246ebeac6c0b0cd8b68f917b9e44f50e710",
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABEbDLXQ",
+    "number": 57946,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/57946.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1236979?v=4",
+        "events_url": "https://api.github.com/users/tlrmchlsmth/events{/privacy}",
+        "followers_url": "https://api.github.com/users/tlrmchlsmth/followers",
+        "following_url": "https://api.github.com/users/tlrmchlsmth/following{/other_user}",
+        "gists_url": "https://api.github.com/users/tlrmchlsmth/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/tlrmchlsmth",
+        "id": 1236979,
+        "login": "tlrmchlsmth",
+        "node_id": "MDQ6VXNlcjEyMzY5Nzk=",
+        "organizations_url": "https://api.github.com/users/tlrmchlsmth/orgs",
+        "received_events_url": "https://api.github.com/users/tlrmchlsmth/received_events",
+        "repos_url": "https://api.github.com/users/tlrmchlsmth/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/tlrmchlsmth/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/tlrmchlsmth/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/tlrmchlsmth",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/3195154?v=4",
+        "events_url": "https://api.github.com/users/mgoin/events{/privacy}",
+        "followers_url": "https://api.github.com/users/mgoin/followers",
+        "following_url": "https://api.github.com/users/mgoin/following{/other_user}",
+        "gists_url": "https://api.github.com/users/mgoin/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/mgoin",
+        "id": 3195154,
+        "login": "mgoin",
+        "node_id": "MDQ6VXNlcjMxOTUxNTQ=",
+        "organizations_url": "https://api.github.com/users/mgoin/orgs",
+        "received_events_url": "https://api.github.com/users/mgoin/received_events",
+        "repos_url": "https://api.github.com/users/mgoin/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/mgoin/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/mgoin/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/mgoin",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/33809857?v=4",
+        "events_url": "https://api.github.com/users/pavanimajety/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pavanimajety/followers",
+        "following_url": "https://api.github.com/users/pavanimajety/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pavanimajety/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pavanimajety",
+        "id": 33809857,
+        "login": "pavanimajety",
+        "node_id": "MDQ6VXNlcjMzODA5ODU3",
+        "organizations_url": "https://api.github.com/users/pavanimajety/orgs",
+        "received_events_url": "https://api.github.com/users/pavanimajety/received_events",
+        "repos_url": "https://api.github.com/users/pavanimajety/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pavanimajety/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pavanimajety/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/pavanimajety",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42426329?v=4",
+        "events_url": "https://api.github.com/users/zyongye/events{/privacy}",
+        "followers_url": "https://api.github.com/users/zyongye/followers",
+        "following_url": "https://api.github.com/users/zyongye/following{/other_user}",
+        "gists_url": "https://api.github.com/users/zyongye/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/zyongye",
+        "id": 42426329,
+        "login": "zyongye",
+        "node_id": "MDQ6VXNlcjQyNDI2MzI5",
+        "organizations_url": "https://api.github.com/users/zyongye/orgs",
+        "received_events_url": "https://api.github.com/users/zyongye/received_events",
+        "repos_url": "https://api.github.com/users/zyongye/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/zyongye/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/zyongye/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/zyongye",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42451412?v=4",
+        "events_url": "https://api.github.com/users/AndreasKaratzas/events{/privacy}",
+        "followers_url": "https://api.github.com/users/AndreasKaratzas/followers",
+        "following_url": "https://api.github.com/users/AndreasKaratzas/following{/other_user}",
+        "gists_url": "https://api.github.com/users/AndreasKaratzas/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/AndreasKaratzas",
+        "id": 42451412,
+        "login": "AndreasKaratzas",
+        "node_id": "MDQ6VXNlcjQyNDUxNDEy",
+        "organizations_url": "https://api.github.com/users/AndreasKaratzas/orgs",
+        "received_events_url": "https://api.github.com/users/AndreasKaratzas/received_events",
+        "repos_url": "https://api.github.com/users/AndreasKaratzas/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/AndreasKaratzas/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/AndreasKaratzas/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/AndreasKaratzas",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/44945378?v=4",
+        "events_url": "https://api.github.com/users/yewentao256/events{/privacy}",
+        "followers_url": "https://api.github.com/users/yewentao256/followers",
+        "following_url": "https://api.github.com/users/yewentao256/following{/other_user}",
+        "gists_url": "https://api.github.com/users/yewentao256/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/yewentao256",
+        "id": 44945378,
+        "login": "yewentao256",
+        "node_id": "MDQ6VXNlcjQ0OTQ1Mzc4",
+        "organizations_url": "https://api.github.com/users/yewentao256/orgs",
+        "received_events_url": "https://api.github.com/users/yewentao256/received_events",
+        "repos_url": "https://api.github.com/users/yewentao256/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/yewentao256/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/yewentao256/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/yewentao256",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/46394894?v=4",
+        "events_url": "https://api.github.com/users/WoosukKwon/events{/privacy}",
+        "followers_url": "https://api.github.com/users/WoosukKwon/followers",
+        "following_url": "https://api.github.com/users/WoosukKwon/following{/other_user}",
+        "gists_url": "https://api.github.com/users/WoosukKwon/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/WoosukKwon",
+        "id": 46394894,
+        "login": "WoosukKwon",
+        "node_id": "MDQ6VXNlcjQ2Mzk0ODk0",
+        "organizations_url": "https://api.github.com/users/WoosukKwon/orgs",
+        "received_events_url": "https://api.github.com/users/WoosukKwon/received_events",
+        "repos_url": "https://api.github.com/users/WoosukKwon/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/WoosukKwon/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/WoosukKwon/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/WoosukKwon",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/57946/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/a2c8e6641171f4759f5fd5d024366b61ccbc0f83",
+    "title": "[Bugfix] Handle MoE padding sentinel in FlashInfer b12x experts",
+    "updated_at": "2026-10-15T07:21:18Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/57946",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/600316?v=4",
+      "events_url": "https://api.github.com/users/jschmied/events{/privacy}",
+      "followers_url": "https://api.github.com/users/jschmied/followers",
+      "following_url": "https://api.github.com/users/jschmied/following{/other_user}",
+      "gists_url": "https://api.github.com/users/jschmied/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/jschmied",
+      "id": 600316,
+      "login": "jschmied",
+      "node_id": "MDQ6VXNlcjYwMDMxNg==",
+      "organizations_url": "https://api.github.com/users/jschmied/orgs",
+      "received_events_url": "https://api.github.com/users/jschmied/received_events",
+      "repos_url": "https://api.github.com/users/jschmied/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/jschmied/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/jschmied/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/jschmied",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 131,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a2c8e6641171f4759f5fd5d024366b61ccbc0f83/tests%2Fkernels%2Fmoe%2Ftest_flashinfer_b12x_moe.py",
+      "changes": 131,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fmoe%2Ftest_flashinfer_b12x_moe.py?ref=a2c8e6641171f4759f5fd5d024366b61ccbc0f83",
+      "deletions": 0,
+      "filename": "tests/kernels/moe/test_flashinfer_b12x_moe.py",
+      "patch": "@@ -28,6 +28,7 @@\n # Import fp4_quantize after the skip guard — FlashInfer must be installed.\n from flashinfer.fp4_quantization import fp4_quantize\n \n+import vllm.envs as envs\n import vllm.model_executor.layers.fused_moe.modular_kernel as mk\n from tests.kernels.moe.utils import make_dummy_moe_config\n from tests.kernels.utils import torch_moe\n@@ -222,6 +223,136 @@ def test_flashinfer_b12x_moe(\n         torch.testing.assert_close(sm12x_output, torch_output, atol=2e-1, rtol=2e-1)\n \n \n+@pytest.mark.parametrize(\n+    \"m,topk,pad_mode\",\n+    [\n+        # half padded, 64 routed rows -> static b12x path\n+        (32, 2, \"half\"),\n+        # ALL rows padded, 768 routed rows -> crosses the 640-row static/dynamic\n+        # cutover.\n+        # This is the shape that faulted in production.\n+        (384, 2, \"all\"),\n+        # vLLM documents that cudagraph padding rows may carry NaN/Inf activations;\n+        # a zero route weight must still yield exactly zero, not 0 * NaN.\n+        (32, 2, \"nan\"),\n+    ],\n+)\n+@pytest.mark.skipif(\n+    not envs.VLLM_MOE_SKIP_PADDING,\n+    reason=\"the -1 sentinel is only written, and only guarded, when \"\n+    \"VLLM_MOE_SKIP_PADDING is on\",\n+)\n+@torch.inference_mode()\n+def test_flashinfer_b12x_moe_tolerates_padding_sentinel(\n+    m, topk, pad_mode, workspace_init\n+):\n+    \"\"\"Padding rows carrying the -1 sentinel must not reach the b12x kernels.\n+\n+    ``VLLM_MOE_SKIP_PADDING`` makes the topk kernels write -1 into ``topk_ids``\n+    for cudagraph padding rows. The b12x kernels index the expert state with\n+    those ids directly, so an unhandled -1 writes out of bounds and trips an\n+    MMU fault (Xid 31 on SM12x). Padding rows must contribute nothing.\n+    \"\"\"\n+    n, k, e = 128, 256, 8\n+    dtype = torch.bfloat16\n+    set_random_seed(7)\n+    with set_current_vllm_config(\n+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))\n+    ):\n+        a = torch.randn((m, k), device=\"cuda\", dtype=dtype) / 10\n+        w1_bf16 = torch.randn((e, 2 * n, k), device=\"cuda\", dtype=dtype) / 15\n+        w2_bf16 = torch.randn((e, k, n), device=\"cuda\", dtype=dtype) / 15\n+\n+        gs = torch.ones(1, device=\"cuda\", dtype=torch.float32)\n+        sf_vec_size = 16\n+\n+        w1_reordered, _ = reorder_w1w3_to_w3w1(\n+            w1_bf16.clone(),\n+            torch.ones((e, 2 * n, 1), device=\"cuda\", dtype=torch.float32),\n+        )\n+        w1_q_flat, w1_sf_flat = fp4_quantize(\n+            w1_reordered.reshape(e * 2 * n, k),\n+            global_scale=gs,\n+            sf_vec_size=sf_vec_size,\n+            is_sf_swizzled_layout=True,\n+        )\n+        w1_q = w1_q_flat.view(e, 2 * n, k // 2)\n+        w1_blockscale = w1_sf_flat.view(e, 2 * n, w1_sf_flat.shape[1])\n+\n+        w2_q_flat, w2_sf_flat = fp4_quantize(\n+            w2_bf16.reshape(e * k, n),\n+            global_scale=gs,\n+            sf_vec_size=sf_vec_size,\n+            is_sf_swizzled_layout=True,\n+        )\n+        w2_q = w2_q_flat.view(e, k, n // 2)\n+        w2_blockscale = w2_sf_flat.view(e, k, w2_sf_flat.shape[1])\n+\n+        ones_e = torch.ones(e, device=\"cuda\", dtype=torch.float32)\n+        quant_config = nvfp4_moe_quant_config(\n+            g1_alphas=ones_e,\n+            g2_alphas=ones_e,\n+            a1_gscale=ones_e,\n+            a2_gscale=ones_e,\n+            w1_scale=w1_blockscale,\n+            w2_scale=w2_blockscale,\n+        )\n+        moe_config = make_dummy_moe_config(\n+            num_experts=e,\n+            experts_per_token=topk,\n+            hidden_dim=k,\n+            intermediate_size=n,\n+            in_dtype=dtype,\n+        )\n+        experts = FlashInferB12xExperts(\n+            moe_config=moe_config, quant_config=quant_config\n+        )\n+        _process_b12x_weights(experts, w1_blockscale, w2_blockscale, ones_e, ones_e)\n+        kernel = mk.FusedMoEKernel(\n+            maybe_make_prepare_finalize(\n+                moe=moe_config,\n+                quant_config=quant_config,\n+                allow_new_interface=True,\n+                use_monolithic=False,\n+            ),\n+            experts,\n+        )\n+\n+        score = torch.randn((m, e), device=\"cuda\", dtype=dtype)\n+        topk_weights, topk_ids, _ = fused_topk(a, score, topk, renormalize=False)\n+\n+        num_real = 0 if pad_mode == \"all\" else m // 2\n+        padded_ids = topk_ids.clone()\n+        padded_ids[num_real:] = -1\n+        if pad_mode == \"nan\":\n+            # Poison the padded rows' activations.\n+            a[num_real:] = float(\"nan\")\n+\n+        def _run(ids):\n+            return kernel.apply(\n+                hidden_states=a,\n+                w1=w1_q,\n+                w2=w2_q,\n+                topk_weights=topk_weights,\n+                topk_ids=ids,\n+                global_num_experts=e,\n+                activation=MoEActivation.SILU,\n+                apply_router_weight_on_input=False,\n+                expert_map=None,\n+            )\n+\n+        out = _run(padded_ids)\n+        # Padding rows contribute nothing -- exactly zero, and finite even when the\n+        # padded activations were NaN.\n+        assert torch.equal(out[num_real:], torch.zeros_like(out[num_real:]))\n+        assert torch.isfinite(out[num_real:]).all()\n+        if num_real:\n+            # Real rows are unaffected by the presence of padding rows.\n+            assert torch.isfinite(out[:num_real]).all()\n+            ref_out = _run(topk_ids)\n+            torch.testing.assert_close(out[:num_real], ref_out[:num_real])\n+\n+\n @pytest.mark.parametrize(\"m,n,k\", MNK_FACTORS)\n @pytest.mark.parametrize(\"e\", [8, 16])\n @pytest.mark.parametrize(\"topk\", [1, 2, 4])",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a2c8e6641171f4759f5fd5d024366b61ccbc0f83/tests%2Fkernels%2Fmoe%2Ftest_flashinfer_b12x_moe.py",
+      "sha": "e436c85319cd032a36d33228710c0b2bdbcf5d99",
+      "status": "modified"
+    },
+    {
+      "additions": 18,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a2c8e6641171f4759f5fd5d024366b61ccbc0f83/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fexperts%2Fflashinfer_b12x_moe.py",
+      "changes": 19,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fexperts%2Fflashinfer_b12x_moe.py?ref=a2c8e6641171f4759f5fd5d024366b61ccbc0f83",
+      "deletions": 1,
+      "filename": "vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py",
+      "patch": "@@ -5,6 +5,7 @@\n \n import torch\n \n+import vllm.envs as envs\n import vllm.model_executor.layers.fused_moe.modular_kernel as mk\n from vllm.model_executor.layers.fused_moe.activation import MoEActivation\n from vllm.model_executor.layers.fused_moe.config import (\n@@ -285,6 +286,22 @@ def apply(\n         wrapper = self._wrapper\n         assert wrapper is not None\n \n+        # VLLM_MOE_SKIP_PADDING (on by default) makes the topk routers write -1\n+        # into topk_ids for cudagraph padding rows. The mask is per row\n+        # (`is_padding[:num_tokens]`), so a marked row is -1 in every slot and\n+        # its whole output is discarded. The b12x kernels index the expert state\n+        # with these ids directly, so the sentinel has to be neutralized here:\n+        # route padding rows to expert 0 with zero weight, contributing nothing\n+        # to the output. Branchless, so it stays cudagraph-capturable. Every\n+        # sentinel writer is gated on the same flag and b12x takes no expert\n+        # map, so with the flag off no -1 can arrive and the guard is skipped\n+        # (a static read, resolved while the graph is traced).\n+        topk_ids = topk_ids.to(torch.int32)\n+        if envs.VLLM_MOE_SKIP_PADDING:\n+            is_padding = topk_ids < 0\n+            topk_ids = torch.where(is_padding, 0, topk_ids)\n+            topk_weights = torch.where(is_padding, 0.0, topk_weights)\n+\n         wrapper_output = wrapper.run(\n             x=hidden_states,\n             w1_weight=w1,\n@@ -294,7 +311,7 @@ def apply(\n             w2_weight=w2,\n             w2_weight_sf=self.w2_sf_mma,\n             w2_alpha=self.g2_alphas,\n-            token_selected_experts=topk_ids.to(torch.int32),\n+            token_selected_experts=topk_ids,\n             token_final_scales=topk_weights,\n         )\n         output.copy_(wrapper_output)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a2c8e6641171f4759f5fd5d024366b61ccbc0f83/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fexperts%2Fflashinfer_b12x_moe.py",
+      "sha": "f3f843ce64ac14625c483501e707c25f85505045",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Hot-path cost of the guard vs the b12x MoE call at the model's real shapes (E=512, k=2560, n=640,\r\ntopk=10), CUDA events, GB10 / sm_121. Both are captured, since that is what a decode step replays:\r\n\r\n| M | sentinel eager us | sentinel graphed us | MoE graphed us | guard, % of graphed MoE |\r\n| ---: | ---: | ---: | ---: | ---: |\r\n| 1 | 22.25 | 6.33 | 117.92 | 5.4% |\r\n| 2 | 21.68 | 6.86 | 284.53 | 2.4% |\r\n| 4 | 22.05 | 6.74 | 482.11 | 1.4% |\r\n| 8 | 21.09 | 6.34 | 1045.32 | 0.6% |\r\n\r\nThe eager cost is flat at ~21 us across every M, so it is kernel-launch overhead on a `[M, topk]`\r\ntensor, not work. Under CUDA graphs the three ops replay in ~6.3 us: 5.4% of the MoE call at M=1,\r\nunder 1.5% from M=4. (The MoE call is only ~11% faster graphed than eager -- 132 us vs 118 us at\r\nM=1 -- so it is GPU-bound rather than launch-bound.) At ~2 us per replayed kernel that is close to\r\nthe floor for elementwise ops here, so the remaining win is native `topk_id < 0` handling inside b12x — which, as\r\nyou say, would also stop padded routes computing expert 0 at all. Happy to take that route instead\r\nif you would rather have it there than in vLLM.\r\n\r\nOn end-to-end before/after: there is no b12x \"before\" to measure, because the unpatched backend\r\nfaults. `VLLM_MOE_SKIP_PADDING=0` isolates the guard cost end-to-end and I can run that if useful.\r\n\r\nAlso applied from your review:\r\n\r\n- dropped the two `zeros_like` allocations\r\n- the test now covers three cases: `(32, 2)` half-padded = 64 routed rows on the static path,\r\n  `(384, 2)` all-padded = 768 routed rows, crossing the 640-row static/dynamic cutover, and a case\r\n  where the padded rows' activations are NaN\r\n- **NaN is safe**: padded rows still produce exactly zero, finite output (0 NaN of 40960 elements),\r\n  so the zero route weight is not defeated by `0 * NaN` on this path\r\n- corrected the chronology in the description. Current `main` no longer marks\r\n  profiling rows as padding (`is_padding=not is_profile`, #57270); the all `-1` profiling batch was\r\n  specific to the `5db652225` build this was isolated on. Cudagraph/DP padding still emits the\r\n  sentinel, so the fix stands, but the startup repro no longer reads correctly against `main` and\r\n  the description now says so.\r\n\r\n*Prepared with AI assistance (Claude Code); all numbers are from real runs on the hardware named.*\r\n",
+      "created_at": "2026-09-21T13:58:59Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5761695151",
+      "id": 5761695151,
+      "updated_at": "2026-09-21T14:29:29Z",
+      "user": {
+        "login": "jschmied"
+      }
+    },
+    {
+      "body": "Asking for SM120 numbers, and flagging that mine are probably the favourable case.\n\nAll the cost figures above are GB10 (`sm_121`): 48 SMs, 24 MiB L2, LPDDR5X shared with the CPU.\nThe guard is a fixed ~6.3 us under cudagraphs regardless of M, so its *share* is set by how fast the\nMoE call it sits in front of is. On SM120 (GB202: far more SMs, GDDR7) the b12x MoE should be\nconsiderably faster than the 118 us I measure at M=1 — which makes the same 6.3 us a **larger**\nfraction there, not a smaller one. I would rather say that up front than have GB10-only numbers\nstand in for the arch where flashinfer actually prefers b12x\n(`gemm/gemm_base.py:6924`: *\"SM120 + CUDA 13: prefer b12x ... SM121 (GB10) is intentionally\nexcluded\"*).\n\nIf someone with a 5090 / PRO 6000 Blackwell can run it, the two useful datapoints are:\n\n1. **Cost.** For M = 1, 2, 4, 8 at your model's `topk`: time the three guard ops and the b12x MoE\n   call at the same shape, both inside a CUDA graph (comparing a graphed guard against an eager MoE\n   call flatters the guard — I made that mistake and corrected it above).\n2. **That the bug and the fix both reproduce.** I cannot test SM120. The faulting code is\n   arch-independent Python, so it should, but that is an inference, not a measurement.\n\nNote b12x MoE is opt-in today, so only `--moe-backend flashinfer_b12x` users are exposed. #54669 and\n#54719 would make it automatically selected — on SM120 first — at which point this fault becomes a\ndefault-path crash, which is the main reason I think it is worth fixing now rather than later.\n\nOn where the fix belongs: I traced it to the kernel and reported it at\nflashinfer-ai/flashinfer#3170 (comment). The generic dynamic kernel histograms with\n`atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), 1)` and `expert_id` can be `-1`,\nwhich is why the Xid is a *write* fault. Handling `topk_id < 0` natively there would remove this\nguard entirely and also stop padded routes computing expert 0. I did not attempt that patch: the id\nreaches seven indexing sites across two phases and is cached into shared memory, so a partial guard\nwould turn a clean fault into silent corruption. This PR stays useful regardless, since vLLM pins\n`flashinfer-python==0.6.18.post1` and a kernel fix reaches no one until that pin moves.\n\n*Prepared with AI assistance (Claude Code); all numbers are from real runs on the box named.*\n",
+      "created_at": "2026-09-21T15:30:39Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5763067897",
+      "id": 5763067897,
+      "updated_at": "2026-09-21T15:30:39Z",
+      "user": {
+        "login": "jschmied"
+      }
+    },
+    {
+      "body": "Can't give you SM120 numbers — I'm on a GB10 too, so mine would be the same favourable case you already flagged. Two things from reading it instead.\n\n**The thing a reviewer would stop on, and it's fine.** Zeroing `topk_weights` where `topk_ids < 0` is only safe if the sentinel is written per *row*, not per slot — otherwise you'd be dropping one expert from a live row and silently changing the remaining weights' normalization. It is per row: `_get_padding_mask()` in `router/fused_topk_router.py` returns `is_padding[:num_tokens]`, a `[num_tokens]` mask, and that's what `ops.topk_softmax` takes. So a marked row is fully `-1` and the whole row's output is zero and discarded. Worth stating explicitly in the PR body, since the guard itself is written elementwise and reads as if per-slot sentinels were possible.\n\n**One way to make the cost you're worried about disappear where it doesn't apply.** The guard runs unconditionally, but with `VLLM_MOE_SKIP_PADDING=0` no `-1` can ever reach here — the routers only mark padding under that flag. Gating it:\n\n```python\nif envs.VLLM_MOE_SKIP_PADDING:\n    topk_ids = topk_ids.to(torch.int32)\n    ...\nelse:\n    topk_ids = topk_ids.to(torch.int32)\n```\n\nis a Python-level read of a static env, resolved while the graph is being traced, so it doesn't cost you capturability. That doesn't help the default path, which is the one your table measures — but it does mean the 6.3 us is only ever paid by configurations that can actually produce the sentinel, which seems worth having given the SM120 share you're raising yourself.\n\nThe `torch.where` pair itself looks right to me: both operate on `[M, topk]`, the scalar `0.0` stays weakly typed so `topk_weights` keeps its dtype, and routing to expert 0 with zero weight is a no-op in an accumulate-style MoE.\n",
+      "created_at": "2026-09-23T15:27:59Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5797663608",
+      "id": 5797663608,
+      "updated_at": "2026-09-23T15:27:59Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "@hclsys thanks, both are in `da6d4a0068`.\n\n- **Per row, not per slot.** The comment and the PR description now say it: the router's mask is `is_padding[:num_tokens]`, so a marked row is `-1` in every slot and its whole output is discarded, and no live row loses a single expert.\n- **The guard is skipped when `VLLM_MOE_SKIP_PADDING` is off.** Every writer of the sentinel is gated on that flag. b12x also refuses expert parallelism and expert maps (`supports_expert_map()` returns `False`), so no other path can hand it a `-1`. With the flag off, the guard is skipped by a static read resolved while the graph is traced.\n\n`tests/kernels/moe/test_flashinfer_b12x_moe.py` on GB10 (sm_121): 51 passed with the flag on, 48 passed with `VLLM_MOE_SKIP_PADDING=0` (the three sentinel cases deselected).\n\nWritten with AI assistance (Claude Code).\n",
+      "created_at": "2026-09-30T11:57:55Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5910775978",
+      "id": 5910775978,
+      "updated_at": "2026-09-30T11:57:55Z",
+      "user": {
+        "login": "jschmied"
+      }
+    },
+    {
+      "body": "Both points look right to me now. Checked the parts that are checkable without the model, on a GB10 (sm_121):\n\n**The guard is identity on the happy path.** Ran the exact code from `da6d4a0068` against sentinel-free routing:\n\n```\nno -1 anywhere:   ids identical True,  weights identical True   (flag on vs off)\nrows 3 and 77 = -1: routed to expert [0,0,0...], weights [0.0,0.0,0.0...]\nlive row 4:         untouched\n```\n\nSo with the flag on and no padding present it costs two no-op `where`s and changes nothing, which is what makes it safe to leave unconditional inside the flag.\n\n**One thing I went looking for and did not find**, in case anyone else wonders: `torch.where(is_padding, 0.0, topk_weights)` with a Python `0.0` does **not** promote — bf16 in, bf16 out, and bitwise identity when the mask is all-False. Python scalars are weak-typed in the promotion rules, so the kernel still receives its original dtype. I expected an fp32 upcast and was wrong.\n\n`if envs.VLLM_MOE_SKIP_PADDING:` reading a module-level env value also does what your comment claims under tracing — it's a Python-level constant at trace time, so the flag-off path has no branch in the captured graph rather than a predicated one.\n\nI'm also running `tests/kernels/moe/test_flashinfer_b12x_moe.py` here to put a second GB10 against your 51/48, but the b12x CuteDSL JIT is still compiling on this box and I'd rather not quote a number before it finishes. Nothing in what I've checked so far contradicts it.\n",
+      "created_at": "2026-09-30T12:21:27Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5911194787",
+      "id": 5911194787,
+      "updated_at": "2026-09-30T12:21:27Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "Suite finished. Your ON number reproduces exactly, and the OFF leg found something.\n\n```\ndefault (flag on)                    51 passed in 163 s        <- same 51 as you\nVLLM_MOE_SKIP_PADDING=0, whole file  27 failed, 24 passed in 23 s\n```\n\nThe first failure is the sentinel test itself, and it isn't an assertion — it's a hard fault:\n\n```\ntests/kernels/moe/test_flashinfer_b12x_moe.py:340\n    assert torch.equal(out[num_real:], torch.zeros_like(out[num_real:]))\nE   torch.AcceleratorError: CUDA error: an illegal memory access was encountered\n```\n\nThat poisons the context, which is where the other 26 failures come from — they're collateral, not 27 separate problems.\n\nThe cause is just that **nothing deselects it for you**. `test_flashinfer_b12x_moe_tolerates_padding_sentinel` is one function (3 params) with no flag guard; the two `pytest.skip` calls at the top of the file are the CUDA/family gates. `vllm.envs` does pick the shell variable up correctly (`VLLM_MOE_SKIP_PADDING = False`), so with the flag off the test feeds `-1`, the guard is skipped by design, and b12x indexes expert state with it. Your 48 must have come from deselecting by hand rather than from the file doing it — worth a `skipif` so the next person doesn't get an illegal access instead of a skip:\n\n```python\n@pytest.mark.skipif(\n    not envs.VLLM_MOE_SKIP_PADDING,\n    reason=\"the sentinel is only written when VLLM_MOE_SKIP_PADDING is on\",\n)\n```\n\nIncidentally this makes the PR's case stronger than the description does. The body reads as if an unguarded `-1` gives wrong-but-finite output that the router discards; on sm_121 it's an out-of-bounds access that kills the context. \"Its whole output is discarded\" is true of the *router's* mask, but the kernel never gets that far.\n",
+      "created_at": "2026-09-30T12:23:43Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5911230822",
+      "id": 5911230822,
+      "updated_at": "2026-09-30T12:23:43Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "@hclsys right, my 48 came from `-k`, not from the file. `a2c8e66411` adds your `skipif`: whole file on GB10 now gives 51 passed with the flag on, 48 passed and 3 skipped with it off. The description now says an unguarded `-1` is an out-of-bounds access that kills the context. Thanks for running both legs.\n\nWritten with AI assistance (Claude Code).\n",
+      "created_at": "2026-09-30T12:32:45Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-5911371374",
+      "id": 5911371374,
+      "updated_at": "2026-09-30T12:32:45Z",
+      "user": {
+        "login": "jschmied"
+      }
+    },
+    {
+      "body": "@jschmied SM120 data point for this, correctness only. I didn't measure the guard's hot-path cost, so this doesn't answer the timing question.\n\n1x RTX PRO 6000 Blackwell Server Edition (sm_120), `vllm/vllm-openai:v0.31.0` (FlashInfer 0.7.0.post1), `nvidia/Qwen3.6-35B-A3B-NVFP4`, `--moe-backend=flashinfer_b12x`, CUDA graphs, capture sizes [1, 2, 4, 8, 16, 24, 32]:\n\n- Without this PR: `CUDA error: an illegal memory access` in `profile_cudagraph_memory` at capture size 2, in all 3 runs (with and without #60069, full 96 GB and a 31.45 GiB memory cap).\n- With this PR (head a2c8e66 applied to v0.31.0): both capture passes finish, the server boots in 70 s, output is coherent.\n- With this PR + #60069 under the 31.45 GiB cap: 13 concurrent requests, all coherent, no faults.\n\nWorth knowing for review: FlashInfer 0.7.1 (flashinfer-ai/flashinfer#5451) fixes the same crash on the kernel side. Unpatched v0.31.0 with FlashInfer 0.7.1 boots and serves with graphs on the same card, and `main` already pins 0.7.1. Full table in #49476.\n",
+      "created_at": "2026-10-15T07:01:07Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-6186436246",
+      "id": 6186436246,
+      "updated_at": "2026-10-15T07:01:07Z",
+      "user": {
+        "login": "adi-suresh01"
+      }
+    },
+    {
+      "body": "Followed up on the 0.7.1 point on a GB10 (sm_121). This PR's test file with the product change reverted, `-k \"sentinel or padding\"`:\n\n```\nflashinfer 0.7.0.post1   1 failed  (padded rows not zero, test:347)\nflashinfer 0.7.1         3 passed\n```\n\nSo flashinfer#5451 already skips the -1 ids here too, and main pins 0.7.1. The guard looks redundant on main now, only older flashinfer needs it.\n",
+      "created_at": "2026-10-15T07:21:18Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#issuecomment-6186762122",
+      "id": 6186762122,
+      "updated_at": "2026-10-15T07:21:18Z",
+      "user": {
+        "login": "hclsys"
+      }
+    }
+  ],
+  "number": 57946,
+  "refs": {
+    "base": {
+      "commit": "db7f1f671419535b85fa73e29ff061e287e39459",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "a2c8e6641171f4759f5fd5d024366b61ccbc0f83",
+      "repository": "jschmied/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/57946#pullrequestreview-5266887252",
+      "id": 5266887252,
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-21T13:01:19Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ]
+}

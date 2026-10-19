@@ -1,0 +1,437 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "b4f3496033b084128257cf93a896dcabe59d60edd450a022c2d269f8e3af935b",
+      "isPrivate": false,
+      "numbers": [
+        7775,
+        7774,
+        7772,
+        7771,
+        7769,
+        7768,
+        7766,
+        7763
+      ],
+      "observed_at": "2026-10-19T18:03:39.905385+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4930,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "54f18cd2195a0fc22c145268c9c1c193e9a3026e",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [x] I, the PR author, have personally reviewed every line of this PR.\r\n\r\n# What does this PR do?\r\n\r\nMakes HybridEP exchange routing information through NCCL instead of its own custom kernel. The custom kernel silently corrupts MoE token routing whenever one GPU is more than about 20 seconds late.\r\n\r\n## The problem\r\n\r\nIn an MoE layer, each GPU decides which experts each of its tokens goes to (the \"routing map\"). Before HybridEP can send tokens to the GPUs that own those experts, **every GPU needs every other GPU's routing map**. HybridEP collects them with an allgather.\r\n\r\nBy default, when all GPUs of the expert-parallel group sit in one NVLink domain (e.g. a GB200/GB300 NVL72 rack), HybridEP uses its own allgather kernel instead of NCCL. The kernel works like this:\r\n\r\n1. Each GPU writes its routing map into a shared buffer on every other GPU.\r\n2. Each GPU then waits until all the others have signalled \"done writing\".\r\n3. Each GPU reads the buffer and decides where tokens go.\r\n\r\nStep 2 has a time limit. If one GPU has not arrived after about 20 seconds, the others print a warning and **carry on anyway**:\r\n\r\n```\r\nHYBRID-EP ALLGATHER TIMEOUT:SM 19 [0]:expecting 416 got 415\r\n```\r\n\r\n(`got 415` of `416` means one GPU had not arrived.) At that point the buffer still holds the late GPU's routing map from the **previous** MoE layer. The other GPUs read it as if it were current, so they send and receive the wrong tokens. Nothing fails, and training continues with wrong numbers.\r\n\r\nAny one-off stall of more than about 20 seconds on a single GPU is enough to trigger it (real cases below).\r\n\r\nWith `enable_custom_allgather=False`, HybridEP uses NCCL's allgather instead. NCCL waits for the late GPU however long it takes, so the data is always current.\r\n\r\n## How it showed up\r\n\r\nDeepSeek-V3 training on 256 GB300 GPUs: runs that should have been bit-identical occasionally diverged at one step. In each of those runs the log contains this timeout warning (60 lines) at exactly the step that diverged. Runs without the warning never diverged.\r\n\r\nA normal training step here takes about 11 s. The timeout hit in the two situations below, which are ordinary in large jobs:\r\n\r\n| Case | When | What the log shows |\r\n|---|---|---|\r\n| First step | step 1 | Step 1 took 543 s. The timeout lines appear while the GPUs are compiling kernels on first use (each GPU compiles its own fused MoE GEMM kernels, so they finish at different times). |\r\n| Degraded run | step 17 | Every step took 99–260 s instead of ~11 s (slow job, cause not diagnosed). The timeout fired at step 17 of 50. |\r\n\r\nAll GPUs in the expert-parallel group must reach the same dispatch within ~20 s of each other. NCCL collectives tolerate a late GPU for the full watchdog timeout, typically 10–60 minutes. Anything that delays one GPU by 20 s to several minutes is therefore harmless with NCCL but silently corrupts data with the custom kernel. Examples are first-step compilation, CUDA graph capture, checkpoint saving, a filesystem stall, or a slow node.\r\n\r\n## Reproducing it (one node, 4 GPUs, about a minute)\r\n\r\nThe script below runs two MoE \"layers\" through HybridEP on 4 GPUs. It records the correct result for layer 1, then runs layer 0 and layer 1 again, but this time GPU 1 waits 30 seconds before layer 1. Each GPU compares what it got to the correct result.\r\n\r\n```python\r\n# torchrun --nproc_per_node=4 hybridep_allgather_timeout_repro.py --custom-allgather 1   # HybridEP's own kernel\r\n# torchrun --nproc_per_node=4 hybridep_allgather_timeout_repro.py --custom-allgather 0   # NCCL (this PR)\r\nimport argparse, os, time\r\n\r\nimport deep_ep\r\nimport torch\r\nimport torch.distributed as dist\r\n\r\np = argparse.ArgumentParser()\r\np.add_argument(\"--custom-allgather\", type=int, default=1)\r\np.add_argument(\"--stall-s\", type=float, default=30)\r\na = p.parse_args()\r\n\r\nrank, local = int(os.environ[\"RANK\"]), int(os.environ[\"LOCAL_RANK\"])\r\ntorch.cuda.set_device(local)\r\ndist.init_process_group(\"nccl\", device_id=torch.device(\"cuda\", local))\r\nworld = dist.get_world_size()\r\ntokens, hidden, local_experts, topk = 1024, 1024, 8, 8\r\nbuf = deep_ep.HybridEPBuffer(\r\n    group=dist.new_group(list(range(world))), hidden_dim=hidden, max_num_of_tokens_per_rank=tokens,\r\n    num_local_experts=local_experts, use_fp8=False, enable_custom_allgather=bool(a.custom_allgather),\r\n)\r\n\r\n\r\ndef layer(seed):  # one MoE layer: random tokens, each routed to `topk` random experts\r\n    g = torch.Generator(device=\"cuda\").manual_seed(seed * 1000 + rank)\r\n    x = torch.randn(tokens, hidden, generator=g, device=\"cuda\", dtype=torch.bfloat16)\r\n    idx = torch.rand(tokens, local_experts * world, generator=g, device=\"cuda\").topk(topk, dim=1).indices\r\n    return x, torch.zeros(tokens, local_experts * world, dtype=torch.bool, device=\"cuda\").scatter_(1, idx, True)\r\n\r\n\r\ndef tokens_per_expert(x, routing_map):  # how many tokens this GPU's experts receive\r\n    return buf.dispatch_with_permute(hidden=x, routing_map=routing_map, pad_multiple=32)[3].tolist()\r\n\r\n\r\nlayer0, layer1 = layer(0), layer(1)\r\nexpected = tokens_per_expert(*layer1)  # correct answer for layer 1 (all GPUs on time)\r\ntokens_per_expert(*layer0)             # run layer 0 ...\r\nif rank == 1:\r\n    time.sleep(a.stall_s)              # ... then GPU 1 is 30 s late for layer 1\r\ngot = tokens_per_expert(*layer1)\r\nprint(f\"rank {rank}: custom_allgather={a.custom_allgather} -> {'CORRUPTED' if got != expected else 'ok'}\", flush=True)\r\ndist.destroy_process_group()\r\n```\r\n\r\nResult on GB300 (DeepEP 1.2.1+17cfb81):\r\n\r\n```\r\n--custom-allgather 1   (HybridEP's own kernel, the current default)\r\n  HYBRID-EP ALLGATHER TIMEOUT ... expecting 12 got 11      <- printed by GPUs 0, 2, 3\r\n  rank 0: CORRUPTED\r\n  rank 1: ok                                               <- the late GPU itself\r\n  rank 2: CORRUPTED\r\n  rank 3: CORRUPTED\r\n\r\n--custom-allgather 0   (NCCL, this PR)\r\n  rank 0-3: ok\r\n```\r\n\r\nWith a 5 s delay instead of 30 s, both settings give `ok`: the problem only appears once the delay exceeds the kernel's time limit. Two nodes over multi-node NVLink with production-sized tensors behave the same way.\r\n\r\n## The change\r\n\r\n`init_hybrid_ep_buffer` now passes `enable_custom_allgather=False` (only when the installed DeepEP accepts that argument). HybridEP then takes the path it already uses for multi-node groups (`executor.cu`: `if (config.num_of_nodes > 1 || !enable_custom_allgather)` → `torch.distributed.all_gather_into_tensor`).\r\n\r\n### Performance\r\n\r\nOnly the routing-map gather moves to NCCL: one boolean `[tokens, num_experts]` tensor per rank per dispatch. Token data still goes through HybridEP's own dispatch and combine kernels. According to DeepEP's docs, the custom kernel exists to avoid \"copying from NCCL's internal buffer to PyTorch tensors\".\r\n\r\nIn end-to-end DeepSeek-V3 runs (256 GB300, MXFP8, 50 steps), the fastest steady-state step was the same with the custom allgather on and off:\r\n\r\n| custom allgather | runs | fastest step (ms) |\r\n|---|---|---|\r\n| on (current default) | 3 | 10875 / 10877 / 10881 |\r\n| off (this PR) | 2 | 10868 / 10869 |\r\n\r\nThese were not dedicated A/B benchmarks. The cluster was noisy (median steps varied widely between runs), and the \"off\" runs also carried an unrelated debugging patch. The result shows no visible cost at this scale, not a precise number.\r\n\r\n## Where the real fix belongs\r\n\r\nThis PR is a mitigation. The bug itself is in DeepEP:\r\n\r\n```\r\nwhere the bug lives                         fix layer\r\n─────────────────────────────────────────   ────────────────────────────\r\nDeepEP  csrc/hybrid_ep/extension/\r\n        allgather.cu:83-86\r\n          if (clock64()-s > 2*TIMEOUT) {\r\n            printf(\"...TIMEOUT...\");\r\n            break;          ← ROOT CAUSE      ★ fundamental fix (DeepEP)\r\n          }                                     fail loudly, never continue\r\n            │\r\n            ▼ stale routing rows used silently\r\nMCore   fused_a2a.py  init_hybrid_ep_buffer   ◇ mitigation (this PR)\r\n          enable_custom_allgather=False          avoid the path; revert later\r\n            │\r\n            ▼\r\nMegatron-Bridge / users                       nothing needed\r\n```\r\n\r\nThe DeepEP kernel should stop with an error (e.g. `__trap()`) instead of `break`. A late GPU would then crash the job, the same way a NCCL watchdog timeout does, instead of silently corrupting it. Once a DeepEP release with that behaviour is the minimum supported version, this change can be reverted to get the custom kernel back.\r\n\r\n## Contribution process\r\n\r\n### Pre-checks\r\n\r\n- [ ] I have added relevant unit tests\r\n- [ ] I have added relevant functional tests\r\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` — n/a: no kernel change; this selects HybridEP's existing NCCL allgather path (`moe_fused_a2a` entry unchanged)\r\n- [ ] I have added proper typing to my code\r\n- [] I have added relevant documentation\r\n- [x] I have run the autoformatter.sh on my PR\r\n\r\nNo suitable unit test but add the the repro use case to clearly show the issue and fix.\r\n\r\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\r\n",
+      "changedFiles": 1,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+            "createdAt": "2026-10-01T02:39:56Z",
+            "databaseId": 5923630177,
+            "updatedAt": "2026-10-01T02:39:56Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-5923630177"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "This PR has been automatically converted to **draft** because all PRs must start as drafts.\n\nWhen you are ready for review, click **Ready for Review** to begin the review process. This will:\n1. Add the oncall reviewer (optional reviewer)\n2. Add required review teams based on your changes\n\nSee the [contribution guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/submit.md) for more details.",
+            "createdAt": "2026-10-01T02:40:01Z",
+            "databaseId": 5923631049,
+            "updatedAt": "2026-10-01T02:40:01Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-5923631049"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhiyuLi-Nvidia"
+            },
+            "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/7771/commits/a5a3cfe7243bf165d8c11296c82ccd6b2d711ee5",
+            "createdAt": "2026-10-06T18:33:25Z",
+            "databaseId": 6022903884,
+            "updatedAt": "2026-10-06T18:33:25Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6022903884"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhiyuLi-Nvidia"
+            },
+            "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/7771/commits/83425b895329cadddf5c379117bfd2a3089990f8",
+            "createdAt": "2026-10-08T00:14:05Z",
+            "databaseId": 6049452352,
+            "updatedAt": "2026-10-08T00:14:05Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6049452352"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/37857000731",
+            "createdAt": "2026-10-08T23:01:10Z",
+            "databaseId": 6070744375,
+            "updatedAt": "2026-10-08T23:01:10Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6070744375"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/37857229399",
+            "createdAt": "2026-10-08T23:03:31Z",
+            "databaseId": 6070773161,
+            "updatedAt": "2026-10-08T23:03:31Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6070773161"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWnYpak=",
+          "hasNextPage": false
+        },
+        "totalCount": 6
+      },
+      "headRefOid": "83425b895329cadddf5c379117bfd2a3089990f8",
+      "headRepository": {
+        "nameWithOwner": "ZhiyuLi-Nvidia/Megatron-LM"
+      },
+      "mergeCommit": {
+        "oid": "8a9923b694c5c72cbdb5bd9c67e6f94c2f117092"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-09T01:42:41Z",
+      "number": 7771,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ericharper"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5394625778,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-02T17:12:17Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5394625778"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jaredcasper"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5396554352,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-02T20:34:13Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5396554352"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yashaswikarnati"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5432276692,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-06T17:31:40Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5432276692"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "zhongbozhu"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5433980282,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-06T20:06:15Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5433980282"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Autumn1998"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5451100500,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-08T03:49:11Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5451100500"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wOFQwMzo0OToxMVq0MjAyNi0xMC0wOFQwMzo0OToxMVrPAAAAAUTpMVQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "MERGED",
+      "title": "fix(moe): disable HybridEP custom allgather to avoid silent routing corruption",
+      "updatedAt": "2026-10-09T01:42:43Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/7771"
+    },
+    "reused_files": {
+      "artifact_path": "knowledge/evidence/prs/NVIDIA--Megatron-LM/7771-c29c1a2d3457c13f64eeab2a0d23b7ba14a77c96ac6344dc6ddc2d91e2c4ac5c.json",
+      "artifact_sha256": "c29c1a2d3457c13f64eeab2a0d23b7ba14a77c96ac6344dc6ddc2d91e2c4ac5c",
+      "reason": "Same immutable head/base repository+commit pair and changed_files; original fully paginated files response reused. Discussions are freshly queried.",
+      "refs": {
+        "base": {
+          "commit": "54f18cd2195a0fc22c145268c9c1c193e9a3026e",
+          "repository": "NVIDIA/Megatron-LM"
+        },
+        "head": {
+          "commit": "83425b895329cadddf5c379117bfd2a3089990f8",
+          "repository": "ZhiyuLi-Nvidia/Megatron-LM"
+        }
+      }
+    },
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "NVIDIA/Megatron-LM"
+      },
+      "sha": "54f18cd2195a0fc22c145268c9c1c193e9a3026e"
+    },
+    "body": "- [x] I, the PR author, have personally reviewed every line of this PR.\r\n\r\n# What does this PR do?\r\n\r\nMakes HybridEP exchange routing information through NCCL instead of its own custom kernel. The custom kernel silently corrupts MoE token routing whenever one GPU is more than about 20 seconds late.\r\n\r\n## The problem\r\n\r\nIn an MoE layer, each GPU decides which experts each of its tokens goes to (the \"routing map\"). Before HybridEP can send tokens to the GPUs that own those experts, **every GPU needs every other GPU's routing map**. HybridEP collects them with an allgather.\r\n\r\nBy default, when all GPUs of the expert-parallel group sit in one NVLink domain (e.g. a GB200/GB300 NVL72 rack), HybridEP uses its own allgather kernel instead of NCCL. The kernel works like this:\r\n\r\n1. Each GPU writes its routing map into a shared buffer on every other GPU.\r\n2. Each GPU then waits until all the others have signalled \"done writing\".\r\n3. Each GPU reads the buffer and decides where tokens go.\r\n\r\nStep 2 has a time limit. If one GPU has not arrived after about 20 seconds, the others print a warning and **carry on anyway**:\r\n\r\n```\r\nHYBRID-EP ALLGATHER TIMEOUT:SM 19 [0]:expecting 416 got 415\r\n```\r\n\r\n(`got 415` of `416` means one GPU had not arrived.) At that point the buffer still holds the late GPU's routing map from the **previous** MoE layer. The other GPUs read it as if it were current, so they send and receive the wrong tokens. Nothing fails, and training continues with wrong numbers.\r\n\r\nAny one-off stall of more than about 20 seconds on a single GPU is enough to trigger it (real cases below).\r\n\r\nWith `enable_custom_allgather=False`, HybridEP uses NCCL's allgather instead. NCCL waits for the late GPU however long it takes, so the data is always current.\r\n\r\n## How it showed up\r\n\r\nDeepSeek-V3 training on 256 GB300 GPUs: runs that should have been bit-identical occasionally diverged at one step. In each of those runs the log contains this timeout warning (60 lines) at exactly the step that diverged. Runs without the warning never diverged.\r\n\r\nA normal training step here takes about 11 s. The timeout hit in the two situations below, which are ordinary in large jobs:\r\n\r\n| Case | When | What the log shows |\r\n|---|---|---|\r\n| First step | step 1 | Step 1 took 543 s. The timeout lines appear while the GPUs are compiling kernels on first use (each GPU compiles its own fused MoE GEMM kernels, so they finish at different times). |\r\n| Degraded run | step 17 | Every step took 99–260 s instead of ~11 s (slow job, cause not diagnosed). The timeout fired at step 17 of 50. |\r\n\r\nAll GPUs in the expert-parallel group must reach the same dispatch within ~20 s of each other. NCCL collectives tolerate a late GPU for the full watchdog timeout, typically 10–60 minutes. Anything that delays one GPU by 20 s to several minutes is therefore harmless with NCCL but silently corrupts data with the custom kernel. Examples are first-step compilation, CUDA graph capture, checkpoint saving, a filesystem stall, or a slow node.\r\n\r\n## Reproducing it (one node, 4 GPUs, about a minute)\r\n\r\nThe script below runs two MoE \"layers\" through HybridEP on 4 GPUs. It records the correct result for layer 1, then runs layer 0 and layer 1 again, but this time GPU 1 waits 30 seconds before layer 1. Each GPU compares what it got to the correct result.\r\n\r\n```python\r\n# torchrun --nproc_per_node=4 hybridep_allgather_timeout_repro.py --custom-allgather 1   # HybridEP's own kernel\r\n# torchrun --nproc_per_node=4 hybridep_allgather_timeout_repro.py --custom-allgather 0   # NCCL (this PR)\r\nimport argparse, os, time\r\n\r\nimport deep_ep\r\nimport torch\r\nimport torch.distributed as dist\r\n\r\np = argparse.ArgumentParser()\r\np.add_argument(\"--custom-allgather\", type=int, default=1)\r\np.add_argument(\"--stall-s\", type=float, default=30)\r\na = p.parse_args()\r\n\r\nrank, local = int(os.environ[\"RANK\"]), int(os.environ[\"LOCAL_RANK\"])\r\ntorch.cuda.set_device(local)\r\ndist.init_process_group(\"nccl\", device_id=torch.device(\"cuda\", local))\r\nworld = dist.get_world_size()\r\ntokens, hidden, local_experts, topk = 1024, 1024, 8, 8\r\nbuf = deep_ep.HybridEPBuffer(\r\n    group=dist.new_group(list(range(world))), hidden_dim=hidden, max_num_of_tokens_per_rank=tokens,\r\n    num_local_experts=local_experts, use_fp8=False, enable_custom_allgather=bool(a.custom_allgather),\r\n)\r\n\r\n\r\ndef layer(seed):  # one MoE layer: random tokens, each routed to `topk` random experts\r\n    g = torch.Generator(device=\"cuda\").manual_seed(seed * 1000 + rank)\r\n    x = torch.randn(tokens, hidden, generator=g, device=\"cuda\", dtype=torch.bfloat16)\r\n    idx = torch.rand(tokens, local_experts * world, generator=g, device=\"cuda\").topk(topk, dim=1).indices\r\n    return x, torch.zeros(tokens, local_experts * world, dtype=torch.bool, device=\"cuda\").scatter_(1, idx, True)\r\n\r\n\r\ndef tokens_per_expert(x, routing_map):  # how many tokens this GPU's experts receive\r\n    return buf.dispatch_with_permute(hidden=x, routing_map=routing_map, pad_multiple=32)[3].tolist()\r\n\r\n\r\nlayer0, layer1 = layer(0), layer(1)\r\nexpected = tokens_per_expert(*layer1)  # correct answer for layer 1 (all GPUs on time)\r\ntokens_per_expert(*layer0)             # run layer 0 ...\r\nif rank == 1:\r\n    time.sleep(a.stall_s)              # ... then GPU 1 is 30 s late for layer 1\r\ngot = tokens_per_expert(*layer1)\r\nprint(f\"rank {rank}: custom_allgather={a.custom_allgather} -> {'CORRUPTED' if got != expected else 'ok'}\", flush=True)\r\ndist.destroy_process_group()\r\n```\r\n\r\nResult on GB300 (DeepEP 1.2.1+17cfb81):\r\n\r\n```\r\n--custom-allgather 1   (HybridEP's own kernel, the current default)\r\n  HYBRID-EP ALLGATHER TIMEOUT ... expecting 12 got 11      <- printed by GPUs 0, 2, 3\r\n  rank 0: CORRUPTED\r\n  rank 1: ok                                               <- the late GPU itself\r\n  rank 2: CORRUPTED\r\n  rank 3: CORRUPTED\r\n\r\n--custom-allgather 0   (NCCL, this PR)\r\n  rank 0-3: ok\r\n```\r\n\r\nWith a 5 s delay instead of 30 s, both settings give `ok`: the problem only appears once the delay exceeds the kernel's time limit. Two nodes over multi-node NVLink with production-sized tensors behave the same way.\r\n\r\n## The change\r\n\r\n`init_hybrid_ep_buffer` now passes `enable_custom_allgather=False` (only when the installed DeepEP accepts that argument). HybridEP then takes the path it already uses for multi-node groups (`executor.cu`: `if (config.num_of_nodes > 1 || !enable_custom_allgather)` → `torch.distributed.all_gather_into_tensor`).\r\n\r\n### Performance\r\n\r\nOnly the routing-map gather moves to NCCL: one boolean `[tokens, num_experts]` tensor per rank per dispatch. Token data still goes through HybridEP's own dispatch and combine kernels. According to DeepEP's docs, the custom kernel exists to avoid \"copying from NCCL's internal buffer to PyTorch tensors\".\r\n\r\nIn end-to-end DeepSeek-V3 runs (256 GB300, MXFP8, 50 steps), the fastest steady-state step was the same with the custom allgather on and off:\r\n\r\n| custom allgather | runs | fastest step (ms) |\r\n|---|---|---|\r\n| on (current default) | 3 | 10875 / 10877 / 10881 |\r\n| off (this PR) | 2 | 10868 / 10869 |\r\n\r\nThese were not dedicated A/B benchmarks. The cluster was noisy (median steps varied widely between runs), and the \"off\" runs also carried an unrelated debugging patch. The result shows no visible cost at this scale, not a precise number.\r\n\r\n## Where the real fix belongs\r\n\r\nThis PR is a mitigation. The bug itself is in DeepEP:\r\n\r\n```\r\nwhere the bug lives                         fix layer\r\n─────────────────────────────────────────   ────────────────────────────\r\nDeepEP  csrc/hybrid_ep/extension/\r\n        allgather.cu:83-86\r\n          if (clock64()-s > 2*TIMEOUT) {\r\n            printf(\"...TIMEOUT...\");\r\n            break;          ← ROOT CAUSE      ★ fundamental fix (DeepEP)\r\n          }                                     fail loudly, never continue\r\n            │\r\n            ▼ stale routing rows used silently\r\nMCore   fused_a2a.py  init_hybrid_ep_buffer   ◇ mitigation (this PR)\r\n          enable_custom_allgather=False          avoid the path; revert later\r\n            │\r\n            ▼\r\nMegatron-Bridge / users                       nothing needed\r\n```\r\n\r\nThe DeepEP kernel should stop with an error (e.g. `__trap()`) instead of `break`. A late GPU would then crash the job, the same way a NCCL watchdog timeout does, instead of silently corrupting it. Once a DeepEP release with that behaviour is the minimum supported version, this change can be reverted to get the custom kernel back.\r\n\r\n## Contribution process\r\n\r\n### Pre-checks\r\n\r\n- [ ] I have added relevant unit tests\r\n- [ ] I have added relevant functional tests\r\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` — n/a: no kernel change; this selects HybridEP's existing NCCL allgather path (`moe_fused_a2a` entry unchanged)\r\n- [ ] I have added proper typing to my code\r\n- [] I have added relevant documentation\r\n- [x] I have run the autoformatter.sh on my PR\r\n\r\nNo suitable unit test but add the the repro use case to clearly show the issue and fix.\r\n\r\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\r\n",
+    "changed_files": 1,
+    "head": {
+      "repo": {
+        "full_name": "ZhiyuLi-Nvidia/Megatron-LM"
+      },
+      "sha": "83425b895329cadddf5c379117bfd2a3089990f8"
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771",
+    "merge_commit_sha": "8a9923b694c5c72cbdb5bd9c67e6f94c2f117092",
+    "merged": true,
+    "merged_at": "2026-10-09T01:42:41Z",
+    "number": 7771,
+    "state": "closed",
+    "title": "fix(moe): disable HybridEP custom allgather to avoid silent routing corruption",
+    "updated_at": "2026-10-09T01:42:43Z"
+  },
+  "files": [
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/83425b895329cadddf5c379117bfd2a3089990f8/megatron%2Fcore%2Ftransformer%2Fmoe%2Ffused_a2a.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftransformer%2Fmoe%2Ffused_a2a.py?ref=83425b895329cadddf5c379117bfd2a3089990f8",
+      "deletions": 0,
+      "filename": "megatron/core/transformer/moe/fused_a2a.py",
+      "patch": "@@ -354,6 +354,10 @@ def init_hybrid_ep_buffer(\n         kwargs['num_blocks_unpermute'] = num_blocks_unpermute\n     if num_sms_preprocessing_api is not None:\n         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api\n+    # HybridEP's custom allgather gives up after ~20 s if a rank is late and continues with that\n+    # rank's routing rows from the previous dispatch, silently corrupting it. Use NCCL instead.\n+    if 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters:\n+        kwargs['enable_custom_allgather'] = False\n     _hybrid_ep_buffer = HybridEPBuffer(\n         group=group,\n         hidden_dim=hidden_dim,",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/83425b895329cadddf5c379117bfd2a3089990f8/megatron%2Fcore%2Ftransformer%2Fmoe%2Ffused_a2a.py",
+      "sha": "7b607878b32021da0a9995716eec7ef1eb0559d4",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+      "created_at": "2026-10-01T02:39:56Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-5923630177",
+      "id": 5923630177,
+      "updated_at": "2026-10-01T02:39:56Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    },
+    {
+      "body": "This PR has been automatically converted to **draft** because all PRs must start as drafts.\n\nWhen you are ready for review, click **Ready for Review** to begin the review process. This will:\n1. Add the oncall reviewer (optional reviewer)\n2. Add required review teams based on your changes\n\nSee the [contribution guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/submit.md) for more details.",
+      "created_at": "2026-10-01T02:40:01Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-5923631049",
+      "id": 5923631049,
+      "updated_at": "2026-10-01T02:40:01Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/7771/commits/a5a3cfe7243bf165d8c11296c82ccd6b2d711ee5",
+      "created_at": "2026-10-06T18:33:25Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6022903884",
+      "id": 6022903884,
+      "updated_at": "2026-10-06T18:33:25Z",
+      "user": {
+        "login": "ZhiyuLi-Nvidia"
+      }
+    },
+    {
+      "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/7771/commits/83425b895329cadddf5c379117bfd2a3089990f8",
+      "created_at": "2026-10-08T00:14:05Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6049452352",
+      "id": 6049452352,
+      "updated_at": "2026-10-08T00:14:05Z",
+      "user": {
+        "login": "ZhiyuLi-Nvidia"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/37857000731",
+      "created_at": "2026-10-08T23:01:10Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6070744375",
+      "id": 6070744375,
+      "updated_at": "2026-10-08T23:01:10Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/37857229399",
+      "created_at": "2026-10-08T23:03:31Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#issuecomment-6070773161",
+      "id": 6070773161,
+      "updated_at": "2026-10-08T23:03:31Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    }
+  ],
+  "number": 7771,
+  "refs": {
+    "base": {
+      "commit": "54f18cd2195a0fc22c145268c9c1c193e9a3026e",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "83425b895329cadddf5c379117bfd2a3089990f8",
+      "repository": "ZhiyuLi-Nvidia/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5394625778",
+      "id": 5394625778,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-02T17:12:17Z",
+      "user": {
+        "login": "ericharper"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5396554352",
+      "id": 5396554352,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-02T20:34:13Z",
+      "user": {
+        "login": "jaredcasper"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5432276692",
+      "id": 5432276692,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-06T17:31:40Z",
+      "user": {
+        "login": "yashaswikarnati"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5433980282",
+      "id": 5433980282,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-06T20:06:15Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7771#pullrequestreview-5451100500",
+      "id": 5451100500,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-08T03:49:11Z",
+      "user": {
+        "login": "Autumn1998"
+      }
+    }
+  ]
+}

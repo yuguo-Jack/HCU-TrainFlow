@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/advanced/custom_dataset_factories.md
-raw_sha256: 6e621c31c320c25316203ad59e7034e9498c4179b272c4b88d68d7f340d12d29
+raw_sha256: 1c420e62bbc6f95921536548d838ae6758b060733c5123f8dc7f8dd6f0ec7667
 sources: []
-generated_body_sha256: 0ce677a8007b3426106ba5c5820b7fc3d44034167697802b1e6d403b1cb5d23a
+generated_body_sha256: bd2270cdac77fd73039e483453527c9e2630c39e4cd20d0f702ce69e41887078
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/custom_dataset_factories.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/advanced/custom_dataset_factories.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/custom_dataset_factories.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -122,7 +122,7 @@ data. A new primary format normally needs:
 3. a factory derived from the narrowest suitable base, usually
    `BaseSingleFileDatasetFactory` or `BaseManifestShardListDatasetFactory`;
 4. format-specific `_build_reader` and `load_sample` implementations;
-5. `as_file_store()` only if key lookup, joins, mounts, or primary auxiliary
+5. `as_file_store()` only if key lookup, mounts, or primary auxiliary
    access are supported;
 6. a stable, serializable `config()` used for diagnostics;
 7. preparation or index-generation code when ordinal access cannot be derived
@@ -160,3 +160,7 @@ Cover at least:
 - stale, missing, or corrupt indexes;
 - local and remote paths where the format promises both;
 - `FileStore` lookup and provenance when supported.
+
+The contributor-level contracts and full checklist are in
+{ref}`dataset-formats`. Changes that alter existing ordering or metadata must
+also follow {ref}`compatibility`.

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: bde4d001130e5112d984ba99f0546e22c09e1a89
 path: docs/training/weight_transfer/README.md
-raw_sha256: 0667bf0764bba25629a931ad8c81801517cfc4a478d4b57286cdeb5591e40518
+raw_sha256: a307f0cf03d6b2581c43ac745a872b7b0d4df4c08b8a2e843633abf0351a35be
 sources: []
-generated_body_sha256: 4afecddcf6381c9f9983d498733fe9bce43a6ab73f921e9609d489b12a044beb
+generated_body_sha256: 939d856a2353ed95681baf129130bb4a814429fe212e7c42492dee444ec530a8
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/weight_transfer/README.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/docs/training/weight_transfer/README.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/weight_transfer/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -173,7 +173,7 @@ engine.send_weights()  # called on every rank
 
 ## API Endpoints
 
-When running vLLM as an HTTP server, the following endpoints are available for weight transfer. `HTTPVLLMWeightSyncClient` speaks the first four for you.
+When running vLLM as an HTTP server, the following endpoints are available for weight transfer. `HTTPVLLMWeightSyncClient` speaks the first five for you. A trainer may also implement the protocol directly without importing vLLM: see the wire contracts in [NCCL](nccl.md#trainer-without-vllm-over-http) and [IPC](ipc.md#trainer-without-vllm-over-http). This keeps the trainer decoupled from vLLM: it needs no vLLM install or version pin, only this documented HTTP and wire contract, so trainer and server can upgrade independently (non-PyTorch trainers such as JAX can use it too).
 
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
@@ -181,6 +181,7 @@ When running vLLM as an HTTP server, the following endpoints are available for w
 | `/start_weight_update` | POST | Start a weight update |
 | `/update_weights` | POST | Transfer a batch of weights with backend-specific metadata |
 | `/finish_weight_update` | POST | Finish the update and optionally commit its `weight_version` |
+| `/shutdown_weight_transfer_engine` | POST | Release the transfer channel without stopping inference |
 | `/update_weight_version` | POST | Update `weight_version` without changing model weights |
 | `/weight_info` | GET | Get the latest committed weight version |
 | `/pause` | POST | Pause generation before weight sync to handle inflight requests |
@@ -189,6 +190,12 @@ When running vLLM as an HTTP server, the following endpoints are available for w
 
 !!! note
     The HTTP weight transfer endpoints require `VLLM_SERVER_DEV_MODE=1` to be set.
+
+!!! warning
+    If `/update_weights` fails, the model is left mid-reload while `/health`
+    stays 200, and `/finish_weight_update` is rejected. Before generating again,
+    resend a full `/start_weight_update` → `/update_weights` →
+    `/finish_weight_update` (see [#57854](https://github.com/vllm-project/vllm/pull/57854)).
 
 The Rust frontend's optional gRPC `Control` service exposes the same pause, sleep, weight-transfer, and weight-version lifecycle for trusted sidecars. The `ServerInfo.rl_capabilities` response reports whether weight transfer and sleep mode were configured. Backend-specific `init_info` and `update_info` remain JSON metadata; model tensors continue to move over the configured NCCL, IPC, sparse-NCCL, or sharded-RDT transport.
 

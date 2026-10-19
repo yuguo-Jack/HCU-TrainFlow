@@ -7,16 +7,16 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/models/gpt/gpt_layer_specs.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 9e153c7f3d3a671f1bd9b84023bfe0f14711fe942c4c0df3dc1dec288100c4af
 - source: nvidia-megatron-lm
   path: tests/unit_tests/transformer/test_multi_latent_attention.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 3df4c807086cc0e770c7fb3c07225f5cb9580756de9708d8509fffbfccd34b69
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 062766158e7bf127e0d2971c0caae021e4b0651fd58ee3ebba90fb2a535195ab
 pr_sources:
 - pr-nvidia--megatron-lm-7942
 kind: authored
@@ -48,14 +48,18 @@ kind: authored
 4. 做同参数的融合开/关局部测试与 kernel dispatch 证据，再跑 profiler-off 步时间；稳定阶段补 loss 验收。
 5. 失败则回退该融合候选，保留非融合正确路径。上游修复存在不代表某个 HCU release 已包含。
 
+## 当前调用与边界
+
+本轮固定主干仍保留 residual 声明与输出/输入梯度/参数梯度对照；新增 MLA KV RoPE+量化融合属于另一条有架构/布局门禁的路径，见 [Core→TE](../topics/transformer-engine.md)。不能因本案例的 norm 属性测试通过，就推定所有新 MLA 融合均生效。
+
 ## 证据边界
 
 PR head 为 `0e98321a9ddacc11141177202769712415d9f4bd`，merge 为 `91655aa78007e74e55c963f99861b8a97368c024`。本页源码链接固定到本轮官方主干快照；没有执行 NVIDIA/HCU GPU 测试，也没有编造吞吐提升比例。
 
 ## 固定源码与更新范围
 
-- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/models/gpt/gpt_layer_specs.py)
-- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/tests/unit_tests/transformer/test_multi_latent_attention.py)
+- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/models/gpt/gpt_layer_specs.py)
+- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/transformer/test_multi_latent_attention.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。
 

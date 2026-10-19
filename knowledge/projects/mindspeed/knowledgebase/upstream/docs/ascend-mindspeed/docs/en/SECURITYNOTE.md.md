@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed
-commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
 path: docs/en/SECURITYNOTE.md
-raw_sha256: 79aa80734e7caf5402670da1f3ace266a9e144de29ced95aaf15e6763d983465
+raw_sha256: bd8ba7f2815856abc315cde99876d8a411ada2a24715fbe4cdab38a610296d2b
 sources: []
-generated_body_sha256: 18f018866d0ab5afb085b496ac712a5c8e690734474e79e72895f64250a11e9d
+generated_body_sha256: 21406bf1578d84db7c5955b82a9c63b31a2e2e0416cfeb9649b8c1fc5044450a
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed / docs/en/SECURITYNOTE.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/SECURITYNOTE.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/SECURITYNOTE.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -101,7 +101,7 @@ Table 1 Recommended maximum values for file (folder) permission control in vario
 |  Introduced by open-source  |      <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/moe/sharded_moe.py>       |                   mindspeed/moe/utils.py                   |    <https://arxiv.org/pdf/2006.16668.pdf>    |                einsum paper address                 |
 |  Introduced by open-source  |        <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/moe/experts.py>         |                  mindspeed/moe/experts.py                  |     <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/moe/experts.py>   |             DeepSpeed MoE source code address             |
 |  Introduced by open-source  |                               <https://github.com/HazyResearch/flash-attention>                               |              docs/en/features/flash-attention.md              |                               <https://arxiv.org/pdf/2205.14135>                               |            Flash-attention documentation            |
-|  Introduced by open-source  |                                    <https://github.com/nvidia/megatron-lm>                                    |         docs/en/features/virtual-pipeline-parallel.md         |               <https://people.eecs.berkeley.edu/~matei/papers/2021/sc_megatron_lm.pdf>       |       Virtual-pipeline-parallel documentation       |
+|  Introduced by open-source  |                                    <https://github.com/nvidia/megatron-lm>                                    |         docs/en/features/virtual-pipeline-parallel.md         |               <https://dl.acm.org/doi/10.1145/3458817.3476209>       |       Virtual-pipeline-parallel documentation       |
 |  Introduced by open-source  |                            <https://github.com/feifeibear/long-context-attention>                             |          docs/en/features/hybrid-context-parallel.md          |                               <https://arxiv.org/abs/2405.07719>                               |        Hybrid-context-parallel documentation        |
 |  Introduced by open-source  |                            <https://github.com/feifeibear/long-context-attention>                             |      docs/en/features/ring-attention-context-parallel.md      |                           <https://arxiv.org/pdf/2310.01889>                                  |    Ring-attention-context-parallel documentation    |
 |  Introduced by open-source  |                          <https://github.com/ofirpress/attention_with_linear_biases>                          |                   docs/en/features/alibi.md                   |           <https://arxiv.org/pdf/2108.12409>                                           |                 Alibi documentation                 |

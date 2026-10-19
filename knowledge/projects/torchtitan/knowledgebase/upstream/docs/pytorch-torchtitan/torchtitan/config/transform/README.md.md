@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/config/transform/README.md
-raw_sha256: d24fa16f2b8cef0aed3a4f601d55ec88f5a22b44572c00c0e411d8933ed5bcef
+raw_sha256: 31ccfda7c1c338a215dc1221b34b5a850d3cf4b5b2d6317191fdf7d1768a54d3
 sources: []
-generated_body_sha256: a0a5dc6fafa6fd7eefe3fe231acb04e99b30aea94b015672bd8baeb96f24886e
+generated_body_sha256: a2cbc215090fb50588c86d2c2701d03d38b46243e1335610d6896c544befb1d9
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/config/transform/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/config/transform/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/transform/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -47,9 +47,9 @@ config = apply_transforms(
     [
         ContextParallelTransform(
             inner_attention_map={
-                FlexInnerAttention: KVAllGatherCPFlexInnerAttention,
+                FlexInnerAttention: AllGatherKVFlexInnerAttention,
                 SlidingWindowFlexInnerAttention: (
-                    KVAllGatherCPSlidingWindowFlexInnerAttention
+                    AllGatherKVSlidingWindowFlexInnerAttention
                 ),
             }
         )

@@ -1,0 +1,669 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "929a01b2bf6ca5f3d233008efd5409bc935e4590bfa5df0fa8971b809bc79887",
+      "isPrivate": false,
+      "numbers": [
+        37808,
+        37806,
+        37798,
+        37797,
+        37796,
+        37794,
+        37785,
+        37777
+      ],
+      "observed_at": "2026-10-19T19:35:14.609181+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4922,
+        "resetAt": "2026-10-19T19:53:19Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "0be8a0af0ef2d1c740dc4d084f368e75ef55a2cf",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nLoading a large MoE checkpoint from network storage is pathologically slow with the default loader settings. On 8×H20 (TP=8) loading GLM-5.2-FP8 (141 shards, 704 GiB) from Lustre, weight loading **did not finish within 20 minutes**.\n\nThe default path is not I/O-bandwidth limited — it is limited by *access pattern*:\n\n| metric (20 s sample, `sglang::scheduler_TP0`) | default | with prefetch |\n|---|---|---|\n| major page faults | **369,655** | **38** |\n| `stime` (kernel, fault handling) | **3,336 ticks** | — |\n| effective read bandwidth | **28 MiB/s** | 704 GiB in 42.6 s |\n\n97 % of the time is spent in kernel mode servicing page faults at ~18 k faults/s. Sequential reads of the same files reach multiple GB/s, so the storage is not the bottleneck.\n\n### Root cause\n\n`should_async_load()` (`model_loader/utils.py`) returns `True` for every CPU tensor, justified by \"using a threadpool can overlap H2D copies\" — which holds only when the data is already resident in RAM. A tensor from `safe_open(...).get_tensor(...)` is a *lazy mmap view*, so the premise does not hold on the default loading path. `do_load_weights()` therefore dispatches essentially every `weight_loader(...)` call into a `ThreadPoolExecutor()` constructed without `max_workers` (up to `min(32, cpu_count + 4)`). The result: up to 32 threads fault pages at unrelated offsets across the shards in the iterator's sliding window. Per-VMA readahead never sees a sequential stream, so Lustre degrades to page-sized synchronous RPCs, each paying a network round trip.\n\nSGLang **already ships the fix**: `_prefetch_all_checkpoints()` / `_prefetch_checkpoint_file()` read in 16 MiB blocks and split shards across ranks — by `world_group.local_rank`, which is the right unit because the page cache is node-local. The only thing missing is the decision to turn it on: `weight_loader_prefetch_checkpoints` defaults to `False` and there is no filesystem detection, so users on NFS/Lustre silently get the slow path.\n\n## Modifications\n\nScope is deliberately limited to **adding the missing auto-detection**. The prefetch implementation, the single-threaded fallback, `weight_loader_prefetch_num_threads` (stays 4), `should_async_load()`, and the executor width in `do_load_weights()` are all left exactly as they are.\n\n| file | change |\n|---|---|\n| `srt/server_args.py` | `weight_loader_prefetch_checkpoints`: `bool = False` → `Optional[bool] = None` (tri-state, already the established pattern here, e.g. `enable_multimodal`) |\n| `srt/model_loader/weight_utils.py` | new `_get_fs_type()` + `should_auto_prefetch_checkpoints()` |\n| `srt/model_loader/loader.py` | resolve `None` via the auto check at the existing `configured_prefetch = ...` site |\n| `test/registered/unit/model_loader/test_prefetch_checkpoints.py` | unit tests (see below) |\n\nWhen the flag is left unset, prefetch is enabled if the checkpoint sits on `nfs`/`nfs4`/`lustre` **and** fits within 90 % of available RAM (prefetching a checkpoint larger than RAM would evict its own earlier pages). An explicit `True`/`False` from the user always wins. Filesystem detection parses `/proc/mounts` with **longest-prefix matching** so nested mounts resolve the way the kernel does, and returns \"unknown\" (prefetch off) wherever `/proc/mounts` is unavailable.\n\n`weight_loader_prefetch_num_threads` keeps its default of 4 — the 4-vs-8 sweep below shows 4 is already enough to saturate the mount and is in fact *faster*, so there is no reason to touch it.\n\nNo change to `weight_loader` implementations, TP sharding, expert-shard mapping, or `post_load_weights()` ordering. The patch only affects *when the pages are read*.\n\n## Accuracy Tests\n\nThis does not change what is loaded, only when the pages are faulted in, so model outputs are unaffected. The existing `test_weights_match_with_and_without_prefetch` in `test_prefetch_checkpoints.py` already asserts weights are bit-identical with and without prefetch. Verified the server reaches `health=200` and serves completions in the prefetch configuration.\n\n## Speed Tests and Profiling\n\nGLM-5.2-FP8, TP=8, 141 shards / 704 GiB on Lustre, 8×H20-3e, page cache dropped between runs. `Load weight end` is per rank; the slowest rank gates startup.\n\n| configuration | prefetch threads | weight load (slowest rank) |\n|---|---|---|\n| current default (8-thread mmap iterator, no prefetch) | — | **did not complete in 20 min** |\n| **this PR's auto path (shipped default)** | **4** | **151.18 s** |\n| prefetch, `num_threads=8` | 8 | 168.81 s |\n| prefetch, `num_threads=8`, multi-threaded iterator forced on | 8 | 198.43 s |\n\nPer-rank detail (4 threads, shipped default): prefetch finished in 38.65–39.66 s; `Load weight end` 70.89 / 151.17 / 151.17 / 151.18 s.\n\nTwo ablations:\n\n* **Prefetch threads, 4 vs 8**: the shipped default of 4 is not just sufficient, it is ~10 % *faster* (151.18 s vs 168.81 s). Four sequential readers already saturate the mount; four more only add contention.\n* **Iterator concurrency**: forcing `enable_multithread_load=true` alongside prefetch regresses the slowest rank from 168.81 s to 198.43 s (~18 % worse), because the shard readers and prefetch threads contend for the same Lustre reads. This confirms the existing single-threaded fallback should stay.\n\nAlso confirmed the page-fault collapse (369,655 → 38 faults per 20 s on `scheduler_TP0`) via `/proc/<pid>/stat`, and prefetch activation from the logs (`Rank N: prefetching 17/141 checkpoint shards into page cache ...`).\n\n## Tests added\n\nExtended the existing `test_prefetch_checkpoints.py` rather than adding a new file:\n\n* `TestAutoPrefetchDetection` — `/proc/mounts` longest-prefix parsing, including the nested-mount case (`/` ext4, `/data` lustre, `/data/local` ext4) and a sibling-prefix case (`/database` must not match the `/data` mount); unreadable `/proc/mounts` → \"unknown\"; auto on for network FS that fits in RAM; auto off for local FS, for a checkpoint exceeding the RAM threshold, and when sizing fails.\n* `TestAutoPrefetchDispatch` — the auto check is consulted only when the flag is unset; an explicit `True`/`False` bypasses detection entirely.\n\n## Not yet verified\n\nBeing upfront about the gaps rather than implying full coverage:\n\n* **No local-NVMe control run yet.** The logic returns `False` for any non-`nfs`/`nfs4`/`lustre` mount and is covered by `test_auto_stays_off_on_local_fs`, but I have not measured a real local-NVMe load to confirm there is no regression in practice.\n* **No run with a checkpoint larger than RAM.** The `fits_in_ram` guard is unit-tested, not measured end to end.\n* The measurements above come from one cluster (Lustre + 8×H20-3e). Numbers on other network filesystems may differ.\n\nHappy to run any of these if reviewers want them before merging, or to gate the auto behaviour more conservatively.\n\n## Questions for reviewers\n\n* Should `auto` also cover other shared filesystems (`gpfs`, `ceph`, `beegfs`)? This PR only recognizes NFS and Lustre.\n* `weight_loader_drop_cache_after_load` combined with the async mmap path looks hazardous: `posix_fadvise(DONTNEED)` can evict pages while queued worker threads still hold un-copied mmap views of that shard, forcing them to fault again. The code comment in `buffered_multi_thread_safetensors_weights_iterator` already acknowledges this. Out of scope here, but worth a follow-up.\n* A deeper fix, independent of prefetch, would be to make `should_async_load()` return `False` for lazy mmap views (mirroring the existing `_sglang_runai_streamer_tensor` opt-out) and/or bound the executor in `do_load_weights()`. That addresses the root cause rather than masking it with readahead, and would also help local-storage users. Happy to follow up if maintainers prefer that direction.\n\n## Duplicate check\n\nSearched open PRs and issues for prefetch / weight-loading / NFS / Lustre. The closest are #33930 (logging cleanup under the same flag) and #35259 (startup weight-load overlap hardening); neither adds filesystem detection or changes the flag's default, so this does not overlap. Please point me at anything I missed.\n\n## Checklist\n\n- [x] Format your code according to [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit) — ruff, ruff-format, isort, codespell all clean\n- [x] Add unit tests according to [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests)\n- [ ] Update documentation — no user-facing doc change beyond the flag's help text; happy to add a note if there is a preferred place\n- [x] Provide accuracy and speed benchmark results (see above; gaps listed under \"Not yet verified\")\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance)\n\n---\n\n*Note: AI assistance was used while preparing this change (investigation, patch, tests, and description). All measurements come from real runs on the cluster described above, and I have reviewed every changed line.*\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #35317934871](https://github.com/sgl-project/sglang/actions/runs/35317934871)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #35317934597](https://github.com/sgl-project/sglang/actions/runs/35317934597)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #35317934803](https://github.com/sgl-project/sglang/actions/runs/35317934803)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuan932"
+            },
+            "body": "Hi @b8zhong @mmangkad — you're the CODEOWNERS for `srt/model_loader`, so tagging you for review when you have time.\n\nTwo notes to make this cheap to review:\n\n- The prefetch machinery it turns on is **already in the tree** (`_prefetch_all_checkpoints`); this PR only adds the filesystem detection that decides when to enable it, plus a tri-state default on the existing flag. `weight_loader_prefetch_num_threads`, `should_async_load()`, the single-threaded fallback, and the executor width in `do_load_weights()` are untouched.\n- Behaviour is unchanged on local storage: detection returns `False` for anything that isn't `nfs`/`nfs4`/`lustre`, and an explicit `True`/`False` always overrides it.\n\nCould someone with the right permissions add the `run-ci` label so CI can run? Per the [merge process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process) I can't apply it myself.\n\nI've listed what I have *not* verified in the PR description (no local-NVMe control run, no larger-than-RAM checkpoint run) — happy to run either, or to make the auto path more conservative, if you'd prefer that before merging.\n",
+            "createdAt": "2026-09-03T12:25:45Z",
+            "databaseId": 5525720452,
+            "updatedAt": "2026-09-03T12:25:45Z",
+            "url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-5525720452"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuan932"
+            },
+            "body": "Following up on the [merge process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process): this PR hasn't been assigned a Merge Oncall and doesn't have the `run-ci` label yet, so CI hasn't run.\n\n`srt/model_loader` doesn't have its own Merge Oncall entry in MAINTAINER.md, and the closest listed area is Scheduler (which covers `srt/model_executor`) — so tagging @merrymercy @hnyls2002 @cctry: could one of you pick this up as Merge Oncall, or point me to the right person?\n\nFor the `run-ci` label, tagging a NVIDIA CI Oncall: @Kangyan-Zhou @ch-wan.\n\nRecap of why this should be cheap to review:\n- The prefetch machinery is already in the tree; this PR only adds the filesystem detection that decides when to turn it on, plus a tri-state default on the existing flag (`bool = False` → `Optional[bool] = None`).\n- Local storage is unaffected: detection returns `False` for anything that isn't `nfs`/`nfs4`/`lustre`, and an explicit `True`/`False` always overrides it. `weight_loader_prefetch_num_threads`, `should_async_load()`, the single-threaded fallback, and the executor width in `do_load_weights()` are all untouched.\n- +235/-4 across 4 files, 129 of those lines being unit tests added to the existing `test_prefetch_checkpoints.py`.\n- Motivation: on 8×H20 (TP=8), GLM-5.2-FP8 (704 GiB, Lustre) does not finish loading in 20 minutes on the current default; 151 s with prefetch on, with major page faults dropping 369,655 → 38 per sample.\n\nNot blocking on my side — happy to rebase, run the local-NVMe / larger-than-RAM checks listed in the description, or scope the auto path down if reviewers prefer. Thanks!\n",
+            "createdAt": "2026-09-03T14:12:27Z",
+            "databaseId": 5527082144,
+            "updatedAt": "2026-09-03T14:12:27Z",
+            "url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-5527082144"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuan932"
+            },
+            "body": "@ch-wan — following up with a more specific ask, since `git log` shows you as by far the most active contributor to `srt/model_loader` recently (8 of the last 30 commits there). `MAINTAINER.md` has no Merge Oncall entry for `model_loader`, which is probably why this PR has sat unassigned since Sep 1 with no `run-ci` label, so CI has never run.\n\nWould you be willing to either shepherd this one or point me at the right person?\n\nThe change is small and additive:\n\n- The prefetch machinery (`_prefetch_all_checkpoints`) is **already in the tree**. This PR only adds the filesystem detection that decides when to enable it, plus a tri-state default on the existing `weight_loader_prefetch_checkpoints` flag (`bool = False` → `Optional[bool] = None`, matching the existing pattern used by `enable_multimodal` and friends).\n- Nothing else is touched: `weight_loader_prefetch_num_threads` stays 4, `should_async_load()`, the single-threaded fallback, and the executor width in `do_load_weights()` are unchanged.\n- Local storage is unaffected — detection returns `False` for anything that isn't `nfs`/`nfs4`/`lustre`, and an explicit `True`/`False` always wins.\n- +235/-4 across 4 files, 129 of those lines being unit tests added to the existing `test_prefetch_checkpoints.py`.\n\nWhy it matters: on 8×H20 (TP=8), GLM-5.2-FP8 (704 GiB on Lustre) **does not finish loading in 20 minutes** on today's default, because up to 32 loader threads fault lazy mmap pages at unrelated offsets and Lustre degrades to page-sized synchronous RPCs (369,655 major faults per 20 s sample, ~28 MiB/s effective). With prefetch on it loads in 151 s and faults drop to 38.\n\nThe gaps I have *not* closed are listed in the description (no local-NVMe control run, no larger-than-RAM checkpoint run) — happy to run either, rebase, or scope the auto path down further.\n",
+            "createdAt": "2026-09-04T08:10:52Z",
+            "databaseId": 5537645039,
+            "updatedAt": "2026-09-04T08:10:52Z",
+            "url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-5537645039"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=35317934490 -->\nRequired checks failed on 7845387; this PR cannot be merged until they pass.\n\n**Lint** ([run](https://github.com/sgl-project/sglang/actions/runs/35317934490))\nRun `pre-commit run --all-files` locally and push the result. The run log shows any other failing step.",
+            "createdAt": "2026-10-18T07:12:20Z",
+            "databaseId": 6247007990,
+            "updatedAt": "2026-10-18T07:12:20Z",
+            "url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-6247007990"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXRZxvY=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "7845387e8fb9c1985632de0d3df7ec0429a1c012",
+      "headRepository": {
+        "nameWithOwner": "chuan932/sglang"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 37806,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[Model Loader] Auto-enable checkpoint prefetch on network filesystems (NFS/Lustre)",
+      "updatedAt": "2026-10-18T07:12:20Z",
+      "url": "https://github.com/sgl-project/sglang/pull/37806"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/37806/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/37806/commits"
+      },
+      "html": {
+        "href": "https://github.com/sgl-project/sglang/pull/37806"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/37806"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/37806/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/37806"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/statuses/7845387e8fb9c1985632de0d3df7ec0429a1c012"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 233,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "auto_merge": null,
+    "base": {
+      "label": "sgl-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/sgl-project/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/sgl-project/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/sgl-project/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/sgl-project/sglang/branches{/branch}",
+        "clone_url": "https://github.com/sgl-project/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/sgl-project/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/sgl-project/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/sgl-project/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/sgl-project/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/sgl-project/sglang/contributors",
+        "created_at": "2024-01-08T04:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/sgl-project/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/sgl-project/sglang/downloads",
+        "events_url": "https://api.github.com/repos/sgl-project/sglang/events",
+        "fork": false,
+        "forks": 9697,
+        "forks_count": 9697,
+        "forks_url": "https://api.github.com/repos/sgl-project/sglang/forks",
+        "full_name": "sgl-project/sglang",
+        "git_commits_url": "https://api.github.com/repos/sgl-project/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/sgl-project/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/sgl-project/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/sgl-project/sglang.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": false,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/sgl-project/sglang/hooks",
+        "html_url": "https://github.com/sgl-project/sglang",
+        "id": 740303686,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/sgl-project/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/sgl-project/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/sgl-project/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/sgl-project/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/sgl-project/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/sgl-project/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/sgl-project/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/sgl-project/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOLCAjRg",
+        "notifications_url": "https://api.github.com/repos/sgl-project/sglang/notifications{?since,all,participating}",
+        "open_issues": 5964,
+        "open_issues_count": 5964,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+          "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/sgl-project/followers",
+          "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/sgl-project",
+          "id": 147780389,
+          "login": "sgl-project",
+          "node_id": "O_kgDOCM7zJQ",
+          "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+          "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+          "repos_url": "https://api.github.com/users/sgl-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/sgl-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/sgl-project/sglang/pulls{/number}",
+        "pushed_at": "2026-10-19T19:11:02Z",
+        "releases_url": "https://api.github.com/repos/sgl-project/sglang/releases{/id}",
+        "size": 453851,
+        "ssh_url": "git@github.com:sgl-project/sglang.git",
+        "stargazers_count": 37444,
+        "stargazers_url": "https://api.github.com/repos/sgl-project/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/sgl-project/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/sgl-project/sglang/subscription",
+        "svn_url": "https://github.com/sgl-project/sglang",
+        "tags_url": "https://api.github.com/repos/sgl-project/sglang/tags",
+        "teams_url": "https://api.github.com/repos/sgl-project/sglang/teams",
+        "topics": [
+          "attention",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "diffusion",
+          "glm",
+          "gpt-oss",
+          "inference",
+          "llama",
+          "llm",
+          "minimax",
+          "moe",
+          "qwen",
+          "qwen-image",
+          "reinforcement-learning",
+          "transformer",
+          "vlm",
+          "wan"
+        ],
+        "trees_url": "https://api.github.com/repos/sgl-project/sglang/git/trees{/sha}",
+        "updated_at": "2026-10-19T19:21:38Z",
+        "url": "https://api.github.com/repos/sgl-project/sglang",
+        "visibility": "public",
+        "watchers": 37444,
+        "watchers_count": 37444,
+        "web_commit_signoff_required": false
+      },
+      "sha": "0be8a0af0ef2d1c740dc4d084f368e75ef55a2cf",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+        "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/sgl-project/followers",
+        "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/sgl-project",
+        "id": 147780389,
+        "login": "sgl-project",
+        "node_id": "O_kgDOCM7zJQ",
+        "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+        "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+        "repos_url": "https://api.github.com/users/sgl-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/sgl-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Motivation\n\nLoading a large MoE checkpoint from network storage is pathologically slow with the default loader settings. On 8×H20 (TP=8) loading GLM-5.2-FP8 (141 shards, 704 GiB) from Lustre, weight loading **did not finish within 20 minutes**.\n\nThe default path is not I/O-bandwidth limited — it is limited by *access pattern*:\n\n| metric (20 s sample, `sglang::scheduler_TP0`) | default | with prefetch |\n|---|---|---|\n| major page faults | **369,655** | **38** |\n| `stime` (kernel, fault handling) | **3,336 ticks** | — |\n| effective read bandwidth | **28 MiB/s** | 704 GiB in 42.6 s |\n\n97 % of the time is spent in kernel mode servicing page faults at ~18 k faults/s. Sequential reads of the same files reach multiple GB/s, so the storage is not the bottleneck.\n\n### Root cause\n\n`should_async_load()` (`model_loader/utils.py`) returns `True` for every CPU tensor, justified by \"using a threadpool can overlap H2D copies\" — which holds only when the data is already resident in RAM. A tensor from `safe_open(...).get_tensor(...)` is a *lazy mmap view*, so the premise does not hold on the default loading path. `do_load_weights()` therefore dispatches essentially every `weight_loader(...)` call into a `ThreadPoolExecutor()` constructed without `max_workers` (up to `min(32, cpu_count + 4)`). The result: up to 32 threads fault pages at unrelated offsets across the shards in the iterator's sliding window. Per-VMA readahead never sees a sequential stream, so Lustre degrades to page-sized synchronous RPCs, each paying a network round trip.\n\nSGLang **already ships the fix**: `_prefetch_all_checkpoints()` / `_prefetch_checkpoint_file()` read in 16 MiB blocks and split shards across ranks — by `world_group.local_rank`, which is the right unit because the page cache is node-local. The only thing missing is the decision to turn it on: `weight_loader_prefetch_checkpoints` defaults to `False` and there is no filesystem detection, so users on NFS/Lustre silently get the slow path.\n\n## Modifications\n\nScope is deliberately limited to **adding the missing auto-detection**. The prefetch implementation, the single-threaded fallback, `weight_loader_prefetch_num_threads` (stays 4), `should_async_load()`, and the executor width in `do_load_weights()` are all left exactly as they are.\n\n| file | change |\n|---|---|\n| `srt/server_args.py` | `weight_loader_prefetch_checkpoints`: `bool = False` → `Optional[bool] = None` (tri-state, already the established pattern here, e.g. `enable_multimodal`) |\n| `srt/model_loader/weight_utils.py` | new `_get_fs_type()` + `should_auto_prefetch_checkpoints()` |\n| `srt/model_loader/loader.py` | resolve `None` via the auto check at the existing `configured_prefetch = ...` site |\n| `test/registered/unit/model_loader/test_prefetch_checkpoints.py` | unit tests (see below) |\n\nWhen the flag is left unset, prefetch is enabled if the checkpoint sits on `nfs`/`nfs4`/`lustre` **and** fits within 90 % of available RAM (prefetching a checkpoint larger than RAM would evict its own earlier pages). An explicit `True`/`False` from the user always wins. Filesystem detection parses `/proc/mounts` with **longest-prefix matching** so nested mounts resolve the way the kernel does, and returns \"unknown\" (prefetch off) wherever `/proc/mounts` is unavailable.\n\n`weight_loader_prefetch_num_threads` keeps its default of 4 — the 4-vs-8 sweep below shows 4 is already enough to saturate the mount and is in fact *faster*, so there is no reason to touch it.\n\nNo change to `weight_loader` implementations, TP sharding, expert-shard mapping, or `post_load_weights()` ordering. The patch only affects *when the pages are read*.\n\n## Accuracy Tests\n\nThis does not change what is loaded, only when the pages are faulted in, so model outputs are unaffected. The existing `test_weights_match_with_and_without_prefetch` in `test_prefetch_checkpoints.py` already asserts weights are bit-identical with and without prefetch. Verified the server reaches `health=200` and serves completions in the prefetch configuration.\n\n## Speed Tests and Profiling\n\nGLM-5.2-FP8, TP=8, 141 shards / 704 GiB on Lustre, 8×H20-3e, page cache dropped between runs. `Load weight end` is per rank; the slowest rank gates startup.\n\n| configuration | prefetch threads | weight load (slowest rank) |\n|---|---|---|\n| current default (8-thread mmap iterator, no prefetch) | — | **did not complete in 20 min** |\n| **this PR's auto path (shipped default)** | **4** | **151.18 s** |\n| prefetch, `num_threads=8` | 8 | 168.81 s |\n| prefetch, `num_threads=8`, multi-threaded iterator forced on | 8 | 198.43 s |\n\nPer-rank detail (4 threads, shipped default): prefetch finished in 38.65–39.66 s; `Load weight end` 70.89 / 151.17 / 151.17 / 151.18 s.\n\nTwo ablations:\n\n* **Prefetch threads, 4 vs 8**: the shipped default of 4 is not just sufficient, it is ~10 % *faster* (151.18 s vs 168.81 s). Four sequential readers already saturate the mount; four more only add contention.\n* **Iterator concurrency**: forcing `enable_multithread_load=true` alongside prefetch regresses the slowest rank from 168.81 s to 198.43 s (~18 % worse), because the shard readers and prefetch threads contend for the same Lustre reads. This confirms the existing single-threaded fallback should stay.\n\nAlso confirmed the page-fault collapse (369,655 → 38 faults per 20 s on `scheduler_TP0`) via `/proc/<pid>/stat`, and prefetch activation from the logs (`Rank N: prefetching 17/141 checkpoint shards into page cache ...`).\n\n## Tests added\n\nExtended the existing `test_prefetch_checkpoints.py` rather than adding a new file:\n\n* `TestAutoPrefetchDetection` — `/proc/mounts` longest-prefix parsing, including the nested-mount case (`/` ext4, `/data` lustre, `/data/local` ext4) and a sibling-prefix case (`/database` must not match the `/data` mount); unreadable `/proc/mounts` → \"unknown\"; auto on for network FS that fits in RAM; auto off for local FS, for a checkpoint exceeding the RAM threshold, and when sizing fails.\n* `TestAutoPrefetchDispatch` — the auto check is consulted only when the flag is unset; an explicit `True`/`False` bypasses detection entirely.\n\n## Not yet verified\n\nBeing upfront about the gaps rather than implying full coverage:\n\n* **No local-NVMe control run yet.** The logic returns `False` for any non-`nfs`/`nfs4`/`lustre` mount and is covered by `test_auto_stays_off_on_local_fs`, but I have not measured a real local-NVMe load to confirm there is no regression in practice.\n* **No run with a checkpoint larger than RAM.** The `fits_in_ram` guard is unit-tested, not measured end to end.\n* The measurements above come from one cluster (Lustre + 8×H20-3e). Numbers on other network filesystems may differ.\n\nHappy to run any of these if reviewers want them before merging, or to gate the auto behaviour more conservatively.\n\n## Questions for reviewers\n\n* Should `auto` also cover other shared filesystems (`gpfs`, `ceph`, `beegfs`)? This PR only recognizes NFS and Lustre.\n* `weight_loader_drop_cache_after_load` combined with the async mmap path looks hazardous: `posix_fadvise(DONTNEED)` can evict pages while queued worker threads still hold un-copied mmap views of that shard, forcing them to fault again. The code comment in `buffered_multi_thread_safetensors_weights_iterator` already acknowledges this. Out of scope here, but worth a follow-up.\n* A deeper fix, independent of prefetch, would be to make `should_async_load()` return `False` for lazy mmap views (mirroring the existing `_sglang_runai_streamer_tensor` opt-out) and/or bound the executor in `do_load_weights()`. That addresses the root cause rather than masking it with readahead, and would also help local-storage users. Happy to follow up if maintainers prefer that direction.\n\n## Duplicate check\n\nSearched open PRs and issues for prefetch / weight-loading / NFS / Lustre. The closest are #33930 (logging cleanup under the same flag) and #35259 (startup weight-load overlap hardening); neither adds filesystem detection or changes the flag's default, so this does not overlap. Please point me at anything I missed.\n\n## Checklist\n\n- [x] Format your code according to [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit) — ruff, ruff-format, isort, codespell all clean\n- [x] Add unit tests according to [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests)\n- [ ] Update documentation — no user-facing doc change beyond the flag's help text; happy to add a note if there is a preferred place\n- [x] Provide accuracy and speed benchmark results (see above; gaps listed under \"Not yet verified\")\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance)\n\n---\n\n*Note: AI assistance was used while preparing this change (investigation, patch, tests, and description). All measurements come from real runs on the cluster described above, and I have reviewed every changed line.*\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #35317934871](https://github.com/sgl-project/sglang/actions/runs/35317934871)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #35317934597](https://github.com/sgl-project/sglang/actions/runs/35317934597)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #35317934803](https://github.com/sgl-project/sglang/actions/runs/35317934803)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 4,
+    "closed_at": null,
+    "comments": 4,
+    "comments_url": "https://api.github.com/repos/sgl-project/sglang/issues/37806/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/sgl-project/sglang/pulls/37806/commits",
+    "created_at": "2026-09-03T12:23:02Z",
+    "deletions": 4,
+    "diff_url": "https://github.com/sgl-project/sglang/pull/37806.diff",
+    "draft": false,
+    "head": {
+      "label": "chuan932:feat/auto-prefetch-network-fs",
+      "ref": "feat/auto-prefetch-network-fs",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/chuan932/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/chuan932/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/chuan932/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/chuan932/sglang/branches{/branch}",
+        "clone_url": "https://github.com/chuan932/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/chuan932/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/chuan932/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/chuan932/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/chuan932/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/chuan932/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/chuan932/sglang/contributors",
+        "created_at": "2026-09-03T12:08:43Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/chuan932/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/chuan932/sglang/downloads",
+        "events_url": "https://api.github.com/repos/chuan932/sglang/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/chuan932/sglang/forks",
+        "full_name": "chuan932/sglang",
+        "git_commits_url": "https://api.github.com/repos/chuan932/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/chuan932/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/chuan932/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/chuan932/sglang.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/chuan932/sglang/hooks",
+        "html_url": "https://github.com/chuan932/sglang",
+        "id": 1355932613,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/chuan932/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/chuan932/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/chuan932/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/chuan932/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/chuan932/sglang/labels{/name}",
+        "language": null,
+        "languages_url": "https://api.github.com/repos/chuan932/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/chuan932/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/chuan932/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOUNHjxQ",
+        "notifications_url": "https://api.github.com/repos/chuan932/sglang/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/320568342?v=4",
+          "events_url": "https://api.github.com/users/chuan932/events{/privacy}",
+          "followers_url": "https://api.github.com/users/chuan932/followers",
+          "following_url": "https://api.github.com/users/chuan932/following{/other_user}",
+          "gists_url": "https://api.github.com/users/chuan932/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/chuan932",
+          "id": 320568342,
+          "login": "chuan932",
+          "node_id": "U_kgDOExt8Fg",
+          "organizations_url": "https://api.github.com/users/chuan932/orgs",
+          "received_events_url": "https://api.github.com/users/chuan932/received_events",
+          "repos_url": "https://api.github.com/users/chuan932/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/chuan932/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/chuan932/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/chuan932",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/chuan932/sglang/pulls{/number}",
+        "pushed_at": "2026-09-18T07:07:17Z",
+        "releases_url": "https://api.github.com/repos/chuan932/sglang/releases{/id}",
+        "size": 355508,
+        "ssh_url": "git@github.com:chuan932/sglang.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/chuan932/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/chuan932/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/chuan932/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/chuan932/sglang/subscription",
+        "svn_url": "https://github.com/chuan932/sglang",
+        "tags_url": "https://api.github.com/repos/chuan932/sglang/tags",
+        "teams_url": "https://api.github.com/repos/chuan932/sglang/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/chuan932/sglang/git/trees{/sha}",
+        "updated_at": "2026-09-03T12:08:43Z",
+        "url": "https://api.github.com/repos/chuan932/sglang",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "7845387e8fb9c1985632de0d3df7ec0429a1c012",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/320568342?v=4",
+        "events_url": "https://api.github.com/users/chuan932/events{/privacy}",
+        "followers_url": "https://api.github.com/users/chuan932/followers",
+        "following_url": "https://api.github.com/users/chuan932/following{/other_user}",
+        "gists_url": "https://api.github.com/users/chuan932/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/chuan932",
+        "id": 320568342,
+        "login": "chuan932",
+        "node_id": "U_kgDOExt8Fg",
+        "organizations_url": "https://api.github.com/users/chuan932/orgs",
+        "received_events_url": "https://api.github.com/users/chuan932/received_events",
+        "repos_url": "https://api.github.com/users/chuan932/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/chuan932/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/chuan932/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/chuan932",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/37806",
+    "id": 4432804955,
+    "issue_url": "https://api.github.com/repos/sgl-project/sglang/issues/37806",
+    "labels": [],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "3e20178fce73105f2a3f3bb4a8fca9018c560dc6",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOLCAjRs8AAAABCDc8Ww",
+    "number": 37806,
+    "patch_url": "https://github.com/sgl-project/sglang/pull/37806.patch",
+    "rebaseable": false,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/176301910?v=4",
+        "events_url": "https://api.github.com/users/mmangkad/events{/privacy}",
+        "followers_url": "https://api.github.com/users/mmangkad/followers",
+        "following_url": "https://api.github.com/users/mmangkad/following{/other_user}",
+        "gists_url": "https://api.github.com/users/mmangkad/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/mmangkad",
+        "id": 176301910,
+        "login": "mmangkad",
+        "node_id": "U_kgDOCoInVg",
+        "organizations_url": "https://api.github.com/users/mmangkad/orgs",
+        "received_events_url": "https://api.github.com/users/mmangkad/received_events",
+        "repos_url": "https://api.github.com/users/mmangkad/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/mmangkad/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/mmangkad/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/mmangkad",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/184021590?v=4",
+        "events_url": "https://api.github.com/users/b8zhong/events{/privacy}",
+        "followers_url": "https://api.github.com/users/b8zhong/followers",
+        "following_url": "https://api.github.com/users/b8zhong/following{/other_user}",
+        "gists_url": "https://api.github.com/users/b8zhong/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/b8zhong",
+        "id": 184021590,
+        "login": "b8zhong",
+        "node_id": "U_kgDOCvfyVg",
+        "organizations_url": "https://api.github.com/users/b8zhong/orgs",
+        "received_events_url": "https://api.github.com/users/b8zhong/received_events",
+        "repos_url": "https://api.github.com/users/b8zhong/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/b8zhong/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/b8zhong/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/b8zhong",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/sgl-project/sglang/pulls/37806/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/7845387e8fb9c1985632de0d3df7ec0429a1c012",
+    "title": "[Model Loader] Auto-enable checkpoint prefetch on network filesystems (NFS/Lustre)",
+    "updated_at": "2026-10-18T07:12:20Z",
+    "url": "https://api.github.com/repos/sgl-project/sglang/pulls/37806",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/320568342?v=4",
+      "events_url": "https://api.github.com/users/chuan932/events{/privacy}",
+      "followers_url": "https://api.github.com/users/chuan932/followers",
+      "following_url": "https://api.github.com/users/chuan932/following{/other_user}",
+      "gists_url": "https://api.github.com/users/chuan932/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/chuan932",
+      "id": 320568342,
+      "login": "chuan932",
+      "node_id": "U_kgDOExt8Fg",
+      "organizations_url": "https://api.github.com/users/chuan932/orgs",
+      "received_events_url": "https://api.github.com/users/chuan932/received_events",
+      "repos_url": "https://api.github.com/users/chuan932/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/chuan932/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/chuan932/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/chuan932",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7845387e8fb9c1985632de0d3df7ec0429a1c012/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fmodel.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fmodel.py?ref=7845387e8fb9c1985632de0d3df7ec0429a1c012",
+      "deletions": 3,
+      "filename": "python/sglang/srt/arg_groups/fields/model.py",
+      "patch": "@@ -290,9 +290,9 @@ class Model(msgspec.Struct):\n         \"Disable mmap while loading weight using safetensors.\",\n     ] = False\n     weight_loader_prefetch_checkpoints: A[\n-        bool,\n-        \"Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Recommended for models on network storage. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set enable_multithread_load=true in --model-loader-extra-config to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).\",\n-    ] = False\n+        Optional[bool],\n+        \"Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Left unset (the default), this is enabled automatically when the checkpoint sits on a network filesystem (NFS/Lustre) and fits in available RAM; pass True or False to override the detection. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set enable_multithread_load=true in --model-loader-extra-config to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).\",\n+    ] = None\n     weight_loader_prefetch_num_threads: A[\n         int, \"Number of threads per rank for checkpoint prefetching (default: 4).\"\n     ] = 4",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7845387e8fb9c1985632de0d3df7ec0429a1c012/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fmodel.py",
+      "sha": "5c29dbeaad3724cf99f001afa67434e41610436b",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7845387e8fb9c1985632de0d3df7ec0429a1c012/python%2Fsglang%2Fsrt%2Fmodel_loader%2Floader.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodel_loader%2Floader.py?ref=7845387e8fb9c1985632de0d3df7ec0429a1c012",
+      "deletions": 0,
+      "filename": "python/sglang/srt/model_loader/loader.py",
+      "patch": "@@ -122,6 +122,7 @@\n     pt_weights_iterator,\n     safetensors_weights_iterator,\n     set_runai_streamer_env,\n+    should_auto_prefetch_checkpoints,\n )\n from sglang.srt.platforms import current_platform\n from sglang.srt.utils import (\n@@ -617,6 +618,8 @@ def _get_weights_iterator(\n         elif use_safetensors:\n             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap\n             configured_prefetch = get_model().weight_loader_prefetch_checkpoints\n+            if configured_prefetch is None:\n+                configured_prefetch = should_auto_prefetch_checkpoints(hf_weights_files)\n             start_iterator_prefetch = (\n                 configured_prefetch and not startup_prefetch_started\n             )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7845387e8fb9c1985632de0d3df7ec0429a1c012/python%2Fsglang%2Fsrt%2Fmodel_loader%2Floader.py",
+      "sha": "19434a9d59dcc47e3f602e886633c018356525c7",
+      "status": "modified"
+    },
+    {
+      "additions": 98,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7845387e8fb9c1985632de0d3df7ec0429a1c012/python%2Fsglang%2Fsrt%2Fmodel_loader%2Fweight_utils.py",
+      "changes": 98,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodel_loader%2Fweight_utils.py?ref=7845387e8fb9c1985632de0d3df7ec0429a1c012",
+      "deletions": 0,
+      "filename": "python/sglang/srt/model_loader/weight_utils.py",
+      "patch": "@@ -917,6 +917,104 @@ def np_cache_weights_iterator(\n         yield name, torch.from_numpy(param)\n \n \n+_NETWORK_FS_TYPES = (\"nfs\", \"nfs4\", \"lustre\")\n+_PREFETCH_RAM_THRESHOLD_PCT = 90\n+\n+\n+def _get_fs_type(files: List[str]) -> str:\n+    \"\"\"Return the filesystem type backing *files* (Linux only, \"\" if unknown).\"\"\"\n+    if not files:\n+        return \"\"\n+    try:\n+        # All checkpoint shards live in the same directory, so probing the first\n+        # file is enough.\n+        resolved = os.path.realpath(files[0])\n+        best_mount = \"\"\n+        best_fstype = \"\"\n+        # /proc/mounts can contain nested mount points (e.g. \"/\" -> ext4,\n+        # \"/data\" -> lustre, \"/data/local\" -> ext4). Pick the longest matching\n+        # mount point, which is the rule the kernel uses to resolve a path.\n+        with open(\"/proc/mounts\") as f:\n+            for line in f:\n+                parts = line.split()\n+                if len(parts) < 3:\n+                    continue\n+                mount_point, fstype = parts[1], parts[2]\n+                if (\n+                    resolved == mount_point\n+                    or resolved.startswith(os.path.join(mount_point, \"\"))\n+                ) and len(mount_point) > len(best_mount):\n+                    best_mount = mount_point\n+                    best_fstype = fstype\n+        return best_fstype\n+    except Exception:\n+        # /proc/mounts is Linux-specific; treat anything unreadable as unknown.\n+        return \"\"\n+\n+\n+def should_auto_prefetch_checkpoints(files: List[str]) -> bool:\n+    \"\"\"Decide whether to prefetch checkpoints when the user left it unset.\n+\n+    Prefetching turns the loader's random mmap page faults into sequential reads,\n+    which matters on network filesystems where a fault costs a network round\n+    trip. It only pays off if the checkpoint can actually stay resident in the\n+    page cache, so a checkpoint larger than most of RAM is skipped: prefetching\n+    it would just evict its own earlier pages.\n+    \"\"\"\n+    if not files:\n+        return False\n+\n+    fs_type = _get_fs_type(files)\n+    is_net_fs = fs_type in _NETWORK_FS_TYPES\n+\n+    try:\n+        import psutil\n+\n+        total_bytes = sum(os.path.getsize(f) for f in files)\n+        avail_bytes = psutil.virtual_memory().available\n+    except Exception:\n+        logger.debug(\"Could not size checkpoints or RAM; skipping auto-prefetch.\")\n+        return False\n+\n+    fits_in_ram = total_bytes <= (_PREFETCH_RAM_THRESHOLD_PCT / 100.0) * avail_bytes\n+    fs_name = fs_type.upper() if fs_type else \"unknown\"\n+\n+    logger.info(\n+        \"Filesystem type for checkpoints: %s. Checkpoint size: %.2f GiB. \"\n+        \"Available RAM: %.2f GiB.\",\n+        fs_name,\n+        total_bytes / 1024**3,\n+        avail_bytes / 1024**3,\n+    )\n+\n+    if not is_net_fs:\n+        logger.info(\n+            \"Auto-prefetch disabled: %s is not a recognized network filesystem \"\n+            \"(%s). Pass --weight-loader-prefetch-checkpoints to force it.\",\n+            fs_name,\n+            \"/\".join(_NETWORK_FS_TYPES),\n+        )\n+        return False\n+\n+    if not fits_in_ram:\n+        logger.warning(\n+            \"Network filesystem (%s) detected, but the checkpoint (%.2f GiB) \"\n+            \"exceeds %d%% of available RAM (%.2f GiB); skipping auto-prefetch.\",\n+            fs_name,\n+            total_bytes / 1024**3,\n+            _PREFETCH_RAM_THRESHOLD_PCT,\n+            avail_bytes / 1024**3,\n+        )\n+        return False\n+\n+    logger.info(\n+        \"Network filesystem (%s) detected; enabling checkpoint prefetch. \"\n+        \"Pass --weight-loader-prefetch-checkpoints=False to disable.\",\n+        fs_name,\n+    )\n+    return True\n+\n+\n def _prefetch_checkpoint_file(\n     file_path: str,\n     cancel_event: Optional[threading.Event] = None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7845387e8fb9c1985632de0d3df7ec0429a1c012/python%2Fsglang%2Fsrt%2Fmodel_loader%2Fweight_utils.py",
+      "sha": "0e533e3e7b71351a00017b982be76167f5ef233c",
+      "status": "modified"
+    },
+    {
+      "additions": 129,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7845387e8fb9c1985632de0d3df7ec0429a1c012/test%2Fregistered%2Funit%2Fmodel_loader%2Ftest_prefetch_checkpoints.py",
+      "changes": 130,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmodel_loader%2Ftest_prefetch_checkpoints.py?ref=7845387e8fb9c1985632de0d3df7ec0429a1c012",
+      "deletions": 1,
+      "filename": "test/registered/unit/model_loader/test_prefetch_checkpoints.py",
+      "patch": "@@ -11,7 +11,7 @@\n import unittest\n from concurrent.futures import Future\n from types import SimpleNamespace\n-from unittest.mock import MagicMock, patch\n+from unittest.mock import MagicMock, mock_open, patch\n \n import safetensors.torch\n import torch\n@@ -20,10 +20,12 @@\n from sglang.srt.model_loader.loader import DefaultModelLoader\n from sglang.srt.model_loader.weight_utils import (\n     CheckpointFilePrefetchHandle,\n+    _get_fs_type,\n     _prefetch_all_checkpoints,\n     buffered_multi_thread_safetensors_weights_iterator,\n     fastsafetensors_weights_iterator,\n     safetensors_weights_iterator,\n+    should_auto_prefetch_checkpoints,\n )\n from sglang.test.ci.ci_register import register_cpu_ci\n from sglang.test.test_utils import CustomTestCase\n@@ -700,5 +702,131 @@ def test_fastsafetensors_enable_gds_requires_boolean(self):\n             )\n \n \n+class TestAutoPrefetchDetection(CustomTestCase):\n+    \"\"\"Verify the filesystem detection behind the ``auto`` prefetch default.\n+\n+    Prefetch turns the loader's scattered mmap faults into sequential reads,\n+    which only pays off when a fault costs a network round trip and the\n+    checkpoint can stay resident in the page cache.\n+    \"\"\"\n+\n+    _MOUNTS = (\n+        \"rootfs / ext4 rw 0 0\\n\"\n+        \"10.0.0.1:/vol /data lustre rw 0 0\\n\"\n+        \"/dev/nvme0n1 /data/local ext4 rw 0 0\\n\"\n+    )\n+\n+    def _patch_mounts(self, contents=None):\n+        return patch(\"builtins.open\", mock_open(read_data=contents or self._MOUNTS))\n+\n+    def test_fs_type_picks_longest_matching_mount(self):\n+        \"\"\"Nested mounts must resolve like the kernel does: longest prefix\n+        wins, so /data/local is ext4 even though /data is lustre.\"\"\"\n+        with self._patch_mounts():\n+            self.assertEqual(_get_fs_type([\"/data/model/f.safetensors\"]), \"lustre\")\n+        with self._patch_mounts():\n+            self.assertEqual(_get_fs_type([\"/data/local/model/f.safetensors\"]), \"ext4\")\n+        with self._patch_mounts():\n+            self.assertEqual(_get_fs_type([\"/opt/model/f.safetensors\"]), \"ext4\")\n+\n+    def test_fs_type_does_not_match_sibling_prefix(self):\n+        \"\"\"/database must not match the /data mount by string prefix alone.\"\"\"\n+        with self._patch_mounts():\n+            self.assertEqual(_get_fs_type([\"/database/f.safetensors\"]), \"ext4\")\n+\n+    def test_fs_type_returns_empty_without_proc_mounts(self):\n+        \"\"\"/proc/mounts is Linux-only; an unreadable file means \"unknown\".\"\"\"\n+        with patch(\"builtins.open\", side_effect=OSError):\n+            self.assertEqual(_get_fs_type([\"/data/f.safetensors\"]), \"\")\n+        self.assertEqual(_get_fs_type([]), \"\")\n+\n+    def _patch_sizing(self, total_bytes, avail_bytes):\n+        return (\n+            patch(\"os.path.getsize\", return_value=total_bytes),\n+            patch(\n+                \"psutil.virtual_memory\",\n+                return_value=SimpleNamespace(available=avail_bytes),\n+            ),\n+        )\n+\n+    def test_auto_enables_on_network_fs_that_fits_in_ram(self):\n+        p_size, p_mem = self._patch_sizing(10 * 1024**3, 100 * 1024**3)\n+        with self._patch_mounts(), p_size, p_mem:\n+            self.assertTrue(\n+                should_auto_prefetch_checkpoints([\"/data/model/f.safetensors\"])\n+            )\n+\n+    def test_auto_stays_off_on_local_fs(self):\n+        \"\"\"Local storage has no round-trip cost to amortize.\"\"\"\n+        p_size, p_mem = self._patch_sizing(10 * 1024**3, 100 * 1024**3)\n+        with self._patch_mounts(), p_size, p_mem:\n+            self.assertFalse(\n+                should_auto_prefetch_checkpoints([\"/data/local/model/f.safetensors\"])\n+            )\n+\n+    def test_auto_stays_off_when_checkpoint_exceeds_ram(self):\n+        \"\"\"Prefetching a checkpoint larger than RAM would evict its own\n+        earlier pages, so the read is paid for twice.\"\"\"\n+        p_size, p_mem = self._patch_sizing(95 * 1024**3, 100 * 1024**3)\n+        with self._patch_mounts(), p_size, p_mem:\n+            self.assertFalse(\n+                should_auto_prefetch_checkpoints([\"/data/model/f.safetensors\"])\n+            )\n+\n+    def test_auto_stays_off_when_sizing_fails(self):\n+        with self._patch_mounts(), patch(\"os.path.getsize\", side_effect=OSError):\n+            self.assertFalse(\n+                should_auto_prefetch_checkpoints([\"/data/model/f.safetensors\"])\n+            )\n+\n+    def test_auto_requires_files(self):\n+        self.assertFalse(should_auto_prefetch_checkpoints([]))\n+\n+\n+class TestAutoPrefetchDispatch(TestPrefetchDispatch):\n+    \"\"\"The ``auto`` default must consult detection only when left unset.\"\"\"\n+\n+    def test_unset_prefetch_consults_auto_detection(self):\n+        loader = self._make_loader({})\n+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(\n+            prefetch=None\n+        )\n+        with (\n+            p_prep,\n+            p_model,\n+            p_buffered as mock_buffered,\n+            p_single as mock_single,\n+            p_log,\n+            patch(\n+                \"sglang.srt.model_loader.loader.should_auto_prefetch_checkpoints\",\n+                return_value=True,\n+            ) as mock_auto,\n+        ):\n+            self._run(loader)\n+        mock_auto.assert_called_once_with([\"f.safetensors\"])\n+        mock_single.assert_called_once()\n+        mock_buffered.assert_not_called()\n+\n+    def test_explicit_prefetch_skips_auto_detection(self):\n+        \"\"\"An explicit True/False from the user is authoritative.\"\"\"\n+        for explicit in (True, False):\n+            loader = self._make_loader({})\n+            p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(\n+                prefetch=explicit\n+            )\n+            with (\n+                p_prep,\n+                p_model,\n+                p_buffered,\n+                p_single,\n+                p_log,\n+                patch(\n+                    \"sglang.srt.model_loader.loader.should_auto_prefetch_checkpoints\",\n+                ) as mock_auto,\n+            ):\n+                self._run(loader)\n+            mock_auto.assert_not_called()\n+\n+\n if __name__ == \"__main__\":\n     unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7845387e8fb9c1985632de0d3df7ec0429a1c012/test%2Fregistered%2Funit%2Fmodel_loader%2Ftest_prefetch_checkpoints.py",
+      "sha": "437352f08d750ea520cda0c37308ccd961bc2a78",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Hi @b8zhong @mmangkad — you're the CODEOWNERS for `srt/model_loader`, so tagging you for review when you have time.\n\nTwo notes to make this cheap to review:\n\n- The prefetch machinery it turns on is **already in the tree** (`_prefetch_all_checkpoints`); this PR only adds the filesystem detection that decides when to enable it, plus a tri-state default on the existing flag. `weight_loader_prefetch_num_threads`, `should_async_load()`, the single-threaded fallback, and the executor width in `do_load_weights()` are untouched.\n- Behaviour is unchanged on local storage: detection returns `False` for anything that isn't `nfs`/`nfs4`/`lustre`, and an explicit `True`/`False` always overrides it.\n\nCould someone with the right permissions add the `run-ci` label so CI can run? Per the [merge process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process) I can't apply it myself.\n\nI've listed what I have *not* verified in the PR description (no local-NVMe control run, no larger-than-RAM checkpoint run) — happy to run either, or to make the auto path more conservative, if you'd prefer that before merging.\n",
+      "created_at": "2026-09-03T12:25:45Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-5525720452",
+      "id": 5525720452,
+      "updated_at": "2026-09-03T12:25:45Z",
+      "user": {
+        "login": "chuan932"
+      }
+    },
+    {
+      "body": "Following up on the [merge process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process): this PR hasn't been assigned a Merge Oncall and doesn't have the `run-ci` label yet, so CI hasn't run.\n\n`srt/model_loader` doesn't have its own Merge Oncall entry in MAINTAINER.md, and the closest listed area is Scheduler (which covers `srt/model_executor`) — so tagging @merrymercy @hnyls2002 @cctry: could one of you pick this up as Merge Oncall, or point me to the right person?\n\nFor the `run-ci` label, tagging a NVIDIA CI Oncall: @Kangyan-Zhou @ch-wan.\n\nRecap of why this should be cheap to review:\n- The prefetch machinery is already in the tree; this PR only adds the filesystem detection that decides when to turn it on, plus a tri-state default on the existing flag (`bool = False` → `Optional[bool] = None`).\n- Local storage is unaffected: detection returns `False` for anything that isn't `nfs`/`nfs4`/`lustre`, and an explicit `True`/`False` always overrides it. `weight_loader_prefetch_num_threads`, `should_async_load()`, the single-threaded fallback, and the executor width in `do_load_weights()` are all untouched.\n- +235/-4 across 4 files, 129 of those lines being unit tests added to the existing `test_prefetch_checkpoints.py`.\n- Motivation: on 8×H20 (TP=8), GLM-5.2-FP8 (704 GiB, Lustre) does not finish loading in 20 minutes on the current default; 151 s with prefetch on, with major page faults dropping 369,655 → 38 per sample.\n\nNot blocking on my side — happy to rebase, run the local-NVMe / larger-than-RAM checks listed in the description, or scope the auto path down if reviewers prefer. Thanks!\n",
+      "created_at": "2026-09-03T14:12:27Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-5527082144",
+      "id": 5527082144,
+      "updated_at": "2026-09-03T14:12:27Z",
+      "user": {
+        "login": "chuan932"
+      }
+    },
+    {
+      "body": "@ch-wan — following up with a more specific ask, since `git log` shows you as by far the most active contributor to `srt/model_loader` recently (8 of the last 30 commits there). `MAINTAINER.md` has no Merge Oncall entry for `model_loader`, which is probably why this PR has sat unassigned since Sep 1 with no `run-ci` label, so CI has never run.\n\nWould you be willing to either shepherd this one or point me at the right person?\n\nThe change is small and additive:\n\n- The prefetch machinery (`_prefetch_all_checkpoints`) is **already in the tree**. This PR only adds the filesystem detection that decides when to enable it, plus a tri-state default on the existing `weight_loader_prefetch_checkpoints` flag (`bool = False` → `Optional[bool] = None`, matching the existing pattern used by `enable_multimodal` and friends).\n- Nothing else is touched: `weight_loader_prefetch_num_threads` stays 4, `should_async_load()`, the single-threaded fallback, and the executor width in `do_load_weights()` are unchanged.\n- Local storage is unaffected — detection returns `False` for anything that isn't `nfs`/`nfs4`/`lustre`, and an explicit `True`/`False` always wins.\n- +235/-4 across 4 files, 129 of those lines being unit tests added to the existing `test_prefetch_checkpoints.py`.\n\nWhy it matters: on 8×H20 (TP=8), GLM-5.2-FP8 (704 GiB on Lustre) **does not finish loading in 20 minutes** on today's default, because up to 32 loader threads fault lazy mmap pages at unrelated offsets and Lustre degrades to page-sized synchronous RPCs (369,655 major faults per 20 s sample, ~28 MiB/s effective). With prefetch on it loads in 151 s and faults drop to 38.\n\nThe gaps I have *not* closed are listed in the description (no local-NVMe control run, no larger-than-RAM checkpoint run) — happy to run either, rebase, or scope the auto path down further.\n",
+      "created_at": "2026-09-04T08:10:52Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-5537645039",
+      "id": 5537645039,
+      "updated_at": "2026-09-04T08:10:52Z",
+      "user": {
+        "login": "chuan932"
+      }
+    },
+    {
+      "body": "<!-- pr-check-comment runs=35317934490 -->\nRequired checks failed on 7845387; this PR cannot be merged until they pass.\n\n**Lint** ([run](https://github.com/sgl-project/sglang/actions/runs/35317934490))\nRun `pre-commit run --all-files` locally and push the result. The run log shows any other failing step.",
+      "created_at": "2026-10-18T07:12:20Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/37806#issuecomment-6247007990",
+      "id": 6247007990,
+      "updated_at": "2026-10-18T07:12:20Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 37806,
+  "refs": {
+    "base": {
+      "commit": "0be8a0af0ef2d1c740dc4d084f368e75ef55a2cf",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "7845387e8fb9c1985632de0d3df7ec0429a1c012",
+      "repository": "chuan932/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": []
+}

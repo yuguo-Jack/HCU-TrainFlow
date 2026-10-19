@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: bde4d001130e5112d984ba99f0546e22c09e1a89
 path: docs/training/weight_transfer/ipc.md
-raw_sha256: 8c191be68ab53aa6fe213a890ca928ea7105228df838eaa2d235e1cdf2a3a597
+raw_sha256: 32f452e9546a50cecc1069a2457b4b3be696ca9d7e633f6f92eda58e02078f51
 sources: []
-generated_body_sha256: bf6eaf51614a42fe07063a028bb292ee3b9cbdcd214b0c29dbdcc566e73a2387
+generated_body_sha256: 248ad6c01409b9f4e48015ea50ed16c7a841fc5d96007932311468f216f23ed1
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/weight_transfer/ipc.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/docs/training/weight_transfer/ipc.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/weight_transfer/ipc.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -138,6 +138,43 @@ mode carries a per-chunk barrier across ranks: without it, a rank could overwrit
 its buffer while its colocated worker is still reading the current chunk. This is
 handled inside `send_weights()`.
 
+## Trainer Without vLLM over HTTP
+
+A colocated trainer can speak the [HTTP endpoints](README.md#api-endpoints)
+directly, with only PyTorch and an HTTP client. The server needs
+`VLLM_ALLOW_INSECURE_SERIALIZATION=1`; without it, init and start return 200 and
+the first `/update_weights` returns 500. Reference:
+[`rlhf_http_ipc_no_vllm.py`](../../../examples/rl/rlhf_http_ipc_no_vllm.py).
+
+`POST /init_weight_transfer_engine` body: `{"init_info": {"packed": false}}`.
+
+`POST /update_weights` body `{"update_info": {...}}`:
+
+| Field | Meaning |
+| ----- | ------- |
+| `names`, `dtype_names`, `shapes` | Checkpoint names, `torch` dtype attribute names (`"bfloat16"`), full shapes |
+| `ipc_handles_pickled` | `base64(pickle.dumps(handles))`. Unpacked: a list with one dict per name. Packed: one dict for the shared buffer |
+| `tensor_sizes` | Packed only: byte size of each tensor in the chunk, in `names` order |
+
+- A handle dict is `{gpu_uuid: reduce_tensor(t)[1]}` with one entry per GPU the
+  server uses (`torch.multiprocessing.reductions.reduce_tensor`).
+  `gpu_uuid = str(torch.cuda.get_device_properties(i).uuid)`, **without** the
+  `GPU-` prefix that `nvidia-smi` prints. The worker overwrites `args[6]`
+  (device index) with its own.
+- `ipc_handles` (unpickled) is not JSON-serializable; over HTTP use
+  `ipc_handles_pickled`.
+- Packed: export one `uint8` buffer once and reuse it for every chunk. Copy
+  `t.contiguous().view(-1).view(torch.uint8)` in `names` order and close a chunk
+  **before** the next tensor would overflow it (unlike NCCL, which closes after).
+  A tensor larger than the buffer is an error. Synchronize before each
+  `/update_weights`; do not overwrite the buffer until the call returns.
+- Keep every exported tensor alive until `/finish_weight_update` returns, then
+  drop the references and call `torch.cuda.ipc_collect()`.
+- Multi-rank trainers: each rank exports handles for its own GPU, the ranks
+  gather the `{uuid: args}` dicts to rank 0 over their own `torch.distributed`
+  group and merge them per index, and rank 0 sends all HTTP. In packed mode,
+  barrier before and after each `/update_weights`.
+
 ## Rank-Local Updates
 
 For different parameter subsets per worker, `update_info` may be a list indexed
@@ -147,4 +184,5 @@ worker to participate.
 ## Examples
 
 - [RLHF with IPC weight syncing (`vllm serve`, HTTP)](../../../examples/rl/rlhf_http_ipc.py) - **Start here.** Server and training model share a single GPU; HTTP control plane, CUDA IPC data plane. Launches and tears down its own server
+- [IPC weight syncing from a trainer that does not import vLLM](../../../examples/rl/rlhf_http_ipc_no_vllm.py) - `torch` + `requests` only, `ipc_handles_pickled` over HTTP; see [Trainer Without vLLM over HTTP](#trainer-without-vllm-over-http)
 - [RLHF with IPC + FSDP2 and expert parallelism](../../../examples/rl/rlhf_ipc_fsdp_ep.py) - Multi-rank trainer colocated with a `--data-parallel-size 4` server on the same 4 GPUs: every FSDP rank builds an engine and joins the handle all-gather, with packed chunking and sleep/wake around the transfer

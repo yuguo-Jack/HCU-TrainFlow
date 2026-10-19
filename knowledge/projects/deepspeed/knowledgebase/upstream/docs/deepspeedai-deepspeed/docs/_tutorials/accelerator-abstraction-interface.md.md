@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
 path: docs/_tutorials/accelerator-abstraction-interface.md
-raw_sha256: 1b10a4a4b8fa03dfb6cc4e3d272e29783423b92f21b8350cca49608b05a16071
+raw_sha256: 4e1f5c9ee3b4e87be2b144486d1b1df05d5b2a4f99fdd7152d1080c16e126ef3
 sources: []
-generated_body_sha256: b131b09338af6f68bd84ba3c467fee54087dcf13823cbbb224bff1c199057308
+generated_body_sha256: ceaf22efbe08a37ca423486dbdfe9c48296004baf2159bdcb94969c9e55c9456
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/accelerator-abstraction-interface.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/accelerator-abstraction-interface.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/docs/_tutorials/accelerator-abstraction-interface.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -70,6 +70,11 @@ if torch.cuda.is_available():
 if get_accelerator().is_available():
     ...
 ```
+
+Use `get_accelerator().is_current_stream_capturing()` to query whether the current
+stream is being captured into a graph. The base implementation returns `False`;
+graph-capable backends should override it with their runtime's capture-state query.
+The CUDA accelerator delegates to `torch.cuda.is_current_stream_capturing()`.
 
 For most `torch.cuda.<interface>(...)` call, we can literally replace `torch.cuda` with `get_accelerator()`.   However, there are some exceptions that needs attention:
 1. For `torch.cuda.current_device()`, we need to know whether calling this interface is to get device index, or supply the return value as a device.   If we want to use the return value as a device string, we need to call `get_accelerator().current_device_name()`.  For example:

@@ -9,30 +9,41 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source, official documentation and related PR reading; no HCU runtime validation
 sources:
 - source: nvidia-megatron-energon
   path: docs/source/basic/task_encoder.md
-  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
   sha256: 0f10499347e02b15f04fbcdac053bccb4640ae205b8951c8bcff718443850164
 - source: nvidia-megatron-energon
   path: docs/source/advanced/packing.md
-  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
   sha256: 92fea78e4c464f9bca5e44d724aaf4f3b28d98ca6b2fc9a0c269826925afe8fa
 - source: nvidia-megatron-energon
   path: src/megatron/energon/task_encoder/base.py
-  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
-  sha256: d4fce3a940e2a673d3e7a40376f7741799b6c687b1e6ddea7202d66c8e943706
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  sha256: 12bc1e83104e970b21fc2f4e7327de71b7131c19c3910d204709d111f70b58fc
 - source: nvidia-megatron-energon
   path: docs/source/advanced/error_handling.md
-  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
   sha256: d4484631b352c16fdab3896e7bff9d7c86de0d59962dac00109ca99d2b6a0e78
 - source: nvidia-megatron-energon
   path: tests/test_dataset_det.py
-  commit: accdabc3983843665a34cd1578c0e82d2403e3a9
-  sha256: f0311cad67786f3aa06c040e53e589e453506a0cad7ea2d2a18549cb6d3e914e
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  sha256: a398a538af98ddb31748edf0307ba2e13f91102806410f2c2dcdc6e31dfc8a8e
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/tags.py
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  sha256: 0f31d0b8b389b32fa3c20e4bcd11f1b5c8979d395318b3988a36fffc2fbe282d
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/recipe/loader.py
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  sha256: cf94d91caa1fb6416626ef7477f337a32b0af05ad13dacb57d671af7a53393a0
+- source: nvidia-megatron-energon
+  path: docs/source/basic/recipe.md
+  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  sha256: 5fed272cbe8dcc57c3767ab8e43214578ad2325c8d5314d32073eb5d84f97f71
 ---
 
 # Energon：TaskEncoder、Packing 与确定性重放
@@ -53,6 +64,12 @@ buffer更大通常增加组合选择，但占host memory、启动等待和恢复
 
 普通迭代默认log并跳过某些样本，而restore的错误策略严格，超过连续错误容限/编程错误会fail；从“训练没崩”推断数据正常不成立。观测skip率、数据类型与有效token分布，故障定位保留原sample/shard信息。
 
+## Recipe 与 tags 迁移不等于数据语义不变
+
+当前 TaskEncoder 从 `recipe.loader_interface` 取得已加载数据，`Batch` 通过 `SampleTagsAlias` 提供兼容。`canonicalize_tag_kwargs` 把旧 `__subflavors__` 转为 `__tags__`，`resolve_tags`/别名构造器在新旧参数同时出现时抛 `ValueError`，不是按优先级静默选择。规范 dataclass 字段已是 `__tags__`，只反射旧字段名的下游 collator/序列化代码需要检查；`derive_from` 与 `_batch` 保持 tags 元数据，旧 cooker 的字典访问另有兼容处理。
+
+Recipe 接替 MetadatasetV2 的公开配置入口，旧名称是弃用别名；不能把此兼容推广到已移除的 v1、joined reader 或旧 checkpoint。迁移验证应覆盖旧/新关键字、两者同时给出的拒绝、cooker 按 tags 路由、多样本 batch 的元数据与实际 tensor/mask/label。`test_tags_backward_compatibility` 是上游这一兼容范围的固定测试依据，本轮未执行；自定义 TaskEncoder、recipe/blend 或 tokenizer 改动仍要重验训练数值。
+
 ## Mask/label、性能与数值验收
 
 核对每样本ID/有效token不丢不重，segment causal mask、EOS/special tokens、position/RoPE重置、cu-seqlens与ignore/loss mask。若loss按token加权，packing前后分母应对应同一目标；原样本等权目标不能擅自变token等权。
@@ -65,10 +82,14 @@ buffer更大通常增加组合选择，但占host memory、启动等待和恢复
 
 ## 固定证据与复核范围
 
-- [docs/source/basic/task_encoder.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/docs/source/basic/task_encoder.md)
-- [docs/source/advanced/packing.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/docs/source/advanced/packing.md)
-- [src/megatron/energon/task_encoder/base.py](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/src/megatron/energon/task_encoder/base.py)
-- [docs/source/advanced/error_handling.md](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/docs/source/advanced/error_handling.md)
-- [tests/test_dataset_det.py](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/tests/test_dataset_det.py)
+- [docs/source/basic/task_encoder.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/basic/task_encoder.md)
+- [docs/source/advanced/packing.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/packing.md)
+- [src/megatron/energon/task_encoder/base.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/task_encoder/base.py)
+- [docs/source/advanced/error_handling.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/error_handling.md)
+- [tests/test_dataset_det.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/tests/test_dataset_det.py)
+
+- [src/megatron/energon/tags.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/tags.py)
+- [src/megatron/energon/recipe/loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/recipe/loader.py)
+- [docs/source/basic/recipe.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/basic/recipe.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

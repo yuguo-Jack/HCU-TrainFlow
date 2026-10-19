@@ -11,6 +11,7 @@
 | 训练融合、attention/linear/低精度、权重与梯度生命周期 | HCU Transformer Engine、Flash-Train、Primus Turbo；原引擎已有实现 | 公共接口、fwd/bwd/dgrad/wgrad、cast/累加精度、实际 dispatcher、主梯度标记、saved tensors、graph/动态 shape |
 | Primus/Primus-LM patch 使用的 GEMM/GroupedGEMM、MoE、融合后端 | **HCU Primus Turbo**；AMD Primus/Primus-LM 的调用与优化动机 | HCU 分支与对应 patch/子模块版本，CK/hipBLASLt/AICC/DTK依赖、gfx能力、低精度门禁、空专家/偏斜/容量、后端实际命中；AMD安装说明不直接等于HCU构建方法 |
 | 通用集合通信及模型同步 | HCU RCCL及实际插件；需要时比较UCCL collective | process group、实际加载so/plugin、网络/RDMA/NUMA与CPU推进、消息量、异步完成、暴露等待；不能把UCCL整个仓当单一RCCL替换库 |
+| 节点内 AR/AG/RS、低精度通信或融合接口 | HCU AITER 的普通 CAR、量化 QR 与对应消费者 | AG 位传输与 RS 数值规约分别核对，检查格式/scale、dim、准入、原地输出、Graph copy-in 和安全回退；见[通信专项](communication-optimization.md#11-数值协议与后端策略必须一起核对) |
 | MoE dispatch/combine 或 EP 低效 | HCU DeepEP、UCCL EP、MoonEP；按实际能力选择 | 单机/跨机、吞吐/低延迟、sync/async、dtype、handle/plan、token排列、padding/drop与路由权重、前后向、重算、多microbatch、buffer生命周期 |
 | 专家负载偏斜、复制与权重/梯度流转 | HCU UltraEP 与引擎专家计算/dispatcher；联查实际rocSHMEM provider | 副本placement/reroute、权重版本、梯度归并与更新归属、异步顺序、拓扑域和额外显存；不能把它当简单dispatch替换后就认为训练语义正确 |
 | 设备侧通信、通算融合与推进瓶颈 | HCU rocSHMEM、MORI、Flux及上述库现有路径 | provider/SHCA、symmetric heap、fence/可见性、progress、资源预留与消费者；遵守[通信专项](communication-optimization.md) |
@@ -22,11 +23,13 @@
 
 编译器升级时核对实际 intrinsic 累加精度、低精度 packing/scale ABI 和最终代码的等待/同步。源码 load 数量可能因向量化而不同于机器事务数；`vmcnt` 非零不能单独证明有效重叠，目标资源上限也不等于实际 VGPR 用量或 occupancy。按当前 HCU 知识和 kernel Skill 继续查 IR/ISA/性能计数器，不复制另一 gfx 的指令门禁或把 no-NaN 假设当通用加速开关。
 
+Triton/TileLang 的前端选项、流水 pass 和后端工具链须作为同一组合核对。BufferLds copy 转换、数据发布和槽位复用可能由不同 pass 负责；不能从某个转换 pass 没有 wait 推断同步缺失，也不能手工重复插入全量等待。TileLang 的 pipeline 注册、布局/scale 同步与 Cython launch ABI 变化后，重新核对实际调用的 pipeline、生成代码和 stream/参数绑定；同名 kernel 或 Python 包版本不足以复用旧缓存。DCC 的 memory scope 使用当前头文件宏，不能把旧枚举数值固化到新版本；AICC、DCC 与其实际选择的 LLVM/GCVM 后端分别记录。
+
 **新增实现的归属：** 当前 HCU 各库均无适用实现的通用训练 HIP 算子，默认放 HCU Flash-Train；增强 TE 既有算子、接口或优化器实现则交 HCU TE，Primus Turbo 自有模块交其 HCU 仓。引擎保留调用接入、配置和集成测试，不复制通用 kernel。先在独立开发树完成验证，整合/PR 沿用任务的完整工作流交付顺序，不中途切换执行基线。
 
 ## 2. HCU 分支与能力边界的检索入口
 
-下表由 **2026-10-12 的 HCU-Knowledge 工程报告**核对，提供仓库身份和分支选择起点，不固定未来任务依赖，也不宣称本轮编译验证。实际操作先用 `$hcu-knowledge-search` 查工程报告和最新来源决策，再确认现场版本与当前源码；同用途公开 HYGON 仓实质同步时优先公开，内部领先则用内部适用分支。DTK `:20080` 与 DAS `:10068` 是两个权限域。
+下表于 **2026-10-20 对照 HCU-Knowledge `3829ef06e7c7` 的工程报告和固定源码**核对，提供仓库身份和分支选择起点，不固定未来任务依赖，也不宣称本轮编译验证。实际操作先用 `$hcu-knowledge-search` 查工程报告和最新来源决策，再确认现场版本与当前源码；同用途公开 HYGON 仓实质同步时优先公开，内部领先则用内部适用分支。DTK `:20080` 与 DAS `:10068` 是两个权限域。
 
 | HCU 工程 / 源码入口 | 已登记分支与修改归属 |
 | --- | --- |
@@ -34,6 +37,7 @@
 | [rccl-test](http://42.228.13.241:20080/dcutoolkit/driverruntime/rccl-test) | `dtk-26.04.2` 测试集成线；负责复现与计时/正确性测试，不是通信算法库。AMD RCCL 仅作上游参考 |
 | [Transformer Engine](http://42.228.13.241:10068/dcutoolkit/deeplearing/TransformerEngine) | HCU `release_v2.16` 配套线与 `main`；模块、低精度状态、融合及接口归此仓。公开同名仓须确认确有 HCU 后端 |
 | [Flash-Train](https://github.com/HYGON-AI/flash-train) | `develop` 综合入口；优先复用训练融合算子，没有适用实现的通用 HIP 算子默认交这里 |
+| [AITER](http://42.228.13.241:10068/dcutoolkit/deeplearing/aiter) | 内部 `main` 为当前 HCU 综合入口；通信、量化与融合分别核对 Python/native、组状态和消费者，不用 AMD 同名接口替代 |
 | [Primus Turbo](http://42.228.13.241:10068/dcutoolkit/deeplearing/Primus-Turbo) | `wyf-main` 为综合 HCU 线，`perf/hygon-megamoe-asm-final` 是专项；自有算子/backend 归这里，并核对 Primus patch、CK/hipBLASLt/AICC 依赖 |
 | [rocSHMEM](https://github.com/HYGON-AI/rocSHMEM-das) | `develop`；设备侧单边通信、heap、provider/SHCA 与内存可见性。消费者实际 gitlink 优先于该分支 HEAD |
 | [DeepEP](http://42.228.13.241:10068/dcutoolkit/deeplearing/DeepEP) | `ci-release` 当前内部集成线；[公开仓](https://github.com/HYGON-AI/DeepEP-das)落后能力需按当前决策比较，不直接替代 |
@@ -47,7 +51,15 @@
 
 CK、Flux、MIOpen、PyTorch/Inductor 等未在表中逐一列出的真实依赖也可按根因修改：从大知识库的对应项目取仓库身份，再沿引擎 build/lock/gitlink 和已加载制品确定目标，不能凭包名拼仓库 URL。权限不足保留缺口，不拿 NVIDIA/AMD 同名源码当作 HCU 实现。
 
+分别记录父仓 gitlink、构建脚本显式 checkout、最终加载的依赖制品；三者可能不同。当前 DeepEP 构建脚本会选择特定 rocSHMEM 子提交与 SHCA/provider，独立 rocSHMEM develop 的新策略不自动进入该消费者。AITER 锁定的 CK/MoE 也不能由独立子仓 HEAD 替换；新增 selector、模板参数或量化布局要追到父仓实际采用的版本。显式环境开关仍需检查实际读取与分派，保留兼容名字但已 ignored 的变量不能证明命中，master 关闭也可能改选另一 provider。
+
 统一知识入口为 HCU-Knowledge `knowledge/projects/<project>/knowledgebase/local/overview/engineering-guide.md`；搜索结果提供固定源码、PR/MR 与原件。这里仅登记引用与归属，内部实现仍在其受控来源，不复制到公开 Wiki。库调用、架构/ABI、provider、精度与完成语义必须与本次任务相符。
+
+### 融合梯度与低精度状态的接入检查
+
+接入 Primus Turbo 等自定义 autograd 时，追到原 Parameter 的属性、每次 backward 的写入和 DDP hook。当前 MegaMoE 支持的 FP32 路径每次先产生独立 dW，再加入 `main_grad`，最后设置 `grad_added_to_main_grad` 并返回 dummy 供 hook 使用；该标志不能被解释成整次迭代只累加一次。按实际 profile 核对 FP32 wgrad 能力，覆盖多 microbatch、重复 backward、iteration reset 和 zero-out，不能把某个模型/profile 的资格推广到其他路径。编译或 autotune 可能实际执行带副作用的 kernel，冷/热缓存都要验证累加次数和输出缓冲，避免首轮额外更新。
+
+TE 的开发 main 与 HCU release 分开查证。按实际 recipe 保留持久 scale/amax 历史，stateless recipe 的空 extra state 与 DelayedScaling 恢复不是同一协议；旧 checkpoint 默认被拒绝时核对格式与来源，不能用丢弃历史或全局启用 unsafe pickle 兼容开关消除报错。Userbuffers、预分配 out/dgrad_out、权重量化缓存重建后，检查 alias、地址寿命和编译常量失效；当前 main 的 `destroy_ub()` 会重置编译缓存，旧编译图不应被当作新 UB 配置的验证。
 
 ## 3. 必要时修改和重编底层库
 

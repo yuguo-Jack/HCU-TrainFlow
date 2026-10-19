@@ -10,34 +10,46 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/dist_checkpointing/serialization.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 2f3c6b9f11c3919ce6579ef75dd877e351f09c1fc54b8c025f7c95fc4f2fcf57
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 5820472782a469830ce6d1f107fb473dd65f7a4c76c56c2c5265eb619e83893f
 - source: nvidia-megatron-lm
   path: megatron/training/checkpointing.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e388d78cd420ee56cafac87bcb33433d3ec247ae5db94f51c53c6ccb5c787c79
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: cf93602f06e5b2a23fbbed9f24dc2eeb3da8cbafdd5228cd40b5ba88757c98ec
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e436206da1fe3ec5b8b5da8a06e1c8d6a7e08f149a0079107d83f1d68284e469
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 560336b88b52060544ca76ceb8c9e0b9274472cdea043b76e2a87db467532883
 - source: nvidia-megatron-lm
   path: megatron/core/rerun_state_machine.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 628f9550686505275eddfda7f444ebee51c573f0790d6927027444660f51a5ea
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 0098ceed9a9cedfc0fba53aab75aefad8fe8ea8d10711da70965f55500401c03
 - source: nvidia-megatron-lm
   path: tests/unit_tests/test_checkpointing.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: c7138e82641e94df41ee1ac16f9f4f94553d5ce705716dd2cefb065359989776
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 004004afb53311238c0e2e237ff72b4bc22a343b65e7cdf68c23b6a6b25948fa
 - source: nvidia-megatron-lm
   path: tests/unit_tests/dist_checkpointing/test_rerun_state_machine_ckpt.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 21689986768bf00506f7437d136bc1072da8bd4dca487d655e77d41af734af05
+- source: nvidia-megatron-lm
+  path: megatron/training/ckpt/glu_checkpointing.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ae5abc38caa095a75f26eee25decbe4c645b1536c8fa52fb42d70986bc74bb04
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/dist_checkpointing/test_stream_ckpt_dequant.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 524d95fa70cf959e07959ede7b67dd4dd4086fa58a296f62caee411b16bffd00
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/training/test_glu_checkpoint_loading_numerics.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 2f9e5b2e19bce5cfd182372582f8e88f1df3775c02dc4ba6afe24ba2719467dc
 ---
 
 # Megatron checkpoint：分片、异步完成、数值状态与恢复
@@ -62,6 +74,16 @@ Core load的strict和validate-access-integrity控制missing/unexpected keys及sh
 
 当前RNG包含Python、NumPy、Torch/device与tensor-parallel tracker，按相应DP/CP等group与key namespace组织。consumed样本/数据游标、成功optimizer updates与iteration分开；乱用某一rank的RNG或保存半步snapshot会导致看似启动成功但loss偏移。
 
+## 当前映射与加载路径的限制
+
+混合 FP32 与 FP16/BF16 参数组的 optimizer 索引现按实际 main-parameter 顺序排列，而非按梯度 buffer 的遇到顺序。DP-reshardable 保存保留 bucket 内 padding、排除仅供 DP 均分的尾 padding。旧 #7336 修复之前生成的错误映射 checkpoint 不会被新 loader 自动修好，需独立检查 moment/master 的参数归属与下一次更新，shape 相同仍可能错配。
+
+`stream_ckpt_dequant` 是推理权重加载路径：逐目标张量使用高精度 scratch 后原地量化，避免同时保留全部高精度副本；不接受带 optimizer 的续训，也拒绝依赖尚未恢复 scale/history 的 DelayedScaling。它不是通用训练恢复省内存开关。对应测试比较量化 codes，并明确 scale padding 的不可复现部分，不能改写为任意量化元数据逐位相同。
+
+GLU FC1 模型权重按连续 gate/up 行保存，optimizer 仍保持运行布局。仅加载模型时可转换部分布局；恢复 optimizer 时先校验 interleave 与 TP 布局，拒绝不兼容组合，不能只转模型再声称完整状态已转换。
+
+保存前对 TrainState 作独立快照；local checkpoint 可内嵌 train_state_metadata，全局/legacy 路径可有 sidecar。加载优先相应 TrainState/latest state，缺失时才走旧字段；核对实际采用的 iteration/consumed samples 来源。`on_saved` 在同步 barrier 后或其异步 checkpoint 请求 finalize 后触发，保证 checkpoint durable。含 logits flush 时，原有部分成功回调先被转移到 logits 请求，但随后追加的 `on_saved` 仍留在 checkpoint 请求上，不能据它推断 logits 也已完成；消费者须检查自己依赖的完成链。旧保存点清理只允许 `0 < previous < current` 且不在保留间隔，恢复到早步不能因此删除目录中较新的保存点。
+
 ## 数值重跑与 checkpoint
 
 rerun-state-machine和training的checkpoint/exit决策要与model/data/RNG同一次迭代一致；相关unit tests验证状态checkpoint。rerun不是“把程序再跑一次”，需恢复同batch与numerical上下文；控制端超时后先核对原save/load是否还在运行，避免重复写同目录。
@@ -82,11 +104,11 @@ training/Core任一save/load、optimizer state schema或consumer数据loader变�
 
 ## 固定源码与维护边界
 
-- [megatron/core/dist_checkpointing/serialization.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/dist_checkpointing/serialization.py)
-- [megatron/training/checkpointing.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/checkpointing.py)
-- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/training.py)
-- [megatron/core/rerun_state_machine.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/rerun_state_machine.py)
-- [tests/unit_tests/test_checkpointing.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/tests/unit_tests/test_checkpointing.py)
-- [tests/unit_tests/dist_checkpointing/test_rerun_state_machine_ckpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/tests/unit_tests/dist_checkpointing/test_rerun_state_machine_ckpt.py)
+- [megatron/core/dist_checkpointing/serialization.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/dist_checkpointing/serialization.py)
+- [megatron/training/checkpointing.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/checkpointing.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/training.py)
+- [megatron/core/rerun_state_machine.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/rerun_state_machine.py)
+- [tests/unit_tests/test_checkpointing.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/test_checkpointing.py)
+- [tests/unit_tests/dist_checkpointing/test_rerun_state_machine_ckpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/dist_checkpointing/test_rerun_state_machine_ckpt.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

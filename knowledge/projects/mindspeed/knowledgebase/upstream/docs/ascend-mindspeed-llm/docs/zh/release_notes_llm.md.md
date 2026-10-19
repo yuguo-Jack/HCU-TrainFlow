@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: 5a8ea03b12066067f39b1771782d12db236267ef
 path: docs/zh/release_notes_llm.md
-raw_sha256: 4c52d907a10085aa482acbe1eed414a39fd07bbe026528ca1e763b01577defeb
+raw_sha256: 5fddf4cbf60b33ae874660f21b2de7c877cf21abe47ec17dbe6f22c665223fee
 sources: []
-generated_body_sha256: 89230fc02c1f3336d803e35150206441645c1e393c1fbfae94c3d11ef5fdc959
+generated_body_sha256: 65b730eb1c87d1e4bbfff5dc8b59ec4cf4e6c8cb9f84798ad83a1f222bfe9afc
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/release_notes_llm.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/release_notes_llm.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/zh/release_notes_llm.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -30,7 +30,7 @@ Upstream source document; original commands, claims and links require their stat
 
 ## 关键特性
 
-MindSpeed LLM 是面向昇腾的大语言模型分布式训练套件，支持Qwen3/DeepSeek/Mamba2等100+主流LLM及Dense/MoE/SSM架构，提供开箱即用的昇腾高性能训练脚本；支持分布式预训练、数据预处理方案和TP/PP/DP/CP/EP多维并行；支持全参/LoRA分布式指令微调；同时支持权重转换与在线推理评估。
+MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/数据合一功能覆盖全量模型，显著提升模型训练能力。
 
 ## 版本配套说明
 
@@ -75,9 +75,10 @@ MindSpeed LLM 是面向昇腾的大语言模型分布式训练套件，支持Qwe
 
 | MindSpeed LLM版本 | MindSpeed Core代码分支名称 | Megatron-LM版本 | PyTorch版本  | TorchNPU版本 | CANN版本 | Triton-Ascend版本 | FSDPTurbo版本 | Python版本 |
 | ---------------- | ------------------------- | ------------ | -----------  | ------------ | ------- | ----------------- | ------------ | ---------- |
-| master（在研版本）| master（在研版本）        | core_v0.12.1  | 2.10.0       | 在研版本      | 在研版本 | 在研版本          | 在研版本      | Python3.12 |
-| 26.2.0           | 26.2.0_core_r0.12.1      | core_v0.12.1  | 2.10.0       | 26.2.0       | 9.2.0   | 3.2.2             | 0.1.0        | Python3.12 |
-| 26.1.0           | 26.1.0_core_r0.12.1      | core_v0.12.1  | 2.7.1        | 26.1.0       | 9.1.0   | 3.2.2             | /            | Python3.10 |
+| master（在研版本）| master（在研版本）    | core_v0.12.1  | 2.10.0      | 在研版本      | 在研版本 | 在研版本   | 在研版本     | Python3.12 |
+| 26.2.0           | 26.2.0_core_r0.12.1  | core_v0.12.1  | 2.10.0      | 26.2.0       | 9.2.0   | 3.2.2     | 26.2.0       | Python3.12 |
+| 26.1.0           | 26.1.0_core_r0.12.1  | core_v0.12.1  | 2.7.1       | 26.1.0       | 9.1.0   | 3.2.2     | /            | Python3.10 |
+| 26.0.0           | 26.0.0_core_r0.12.1  | core_v0.12.1  | 2.7.1       | 26.0.0       | 9.0.0   | 3.2.1     |   /          | Python3.10 |
 
 >[!NOTE]
 >
@@ -100,29 +101,41 @@ MindSpeed LLM 是面向昇腾的大语言模型分布式训练套件，支持Qwe
     <col style="width: 150px">
     <col style="width: 150px">
     <col style="width: 150px">
+    <col style="width: 150px">
   </colgroup>
   <thead>
     <tr>
-      <th rowspan="2">MindSpeed LLM</th>
-      <th colspan="4">TorchNPU版本</th>
+      <th rowspan="3">MindSpeed LLM</th>
+      <th colspan="5">TorchNPU版本</th>
     </tr>
     <tr>
+      <th>7.2.0</th>
       <th>7.3.0</th>
       <th>26.0.0</th>
-      <th>26.1.0</th>
-      <th>26.2.0</th>
+      <th>26.1.X</th>
+      <th>26.2.X</th>
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>26.0.0</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+    </tr>
     <tr>
       <td>26.1.0</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
-      <td>/</td>
+      <td>Y</td>
+      <td>Y</td>
     </tr>
     <tr>
       <td>26.2.0</td>
+      <td>Y</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -140,13 +153,15 @@ MindSpeed LLM 是面向昇腾的大语言模型分布式训练套件，支持Qwe
     <col style="width: 150px">
     <col style="width: 150px">
     <col style="width: 150px">
+    <col style="width: 150px">
   </colgroup>
   <thead>
     <tr>
-      <th rowspan="2">MindSpeed LLM</th>
-      <th colspan="4">CANN版本</th>
+      <th rowspan="3">MindSpeed LLM</th>
+      <th colspan="5">CANN版本</th>
     </tr>
     <tr>
+      <th>8.3.RCX</th>
       <th>8.5.X</th>
       <th>9.0.X</th>
       <th>9.1.X</th>
@@ -155,14 +170,24 @@ MindSpeed LLM 是面向昇腾的大语言模型分布式训练套件，支持Qwe
   </thead>
   <tbody>
     <tr>
+      <td>26.0.0</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+      <td>Y</td>
+    </tr>
+    <tr>
       <td>26.1.0</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
-      <td>/</td>
+      <td>Y</td>
+      <td>Y</td>
     </tr>
     <tr>
       <td>26.2.0</td>
+      <td>Y</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -187,7 +212,7 @@ MindSpeed LLM 是面向昇腾的大语言模型分布式训练套件，支持Qwe
 |--|--|--|
 |MindSpeed LLM|模型下架|模型下架清单：<br>LLaMA2-13B<br>Qwen2.5-72B<br>Qwen3-0.6B/1.7B/4B/14B/32B<br>Gemma2-9B/27B<br>Phi3.5-mini‑instruct<br>Magistral-24B<br>PLM-1.8B<br>Qwen3‑Next<br>Qwen3‑Coder‑Next<br>DeepSeek‑V2‑Lite<br>Ling‑mini‑2.0<br>Ring-1T<br>Phi3.5<br>GLM4.5‑Air<br>Step3.5‑Flash<br>GPT‑OSS<br>MiniMax‑M2.7<br>Mamba3|
 |MindSpeed LLM|特性下架|下架DPO特性以及相关脚本|
-|MindSpeed LLM|架构下架|下架mindspore架构相关脚本、代码、文档|
+|MindSpeed LLM|架构下架|下架MindSpore架构相关脚本、代码、文档|
 
 ### 接口变更说明
 
@@ -232,10 +257,16 @@ MindSpeed LLM 是面向昇腾的大语言模型分布式训练套件，支持Qwe
 
 |防病毒软件名称|防病毒软件版本|病毒库版本|扫描时间|扫描结果|
 |---|---|---|---|---|
-|QiAnXin|8.0.5.5260|2026-07-05 08:00:00.0|2026-07-06|无病毒，无恶意|
-|Kaspersky|12.0.0.6672|2026-07-06 10:03:00|2026-07-06|无病毒，无恶意|
-|Bitdefender|7.5.1.200224|7.101158|2026-07-06|无病毒，无恶意|
+|QiAnXin|8.0.5.5260|2026-09-27 08:00:00.0|2026-09-28|无病毒，无恶意|
+|Kaspersky|12.0.0.6672|2026-09-28 10:09:00|2026-09-28|无病毒，无恶意|
+|Bitdefender|7.5.1.200224|7.101487|2026-09-28|无病毒，无恶意|
 
 ## 漏洞修补列表
 
 无
+
+## 修订记录
+ 
+| 文档版本 | 发布日期 | 修改说明 |
+| --- | --- | --- |
+| 01 | 2026-10-15 | 第一次正式发布。 |

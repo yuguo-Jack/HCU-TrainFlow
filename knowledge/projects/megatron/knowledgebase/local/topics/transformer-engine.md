@@ -10,26 +10,30 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/extensions/transformer_engine.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 6ee4807baa38389691e5ecf19472ee933f2ac5b6fe51b3e3cf26539388b77bf4
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 402dd8cf540b17fac15f0f77fba603acaa5fb4f6d9493536ff6550719f0bda47
 - source: nvidia-megatron-lm
   path: megatron/core/models/gpt/gpt_layer_specs.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 9e153c7f3d3a671f1bd9b84023bfe0f14711fe942c4c0df3dc1dec288100c4af
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
 - source: nvidia-megatron-lm
   path: tests/unit_tests/transformer/test_multi_latent_attention.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 3df4c807086cc0e770c7fb3c07225f5cb9580756de9708d8509fffbfccd34b69
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 062766158e7bf127e0d2971c0caae021e4b0651fd58ee3ebba90fb2a535195ab
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_latent_attention.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 0cb02e328f77eeabb0131fb12b2eef13d565eeb8d2f795b5a6f16359cba24503
 ---
 
 # Megatron Core→Transformer Engine：配置、融合、低精度与HCU接口
@@ -58,6 +62,14 @@ first-microbatch跟踪控制权重cache复用；optimizer更新后cache失效/�
 
 [MLA residual案例](../cases/mla-residual-norm.md)说明pre-MLP norm缺`has_residual=True`会使配置已开但融合backward没有进入。验证既看module的returns-residual属性，也比较outputs/input-grads/param-grads和真实trace；源码属性正确不代替kernel执行证据。
 
+## 当前 adapter 的新增消费条件
+
+虚拟专家给 TEGroupedLinear 增加 runtime slot，但 checkpoint/初始化仍只拥有真实专家，且禁用 first-microbatch 权重量化缓存复用。不要按运行 GEMM 数量推断模型参数数或保存布局。
+
+MTP 与主头共享权重时设置 `zero_tensor_dummy_wgrad`，由支持该属性的 TE 返回可免费相加的 ZeroTensor dummy；真正的 wgrad 仍已累积到 main_grad。旧 TE 可能忽略属性，不能把 dummy 当真实梯度或宣称所有版本均消除了额外 add。
+
+MLA 新增 KV RoPE+MXFP8 量化融合，与已有 residual norm 修复是不同机制。当前路径要求 MXFP8 DPA、零 dropout 和支持的 CUDA 架构/布局；TP/CP>1、THD、FP16、相关重算、eval 或禁用对应 FP8 backward 时走未融合路径。检查配置前置报错、运行 fallback 和实际 kernel 三层，不将 fallback 单测算为融合路径通过。
+
 ## HCU复用与交付
 
 已有HCU TE能力优先复用；通用training fusion/AI编译/cuDNN等需求查Flash-Train已实现功能，PrimusTurbo与消费者接入亦按真实版本参考。缺口按接口owner集中补实现，训练引擎保留调用/配置与测试，底层库接收其负责kernel/ABI/数值改动。
@@ -72,9 +84,9 @@ first-microbatch跟踪控制权重cache复用；optimizer更新后cache失效/�
 
 ## 固定源码与维护边界
 
-- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/extensions/transformer_engine.py)
-- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/models/gpt/gpt_layer_specs.py)
-- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/transformer_config.py)
-- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/tests/unit_tests/transformer/test_multi_latent_attention.py)
+- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/extensions/transformer_engine.py)
+- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/models/gpt/gpt_layer_specs.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/transformer_config.py)
+- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/transformer/test_multi_latent_attention.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

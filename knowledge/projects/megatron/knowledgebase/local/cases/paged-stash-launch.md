@@ -12,17 +12,17 @@ pr_sources:
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/ops/paged_stash.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: dba859b82cd90179fc8e45bf3c55ecef10a7432a6d968df4b30c66768efd6de4
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/paged_stash.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 950b8c72253b90e8b6936a5aa8532120bd8e056f6cc88807efa4c818d88d4efc
 - source: nvidia-megatron-lm
   path: tests/unit_tests/transformer/moe/test_paged_stashing.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 7928d461548b0d33cc0d488d5f164d73bd1aa301a9f73069e4f289fba9e6de8d
-reviewed_on: '2026-10-12'
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 801096dfc6193ba133b5b6728d56e1398d6ea0c4bf61033e766426f3e5a663b4
+reviewed_on: '2026-10-20'
 ---
 
 # Paged Stash copy/pop：launch 粒度、带宽与 PR 描述漂移
@@ -63,10 +63,12 @@ HCU 实验建议按实际 token×hidden、dtype、page size 采样，分别测 c
 
 ## 当前主干复核：案例仍有实现依据
 
-2026-10-12 固定主干仍保留 copy/pop 参数传递与设备选择，`paged_stash_reset` 对 capability `(10,7)` 选 4096/8192，其他设备选默认 1024/2048；disabled 路径在设备查询前返回。对应单测覆盖设备选择、关闭时不查询和两套 launch 的 bit-exact round trip。因此本案例继续适用于解释当前官方实现，PR 原始 head/review 仍作为历史改因证据保留。
+2026-10-20 固定主干仍保留 copy/pop 参数传递与设备选择，`paged_stash_reset` 对 capability `(10,7)` 选 4096/8192，其他设备选默认 1024/2048；disabled 路径在设备查询前返回。对应单测覆盖设备选择、关闭时不查询和两套 launch 的 bit-exact round trip。因此本案例继续适用于解释当前官方实现，PR 原始 head/review 仍作为历史改因证据保留。
+
+当前虚拟专家负载均衡与 Paged Stash 的组合另被 TransformerConfig 拒绝；本案例的 copy/pop 优化不能解除该限制。
 
 该判断是 NVIDIA capability 规则，不能映射成 HCU gfx 支持/最优 launch 的结论。当前 docs 与配置对 stash backend 的描述还存在范围差异，读 [MoE](../topics/moe.md)/[显存](../topics/memory.md) 的当前配置约束后，再沿实际 HCU fork 的 kernel/stream/stash 生命周期验证；本轮没有执行这组 GPU 测试。
 
-- [megatron/core/transformer/moe/ops/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/ops/paged_stash.py)
-- [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/paged_stash.py)
-- [tests/unit_tests/transformer/moe/test_paged_stashing.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/tests/unit_tests/transformer/moe/test_paged_stashing.py)
+- [megatron/core/transformer/moe/ops/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/ops/paged_stash.py)
+- [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/paged_stash.py)
+- [tests/unit_tests/transformer/moe/test_paged_stashing.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/transformer/moe/test_paged_stashing.py)

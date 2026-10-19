@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
 path: docs/developer/forward-compatibility.mdx
-raw_sha256: 1884cef0023229a512092a5a0009756f6ee93ff8f0b6f63ea7214d46c3084dc3
+raw_sha256: 064e99d60623449bc7ba2a3ef728f574bd282e0db84304068669ed10e98f67d0
 sources: []
-generated_body_sha256: 49b112b07de59f98e078adf2ad32488918baa93be94a823cb8c9af0cb84afec4
+generated_body_sha256: b01efdea90114550ec8d9db00ffe2f49c24cc33c7113b9df9326ff8ddfe21141
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / docs/developer/forward-compatibility.mdx
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/docs/developer/forward-compatibility.mdx)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/developer/forward-compatibility.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -104,6 +104,8 @@ The operation graphs which are not listed above are not yet made forward-compati
 For operation graphs that are not yet forward compatible, the library returns a [status](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html#cudnnstatus-t) of `CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH`.
 
 There are some known issues in forward-compatibility mode for the following cases within the generic runtime fusion engines:
+
+In this list, g<sub>1</sub> is the prologue pointwise subgraph before the primary operation, and g<sub>2</sub> is the epilogue pointwise subgraph after the primary operation, as defined in [Generic Runtime Fusion Engines](/developer/graph-api#generic-runtime-fusion-engines).
 
 - Some convolution fusions involving the following patterns:
 

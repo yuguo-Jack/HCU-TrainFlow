@@ -120,12 +120,44 @@ def test_cli_external_reference_filter_and_search(tmp_path):
     root=project(tmp_path)
     (root/'knowledge/route.md').write_text(official.markdown({
         'id':'hcu-tool-route','kind':'external-reference','hcu_project':'cluster-manager',
-        'search_skill':'hcu-knowledge-search'}, '# hcu-envcheck run_nhc 联查 HCU-Knowledge'))
+        'search_skill':'hcu-knowledge-search'}, '# hcu-envcheck run_nhc 联查 HCU-Knowledge'), encoding='utf-8')
     args=parser().parse_args(['--workspace',str(tmp_path/'cache'),'wiki-search','run_nhc',
                              '--project',str(root),'--kind','external-reference','--online-pr','off'])
     result=execute(args)
     assert result['results'][0]['id']=='hcu-tool-route'
     assert result['results'][0]['metadata']['hcu_project']=='cluster-manager'
+
+
+def test_review_scans_keep_live_author_pages_without_parsing_generated_sources(tmp_path, monkeypatch):
+    root=project(tmp_path)
+    upstream=layout.upstream_root(root,source='engine')/'docs/raw.md'
+    upstream.parent.mkdir(parents=True)
+    upstream.write_text(official.markdown({'kind':'source-document','sources':[]},'# Original'),encoding='utf-8')
+    authored=root/'knowledge/projects/engine/knowledgebase/local/topics/state.md'
+    authored.parent.mkdir(parents=True)
+    meta={'id':'state','sources':[{'source':'engine'}]}
+    authored.write_text(official.markdown(meta,'# Initial state'),encoding='utf-8')
+    parse=wiki.parse_page
+    def authored_only(path):
+        assert not Path(path).is_relative_to(upstream.parents[1])
+        return parse(path)
+    monkeypatch.setattr(wiki,'parse_page',authored_only)
+    first=official.pr_page_hashes(root,'pr-org--engine-1','org/engine')
+    assert first==wiki.source_page_hashes(root,'engine')
+    assert set(first)=={authored.relative_to(root).as_posix()}
+    # A later batch must see both changed prose and a newly added experience.
+    authored.write_text(official.markdown(meta,'# Updated state'),encoding='utf-8')
+    experience=root/'knowledge/sites/shared.md'
+    experience.parent.mkdir()
+    experience.write_text(official.markdown(meta,'# Reusable site condition'),encoding='utf-8')
+    current=official.pr_page_hashes(root,'pr-org--engine-1','org/engine')
+    assert current==wiki.source_page_hashes(root,'engine')
+    assert current[authored.relative_to(root).as_posix()]!=first[authored.relative_to(root).as_posix()]
+    assert experience.relative_to(root).as_posix() in current
+    # Citation removal is still covered by the prior affected-page inventory.
+    authored.write_text(official.markdown({'id':'state','sources':[]},'# Citation removed'),encoding='utf-8')
+    assert authored.relative_to(root).as_posix() in official.pr_page_hashes(
+        root,'pr-org--engine-1','org/engine',previous=current)
 
 
 def test_relative_cli_project_can_retain_and_regenerate_catalog(tmp_path,monkeypatch):

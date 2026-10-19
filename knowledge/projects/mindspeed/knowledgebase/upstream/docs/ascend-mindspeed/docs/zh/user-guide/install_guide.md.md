@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed
-commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
 path: docs/zh/user-guide/install_guide.md
-raw_sha256: 4f217c3c6977038c30a8882ccdc765349828cc278e67f5366bba4122ec2aca85
+raw_sha256: 99138c168be2f1095e304e680f321fbc7ba61cbe9eb60cb09fb8a25e47691707
 sources: []
-generated_body_sha256: c68754c88c1b1878da78ea2c2371585b8cc86b4dbdefdcbd5d80603ee3a12f99
+generated_body_sha256: 9e33811c7ad297a19fd6371e2d252b353a56b8f6dd22b4f1efe027d2e48b2129
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed / docs/zh/user-guide/install_guide.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/user-guide/install_guide.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/zh/user-guide/install_guide.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -70,8 +70,8 @@ Upstream source document; original commands, claims and links require their stat
 
 > [!NOTE]
 >
-> - 使用镜像前，请先确认机器型号。最新镜像支持aarch64及X86_64架构，可通过uname -a命令确认当前环境是否符合要求。
-> - 配套镜像已预装配套的CANN 9.1.0软件及TorchNPU 26.1.0插件，可根据需要选用。
+> - 使用镜像前，请先确认机器型号。最新镜像支持aarch64及X86_64架构，可通过`uname -a`命令确认当前环境是否符合要求。
+> - 配套镜像已预装配套的CANN 9.2.0软件及TorchNPU 26.2.0插件，可根据需要选用。
 > - 若当前环境与提供的镜像不兼容，请选择[方式二：源码安装](#方式二源码安装)。
 > - master分支后续会更新新的镜像，如果需要自定义构建镜像请参见[镜像概述](../../../docker/OVERVIEW.zh.md)。
 

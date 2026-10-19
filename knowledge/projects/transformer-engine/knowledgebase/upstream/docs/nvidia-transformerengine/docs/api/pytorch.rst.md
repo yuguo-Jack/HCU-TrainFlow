@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/TransformerEngine
-commit: 39c30c577f5dd4f9fba921ee011b5cd797ae667e
+commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
 path: docs/api/pytorch.rst
-raw_sha256: c163c91a42f5dace8461639352eaeb4cbb26a24757d78c8c29bdd058e52785f3
+raw_sha256: 4759218bf6eba4aba0fbeb969394011342bca371eb274099640a3c77a2cc0d7e
 sources: []
-generated_body_sha256: 05802118bb87b25ce4a5087d047a276b93fad7efccd6c331dc86abab832392d4
+generated_body_sha256: 2a90871e61906c404df9d8b50ebdf6a18b4e92c073c718f30b15d84119d11a38
 source_state: current-scan
 ---
 
 # NVIDIA/TransformerEngine / docs/api/pytorch.rst
 
-[Original at fixed commit](https://github.com/NVIDIA/TransformerEngine/blob/39c30c577f5dd4f9fba921ee011b5cd797ae667e/docs/api/pytorch.rst)
+[Original at fixed commit](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/api/pytorch.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -60,6 +60,9 @@ PyTorch
   :members: forward
 
 .. autoapiclass:: transformer_engine.pytorch.GatedDeltaProductAttention(num_attention_heads, kv_channels, num_householder=1, **kwargs)
+  :members: forward
+
+.. autoapiclass:: transformer_engine.pytorch.KimiDeltaAttention(num_attention_heads, kv_channels, **kwargs)
   :members: forward
 
 .. autoapiclass:: transformer_engine.pytorch.MultiheadAttention(hidden_size, num_attention_heads, **kwargs)

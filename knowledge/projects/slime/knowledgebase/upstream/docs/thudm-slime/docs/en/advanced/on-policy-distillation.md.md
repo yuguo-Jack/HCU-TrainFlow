@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/advanced/on-policy-distillation.md
-raw_sha256: 8ac98a4259033289004d17013005df3100270da6788470152dca447720edb4e6
+raw_sha256: dd6f77af8b0fcc439fb9edab9bcc9d2cc29182f20b832c910762fd9f379ebd17
 sources: []
-generated_body_sha256: dc504a96b5d5791783babe199da1fd6284ced3ec12f4aadd1a2a4a5bb6a25763
+generated_body_sha256: 2784b4af04ff8d86351ad6c2c39cd109193613db095e3fda62ed93695e225469
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/on-policy-distillation.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/on-policy-distillation.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/on-policy-distillation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -134,7 +134,7 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
     --save /root/Qwen3-8B_torch_dist
 
 # 3. Run
-bash examples/on_policy_distillation/run-qwen3-8B-opd.sh
+bash examples/on_policy_distillation/run-qwen3-4B-opd.sh
 ```
 
 ### Megatron Teacher
@@ -142,7 +142,7 @@ bash examples/on_policy_distillation/run-qwen3-8B-opd.sh
 ```bash
 # 1. Convert both student and teacher models to Megatron format
 # 2. Run
-bash examples/on_policy_distillation/run-qwen3-8B-opd-megatron.sh
+bash examples/on_policy_distillation/run-qwen3-4B-opd-megatron.sh
 ```
 
 ## Preliminary Results

@@ -9,46 +9,82 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: Curated source chains and official evidence at a fixed main commit; not
-  all models, backends or HCU runtime validated.
+reviewed_on: '2026-10-20'
+coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
+  or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/rl/train.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 7a6ce29b3feccac7bd9b710b732266a7beab26079d04c8d8efc6701f0b88095e
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 63d83a8ee812a76d4d04abbff5d4a5821074a703145757ebf4904a2cdc551a78
 - source: pytorch-torchtitan
-  path: torchtitan/rl/trainer.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 77eea0ae2d0db6b99c65a68db1db7b1844e38be0367d421f776eba2da92f82de
+  path: torchtitan/rl/trainer/trainer.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 35f0171826f745ea5c82458b176831e2e5ced1969ac352d5f60092fc4ad0b65c
 - source: pytorch-torchtitan
-  path: torchtitan/rl/distributed/WEIGHT_SYNC.md
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: f04cf9beb18c900eab1c2aff5d079e1fe4fa4db03fda74286cf72ebd6ff3e669
+  path: torchtitan/rl/actors/monarch/README.md
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 5f4cdb46330683cb8bd2a65d764662712972fb8989afe35a9b9dfbe5e3270209
 - source: pytorch-torchtitan
   path: torchtitan/rl/BITWISE_PARITY.md
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: e2d8599828473b3abd1f7beb8db39606d27870602bbcc21279c072175dac0144
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 00e77fab6806fa0986f1f4b16ca3769ceee98f7959ea76680fd8ba81d064fce0
 - source: pytorch-torchtitan
   path: torchtitan_recipes/rl/model_configs.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 5ab4c39072e7b2b29addc5a7e5004520c8bfb886ce49e389a73a4810869653b4
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: d62f1526bb38cb195554426f9f19d7f688f7f0c84c52ec8e905159709e1499e8
 - source: pytorch-torchtitan
   path: torchtitan/rl/observability/metrics/README.md
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 11b5fd3963900a52094028d4b2e35ee4ce1761d4f45d19e902052d1e74e9e1d6
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: df9c8957b9048a9739c617c6d339fd21efd3eb3606e416415f5b3c3f777b0885
 - source: pytorch-torchtitan
-  path: torchtitan/rl/generator.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: 01fb62b560f65880b33d51135d2fe10a49d15a00cb153fc56f8ff9003b585155
+  path: torchtitan/rl/generator/generator.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: aecf95576c0710a68846850e63703b928fa41f5e426232a36069a0b3b424175e
 - source: pytorch-torchtitan
-  path: torchtitan/rl/controller.py
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: b6ee8ffe9b67f570bc45a6b74ae79822afa23c9740491ec311ccbb2dab270ea0
+  path: torchtitan/rl/controller/controller.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 4999b903e21b90140bff9e34fdb1900b5cd0206841f299983b4eb4d73700320b
 - source: pytorch-torchtitan
   path: torchtitan/rl/README.md
-  commit: b663c1673c00d97864bb32f18029ce5ec40442e2
-  sha256: d0cced32ef4222b2473689607eadcb749cbb4650e6da9da27df32353842908e6
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 62fde87475bed82db694353ac5892caaa9162c3ca854d7182353f6bcb486970b
+- source: pytorch-torchtitan
+  path: torchtitan/rl/actors/system.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 7733d646cda32114febac5a669f9beb12be8445c864d8b540bc908f240e1650a
+- source: pytorch-torchtitan
+  path: torchtitan/rl/actors/monarch/system.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 99f940aa2efdf924cf99838de83266d752fe2f9a3e39a75b34dac5e3e06c0345
+- source: pytorch-torchtitan
+  path: torchtitan/rl/actors/monarch/trainer.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: b4a8bb1ad4f405986e28fd3fb241263be51490a687cd8fafd54a45896373246f
+- source: pytorch-torchtitan
+  path: torchtitan/rl/actors/monarch/generator.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: d31019f3f348144f2f7e0542b49cdc2618f1d869f0822b708f5a85a3c75ed016
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/engine_loop.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 9c4679f1923f8d2f0a946b8576bccec5a810bf54e3996cc5c0af385341222a15
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/dispatcher.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 568ab88ca0d0846154661364c43e713eab388489679650fa5c80da90f73b442c
+- source: pytorch-torchtitan
+  path: torchtitan/config/transform/freeze_moe_routing.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 985eee889df806f156a8545a93baff4450c0fde0980786a6cdf7ecfcc4c1faa8
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_model_defaults.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: ca915722651a4aed4548ff74bf7f272b691c0753943bea56613d48b949798db3
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_engine_loop.py
+  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  sha256: 91c705347bd99eba806630029e387c4f369e5e8fed7e76a989af8014b9bfe43d
 pr_sources:
 - pr-pytorch--torchtitan-5107
 - pr-pytorch--torchtitan-5268
@@ -58,7 +94,7 @@ pr_sources:
 
 ## 组件分工
 
-TitanRL 由 Controller 协调 trainer、generator、rollouter、数据、环境/奖励和 work buffer；以 Monarch 组织进程与任务，使用 TorchStore 等路径同步权重，生成侧可由 vLLM 对接 TorchTitan 模型。训练侧复用 `TrainingEngine`，并非把监督 Trainer 的一轮循环直接改个 loss。
+TitanRL 由 Controller 协调 trainer、generator、rollouter、数据、环境/奖励和 work buffer；经 ActorSystem 组织进程与任务，默认实现为Monarch，使用TorchStore传输model state dict，生成侧由可配置engine（当前默认vLLM）对接TorchTitan模型。训练侧复用 `TrainingEngine`，并非把监督 Trainer 的一轮循环直接改个 loss。
 
 trainer 与 generator 各自有并行配置、资源和模型 Config；`build_rl_model_configs` 一类构造器分别建立布局。可以布局不同，但模型语义、参数映射和权重版本必须一致。RL 安装/启动由其独立入口和脚本负责，不能用普通 `run_train.sh` 的默认预训练配置假定已经启动全部组件。
 
@@ -104,33 +140,47 @@ optimizer N 完成
 
 移植时复用 HCU 已有 RL/推理引擎能力，必要时读底层库对应分支；不要因为官方采用某个 NVIDIA kernel 就重写整个 RL 系统。
 
+## 当前角色配置、输入传输与数值默认
+
+`Controller.Config.actor_system` 默认构造MonarchActorSystem，负责provision、spawn和stop；领域服务不直接依赖Monarch，trainer handles按DP列组织，generator通过router访问。launcher自有hosts时传入预建actor system。默认实现的TorchStore storage与trainer mesh同置，并为每个trainer/generator rank初始化client；移植需同时满足handle调用约定、进程生命周期、DP列分发和传输所有权，不能仅替换class名字。
+
+`build_rl_model_configs` 当前默认给trainer和generator都设FP32-output LM head，并冻结router gate/expert bias、去掉aux load-balancing loss，保持对齐。它改变可训练参数/优化器状态与目标，不只改变计算速度；显式关闭任一默认时两侧一起复核。某些SoftCappedLinear配方不能应用同样head converter，测试保留例外。vLLM config转换还要保留YaRN scale、首个full-attention选择和sharding；相同模型名不足以保证logprob一致。
+
+RDMA microbatch是数据传输优化，和TorchStore模型快照不是同一路径。未开lazy preprocessing时，RDMA tensor仍会全部先读完再前后向，不能宣称已overlap。当前Controller拒绝RDMA+PP；RL Trainer另拒绝CP>1，因为per-token loss kwargs尚未相应切分。lazy preprocessing要求关闭CUDA graphs且无SDC replay；逐group Graph有不同的归约与metadata要求，见[编译通信](compile-fusion-and-communication.md)。RL optimizer-step边界由 `async_loop.num_prompts_per_train_step` 控制，普通 `training.num_tokens_per_train_step` 会被忽略并警告。
+
 ## 固定证据与使用边界
 
-本页以官方主线 `65aaaa960698ab5d6e98c874177b41b9c30e9c58` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/README.md)
-- [torchtitan/rl/train.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/train.py)
-- [torchtitan/rl/trainer.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/trainer.py)
-- [torchtitan/rl/generator.py](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/generator.py)
-- [torchtitan/rl/distributed/WEIGHT_SYNC.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/distributed/WEIGHT_SYNC.md)
-- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/BITWISE_PARITY.md)
-- [torchtitan_recipes/rl/model_configs.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan_recipes/rl/model_configs.py)
-- [torchtitan/rl/observability/metrics/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/observability/metrics/README.md)
+- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/README.md)
+- [torchtitan/rl/train.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/train.py)
+- [torchtitan/rl/trainer/trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/trainer/trainer.py)
+- [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/generator/generator.py)
+- [torchtitan/rl/actors/monarch/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/README.md)
+- [torchtitan/rl/BITWISE_PARITY.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/BITWISE_PARITY.md)
+- [torchtitan_recipes/rl/model_configs.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan_recipes/rl/model_configs.py)
+- [torchtitan/rl/observability/metrics/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/observability/metrics/README.md)
 
 - [PR #5107：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5107.md)
 - [PR #5268：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5268.md)
 - [PR #5280：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5280.md)
 
-## 当前主线补充：请求失败与模型版本等待
+## 当前请求失败与模型版本等待
 
-主线 `b663c1673c00d97864bb32f18029ce5ec40442e2` 的 [PR #5182](https://github.com/pytorch/torchtitan/pull/5182) 区分“单个请求在 admission 被拒绝”和“generator engine loop 崩溃”。`process_rejected_requests` 由每个 TP 组的 rank 0 传回请求错误，rank 0 的 `_rank0_fail_generations` 结束对应 reply 并释放路由占用；其他正常请求不应因此整体失败。
+PR #5182 引入的单请求失败边界在本固定代码中移到 `generator/engine_loop.py` 与 `generator/dispatcher.py`：engine admission的rejected请求回送相应错误，其他请求继续；loop异常则失败outstanding、排队load/generate与后续调用，并释放engine资源。`wait_engine_loop`让controller观察loop异常；旧 `_rank0_drain_results` 的私有回调/TODO不能继续作为当前源码入口。CPU `test_request_rejected_at_admission_fails_alone` 与 `test_crash_fails_outstanding_and_queued_calls_and_later_calls` 分别覆盖两种边界，仍不替代真实多rank故障测试。
 
-`wait_engine_loop` 暴露引擎循环异常，Controller 可及时观察，而不是一直把请求发往死亡 generator。仍需注意源码保留的限制：`_rank0_drain_results` 自身异常尚有 TODO，不应将新增等待接口解释为所有后台任务失败都已覆盖。
+`load_model_state_dict(version)` 排队等待引擎在step间应用；同一批load请求可合并到最高version，再统一完成reply。Controller等待push与所有generator pull完成后才释放下一批rollout group，早完成的generator仍可能等待慢者。session affinity释放、drain与模型版本等待属于不同依赖，不能把合理等待当死锁而任意重路由。
 
-[PR #5217](https://github.com/pytorch/torchtitan/pull/5217) / [#5218](https://github.com/pytorch/torchtitan/pull/5218) 涉及 rollout 结束后的 session affinity 释放和 drain 时等待原绑定 generator。排查权重同步停滞时区分请求等待、session pin、引擎崩溃和 collective；不要将合理版本等待当作死锁后任意重路由。
+当前启动输出参数为 `--output-dir`，资产和角色配置由recipe提供。升级要同时核对Controller、ActorSystem、Generator engine与配方；以上为固定源码和上游测试阅读，未进行新的RL现场恢复实验。
 
-当前启动输出参数为 `--output-dir`，不是旧示例的 `--dump-folder`；模型资产路径由 recipe 设置，不能假定所有 config 都能用任意 CLI 参数覆盖。升级后同时检查教程、train.py 参数解析与真实配方。以上是本次代码审查，未进行新的 RL 现场恢复实验。
+## 本次补充的实现与测试依据
 
-- [torchtitan/rl/generator.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/generator.py)
-- [torchtitan/rl/controller.py](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/controller.py)
-- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/rl/README.md)
+- [torchtitan/rl/actors/system.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/system.py)
+- [torchtitan/rl/actors/monarch/system.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/system.py)
+- [torchtitan/rl/actors/monarch/trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/trainer.py)
+- [torchtitan/rl/actors/monarch/generator.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/generator.py)
+- [torchtitan/rl/generator/engine_loop.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/generator/engine_loop.py)
+- [torchtitan/rl/generator/dispatcher.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/generator/dispatcher.py)
+- [torchtitan/config/transform/freeze_moe_routing.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/transform/freeze_moe_routing.py)
+- [tests/rl/unit_tests/cpu/test_model_defaults.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/rl/unit_tests/cpu/test_model_defaults.py)
+- [tests/rl/unit_tests/cpu/test_engine_loop.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/rl/unit_tests/cpu/test_engine_loop.py)

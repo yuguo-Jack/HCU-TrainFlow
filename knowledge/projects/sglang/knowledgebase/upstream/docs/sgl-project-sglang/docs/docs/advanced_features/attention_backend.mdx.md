@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
 path: docs/docs/advanced_features/attention_backend.mdx
-raw_sha256: e3800cefb47fe64af5f5b8b217bae86da4ceec5caf0b3e1aa5538f0145b89245
+raw_sha256: 2d58cc948ddcd4bf97393b4f1cce987fba7a74c02b976c9197d8298cc4ffde4d
 sources: []
-generated_body_sha256: c10e2096640e42b297136726e4f1db024d3559f188c6354bfd21dcc1b84071bd
+generated_body_sha256: 303d1a41469fb018f7f1ca920cb9dbca7b65576cea40d449753d68deb50db5f2
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/attention_backend.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/attention_backend.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/advanced_features/attention_backend.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -464,7 +464,7 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>flashmla_sparse_q8</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Native FP8 (q8×kv8) sparse prefill on Hopper (SM90); requires <code>--kv-cache-dtype fp8_e4m3</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Native FP8 (q8×kv8) sparse prefill on Hopper (SM90); BF16 or FP8 KV cache</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>triton_sparse_mla</strong></td>

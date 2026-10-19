@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 429c0ede80d9f7f795035146c9c8f49a09b52ee776ce22e74bd0bea02ca09803
+generated_body_sha256: c6146e56fb42797748316d929ba624bef402c8ef19923c118a04d563df24d2eb
 ---
 
 # loongforge
@@ -21,6 +21,7 @@ generated_body_sha256: 429c0ede80d9f7f795035146c9c8f49a09b52ee776ce22e74bd0bea02
 ### 机制专题
 
 - [LoongForge Torch-native：异步保存完成投票与 DCP 恢复](knowledgebase/local/topics/loongforge-async-checkpoint.md)
+- [LoongForge：变量长 ChunkPipe 的位置、缓存与梯度归一化](knowledgebase/local/topics/loongforge-chunkpipe-variable-length.md)
 - [LoongForge：变长/视觉 DP 代价模型与跨 rank 样本均衡](knowledgebase/local/topics/loongforge-dp-balance.md)
 - [LoongForge：跨微批 EP 重叠、延迟 wgrad 与细粒度卸载](knowledgebase/local/topics/loongforge-ep-offload.md)
 

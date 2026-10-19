@@ -1,0 +1,847 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "fd1a72593ded8db31f281282a5c0d696589bdc6ad2f5b61d7cb189c994d8a711",
+      "isPrivate": false,
+      "numbers": [
+        5292,
+        5291,
+        5290,
+        5289,
+        5286,
+        5285,
+        5284,
+        5283
+      ],
+      "observed_at": "2026-10-19T18:04:18.715522+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4913,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "4b68c5ea28f6c9818e24c30aa47a341c4cf3ddfd",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** Reads now overlap compute: each trainer rank reads its RDMA microbatches two ahead on a background thread, and the engine trains each one as it arrives. On H100 the loss is bitwise equal to the base at DP 1 and DP 2, and reads after a step's first microbatch wait ≤ 1.1 ms per step in total. Opt-in: it needs the RDMA fast path (`async_loop.batcher.rdma_min_tensor_bytes`) and the new `trainer.training.preprocess_microbatch_groups_lazily=True`.\n\n**Problem**\n1. **With the RDMA fast path on, each rank reads its whole column before compute.**\n2. **The reads are exposed:** est. ~0.15% of `forward_backward` at 38 B/token, ~2% at 614 B/token, up to ~25% for a fast trainer with a heavy payload and 16 TCP readers.\n3. **The whole column sits in host memory.**\n4. **The engine needs every microbatch before the first forward:** `TrainingEngine.forward_backward` preprocesses every group up front, so it would drain a prefetcher before training starts.\n\n**Solution**\n1. **`TrainingEngine`, opt-in:** with `training.preprocess_microbatch_groups_lazily=True` (default False), each group is preprocessed just before its forward (PP included), by the new `_preprocess_microbatch_group`.\n   - Rejected with CUDA graphs on (TODO: several smaller graphs), with SDC replay, and by `GraphTrainer`. The RL controller warns when `rdma_min_tensor_bytes` is set without it.\n   - Each model fills its own `aux_loss_denominators` (the aux-denominator PR below), so one group needs no engine patch.\n2. **`RDMAMicrobatchPrefetcher`:** `Trainer.forward_backward` passes it as `microbatch_groups` when it gets `MonarchRDMAMicrobatch`es (by value, the column as before).\n   - It reads this rank's column on a thread, two ahead, one `asyncio.run` per read, with the actor's context copied in (else Monarch starts a second client). The engine needs only `len()` and one pass.\n   - Ending the pass early (e.g. a failed step) cancels the queued reads. A `wait_for_microbatch` span records the read time training didn't hide; the total read time feeds `timing/trainer/read_microbatches/max`.\n3. **Unchanged by default:** pretraining, ROCm and by-value RL preprocess up front as on main. With RDMA on but lazy off, the engine drains the prefetcher first: correct, no overlap.\n\n```text\nengine, default:  preprocess 0, preprocess 1 | fwd/bwd 0 | fwd/bwd 1\nengine, lazy:     preprocess 0 | fwd/bwd 0 | preprocess 1 | fwd/bwd 1\n\ntrainer rank:  read thread  | read 0 | read 1, read 2 | read 3  | ...\n               main thread  | wait   | train 0        | train 1 | ...\n```\n\n**Results**\n\nGPU, Qwen3-0.6B, H100, batch invariant, lockstep, 10 steps, one TP 1 generator, 4,096-token microbatches (0.16 MB each), RDMA and lazy preprocessing on. From an earlier push, before the opt-in flag (not re-run on GPU). \"main + engine change\" is upstream main plus this PR's engine change, without the RDMA microbatch PR:\n```text\n                                          trainer DP 1 (2 GPUs)          trainer DP 2 (3 GPUs)\nloss/mean, vs main + engine change        bitwise equal at all 10 steps  bitwise equal at all 10 steps\nforward_backward, main + engine change    1.393 s                        0.909 s\nforward_backward, RDMA microbatch PR      1.414 s                        0.910 s\nforward_backward, this stack              1.399 s                        0.932 s\nwait_for_microbatch, first read           2.3-3.1 ms per step            2.8-5.1 ms per step\nwait_for_microbatch, later reads          0.4-1.1 ms per step in total   0.2-0.7 ms per step in total, per rank\n```\n- At this size there is little to hide, and the forward_backward rows differ by run-to-run noise (the RDMA microbatch PR row is a separate run). Prefetch pays with heavier per-token payloads (see NOTE).\n- At the batcher-process and scatter PRs' heads (which include this PR), trainer DP 2, 5 steps: `loss/mean` bitwise equal to main's DP 2 at every step, over TCP and over ibverbs.\n- CPU stress: 1,500 steps x 8 microbatches x 4 ranks of register, read and drop: every field matched, no hang.\n\nYou may ask:\n- **Does this change pretraining?** No, lazy preprocessing is off by default. With it on, the device holds one group's inputs instead of the step's (an RL step of 46 x 128K tokens: 229 MB -> 5 MB).\n- **Why not with SDC replay?** Replay reruns a checked step on the same inputs, so lazily it would preprocess (and count `ntokens_seen`) and read every microbatch again.\n- **Why a Python thread if Rust moves the bytes?** A Monarch `Future` does nothing until someone calls `get()` or awaits it, and the actor's loop thread is busy in forward/backward.\n- **Why two ahead?** A rank then holds at most 4 microbatches on the host (2 queued, 1 waited on, 1 training). Not tuned.\n\nNOTE:\n- **The lazy path costs ~4 ms per microbatch** (pageable inputs and varlen's host sync; +0.77% at 16K tokens, Qwen3-0.6B, H100), about what prefetch hides at 38 B/token. In a repro, pinned inputs plus `max_num_documents` removed it; pinned alone did not.\n- **Metrics:** with the fast path, `trainer/tokens_per_second` and MFU now include the reads: each step's first read with lazy preprocessing on, every read with it off. The weight push returns after `forward_backward`, as on main (the RDMA microbatch PR let it finish during the reads).\n- **Not tested:** multiple hosts; the RL GPU CI.\n\n**Test plan**\n- Repo root, Monarch 0.7, merged with main: `pytest tests/rl/unit_tests/cpu` 497 passed, 5 skipped; `pytest tests/unit_tests/cpu` 1,658 passed; the only failures fail on main too (offline: 3 tokenizer downloads, `test_download_hf_assets`; `test_quantization.py` needs `torchao`).\n- `test_trainer.py`: by value, the column goes to the engine as is; with `MonarchRDMAMicrobatch`es, the prefetcher reads it and the read time is reported.\n- Engine: lazy and up-front preprocessing (PP included), the flag reaching the body, and the config checks (CUDA graphs, SDC, GraphTrainer).\n- `test_rdma_microbatch.py`: the prefetcher yields in order and reads exactly two ahead (fails for a read-ahead of 0, 1 or 100); the read thread sees the caller's context; closing it cancels queued reads.\n",
+      "changedFiles": 12,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "@claude review the PR and my review",
+            "createdAt": "2026-10-14T05:23:00Z",
+            "databaseId": 6161537824,
+            "updatedAt": "2026-10-14T05:23:00Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#issuecomment-6161537824"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @tianyu-l's task in 2m 0s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/38516335485)\n\n---\n### Review of #5286 and @tianyu-l's review\n\n- [x] Gather context\n- [x] Read the diff (engine, `rdma_microbatch.py`, trainer, tests)\n- [x] Assess each review comment\n- [x] Do my own review pass\n- [x] Post the findings\n\nThe design holds up. `MicrobatchStream` is a small one-pass iterator, and the CUDA graph and SDC paths still drain it up front, so they stay correct. I agree with all five of @tianyu-l's comments. The opt-in config is the most important, because it stops this PR from changing behavior that has nothing to do with RL. I found no blocking bugs in what the PR does today; there are a few smaller issues at the end.\n\n---\n\n### On @tianyu-l's comments\n\n**1. `training_engine.py:498`: make lazy preprocessing an explicit config (strongly agree)**\n\nRight now lazy preprocessing turns on for **every** eager run without SDC: pretraining recipes with `disable_cuda_graphs=True`, ROCm (`not cuda_graphs_supported()`), Flux and DeepSeek-V3. The PR's own NOTE says this path costs about 4 ms per microbatch (pageable H2D plus varlen's host sync), and it was not measured on Flux, DSv3 or ROCm. Pretraining gets nothing from it, since its inputs come from a dataloader and are already pinned. That cuts against \"protect battle-tested code paths.\" Suggestions:\n- Add `training.preprocess_microbatch_groups_lazily: bool = False`. The docstring should say it exists so RL can overlap the controller -> trainer transfer with forward/backward. Turn it on in the RL recipes, which all set `disable_cuda_graphs=True` already.\n- In `__post_init__`, raise `ValueError` if it is set with `disable_cuda_graphs=False` or with `sdc_replayer`. ROCm with `disable_cuda_graphs=False` would then be rejected even though it runs eagerly. That's fine: the user sets the flag explicitly.\n- `GraphTrainingEngine` overrides both `_initialize_forward_backward` and `_forward_backward_body`, so it would silently ignore the new flag. It should reject the flag, or at least warn.\n- On the RL side, an RDMA run (`rdma_fast_path_threshold` set) with lazy preprocessing off still works, because the engine drains the stream up front. But nothing overlaps, so warn once, per the \"silently skips user configuration\" rule.\n- This also removes the `_preprocess_groups_lazily=False` lines added to about 8 `SimpleNamespace` engine fakes in the tests.\n\n**Why it can't work with SDC replay (your question):** `SDCReplayer.run_fwd_bwd` calls `execute` **twice** on a checked step (`sdc_replayer.py:376`, `_run_checked`). With lazy preprocessing, `execute` iterates over the raw `microbatch_groups`, so the replay would:\n- (a) re-run `_preprocess_microbatch_groups`, which **double-counts `ntokens_seen`** (`training_engine.py:613`). That value is checkpointed state.\n- (b) iterate `MicrobatchStream` a second time. `__iter__` builds a new pool and **reads every microbatch over RDMA again**, even though the class says it supports only one pass.\n- (c) for pretraining, it would also re-run H2D and mask building inside the region being checked.\n\nBanning the combination is right. It would help to say why in the `ValueError` message.\n\n**2. `training_engine.py:670`: add a dedicated `_preprocess_microbatch_group()` (agree)**\n\nThe pattern `self._preprocess_microbatch_groups([microbatch_group])` followed by `[prepared_inputs] = prepared_groups` is awkward. The plural method's loop body (lines 597-649) splits cleanly into a singular method that returns one prepared tuple. The plural one becomes `[self._preprocess_microbatch_group(g) for g in groups]`. The `ntokens_seen` accounting would live in the singular method. `GraphTrainingEngine._preprocess_microbatch_groups` overrides the plural method and never runs lazily, so it can stay as is.\n\n**3. `training_engine.py:569`: move the `aux_loss_denominators` fill into `Model.preprocess_inputs()` (agree)**\n\nBenefits:\n- It removes `_set_aux_loss_denominators`. That helper detects PP vs non-PP by checking whether the tuple has 3 or 4 elements.\n- It removes the `self._global_routing_token_counts` attribute, which exists only to pass state from one call to the next.\n- The PP path and `GraphTrainingEngine` get it for free.\n\nThe models already write `input_dict[\"aux_loss_denominators\"] = None` as a placeholder, so they would write the real tensor instead. To audit every callsite, the new keyword has to reach:\n- `models/base/model.py:52` (signature)\n- `common/decoder.py:331`\n- `qwen3_5/model.py:557`\n- `deepseek_v3/mtp.py:326` (per-depth tensor; it already checks `numel() == len(mtp_layers) + 1`)\n- `kimi_k3/model.py:544`\n- `kimi_k2_7/model.py:182`\n- the `**kwargs` overrides: flux, muse_glimmer, `transformers_modeling_backend`\n- `graph_trainer/precompile_main.py:267`, which fills the value by hand\n\nTwo caveats:\n- `preprocess_inputs` runs under `activate_spmd()`. The value must be set **after** `annotate_input_spmd_types`, so it stays a plain tensor as it is today.\n- `forward_backward` always receives `global_routing_token_counts`. The new keyword can therefore be required rather than defaulting to `None`.\n\nThis could be its own small PR before this one, since it touches every model.\n\n**4. `rdma_microbatch.py:113`: rename (agree, with one fix)**\n\nThe suggested name has a typo: `RMDAMicrobatchStream` should be `RDMA...`. I agree that \"stream\" is overloaded: CUDA streams appear all through `training_engine.py`. I'd use **`RDMAMicrobatchPrefetcher`**. It names the scope (RDMA) and what it does (reads ahead). Also update:\n- the test names (`test_microbatch_stream_*`)\n- the module docstring in `test_rdma_microbatch.py`\n- the imports in `rl/trainer.py` and `tests/rl/unit_tests/cpu/test_trainer.py`\n- the \"read through the stream\" comment in `test_trainer.py`\n\n**5. `rdma_microbatch.py:163`: make `_wait_for_microbatch` an inner function of `__iter__` (agree)**\n\nIt is used only there. `_read` could also be a closure, accumulating into a local and assigning `self.read_s` in the `finally`.\n\n---\n\n### My own findings\n\n1. **The `finally` cleanup only runs when the generator is closed** (`rdma_microbatch.py:148-151`). If forward/backward raises mid-step, the `enumerate(microbatch_groups)` iterator in `_forward_backward_body` stays alive as long as the traceback is referenced. Monarch's actor error handling may keep it, so the `shutdown(cancel_futures=True)` that cancels the queued reads can run late or never.\n   - Also, `shutdown()` defaults to `wait=True`, so if the controller is gone, the read already in flight still blocks for up to the 60 s RDMA timeout.\n   - The comment \"On an error, cancel queued reads\" reads as stronger than what happens. Either call `iterator.close()` explicitly from the engine loop, which is awkward in core, or reword the comment to describe the real behavior.\n   - The current test (`iterator.close()`) only covers the explicit-close case.\n2. **`read_s` accumulates across iterations.** If anything iterates twice (see the SDC point above), the reported `read_microbatches/max` doubles. Renaming the class to a prefetcher and documenting it as one-pass, or raising on a second `__iter__`, would make the contract explicit.\n3. **The cross-thread write to `read_s`** is safe today: `pool.shutdown()` in the `finally` joins the worker before `Trainer` reads the value. A comment saying the value is valid only after iteration ends would stop someone from reading it mid-step.\n4. **`_step_num_tokens_per_dp_rank` now counts tokens differently** (`rl/trainer.py:269`). It changed from `sum(labels.numel())` to `len(microbatches) * num_tokens_per_microbatch_per_dp_rank`. That matches `Batcher`'s fixed `rows x seq_len` padding (`batcher.py:204`), so the value is the same today. But the by-value path now trusts an invariant it used to compute directly. This is fine; just pointing it out.\n5. **The `_ForwardBackwardFn` type is now `list[Any]`.** After the config change, it might be clearer to type it as `Sequence[list[TrainingMicrobatch]] | list[tuple[Any, ...]]`, and to change `forward_backward`'s `microbatch_groups` annotation from `list[...]` to `Sequence`/`Sized & Iterable`. A `MicrobatchStream` is not a `list`.\n6. **Test timing:** `test_microbatch_stream_yields_in_order_and_reads_two_ahead` uses sleeps, but a read past the window is structurally impossible, so it can't fail spuriously. 👍\n\n### Summary\n- **Blocking:** the opt-in config (#1). It keeps pretraining and ROCm on the code path that has been validated.\n- **Cleanups:** #2, #4 and #5 are small refactors worth doing in this PR. #3 touches every model variant and might fit better as a separate PR before this one.\n- **Not done:** I didn't run any tests or GPU jobs. This is a read-only review.",
+            "createdAt": "2026-10-14T05:23:27Z",
+            "databaseId": 6161542980,
+            "updatedAt": "2026-10-14T05:25:42Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#issuecomment-6161542980"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "reply from claude: Thanks. Also done from this review:\n- `GraphTrainer` rejects the lazy flag.\n- The RL controller warns when RDMA is on but lazy preprocessing is off.\n- The `finally` comment says when the queued reads are cancelled (the read in flight still finishes).\n- `read_s` is documented as final once the pass ends.\n\nLeft as is:\n- Lazy stays off in the RL recipes: by value it costs ~4 ms per microbatch and hides nothing, so it pairs with the opt-in `rdma_min_tensor_bytes`.\n- `_global_routing_token_counts` stays for the lazy path: preprocessing then runs inside `_forward_backward_body`, whose signature the CUDA-graph wrappers share.\n- The new keyword (now in the PR below this one) defaults to `None`: the validator calls `preprocess_inputs` without routing counts.\n- `_read` stays a method: it adds to `read_s`.\n",
+            "createdAt": "2026-10-15T02:42:36Z",
+            "databaseId": 6183186666,
+            "updatedAt": "2026-10-15T02:42:36Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#issuecomment-6183186666"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXCL8Oo=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": {
+        "oid": "bed6eca29106f3ff1f7ab9b4917d2d4a027766e8"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-15T06:05:12Z",
+      "number": 5286,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "can it be an inner function in `MicrobatchStream.__iter__()`",
+                  "createdAt": "2026-10-14T04:54:48Z",
+                  "databaseId": 4266925478,
+                  "diffHunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:\n+    \"\"\"Yields this rank's microbatches in order, reading the next ones on a background thread.\n+\n+    Implements only what `TrainingEngine.forward_backward` uses: `len()` and one in-order pass.\n+\n+    Example:\n+        stream = MicrobatchStream([rdma_microbatch_0, ..., rdma_microbatch_3])\n+        len(stream)  # 4\n+        for [microbatch] in stream:\n+            train(microbatch)\n+\n+        read thread:  read 0 | read 1, read 2 | read 3  |\n+        main thread:  wait   | train 0        | train 1 | train 2 | train 3\n+    \"\"\"\n+\n+    def __init__(self, rdma_microbatches: list[RDMAMicrobatch]) -> None:\n+        self._rdma_microbatches = rdma_microbatches\n+        self.read_s = 0.0  # this rank's total read time, hidden behind training or not\n+\n+    def __len__(self) -> int:\n+        return len(self._rdma_microbatches)\n+\n+    def __iter__(self) -> Iterator[list[TrainingMicrobatch]]:\n+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=\"microbatch_read\")\n+        reads: deque[Future[TrainingMicrobatch]] = deque()\n+        try:\n+            for rdma_microbatch in self._rdma_microbatches:\n+                # Copy the actor's context: in a bare thread Monarch would start a second client.\n+                # Create the coroutine there too, so a cancelled read doesn't leave one unawaited.\n+                reads.append(\n+                    pool.submit(\n+                        contextvars.copy_context().run, self._read, rdma_microbatch\n+                    )\n+                )\n+                if len(reads) > _NUM_MICROBATCHES_READ_AHEAD:\n+                    yield [_wait_for_microbatch(reads.popleft())]\n+            while reads:\n+                yield [_wait_for_microbatch(reads.popleft())]\n+        finally:\n+            # On an error, cancel queued reads: with the controller gone, each would wait out\n+            # the 60 s RDMA timeout.\n+            pool.shutdown(cancel_futures=True)\n+\n+    def _read(self, rdma_microbatch: RDMAMicrobatch) -> TrainingMicrobatch:\n+        start = time.perf_counter()\n+        microbatch = asyncio.run(rdma_microbatch.read())\n+        self.read_s += time.perf_counter() - start\n+        return microbatch\n+\n+\n+def _wait_for_microbatch(read: Future[TrainingMicrobatch]) -> TrainingMicrobatch:",
+                  "line": null,
+                  "originalLine": 163,
+                  "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+                  "updatedAt": "2026-10-14T05:22:43Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4266925478"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "```suggestion\nclass RMDAMicrobatchStream:\n```\nas a more accurate scope\n\nalso \"stream\" is a bit overloaded in distributed -- can we rename to something more accurate, e.g. `Prefetcher`. I'll ask agent for help.",
+                  "createdAt": "2026-10-14T04:56:50Z",
+                  "databaseId": 4266936732,
+                  "diffHunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:",
+                  "line": null,
+                  "originalLine": 113,
+                  "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+                  "updatedAt": "2026-10-14T05:22:43Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4266936732"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "instead, could you help move `model_kwargs[\"aux_loss_denominators\"] = global_routing_token_counts` logic into `Model.preprocess_inputs()`?",
+                  "createdAt": "2026-10-14T05:07:32Z",
+                  "databaseId": 4266994986,
+                  "diffHunk": "@@ -550,34 +559,28 @@ def forward_backward(\n         self.optim.zero_grad(\n             set_to_none=not self._cuda_graph_per_accumulation_group_enabled\n         )\n-        preprocessed_microbatch_groups = self._preprocess_microbatch_groups(\n-            microbatch_groups\n-        )\n         global_loss_token_counts = torch.as_tensor(\n             global_loss_token_counts, device=self.device\n         )\n-        global_routing_token_counts = global_routing_token_counts.to(self.device)\n-        for prepared_group in preprocessed_microbatch_groups:\n-            model_kwargs_collection = (\n-                prepared_group[1] if len(prepared_group) == 3 else (prepared_group[2],)\n-            )\n-            for model_kwargs in model_kwargs_collection:\n-                if \"aux_loss_denominators\" in model_kwargs:\n-                    model_kwargs[\"aux_loss_denominators\"] = global_routing_token_counts\n+        self._global_routing_token_counts = global_routing_token_counts.to(self.device)\n+        step_inputs: list[Any] = microbatch_groups\n+        if not self._preprocess_groups_lazily:\n+            step_inputs = self._preprocess_microbatch_groups(microbatch_groups)\n+            _set_aux_loss_denominators(step_inputs, self._global_routing_token_counts)",
+                  "line": null,
+                  "originalLine": 569,
+                  "path": "torchtitan/training_engine.py",
+                  "updatedAt": "2026-10-14T05:22:43Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4266994986"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "instead of piggyback on existing `_preprocess_microbatch_groups()` by making a singleton list, could we create a dedicated `_preprocess_microbatch_group()` which can be used by both `_preprocess_groups_lazily` case and `_preprocess_microbatch_groups()`.",
+                  "createdAt": "2026-10-14T05:11:13Z",
+                  "databaseId": 4267014984,
+                  "diffHunk": "@@ -658,8 +661,17 @@ def _forward_backward_body(\n         accumulated_loss: torch.Tensor | None = None\n         loss_metrics: list[dict[str, torch.Tensor]] = []\n         num_accumulation_steps = len(microbatch_groups)\n-        for accumulation_index, prepared_inputs in enumerate(microbatch_groups):\n+        for accumulation_index, microbatch_group in enumerate(microbatch_groups):\n             is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1\n+            prepared_inputs = microbatch_group\n+            if self._preprocess_groups_lazily:\n+                # TODO: this waits ~4 ms per microbatch on pageable inputs and varlen's host sync\n+                # (+0.77% at 16K tokens, Qwen3-0.6B, H100). Pinned inputs + max_num_documents fix it.\n+                prepared_groups = self._preprocess_microbatch_groups([microbatch_group])",
+                  "line": null,
+                  "originalLine": 670,
+                  "path": "torchtitan/training_engine.py",
+                  "updatedAt": "2026-10-14T05:22:43Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4267014984"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "This doesn't seem to be robust. For pretraining Trainer, it'd never need to use this flag.\r\n\r\nI'd suggest\r\n- we make it a config `preprocess_microbatch_groups_lazily` default to `False` and note that it is needed in RL to overlap controller -> trainer data transfer and trainer fwd-bwd.\r\n- error out in `post_init` when it's used with `disable_cuda_graphs=False`. Add a TODO because with @sanketpurandare 's multiple smaller cudagraphs idea, it'd work in the future.\r\n- I actually haven't realized why it couldn't work with sdc_replay, although anyways I don't mind it being banned for now.",
+                  "createdAt": "2026-10-14T05:22:23Z",
+                  "databaseId": 4267078173,
+                  "diffHunk": "@@ -487,6 +492,10 @@ def _initialize_forward_backward(self) -> None:\n         )\n         self._run_forward_backward = eager_forward_backward_fn\n         if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():\n+            # Preprocess each group just before its forward, so the device holds one group's\n+            # inputs at a time. With SDC replay, which reruns the step on the same inputs, the\n+            # engine preprocesses up front.\n+            self._preprocess_groups_lazily = self.sdc_replayer is None",
+                  "line": null,
+                  "originalLine": 498,
+                  "path": "torchtitan/training_engine.py",
+                  "updatedAt": "2026-10-14T05:27:20Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4267078173"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNFQwNToyMjoyM1rO_lZyHQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 5
+            },
+            "databaseId": 5513236189,
+            "state": "CHANGES_REQUESTED",
+            "submittedAt": "2026-10-14T05:22:43Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5513236189"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude: Done, it's an inner function of `__iter__` now.\n",
+                  "createdAt": "2026-10-15T02:42:29Z",
+                  "databaseId": 4278474269,
+                  "diffHunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:\n+    \"\"\"Yields this rank's microbatches in order, reading the next ones on a background thread.\n+\n+    Implements only what `TrainingEngine.forward_backward` uses: `len()` and one in-order pass.\n+\n+    Example:\n+        stream = MicrobatchStream([rdma_microbatch_0, ..., rdma_microbatch_3])\n+        len(stream)  # 4\n+        for [microbatch] in stream:\n+            train(microbatch)\n+\n+        read thread:  read 0 | read 1, read 2 | read 3  |\n+        main thread:  wait   | train 0        | train 1 | train 2 | train 3\n+    \"\"\"\n+\n+    def __init__(self, rdma_microbatches: list[RDMAMicrobatch]) -> None:\n+        self._rdma_microbatches = rdma_microbatches\n+        self.read_s = 0.0  # this rank's total read time, hidden behind training or not\n+\n+    def __len__(self) -> int:\n+        return len(self._rdma_microbatches)\n+\n+    def __iter__(self) -> Iterator[list[TrainingMicrobatch]]:\n+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=\"microbatch_read\")\n+        reads: deque[Future[TrainingMicrobatch]] = deque()\n+        try:\n+            for rdma_microbatch in self._rdma_microbatches:\n+                # Copy the actor's context: in a bare thread Monarch would start a second client.\n+                # Create the coroutine there too, so a cancelled read doesn't leave one unawaited.\n+                reads.append(\n+                    pool.submit(\n+                        contextvars.copy_context().run, self._read, rdma_microbatch\n+                    )\n+                )\n+                if len(reads) > _NUM_MICROBATCHES_READ_AHEAD:\n+                    yield [_wait_for_microbatch(reads.popleft())]\n+            while reads:\n+                yield [_wait_for_microbatch(reads.popleft())]\n+        finally:\n+            # On an error, cancel queued reads: with the controller gone, each would wait out\n+            # the 60 s RDMA timeout.\n+            pool.shutdown(cancel_futures=True)\n+\n+    def _read(self, rdma_microbatch: RDMAMicrobatch) -> TrainingMicrobatch:\n+        start = time.perf_counter()\n+        microbatch = asyncio.run(rdma_microbatch.read())\n+        self.read_s += time.perf_counter() - start\n+        return microbatch\n+\n+\n+def _wait_for_microbatch(read: Future[TrainingMicrobatch]) -> TrainingMicrobatch:",
+                  "line": null,
+                  "originalLine": 163,
+                  "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+                  "updatedAt": "2026-10-15T02:42:29Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474269"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMjo0MjoyOVrO_wRWHQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527421918,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T02:42:29Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527421918"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude: Renamed to `RDMAMicrobatchPrefetcher`: RDMA for the scope, and \"prefetcher\" for what it does (the trainer already has CUDA streams).\n",
+                  "createdAt": "2026-10-15T02:42:31Z",
+                  "databaseId": 4278474393,
+                  "diffHunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:",
+                  "line": null,
+                  "originalLine": 113,
+                  "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+                  "updatedAt": "2026-10-15T02:42:31Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474393"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMjo0MjozMVrO_wRWmQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527422043,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T02:42:31Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422043"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude: Done, in its own draft PR right below this one in the stack: `preprocess_inputs` now takes `global_routing_token_counts`, and each model with an aux loss puts it in `aux_loss_denominators`, where it writes `None` today. `_set_aux_loss_denominators` is gone, and this PR is back to its own files.\n",
+                  "createdAt": "2026-10-15T02:42:32Z",
+                  "databaseId": 4278474518,
+                  "diffHunk": "@@ -550,34 +559,28 @@ def forward_backward(\n         self.optim.zero_grad(\n             set_to_none=not self._cuda_graph_per_accumulation_group_enabled\n         )\n-        preprocessed_microbatch_groups = self._preprocess_microbatch_groups(\n-            microbatch_groups\n-        )\n         global_loss_token_counts = torch.as_tensor(\n             global_loss_token_counts, device=self.device\n         )\n-        global_routing_token_counts = global_routing_token_counts.to(self.device)\n-        for prepared_group in preprocessed_microbatch_groups:\n-            model_kwargs_collection = (\n-                prepared_group[1] if len(prepared_group) == 3 else (prepared_group[2],)\n-            )\n-            for model_kwargs in model_kwargs_collection:\n-                if \"aux_loss_denominators\" in model_kwargs:\n-                    model_kwargs[\"aux_loss_denominators\"] = global_routing_token_counts\n+        self._global_routing_token_counts = global_routing_token_counts.to(self.device)\n+        step_inputs: list[Any] = microbatch_groups\n+        if not self._preprocess_groups_lazily:\n+            step_inputs = self._preprocess_microbatch_groups(microbatch_groups)\n+            _set_aux_loss_denominators(step_inputs, self._global_routing_token_counts)",
+                  "line": null,
+                  "originalLine": 569,
+                  "path": "torchtitan/training_engine.py",
+                  "updatedAt": "2026-10-15T02:42:32Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474518"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMjo0MjozMlrO_wRXFg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527422166,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T02:42:32Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422166"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude: Done: `_preprocess_microbatch_group()` prepares one group; `_preprocess_microbatch_groups()` is a loop over it, and the lazy path calls it directly.\n",
+                  "createdAt": "2026-10-15T02:42:33Z",
+                  "databaseId": 4278474636,
+                  "diffHunk": "@@ -658,8 +661,17 @@ def _forward_backward_body(\n         accumulated_loss: torch.Tensor | None = None\n         loss_metrics: list[dict[str, torch.Tensor]] = []\n         num_accumulation_steps = len(microbatch_groups)\n-        for accumulation_index, prepared_inputs in enumerate(microbatch_groups):\n+        for accumulation_index, microbatch_group in enumerate(microbatch_groups):\n             is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1\n+            prepared_inputs = microbatch_group\n+            if self._preprocess_groups_lazily:\n+                # TODO: this waits ~4 ms per microbatch on pageable inputs and varlen's host sync\n+                # (+0.77% at 16K tokens, Qwen3-0.6B, H100). Pinned inputs + max_num_documents fix it.\n+                prepared_groups = self._preprocess_microbatch_groups([microbatch_group])",
+                  "line": null,
+                  "originalLine": 670,
+                  "path": "torchtitan/training_engine.py",
+                  "updatedAt": "2026-10-15T02:42:33Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474636"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMjo0MjozM1rO_wRXjA==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527422282,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T02:42:33Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422282"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude: Done:\n- `training.preprocess_microbatch_groups_lazily: bool = False`, in `TrainingConfig` next to `cuda_graph_per_accumulation_group`.\n- `TrainingEngine.Config.__post_init__` raises if it is set with CUDA graphs on (with the TODO) or with SDC replay.\n\nWhy not SDC: replay reruns a checked step on the same inputs. Lazily, each rerun would preprocess again (counting `ntokens_seen` again) and read every microbatch over RDMA again.\n",
+                  "createdAt": "2026-10-15T02:42:34Z",
+                  "databaseId": 4278474728,
+                  "diffHunk": "@@ -487,6 +492,10 @@ def _initialize_forward_backward(self) -> None:\n         )\n         self._run_forward_backward = eager_forward_backward_fn\n         if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():\n+            # Preprocess each group just before its forward, so the device holds one group's\n+            # inputs at a time. With SDC replay, which reruns the step on the same inputs, the\n+            # engine preprocesses up front.\n+            self._preprocess_groups_lazily = self.sdc_replayer is None",
+                  "line": null,
+                  "originalLine": 498,
+                  "path": "torchtitan/training_engine.py",
+                  "updatedAt": "2026-10-15T02:42:34Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474728"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMjo0MjozNFrO_wRX6A==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527422380,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T02:42:34Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422380"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5528045239,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-15T04:30:21Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5528045239"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNVQwNDozMDoyMVq0MjAyNi0xMC0xNVQwNDozMDoyMVrPAAAAAUl_Rrc=",
+          "hasNextPage": false
+        },
+        "totalCount": 7
+      },
+      "state": "MERGED",
+      "title": "[rl] read each trainer rank's microbatches two ahead of training",
+      "updatedAt": "2026-10-15T06:05:12Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5286"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "4b68c5ea28f6c9818e24c30aa47a341c4cf3ddfd"
+    },
+    "body": "**TLDR:** Reads now overlap compute: each trainer rank reads its RDMA microbatches two ahead on a background thread, and the engine trains each one as it arrives. On H100 the loss is bitwise equal to the base at DP 1 and DP 2, and reads after a step's first microbatch wait ≤ 1.1 ms per step in total. Opt-in: it needs the RDMA fast path (`async_loop.batcher.rdma_min_tensor_bytes`) and the new `trainer.training.preprocess_microbatch_groups_lazily=True`.\n\n**Problem**\n1. **With the RDMA fast path on, each rank reads its whole column before compute.**\n2. **The reads are exposed:** est. ~0.15% of `forward_backward` at 38 B/token, ~2% at 614 B/token, up to ~25% for a fast trainer with a heavy payload and 16 TCP readers.\n3. **The whole column sits in host memory.**\n4. **The engine needs every microbatch before the first forward:** `TrainingEngine.forward_backward` preprocesses every group up front, so it would drain a prefetcher before training starts.\n\n**Solution**\n1. **`TrainingEngine`, opt-in:** with `training.preprocess_microbatch_groups_lazily=True` (default False), each group is preprocessed just before its forward (PP included), by the new `_preprocess_microbatch_group`.\n   - Rejected with CUDA graphs on (TODO: several smaller graphs), with SDC replay, and by `GraphTrainer`. The RL controller warns when `rdma_min_tensor_bytes` is set without it.\n   - Each model fills its own `aux_loss_denominators` (the aux-denominator PR below), so one group needs no engine patch.\n2. **`RDMAMicrobatchPrefetcher`:** `Trainer.forward_backward` passes it as `microbatch_groups` when it gets `MonarchRDMAMicrobatch`es (by value, the column as before).\n   - It reads this rank's column on a thread, two ahead, one `asyncio.run` per read, with the actor's context copied in (else Monarch starts a second client). The engine needs only `len()` and one pass.\n   - Ending the pass early (e.g. a failed step) cancels the queued reads. A `wait_for_microbatch` span records the read time training didn't hide; the total read time feeds `timing/trainer/read_microbatches/max`.\n3. **Unchanged by default:** pretraining, ROCm and by-value RL preprocess up front as on main. With RDMA on but lazy off, the engine drains the prefetcher first: correct, no overlap.\n\n```text\nengine, default:  preprocess 0, preprocess 1 | fwd/bwd 0 | fwd/bwd 1\nengine, lazy:     preprocess 0 | fwd/bwd 0 | preprocess 1 | fwd/bwd 1\n\ntrainer rank:  read thread  | read 0 | read 1, read 2 | read 3  | ...\n               main thread  | wait   | train 0        | train 1 | ...\n```\n\n**Results**\n\nGPU, Qwen3-0.6B, H100, batch invariant, lockstep, 10 steps, one TP 1 generator, 4,096-token microbatches (0.16 MB each), RDMA and lazy preprocessing on. From an earlier push, before the opt-in flag (not re-run on GPU). \"main + engine change\" is upstream main plus this PR's engine change, without the RDMA microbatch PR:\n```text\n                                          trainer DP 1 (2 GPUs)          trainer DP 2 (3 GPUs)\nloss/mean, vs main + engine change        bitwise equal at all 10 steps  bitwise equal at all 10 steps\nforward_backward, main + engine change    1.393 s                        0.909 s\nforward_backward, RDMA microbatch PR      1.414 s                        0.910 s\nforward_backward, this stack              1.399 s                        0.932 s\nwait_for_microbatch, first read           2.3-3.1 ms per step            2.8-5.1 ms per step\nwait_for_microbatch, later reads          0.4-1.1 ms per step in total   0.2-0.7 ms per step in total, per rank\n```\n- At this size there is little to hide, and the forward_backward rows differ by run-to-run noise (the RDMA microbatch PR row is a separate run). Prefetch pays with heavier per-token payloads (see NOTE).\n- At the batcher-process and scatter PRs' heads (which include this PR), trainer DP 2, 5 steps: `loss/mean` bitwise equal to main's DP 2 at every step, over TCP and over ibverbs.\n- CPU stress: 1,500 steps x 8 microbatches x 4 ranks of register, read and drop: every field matched, no hang.\n\nYou may ask:\n- **Does this change pretraining?** No, lazy preprocessing is off by default. With it on, the device holds one group's inputs instead of the step's (an RL step of 46 x 128K tokens: 229 MB -> 5 MB).\n- **Why not with SDC replay?** Replay reruns a checked step on the same inputs, so lazily it would preprocess (and count `ntokens_seen`) and read every microbatch again.\n- **Why a Python thread if Rust moves the bytes?** A Monarch `Future` does nothing until someone calls `get()` or awaits it, and the actor's loop thread is busy in forward/backward.\n- **Why two ahead?** A rank then holds at most 4 microbatches on the host (2 queued, 1 waited on, 1 training). Not tuned.\n\nNOTE:\n- **The lazy path costs ~4 ms per microbatch** (pageable inputs and varlen's host sync; +0.77% at 16K tokens, Qwen3-0.6B, H100), about what prefetch hides at 38 B/token. In a repro, pinned inputs plus `max_num_documents` removed it; pinned alone did not.\n- **Metrics:** with the fast path, `trainer/tokens_per_second` and MFU now include the reads: each step's first read with lazy preprocessing on, every read with it off. The weight push returns after `forward_backward`, as on main (the RDMA microbatch PR let it finish during the reads).\n- **Not tested:** multiple hosts; the RL GPU CI.\n\n**Test plan**\n- Repo root, Monarch 0.7, merged with main: `pytest tests/rl/unit_tests/cpu` 497 passed, 5 skipped; `pytest tests/unit_tests/cpu` 1,658 passed; the only failures fail on main too (offline: 3 tokenizer downloads, `test_download_hf_assets`; `test_quantization.py` needs `torchao`).\n- `test_trainer.py`: by value, the column goes to the engine as is; with `MonarchRDMAMicrobatch`es, the prefetcher reads it and the read time is reported.\n- Engine: lazy and up-front preprocessing (PP included), the flag reaching the body, and the config checks (CUDA graphs, SDC, GraphTrainer).\n- `test_rdma_microbatch.py`: the prefetcher yields in order and reads exactly two ahead (fails for a read-ahead of 0, 1 or 100); the read thread sees the caller's context; closing it cancels queued reads.\n",
+    "changed_files": 12,
+    "head": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "e95caa6a00a8e0905cb7c33797376d26a008c73f"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5286",
+    "merge_commit_sha": "bed6eca29106f3ff1f7ab9b4917d2d4a027766e8",
+    "merged": true,
+    "merged_at": "2026-10-15T06:05:12Z",
+    "number": 5286,
+    "state": "closed",
+    "title": "[rl] read each trainer rank's microbatches two ahead of training",
+    "updated_at": "2026-10-15T06:05:12Z"
+  },
+  "files": [
+    {
+      "additions": 79,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py",
+      "changes": 81,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 2,
+      "filename": "tests/rl/unit_tests/cpu/test_rdma_microbatch.py",
+      "patch": "@@ -4,10 +4,15 @@\n # This source code is licensed under the BSD-style license found in the\n # LICENSE file in the root directory of this source tree.\n \n-\"\"\"Unit tests for `MonarchRDMAMicrobatch`: with Monarch's RDMA classes faked, and one over real Monarch (TCP).\"\"\"\n+\"\"\"Unit tests for `MonarchRDMAMicrobatch` and `RDMAMicrobatchPrefetcher`, with Monarch's RDMA\n+classes faked except in one test over real Monarch (TCP).\"\"\"\n \n import asyncio\n+import contextvars\n import dataclasses\n+import threading\n+import time\n+from types import SimpleNamespace\n \n import numpy as np\n import pytest\n@@ -18,7 +23,12 @@\n \n from torchtitan.rl.trainer import rdma_microbatch\n from torchtitan.rl.trainer.batcher import Batcher, TrainingMicrobatch\n-from torchtitan.rl.trainer.rdma_microbatch import _TensorRef, MonarchRDMAMicrobatch\n+from torchtitan.rl.trainer.rdma_microbatch import (\n+    _NUM_MICROBATCHES_READ_AHEAD,\n+    _TensorRef,\n+    MonarchRDMAMicrobatch,\n+    RDMAMicrobatchPrefetcher,\n+)\n from torchtitan.rl.trainer.training_sample_builder import (\n     TrainingSample,\n     TrainingSampleGroup,\n@@ -179,6 +189,73 @@ def test_batcher_registers_each_batch_and_releases_the_oldest(monkeypatch) -> No\n     assert [batch.microbatches[0][0].batch_index for batch in batches] == [0, 1]\n \n \n+def _fake_rdma_microbatch(index: int, started: list[int]) -> SimpleNamespace:\n+    \"\"\"Stands in for a `MonarchRDMAMicrobatch`: `read()` records its index.\"\"\"\n+\n+    async def read() -> int:\n+        started.append(index)\n+        return index\n+\n+    return SimpleNamespace(read=read)\n+\n+\n+def test_prefetcher_yields_in_order_and_reads_two_ahead() -> None:\n+    started: list[int] = []\n+    prefetcher = RDMAMicrobatchPrefetcher(\n+        [_fake_rdma_microbatch(index, started) for index in range(6)]\n+    )\n+\n+    assert len(prefetcher) == 6\n+    for [index] in prefetcher:\n+        # Wait for the expected read, then 20 ms more, so a read too far ahead shows.\n+        expected = min(index + _NUM_MICROBATCHES_READ_AHEAD, 5)\n+        deadline = time.monotonic() + 5\n+        while max(started) < expected and time.monotonic() < deadline:\n+            time.sleep(0.01)\n+        time.sleep(0.02)\n+        assert max(started) == expected\n+    assert started == list(range(6))\n+\n+\n+def test_prefetcher_read_thread_sees_caller_context() -> None:\n+    step = contextvars.ContextVar(\"step\")\n+    step.set(7)\n+\n+    async def read() -> int:\n+        return step.get()\n+\n+    prefetcher = RDMAMicrobatchPrefetcher([SimpleNamespace(read=read)])\n+\n+    assert list(prefetcher) == [[7]]\n+\n+\n+def test_prefetcher_skips_queued_reads_when_training_stops() -> None:\n+    started: list[int] = []\n+    read_1_started, read_1_done = threading.Event(), threading.Event()\n+\n+    async def read_1() -> int:\n+        read_1_started.set()\n+        await asyncio.sleep(0.2)\n+        read_1_done.set()\n+        return 1\n+\n+    prefetcher = RDMAMicrobatchPrefetcher(\n+        [\n+            _fake_rdma_microbatch(0, started),\n+            SimpleNamespace(read=read_1),\n+            _fake_rdma_microbatch(2, started),\n+        ]\n+    )\n+    iterator = iter(prefetcher)\n+\n+    assert next(iterator) == [0]\n+    assert read_1_started.wait(timeout=5)\n+    # Read 1 is running and read 2 is queued: closing waits for read 1 and cancels read 2.\n+    iterator.close()\n+\n+    assert read_1_done.is_set() and 2 not in started\n+\n+\n class _TrainerRank(Actor):\n     \"\"\"Reads its DP column of a batch, as a trainer rank does.\"\"\"\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py",
+      "sha": "64625179661fef91921a7a9fa38d89f538fda216",
+      "status": "modified"
+    },
+    {
+      "additions": 16,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "changes": 21,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 5,
+      "filename": "tests/rl/unit_tests/cpu/test_trainer.py",
+      "patch": "@@ -8,7 +8,7 @@\n import threading\n from contextlib import nullcontext\n from types import SimpleNamespace\n-from unittest.mock import AsyncMock, MagicMock, patch\n+from unittest.mock import ANY, AsyncMock, MagicMock, patch\n \n import pytest\n \n@@ -23,7 +23,10 @@\n from torchtitan.rl.actors.monarch.trainer import TrainerActor\n from torchtitan.rl.trainer.batcher import TrainingMicrobatch\n from torchtitan.rl.trainer.controller_state import MirroredState\n-from torchtitan.rl.trainer.rdma_microbatch import MonarchRDMAMicrobatch\n+from torchtitan.rl.trainer.rdma_microbatch import (\n+    MonarchRDMAMicrobatch,\n+    RDMAMicrobatchPrefetcher,\n+)\n from torchtitan.rl.trainer.trainer import Trainer\n from torchtitan.trainer import Trainer as DatasetTrainer\n from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine\n@@ -254,7 +257,9 @@ def test_forward_backward_uses_global_token_count() -> None:\n         garbage_collector=SimpleNamespace(run=MagicMock()),\n         optim=SimpleNamespace(zero_grad=MagicMock()),\n         config=SimpleNamespace(\n-            training=SimpleNamespace(disable_cuda_graphs=True),\n+            training=SimpleNamespace(\n+                disable_cuda_graphs=True, preprocess_microbatch_groups_lazily=False\n+            ),\n             parallelism=SimpleNamespace(\n                 fsdp_defer_gradient_reduction=False,\n                 fsdp_reshard_after_forward=\"default\",\n@@ -409,11 +414,17 @@ async def run() -> None:\n         )\n \n         engine.forward_backward.assert_called_once_with(\n-            microbatch_groups=[[batch], [batch]],\n+            microbatch_groups=ANY,\n             global_loss_token_counts=torch.tensor([3]),\n             global_routing_token_counts=torch.tensor([2]),\n         )\n-        assert trainer._step_num_tokens_per_dp_rank == 2\n+        # MonarchRDMAMicrobatches are read through the prefetcher; by value, the column is passed as is.\n+        groups = engine.forward_backward.call_args.kwargs[\"microbatch_groups\"]\n+        assert isinstance(groups, RDMAMicrobatchPrefetcher) == rdma\n+        assert list(groups) == [[batch], [batch]]\n+        assert trainer._step_num_tokens_per_dp_rank == (\n+            2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank\n+        )\n         if rdma:\n             other_rank.read.assert_not_called()\n             assert trainer._num_rdma_batches_read == 1",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "sha": "323a8eeb78fd74a12f3b54ac64ff91a9ef29777a",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Fcomponents%2Ftest_invalid_loss.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fcomponents%2Ftest_invalid_loss.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/components/test_invalid_loss.py",
+      "patch": "@@ -43,6 +43,7 @@ def _make_trainer(self, loss_value: float, should_log: bool) -> Trainer:\n         trainer.config.training.disable_cuda_graphs = True\n         trainer.sdc_replayer = None\n         trainer._cuda_graph_per_accumulation_group_enabled = False\n+        trainer.config.training.preprocess_microbatch_groups_lazily = False\n         trainer.device = torch.device(\"cpu\")\n         trainer.num_completed_steps = 1\n         trainer.ntokens_seen = 0",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Fcomponents%2Ftest_invalid_loss.py",
+      "sha": "e69092c91b9771a0aa58f74b604d3a08df48cde2",
+      "status": "modified"
+    },
+    {
+      "additions": 27,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Fconfig%2Ftest_config_validation.py",
+      "changes": 27,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fconfig%2Ftest_config_validation.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/config/test_config_validation.py",
+      "patch": "@@ -75,13 +75,40 @@ def test_per_group_cuda_graph_config_restrictions() -> None:\n     )\n \n \n+def test_lazy_preprocessing_config_restrictions() -> None:\n+    with pytest.raises(ValueError, match=\"requires training.disable_cuda_graphs=True\"):\n+        TrainingEngine.Config(\n+            training=TrainingConfig(preprocess_microbatch_groups_lazily=True)\n+        )\n+    with pytest.raises(ValueError, match=\"does not support SDC replay\"):\n+        TrainingEngine.Config(\n+            training=TrainingConfig(\n+                preprocess_microbatch_groups_lazily=True, disable_cuda_graphs=True\n+            ),\n+            sdc_replayer=SDCReplayer.Config(),\n+        )\n+\n+    TrainingEngine.Config(\n+        training=TrainingConfig(\n+            preprocess_microbatch_groups_lazily=True, disable_cuda_graphs=True\n+        )\n+    )\n+\n+\n def test_graph_trainer_rejects_per_group_cuda_graphs() -> None:\n     config = llama3_debugmodel(attn_backend=\"flex\")\n     with pytest.raises(ValueError, match=\"not supported with GraphTrainer\"):\n         GraphTrainer.Config(\n             model=config.model,\n             training=TrainingConfig(cuda_graph_per_accumulation_group=True),\n         )\n+    with pytest.raises(ValueError, match=\"lazily is not supported with GraphTrainer\"):\n+        GraphTrainer.Config(\n+            model=config.model,\n+            training=TrainingConfig(\n+                preprocess_microbatch_groups_lazily=True, disable_cuda_graphs=True\n+            ),\n+        )\n \n \n def test_cuda_graphs_reject_pipeline_validation() -> None:",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Fconfig%2Ftest_config_validation.py",
+      "sha": "f0467789c3ee1db1a24525b07844acf1de151dd4",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_dist_moe.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_dist_moe.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/models/common/test_dist_moe.py",
+      "patch": "@@ -240,6 +240,7 @@ def test_engine_builds_dist_moe_runtime_with_eager_pp_schedule() -> None:\n             num_tokens_per_microbatch_per_dp_rank=8,\n             mixed_precision_param=\"bfloat16\",\n             mixed_precision_reduce=\"float32\",\n+            preprocess_microbatch_groups_lazily=False,\n         ),\n         parallelism=SimpleNamespace(\n             fsdp_defer_gradient_reduction=False,",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_dist_moe.py",
+      "sha": "173d73aafbab1a341e2a3db14820d48fe3b3ced6",
+      "status": "modified"
+    },
+    {
+      "additions": 74,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "changes": 84,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Ftest_trainer.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 10,
+      "filename": "tests/unit_tests/cpu/test_trainer.py",
+      "patch": "@@ -315,8 +315,8 @@ def preprocess_inputs(self, input_dict, **kwargs):\n             }\n         ),\n     ]\n-    [(arg_mbs, kwarg_mbs, target_mbs)] = TrainingEngine._preprocess_microbatch_groups(\n-        trainer, [microbatches], global_routing_token_counts=torch.tensor([7])\n+    arg_mbs, kwarg_mbs, target_mbs = TrainingEngine._preprocess_microbatch_group(\n+        trainer, microbatches, global_routing_token_counts=torch.tensor([7])\n     )\n \n     assert arg_mbs is not None\n@@ -372,30 +372,31 @@ def test_preprocess_microbatch_groups_rejects_pp_loss_kwargs(monkeypatch) -> Non\n         {\"advantages\": torch.tensor([0.1])},\n     )\n     with pytest.raises(ValueError, match=\"pipeline parallelism\"):\n-        TrainingEngine._preprocess_microbatch_groups(\n-            trainer,\n-            [[microbatch]],\n-            global_routing_token_counts=torch.tensor([7]),\n+        TrainingEngine._preprocess_microbatch_group(\n+            trainer, [microbatch], global_routing_token_counts=torch.tensor([7])\n         )\n \n \n @pytest.mark.parametrize(\n-    (\"per_group_graph\", \"set_to_none\"),\n-    [(False, True), (True, False)],\n+    (\"per_group_graph\", \"lazily\", \"set_to_none\"),\n+    [(False, False, True), (True, False, False), (False, True, True)],\n )\n def test_forward_backward_runs_whole_accumulation(\n     monkeypatch,\n     per_group_graph: bool,\n+    lazily: bool,\n     set_to_none: bool,\n ) -> None:\n     captured: dict[str, Any] = {}\n+    events: list[str] = []\n \n     class _FakeModel:\n         def modules(self):\n             return iter(())\n \n         def preprocess_inputs(self, input_dict, *, global_routing_token_counts, **kw):\n             captured[\"preprocess_kwargs\"] = kw\n+            events.append(f\"preprocess {input_dict['input']}\")\n             return (\n                 \"INPUTS\",\n                 torch.ones(7),\n@@ -406,6 +407,7 @@ def preprocess_inputs(self, input_dict, *, global_routing_token_counts, **kw):\n \n     def forward_backward_body(*, inputs, labels, model_kwargs, loss_kwargs):\n         captured.setdefault(\"fwd_bwd_args\", []).append((inputs, labels, model_kwargs))\n+        events.append(\"forward\")\n         torch.testing.assert_close(\n             loss_kwargs[\"global_loss_token_counts\"], torch.tensor(2)\n         )\n@@ -432,6 +434,7 @@ def forward_backward_body(*, inputs, labels, model_kwargs, loss_kwargs):\n             disable_cuda_graphs=True,\n             max_context_length=2048,\n             num_tokens_per_microbatch_per_dp_rank=7,\n+            preprocess_microbatch_groups_lazily=lazily,\n         ),\n     )\n     engine.preprocess_inputs_kwargs = {\"processor\": \"VALUE\"}\n@@ -447,6 +450,7 @@ def forward_backward_body(*, inputs, labels, model_kwargs, loss_kwargs):\n         TrainingEngine._forward_backward_body,\n         engine,\n         defer_fsdp_gradient_reduction=False,\n+        preprocess_microbatch_groups_lazily=lazily,\n     )\n     microbatches = [\n         _dict_microbatch(\n@@ -469,6 +473,12 @@ def forward_backward_body(*, inputs, labels, model_kwargs, loss_kwargs):\n     ]\n     assert engine.num_accumulation_steps == 2\n     assert engine.ntokens_seen == 114\n+    # Lazy preprocessing moves each microbatch to the device just before its forward.\n+    assert events == (\n+        [\"preprocess 0\", \"forward\", \"preprocess 1\", \"forward\"]\n+        if lazily\n+        else [\"preprocess 0\", \"preprocess 1\", \"forward\", \"forward\"]\n+    )\n     assert engine.loss is result.loss\n     engine.garbage_collector.run.assert_called_once_with(1)\n     engine.optim.zero_grad.assert_called_once_with(set_to_none=set_to_none)\n@@ -706,6 +716,7 @@ def test_training_engine_skips_gradient_accumulation_graph_when_unsupported() ->\n                 training=SimpleNamespace(\n                     cuda_graph_per_accumulation_group=False,\n                     disable_cuda_graphs=False,\n+                    preprocess_microbatch_groups_lazily=False,\n                 ),\n                 parallelism=SimpleNamespace(\n                     enable_sequence_parallel=False,\n@@ -984,7 +995,9 @@ def test_engine_replay_checks_whole_accumulation() -> None:\n     )\n     engine = object.__new__(TrainingEngine)\n     engine.config = SimpleNamespace(\n-        training=SimpleNamespace(disable_cuda_graphs=True),\n+        training=SimpleNamespace(\n+            disable_cuda_graphs=True, preprocess_microbatch_groups_lazily=False\n+        ),\n         parallelism=SimpleNamespace(\n             fsdp_defer_gradient_reduction=False,\n             fsdp_reshard_after_forward=\"default\",\n@@ -1028,7 +1041,9 @@ def test_replay_failure_propagates_from_engine():\n     )\n     engine = object.__new__(TrainingEngine)\n     engine.config = SimpleNamespace(\n-        training=SimpleNamespace(disable_cuda_graphs=True),\n+        training=SimpleNamespace(\n+            disable_cuda_graphs=True, preprocess_microbatch_groups_lazily=False\n+        ),\n         parallelism=SimpleNamespace(\n             fsdp_defer_gradient_reduction=False,\n             fsdp_reshard_after_forward=\"default\",\n@@ -1209,8 +1224,10 @@ def test_cuda_graph_accumulation_supports_eager_gradient_reduction() -> None:\n \n \n @pytest.mark.parametrize(\"configured_defer\", [False, True])\n+@pytest.mark.parametrize(\"lazily\", [False, True])\n def test_initialize_forward_backward_uses_eager_fsdp_reduction_config(\n     configured_defer: bool,\n+    lazily: bool,\n ) -> None:\n     forward_backward_body = MagicMock(\n         return_value=ForwardBackwardResult(torch.tensor(1.0), [])\n@@ -1223,6 +1240,7 @@ def test_initialize_forward_backward_uses_eager_fsdp_reduction_config(\n                 training=SimpleNamespace(\n                     cuda_graph_per_accumulation_group=False,\n                     disable_cuda_graphs=True,\n+                    preprocess_microbatch_groups_lazily=lazily,\n                 ),\n                 parallelism=SimpleNamespace(\n                     fsdp_defer_gradient_reduction=configured_defer,\n@@ -1247,6 +1265,10 @@ def test_initialize_forward_backward_uses_eager_fsdp_reduction_config(\n         forward_backward_body.call_args.kwargs[\"defer_fsdp_gradient_reduction\"]\n         is configured_defer\n     )\n+    assert (\n+        forward_backward_body.call_args.kwargs[\"preprocess_microbatch_groups_lazily\"]\n+        is lazily\n+    )\n \n \n class _RecordingFSDPPart:\n@@ -1402,6 +1424,48 @@ def test_fsdp_gradient_accumulation_reduction_policy(\n         assert fsdp_root.requires_gradient_sync_calls == []\n \n \n+def test_pp_lazy_preprocessing_prepares_each_group_before_its_step() -> None:\n+    events: list[str] = []\n+\n+    def preprocess(microbatch_group, *, global_routing_token_counts):\n+        events.append(f\"preprocess {microbatch_group}\")\n+        torch.testing.assert_close(global_routing_token_counts, torch.tensor([5]))\n+        return (None, [{}] * 2, None)\n+\n+    def pp_step(*, finalize_gradients, **kwargs):\n+        events.append(f\"step finalize={finalize_gradients}\")\n+        return torch.tensor(1.0)\n+\n+    engine = cast(\n+        TrainingEngine,\n+        SimpleNamespace(\n+            parallelism_context=SimpleNamespace(\n+                pp_enabled=True,\n+                dp_replicate_enabled=False,\n+            ),\n+            model_parts=[],\n+            _preprocess_microbatch_group=preprocess,\n+            _global_routing_token_counts=torch.tensor([5]),\n+            _pp_forward_backward_microbatch_group=pp_step,\n+        ),\n+    )\n+\n+    TrainingEngine._forward_backward_body(\n+        engine,\n+        [\"group0\", \"group1\"],\n+        torch.tensor(2),\n+        defer_fsdp_gradient_reduction=True,\n+        preprocess_microbatch_groups_lazily=True,\n+    )\n+\n+    assert events == [\n+        \"preprocess group0\",\n+        \"step finalize=False\",\n+        \"preprocess group1\",\n+        \"step finalize=True\",\n+    ]\n+\n+\n @pytest.mark.parametrize(\n     (\"defer_fsdp_gradient_reduction\", \"expected_finalize_gradients\"),\n     [(False, [True, True]), (True, [False, True])],",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/tests%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "sha": "b07e6c3a2b9f0622acf9f9fea25c4823407db1b2",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Fconfig%2Fconfigs.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fconfig%2Fconfigs.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 0,
+      "filename": "torchtitan/config/configs.py",
+      "patch": "@@ -97,6 +97,12 @@ def __post_init__(self) -> None:\n     # TODO: Remove this option when multiple CUDA graphs support variable group\n     # counts without duplicating the gradient accumulation logic.\n \n+    preprocess_microbatch_groups_lazily: bool = False\n+    \"\"\"Preprocess each microbatch group (host-to-device copy, masks) just before its\n+    forward/backward, not all groups up front, so RL can read the next microbatches\n+    during training. Requires ``disable_cuda_graphs=True`` and no SDC replay.\n+    \"\"\"\n+\n     dtype: Literal[\"bfloat16\", \"float32\"] = \"float32\"\n     \"\"\"\n     torch dtype for training. In contrast to mixed precision training, setting training_dtype=bfloat16 will",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Fconfig%2Fconfigs.py",
+      "sha": "9d2d94e00734af9cb35ee728f3e5c862dc644056",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Fexperiments%2Fgraph_trainer%2Ftrainer.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fexperiments%2Fgraph_trainer%2Ftrainer.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 0,
+      "filename": "torchtitan/experiments/graph_trainer/trainer.py",
+      "patch": "@@ -373,6 +373,11 @@ def __post_init__(self) -> None:\n                 raise ValueError(\n                     \"Per-group CUDA graphs are not supported with GraphTrainer.\"\n                 )\n+            if self.training.preprocess_microbatch_groups_lazily:\n+                raise ValueError(\n+                    \"training.preprocess_microbatch_groups_lazily is not supported \"\n+                    \"with GraphTrainer.\"\n+                )\n             # to_graph_trainer_config and the flavor builders turn these off;\n             # this catches a transform applied afterwards that builds them with\n             # the eager default.",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Fexperiments%2Fgraph_trainer%2Ftrainer.py",
+      "sha": "81069aabdb3bcceb39cde887d9986b74c9a82113",
+      "status": "modified"
+    },
+    {
+      "additions": 12,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Frl%2Fcontroller%2Fcontroller.py",
+      "changes": 12,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fcontroller%2Fcontroller.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 0,
+      "filename": "torchtitan/rl/controller/controller.py",
+      "patch": "@@ -356,6 +356,16 @@ def __post_init__(self):\n                     \"to control optimizer-step boundaries.\",\n                     stacklevel=2,\n                 )\n+            if (\n+                self.async_loop.batcher.rdma_min_tensor_bytes is not None\n+                and not self.trainer.training.preprocess_microbatch_groups_lazily\n+            ):\n+                warnings.warn(\n+                    \"async_loop.batcher.rdma_min_tensor_bytes is set without \"\n+                    \"trainer.training.preprocess_microbatch_groups_lazily=True: trainer \"\n+                    \"ranks read all microbatches before forward/backward, with no overlap.\",\n+                    stacklevel=2,\n+                )\n             if self.trainer.parallelism.enable_sequence_parallel:\n                 sp_degree = self.trainer.parallelism.tensor_parallel_degree\n                 max_context_length = self.trainer.training.max_context_length\n@@ -1178,6 +1188,8 @@ async def _trainer_loop(\n                     sl.log_trace_span(\"forward_backward\"),\n                     step_timer.record(\"timing/step/forward_backward\"),\n                 ):\n+                    # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).\n+                    # Sending the MonarchRDMAMicrobatches during the previous optim_step would hide it.\n                     try:\n                         fwd_bwd_metrics = self._get_rank_0_value(\n                             await self.trainer.forward_backward.call(",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Frl%2Fcontroller%2Fcontroller.py",
+      "sha": "cc386648049348199ce7c00754d06064621d4c1d",
+      "status": "modified"
+    },
+    {
+      "additions": 69,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Frl%2Ftrainer%2Frdma_microbatch.py",
+      "changes": 69,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer%2Frdma_microbatch.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 0,
+      "filename": "torchtitan/rl/trainer/rdma_microbatch.py",
+      "patch": "@@ -11,15 +11,21 @@\n from __future__ import annotations\n \n import asyncio\n+import contextvars\n import ctypes\n import dataclasses\n import logging\n+import time\n+from collections import deque\n+from collections.abc import Iterator\n+from concurrent.futures import Future, ThreadPoolExecutor\n from typing import Any\n \n import torch\n from monarch.rdma import RDMAAction, RDMABuffer\n from torch.utils import _pytree as pytree\n \n+from torchtitan.observability import structured_logger as sl\n from torchtitan.rl.trainer.batcher import TrainingMicrobatch\n \n logger = logging.getLogger(__name__)\n@@ -81,6 +87,8 @@ async def read(self) -> TrainingMicrobatch:\n         action = RDMAAction()\n \n         def queue_read(tensor_ref: _TensorRef) -> torch.Tensor:\n+            # TODO: allocate pinned tensors here. With max_num_documents also set, that removed the\n+            # ~4 ms per microbatch in `TrainingEngine._forward_backward_body`'s TODO; pinned alone did not.\n             tensor = torch.empty(tensor_ref.shape, dtype=tensor_ref.dtype)\n             action.read_remote(tensor.view(-1).view(torch.uint8), tensor_ref.buffer)\n             return tensor\n@@ -117,6 +125,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class RDMAMicrobatchPrefetcher:\n+    \"\"\"Yields this rank's microbatches in order, reading the next ones on a background thread.\n+\n+    Implements only what `TrainingEngine.forward_backward` uses: `len()` and one in-order pass.\n+\n+    Example:\n+        prefetcher = RDMAMicrobatchPrefetcher([rdma_microbatch_0, ..., rdma_microbatch_3])\n+        len(prefetcher)  # 4\n+        for [microbatch] in prefetcher:\n+            train(microbatch)\n+\n+        read thread:  read 0 | read 1, read 2 | read 3  |\n+        main thread:  wait   | train 0        | train 1 | train 2 | train 3\n+    \"\"\"\n+\n+    def __init__(self, rdma_microbatches: list[MonarchRDMAMicrobatch]) -> None:\n+        self._rdma_microbatches = rdma_microbatches\n+        # This rank's total read time, hidden or not; final once the pass ends.\n+        self.read_s = 0.0\n+\n+    def __len__(self) -> int:\n+        return len(self._rdma_microbatches)\n+\n+    def __iter__(self) -> Iterator[list[TrainingMicrobatch]]:\n+        def wait_for_microbatch(read: Future[TrainingMicrobatch]) -> TrainingMicrobatch:\n+            # The span is the read time that training did not hide.\n+            with sl.log_trace_span(\"wait_for_microbatch\"):\n+                return read.result()\n+\n+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=\"microbatch_read\")\n+        reads: deque[Future[TrainingMicrobatch]] = deque()\n+        try:\n+            for rdma_microbatch in self._rdma_microbatches:\n+                # Copy the actor's context: in a bare thread Monarch would start a second client.\n+                # Create the coroutine there too, so a cancelled read doesn't leave one unawaited.\n+                reads.append(\n+                    pool.submit(\n+                        contextvars.copy_context().run, self._read, rdma_microbatch\n+                    )\n+                )\n+                if len(reads) > _NUM_MICROBATCHES_READ_AHEAD:\n+                    yield [wait_for_microbatch(reads.popleft())]\n+            while reads:\n+                yield [wait_for_microbatch(reads.popleft())]\n+        finally:\n+            # The pass ended, or the generator was closed or collected (e.g. a failed step). Cancel the queued\n+            # reads: with the batcher gone, each would wait out the 60 s RDMA timeout. The running read finishes.\n+            pool.shutdown(cancel_futures=True)\n+\n+    def _read(self, rdma_microbatch: MonarchRDMAMicrobatch) -> TrainingMicrobatch:\n+        start = time.perf_counter()\n+        microbatch = asyncio.run(rdma_microbatch.read())\n+        self.read_s += time.perf_counter() - start\n+        return microbatch\n+\n+\n # The CUDA driver's `CU_LIMIT_STACK_SIZE` (cuda.h).\n _CU_LIMIT_STACK_SIZE = 0\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Frl%2Ftrainer%2Frdma_microbatch.py",
+      "sha": "358b69a1428794a0b78189a67d97ca4108572cec",
+      "status": "modified"
+    },
+    {
+      "additions": 16,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "changes": 31,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer%2Ftrainer.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 15,
+      "filename": "torchtitan/rl/trainer/trainer.py",
+      "patch": "@@ -30,7 +30,10 @@\n from torchtitan.rl.controller.metrics import combine_microbatch_metrics\n from torchtitan.rl.trainer.batcher import TrainingMicrobatch\n from torchtitan.rl.trainer.controller_state import CONTROLLER_STATE_KEY, MirroredState\n-from torchtitan.rl.trainer.rdma_microbatch import MonarchRDMAMicrobatch\n+from torchtitan.rl.trainer.rdma_microbatch import (\n+    MonarchRDMAMicrobatch,\n+    RDMAMicrobatchPrefetcher,\n+)\n from torchtitan.tools import utils\n from torchtitan.training_engine import TrainingEngine\n \n@@ -253,7 +256,7 @@ async def forward_backward(\n         Args:\n             training_data: Microbatch-major grid with shape\n                 ``[num_microbatches][dp_degree]``; `MonarchRDMAMicrobatch`es when\n-                `rdma_min_tensor_bytes` is set.\n+                `rdma_min_tensor_bytes` is set, read a few microbatches ahead of training.\n             global_loss_token_counts: Per-objective loss-token counts across the\n                 global batch.\n             global_routing_token_counts: Per-depth non-padding routing-token\n@@ -267,11 +270,17 @@ async def forward_backward(\n             f\"policy_version={self.policy_version}\"\n         )\n         engine = self.engine\n+        self._step_compute_start = time.perf_counter()\n         microbatches = [rank_batches[self.dp_rank] for rank_batches in training_data]\n+        # The batcher pads every microbatch to the same token count.\n+        self._step_num_tokens_per_dp_rank = (\n+            len(microbatches)\n+            * self.config.training.num_tokens_per_microbatch_per_dp_rank\n+        )\n         uses_rdma = bool(microbatches) and isinstance(\n             microbatches[0], MonarchRDMAMicrobatch\n         )\n-        read_start = time.perf_counter()\n+        microbatch_groups = [[microbatch] for microbatch in microbatches]\n         if uses_rdma:\n             # A wrong column, or a batch read twice or out of order, fails here instead of training.\n             # Both counters start at 0 in their own process, and every registered batch trains in order.\n@@ -290,17 +299,9 @@ async def forward_backward(\n             self._num_rdma_batches_read += 1\n             # TODO: the cp * tp ranks of a DP replica read the same column. Read it once per replica\n             # and broadcast it, to cut the trainer's reads by cp * tp. Needs a per-replica group.\n-            # TODO: investigate prefetching\n-            with sl.log_trace_span(\"read_microbatches\"):\n-                # One at a time, not asyncio.gather: gathered reads share the controller's bandwidth,\n-                # so each takes as long as the whole column and can hit its 60 s RDMA timeout.\n-                microbatches = [await microbatch.read() for microbatch in microbatches]\n-        self._step_compute_start = time.perf_counter()\n-        self._step_num_tokens_per_dp_rank = sum(\n-            microbatch.labels.numel() for microbatch in microbatches\n-        )\n+            microbatch_groups = RDMAMicrobatchPrefetcher(microbatches)\n         result = engine.forward_backward(\n-            microbatch_groups=[[microbatch] for microbatch in microbatches],\n+            microbatch_groups=microbatch_groups,\n             global_loss_token_counts=global_loss_token_counts,\n             global_routing_token_counts=global_routing_token_counts,\n         )\n@@ -323,9 +324,9 @@ async def forward_backward(\n \n         metrics = combine_microbatch_metrics(microbatch_metrics)\n         if uses_rdma:\n-            # The slowest rank's read time this step (max over the loss mesh).\n+            # The slowest rank's total read time this step, hidden or not (max over the loss mesh).\n             read_microbatches_s = torch.tensor(\n-                self._step_compute_start - read_start, device=engine.device\n+                microbatch_groups.read_s, device=engine.device\n             )\n             metrics.update(\n                 self._reduce_forward_backward_metrics(",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "sha": "00250211ac9e0dc534e7e2027049241fc6db7434",
+      "status": "modified"
+    },
+    {
+      "additions": 107,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Ftraining_engine.py",
+      "changes": 169,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Ftraining_engine.py?ref=e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "deletions": 62,
+      "filename": "torchtitan/training_engine.py",
+      "patch": "@@ -62,7 +62,7 @@ class ForwardBackwardResult(NamedTuple):\n \n \n _ForwardBackwardFn: TypeAlias = Callable[\n-    [list[tuple[Any, ...]], torch.Tensor], ForwardBackwardResult\n+    [list[Any], torch.Tensor], ForwardBackwardResult\n ]\n \n \n@@ -84,11 +84,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu\n         |\n         +-- TrainingEngine.forward_backward\n             |\n-            +-- _preprocess_microbatch_groups\n+            +-- _preprocess_microbatch_groups (unless lazy)\n             |\n             +-- _run_forward_backward =\n                 _forward_backward_body (maybe_wrapped_with_cuda_graph)\n                 |\n+                +-- _preprocess_microbatch_group (if lazy)\n+                |\n                 +-- _pp_forward_backward_microbatch_group\n                 |\n                 +-- _non_pp_forward_backward_microbatch\n@@ -171,6 +173,19 @@ def __post_init__(self) -> None:\n                         \"Per-group CUDA graphs require \"\n                         \"parallelism.fsdp_defer_gradient_reduction=False.\"\n                     )\n+            if self.training.preprocess_microbatch_groups_lazily:\n+                if not self.training.disable_cuda_graphs:\n+                    # TODO: with several smaller CUDA graphs, preprocess each group between replays.\n+                    raise ValueError(\n+                        \"training.preprocess_microbatch_groups_lazily requires \"\n+                        \"training.disable_cuda_graphs=True.\"\n+                    )\n+                if self.sdc_replayer is not None:\n+                    raise ValueError(\n+                        \"training.preprocess_microbatch_groups_lazily does not support SDC \"\n+                        \"replay: replay reruns a checked step, which would preprocess its \"\n+                        \"microbatches again.\"\n+                    )\n             num_tokens = self.training.num_tokens_per_microbatch_per_dp_rank\n             sequence_parallel_degree = (\n                 self.parallelism.tensor_parallel_degree\n@@ -228,6 +243,7 @@ def __post_init__(self) -> None:\n     model_device_mem_stats: DeviceMemStats\n     _run_forward_backward: _ForwardBackwardFn\n     _cuda_graph_per_accumulation_group_enabled: bool\n+    _global_routing_token_counts: torch.Tensor\n     _dist_moe_runtime: \"DistMoeRuntime | None\"\n \n     def __init__(\n@@ -487,6 +503,12 @@ def _initialize_forward_backward(self) -> None:\n         )\n         self._run_forward_backward = eager_forward_backward_fn\n         if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():\n+            self._run_forward_backward = partial(\n+                eager_forward_backward_fn,\n+                preprocess_microbatch_groups_lazily=(\n+                    self.config.training.preprocess_microbatch_groups_lazily\n+                ),\n+            )\n             return\n \n         if self.config.training.cuda_graph_per_accumulation_group:\n@@ -550,27 +572,33 @@ def forward_backward(\n         self.optim.zero_grad(\n             set_to_none=not self._cuda_graph_per_accumulation_group_enabled\n         )\n-        preprocessed_microbatch_groups = self._preprocess_microbatch_groups(\n-            microbatch_groups,\n-            global_routing_token_counts=global_routing_token_counts.to(self.device),\n-        )\n         global_loss_token_counts = torch.as_tensor(\n             global_loss_token_counts, device=self.device\n         )\n+        global_routing_token_counts = global_routing_token_counts.to(self.device)\n+        if self.config.training.preprocess_microbatch_groups_lazily:\n+            # _forward_backward_body preprocesses each group just before its forward/backward.\n+            self._global_routing_token_counts = global_routing_token_counts\n+            step_inputs: list[Any] = microbatch_groups\n+        else:\n+            step_inputs = self._preprocess_microbatch_groups(\n+                microbatch_groups,\n+                global_routing_token_counts=global_routing_token_counts,\n+            )\n \n         if self.sdc_replayer is not None:\n             result = self.sdc_replayer.run_fwd_bwd(\n                 partial(\n                     self._run_forward_backward,\n-                    preprocessed_microbatch_groups,\n+                    step_inputs,\n                     global_loss_token_counts,\n                 ),\n                 step=self.num_completed_steps + 1,\n                 get_loss=lambda result: result.loss,\n             )\n         else:\n             result = self._run_forward_backward(\n-                preprocessed_microbatch_groups,\n+                step_inputs,\n                 global_loss_token_counts,\n             )\n \n@@ -584,78 +612,95 @@ def _preprocess_microbatch_groups(\n         global_routing_token_counts: torch.Tensor,\n     ) -> list[tuple[Any, ...]]:\n         \"\"\"Preprocess all microbatch groups outside CUDA capture.\"\"\"\n-        preprocessed_microbatch_groups: list[tuple[Any, ...]] = []\n-        for microbatch_group in microbatch_groups:\n-            prepared_microbatches: list[tuple[Any, ...]] = []\n-            for microbatch in microbatch_group:\n-                with (\n-                    sl.log_trace_span(\"preprocess_inputs\"),\n-                    self.parallelism_context.activate_spmd(),\n-                ):\n-                    inputs, labels, model_kwargs = self.model_parts[\n-                        0\n-                    ].preprocess_inputs(\n-                        microbatch.to_input_dict(self.device, non_blocking=True),\n-                        parallelism_context=self.parallelism_context,\n-                        parallelism=self.config.parallelism,\n-                        max_num_documents=self.max_num_documents,\n-                        max_context_length=self.config.training.max_context_length,\n-                        global_routing_token_counts=global_routing_token_counts,\n-                        **self.preprocess_inputs_kwargs,\n-                    )\n-                self.ntokens_seen += (\n-                    self.config.training.num_tokens_per_microbatch_per_dp_rank\n-                    // self.parallelism_context.cp\n+        return [\n+            self._preprocess_microbatch_group(\n+                microbatch_group,\n+                global_routing_token_counts=global_routing_token_counts,\n+            )\n+            for microbatch_group in microbatch_groups\n+        ]\n+\n+    def _preprocess_microbatch_group(\n+        self,\n+        microbatch_group: list[TrainingMicrobatch],\n+        *,\n+        global_routing_token_counts: torch.Tensor,\n+    ) -> tuple[Any, ...]:\n+        \"\"\"Preprocess one group: ``(inputs, labels, model_kwargs, loss_kwargs)``, or with PP\n+        ``(arg_mbs, kwarg_mbs, target_mbs)``.\"\"\"\n+        prepared_microbatches: list[tuple[Any, ...]] = []\n+        for microbatch in microbatch_group:\n+            with (\n+                sl.log_trace_span(\"preprocess_inputs\"),\n+                self.parallelism_context.activate_spmd(),\n+            ):\n+                inputs, labels, model_kwargs = self.model_parts[0].preprocess_inputs(\n+                    microbatch.to_input_dict(self.device, non_blocking=True),\n+                    parallelism_context=self.parallelism_context,\n+                    parallelism=self.config.parallelism,\n+                    max_num_documents=self.max_num_documents,\n+                    max_context_length=self.config.training.max_context_length,\n+                    global_routing_token_counts=global_routing_token_counts,\n+                    **self.preprocess_inputs_kwargs,\n                 )\n-                prepared_microbatches.append(\n-                    (\n-                        inputs,\n-                        labels,\n-                        model_kwargs,\n-                        microbatch.to_loss_kwargs(self.device, non_blocking=True),\n-                    )\n+            self.ntokens_seen += (\n+                self.config.training.num_tokens_per_microbatch_per_dp_rank\n+                // self.parallelism_context.cp\n+            )\n+            prepared_microbatches.append(\n+                (\n+                    inputs,\n+                    labels,\n+                    model_kwargs,\n+                    microbatch.to_loss_kwargs(self.device, non_blocking=True),\n                 )\n+            )\n \n-            if not self.parallelism_context.pp_enabled:\n-                assert len(prepared_microbatches) == 1\n-                preprocessed_microbatch_groups.append(prepared_microbatches[0])\n-                continue\n+        if not self.parallelism_context.pp_enabled:\n+            assert len(prepared_microbatches) == 1\n+            return prepared_microbatches[0]\n \n-            if any(loss_kwargs for *_, loss_kwargs in prepared_microbatches):\n-                raise ValueError(\n-                    \"Per-microbatch loss arguments are not supported with \"\n-                    \"pipeline parallelism yet.\"\n-                )\n-            arg_mbs = (\n-                [(inputs,) for inputs, *_ in prepared_microbatches]\n-                if self.pp_has_first_stage\n-                else None\n+        if any(loss_kwargs for *_, loss_kwargs in prepared_microbatches):\n+            raise ValueError(\n+                \"Per-microbatch loss arguments are not supported with \"\n+                \"pipeline parallelism yet.\"\n             )\n-            kwarg_mbs = [\n-                model_kwargs for _, _, model_kwargs, _ in prepared_microbatches\n-            ]\n-            target_mbs = (\n-                [labels for _, labels, _, _ in prepared_microbatches]\n-                if self.pp_has_last_stage\n-                else None\n-            )\n-            preprocessed_microbatch_groups.append((arg_mbs, kwarg_mbs, target_mbs))\n-        return preprocessed_microbatch_groups\n+        arg_mbs = (\n+            [(inputs,) for inputs, *_ in prepared_microbatches]\n+            if self.pp_has_first_stage\n+            else None\n+        )\n+        kwarg_mbs = [model_kwargs for _, _, model_kwargs, _ in prepared_microbatches]\n+        target_mbs = (\n+            [labels for _, labels, _, _ in prepared_microbatches]\n+            if self.pp_has_last_stage\n+            else None\n+        )\n+        return (arg_mbs, kwarg_mbs, target_mbs)\n \n     def _forward_backward_body(\n         self,\n-        microbatch_groups: list[tuple[Any, ...]],\n+        microbatch_groups: list[Any],\n         global_loss_token_counts: torch.Tensor,\n         *,\n         defer_fsdp_gradient_reduction: bool,\n+        preprocess_microbatch_groups_lazily: bool = False,\n     ) -> ForwardBackwardResult:\n         \"\"\"Run all microbatch groups in one graphable call.\"\"\"\n \n         accumulated_loss: torch.Tensor | None = None\n         loss_metrics: list[dict[str, torch.Tensor]] = []\n         num_accumulation_steps = len(microbatch_groups)\n-        for accumulation_index, prepared_inputs in enumerate(microbatch_groups):\n+        for accumulation_index, microbatch_group in enumerate(microbatch_groups):\n             is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1\n+            prepared_inputs = microbatch_group\n+            if preprocess_microbatch_groups_lazily:\n+                # TODO: this waits ~4 ms per microbatch on pageable inputs and varlen's host sync\n+                # (+0.77% at 16K tokens, Qwen3-0.6B, H100). Pinned inputs + max_num_documents fix it.\n+                prepared_inputs = self._preprocess_microbatch_group(\n+                    microbatch_group,\n+                    global_routing_token_counts=self._global_routing_token_counts,\n+                )\n \n             if self.parallelism_context.dp_replicate_enabled:\n                 # All-reduce HSDP replicas only with the final accumulated gradient.",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/e95caa6a00a8e0905cb7c33797376d26a008c73f/torchtitan%2Ftraining_engine.py",
+      "sha": "5b87b09e5dd8adb41dd069a5df1b7689140a42b4",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "can it be an inner function in `MicrobatchStream.__iter__()`",
+      "created_at": "2026-10-14T04:54:48Z",
+      "diff_hunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:\n+    \"\"\"Yields this rank's microbatches in order, reading the next ones on a background thread.\n+\n+    Implements only what `TrainingEngine.forward_backward` uses: `len()` and one in-order pass.\n+\n+    Example:\n+        stream = MicrobatchStream([rdma_microbatch_0, ..., rdma_microbatch_3])\n+        len(stream)  # 4\n+        for [microbatch] in stream:\n+            train(microbatch)\n+\n+        read thread:  read 0 | read 1, read 2 | read 3  |\n+        main thread:  wait   | train 0        | train 1 | train 2 | train 3\n+    \"\"\"\n+\n+    def __init__(self, rdma_microbatches: list[RDMAMicrobatch]) -> None:\n+        self._rdma_microbatches = rdma_microbatches\n+        self.read_s = 0.0  # this rank's total read time, hidden behind training or not\n+\n+    def __len__(self) -> int:\n+        return len(self._rdma_microbatches)\n+\n+    def __iter__(self) -> Iterator[list[TrainingMicrobatch]]:\n+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=\"microbatch_read\")\n+        reads: deque[Future[TrainingMicrobatch]] = deque()\n+        try:\n+            for rdma_microbatch in self._rdma_microbatches:\n+                # Copy the actor's context: in a bare thread Monarch would start a second client.\n+                # Create the coroutine there too, so a cancelled read doesn't leave one unawaited.\n+                reads.append(\n+                    pool.submit(\n+                        contextvars.copy_context().run, self._read, rdma_microbatch\n+                    )\n+                )\n+                if len(reads) > _NUM_MICROBATCHES_READ_AHEAD:\n+                    yield [_wait_for_microbatch(reads.popleft())]\n+            while reads:\n+                yield [_wait_for_microbatch(reads.popleft())]\n+        finally:\n+            # On an error, cancel queued reads: with the controller gone, each would wait out\n+            # the 60 s RDMA timeout.\n+            pool.shutdown(cancel_futures=True)\n+\n+    def _read(self, rdma_microbatch: RDMAMicrobatch) -> TrainingMicrobatch:\n+        start = time.perf_counter()\n+        microbatch = asyncio.run(rdma_microbatch.read())\n+        self.read_s += time.perf_counter() - start\n+        return microbatch\n+\n+\n+def _wait_for_microbatch(read: Future[TrainingMicrobatch]) -> TrainingMicrobatch:",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4266925478",
+      "id": 4266925478,
+      "line": null,
+      "original_line": 163,
+      "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+      "updated_at": "2026-10-14T05:22:43Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "```suggestion\nclass RMDAMicrobatchStream:\n```\nas a more accurate scope\n\nalso \"stream\" is a bit overloaded in distributed -- can we rename to something more accurate, e.g. `Prefetcher`. I'll ask agent for help.",
+      "created_at": "2026-10-14T04:56:50Z",
+      "diff_hunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4266936732",
+      "id": 4266936732,
+      "line": null,
+      "original_line": 113,
+      "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+      "updated_at": "2026-10-14T05:22:43Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "instead, could you help move `model_kwargs[\"aux_loss_denominators\"] = global_routing_token_counts` logic into `Model.preprocess_inputs()`?",
+      "created_at": "2026-10-14T05:07:32Z",
+      "diff_hunk": "@@ -550,34 +559,28 @@ def forward_backward(\n         self.optim.zero_grad(\n             set_to_none=not self._cuda_graph_per_accumulation_group_enabled\n         )\n-        preprocessed_microbatch_groups = self._preprocess_microbatch_groups(\n-            microbatch_groups\n-        )\n         global_loss_token_counts = torch.as_tensor(\n             global_loss_token_counts, device=self.device\n         )\n-        global_routing_token_counts = global_routing_token_counts.to(self.device)\n-        for prepared_group in preprocessed_microbatch_groups:\n-            model_kwargs_collection = (\n-                prepared_group[1] if len(prepared_group) == 3 else (prepared_group[2],)\n-            )\n-            for model_kwargs in model_kwargs_collection:\n-                if \"aux_loss_denominators\" in model_kwargs:\n-                    model_kwargs[\"aux_loss_denominators\"] = global_routing_token_counts\n+        self._global_routing_token_counts = global_routing_token_counts.to(self.device)\n+        step_inputs: list[Any] = microbatch_groups\n+        if not self._preprocess_groups_lazily:\n+            step_inputs = self._preprocess_microbatch_groups(microbatch_groups)\n+            _set_aux_loss_denominators(step_inputs, self._global_routing_token_counts)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4266994986",
+      "id": 4266994986,
+      "line": null,
+      "original_line": 569,
+      "path": "torchtitan/training_engine.py",
+      "updated_at": "2026-10-14T05:22:43Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "instead of piggyback on existing `_preprocess_microbatch_groups()` by making a singleton list, could we create a dedicated `_preprocess_microbatch_group()` which can be used by both `_preprocess_groups_lazily` case and `_preprocess_microbatch_groups()`.",
+      "created_at": "2026-10-14T05:11:13Z",
+      "diff_hunk": "@@ -658,8 +661,17 @@ def _forward_backward_body(\n         accumulated_loss: torch.Tensor | None = None\n         loss_metrics: list[dict[str, torch.Tensor]] = []\n         num_accumulation_steps = len(microbatch_groups)\n-        for accumulation_index, prepared_inputs in enumerate(microbatch_groups):\n+        for accumulation_index, microbatch_group in enumerate(microbatch_groups):\n             is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1\n+            prepared_inputs = microbatch_group\n+            if self._preprocess_groups_lazily:\n+                # TODO: this waits ~4 ms per microbatch on pageable inputs and varlen's host sync\n+                # (+0.77% at 16K tokens, Qwen3-0.6B, H100). Pinned inputs + max_num_documents fix it.\n+                prepared_groups = self._preprocess_microbatch_groups([microbatch_group])",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4267014984",
+      "id": 4267014984,
+      "line": null,
+      "original_line": 670,
+      "path": "torchtitan/training_engine.py",
+      "updated_at": "2026-10-14T05:22:43Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "This doesn't seem to be robust. For pretraining Trainer, it'd never need to use this flag.\r\n\r\nI'd suggest\r\n- we make it a config `preprocess_microbatch_groups_lazily` default to `False` and note that it is needed in RL to overlap controller -> trainer data transfer and trainer fwd-bwd.\r\n- error out in `post_init` when it's used with `disable_cuda_graphs=False`. Add a TODO because with @sanketpurandare 's multiple smaller cudagraphs idea, it'd work in the future.\r\n- I actually haven't realized why it couldn't work with sdc_replay, although anyways I don't mind it being banned for now.",
+      "created_at": "2026-10-14T05:22:23Z",
+      "diff_hunk": "@@ -487,6 +492,10 @@ def _initialize_forward_backward(self) -> None:\n         )\n         self._run_forward_backward = eager_forward_backward_fn\n         if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():\n+            # Preprocess each group just before its forward, so the device holds one group's\n+            # inputs at a time. With SDC replay, which reruns the step on the same inputs, the\n+            # engine preprocesses up front.\n+            self._preprocess_groups_lazily = self.sdc_replayer is None",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4267078173",
+      "id": 4267078173,
+      "line": null,
+      "original_line": 498,
+      "path": "torchtitan/training_engine.py",
+      "updated_at": "2026-10-14T05:27:20Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "reply from claude: Done, it's an inner function of `__iter__` now.\n",
+      "created_at": "2026-10-15T02:42:29Z",
+      "diff_hunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:\n+    \"\"\"Yields this rank's microbatches in order, reading the next ones on a background thread.\n+\n+    Implements only what `TrainingEngine.forward_backward` uses: `len()` and one in-order pass.\n+\n+    Example:\n+        stream = MicrobatchStream([rdma_microbatch_0, ..., rdma_microbatch_3])\n+        len(stream)  # 4\n+        for [microbatch] in stream:\n+            train(microbatch)\n+\n+        read thread:  read 0 | read 1, read 2 | read 3  |\n+        main thread:  wait   | train 0        | train 1 | train 2 | train 3\n+    \"\"\"\n+\n+    def __init__(self, rdma_microbatches: list[RDMAMicrobatch]) -> None:\n+        self._rdma_microbatches = rdma_microbatches\n+        self.read_s = 0.0  # this rank's total read time, hidden behind training or not\n+\n+    def __len__(self) -> int:\n+        return len(self._rdma_microbatches)\n+\n+    def __iter__(self) -> Iterator[list[TrainingMicrobatch]]:\n+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=\"microbatch_read\")\n+        reads: deque[Future[TrainingMicrobatch]] = deque()\n+        try:\n+            for rdma_microbatch in self._rdma_microbatches:\n+                # Copy the actor's context: in a bare thread Monarch would start a second client.\n+                # Create the coroutine there too, so a cancelled read doesn't leave one unawaited.\n+                reads.append(\n+                    pool.submit(\n+                        contextvars.copy_context().run, self._read, rdma_microbatch\n+                    )\n+                )\n+                if len(reads) > _NUM_MICROBATCHES_READ_AHEAD:\n+                    yield [_wait_for_microbatch(reads.popleft())]\n+            while reads:\n+                yield [_wait_for_microbatch(reads.popleft())]\n+        finally:\n+            # On an error, cancel queued reads: with the controller gone, each would wait out\n+            # the 60 s RDMA timeout.\n+            pool.shutdown(cancel_futures=True)\n+\n+    def _read(self, rdma_microbatch: RDMAMicrobatch) -> TrainingMicrobatch:\n+        start = time.perf_counter()\n+        microbatch = asyncio.run(rdma_microbatch.read())\n+        self.read_s += time.perf_counter() - start\n+        return microbatch\n+\n+\n+def _wait_for_microbatch(read: Future[TrainingMicrobatch]) -> TrainingMicrobatch:",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474269",
+      "id": 4278474269,
+      "line": null,
+      "original_line": 163,
+      "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+      "updated_at": "2026-10-15T02:42:29Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude: Renamed to `RDMAMicrobatchPrefetcher`: RDMA for the scope, and \"prefetcher\" for what it does (the trainer already has CUDA streams).\n",
+      "created_at": "2026-10-15T02:42:31Z",
+      "diff_hunk": "@@ -97,6 +105,67 @@ def register(cls, tensor: torch.Tensor) -> _TensorRef:\n         )\n \n \n+# Reads queued behind the one the engine waits on. A rank holds at most 4 microbatches on\n+# the host: these 2, the one waited on, and the previous one, still in the engine's loop.\n+_NUM_MICROBATCHES_READ_AHEAD = 2\n+\n+\n+class MicrobatchStream:",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474393",
+      "id": 4278474393,
+      "line": null,
+      "original_line": 113,
+      "path": "torchtitan/rl/distributed/rdma_microbatch.py",
+      "updated_at": "2026-10-15T02:42:31Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude: Done, in its own draft PR right below this one in the stack: `preprocess_inputs` now takes `global_routing_token_counts`, and each model with an aux loss puts it in `aux_loss_denominators`, where it writes `None` today. `_set_aux_loss_denominators` is gone, and this PR is back to its own files.\n",
+      "created_at": "2026-10-15T02:42:32Z",
+      "diff_hunk": "@@ -550,34 +559,28 @@ def forward_backward(\n         self.optim.zero_grad(\n             set_to_none=not self._cuda_graph_per_accumulation_group_enabled\n         )\n-        preprocessed_microbatch_groups = self._preprocess_microbatch_groups(\n-            microbatch_groups\n-        )\n         global_loss_token_counts = torch.as_tensor(\n             global_loss_token_counts, device=self.device\n         )\n-        global_routing_token_counts = global_routing_token_counts.to(self.device)\n-        for prepared_group in preprocessed_microbatch_groups:\n-            model_kwargs_collection = (\n-                prepared_group[1] if len(prepared_group) == 3 else (prepared_group[2],)\n-            )\n-            for model_kwargs in model_kwargs_collection:\n-                if \"aux_loss_denominators\" in model_kwargs:\n-                    model_kwargs[\"aux_loss_denominators\"] = global_routing_token_counts\n+        self._global_routing_token_counts = global_routing_token_counts.to(self.device)\n+        step_inputs: list[Any] = microbatch_groups\n+        if not self._preprocess_groups_lazily:\n+            step_inputs = self._preprocess_microbatch_groups(microbatch_groups)\n+            _set_aux_loss_denominators(step_inputs, self._global_routing_token_counts)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474518",
+      "id": 4278474518,
+      "line": null,
+      "original_line": 569,
+      "path": "torchtitan/training_engine.py",
+      "updated_at": "2026-10-15T02:42:32Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude: Done: `_preprocess_microbatch_group()` prepares one group; `_preprocess_microbatch_groups()` is a loop over it, and the lazy path calls it directly.\n",
+      "created_at": "2026-10-15T02:42:33Z",
+      "diff_hunk": "@@ -658,8 +661,17 @@ def _forward_backward_body(\n         accumulated_loss: torch.Tensor | None = None\n         loss_metrics: list[dict[str, torch.Tensor]] = []\n         num_accumulation_steps = len(microbatch_groups)\n-        for accumulation_index, prepared_inputs in enumerate(microbatch_groups):\n+        for accumulation_index, microbatch_group in enumerate(microbatch_groups):\n             is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1\n+            prepared_inputs = microbatch_group\n+            if self._preprocess_groups_lazily:\n+                # TODO: this waits ~4 ms per microbatch on pageable inputs and varlen's host sync\n+                # (+0.77% at 16K tokens, Qwen3-0.6B, H100). Pinned inputs + max_num_documents fix it.\n+                prepared_groups = self._preprocess_microbatch_groups([microbatch_group])",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474636",
+      "id": 4278474636,
+      "line": null,
+      "original_line": 670,
+      "path": "torchtitan/training_engine.py",
+      "updated_at": "2026-10-15T02:42:33Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude: Done:\n- `training.preprocess_microbatch_groups_lazily: bool = False`, in `TrainingConfig` next to `cuda_graph_per_accumulation_group`.\n- `TrainingEngine.Config.__post_init__` raises if it is set with CUDA graphs on (with the TODO) or with SDC replay.\n\nWhy not SDC: replay reruns a checked step on the same inputs. Lazily, each rerun would preprocess again (counting `ntokens_seen` again) and read every microbatch over RDMA again.\n",
+      "created_at": "2026-10-15T02:42:34Z",
+      "diff_hunk": "@@ -487,6 +492,10 @@ def _initialize_forward_backward(self) -> None:\n         )\n         self._run_forward_backward = eager_forward_backward_fn\n         if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():\n+            # Preprocess each group just before its forward, so the device holds one group's\n+            # inputs at a time. With SDC replay, which reruns the step on the same inputs, the\n+            # engine preprocesses up front.\n+            self._preprocess_groups_lazily = self.sdc_replayer is None",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#discussion_r4278474728",
+      "id": 4278474728,
+      "line": null,
+      "original_line": 498,
+      "path": "torchtitan/training_engine.py",
+      "updated_at": "2026-10-15T02:42:34Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "@claude review the PR and my review",
+      "created_at": "2026-10-14T05:23:00Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#issuecomment-6161537824",
+      "id": 6161537824,
+      "updated_at": "2026-10-14T05:23:00Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "**Claude finished @tianyu-l's task in 2m 0s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/38516335485)\n\n---\n### Review of #5286 and @tianyu-l's review\n\n- [x] Gather context\n- [x] Read the diff (engine, `rdma_microbatch.py`, trainer, tests)\n- [x] Assess each review comment\n- [x] Do my own review pass\n- [x] Post the findings\n\nThe design holds up. `MicrobatchStream` is a small one-pass iterator, and the CUDA graph and SDC paths still drain it up front, so they stay correct. I agree with all five of @tianyu-l's comments. The opt-in config is the most important, because it stops this PR from changing behavior that has nothing to do with RL. I found no blocking bugs in what the PR does today; there are a few smaller issues at the end.\n\n---\n\n### On @tianyu-l's comments\n\n**1. `training_engine.py:498`: make lazy preprocessing an explicit config (strongly agree)**\n\nRight now lazy preprocessing turns on for **every** eager run without SDC: pretraining recipes with `disable_cuda_graphs=True`, ROCm (`not cuda_graphs_supported()`), Flux and DeepSeek-V3. The PR's own NOTE says this path costs about 4 ms per microbatch (pageable H2D plus varlen's host sync), and it was not measured on Flux, DSv3 or ROCm. Pretraining gets nothing from it, since its inputs come from a dataloader and are already pinned. That cuts against \"protect battle-tested code paths.\" Suggestions:\n- Add `training.preprocess_microbatch_groups_lazily: bool = False`. The docstring should say it exists so RL can overlap the controller -> trainer transfer with forward/backward. Turn it on in the RL recipes, which all set `disable_cuda_graphs=True` already.\n- In `__post_init__`, raise `ValueError` if it is set with `disable_cuda_graphs=False` or with `sdc_replayer`. ROCm with `disable_cuda_graphs=False` would then be rejected even though it runs eagerly. That's fine: the user sets the flag explicitly.\n- `GraphTrainingEngine` overrides both `_initialize_forward_backward` and `_forward_backward_body`, so it would silently ignore the new flag. It should reject the flag, or at least warn.\n- On the RL side, an RDMA run (`rdma_fast_path_threshold` set) with lazy preprocessing off still works, because the engine drains the stream up front. But nothing overlaps, so warn once, per the \"silently skips user configuration\" rule.\n- This also removes the `_preprocess_groups_lazily=False` lines added to about 8 `SimpleNamespace` engine fakes in the tests.\n\n**Why it can't work with SDC replay (your question):** `SDCReplayer.run_fwd_bwd` calls `execute` **twice** on a checked step (`sdc_replayer.py:376`, `_run_checked`). With lazy preprocessing, `execute` iterates over the raw `microbatch_groups`, so the replay would:\n- (a) re-run `_preprocess_microbatch_groups`, which **double-counts `ntokens_seen`** (`training_engine.py:613`). That value is checkpointed state.\n- (b) iterate `MicrobatchStream` a second time. `__iter__` builds a new pool and **reads every microbatch over RDMA again**, even though the class says it supports only one pass.\n- (c) for pretraining, it would also re-run H2D and mask building inside the region being checked.\n\nBanning the combination is right. It would help to say why in the `ValueError` message.\n\n**2. `training_engine.py:670`: add a dedicated `_preprocess_microbatch_group()` (agree)**\n\nThe pattern `self._preprocess_microbatch_groups([microbatch_group])` followed by `[prepared_inputs] = prepared_groups` is awkward. The plural method's loop body (lines 597-649) splits cleanly into a singular method that returns one prepared tuple. The plural one becomes `[self._preprocess_microbatch_group(g) for g in groups]`. The `ntokens_seen` accounting would live in the singular method. `GraphTrainingEngine._preprocess_microbatch_groups` overrides the plural method and never runs lazily, so it can stay as is.\n\n**3. `training_engine.py:569`: move the `aux_loss_denominators` fill into `Model.preprocess_inputs()` (agree)**\n\nBenefits:\n- It removes `_set_aux_loss_denominators`. That helper detects PP vs non-PP by checking whether the tuple has 3 or 4 elements.\n- It removes the `self._global_routing_token_counts` attribute, which exists only to pass state from one call to the next.\n- The PP path and `GraphTrainingEngine` get it for free.\n\nThe models already write `input_dict[\"aux_loss_denominators\"] = None` as a placeholder, so they would write the real tensor instead. To audit every callsite, the new keyword has to reach:\n- `models/base/model.py:52` (signature)\n- `common/decoder.py:331`\n- `qwen3_5/model.py:557`\n- `deepseek_v3/mtp.py:326` (per-depth tensor; it already checks `numel() == len(mtp_layers) + 1`)\n- `kimi_k3/model.py:544`\n- `kimi_k2_7/model.py:182`\n- the `**kwargs` overrides: flux, muse_glimmer, `transformers_modeling_backend`\n- `graph_trainer/precompile_main.py:267`, which fills the value by hand\n\nTwo caveats:\n- `preprocess_inputs` runs under `activate_spmd()`. The value must be set **after** `annotate_input_spmd_types`, so it stays a plain tensor as it is today.\n- `forward_backward` always receives `global_routing_token_counts`. The new keyword can therefore be required rather than defaulting to `None`.\n\nThis could be its own small PR before this one, since it touches every model.\n\n**4. `rdma_microbatch.py:113`: rename (agree, with one fix)**\n\nThe suggested name has a typo: `RMDAMicrobatchStream` should be `RDMA...`. I agree that \"stream\" is overloaded: CUDA streams appear all through `training_engine.py`. I'd use **`RDMAMicrobatchPrefetcher`**. It names the scope (RDMA) and what it does (reads ahead). Also update:\n- the test names (`test_microbatch_stream_*`)\n- the module docstring in `test_rdma_microbatch.py`\n- the imports in `rl/trainer.py` and `tests/rl/unit_tests/cpu/test_trainer.py`\n- the \"read through the stream\" comment in `test_trainer.py`\n\n**5. `rdma_microbatch.py:163`: make `_wait_for_microbatch` an inner function of `__iter__` (agree)**\n\nIt is used only there. `_read` could also be a closure, accumulating into a local and assigning `self.read_s` in the `finally`.\n\n---\n\n### My own findings\n\n1. **The `finally` cleanup only runs when the generator is closed** (`rdma_microbatch.py:148-151`). If forward/backward raises mid-step, the `enumerate(microbatch_groups)` iterator in `_forward_backward_body` stays alive as long as the traceback is referenced. Monarch's actor error handling may keep it, so the `shutdown(cancel_futures=True)` that cancels the queued reads can run late or never.\n   - Also, `shutdown()` defaults to `wait=True`, so if the controller is gone, the read already in flight still blocks for up to the 60 s RDMA timeout.\n   - The comment \"On an error, cancel queued reads\" reads as stronger than what happens. Either call `iterator.close()` explicitly from the engine loop, which is awkward in core, or reword the comment to describe the real behavior.\n   - The current test (`iterator.close()`) only covers the explicit-close case.\n2. **`read_s` accumulates across iterations.** If anything iterates twice (see the SDC point above), the reported `read_microbatches/max` doubles. Renaming the class to a prefetcher and documenting it as one-pass, or raising on a second `__iter__`, would make the contract explicit.\n3. **The cross-thread write to `read_s`** is safe today: `pool.shutdown()` in the `finally` joins the worker before `Trainer` reads the value. A comment saying the value is valid only after iteration ends would stop someone from reading it mid-step.\n4. **`_step_num_tokens_per_dp_rank` now counts tokens differently** (`rl/trainer.py:269`). It changed from `sum(labels.numel())` to `len(microbatches) * num_tokens_per_microbatch_per_dp_rank`. That matches `Batcher`'s fixed `rows x seq_len` padding (`batcher.py:204`), so the value is the same today. But the by-value path now trusts an invariant it used to compute directly. This is fine; just pointing it out.\n5. **The `_ForwardBackwardFn` type is now `list[Any]`.** After the config change, it might be clearer to type it as `Sequence[list[TrainingMicrobatch]] | list[tuple[Any, ...]]`, and to change `forward_backward`'s `microbatch_groups` annotation from `list[...]` to `Sequence`/`Sized & Iterable`. A `MicrobatchStream` is not a `list`.\n6. **Test timing:** `test_microbatch_stream_yields_in_order_and_reads_two_ahead` uses sleeps, but a read past the window is structurally impossible, so it can't fail spuriously. 👍\n\n### Summary\n- **Blocking:** the opt-in config (#1). It keeps pretraining and ROCm on the code path that has been validated.\n- **Cleanups:** #2, #4 and #5 are small refactors worth doing in this PR. #3 touches every model variant and might fit better as a separate PR before this one.\n- **Not done:** I didn't run any tests or GPU jobs. This is a read-only review.",
+      "created_at": "2026-10-14T05:23:27Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#issuecomment-6161542980",
+      "id": 6161542980,
+      "updated_at": "2026-10-14T05:25:42Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "reply from claude: Thanks. Also done from this review:\n- `GraphTrainer` rejects the lazy flag.\n- The RL controller warns when RDMA is on but lazy preprocessing is off.\n- The `finally` comment says when the queued reads are cancelled (the read in flight still finishes).\n- `read_s` is documented as final once the pass ends.\n\nLeft as is:\n- Lazy stays off in the RL recipes: by value it costs ~4 ms per microbatch and hides nothing, so it pairs with the opt-in `rdma_min_tensor_bytes`.\n- `_global_routing_token_counts` stays for the lazy path: preprocessing then runs inside `_forward_backward_body`, whose signature the CUDA-graph wrappers share.\n- The new keyword (now in the PR below this one) defaults to `None`: the validator calls `preprocess_inputs` without routing counts.\n- `_read` stays a method: it adds to `read_s`.\n",
+      "created_at": "2026-10-15T02:42:36Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#issuecomment-6183186666",
+      "id": 6183186666,
+      "updated_at": "2026-10-15T02:42:36Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5286,
+  "refs": {
+    "base": {
+      "commit": "4b68c5ea28f6c9818e24c30aa47a341c4cf3ddfd",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "e95caa6a00a8e0905cb7c33797376d26a008c73f",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5513236189",
+      "id": 5513236189,
+      "state": "CHANGES_REQUESTED",
+      "submitted_at": "2026-10-14T05:22:43Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527421918",
+      "id": 5527421918,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T02:42:29Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422043",
+      "id": 5527422043,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T02:42:31Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422166",
+      "id": 5527422166,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T02:42:32Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422282",
+      "id": 5527422282,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T02:42:33Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5527422380",
+      "id": 5527422380,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T02:42:34Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5286#pullrequestreview-5528045239",
+      "id": 5528045239,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-15T04:30:21Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ]
+}

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/basic/data_prep.md
-raw_sha256: fc9b9a2e3b7dae37ca5e0d8d52205a1e1c7829cbbd492677ed57e9874ee68b2e
+raw_sha256: 61bc96b43877e1fe96c221ff58ebf845ce8c71f6e50f90b9ea16011d56c64cef
 sources: []
-generated_body_sha256: eed13c05bef37d12e4df0638031e2ea02f356101ee8900a603abcf65bde22c9f
+generated_body_sha256: fe6a66a01810d2f9a3b869f788c504a0c3ea05b97a56060d73f4e2ba7961e846
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/basic/data_prep.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/basic/data_prep.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/basic/data_prep.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -99,7 +99,7 @@ These are the typical steps to get your data ready:
 3. Run our preparation tool `energon prepare` **on both datasets** (yes also on JSONL files) to convert to an energon-compatible format
     * Configure WebDataset-based crude datasets as `CrudeWebdataset`; JSONL datasets are loaded as crude data by default.
     * For the auxiliary datasets, we recommend to enable the [media metadata feature](media-metadata) to store additional information about the media (like image size, resolution, video duration etc.)
-4. Create a [metadataset](../basic/metadataset) that specifies what auxiliary data to load for each primary dataset
+4. Create a [recipe](../basic/recipe) that specifies what auxiliary data to load for each primary dataset
     * For more details read about [crude data](crude-data)
 
 (create-jsonl-dataset)=
@@ -136,7 +136,7 @@ each file containing the JSON from one of the lines above.
 
 None of the JSON fields is mandatory. The data is considered to be crude data and will be interpreted by your custom [cooker](crude-data).
 If you want to include media, you should include file names of the media files in the JSON.
-A metadataset with [auxiliary data](aux-data) can then be used to load the media on the fly.
+A recipe with [auxiliary data](aux-data) can then be used to load the media on the fly.
 
 Here's an example of how a polylithic JSONL dataset with images might look like:
 
@@ -149,14 +149,14 @@ Steps needed:
 
 1. Create the JSONL file according to your needs
 2. Run `energon prepare /path/to/my_dataset.jsonl` to create an index next to it
-3. Optionally create a [metadataset](../basic/metadataset) that specifies what auxiliary data to load for each primary dataset
+3. Optionally create a [recipe](../basic/recipe) that specifies what auxiliary data to load for each primary dataset
     * For more details read about [crude data](crude-data)
 
-The metadataset would then refer to the JSONL dataset while specifying the auxiliary data source:
+The recipe would then refer to the JSONL dataset while specifying the auxiliary data source:
 
 ```yaml
 __module__: megatron.energon
-__class__: MetadatasetV2
+__class__: Recipe
 splits:
   train:
     path: /path/to/my_dataset.jsonl
@@ -381,7 +381,7 @@ These are the possible integrated types you can currently choose from:
   * Attributes:
     * {py:attr}`__key__: str <megatron.energon.Sample.__key__>`: Unique identifier of the sample within the dataset. Useful for backtracking the source of a single sample.
     * {py:attr}`__key__: str <megatron.energon.Sample.__restore_key__>`: Structured key of the sample, which can be used to regenerate the sample without storing the whole sample.
-    * {py:attr}`__subflavors__: dict[str, Any] | None <megatron.energon.Sample.__subflavors__>`: Represents the subflavors (i.e. custom dict data) set for the source dataset (typically in the metadataset).
+    * {py:attr}`__tags__: dict[str, Any] | None <megatron.energon.Sample.__tags__>`: Represents the tags (i.e. custom dict data) set for the source dataset (typically in the recipe).
   * {py:class}`CaptioningSample <megatron.energon.CaptioningSample>`: Represents a sample for captioning
     * Attributes:
       * {py:attr}`image: torch.Tensor <megatron.energon.CaptioningSample.image>`: The input image tensor

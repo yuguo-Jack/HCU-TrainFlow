@@ -1,0 +1,696 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "ed660c6c092e426d9603e3eb7e029aba3d3a80915bf4712fae6d44bfa5657d17",
+      "isPrivate": false,
+      "numbers": [
+        52296,
+        52244,
+        52240,
+        52231,
+        52229,
+        52215,
+        52190,
+        52183
+      ],
+      "observed_at": "2026-10-19T20:27:31.692373+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4967,
+        "resetAt": "2026-10-19T21:21:39Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "69d4c3a06bf8d087455544db8cea570721eca415",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "# [kimik3][ROCm] Enable torch.compile for so post-grad fusion passes work (aiter::fused_qk_rmsnorm_kernel, aiter::allreduce_fusion_kernel_1stage)\r\n\r\n## Purpose\r\n\r\nKimi-K3's model classes carry no `@support_torch_compile` and vLLM logs:\r\n\r\n```\r\n`torch.compile` is turned on, but the model /path/to/Kimi-K3 does not support it.\r\nPlease open an issue on GitHub if you want it to be supported.\r\n```\r\n\r\nBecause there is no inductor post-grad graph, **none of the fusion passes ever run\r\nfor K3** — even though they are enabled in the config and reported as active at\r\nstartup:\r\n\r\n```\r\nINFO [config/compilation.py] Enabled custom fusions: norm_quant, act_quant, allreduce_rms, mla_dual_rms_norm\r\n... 'pass_config': {..., 'fuse_mla_dual_rms_norm': True, 'fuse_allreduce_rms': True, ...}\r\n```\r\n\r\nIn particular `MLADualRMSNormFusionPass` already knows how to fuse the paired MLA\r\n`q_a_layernorm` + `kv_a_layernorm` into AITER's `fused_qk_rmsnorm` kernel, but it\r\nnever sees a graph. Confirmed by instrumenting `VllmFusionPatternMatcherPass.__call__`:\r\nzero pass invocations and zero pattern dumps on an otherwise fully-configured run.\r\n\r\nThis PR enables compilation so the existing passes can do their job. Two of the\r\nthree changes are **correctness fixes** that compilation exposes rather than\r\noptimizations.\r\n\r\n## Changes\r\n\r\n1. **`vllm/models/kimi_k3/amd/linear.py`** — add `@support_torch_compile` to\r\n   `KimiLinearModel`. Its `__init__(self, *, vllm_config, prefix)` and `forward`\r\n   signatures already match the shape the decorator expects (same as\r\n   `DeepseekV2Model`).\r\n\r\n2. **`vllm/models/kimi_k3/amd/kda.py` + `vllm/config/compilation.py`** — wrap the\r\n   KDA conv1d + recurrent/chunk core in a `kimi_kda_attention_core` custom op\r\n   declaring `mutates_args=[\"core_attn_out\"]`, and add\r\n   `vllm::kimi_kda_attention_core` to the default `splitting_ops`.\r\n\r\n   **This is required for correctness, not perf.** `KimiGatedDeltaNetAttention._forward`\r\n   writes its result in place into a caller-allocated `core_attn_out` and returns\r\n   `None`, and was not a registered custom op. Under fullgraph capture the call\r\n   therefore has no compiler-visible effect and the entire linear-attention path is\r\n   eliminated: with only the decorator applied, **all KDA kernels for all 69 KDA\r\n   layers stop executing** (K3 is 24 MLA + 69 KDA), while the surrounding `o_proj`\r\n   and MoE keep running on the uninitialized `torch.empty` buffer. It fails\r\n   silently — no exception, no graph-break warning, just degenerate output. Follows\r\n   the existing `vllm::qwen_gdn_attention_core` pattern.\r\n\r\n3. **`vllm/models/kimi_k3/amd/ops/attn_res.py`** — register the attention-residual\r\n   Triton launcher as `vllm::kimi_attn_res` with `mutates_args=[\"blocks\"]`.\r\n\r\n   Two problems, one op. First, the launcher picks its tile shape with a host-side\r\n   branch on the token count:\r\n\r\n   ```python\r\n   if num_tokens >= 256 or num_blocks <= 1:\r\n       block_l, num_warps = 1, 4\r\n   else:\r\n       block_l, num_warps = 4, 8\r\n   ```\r\n\r\n   Dynamo traced this, evaluated it on the large profile-run batch and emitted the\r\n   dynamic-shape guard `s72 >= 256`. vLLM's wrapper drops guards, so the artifact\r\n   specialized for the `>= 256` branch was silently reused for small decode\r\n   batches. Second, with `block_write_idx >= 0` the kernel stores its prefix sum\r\n   into `blocks` in place (`WRITE_BLOCK`), which is invisible to the compiler\r\n   unless declared. Both are fixed by making this a custom op with the mutation\r\n   declared; found via `TORCH_TRACE` + `tlparse`, reading the `user_stack` field of\r\n   the raw `guard_added_fast` records.\r\n\r\n4. **`vllm/models/kimi_k3/amd/latent_moe_runner.py`** — fullgraph capture cannot\r\n   trace `logging.Logger` methods\r\n   ([gb0291](https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0291.html)):\r\n\r\n   ```\r\n   torch._dynamo.exc.Unsupported: logging.Logger method not supported for non-export cases\r\n     Developer debug context: method: <Logger vllm.models.kimi_k3.amd.latent_moe_runner>.info_once\r\n     from user code: latent_moe_runner.py:67 in _shard_up_proj_tail\r\n   ```\r\n\r\n   The one-shot diagnostic in `_shard_up_proj_tail` is hoisted into `__init__` under\r\n   the same `self._tail_shardable` condition that gates its only call site, so the\r\n   message is preserved and both the logger call and the `_logged_sharded_tail`\r\n   state mutation leave the traced hot path.\r\n\r\n**No changes to any fusion pass or pattern.** The existing DeepSeek-shaped MLA\r\ndual-RMSNorm pattern matches K3 unmodified.\r\n\r\n## Test Plan\r\n\r\nKimi-K3, MI355X, TP8, MXFP4 weights, AITER enabled. Two stacks:\r\n\r\n- **A — upstream nightly, no spec decoding**, `--kv-cache-dtype fp8_e4m3`.\r\n  Decode-only torch-profiler capture, three arms on identical settings\r\n  (ISL 2048 / OSL 96 / concurrency 16, `wait_iterations=40`, `active_iterations=2`).\r\n  All windows verified pure decode — `execute_context_0(0)_generation_16(16)`,\r\n  zero prefill-attention kernels.\r\n- **B — AMD downstream K3 stack with DSpark MTP + CUDA graphs**\r\n  (`FULL_AND_PIECEWISE`, `--kv-cache-dtype fp8`, `num_speculative_tokens=2`),\r\n  i.e. the configuration this model is actually served in. Added because\r\n  compilation interacts with cudagraph capture and speculative decoding, and\r\n  stack A exercises neither. Using agentX coni\r\n- **Accuracy** — gsm8k via lm-eval against `/v1/completions`.\r\n\r\n## Test Result\r\n\r\n### Fusion passes now run (stack A)\r\n\r\nCumulative match table for one full model forward, per rank:\r\n\r\n```\r\nmla_dual_rms_norm_fusion_pass                  : 24   <- 1 per MLA layer (K3 has 24)\r\nrocm_aiter_allreduce_fusion_pass               : 92   <- ~1 per layer (K3 has 93)\r\nactivation_quant_fusion_pass                   :  0\r\nrocm_aiter_silu_mul_fp8_group_quant_fusion_pass:  0\r\nRocmAiterRMSNormQuantFusionPass                :  0\r\n```\r\n\r\n`24` is exactly the MLA layer count, i.e. single coverage with no double counting.\r\nCross-check against the per-graph-piece `Replaced N patterns` lines: 16x1 + 8x2 +\r\n176x4 = 736 across 8 ranks = 92/rank. Identical with and without the KDA custom\r\nop, i.e. the new splitting op does not disturb the fusions.\r\n\r\n### Kernel counts, pure-decode window (stack A, 2 steps, rank 0)\r\n\r\n| kernel group | eager | decorator only | **this PR** |\r\n|---|---|---|---|\r\n| MLA attention (24 x 2) | 48 | 48 | **48** |\r\n| MoE `mfma_moe1` (92 x 2) | 184 | 184 | **184** |\r\n| KDA `causal_conv1d` + `fused_recurrent_kda` | 276 | **0** ❌ | **276** ✅ |\r\n| `aiter::fused_qk_rmsnorm_kernel` (24 x 2) | 0 | 48 | **48** |\r\n| `add_rmsnorm_quant` (all) | 282 | 2 | **2** |\r\n| `aiter::allreduce_fusion_kernel_1stage` | 0 | 184 | **184** |\r\n\r\nThe middle column is the decorator applied *without* change (2) — included to show\r\nthe silent KDA loss that change (2) fixes. Corroborated independently of the\r\nprofiler by the server log: stock and this PR both log\r\n`Triton kernel JIT compilation during inference:` for `chunk_kda_fwd_kernel_intra_sub_chunk`,\r\n`fused_recurrent_kda_fwd_kernel`, `_causal_conv1d_fwd_kernel` and seven more\r\n(223 / 224 lines); the decorator-only build logs **none** of them.\r\n\r\n### Norm kernels in detail (stack A)\r\n\r\n| Norm kernel | eager | this PR |\r\n|---|---|---|\r\n| `add_rmsnorm_quant` — `q_a_layernorm` | 48 x 230.392 us | — |\r\n| `add_rmsnorm_quant` — `kv_a_layernorm` | 48 x 218.353 us | — |\r\n| **`aiter::fused_qk_rmsnorm_kernel<bf16,256,8,true,1>`** | — | **48 x 231.194 us** |\r\n| `add_rmsnorm_quant` — per-layer input/post-attn | 184 x 912.578 us | — (folded into allreduce fusion) |\r\n| `add_rmsnorm_quant` — final norm | 2 x 10.718 us | 2 x 11.078 us |\r\n\r\n96 launches / 448.745 us collapse into 48 launches / 231.194 us of\r\n`aiter::fused_qk_rmsnorm_kernel<std::bfloat16_t, 256, 8, true, 1>`, and the 184\r\nstandalone per-layer norms are absorbed by the 92 allreduce+RMSNorm fusions.\r\nDecode is where this matters: AITER's `_fused_qk_rmsnorm` wrapper deliberately\r\nfalls back to two separate `rmsnorm` calls at `m >= 16384` tokens, so the fused\r\nkernel is the decode / small-batch path.\r\n\r\n### Works under CUDA graphs + speculative decoding (stack B)\r\n\r\nPure-decode capture, DSpark MTP, concurrency 2 (verify batch\r\n`2*CONC*(1+num_spec)` = 12), `FULL_AND_PIECEWISE`, 6 engine steps, rank 0.\r\nWindow verified pure decode: `execute_context_0(0)_generation_2(6)` x12, no\r\nprefill kernels.\r\n\r\n| kernel group | launches | per step | expected |\r\n|---|---|---|---|\r\n| `aiter::fused_qk_rmsnorm` | 144 | 24 | 24 MLA layers ✅ |\r\n| `allreduce_fusion_kernel_1stage` | 558 | 93 | 93 layers ✅ |\r\n| `fused_recurrent_kda` + `causal_conv1d_update` | 828 | 69 + 69 | 69 KDA layers ✅ |\r\n| MLA `mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps` | 144 | 24 | 24 ✅ |\r\n\r\nThe KDA path stays fully alive at 69 layers/step with compilation, cudagraph\r\ncapture and MTP all active simultaneously, and the QK fusion covers exactly all\r\n24 MLA layers.\r\n\r\nTrace showing Cuda graph + MTP + compiler pass fusions active\r\n<img width=\"2890\" height=\"687\" alt=\"image\" src=\"https://github.com/user-attachments/assets/0c93dcd2-6533-4c7b-b48c-17aacd781306\" />\r\n\r\n### Accuracy — no regression\r\n\r\n| stack | harness | baseline | this PR |\r\n|---|---|---|---|\r\n| A (no spec decode) | gsm8k, full 1319, 5-shot, greedy | 0.9098 ± 0.0079 | **0.9257 ± 0.0072** |\r\n| B (DSpark MTP + cudagraph) | gsm8k, 250-sample, 5-shot | 0.988 | **0.984** |\r\n\r\nStack A's delta is within ~1.5 combined standard errors. Stack B was run with\r\n`rejection_sample_method=block`; the `synthetic` variant is a throughput\r\napproximation and is not a valid accuracy configuration.\r\n\r\n## Known limitation: CUDA graph capture ladder (stack B)\r\n\r\nOn the AMD downstream MTP stack, enabling compilation narrows the range of CUDA\r\ngraph capture sizes that can be captured. Outside that range the **per-size warmup\r\nforward** — before any capture begins, descending from the largest size — dies with\r\n`Memory access fault by GPU node-N`.\r\n\r\n**Root cause is not yet understood.** It is reported here rather than left for a\r\nreviewer to hit. Note this is observed only on the downstream stack — the DSpark\r\nMTP method and that cudagraph path are not upstream — so it may not be reachable\r\nfrom an upstream configuration. It does not affect stack A, which captures the\r\ndefault ladder without incident.\r\n\r\n\r\n",
+      "changedFiles": 5,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @rbrugaro-amd.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-08-13T18:21:19Z",
+            "databaseId": 5284721760,
+            "updatedAt": "2026-08-13T18:21:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-5284721760"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "stefanskiasan"
+            },
+            "body": "Independently validated this on a real 2.8T MXFP4 Kimi-K3 / 8× MI350X (gfx950), applied on top of `vllm/vllm-openai-rocm:nightly` (patch applies cleanly with fuzz 3).\n\nWith `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `-O3` the fusion engages (`module_fused_qk_norm_rope_cache_quant_shuffle` loads) and warm decode throughput at N=128 goes from ~1578 tok/s (ROCM_AITER_MLA, no compile) to **~1650 tok/s (+4%)**. Cost: ~9 min inductor compile at first boot (cached after), ~2 warmup bursts before the graphs are hot. No correctness issues observed across a short + long-context (up to 1M) sweep.\n\nThanks for the fix — would love to see this land.",
+            "createdAt": "2026-08-14T22:47:40Z",
+            "databaseId": 5298912353,
+            "updatedAt": "2026-08-14T22:47:40Z",
+            "url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-5298912353"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "stefanskiasan"
+            },
+            "body": "Correction to my earlier comment: I have to retract the \"no correctness issues observed\" part. On re-check, this Kimi-K3 / gfx950 / nightly stack produces **degenerate repeated-token output** (e.g. \"2 + 2 =\" → \" 1. 1. 1\") — I had only measured throughput, not correctness. The degeneration reproduces with the aiter/flydsl MXFP4 MoE and disappears with `VLLM_ROCM_USE_AITER_MOE=0` (emulation MoE stays coherent), so it looks like the MXFP4-MoE weight-layout issue tracked in #52240 rather than anything in this torch.compile PR. My earlier throughput numbers here were therefore measured on a model that was emitting garbage — please disregard the \"+4%\" figure until the MoE correctness is resolved. Apologies for the noise.",
+            "createdAt": "2026-08-15T01:15:24Z",
+            "databaseId": 5299755659,
+            "updatedAt": "2026-08-15T01:15:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-5299755659"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "rbrugaro-amd"
+            },
+            "body": "superseded by [PR#52494](https://github.com/vllm-project/vllm/pull/52494) . For new models like KK3 the direction seems to be fusions go directly baked in model definition not on the compiler pass which is disabled https://github.com/vllm-project/vllm/issues/42770 ",
+            "createdAt": "2026-10-12T21:45:13Z",
+            "databaseId": 6133179718,
+            "updatedAt": "2026-10-12T21:45:13Z",
+            "url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-6133179718"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW2Q5UY=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "c70113053761985aa289d5088503731c535dc028",
+      "headRepository": {
+        "nameWithOwner": "rbrugaro-amd/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 52190,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "CLOSED",
+      "title": "# [kimik3][ROCm] Enable torch.compile for so post-grad fusion passes work (aiter::fused_qk_rmsnorm_kernel, aiter::allreduce_fusion_kernel_1stage)",
+      "updatedAt": "2026-10-12T21:45:19Z",
+      "url": "https://github.com/vllm-project/vllm/pull/52190"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/52190/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/52190/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/52190"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/52190"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/52190/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/52190"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/c70113053761985aa289d5088503731c535dc028"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 142,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 23600,
+        "forks_count": 23600,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9086,
+        "open_issues_count": 9086,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-10-19T20:25:36Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 323965,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 94152,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-10-19T20:25:46Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 94152,
+        "watchers_count": 94152,
+        "web_commit_signoff_required": true
+      },
+      "sha": "69d4c3a06bf8d087455544db8cea570721eca415",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "# [kimik3][ROCm] Enable torch.compile for so post-grad fusion passes work (aiter::fused_qk_rmsnorm_kernel, aiter::allreduce_fusion_kernel_1stage)\r\n\r\n## Purpose\r\n\r\nKimi-K3's model classes carry no `@support_torch_compile` and vLLM logs:\r\n\r\n```\r\n`torch.compile` is turned on, but the model /path/to/Kimi-K3 does not support it.\r\nPlease open an issue on GitHub if you want it to be supported.\r\n```\r\n\r\nBecause there is no inductor post-grad graph, **none of the fusion passes ever run\r\nfor K3** — even though they are enabled in the config and reported as active at\r\nstartup:\r\n\r\n```\r\nINFO [config/compilation.py] Enabled custom fusions: norm_quant, act_quant, allreduce_rms, mla_dual_rms_norm\r\n... 'pass_config': {..., 'fuse_mla_dual_rms_norm': True, 'fuse_allreduce_rms': True, ...}\r\n```\r\n\r\nIn particular `MLADualRMSNormFusionPass` already knows how to fuse the paired MLA\r\n`q_a_layernorm` + `kv_a_layernorm` into AITER's `fused_qk_rmsnorm` kernel, but it\r\nnever sees a graph. Confirmed by instrumenting `VllmFusionPatternMatcherPass.__call__`:\r\nzero pass invocations and zero pattern dumps on an otherwise fully-configured run.\r\n\r\nThis PR enables compilation so the existing passes can do their job. Two of the\r\nthree changes are **correctness fixes** that compilation exposes rather than\r\noptimizations.\r\n\r\n## Changes\r\n\r\n1. **`vllm/models/kimi_k3/amd/linear.py`** — add `@support_torch_compile` to\r\n   `KimiLinearModel`. Its `__init__(self, *, vllm_config, prefix)` and `forward`\r\n   signatures already match the shape the decorator expects (same as\r\n   `DeepseekV2Model`).\r\n\r\n2. **`vllm/models/kimi_k3/amd/kda.py` + `vllm/config/compilation.py`** — wrap the\r\n   KDA conv1d + recurrent/chunk core in a `kimi_kda_attention_core` custom op\r\n   declaring `mutates_args=[\"core_attn_out\"]`, and add\r\n   `vllm::kimi_kda_attention_core` to the default `splitting_ops`.\r\n\r\n   **This is required for correctness, not perf.** `KimiGatedDeltaNetAttention._forward`\r\n   writes its result in place into a caller-allocated `core_attn_out` and returns\r\n   `None`, and was not a registered custom op. Under fullgraph capture the call\r\n   therefore has no compiler-visible effect and the entire linear-attention path is\r\n   eliminated: with only the decorator applied, **all KDA kernels for all 69 KDA\r\n   layers stop executing** (K3 is 24 MLA + 69 KDA), while the surrounding `o_proj`\r\n   and MoE keep running on the uninitialized `torch.empty` buffer. It fails\r\n   silently — no exception, no graph-break warning, just degenerate output. Follows\r\n   the existing `vllm::qwen_gdn_attention_core` pattern.\r\n\r\n3. **`vllm/models/kimi_k3/amd/ops/attn_res.py`** — register the attention-residual\r\n   Triton launcher as `vllm::kimi_attn_res` with `mutates_args=[\"blocks\"]`.\r\n\r\n   Two problems, one op. First, the launcher picks its tile shape with a host-side\r\n   branch on the token count:\r\n\r\n   ```python\r\n   if num_tokens >= 256 or num_blocks <= 1:\r\n       block_l, num_warps = 1, 4\r\n   else:\r\n       block_l, num_warps = 4, 8\r\n   ```\r\n\r\n   Dynamo traced this, evaluated it on the large profile-run batch and emitted the\r\n   dynamic-shape guard `s72 >= 256`. vLLM's wrapper drops guards, so the artifact\r\n   specialized for the `>= 256` branch was silently reused for small decode\r\n   batches. Second, with `block_write_idx >= 0` the kernel stores its prefix sum\r\n   into `blocks` in place (`WRITE_BLOCK`), which is invisible to the compiler\r\n   unless declared. Both are fixed by making this a custom op with the mutation\r\n   declared; found via `TORCH_TRACE` + `tlparse`, reading the `user_stack` field of\r\n   the raw `guard_added_fast` records.\r\n\r\n4. **`vllm/models/kimi_k3/amd/latent_moe_runner.py`** — fullgraph capture cannot\r\n   trace `logging.Logger` methods\r\n   ([gb0291](https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0291.html)):\r\n\r\n   ```\r\n   torch._dynamo.exc.Unsupported: logging.Logger method not supported for non-export cases\r\n     Developer debug context: method: <Logger vllm.models.kimi_k3.amd.latent_moe_runner>.info_once\r\n     from user code: latent_moe_runner.py:67 in _shard_up_proj_tail\r\n   ```\r\n\r\n   The one-shot diagnostic in `_shard_up_proj_tail` is hoisted into `__init__` under\r\n   the same `self._tail_shardable` condition that gates its only call site, so the\r\n   message is preserved and both the logger call and the `_logged_sharded_tail`\r\n   state mutation leave the traced hot path.\r\n\r\n**No changes to any fusion pass or pattern.** The existing DeepSeek-shaped MLA\r\ndual-RMSNorm pattern matches K3 unmodified.\r\n\r\n## Test Plan\r\n\r\nKimi-K3, MI355X, TP8, MXFP4 weights, AITER enabled. Two stacks:\r\n\r\n- **A — upstream nightly, no spec decoding**, `--kv-cache-dtype fp8_e4m3`.\r\n  Decode-only torch-profiler capture, three arms on identical settings\r\n  (ISL 2048 / OSL 96 / concurrency 16, `wait_iterations=40`, `active_iterations=2`).\r\n  All windows verified pure decode — `execute_context_0(0)_generation_16(16)`,\r\n  zero prefill-attention kernels.\r\n- **B — AMD downstream K3 stack with DSpark MTP + CUDA graphs**\r\n  (`FULL_AND_PIECEWISE`, `--kv-cache-dtype fp8`, `num_speculative_tokens=2`),\r\n  i.e. the configuration this model is actually served in. Added because\r\n  compilation interacts with cudagraph capture and speculative decoding, and\r\n  stack A exercises neither. Using agentX coni\r\n- **Accuracy** — gsm8k via lm-eval against `/v1/completions`.\r\n\r\n## Test Result\r\n\r\n### Fusion passes now run (stack A)\r\n\r\nCumulative match table for one full model forward, per rank:\r\n\r\n```\r\nmla_dual_rms_norm_fusion_pass                  : 24   <- 1 per MLA layer (K3 has 24)\r\nrocm_aiter_allreduce_fusion_pass               : 92   <- ~1 per layer (K3 has 93)\r\nactivation_quant_fusion_pass                   :  0\r\nrocm_aiter_silu_mul_fp8_group_quant_fusion_pass:  0\r\nRocmAiterRMSNormQuantFusionPass                :  0\r\n```\r\n\r\n`24` is exactly the MLA layer count, i.e. single coverage with no double counting.\r\nCross-check against the per-graph-piece `Replaced N patterns` lines: 16x1 + 8x2 +\r\n176x4 = 736 across 8 ranks = 92/rank. Identical with and without the KDA custom\r\nop, i.e. the new splitting op does not disturb the fusions.\r\n\r\n### Kernel counts, pure-decode window (stack A, 2 steps, rank 0)\r\n\r\n| kernel group | eager | decorator only | **this PR** |\r\n|---|---|---|---|\r\n| MLA attention (24 x 2) | 48 | 48 | **48** |\r\n| MoE `mfma_moe1` (92 x 2) | 184 | 184 | **184** |\r\n| KDA `causal_conv1d` + `fused_recurrent_kda` | 276 | **0** ❌ | **276** ✅ |\r\n| `aiter::fused_qk_rmsnorm_kernel` (24 x 2) | 0 | 48 | **48** |\r\n| `add_rmsnorm_quant` (all) | 282 | 2 | **2** |\r\n| `aiter::allreduce_fusion_kernel_1stage` | 0 | 184 | **184** |\r\n\r\nThe middle column is the decorator applied *without* change (2) — included to show\r\nthe silent KDA loss that change (2) fixes. Corroborated independently of the\r\nprofiler by the server log: stock and this PR both log\r\n`Triton kernel JIT compilation during inference:` for `chunk_kda_fwd_kernel_intra_sub_chunk`,\r\n`fused_recurrent_kda_fwd_kernel`, `_causal_conv1d_fwd_kernel` and seven more\r\n(223 / 224 lines); the decorator-only build logs **none** of them.\r\n\r\n### Norm kernels in detail (stack A)\r\n\r\n| Norm kernel | eager | this PR |\r\n|---|---|---|\r\n| `add_rmsnorm_quant` — `q_a_layernorm` | 48 x 230.392 us | — |\r\n| `add_rmsnorm_quant` — `kv_a_layernorm` | 48 x 218.353 us | — |\r\n| **`aiter::fused_qk_rmsnorm_kernel<bf16,256,8,true,1>`** | — | **48 x 231.194 us** |\r\n| `add_rmsnorm_quant` — per-layer input/post-attn | 184 x 912.578 us | — (folded into allreduce fusion) |\r\n| `add_rmsnorm_quant` — final norm | 2 x 10.718 us | 2 x 11.078 us |\r\n\r\n96 launches / 448.745 us collapse into 48 launches / 231.194 us of\r\n`aiter::fused_qk_rmsnorm_kernel<std::bfloat16_t, 256, 8, true, 1>`, and the 184\r\nstandalone per-layer norms are absorbed by the 92 allreduce+RMSNorm fusions.\r\nDecode is where this matters: AITER's `_fused_qk_rmsnorm` wrapper deliberately\r\nfalls back to two separate `rmsnorm` calls at `m >= 16384` tokens, so the fused\r\nkernel is the decode / small-batch path.\r\n\r\n### Works under CUDA graphs + speculative decoding (stack B)\r\n\r\nPure-decode capture, DSpark MTP, concurrency 2 (verify batch\r\n`2*CONC*(1+num_spec)` = 12), `FULL_AND_PIECEWISE`, 6 engine steps, rank 0.\r\nWindow verified pure decode: `execute_context_0(0)_generation_2(6)` x12, no\r\nprefill kernels.\r\n\r\n| kernel group | launches | per step | expected |\r\n|---|---|---|---|\r\n| `aiter::fused_qk_rmsnorm` | 144 | 24 | 24 MLA layers ✅ |\r\n| `allreduce_fusion_kernel_1stage` | 558 | 93 | 93 layers ✅ |\r\n| `fused_recurrent_kda` + `causal_conv1d_update` | 828 | 69 + 69 | 69 KDA layers ✅ |\r\n| MLA `mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps` | 144 | 24 | 24 ✅ |\r\n\r\nThe KDA path stays fully alive at 69 layers/step with compilation, cudagraph\r\ncapture and MTP all active simultaneously, and the QK fusion covers exactly all\r\n24 MLA layers.\r\n\r\nTrace showing Cuda graph + MTP + compiler pass fusions active\r\n<img width=\"2890\" height=\"687\" alt=\"image\" src=\"https://github.com/user-attachments/assets/0c93dcd2-6533-4c7b-b48c-17aacd781306\" />\r\n\r\n### Accuracy — no regression\r\n\r\n| stack | harness | baseline | this PR |\r\n|---|---|---|---|\r\n| A (no spec decode) | gsm8k, full 1319, 5-shot, greedy | 0.9098 ± 0.0079 | **0.9257 ± 0.0072** |\r\n| B (DSpark MTP + cudagraph) | gsm8k, 250-sample, 5-shot | 0.988 | **0.984** |\r\n\r\nStack A's delta is within ~1.5 combined standard errors. Stack B was run with\r\n`rejection_sample_method=block`; the `synthetic` variant is a throughput\r\napproximation and is not a valid accuracy configuration.\r\n\r\n## Known limitation: CUDA graph capture ladder (stack B)\r\n\r\nOn the AMD downstream MTP stack, enabling compilation narrows the range of CUDA\r\ngraph capture sizes that can be captured. Outside that range the **per-size warmup\r\nforward** — before any capture begins, descending from the largest size — dies with\r\n`Memory access fault by GPU node-N`.\r\n\r\n**Root cause is not yet understood.** It is reported here rather than left for a\r\nreviewer to hit. Note this is observed only on the downstream stack — the DSpark\r\nMTP method and that cudagraph path are not upstream — so it may not be reachable\r\nfrom an upstream configuration. It does not affect stack A, which captures the\r\ndefault ladder without incident.\r\n\r\n\r\n",
+    "changed_files": 5,
+    "closed_at": "2026-10-12T21:45:19Z",
+    "comments": 4,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/52190/comments",
+    "commits": 3,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/52190/commits",
+    "created_at": "2026-08-13T16:57:07Z",
+    "deletions": 16,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/52190.diff",
+    "draft": true,
+    "head": {
+      "label": "rbrugaro-amd:rbrugaro/kimi-k3-support-torch-compile",
+      "ref": "rbrugaro/kimi-k3-support-torch-compile",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/rbrugaro-amd/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/rbrugaro-amd/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/rbrugaro-amd/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/rbrugaro-amd/vllm/branches{/branch}",
+        "clone_url": "https://github.com/rbrugaro-amd/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/rbrugaro-amd/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/rbrugaro-amd/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/rbrugaro-amd/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/rbrugaro-amd/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/rbrugaro-amd/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/rbrugaro-amd/vllm/contributors",
+        "created_at": "2026-03-18T22:52:09Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/rbrugaro-amd/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/rbrugaro-amd/vllm/downloads",
+        "events_url": "https://api.github.com/repos/rbrugaro-amd/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/rbrugaro-amd/vllm/forks",
+        "full_name": "rbrugaro-amd/vllm",
+        "git_commits_url": "https://api.github.com/repos/rbrugaro-amd/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/rbrugaro-amd/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/rbrugaro-amd/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/rbrugaro-amd/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/rbrugaro-amd/vllm/hooks",
+        "html_url": "https://github.com/rbrugaro-amd/vllm",
+        "id": 1185748581,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/rbrugaro-amd/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/rbrugaro-amd/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/rbrugaro-amd/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/rbrugaro-amd/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/rbrugaro-amd/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/rbrugaro-amd/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/rbrugaro-amd/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/rbrugaro-amd/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDORq0WZQ",
+        "notifications_url": "https://api.github.com/repos/rbrugaro-amd/vllm/notifications{?since,all,participating}",
+        "open_issues": 1,
+        "open_issues_count": 1,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/225979990?v=4",
+          "events_url": "https://api.github.com/users/rbrugaro-amd/events{/privacy}",
+          "followers_url": "https://api.github.com/users/rbrugaro-amd/followers",
+          "following_url": "https://api.github.com/users/rbrugaro-amd/following{/other_user}",
+          "gists_url": "https://api.github.com/users/rbrugaro-amd/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/rbrugaro-amd",
+          "id": 225979990,
+          "login": "rbrugaro-amd",
+          "node_id": "U_kgDODXguVg",
+          "organizations_url": "https://api.github.com/users/rbrugaro-amd/orgs",
+          "received_events_url": "https://api.github.com/users/rbrugaro-amd/received_events",
+          "repos_url": "https://api.github.com/users/rbrugaro-amd/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/rbrugaro-amd/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/rbrugaro-amd/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/rbrugaro-amd",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/rbrugaro-amd/vllm/pulls{/number}",
+        "pushed_at": "2026-09-29T04:49:01Z",
+        "releases_url": "https://api.github.com/repos/rbrugaro-amd/vllm/releases{/id}",
+        "size": 362316,
+        "ssh_url": "git@github.com:rbrugaro-amd/vllm.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/rbrugaro-amd/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/rbrugaro-amd/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/rbrugaro-amd/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/rbrugaro-amd/vllm/subscription",
+        "svn_url": "https://github.com/rbrugaro-amd/vllm",
+        "tags_url": "https://api.github.com/repos/rbrugaro-amd/vllm/tags",
+        "teams_url": "https://api.github.com/repos/rbrugaro-amd/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/rbrugaro-amd/vllm/git/trees{/sha}",
+        "updated_at": "2026-09-14T21:26:36Z",
+        "url": "https://api.github.com/repos/rbrugaro-amd/vllm",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": true
+      },
+      "sha": "c70113053761985aa289d5088503731c535dc028",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/225979990?v=4",
+        "events_url": "https://api.github.com/users/rbrugaro-amd/events{/privacy}",
+        "followers_url": "https://api.github.com/users/rbrugaro-amd/followers",
+        "following_url": "https://api.github.com/users/rbrugaro-amd/following{/other_user}",
+        "gists_url": "https://api.github.com/users/rbrugaro-amd/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/rbrugaro-amd",
+        "id": 225979990,
+        "login": "rbrugaro-amd",
+        "node_id": "U_kgDODXguVg",
+        "organizations_url": "https://api.github.com/users/rbrugaro-amd/orgs",
+        "received_events_url": "https://api.github.com/users/rbrugaro-amd/received_events",
+        "repos_url": "https://api.github.com/users/rbrugaro-amd/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/rbrugaro-amd/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/rbrugaro-amd/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/rbrugaro-amd",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/52190",
+    "id": 4273194179,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/52190",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "B60205",
+        "default": false,
+        "description": "Related to AMD ROCm",
+        "id": 6114440385,
+        "name": "rocm",
+        "node_id": "LA_kwDOI7xefs8AAAABbHL0wQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/rocm"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "E494D5",
+        "default": false,
+        "description": "",
+        "id": 7290797835,
+        "name": "torch.compile",
+        "node_id": "LA_kwDOI7xefs8AAAABspC_Cw",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/torch.compile"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d4c5f9",
+        "default": false,
+        "description": "",
+        "id": 7614859318,
+        "name": "needs-rebase",
+        "node_id": "LA_kwDOI7xefs8AAAABxeGINg",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/needs-rebase"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "78d0bd",
+        "default": false,
+        "description": null,
+        "id": 11639749480,
+        "name": "kimi",
+        "node_id": "LA_kwDOI7xefs8AAAACtch7aA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/kimi"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "e429eb",
+        "default": false,
+        "description": null,
+        "id": 11639749575,
+        "name": "k3",
+        "node_id": "LA_kwDOI7xefs8AAAACtch7xw",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/k3"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": null,
+    "mergeable": false,
+    "mergeable_state": "dirty",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs7-s8TD",
+    "number": 52190,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/52190.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/52190/comments",
+    "state": "closed",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/c70113053761985aa289d5088503731c535dc028",
+    "title": "# [kimik3][ROCm] Enable torch.compile for so post-grad fusion passes work (aiter::fused_qk_rmsnorm_kernel, aiter::allreduce_fusion_kernel_1stage)",
+    "updated_at": "2026-10-12T21:45:19Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/52190",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/225979990?v=4",
+      "events_url": "https://api.github.com/users/rbrugaro-amd/events{/privacy}",
+      "followers_url": "https://api.github.com/users/rbrugaro-amd/followers",
+      "following_url": "https://api.github.com/users/rbrugaro-amd/following{/other_user}",
+      "gists_url": "https://api.github.com/users/rbrugaro-amd/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/rbrugaro-amd",
+      "id": 225979990,
+      "login": "rbrugaro-amd",
+      "node_id": "U_kgDODXguVg",
+      "organizations_url": "https://api.github.com/users/rbrugaro-amd/orgs",
+      "received_events_url": "https://api.github.com/users/rbrugaro-amd/received_events",
+      "repos_url": "https://api.github.com/users/rbrugaro-amd/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/rbrugaro-amd/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/rbrugaro-amd/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/rbrugaro-amd",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/c70113053761985aa289d5088503731c535dc028/vllm%2Fconfig%2Fcompilation.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fconfig%2Fcompilation.py?ref=c70113053761985aa289d5088503731c535dc028",
+      "deletions": 0,
+      "filename": "vllm/config/compilation.py",
+      "patch": "@@ -769,6 +769,7 @@ class CompilationConfig:\n         \"vllm::short_conv\",\n         \"vllm::linear_attention\",\n         \"vllm::qwen_gdn_attention_core\",\n+        \"vllm::kimi_kda_attention_core\",\n         \"vllm::gdn_attention_core_xpu\",\n         \"vllm::olmo_hybrid_gdn_full_forward\",\n         \"vllm::sparse_attn_indexer\",",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/c70113053761985aa289d5088503731c535dc028/vllm%2Fconfig%2Fcompilation.py",
+      "sha": "ad98e84aec26fbceca26c64cd13772a234c77368",
+      "status": "modified"
+    },
+    {
+      "additions": 53,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Fkda.py",
+      "changes": 59,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fkimi_k3%2Famd%2Fkda.py?ref=c70113053761985aa289d5088503731c535dc028",
+      "deletions": 6,
+      "filename": "vllm/models/kimi_k3/amd/kda.py",
+      "patch": "@@ -38,6 +38,7 @@\n )\n from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader\n from vllm.model_executor.utils import set_weight_attrs\n+from vllm.utils.torch_utils import direct_register_custom_op\n from vllm.models.kimi_k3.amd.ops.third_party.kda import (\n     chunk_kda_with_fused_gate,\n     fused_recurrent_kda,\n@@ -229,12 +230,13 @@ def forward(\n             device=hidden_states.device,\n         )\n \n-        self._forward(\n-            mixed_qkv=mixed_qkv,\n-            g1=g1,\n-            g2=g2,\n-            beta=beta,\n-            core_attn_out=core_attn_out,\n+        torch.ops.vllm.kimi_kda_attention_core(\n+            mixed_qkv,\n+            g1,\n+            g2,\n+            beta,\n+            core_attn_out,\n+            self.prefix,\n         )\n         core_attn_out = rearrange(core_attn_out, \"1 n h d -> n (h d)\")\n         output[:] = self.o_proj(core_attn_out)[0]\n@@ -528,3 +530,48 @@ def _prefill_conv(\n         else:\n             assert core_attn_out_spec is not None\n         core_attn_out.copy_(self.o_norm(core_attn_out, g2))\n+\n+\n+def kimi_kda_attention_core(\n+    mixed_qkv: torch.Tensor,\n+    g1: torch.Tensor,\n+    g2: torch.Tensor,\n+    beta: torch.Tensor,\n+    core_attn_out: torch.Tensor,\n+    layer_name: str,\n+) -> None:\n+    \"\"\"Custom-op wrapper around the KDA conv1d + recurrent/chunk core.\n+\n+    ``core_attn_out`` is mutated in place. Registering this as a custom op\n+    (and listing it in ``splitting_ops``) keeps the KDA branch visible to\n+    torch.compile: without it the call has no compiler-visible effect and\n+    the whole linear-attention path is eliminated from the graph.\n+    \"\"\"\n+    forward_context = get_forward_context()\n+    self = forward_context.no_compile_layers[layer_name]\n+    self._forward(\n+        mixed_qkv=mixed_qkv,\n+        g1=g1,\n+        g2=g2,\n+        beta=beta,\n+        core_attn_out=core_attn_out,\n+    )\n+\n+\n+def kimi_kda_attention_core_fake(\n+    mixed_qkv: torch.Tensor,\n+    g1: torch.Tensor,\n+    g2: torch.Tensor,\n+    beta: torch.Tensor,\n+    core_attn_out: torch.Tensor,\n+    layer_name: str,\n+) -> None:\n+    return\n+\n+\n+direct_register_custom_op(\n+    op_name=\"kimi_kda_attention_core\",\n+    op_func=kimi_kda_attention_core,\n+    mutates_args=[\"core_attn_out\"],\n+    fake_impl=kimi_kda_attention_core_fake,\n+)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Fkda.py",
+      "sha": "e226beb7234bd46d20cffa42428b1f03a9670e22",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Flatent_moe_runner.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fkimi_k3%2Famd%2Flatent_moe_runner.py?ref=c70113053761985aa289d5088503731c535dc028",
+      "deletions": 9,
+      "filename": "vllm/models/kimi_k3/amd/latent_moe_runner.py",
+      "patch": "@@ -45,13 +45,17 @@ def __init__(\n         if self._tail_shardable:\n             assert up_proj is not None\n             self._up_proj_shard_size = up_proj.weight.shape[0] // tp_size\n+            logger.info_once(\n+                \"Kimi-K3 latent-MoE tail: up-projecting only this rank's \"\n+                \"hidden shard into the shared output.\",\n+                scope=\"global\",\n+            )\n         else:\n             logger.warning_once(\n                 \"K3 latent-MoE tail is not shardable under this config, \"\n                 \"falling back to the replicated up-projection.\",\n                 scope=\"global\",\n             )\n-        self._logged_sharded_tail = False\n \n     def _shard_up_proj_tail(\n         self,\n@@ -62,14 +66,6 @@ def _shard_up_proj_tail(\n         \"\"\"\n         Tier 2: column-parallel up-projection folded into the final reduce.\n         \"\"\"\n-        if not self._logged_sharded_tail:\n-            self._logged_sharded_tail = True\n-            logger.info_once(\n-                \"Kimi-K3 latent-MoE tail: up-projecting only this rank's \"\n-                \"hidden shard into the shared output.\",\n-                scope=\"global\",\n-            )\n-\n         transform = self.routed_output_transform\n         assert transform is not None\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Flatent_moe_runner.py",
+      "sha": "657bac5d6d8d8fc01803a0d44aea1a6f48d63bbb",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Flinear.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fkimi_k3%2Famd%2Flinear.py?ref=c70113053761985aa289d5088503731c535dc028",
+      "deletions": 0,
+      "filename": "vllm/models/kimi_k3/amd/linear.py",
+      "patch": "@@ -7,6 +7,7 @@\n import torch\n from torch import nn\n \n+from vllm.compilation.decorators import support_torch_compile\n from vllm.config import CacheConfig, VllmConfig\n from vllm.distributed import (\n     get_pp_group,\n@@ -662,6 +663,7 @@ def forward_attn_residual(\n         return prefix_sum, block_residual\n \n \n+@support_torch_compile\n class KimiLinearModel(nn.Module, EagleModelMixin):\n     def __init__(self, *, vllm_config: VllmConfig, prefix: str = \"\"):\n         super().__init__()",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Flinear.py",
+      "sha": "e439fd6b99e4639d2857d16f1255aa05835195da",
+      "status": "modified"
+    },
+    {
+      "additions": 81,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Fops%2Fattn_res.py",
+      "changes": 82,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fkimi_k3%2Famd%2Fops%2Fattn_res.py?ref=c70113053761985aa289d5088503731c535dc028",
+      "deletions": 1,
+      "filename": "vllm/models/kimi_k3/amd/ops/attn_res.py",
+      "patch": "@@ -11,6 +11,7 @@\n import torch\n \n from vllm.triton_utils import tl, triton\n+from vllm.utils.torch_utils import direct_register_custom_op\n \n \n @triton.jit\n@@ -136,7 +137,7 @@ def _attn_res_kernel(\n     )\n \n \n-def attn_res(\n+def _attn_res_impl(\n     prefix: torch.Tensor,\n     delta: torch.Tensor | None,\n     blocks: torch.Tensor,\n@@ -191,3 +192,82 @@ def attn_res(\n         num_stages=2,\n     )\n     return output\n+\n+\n+def _kimi_attn_res(\n+    prefix: torch.Tensor,\n+    delta: torch.Tensor | None,\n+    blocks: torch.Tensor,\n+    norm_weight: torch.Tensor,\n+    qk_weight: torch.Tensor,\n+    output_norm_weight: torch.Tensor | None,\n+    num_blocks: int,\n+    block_write_idx: int,\n+    eps: float,\n+    output_norm_eps: float,\n+) -> torch.Tensor:\n+    return _attn_res_impl(\n+        prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight,\n+        num_blocks, block_write_idx, eps, output_norm_eps,\n+    )\n+\n+\n+def _kimi_attn_res_fake(\n+    prefix: torch.Tensor,\n+    delta: torch.Tensor | None,\n+    blocks: torch.Tensor,\n+    norm_weight: torch.Tensor,\n+    qk_weight: torch.Tensor,\n+    output_norm_weight: torch.Tensor | None,\n+    num_blocks: int,\n+    block_write_idx: int,\n+    eps: float,\n+    output_norm_eps: float,\n+) -> torch.Tensor:\n+    return prefix.new_empty(prefix.shape)\n+\n+\n+direct_register_custom_op(\n+    op_name=\"kimi_attn_res\",\n+    op_func=_kimi_attn_res,\n+    # WRITE_BLOCK=block_write_idx >= 0 makes the kernel store this layer's\n+    # prefix sum into blocks[:, block_write_idx, :].\n+    mutates_args=[\"blocks\"],\n+    fake_impl=_kimi_attn_res_fake,\n+)\n+\n+\n+def attn_res(\n+    prefix: torch.Tensor,\n+    delta: torch.Tensor | None,\n+    blocks: torch.Tensor,\n+    norm_weight: torch.Tensor,\n+    qk_weight: torch.Tensor,\n+    output_norm_weight: torch.Tensor | None,\n+    num_blocks: int,\n+    block_write_idx: int,\n+    eps: float,\n+    output_norm_eps: float,\n+) -> torch.Tensor:\n+    \"\"\"Custom-op entry point for the attn-res kernel.\n+\n+    Two reasons this must not be traced by Dynamo:\n+\n+    * The launcher picks its tile/warp config from the token count\n+      (``num_tokens == 0``, ``num_tokens >= 256``) and uses a ``(num_tokens,)``\n+      grid. Traced directly, Dynamo evaluates those against the profile-run\n+      batch and emits a dynamic-shape guard (``s >= 256``). vLLM drops such\n+      guards, so the artifact specialised for the large-batch branch is then\n+      reused for small decode batches.\n+    * With ``block_write_idx >= 0`` the kernel writes into ``blocks`` in place.\n+      Traced, that functionalises into ``select_scatter`` + ``copy_`` on a\n+      graph input, forcing the attn-res block bank -- a buffer created inside\n+      the traced region -- to be lifted to a mutated graph input.\n+\n+    Both showed up as failing ``assert_size_stride`` and CUDA illegal memory\n+    accesses once CUDA graphs were enabled.\n+    \"\"\"\n+    return torch.ops.vllm.kimi_attn_res(\n+        prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight,\n+        num_blocks, block_write_idx, eps, output_norm_eps,\n+    )",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/c70113053761985aa289d5088503731c535dc028/vllm%2Fmodels%2Fkimi_k3%2Famd%2Fops%2Fattn_res.py",
+      "sha": "6afa0188d55da8e2ff40e334e32481c795223cb3",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @rbrugaro-amd.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-08-13T18:21:19Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-5284721760",
+      "id": 5284721760,
+      "updated_at": "2026-08-13T18:21:19Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "Independently validated this on a real 2.8T MXFP4 Kimi-K3 / 8× MI350X (gfx950), applied on top of `vllm/vllm-openai-rocm:nightly` (patch applies cleanly with fuzz 3).\n\nWith `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `-O3` the fusion engages (`module_fused_qk_norm_rope_cache_quant_shuffle` loads) and warm decode throughput at N=128 goes from ~1578 tok/s (ROCM_AITER_MLA, no compile) to **~1650 tok/s (+4%)**. Cost: ~9 min inductor compile at first boot (cached after), ~2 warmup bursts before the graphs are hot. No correctness issues observed across a short + long-context (up to 1M) sweep.\n\nThanks for the fix — would love to see this land.",
+      "created_at": "2026-08-14T22:47:40Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-5298912353",
+      "id": 5298912353,
+      "updated_at": "2026-08-14T22:47:40Z",
+      "user": {
+        "login": "stefanskiasan"
+      }
+    },
+    {
+      "body": "Correction to my earlier comment: I have to retract the \"no correctness issues observed\" part. On re-check, this Kimi-K3 / gfx950 / nightly stack produces **degenerate repeated-token output** (e.g. \"2 + 2 =\" → \" 1. 1. 1\") — I had only measured throughput, not correctness. The degeneration reproduces with the aiter/flydsl MXFP4 MoE and disappears with `VLLM_ROCM_USE_AITER_MOE=0` (emulation MoE stays coherent), so it looks like the MXFP4-MoE weight-layout issue tracked in #52240 rather than anything in this torch.compile PR. My earlier throughput numbers here were therefore measured on a model that was emitting garbage — please disregard the \"+4%\" figure until the MoE correctness is resolved. Apologies for the noise.",
+      "created_at": "2026-08-15T01:15:24Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-5299755659",
+      "id": 5299755659,
+      "updated_at": "2026-08-15T01:15:24Z",
+      "user": {
+        "login": "stefanskiasan"
+      }
+    },
+    {
+      "body": "superseded by [PR#52494](https://github.com/vllm-project/vllm/pull/52494) . For new models like KK3 the direction seems to be fusions go directly baked in model definition not on the compiler pass which is disabled https://github.com/vllm-project/vllm/issues/42770 ",
+      "created_at": "2026-10-12T21:45:13Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/52190#issuecomment-6133179718",
+      "id": 6133179718,
+      "updated_at": "2026-10-12T21:45:13Z",
+      "user": {
+        "login": "rbrugaro-amd"
+      }
+    }
+  ],
+  "number": 52190,
+  "refs": {
+    "base": {
+      "commit": "69d4c3a06bf8d087455544db8cea570721eca415",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "c70113053761985aa289d5088503731c535dc028",
+      "repository": "rbrugaro-amd/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": []
+}

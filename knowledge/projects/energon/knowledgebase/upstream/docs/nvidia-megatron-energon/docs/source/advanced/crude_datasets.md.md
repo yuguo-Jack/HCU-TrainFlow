@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/advanced/crude_datasets.md
-raw_sha256: dfe94963b8c825a4de267cbd2bd35ede2477944fa0bfa93ad09fc3ab3eef83bb
+raw_sha256: 07dcc27127dfbc0cffba3fff54165eb0d2c5777526449e2789b59964f8484b8a
 sources: []
-generated_body_sha256: 6c85a1d347665000e5d32e77447c8913a4baf0f2176cb8b51b4a7097ff1684ca
+generated_body_sha256: 0021deaa94235d3156b371ff271b7d113fa5c03656dae214c9ca4415f2e13b87
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/crude_datasets.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/advanced/crude_datasets.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/crude_datasets.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -57,14 +57,14 @@ New `dataset.yaml` (or `crude.yaml` of you like):
 ```yaml
 __module__: megatron.energon
 __class__: CrudeWebdataset
-subflavors:
+tags:
   example_crude_selector: foobar
 ```
 
-As shown above, [subflavors](sect-subflavors) can be assigned directly in the dataset yaml, however we recommend
-to define them in the [Metadataset](../basic/metadataset) instead.
-Subflavors can be used to differentiate the data origin when you mix different crude datasets or crude with non-crude data using a [Metadataset](../basic/metadataset).
-You can then use the subflavors to determine how each sample shall be processed, as explained below.
+As shown above, [tags](sect-tags) can be assigned directly in the dataset yaml, however we recommend
+to define them in the [Recipe](../basic/recipe) instead.
+Tags can be used to differentiate the data origin when you mix different crude datasets or crude with non-crude data using a [Recipe](../basic/recipe).
+You can then use the tags to determine how each sample shall be processed, as explained below.
 
 Let's see how we set up our [Task Encoder](../basic/task_encoder) to cook the crude samples and turn them into real samples like {py:class}`TextSample <megatron.energon.TextSample>`.
 
@@ -86,19 +86,19 @@ def cook_text(sample: dict) -> TextSample:
 
 class MyTaskEncoder(DefaultTaskEncoder[TextSample, TextSample, TextRawBatch, TextBatch]):
     cookers = [
-        Cooker(cook_text, has_subflavors={"example_crude_selector": "foobar"}),
+        Cooker(cook_text, has_tags={"example_crude_selector": "foobar"}),
         Cooker(...)  # other cookers for other crude data if needed
     ]
 
     # ...
 ```
 
-In the example above, the cooker acts on all crude samples that have a subflavor `example_crude_selector` set to `foobar`.
-If you leave out the `has_subflavors` argument, the cooker will apply to any sample.
+In the example above, the cooker acts on all crude samples that have a tag `example_crude_selector` set to `foobar`.
+If you leave out the `has_tags` argument, the cooker will apply to any sample.
 
 The cooker will convert the dictionary to a {py:class}`TextSample <megatron.energon.TextSample>` by decoding the raw bytes and decorating the text with some nice angle brackets.
 Probably you noticed the {py:meth}`basic_sample_keys <megatron.energon.task_encoder.cooking.basic_sample_keys>` helper that we inserted.
-All it does, is to forward the key, restore key and flavors from the dict to the real sample. You will always need to forward these, or your dataset will not be restorable.
+All it does, is to forward the key, restore key and tags from the dict to the real sample. You will always need to forward these, or your dataset will not be restorable.
 
 In a real use-case you will want to do a lot more here and we recommend keeping the cook methods in separate files and importing them where you define your TaskEncoder.
 
@@ -149,10 +149,10 @@ An auxiliary data source can be either
 * Another energon-prepared WebDataset
 * A folder on the local or a remote file system
 
-You can specify it in your [metadataset](../basic/metadataset) yaml as follows (look at the `aux:` section)
+You can specify it in your [recipe](../basic/recipe) yaml as follows (look at the `aux:` section)
 ```yaml
 __module__: megatron.energon
-__class__: MetadatasetV2
+__class__: Recipe
 splits:
   train:
     path: ./my_primary_ds
@@ -162,7 +162,7 @@ splits:
       fs_source_abs: filesystem:///absolute/path/to/images
       remote_source: msc://coolstore/mainbucket/path/ds
       remote_fs_source: filesystem+msc://coolstore/mainbucket/path/images
-    subflavors:
+    tags:
       crude_type: my_dual_aux_example
 ```
 
@@ -198,7 +198,7 @@ def cook_text(sample: dict, foo_bar_source: FileStore) -> TextSample:
 # ...
 ```
 
-You can use multiple sources. You'll have to specify a cooker argument for each source that was defined in the metadataset.
+You can use multiple sources. You'll have to specify a cooker argument for each source that was defined in the recipe.
 
 For easier debugging, you should always keep track of all the sources you used. The `get` method takes care of this if you pass it the sample like this:
 

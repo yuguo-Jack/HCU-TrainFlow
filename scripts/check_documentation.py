@@ -40,8 +40,13 @@ def pages(project):
 
 def links(text):
     body = prose(text)
-    pattern = r'!?\[[^\]\n]*\]\((<[^>\n]+>|[^\s)\n]+)(?:\s+[^)]*)?\)'
-    result = re.findall(pattern, body)
+    # PR titles commonly contain a bracketed component, e.g. [PyTorch].
+    # Include that nested label instead of silently dropping the entire link.
+    simple = r'!?\[[^\]\n]*\]\((<[^>\n]+>|[^\s)\n]+)(?:\s+[^)]*)?\)'
+    nested = r'!?\[(?:[^\[\]\n]|\[[^\[\]\n]*\](?!\())*\]\((<[^>\n]+>|[^\s)\n]+)(?:\s+[^)]*)?\)'
+    # Preserve inner images in clickable images. A nested link is not a valid
+    # outer Markdown link, so exclude [inner](...) from the label extension.
+    result = list(dict.fromkeys(re.findall(simple, body) + re.findall(nested, body)))
     # Reference-style destinations are checked even if their label is unused.
     result.extend(re.findall(r'^ {0,3}\[[^\]\n]+\]:\s*(<[^>\n]+>|\S+)', body, re.M))
     return [value.strip('<>') for value in result]

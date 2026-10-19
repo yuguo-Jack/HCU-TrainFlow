@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/experiments/transformers_modeling_backend/MODEL_COMPATIBILITY.md
-raw_sha256: 52b96dd6999ede364dcdd42dfc7afd53b3d13ba3eb45849b662ab445ffa3c86f
+raw_sha256: 6eba966b376e07d940e7fd4ce539fb58e7099e5d36ed27ce4b7fd6c71bb4278a
 sources: []
-generated_body_sha256: 9cd94b5fb55ac5c19595b7e5d8b429eb2df6ea9d881efa7dfd1c4acfe2cdc418
+generated_body_sha256: 34c8b31f9d7dac3d71dedfb3b32f3b548ec1c44939646240e100fa5325f6db81
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/experiments/transformers_modeling_backend/MODEL_COMPATIBILITY.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/experiments/transformers_modeling_backend/MODEL_COMPATIBILITY.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/experiments/transformers_modeling_backend/MODEL_COMPATIBILITY.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -101,7 +101,7 @@ diff.
 ### DeepSeek-V3 (deepseek_v3)
 - **Router:** sigmoid with e_score_correction_bias, group routing — supported
 - **Experts:** fused gate_up_proj, SwiGLU — fully supported
-- **Shared experts:** additive (FeedForward) — supported
+- **Shared experts:** additive (DenseFeedForward) — supported
 - **Attention:** MLA (q_lora_rank, kv_lora_rank) — supported via ShardingConfig TP plan
 - **Differences from Titan:** dispatcher precision only
 

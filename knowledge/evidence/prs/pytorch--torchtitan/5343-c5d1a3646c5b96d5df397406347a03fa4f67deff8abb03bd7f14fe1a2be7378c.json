@@ -1,0 +1,1149 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "585498fd86264de9566beb8e0d30196146878e9737ec8ca6db900c61955cda90",
+      "isPrivate": false,
+      "numbers": [
+        5345,
+        5344,
+        5343,
+        5342,
+        5341,
+        5340,
+        5339,
+        5338
+      ],
+      "observed_at": "2026-10-19T18:03:38.099566+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4931,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "dbbfaefe99a3e3bd605f4eff1456eef6e72200df",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** Under compile, the MoE router picks experts with masked argmax rounds instead of `topk`, and the load-balance sums run in a region; every model on the shared router path turns it on. Qwen3.5 MoE layer fwd+bwd -3.6% at 16k; Kimi K2.5 / Muse Spark router + counts at EP 4 decode 35.9 -> 19.0 / 36.2 -> 19.9 us per layer.\n\n**Stack** (3 PRs, merge bottom-up; this PR is in **bold**)\n\n| # | PR | Independent? | Needs (stack positions) |\n|---|---|---|---|\n| 1 | Dist-MoE: skip the per-expert token count it doesn't read | yes | — |\n| 2 | Shared experts on a side stream in CUDA graphs at inference | yes | — |\n| **3** | **Compile the MoE router and its load-balance sums** | **yes** | **—** |\n\n**Problem**\n1. **Selection.** `TokenChoiceTopKRouter` picks 8 of 256 experts per token with `torch.topk`.\n2. **Not fusable.** Inductor lowers `topk` to an ATen fallback, so a compiled router still runs a 162 us radix-select at 16k.\n3. **Loss sums.** The batch-wise load-balance loss sums `[T, 256]` maps and scores in eager: ~190 us of reductions over 16 MB tensors.\n4. **Cost.** The router takes 617 us per MoE layer at 16k under CUDA graphs: ~25 ms per 16k microbatch over Qwen3.5's 40 layers.\n\n**Solution**\n1. **Argmax rounds.** Under compile, `_select_experts` takes 8 masked argmax rounds (`_topk_ids_by_argmax`) that fuse with the softmax into one kernel; eager keeps `topk`.\n2. **Top-k region.** Scoring, selection, gather and normalization after the gate run as the `moe_router_topk` region, compiled with Inductor's `batch_invariant` option (launch configs don't depend on the token count).\n3. **Loss sums.** The batch-wise loss's counts and score sums run in the existing `moe_aux_loss` region, called where they ran before (same SPMD typing).\n4. **Enabled** in the defaults of Qwen3.5 (3.6, 3.8), the Qwen3 MoE flavors, DeepSeek-V3 (so Kimi K2.5), DeepSeek-V4, GPT-OSS, Kimi K3 and Muse Spark, and so in recipes that extend them (Muse Spark 816B Dist-MoE).\n5. **Kimi K3.** `QuantileBalancedTopKRouter` selects with the base `_select_experts` and updates its histogram in eager, after the region (a checkpoint recompute inside it would update it twice).\n6. **Unchanged.** Counters, aux-loss injection and collectives stay in eager; ties pick the lower expert id.\n\n```text\nbefore:  gate -> softmax -> topk (ATen) -> gather/norm -> eager [T,E] sums for the loss\nafter:   gate -> [softmax + 8 argmax rounds + gather/norm] (moe_router_topk) -> [counts], [score sums] (moe_aux_loss)\n```\n\n**Results**\n```text\nNumerics: not bitwise (compiled reductions round differently). Compiled vs eager:\nmodel                  expert ids                           scores and grads\nQwen3.5 16k            identical (bf16, fp32)               rel L2 bf16: scores 7.5e-8, x grad 2.2e-5, gate grad 2.6e-5; fp32 1e-7\nKimi K2.5, Muse Spark  1-4 of 1,048,576 differ (near-ties)  differ by rounding\nDeepSeek-V3 671B       exact at 256 tokens (GPU test)       within assert_close's bf16 tolerance\ncounts and aux metric: exact. Error vs fp64: not measured for Qwen3.5 and DeepSeek-V3.\nWith the batch_invariant option: expert ids and routing map unchanged; test_router_matches_eager passes.\n\nQwen3.5 35B-A3B MoE layer, fwd+bwd, 1x GB300, 3 fresh processes, Qwen default regions as base,\nwithout the batch_invariant option, us\n16k CUDA graphs  8825.7 -> 8510.8   (-3.6%)\n16k launch       9280.9 -> 8904.0   (-4.1%)\n4k CUDA graphs   3284.1 -> 3147.4   (-4.2%)\n16k SelectiveAC  12469.9 -> 12118.3 (-2.8%, 1 process)\nrouter alone, 16k graphs   617 -> 579 (region as written) -> 437 (argmax) -> 301 (+ loss sums)\ncompiled graphs per region: moe_router_topk 3, _expert_counts 3, _norm_sum_scores_over_tokens 3\n  (training 16k/8k/2k + no_grad, limit 8)\n\nmoe_router_topk region alone, E=256, top-8, 1x GB300, min of 3 interleaved processes, us\n                                     without option    with option\nfwd+bwd 16k, CUDA graph              44.9              44.5\nno grad, CUDA-graph replay  T=1      8.9               10.2    (per-process: 8.9-10.5 without | 10.2-14.5 with)\n                            T=8      12.7              12.8\n                            T=34     12.2              12.8\n                            T=256    13.2              12.9\n\ntokens whose router outputs differ from the same tokens in a 16k batch\n(no grad; compiled 16384, 14336, then 2048, 34, 8, 1)\n                  T=1       T=8    T=34   T=2048\nwithout option    1 of 1    0      0      0        (scores differ; expert ids and routing map equal)\nwith option       0         0      0      0        (scores, top-k scores, ids, routing map)\n\nKimi K2.5 / Muse Spark, router + per-expert count as MoE.forward runs it, EP 4 on 4 GB300, Dist-MoE,\n4 layers per CUDA graph, decode, us per layer, slowest rank, min of 2 processes,\nwith an earlier version of the batch_invariant option\nT per GPU    32             64             256\nKimi K2.5    34.5 -> 19.6   35.9 -> 19.0   46.5 -> 24.4\nMuse Spark   34.2 -> 20.0   36.2 -> 19.9   45.6 -> 24.6\n\nDeepSeek-V4 (hash routing does a TP redistribute inside the region): CI's deepseek_v4_fsdp+tp+ep config\n(debug flavor, FSDP2 x TP2 x EP2, 4 GPUs, 10 steps), region on vs off\ngraph breaks 0; 1 expected recompile (hash vs non-hash layers); tokens/s ~1,420 vs ~1,400\nstep-10 loss 3.68 (region) vs 3.78 and 3.76 (two unseeded baseline runs)\n```\n\nYou may ask:\n- Why not `triton.decompose_sort_ops`? Slower than ATen topk here (747 vs 579 us).\n- Why not include the gate? Tracing it raises with `inplace_wgrad_accum=True`; with the flag off, a compiled region rounds its fp32 weight grad to bf16.\n\nNOTE:\n- Not tested: EP>1 training beyond the DeepSeek-V4 run, GraphTrainer (traces the eager topk path), loss curves, H100.\n- Not covered: the HF-backend MoE (`transformers_modeling_backend`) swaps in this router but keeps its own region list, so it doesn't compile it. Follow-up.\n- The B200 RL Dist-MoE test `rl_grpo_moe_debug_dist_moe_tp2_ep4` is the first CI run of the router region in the vLLM generator (full CUDA graphs). Watch it when B200 CI runs.\n- Kimi K3 in eager: ids within a row now come unsorted, so route-norm scores can move by 1 ulp; same experts except on exact ties; histogram unchanged.\n- Goldens: 5 integration tests compare losses exactly and change with the new defaults: `qwen3_moe_fsdp+tp+cp+ep_param_groups`, `deepseek_v3_fsdp+ep`, `deepseek_v3_fsdp+cp+pp+ep`, `gpt_oss_fsdp+tp+ep`, `gpt_oss_pp+fsdp+cp+ep+sacop`. This PR refreshes their A10G real-PG goldens (Integration Tests export run). `ciflow/fake-pg` and `rocm` stay red on them until the A10G fake-PG and the MI350X goldens are regenerated (follow-ups).\n\n**Test plan**\n`pytest tests/unit_tests/gpu/models/common/test_router_compile.py tests/unit_tests/cpu/models/common/test_router_compile_regions.py tests/unit_tests/cpu/models/common/test_aux_loss.py tests/unit_tests/cpu/models/common/test_moe.py tests/unit_tests/cpu/config/test_compile_config.py tests/unit_tests/gpu/distributed/test_remat.py tests/unit_tests/gpu/models/common/test_quantile_balance.py`\n- `test_scores_do_not_depend_on_batch_size`: all four router outputs at 1 and 34 tokens equal the same tokens in a 16k batch, bitwise; fails without the option.\n- `test_flavor_routers_match_eager`, `test_flavor_router_scores_do_not_depend_on_batch_size`: the same checks on the DeepSeek-V3 671B, Kimi K2.5 and Muse Spark routers.\n- `test_router_compile_regions.py`: every MoE model's debug flavor lists `moe_router_topk`, its routers subclass `TokenChoiceTopKRouter`, and `apply_local_compile` accepts its default regions.\n",
+      "changedFiles": 22,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Follow-up after this lands: Muse Spark doesn't enable the router region yet; it needs a one-line addition to `MuseSparkModel.Config.local_compile_regions`. At Muse Spark's 256-expert router width: 245 -> 169 us per layer at 4k, 651 -> 441 us at 16k (CUDA graphs).\n",
+            "createdAt": "2026-10-15T23:31:02Z",
+            "databaseId": 6204453525,
+            "updatedAt": "2026-10-15T23:31:02Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5343#issuecomment-6204453525"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXHQcpU=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 5343,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "acisseJZhong"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "acisseJZhong"
+                  },
+                  "body": "why adding this? ",
+                  "createdAt": "2026-10-14T07:11:53Z",
+                  "databaseId": 4267800631,
+                  "diffHunk": "@@ -249,56 +271,30 @@ def forward(\n             topk_expert_ids_TK: Expert indices ``(T, K)``.\n             routing_map_TE: One-hot boolean routing map ``(T, E)``.\n         \"\"\"\n-        # HiMidLoLinear returns FP32, so configured scoring runs in FP32.\n-        gate_TE = self.gate(x_TD)\n-        # The scoring function reads the router gate projection output with bare ops.\n-        remat.recompute_needs_tensor(gate_TE)\n-        scores_TE = self.score_func(gate_TE)\n-\n         if padding_mask_T is not None:\n             if padding_mask_T.dtype != torch.bool:\n                 raise ValueError(\n                     \"padding_mask_T must have dtype bool, \"\n                     f\"got {padding_mask_T.dtype}.\"\n                 )\n-            if padding_mask_T.shape != scores_TE.shape[:-1]:\n+            if padding_mask_T.shape != x_TD.shape[:-1]:\n                 raise ValueError(\n                     \"padding_mask_T must have shape matching the routing-map \"\n-                    f\"token axis, got {tuple(padding_mask_T.shape)} for scores \"\n-                    f\"{tuple(scores_TE.shape)}.\"\n+                    f\"token axis, got {tuple(padding_mask_T.shape)} for input \"\n+                    f\"{tuple(x_TD.shape)}.\"\n                 )\n \n-        topk_expert_ids_TK = remat.region(\n-            self._select_experts,\n-            \"routing_decision\",\n-            recompute=False,\n-        )(\n-            scores_TE,\n+        # HiMidLoLinear returns FP32, so configured scoring runs in FP32. It stays\n+        # out of the router region: its in-place weight-grad accumulation can't be traced.",
+                  "line": null,
+                  "originalLine": 288,
+                  "path": "torchtitan/models/common/moe.py",
+                  "updatedAt": "2026-10-14T07:14:53Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4267800631"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "acisseJZhong"
+                  },
+                  "body": "how do you decide the boundary for this local compile region? \nalso give this a better name?",
+                  "createdAt": "2026-10-14T07:14:10Z",
+                  "databaseId": 4267818260,
+                  "diffHunk": "@@ -327,6 +323,61 @@ def forward(\n             routing_map_TE,\n         )\n \n+    # Compiled only when \"router\" is listed in the model's local_compile_regions.\n+    # The expert counts and the aux loss stay in forward: under compile\n+    # torch_remat.is_recomputing() is always False, so a RegionAC recompute pass\n+    # would count them twice.\n+    @local_compile(\"router\", batch_invariant=False)",
+                  "line": null,
+                  "originalLine": 330,
+                  "path": "torchtitan/models/common/moe.py",
+                  "updatedAt": "2026-10-14T07:14:53Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4267818260"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "acisseJZhong"
+                  },
+                  "body": "how much speed up this bring? ",
+                  "createdAt": "2026-10-14T07:14:48Z",
+                  "databaseId": 4267823136,
+                  "diffHunk": "@@ -669,9 +728,7 @@ def forward(\n     ) -> torch.Tensor:\n         \"\"\"Compute batch-wise balance and inject its router gradient.\"\"\"\n         E = scores_TE.size(-1)\n-        # Cast before summing: casting a Partial tensor is non-linear and\n-        # rejected by spmd_types.\n-        counts_E = routing_map_TE.to(scores_TE.dtype).sum(dim=0)\n+        counts_E = _expert_counts(routing_map_TE, scores_TE.dtype)",
+                  "line": 764,
+                  "originalLine": 731,
+                  "path": "torchtitan/models/common/moe/moe.py",
+                  "updatedAt": "2026-10-14T07:14:53Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4267823136"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNFQwNzoxNDo0OFrO_mHQIA==",
+                "hasNextPage": false
+              },
+              "totalCount": 3
+            },
+            "databaseId": 5514278907,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-14T07:14:53Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5514278907"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude:\nIt said why the gate stays out of the compiled region, and the reason was wrong for the router. The real ones: `HiMidLoLinear` raises when traced with `inplace_wgrad_accum=True` (the default), and with the flag off a compiled region would round its fp32 weight grad to bf16. Both now sit in the region's docstring, next to the boundary (other thread). `forward` is back to main's order and comments, so this hunk is gone.\n",
+                  "createdAt": "2026-10-15T01:49:36Z",
+                  "databaseId": 4278182800,
+                  "diffHunk": "@@ -249,56 +271,30 @@ def forward(\n             topk_expert_ids_TK: Expert indices ``(T, K)``.\n             routing_map_TE: One-hot boolean routing map ``(T, E)``.\n         \"\"\"\n-        # HiMidLoLinear returns FP32, so configured scoring runs in FP32.\n-        gate_TE = self.gate(x_TD)\n-        # The scoring function reads the router gate projection output with bare ops.\n-        remat.recompute_needs_tensor(gate_TE)\n-        scores_TE = self.score_func(gate_TE)\n-\n         if padding_mask_T is not None:\n             if padding_mask_T.dtype != torch.bool:\n                 raise ValueError(\n                     \"padding_mask_T must have dtype bool, \"\n                     f\"got {padding_mask_T.dtype}.\"\n                 )\n-            if padding_mask_T.shape != scores_TE.shape[:-1]:\n+            if padding_mask_T.shape != x_TD.shape[:-1]:\n                 raise ValueError(\n                     \"padding_mask_T must have shape matching the routing-map \"\n-                    f\"token axis, got {tuple(padding_mask_T.shape)} for scores \"\n-                    f\"{tuple(scores_TE.shape)}.\"\n+                    f\"token axis, got {tuple(padding_mask_T.shape)} for input \"\n+                    f\"{tuple(x_TD.shape)}.\"\n                 )\n \n-        topk_expert_ids_TK = remat.region(\n-            self._select_experts,\n-            \"routing_decision\",\n-            recompute=False,\n-        )(\n-            scores_TE,\n+        # HiMidLoLinear returns FP32, so configured scoring runs in FP32. It stays\n+        # out of the router region: its in-place weight-grad accumulation can't be traced.",
+                  "line": null,
+                  "originalLine": 288,
+                  "path": "torchtitan/models/common/moe.py",
+                  "updatedAt": "2026-10-15T01:49:36Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278182800"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMTo0OTozNlrO_v_jkA==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527052885,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T01:49:36Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527052885"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude:\nIt's the part of `forward` that traces and doesn't update state:\n```\ngate (eager) -> [score, top-k, gather, normalize, routing map] -> counts, aux loss (eager)\n```\n- Gate: raises when traced with `inplace_wgrad_accum=True` (the default); with the flag off, a compiled region rounds its fp32 weight grad to bf16.\n- Counts, aux loss: they update buffers. Compiled, `remat.is_recomputing()` is always False, so a recompute pass would count them twice. Their `[T, E]` sums run in `moe_aux_loss`, as the microbatch-wise loss already does.\n- Same rule for subclasses: `QuantileBalancedTopKRouter` updates a histogram in `_select_experts`, so it now always runs this step eagerly, with a test (the histogram doubled before: 12 -> 24).\n\nRouter, 16k tokens, GB300: 617 us eager -> 579 (region, ATen `topk` inside) -> 437 (argmax rounds) -> 301 (+ aux-loss sums).\nRenamed to `moe_router_topk` / `_score_and_select_experts`: it is the router's top-k stage, next to `moe_dispatch` and `moe_combine`.\n",
+                  "createdAt": "2026-10-15T01:49:37Z",
+                  "databaseId": 4278182922,
+                  "diffHunk": "@@ -327,6 +323,61 @@ def forward(\n             routing_map_TE,\n         )\n \n+    # Compiled only when \"router\" is listed in the model's local_compile_regions.\n+    # The expert counts and the aux loss stay in forward: under compile\n+    # torch_remat.is_recomputing() is always False, so a RegionAC recompute pass\n+    # would count them twice.\n+    @local_compile(\"router\", batch_invariant=False)",
+                  "line": null,
+                  "originalLine": 330,
+                  "path": "torchtitan/models/common/moe.py",
+                  "updatedAt": "2026-10-15T01:49:37Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278182922"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMTo0OTozN1rO_v_kCg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527053026,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T01:49:37Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527053026"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude:\nSmall. It's what the microbatch-wise loss already does: `_microbatch_load_balance_local_stats` runs the same counts in `moe_aux_loss`. Eager casts the `[T, E]` bool map to an fp32 copy, then sums it; compiled reads the map once. H100, per MoE layer:\n```\ntokens   _expert_counts      _norm_sum_scores_over_tokens (fwd+bwd)\n4k       14.7 -> 3.4 us      57.8 -> 9.1 us\n16k      31.7 -> 5.5 us      172.3 -> 20.0 us\n```\n`_expert_counts` alone saves ~1 ms per 16k microbatch over 40 MoE layers. With the score sums, it is the 437 -> 301 us router step in the PR body (GB300). I added the number to its docstring.\n",
+                  "createdAt": "2026-10-15T01:49:38Z",
+                  "databaseId": 4278183015,
+                  "diffHunk": "@@ -669,9 +728,7 @@ def forward(\n     ) -> torch.Tensor:\n         \"\"\"Compute batch-wise balance and inject its router gradient.\"\"\"\n         E = scores_TE.size(-1)\n-        # Cast before summing: casting a Partial tensor is non-linear and\n-        # rejected by spmd_types.\n-        counts_E = routing_map_TE.to(scores_TE.dtype).sum(dim=0)\n+        counts_E = _expert_counts(routing_map_TE, scores_TE.dtype)",
+                  "line": 764,
+                  "originalLine": 731,
+                  "path": "torchtitan/models/common/moe/moe.py",
+                  "updatedAt": "2026-10-15T01:49:39Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278183015"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMTo0OTozOFrO_v_kZw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527053155,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T01:49:38Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527053155"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude:\nUpdate: `QuantileBalancedTopKRouter` no longer runs this step eagerly. Its histogram update moved out of the region instead, into eager code after it, like the counts. It reads the region's outputs: the cutoff is the best biased score among the unpicked experts, the same value as the old Top-(k+1) score. So this router gets the region too.\n- Same test, now with the region on: 12 (24 with the update inside the region).\n- The router now selects with the base `_select_experts`: the k+1 was only for the cutoff. Same experts per token except on exact ties.\n- Old vs new path, E=64, K=6, 4096 tokens, fp32: histogram bitwise equal, eager and compiled.\n",
+                  "createdAt": "2026-10-15T03:15:10Z",
+                  "databaseId": 4278640730,
+                  "diffHunk": "@@ -327,6 +323,61 @@ def forward(\n             routing_map_TE,\n         )\n \n+    # Compiled only when \"router\" is listed in the model's local_compile_regions.\n+    # The expert counts and the aux loss stay in forward: under compile\n+    # torch_remat.is_recomputing() is always False, so a RegionAC recompute pass\n+    # would count them twice.\n+    @local_compile(\"router\", batch_invariant=False)",
+                  "line": null,
+                  "originalLine": 330,
+                  "path": "torchtitan/models/common/moe.py",
+                  "updatedAt": "2026-10-15T03:15:10Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278640730"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwMzoxNToxMFrO_wbgWg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5527612958,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T03:15:10Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527612958"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNVQwMzoxNToxMFq0MjAyNi0xMC0xNVQwMzoxNTowOVrPAAAAAUl4rh4=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "OPEN",
+      "title": "[moe][perf] Compile the MoE router and its load-balance sums (3/3)",
+      "updatedAt": "2026-10-19T09:32:30Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5343"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5343/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5343/commits"
+      },
+      "html": {
+        "href": "https://github.com/pytorch/torchtitan/pull/5343"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5343"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5343/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5343"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/statuses/5d29be697745d2f20bcc36c7c4d57624fa09ada1"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 477,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "pytorch:felipemello1/moe/7-shared-experts-side-stream",
+      "ref": "felipemello1/moe/7-shared-experts-side-stream",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "dbbfaefe99a3e3bd605f4eff1456eef6e72200df",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "body": "**TLDR:** Under compile, the MoE router picks experts with masked argmax rounds instead of `topk`, and the load-balance sums run in a region; every model on the shared router path turns it on. Qwen3.5 MoE layer fwd+bwd -3.6% at 16k; Kimi K2.5 / Muse Spark router + counts at EP 4 decode 35.9 -> 19.0 / 36.2 -> 19.9 us per layer.\n\n**Stack** (3 PRs, merge bottom-up; this PR is in **bold**)\n\n| # | PR | Independent? | Needs (stack positions) |\n|---|---|---|---|\n| 1 | Dist-MoE: skip the per-expert token count it doesn't read | yes | — |\n| 2 | Shared experts on a side stream in CUDA graphs at inference | yes | — |\n| **3** | **Compile the MoE router and its load-balance sums** | **yes** | **—** |\n\n**Problem**\n1. **Selection.** `TokenChoiceTopKRouter` picks 8 of 256 experts per token with `torch.topk`.\n2. **Not fusable.** Inductor lowers `topk` to an ATen fallback, so a compiled router still runs a 162 us radix-select at 16k.\n3. **Loss sums.** The batch-wise load-balance loss sums `[T, 256]` maps and scores in eager: ~190 us of reductions over 16 MB tensors.\n4. **Cost.** The router takes 617 us per MoE layer at 16k under CUDA graphs: ~25 ms per 16k microbatch over Qwen3.5's 40 layers.\n\n**Solution**\n1. **Argmax rounds.** Under compile, `_select_experts` takes 8 masked argmax rounds (`_topk_ids_by_argmax`) that fuse with the softmax into one kernel; eager keeps `topk`.\n2. **Top-k region.** Scoring, selection, gather and normalization after the gate run as the `moe_router_topk` region, compiled with Inductor's `batch_invariant` option (launch configs don't depend on the token count).\n3. **Loss sums.** The batch-wise loss's counts and score sums run in the existing `moe_aux_loss` region, called where they ran before (same SPMD typing).\n4. **Enabled** in the defaults of Qwen3.5 (3.6, 3.8), the Qwen3 MoE flavors, DeepSeek-V3 (so Kimi K2.5), DeepSeek-V4, GPT-OSS, Kimi K3 and Muse Spark, and so in recipes that extend them (Muse Spark 816B Dist-MoE).\n5. **Kimi K3.** `QuantileBalancedTopKRouter` selects with the base `_select_experts` and updates its histogram in eager, after the region (a checkpoint recompute inside it would update it twice).\n6. **Unchanged.** Counters, aux-loss injection and collectives stay in eager; ties pick the lower expert id.\n\n```text\nbefore:  gate -> softmax -> topk (ATen) -> gather/norm -> eager [T,E] sums for the loss\nafter:   gate -> [softmax + 8 argmax rounds + gather/norm] (moe_router_topk) -> [counts], [score sums] (moe_aux_loss)\n```\n\n**Results**\n```text\nNumerics: not bitwise (compiled reductions round differently). Compiled vs eager:\nmodel                  expert ids                           scores and grads\nQwen3.5 16k            identical (bf16, fp32)               rel L2 bf16: scores 7.5e-8, x grad 2.2e-5, gate grad 2.6e-5; fp32 1e-7\nKimi K2.5, Muse Spark  1-4 of 1,048,576 differ (near-ties)  differ by rounding\nDeepSeek-V3 671B       exact at 256 tokens (GPU test)       within assert_close's bf16 tolerance\ncounts and aux metric: exact. Error vs fp64: not measured for Qwen3.5 and DeepSeek-V3.\nWith the batch_invariant option: expert ids and routing map unchanged; test_router_matches_eager passes.\n\nQwen3.5 35B-A3B MoE layer, fwd+bwd, 1x GB300, 3 fresh processes, Qwen default regions as base,\nwithout the batch_invariant option, us\n16k CUDA graphs  8825.7 -> 8510.8   (-3.6%)\n16k launch       9280.9 -> 8904.0   (-4.1%)\n4k CUDA graphs   3284.1 -> 3147.4   (-4.2%)\n16k SelectiveAC  12469.9 -> 12118.3 (-2.8%, 1 process)\nrouter alone, 16k graphs   617 -> 579 (region as written) -> 437 (argmax) -> 301 (+ loss sums)\ncompiled graphs per region: moe_router_topk 3, _expert_counts 3, _norm_sum_scores_over_tokens 3\n  (training 16k/8k/2k + no_grad, limit 8)\n\nmoe_router_topk region alone, E=256, top-8, 1x GB300, min of 3 interleaved processes, us\n                                     without option    with option\nfwd+bwd 16k, CUDA graph              44.9              44.5\nno grad, CUDA-graph replay  T=1      8.9               10.2    (per-process: 8.9-10.5 without | 10.2-14.5 with)\n                            T=8      12.7              12.8\n                            T=34     12.2              12.8\n                            T=256    13.2              12.9\n\ntokens whose router outputs differ from the same tokens in a 16k batch\n(no grad; compiled 16384, 14336, then 2048, 34, 8, 1)\n                  T=1       T=8    T=34   T=2048\nwithout option    1 of 1    0      0      0        (scores differ; expert ids and routing map equal)\nwith option       0         0      0      0        (scores, top-k scores, ids, routing map)\n\nKimi K2.5 / Muse Spark, router + per-expert count as MoE.forward runs it, EP 4 on 4 GB300, Dist-MoE,\n4 layers per CUDA graph, decode, us per layer, slowest rank, min of 2 processes,\nwith an earlier version of the batch_invariant option\nT per GPU    32             64             256\nKimi K2.5    34.5 -> 19.6   35.9 -> 19.0   46.5 -> 24.4\nMuse Spark   34.2 -> 20.0   36.2 -> 19.9   45.6 -> 24.6\n\nDeepSeek-V4 (hash routing does a TP redistribute inside the region): CI's deepseek_v4_fsdp+tp+ep config\n(debug flavor, FSDP2 x TP2 x EP2, 4 GPUs, 10 steps), region on vs off\ngraph breaks 0; 1 expected recompile (hash vs non-hash layers); tokens/s ~1,420 vs ~1,400\nstep-10 loss 3.68 (region) vs 3.78 and 3.76 (two unseeded baseline runs)\n```\n\nYou may ask:\n- Why not `triton.decompose_sort_ops`? Slower than ATen topk here (747 vs 579 us).\n- Why not include the gate? Tracing it raises with `inplace_wgrad_accum=True`; with the flag off, a compiled region rounds its fp32 weight grad to bf16.\n\nNOTE:\n- Not tested: EP>1 training beyond the DeepSeek-V4 run, GraphTrainer (traces the eager topk path), loss curves, H100.\n- Not covered: the HF-backend MoE (`transformers_modeling_backend`) swaps in this router but keeps its own region list, so it doesn't compile it. Follow-up.\n- The B200 RL Dist-MoE test `rl_grpo_moe_debug_dist_moe_tp2_ep4` is the first CI run of the router region in the vLLM generator (full CUDA graphs). Watch it when B200 CI runs.\n- Kimi K3 in eager: ids within a row now come unsorted, so route-norm scores can move by 1 ulp; same experts except on exact ties; histogram unchanged.\n- Goldens: 5 integration tests compare losses exactly and change with the new defaults: `qwen3_moe_fsdp+tp+cp+ep_param_groups`, `deepseek_v3_fsdp+ep`, `deepseek_v3_fsdp+cp+pp+ep`, `gpt_oss_fsdp+tp+ep`, `gpt_oss_pp+fsdp+cp+ep+sacop`. This PR refreshes their A10G real-PG goldens (Integration Tests export run). `ciflow/fake-pg` and `rocm` stay red on them until the A10G fake-PG and the MI350X goldens are regenerated (follow-ups).\n\n**Test plan**\n`pytest tests/unit_tests/gpu/models/common/test_router_compile.py tests/unit_tests/cpu/models/common/test_router_compile_regions.py tests/unit_tests/cpu/models/common/test_aux_loss.py tests/unit_tests/cpu/models/common/test_moe.py tests/unit_tests/cpu/config/test_compile_config.py tests/unit_tests/gpu/distributed/test_remat.py tests/unit_tests/gpu/models/common/test_quantile_balance.py`\n- `test_scores_do_not_depend_on_batch_size`: all four router outputs at 1 and 34 tokens equal the same tokens in a 16k batch, bitwise; fails without the option.\n- `test_flavor_routers_match_eager`, `test_flavor_router_scores_do_not_depend_on_batch_size`: the same checks on the DeepSeek-V3 671B, Kimi K2.5 and Muse Spark routers.\n- `test_router_compile_regions.py`: every MoE model's debug flavor lists `moe_router_topk`, its routers subclass `TokenChoiceTopKRouter`, and `apply_local_compile` accepts its default regions.\n",
+    "changed_files": 22,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5343/comments",
+    "commits": 4,
+    "commits_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5343/commits",
+    "created_at": "2026-10-12T23:16:07Z",
+    "deletions": 110,
+    "diff_url": "https://github.com/pytorch/torchtitan/pull/5343.diff",
+    "draft": true,
+    "head": {
+      "label": "pytorch:felipemello1/qwen35-router",
+      "ref": "felipemello1/qwen35-router",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5343",
+    "id": 4836107848,
+    "issue_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5343",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "009900",
+        "default": false,
+        "description": "This label is managed by the Meta Open Source bot.",
+        "id": 6319105129,
+        "name": "CLA Signed",
+        "node_id": "LA_kwDOK5EkJM8AAAABeKXkaQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/CLA%20Signed"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10889347594,
+        "name": "ciflow/rl",
+        "node_id": "LA_kwDOK5EkJM8AAAACiQ5CCg",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/rl"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": "5788c5b712c9280c217aa4fe28c41bb24f99a1a3",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOK5EkJM8AAAABIEEmSA",
+    "number": 5343,
+    "patch_url": "https://github.com/pytorch/torchtitan/pull/5343.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}",
+    "review_comments": 7,
+    "review_comments_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5343/comments",
+    "stack": {
+      "base": {
+        "ref": "main",
+        "sha": "619cd4cef2ef3ff7e9667d1571cf81c51c8580e7"
+      },
+      "id": 2292889,
+      "number": 5534,
+      "position": 3,
+      "size": 3
+    },
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+    "title": "[moe][perf] Compile the MoE router and its load-balance sums (3/3)",
+    "updated_at": "2026-10-19T09:32:30Z",
+    "url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5343",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+      "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+      "followers_url": "https://api.github.com/users/felipemello1/followers",
+      "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+      "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/felipemello1",
+      "id": 23004953,
+      "login": "felipemello1",
+      "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+      "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+      "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+      "repos_url": "https://api.github.com/users/felipemello1/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/felipemello1",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fdeepseek_v3.txt",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fdeepseek_v3.txt?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 10,
+      "filename": "tests/assets/losses/real_pg/a10g/deepseek_v3.txt",
+      "patch": "@@ -2,13 +2,13 @@\n # ngpu: 8\n # parallelism: FSDP=8, EP=8\n # step loss grad_norm\n-1 8.21900749206543 3.6382839679718018\n-2 6.146541118621826 4.6469902992248535\n-3 4.755226135253906 3.5344550609588623\n-4 4.62726354598999 2.8163540363311768\n-5 4.40510368347168 2.6265408992767334\n-6 4.157379627227783 2.268610954284668\n-7 3.9926187992095947 1.7176399230957031\n-8 3.968620538711548 1.9707367420196533\n-9 4.041754722595215 2.1604437828063965\n-10 3.80991530418396 1.7274022102355957\n+1 8.219006538391113 3.638293504714966\n+2 6.146537780761719 4.647007942199707\n+3 4.75520658493042 3.534836530685425\n+4 4.627299785614014 2.821259021759033\n+5 4.405552864074707 2.6268527507781982\n+6 4.157714366912842 2.2696077823638916\n+7 3.9924542903900146 1.7179510593414307\n+8 3.969447135925293 1.9759266376495361\n+9 4.043103218078613 2.1684389114379883\n+10 3.8104257583618164 1.7322847843170166",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fdeepseek_v3.txt",
+      "sha": "7360a1b90e9f53091bc3aa03b0ad2f4b3f1362ed",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fdeepseek_v3_cp_pp.txt",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fdeepseek_v3_cp_pp.txt?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 10,
+      "filename": "tests/assets/losses/real_pg/a10g/deepseek_v3_cp_pp.txt",
+      "patch": "@@ -2,13 +2,13 @@\n # ngpu: 8\n # parallelism: FSDP=2, CP=2, EP=4, PP=2\n # step loss grad_norm\n-1 8.237022399902344 3.8524279594421387\n-2 6.199502944946289 4.496014595031738\n-3 4.772503852844238 3.635852813720703\n-4 4.6403608322143555 2.8357601165771484\n-5 4.46818208694458 2.45115327835083\n-6 4.179629325866699 2.1287856101989746\n-7 4.043415069580078 1.6801478862762451\n-8 4.024997234344482 2.112795114517212\n-9 3.9646756649017334 1.8824748992919922\n-10 3.8311338424682617 1.5787163972854614\n+1 8.237024307250977 3.8524153232574463\n+2 6.199494361877441 4.4959893226623535\n+3 4.772515296936035 3.6360514163970947\n+4 4.640369415283203 2.835782289505005\n+5 4.468218803405762 2.4512391090393066\n+6 4.1796875 2.1288750171661377\n+7 4.043381690979004 1.6801345348358154\n+8 4.025116443634033 2.116140604019165\n+9 3.964761972427368 1.8826464414596558\n+10 3.83115291595459 1.578445553779602",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fdeepseek_v3_cp_pp.txt",
+      "sha": "f94ad03cc794fec636851609d5cd4d30b9ec34cb",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fgpt_oss.txt",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fgpt_oss.txt?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 10,
+      "filename": "tests/assets/losses/real_pg/a10g/gpt_oss.txt",
+      "patch": "@@ -2,13 +2,13 @@\n # ngpu: 8\n # parallelism: FSDP=4, TP=2, EP=4\n # step loss grad_norm\n-1 7.955585479736328 46.24765396118164\n-2 5.301669120788574 15.41297721862793\n-3 5.297870635986328 4.662709712982178\n-4 4.499295711517334 2.6056394577026367\n-5 4.475003242492676 6.392116069793701\n-6 4.112522125244141 2.1256518363952637\n-7 4.056522369384766 2.215843915939331\n-8 3.9837710857391357 2.563532590866089\n-9 3.964216709136963 1.9628283977508545\n-10 3.858022689819336 1.8031314611434937\n+1 7.955631732940674 46.24734115600586\n+2 5.301871299743652 15.417932510375977\n+3 5.298506736755371 4.668668270111084\n+4 4.500110149383545 2.5984230041503906\n+5 4.4631266593933105 6.278569221496582\n+6 4.111076354980469 2.147303342819214\n+7 4.056242942810059 2.211965560913086\n+8 3.98451828956604 2.552351951599121\n+9 3.9626035690307617 1.9441096782684326\n+10 3.852578639984131 1.7234493494033813",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fgpt_oss.txt",
+      "sha": "c4f8b01a36e8bceb13430ba10c380e7bf1bb60ea",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fgpt_oss_pp.txt",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fgpt_oss_pp.txt?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 10,
+      "filename": "tests/assets/losses/real_pg/a10g/gpt_oss_pp.txt",
+      "patch": "@@ -2,13 +2,13 @@\n # ngpu: 8\n # parallelism: FSDP=2, CP=2, EP=4, PP=2\n # step loss grad_norm\n-1 7.947325706481934 42.14341354370117\n-2 5.397617340087891 12.37936019897461\n-3 5.166536331176758 3.945122003555298\n-4 4.561816215515137 2.7369799613952637\n-5 4.238299369812012 2.2773404121398926\n-6 4.0821638107299805 2.1016147136688232\n-7 3.961998462677002 1.8504366874694824\n-8 3.912905693054199 1.6535382270812988\n-9 3.9577159881591797 1.47731351852417\n-10 3.9081263542175293 1.4238137006759644\n+1 7.947318077087402 42.14335250854492\n+2 5.397639751434326 12.379162788391113\n+3 5.176573753356934 3.9602243900299072\n+4 4.5555830001831055 2.6353495121002197\n+5 4.229969024658203 2.204664468765259\n+6 4.0828351974487305 2.091771364212036\n+7 3.960055351257324 1.8450559377670288\n+8 3.9094507694244385 1.6251384019851685\n+9 3.9566593170166016 1.467392921447754\n+10 3.9081804752349854 1.4363927841186523",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fgpt_oss_pp.txt",
+      "sha": "174e912f918654a88fe612aacf2eb78bd8ba48bb",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fqwen3.txt",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fqwen3.txt?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 10,
+      "filename": "tests/assets/losses/real_pg/a10g/qwen3.txt",
+      "patch": "@@ -2,13 +2,13 @@\n # ngpu: 8\n # parallelism: FSDP=2, TP=2, CP=2, EP=8\n # step loss grad_norm\n-1 7.72227144241333 23.218080520629883\n-2 7.0880255699157715 20.9434871673584\n-3 6.549936294555664 3.7906463146209717\n-4 6.239657402038574 3.6388628482818604\n-5 6.505231857299805 15.887887001037598\n-6 5.856864929199219 3.538511037826538\n-7 5.697327613830566 3.4707326889038086\n-8 5.761327743530273 3.03719425201416\n-9 5.388110160827637 3.567819595336914\n-10 5.3545684814453125 3.4849300384521484\n+1 7.722224712371826 23.217626571655273\n+2 7.087495803833008 20.89166259765625\n+3 6.5496978759765625 3.7905571460723877\n+4 6.239506721496582 3.638798236846924\n+5 6.506383895874023 15.072086334228516\n+6 5.855795860290527 3.53779935836792\n+7 5.695913314819336 3.4702508449554443\n+8 5.7605719566345215 3.0367980003356934\n+9 5.3864874839782715 3.5673933029174805\n+10 5.353092193603516 3.4842987060546875",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Fassets%2Flosses%2Freal_pg%2Fa10g%2Fqwen3.txt",
+      "sha": "272b6896a2d78aaacfb3295c119eafe99996ebc9",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fconfig%2Ftest_compile_config.py",
+      "changes": 13,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fconfig%2Ftest_compile_config.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 5,
+      "filename": "tests/unit_tests/cpu/config/test_compile_config.py",
+      "patch": "@@ -9,7 +9,11 @@\n \n from torchtitan.components.loss import compute_logprobs, cross_entropy_loss, mse_loss\n from torchtitan.distributed.local_compile import apply_local_compile, local_compile\n-from torchtitan.models.common.moe.moe import _microbatch_load_balance_local_stats\n+from torchtitan.models.common.aux_loss import AuxLoss\n+from torchtitan.models.common.moe.moe import (\n+    _expert_counts,\n+    _microbatch_load_balance_local_stats,\n+)\n \n \n @pytest.fixture(autouse=True)\n@@ -132,8 +136,7 @@ def fake_compile(reference, **kwargs):\n     apply_local_compile([\"moe_aux_loss\"])\n \n     assert compiled == [\n-        (\n-            _microbatch_load_balance_local_stats.__wrapped__,\n-            {\"fullgraph\": True},\n-        )\n+        (AuxLoss._norm_sum_scores_over_tokens.__wrapped__, {\"fullgraph\": True}),\n+        (_microbatch_load_balance_local_stats.__wrapped__, {\"fullgraph\": True}),\n+        (_expert_counts.__wrapped__, {\"fullgraph\": True}),\n     ]",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fconfig%2Ftest_compile_config.py",
+      "sha": "0ca6e21673b027ad4f1659fff892878cd7e3e063",
+      "status": "modified"
+    },
+    {
+      "additions": 56,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_router_compile_regions.py",
+      "changes": 56,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_router_compile_regions.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/models/common/test_router_compile_regions.py",
+      "patch": "@@ -0,0 +1,56 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import pytest\n+\n+from torchtitan.config.parallelism import ParallelismConfig\n+from torchtitan.distributed.local_compile import apply_local_compile\n+from torchtitan.models import (\n+    deepseek_v3,\n+    deepseek_v4,\n+    gpt_oss,\n+    kimi_k2_7,\n+    kimi_k3,\n+    muse_spark,\n+    qwen3,\n+    qwen3_5,\n+)\n+from torchtitan.models.common.moe import TokenChoiceTopKRouter\n+\n+\n+# One MoE debug flavor per model whose routers subclass TokenChoiceTopKRouter.\n+@pytest.mark.parametrize(\n+    \"model, flavor\",\n+    [\n+        (qwen3, \"debugmodel_moe\"),\n+        (qwen3_5, \"debugmodel_moe\"),\n+        (deepseek_v3, \"debugmodel\"),\n+        (deepseek_v4, \"debugmodel\"),\n+        (gpt_oss, \"debugmodel\"),\n+        (kimi_k2_7, \"debugmodel\"),\n+        (kimi_k3, \"debugmodel\"),\n+        (muse_spark, \"debugmodel\"),\n+    ],\n+    ids=lambda value: getattr(value, \"__name__\", value),\n+)\n+def test_moe_models_compile_the_router_region(model, flavor: str) -> None:\n+    \"\"\"Each MoE model lists moe_router_topk, uses TokenChoiceTopKRouter subclasses, and lists only registered regions.\"\"\"\n+    config = model.build_model_config(flavor, parallelism=ParallelismConfig())\n+    routers = [\n+        layer.feed_forward.router\n+        for layer in config.layers\n+        if hasattr(layer.feed_forward, \"router\")\n+    ]\n+\n+    assert \"moe_router_topk\" in config.local_compile_regions\n+    assert routers\n+    assert all(isinstance(r, TokenChoiceTopKRouter.Config) for r in routers)\n+    try:\n+        # Raises on a name no local_compile function registered.\n+        apply_local_compile(config.local_compile_regions)\n+    finally:\n+        # The binding is process-wide: don't leave compiled regions on for later tests.\n+        apply_local_compile([])",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_router_compile_regions.py",
+      "sha": "8bb00bdf79c3e9028c8285c90ce53e31f340b367",
+      "status": "added"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fmodels%2Fkimi_k3%2Ftest_kimi_k3_config.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fmodels%2Fkimi_k3%2Ftest_kimi_k3_config.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/models/kimi_k3/test_kimi_k3_config.py",
+      "patch": "@@ -26,6 +26,7 @@ def test_kimi_k3_enables_attention_residual_local_compile() -> None:\n         \"gated_rmsnorm\",\n         \"fused_binary_activation\",\n         \"fp32_to_bf16_split\",\n+        \"moe_router_topk\",\n         \"attention_residual\",\n     ]\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fmodels%2Fkimi_k3%2Ftest_kimi_k3_config.py",
+      "sha": "8623baf3929d1e6cef6c158452ac57e8d8ba775c",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fmodels%2Fqwen3_5%2Ftest_offset_rmsnorm.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fmodels%2Fqwen3_5%2Ftest_offset_rmsnorm.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/models/qwen3_5/test_offset_rmsnorm.py",
+      "patch": "@@ -20,4 +20,6 @@ def test_qwen35_architecture_enables_offset_rmsnorm_local_compile() -> None:\n             \"partial_rope\",\n             \"shared_expert_gate\",\n             \"fp32_to_bf16_split\",\n+            \"moe_router_topk\",\n+            \"moe_aux_loss\",\n         ]",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fcpu%2Fmodels%2Fqwen3_5%2Ftest_offset_rmsnorm.py",
+      "sha": "8d67b413b4fb84731b7d0f272d425691034158c0",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fgpu%2Fdistributed%2Ftest_remat.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fgpu%2Fdistributed%2Ftest_remat.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "tests/unit_tests/gpu/distributed/test_remat.py",
+      "patch": "@@ -23,6 +23,7 @@\n     ActivationRematConfig,\n     DefaultActivationRematConfig,\n )\n+from torchtitan.distributed.local_compile import apply_local_compile\n from torchtitan.models.base.module import Module, ModuleDict\n from torchtitan.models.common.activation import (\n     BinaryActivationFn,\n@@ -1154,6 +1155,15 @@ def forward(x_TD: torch.Tensor) -> torch.Tensor:\n         )\n         self.assertIsNotNone(x_TD.grad)\n \n+    def test_quantile_router_statistics_are_recorded_once_with_topk_region(self):\n+        # The recompute replays the compiled region; a histogram update inside it would\n+        # run again (12 -> 24), so the router updates the histogram in eager.\n+        apply_local_compile([\"moe_router_topk\"])\n+        try:\n+            self.test_quantile_router_statistics_are_recorded_once()\n+        finally:\n+            apply_local_compile([])\n+\n     def test_forced_router_statistics_are_recorded_once(self):\n         router = RoundRobinTokenChoiceTopKRouter.Config(\n             num_experts=4,",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fgpu%2Fdistributed%2Ftest_remat.py",
+      "sha": "f12debd42d37593edbdf1cadf033495fcb1335b8",
+      "status": "modified"
+    },
+    {
+      "additions": 193,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fgpu%2Fmodels%2Fcommon%2Ftest_router_compile.py",
+      "changes": 193,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fgpu%2Fmodels%2Fcommon%2Ftest_router_compile.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "tests/unit_tests/gpu/models/common/test_router_compile.py",
+      "patch": "@@ -0,0 +1,193 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import unittest\n+\n+import torch\n+\n+from torchtitan.config.parallelism import ParallelismConfig\n+from torchtitan.distributed.local_compile import apply_local_compile\n+from torchtitan.models import deepseek_v3, kimi_k2_7, muse_spark\n+from torchtitan.models.common.activation import Softmax\n+from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear\n+from torchtitan.models.common.moe import BatchWiseLoadBalanceLoss, TokenChoiceTopKRouter\n+\n+TOKENS, DIM, NUM_EXPERTS = 256, 512, 64\n+\n+\n+def _flavor_router(model_config) -> TokenChoiceTopKRouter:\n+    \"\"\"The last layer's router of a full-size flavor, on CUDA, with a bf16 gate.\"\"\"\n+    config = model_config.layers[-1].feed_forward.router\n+    with torch.device(\"cuda\"):\n+        router = config.build()\n+    router.init_states(buffer_device=torch.device(\"cuda\"))\n+    with torch.no_grad():\n+        router.gate.weight.normal_(std=0.02)\n+    router.gate.to(torch.bfloat16)\n+    return router\n+\n+\n+# Sigmoid scores and route_norm; the tests pass an expert bias, as the MoE does.\n+# DeepSeek-V3 671B also runs its group-limited top-k (8 expert groups, 4 kept) inside the region.\n+FLAVOR_ROUTERS = {\n+    \"DeepSeek-V3 671B\": lambda: _flavor_router(\n+        deepseek_v3.build_model_config(\"671B\", parallelism=ParallelismConfig())\n+    ),\n+    \"Kimi-K2.5\": lambda: _flavor_router(\n+        kimi_k2_7.build_model_config(\"Kimi-K2.5\", parallelism=ParallelismConfig())\n+    ),\n+    \"Muse Spark 816B-A42B\": lambda: _flavor_router(\n+        muse_spark.build_model_config(\"816B-A42B\")\n+    ),\n+}\n+\n+\n+@unittest.skipUnless(torch.cuda.is_available(), \"CUDA required\")\n+class TestTokenChoiceRouterLocalCompile(unittest.TestCase):\n+    def tearDown(self):\n+        apply_local_compile([])\n+        torch._dynamo.reset()\n+\n+    def _run(self, router, x, expert_bias_E=None):\n+        router.tokens_per_expert_E.zero_()\n+        if router.aux_loss is not None:\n+            router.aux_loss._reset_accumulators()\n+        x = x.detach().requires_grad_()\n+        topk_scores_TK, topk_ids_TK, routing_map_TE = router(\n+            x,\n+            expert_bias_E=expert_bias_E,\n+            aux_loss_denominator=torch.tensor(float(TOKENS), device=\"cuda\"),\n+        )\n+        # Compare per token in expert-id order: topk's id order is unspecified.\n+        order_TK = topk_ids_TK.argsort(dim=-1)\n+        topk_scores_TK = topk_scores_TK.gather(-1, order_TK)\n+        generator = torch.Generator(device=\"cuda\").manual_seed(1)\n+        grad_TK = torch.randn(topk_scores_TK.shape, device=\"cuda\", generator=generator)\n+        topk_scores_TK.backward(grad_TK)\n+        values = [\n+            topk_scores_TK.detach(),\n+            topk_ids_TK.gather(-1, order_TK),\n+            routing_map_TE,\n+            router.tokens_per_expert_E.clone(),\n+            x.grad,\n+            router.gate.weight.grad.clone(),\n+        ]\n+        if router.aux_loss is not None:\n+            values += [buffer.clone() for buffer in router.aux_loss.buffers()]\n+        router.zero_grad(set_to_none=True)\n+        return values\n+\n+    def test_router_matches_eager(self):\n+        torch.manual_seed(0)\n+        config = TokenChoiceTopKRouter.Config(\n+            num_experts=NUM_EXPERTS,\n+            gate=HiMidLoLinear.Config(\n+                backward_mode=\"hi_mid_lo\", in_features=DIM, out_features=NUM_EXPERTS\n+            ),\n+            score_func=Softmax.Config(),\n+            top_k=8,\n+            route_norm=True,\n+            aux_loss=BatchWiseLoadBalanceLoss.Config(\n+                coeff=1e-3, num_experts=NUM_EXPERTS\n+            ),\n+        )\n+        with torch.device(\"cuda\"):\n+            router = config.build()\n+        router.init_states(buffer_device=torch.device(\"cuda\"))\n+        with torch.no_grad():\n+            router.gate.weight.normal_(std=0.02)\n+        # bf16 gate weight as under FSDP mixed precision; buffers stay fp32.\n+        router.gate.to(torch.bfloat16)\n+        x = torch.randn(TOKENS, DIM, device=\"cuda\", dtype=torch.bfloat16)\n+\n+        apply_local_compile([])\n+        eager = self._run(router, x)\n+        apply_local_compile([\"moe_router_topk\", \"moe_aux_loss\"])\n+        compiled = self._run(router, x)\n+        # Default dtype-aware tolerances: ids, maps and counts must match exactly, and the\n+        # compiled kernels may round bf16 grads one ulp differently.\n+        for actual, expected in zip(compiled, eager, strict=True):\n+            torch.testing.assert_close(actual, expected)\n+\n+    def test_scores_do_not_depend_on_batch_size(self):\n+        \"\"\"A token's router outputs at 1 and 34 tokens equal its outputs in a 16k batch, bitwise.\"\"\"\n+        torch.manual_seed(0)\n+        config = TokenChoiceTopKRouter.Config(\n+            num_experts=256,\n+            gate=HiMidLoLinear.Config(in_features=DIM, out_features=256),\n+            score_func=Softmax.Config(),\n+            top_k=8,\n+            route_norm=True,\n+        )\n+        with torch.device(\"cuda\"):\n+            router = config.build().eval()\n+        apply_local_compile([\"moe_router_topk\"])\n+        gate_TE = torch.randn(16384, 256, device=\"cuda\")\n+        with torch.no_grad():\n+            # The generator's compile order: 16384 (static), 14336 (T turns dynamic), then\n+            # decode; Dynamo gives T=1 its own graph.\n+            outputs = {\n+                n: router._score_and_select_experts(\n+                    gate_TE[:n].contiguous(), None, padding_mask_T=None\n+                )\n+                for n in (16384, 14336, 34, 1)\n+            }\n+        for n in (34, 1):\n+            for actual, expected in zip(outputs[n], outputs[16384], strict=True):\n+                self.assertTrue(torch.equal(actual, expected[:n]))\n+\n+    def test_flavor_routers_match_eager(self):\n+        \"\"\"Full-size flavor routers: compiled fwd + bwd matches eager.\"\"\"\n+        for flavor, build_router in FLAVOR_ROUTERS.items():\n+            with self.subTest(flavor):\n+                torch.manual_seed(0)\n+                router = build_router()\n+                dim = router.gate.weight.shape[1]\n+                x = torch.randn(TOKENS, dim, device=\"cuda\", dtype=torch.bfloat16)\n+                expert_bias_E = 1e-3 * torch.randn(router.num_experts, device=\"cuda\")\n+                apply_local_compile([])\n+                eager = self._run(router, x, expert_bias_E=expert_bias_E)\n+                apply_local_compile([\"moe_router_topk\"])\n+                compiled = self._run(router, x, expert_bias_E=expert_bias_E)\n+                torch._dynamo.reset()\n+                for actual, expected in zip(compiled, eager, strict=True):\n+                    torch.testing.assert_close(actual, expected)\n+                # Values 4 and 5 are the input and gate weight grads. bf16's\n+                # rtol (1.6e-2) lets a 1% error pass, so bound their rel L2\n+                # (measured 2e-5 to 7e-5).\n+                for actual, expected in zip(compiled[4:6], eager[4:6], strict=True):\n+                    error_l2 = (actual - expected).float().norm()\n+                    self.assertLess((error_l2 / expected.float().norm()).item(), 1e-3)\n+\n+    def test_flavor_router_scores_do_not_depend_on_batch_size(self):\n+        \"\"\"Full-size flavor routers: a token's routing is the same at 1-256 tokens and 16k.\"\"\"\n+        for flavor, build_router in FLAVOR_ROUTERS.items():\n+            with self.subTest(flavor):\n+                torch.manual_seed(0)\n+                router = build_router().eval()\n+                apply_local_compile([\"moe_router_topk\"])\n+                gate_TE = torch.randn(16384, router.num_experts, device=\"cuda\")\n+                expert_bias_E = 1e-3 * torch.randn(router.num_experts, device=\"cuda\")\n+                with torch.no_grad():\n+                    # Largest first, as the generator compiles.\n+                    outputs = {\n+                        n: router._score_and_select_experts(\n+                            gate_TE[:n].contiguous(),\n+                            expert_bias_E=expert_bias_E,\n+                            padding_mask_T=None,\n+                        )\n+                        for n in (16384, 256, 34, 3, 1)\n+                    }\n+                torch._dynamo.reset()\n+                for n in (256, 34, 3, 1):\n+                    for actual, expected in zip(\n+                        outputs[n], outputs[16384], strict=True\n+                    ):\n+                        self.assertTrue(torch.equal(actual, expected[:n]))\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/tests%2Funit_tests%2Fgpu%2Fmodels%2Fcommon%2Ftest_router_compile.py",
+      "sha": "22cb33124080f10fe54005bdca5166aa3c194856",
+      "status": "added"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fdistributed%2FREMAT.md",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fdistributed%2FREMAT.md?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 2,
+      "filename": "torchtitan/distributed/REMAT.md",
+      "patch": "@@ -271,8 +271,8 @@ which regions are saved or recomputed.\n \n State accumulated for logging or optimizer-step updates must advance only on\n the original forward. The always-retained MoE `routing_decision` region owns\n-expert selection and quantile-histogram observation, while token-count\n-accumulation explicitly ignores checkpoint replay. Both reuse the routing map\n+expert selection, while token-count accumulation and quantile-histogram\n+observation explicitly ignore checkpoint replay. Both reuse the routing map\n built for dispatch and auxiliary loss. Kimi K2.7 QK-clipping statistics also\n ignore replay. Auxiliary-loss accumulation uses an always-retained region.\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fdistributed%2FREMAT.md",
+      "sha": "9f432ed66d2fde01b258cb3207dff2b88164779f",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fcommon%2Faux_loss.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fcommon%2Faux_loss.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "torchtitan/models/common/aux_loss.py",
+      "patch": "@@ -36,6 +36,7 @@\n \n from torchtitan.components.optim import OptimizersContainer\n from torchtitan.distributed import ParallelismContext\n+from torchtitan.distributed.local_compile import local_compile\n from torchtitan.distributed.spmd_types import spmd_mesh_size\n from torchtitan.models.base.module import Module\n from torchtitan.tools.utils import device_type\n@@ -162,6 +163,7 @@ def _reduce_token_partials(\n         return partial_E\n \n     @staticmethod\n+    @local_compile(\"moe_aux_loss\", batch_invariant=False)\n     def _norm_sum_scores_over_tokens(\n         scores_TE: torch.Tensor,\n         padding_mask_T: torch.Tensor | None,",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fcommon%2Faux_loss.py",
+      "sha": "6a68bcfb5d2fe52b515ac2d8155265780386389c",
+      "status": "modified"
+    },
+    {
+      "additions": 134,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fcommon%2Fmoe%2Fmoe.py",
+      "changes": 182,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fcommon%2Fmoe%2Fmoe.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 48,
+      "filename": "torchtitan/models/common/moe/moe.py",
+      "patch": "@@ -172,6 +172,26 @@ def forward(\n         return out_TD\n \n \n+def _topk_ids_by_argmax(scores: torch.Tensor, k: int) -> torch.Tensor:\n+    \"\"\"Return the ids of the ``k`` largest entries on the last dim; ties go to the lower id.\n+\n+    Compiled replacement for ``torch.topk(...).indices``: Inductor lowers ``topk``\n+    to an ATen fallback (a radix-select kernel), while ``k`` masked argmax rounds\n+    fuse with the surrounding pointwise code into one kernel.\n+\n+    Example:\n+        >>> _topk_ids_by_argmax(torch.tensor([[0.1, 0.9, 0.5, 0.9]]), 2)\n+        tensor([[1, 3]])\n+    \"\"\"\n+    ids = torch.arange(scores.size(-1), device=scores.device)\n+    topk_ids = []\n+    for _ in range(k):\n+        top_id = scores.argmax(dim=-1, keepdim=True)\n+        topk_ids.append(top_id)\n+        scores = scores.masked_fill(ids == top_id, float(\"-inf\"))\n+    return torch.cat(topk_ids, dim=-1)\n+\n+\n class TokenChoiceTopKRouter(Module):\n     \"\"\"This class implements token-choice routing. In token-choice top-K routing, each token is\n     routed to top K experts based on the router scores.\n@@ -229,6 +249,8 @@ def _select_experts(\n         scores_for_choice_TE = (\n             scores_TE if expert_bias_E is None else scores_TE + expert_bias_E\n         )\n+        if torch.compiler.is_compiling():\n+            return _topk_ids_by_argmax(scores_for_choice_TE, self.top_k)\n         return torch.topk(\n             scores_for_choice_TE, k=self.top_k, dim=-1, sorted=False\n         ).indices\n@@ -257,52 +279,31 @@ def forward(\n         gate_TE = self.gate(x_TD)\n         # The scoring function reads the router gate projection output with bare ops.\n         remat.recompute_needs_tensor(gate_TE)\n-        scores_TE = self.score_func(gate_TE)\n \n         if padding_mask_T is not None:\n             if padding_mask_T.dtype != torch.bool:\n                 raise ValueError(\n                     \"padding_mask_T must have dtype bool, \"\n                     f\"got {padding_mask_T.dtype}.\"\n                 )\n-            if padding_mask_T.shape != scores_TE.shape[:-1]:\n+            if padding_mask_T.shape != gate_TE.shape[:-1]:\n                 raise ValueError(\n                     \"padding_mask_T must have shape matching the routing-map \"\n-                    f\"token axis, got {tuple(padding_mask_T.shape)} for scores \"\n-                    f\"{tuple(scores_TE.shape)}.\"\n+                    f\"token axis, got {tuple(padding_mask_T.shape)} for gate output \"\n+                    f\"{tuple(gate_TE.shape)}.\"\n                 )\n \n-        topk_expert_ids_TK = remat.region(\n-            self._select_experts,\n-            \"routing_decision\",\n-            recompute=False,\n-        )(\n+        (\n             scores_TE,\n-            expert_bias_E,\n+            topk_scores_TK,\n+            topk_expert_ids_TK,\n+            routing_map_TE,\n+        ) = self._score_and_select_experts(\n+            gate_TE=gate_TE,\n+            expert_bias_E=expert_bias_E,\n             padding_mask_T=padding_mask_T,\n             **router_kwargs,\n         )\n-        remat.recompute_needs_tensor(topk_expert_ids_TK)\n-        # The expert bias is only used for routing. The gating value is\n-        # still derived from the original scores.\n-        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)\n-\n-        if self.route_norm:\n-            denominator_T1 = (\n-                topk_scores_TK.sum(dim=-1, keepdim=True) + self.route_norm_epsilon\n-            )\n-            topk_scores_TK = topk_scores_TK / denominator_T1\n-        topk_scores_TK = topk_scores_TK * self.route_scale\n-\n-        # Build a one-hot boolean routing map (T, E) marking the experts each\n-        # token is routed to. Under TP/SP the router outputs are sharded on the\n-        # token dimension; scatter_ writes along the replicated expert\n-        # dimension and therefore needs no redistribution.\n-        routing_map_TE = torch.zeros_like(scores_TE, dtype=torch.bool).scatter_(\n-            -1,\n-            topk_expert_ids_TK,\n-            True,\n-        )\n         # Keep the full routing map for dispatch, and build the masked view once\n         # for all load-balancing statistics. The auxiliary-loss gradient is\n         # injected into topk_scores_TK on backward; see ``AuxLoss.inject``.\n@@ -331,6 +332,72 @@ def forward(\n             routing_map_TE,\n         )\n \n+    # options: Inductor's batch_invariant fixes each reduction's launch config, so a token's\n+    # scores don't depend on the batch size (the 1-token graph would otherwise pick another).\n+    # batch_invariant=False: torchtitan's batch-invariant mode still rejects this region.\n+    @local_compile(\n+        \"moe_router_topk\", batch_invariant=False, options={\"batch_invariant\": True}\n+    )\n+    def _score_and_select_experts(\n+        self,\n+        gate_TE: torch.Tensor,\n+        expert_bias_E: torch.Tensor | None,\n+        *,\n+        padding_mask_T: torch.Tensor | None,\n+        **router_kwargs,\n+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n+        \"\"\"Score the gate output and pick each token's experts.\n+\n+            gate -> [score, top-k, gather, normalize, routing map] -> counts, aux loss\n+            eager    this region                                      eager\n+\n+        Outside the region:\n+        - gate: ``HiMidLoLinear`` raises when traced with ``inplace_wgrad_accum=True`` (the\n+          default); with it off, a compiled region would round its fp32 weight grad to bf16.\n+        - counts, aux loss, ``QuantileBalancedTopKRouter``'s histogram: they update buffers.\n+          Compiled, ``remat.is_recomputing()`` is always False, so a recompute pass would\n+          count them twice. ``_select_experts`` runs here, so it must not update state.\n+\n+        Returns:\n+            scores_TE: Router scores ``(T, E)`` in FP32.\n+            topk_scores_TK: Routing scores ``(T, K)``.\n+            topk_expert_ids_TK: Expert indices ``(T, K)``.\n+            routing_map_TE: One-hot boolean routing map ``(T, E)``.\n+        \"\"\"\n+        scores_TE = self.score_func(gate_TE)\n+        topk_expert_ids_TK = remat.region(\n+            self._select_experts,\n+            \"routing_decision\",\n+            recompute=False,\n+        )(\n+            scores_TE,\n+            expert_bias_E,\n+            padding_mask_T=padding_mask_T,\n+            **router_kwargs,\n+        )\n+        remat.recompute_needs_tensor(topk_expert_ids_TK)\n+        # The expert bias is only used for routing. The gating value is\n+        # still derived from the original scores.\n+        topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)\n+\n+        if self.route_norm:\n+            denominator_T1 = (\n+                topk_scores_TK.sum(dim=-1, keepdim=True) + self.route_norm_epsilon\n+            )\n+            topk_scores_TK = topk_scores_TK / denominator_T1\n+        topk_scores_TK = topk_scores_TK * self.route_scale\n+\n+        # Build a one-hot boolean routing map (T, E) marking the experts each\n+        # token is routed to. Under TP/SP the router outputs are sharded on the\n+        # token dimension; scatter_ writes along the replicated expert\n+        # dimension and therefore needs no redistribution.\n+        routing_map_TE = torch.zeros_like(scores_TE, dtype=torch.bool).scatter_(\n+            -1,\n+            topk_expert_ids_TK,\n+            True,\n+        )\n+        return scores_TE, topk_scores_TK, topk_expert_ids_TK, routing_map_TE\n+\n \n class RoundRobinTokenChoiceTopKRouter(TokenChoiceTopKRouter):\n     \"\"\"Route token-expert assignments round-robin with exact balance.\"\"\"\n@@ -374,30 +441,33 @@ def __init__(self, config: Config):\n             num_bins=config.num_bins,\n         ).build()\n \n-    def _select_experts(\n+    def _score_and_select_experts(\n         self,\n-        scores_TE: torch.Tensor,\n-        expert_bias_E: torch.Tensor | None = None,\n-        padding_mask_T: torch.Tensor | None = None,\n+        gate_TE: torch.Tensor,\n+        expert_bias_E: torch.Tensor | None,\n+        *,\n+        padding_mask_T: torch.Tensor | None,\n         **router_kwargs,\n-    ) -> torch.Tensor:\n+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n+        \"\"\"Run the base method (compiled when ``moe_router_topk`` is on), then update the\n+        histogram in eager, as ``forward`` does for its counts.\"\"\"\n         if expert_bias_E is None:\n             raise ValueError(\"Quantile balancing requires an expert bias.\")\n-        biased_scores_TE = scores_TE + expert_bias_E\n-        topk_plus_one_scores, topk_plus_one_expert_ids = torch.topk(\n-            biased_scores_TE,\n-            k=self.top_k + 1,\n-            dim=-1,\n-            sorted=True,\n+        outputs = super()._score_and_select_experts(\n+            gate_TE,\n+            expert_bias_E,\n+            padding_mask_T=padding_mask_T,\n+            **router_kwargs,\n         )\n+        scores_TE, _, _, routing_map_TE = outputs\n         if self.training and not remat.is_recomputing():\n             self.quantile_balancer.observe(\n                 scores_TE,\n-                topk_plus_one_scores[:, self.top_k :],\n+                routing_map_TE,\n                 expert_bias_E,\n                 padding_mask_T,\n             )\n-        return topk_plus_one_expert_ids[:, : self.top_k].contiguous()\n+        return outputs\n \n \n class QuantileBalancer(Module):\n@@ -430,7 +500,7 @@ def __init__(self, config: Config):\n     def observe(\n         self,\n         scores_TE: torch.Tensor,\n-        cutoff_T1: torch.Tensor,\n+        routing_map_TE: torch.Tensor,\n         expert_bias_E: torch.Tensor,\n         padding_mask_T: torch.Tensor | None,\n     ) -> None:\n@@ -439,6 +509,12 @@ def observe(\n             return\n \n         with spmd.no_typecheck(), torch.no_grad():\n+            # The Top-(k+1) cutoff: the best biased score among the unpicked experts.\n+            cutoff_T1 = (\n+                (scores_TE + expert_bias_E)\n+                .masked_fill(routing_map_TE, float(\"-inf\"))\n+                .amax(dim=-1, keepdim=True)\n+            )\n             lower_bound = expert_bias_E.min() - 1.0\n             bin_width = (\n                 expert_bias_E.max() - expert_bias_E.min() + 2.0\n@@ -512,6 +588,18 @@ def _microbatch_load_balance_local_stats(\n     return counts_E, probs_TE.sum(dim=0)\n \n \n+@local_compile(\"moe_aux_loss\", batch_invariant=False)\n+def _expert_counts(routing_map_TE: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:\n+    \"\"\"Routed-token count per expert ``(E,)`` over this rank's tokens, in ``dtype``.\n+\n+    Compiled, the cast fuses into the sum: no ``[T, E]`` float copy\n+    (16k tokens, E=256, H100: 32 -> 6 us).\n+    \"\"\"\n+    # Cast before summing: casting a Partial tensor is non-linear and\n+    # rejected by spmd_types.\n+    return routing_map_TE.to(dtype).sum(dim=0)\n+\n+\n class MicrobatchWiseLoadBalanceLoss(AuxLoss):\n     \"\"\"Per-forward MoE load-balance gradient (DeepSeek-V3 Sec 2.1.2 Eqs 17-20).\n \n@@ -673,9 +761,7 @@ def forward(\n     ) -> torch.Tensor:\n         \"\"\"Compute batch-wise balance and inject its router gradient.\"\"\"\n         E = scores_TE.size(-1)\n-        # Cast before summing: casting a Partial tensor is non-linear and\n-        # rejected by spmd_types.\n-        counts_E = routing_map_TE.to(scores_TE.dtype).sum(dim=0)\n+        counts_E = _expert_counts(routing_map_TE, scores_TE.dtype)\n \n         # The rolling-count update is a forward side effect, and the snapshot\n         # must match the original forward even if later microbatches' forwards",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fcommon%2Fmoe%2Fmoe.py",
+      "sha": "3cccb733e8cb8d0b16397f13226e690e237059fd",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "torchtitan/models/deepseek_v3/model.py",
+      "patch": "@@ -122,6 +122,7 @@ class Config(MTPDecoder.Config):\n                 \"loss\",\n                 \"fused_binary_activation\",\n                 \"fp32_to_bf16_split\",\n+                \"moe_router_topk\",\n                 \"moe_aux_loss\",\n             ]\n         )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "sha": "d6c3dba9e0170a1a2fd6917780e5d4b2acc407ca",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fdeepseek_v4%2Fmodel.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fdeepseek_v4%2Fmodel.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "torchtitan/models/deepseek_v4/model.py",
+      "patch": "@@ -178,6 +178,7 @@ class Config(Decoder.Config):\n                 \"loss\",\n                 \"fused_binary_activation\",\n                 \"fp32_to_bf16_split\",\n+                \"moe_router_topk\",\n             ]\n         )\n         hc_mult: int = 4",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fdeepseek_v4%2Fmodel.py",
+      "sha": "8df0f6b0436bae4249c757b114cd84559a2f6122",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fgpt_oss%2Fmodel.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fgpt_oss%2Fmodel.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "torchtitan/models/gpt_oss/model.py",
+      "patch": "@@ -225,6 +225,8 @@ class Config(Decoder.Config):\n                 \"fused_binary_activation\",\n                 \"cos_sin_rope\",\n                 \"fp32_to_bf16_split\",\n+                \"moe_router_topk\",\n+                \"moe_aux_loss\",\n             ]\n         )\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fgpt_oss%2Fmodel.py",
+      "sha": "1ac8be365eac53f22a156136b8b9b8b505a742c2",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fkimi_k3%2Fmodel.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fkimi_k3%2Fmodel.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "torchtitan/models/kimi_k3/model.py",
+      "patch": "@@ -233,6 +233,7 @@ class Config(Decoder.Config):\n                 \"gated_rmsnorm\",\n                 \"fused_binary_activation\",\n                 \"fp32_to_bf16_split\",\n+                \"moe_router_topk\",\n                 \"attention_residual\",\n             ]\n         )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fkimi_k3%2Fmodel.py",
+      "sha": "3eac720732644d1daee1dfc17247e96bc7244121",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fmuse_spark%2Fmodel.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fmuse_spark%2Fmodel.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 1,
+      "filename": "torchtitan/models/muse_spark/model.py",
+      "patch": "@@ -399,7 +399,7 @@ class Config(MultimodalModel.Config):\n         \"\"\"\n \n         local_compile_regions: list[str] = field(\n-            default_factory=lambda: [\"loss\", \"fp32_to_bf16_split\"]\n+            default_factory=lambda: [\"loss\", \"fp32_to_bf16_split\", \"moe_router_topk\"]\n         )\n         # pyrefly: ignore [bad-override]\n         tok_embeddings: MuseSparkEmbeddingWithNorm.Config",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fmuse_spark%2Fmodel.py",
+      "sha": "fff6e897368d74fbe1dff38053ef5906951d5474",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fqwen3%2Fflavors.py",
+      "changes": 13,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fqwen3%2Fflavors.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 3,
+      "filename": "torchtitan/models/qwen3/flavors.py",
+      "patch": "@@ -572,7 +572,7 @@ def _debugmodel_moe(\n     head_dim = 128\n     n_layers = 8\n     vocab_size = 2048\n-    return Qwen3Model.Config(\n+    config = Qwen3Model.Config(\n         max_context_length=seq_len,\n         vocab_size=vocab_size,\n         dim=dim,\n@@ -615,6 +615,9 @@ def _debugmodel_moe(\n             enable_ep=parallelism.expert_parallel_degree > 1,\n         ),\n     )\n+    # Only the MoE flavors run the router and its load-balance sums.\n+    config.local_compile_regions += [\"moe_router_topk\", \"moe_aux_loss\"]\n+    return config\n \n \n def _30b_a3b(\n@@ -627,7 +630,7 @@ def _30b_a3b(\n     head_dim = 128\n     n_layers = 48\n     vocab_size = 151936\n-    return Qwen3Model.Config(\n+    config = Qwen3Model.Config(\n         max_context_length=seq_len,\n         vocab_size=vocab_size,\n         dim=dim,\n@@ -670,6 +673,8 @@ def _30b_a3b(\n             enable_ep=parallelism.expert_parallel_degree > 1,\n         ),\n     )\n+    config.local_compile_regions += [\"moe_router_topk\", \"moe_aux_loss\"]\n+    return config\n \n \n def _235b_a22b(\n@@ -682,7 +687,7 @@ def _235b_a22b(\n     head_dim = 128\n     n_layers = 94\n     vocab_size = 151936\n-    return Qwen3Model.Config(\n+    config = Qwen3Model.Config(\n         max_context_length=seq_len,\n         vocab_size=vocab_size,\n         dim=dim,\n@@ -725,6 +730,8 @@ def _235b_a22b(\n             enable_ep=parallelism.expert_parallel_degree > 1,\n         ),\n     )\n+    config.local_compile_regions += [\"moe_router_topk\", \"moe_aux_loss\"]\n+    return config\n \n \n MODEL_FLAVORS = {",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fqwen3%2Fflavors.py",
+      "sha": "f8ecaf8232cb185e4ee35c1f7273f925ada70dc1",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fqwen3_5%2Fmodel.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fqwen3_5%2Fmodel.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 0,
+      "filename": "torchtitan/models/qwen3_5/model.py",
+      "patch": "@@ -343,6 +343,8 @@ class Config(Decoder.Config):\n                 \"partial_rope\",\n                 \"shared_expert_gate\",\n                 \"fp32_to_bf16_split\",\n+                \"moe_router_topk\",\n+                \"moe_aux_loss\",\n             ]\n         )\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan%2Fmodels%2Fqwen3_5%2Fmodel.py",
+      "sha": "521cd326f8b87626c511135dbcaea9719c4458a5",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan_recipes%2Fmodels%2Fmuse_spark.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan_recipes%2Fmodels%2Fmuse_spark.py?ref=5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "deletions": 1,
+      "filename": "torchtitan_recipes/models/muse_spark.py",
+      "patch": "@@ -523,7 +523,7 @@ def _muse_spark_816b_dist_moe_bf16_spmd(\n     p.num_pp_microbatches = 1\n     p.fsdp_reshard_after_forward = \"always\"\n \n-    # Compile only the elementwise regions with measured fusion wins. Activation\n+    # Add the elementwise regions with measured fusion wins to the model defaults. Activation\n     # remat saves the expensive inner-attention and effectful Dist-MoE outputs\n     # while recomputing projections, routing preparation, norms, and pool/unpool.\n     config.model.local_compile_regions.extend(",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/5d29be697745d2f20bcc36c7c4d57624fa09ada1/torchtitan_recipes%2Fmodels%2Fmuse_spark.py",
+      "sha": "54684d5afd44a23820daa3cab48a23addee9dfe3",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "why adding this? ",
+      "created_at": "2026-10-14T07:11:53Z",
+      "diff_hunk": "@@ -249,56 +271,30 @@ def forward(\n             topk_expert_ids_TK: Expert indices ``(T, K)``.\n             routing_map_TE: One-hot boolean routing map ``(T, E)``.\n         \"\"\"\n-        # HiMidLoLinear returns FP32, so configured scoring runs in FP32.\n-        gate_TE = self.gate(x_TD)\n-        # The scoring function reads the router gate projection output with bare ops.\n-        remat.recompute_needs_tensor(gate_TE)\n-        scores_TE = self.score_func(gate_TE)\n-\n         if padding_mask_T is not None:\n             if padding_mask_T.dtype != torch.bool:\n                 raise ValueError(\n                     \"padding_mask_T must have dtype bool, \"\n                     f\"got {padding_mask_T.dtype}.\"\n                 )\n-            if padding_mask_T.shape != scores_TE.shape[:-1]:\n+            if padding_mask_T.shape != x_TD.shape[:-1]:\n                 raise ValueError(\n                     \"padding_mask_T must have shape matching the routing-map \"\n-                    f\"token axis, got {tuple(padding_mask_T.shape)} for scores \"\n-                    f\"{tuple(scores_TE.shape)}.\"\n+                    f\"token axis, got {tuple(padding_mask_T.shape)} for input \"\n+                    f\"{tuple(x_TD.shape)}.\"\n                 )\n \n-        topk_expert_ids_TK = remat.region(\n-            self._select_experts,\n-            \"routing_decision\",\n-            recompute=False,\n-        )(\n-            scores_TE,\n+        # HiMidLoLinear returns FP32, so configured scoring runs in FP32. It stays\n+        # out of the router region: its in-place weight-grad accumulation can't be traced.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4267800631",
+      "id": 4267800631,
+      "line": null,
+      "original_line": 288,
+      "path": "torchtitan/models/common/moe.py",
+      "updated_at": "2026-10-14T07:14:53Z",
+      "user": {
+        "login": "acisseJZhong"
+      }
+    },
+    {
+      "body": "how do you decide the boundary for this local compile region? \nalso give this a better name?",
+      "created_at": "2026-10-14T07:14:10Z",
+      "diff_hunk": "@@ -327,6 +323,61 @@ def forward(\n             routing_map_TE,\n         )\n \n+    # Compiled only when \"router\" is listed in the model's local_compile_regions.\n+    # The expert counts and the aux loss stay in forward: under compile\n+    # torch_remat.is_recomputing() is always False, so a RegionAC recompute pass\n+    # would count them twice.\n+    @local_compile(\"router\", batch_invariant=False)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4267818260",
+      "id": 4267818260,
+      "line": null,
+      "original_line": 330,
+      "path": "torchtitan/models/common/moe.py",
+      "updated_at": "2026-10-14T07:14:53Z",
+      "user": {
+        "login": "acisseJZhong"
+      }
+    },
+    {
+      "body": "how much speed up this bring? ",
+      "created_at": "2026-10-14T07:14:48Z",
+      "diff_hunk": "@@ -669,9 +728,7 @@ def forward(\n     ) -> torch.Tensor:\n         \"\"\"Compute batch-wise balance and inject its router gradient.\"\"\"\n         E = scores_TE.size(-1)\n-        # Cast before summing: casting a Partial tensor is non-linear and\n-        # rejected by spmd_types.\n-        counts_E = routing_map_TE.to(scores_TE.dtype).sum(dim=0)\n+        counts_E = _expert_counts(routing_map_TE, scores_TE.dtype)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4267823136",
+      "id": 4267823136,
+      "line": 764,
+      "original_line": 731,
+      "path": "torchtitan/models/common/moe/moe.py",
+      "updated_at": "2026-10-14T07:14:53Z",
+      "user": {
+        "login": "acisseJZhong"
+      }
+    },
+    {
+      "body": "reply from claude:\nIt said why the gate stays out of the compiled region, and the reason was wrong for the router. The real ones: `HiMidLoLinear` raises when traced with `inplace_wgrad_accum=True` (the default), and with the flag off a compiled region would round its fp32 weight grad to bf16. Both now sit in the region's docstring, next to the boundary (other thread). `forward` is back to main's order and comments, so this hunk is gone.\n",
+      "created_at": "2026-10-15T01:49:36Z",
+      "diff_hunk": "@@ -249,56 +271,30 @@ def forward(\n             topk_expert_ids_TK: Expert indices ``(T, K)``.\n             routing_map_TE: One-hot boolean routing map ``(T, E)``.\n         \"\"\"\n-        # HiMidLoLinear returns FP32, so configured scoring runs in FP32.\n-        gate_TE = self.gate(x_TD)\n-        # The scoring function reads the router gate projection output with bare ops.\n-        remat.recompute_needs_tensor(gate_TE)\n-        scores_TE = self.score_func(gate_TE)\n-\n         if padding_mask_T is not None:\n             if padding_mask_T.dtype != torch.bool:\n                 raise ValueError(\n                     \"padding_mask_T must have dtype bool, \"\n                     f\"got {padding_mask_T.dtype}.\"\n                 )\n-            if padding_mask_T.shape != scores_TE.shape[:-1]:\n+            if padding_mask_T.shape != x_TD.shape[:-1]:\n                 raise ValueError(\n                     \"padding_mask_T must have shape matching the routing-map \"\n-                    f\"token axis, got {tuple(padding_mask_T.shape)} for scores \"\n-                    f\"{tuple(scores_TE.shape)}.\"\n+                    f\"token axis, got {tuple(padding_mask_T.shape)} for input \"\n+                    f\"{tuple(x_TD.shape)}.\"\n                 )\n \n-        topk_expert_ids_TK = remat.region(\n-            self._select_experts,\n-            \"routing_decision\",\n-            recompute=False,\n-        )(\n-            scores_TE,\n+        # HiMidLoLinear returns FP32, so configured scoring runs in FP32. It stays\n+        # out of the router region: its in-place weight-grad accumulation can't be traced.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278182800",
+      "id": 4278182800,
+      "line": null,
+      "original_line": 288,
+      "path": "torchtitan/models/common/moe.py",
+      "updated_at": "2026-10-15T01:49:36Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude:\nIt's the part of `forward` that traces and doesn't update state:\n```\ngate (eager) -> [score, top-k, gather, normalize, routing map] -> counts, aux loss (eager)\n```\n- Gate: raises when traced with `inplace_wgrad_accum=True` (the default); with the flag off, a compiled region rounds its fp32 weight grad to bf16.\n- Counts, aux loss: they update buffers. Compiled, `remat.is_recomputing()` is always False, so a recompute pass would count them twice. Their `[T, E]` sums run in `moe_aux_loss`, as the microbatch-wise loss already does.\n- Same rule for subclasses: `QuantileBalancedTopKRouter` updates a histogram in `_select_experts`, so it now always runs this step eagerly, with a test (the histogram doubled before: 12 -> 24).\n\nRouter, 16k tokens, GB300: 617 us eager -> 579 (region, ATen `topk` inside) -> 437 (argmax rounds) -> 301 (+ aux-loss sums).\nRenamed to `moe_router_topk` / `_score_and_select_experts`: it is the router's top-k stage, next to `moe_dispatch` and `moe_combine`.\n",
+      "created_at": "2026-10-15T01:49:37Z",
+      "diff_hunk": "@@ -327,6 +323,61 @@ def forward(\n             routing_map_TE,\n         )\n \n+    # Compiled only when \"router\" is listed in the model's local_compile_regions.\n+    # The expert counts and the aux loss stay in forward: under compile\n+    # torch_remat.is_recomputing() is always False, so a RegionAC recompute pass\n+    # would count them twice.\n+    @local_compile(\"router\", batch_invariant=False)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278182922",
+      "id": 4278182922,
+      "line": null,
+      "original_line": 330,
+      "path": "torchtitan/models/common/moe.py",
+      "updated_at": "2026-10-15T01:49:37Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude:\nSmall. It's what the microbatch-wise loss already does: `_microbatch_load_balance_local_stats` runs the same counts in `moe_aux_loss`. Eager casts the `[T, E]` bool map to an fp32 copy, then sums it; compiled reads the map once. H100, per MoE layer:\n```\ntokens   _expert_counts      _norm_sum_scores_over_tokens (fwd+bwd)\n4k       14.7 -> 3.4 us      57.8 -> 9.1 us\n16k      31.7 -> 5.5 us      172.3 -> 20.0 us\n```\n`_expert_counts` alone saves ~1 ms per 16k microbatch over 40 MoE layers. With the score sums, it is the 437 -> 301 us router step in the PR body (GB300). I added the number to its docstring.\n",
+      "created_at": "2026-10-15T01:49:38Z",
+      "diff_hunk": "@@ -669,9 +728,7 @@ def forward(\n     ) -> torch.Tensor:\n         \"\"\"Compute batch-wise balance and inject its router gradient.\"\"\"\n         E = scores_TE.size(-1)\n-        # Cast before summing: casting a Partial tensor is non-linear and\n-        # rejected by spmd_types.\n-        counts_E = routing_map_TE.to(scores_TE.dtype).sum(dim=0)\n+        counts_E = _expert_counts(routing_map_TE, scores_TE.dtype)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278183015",
+      "id": 4278183015,
+      "line": 764,
+      "original_line": 731,
+      "path": "torchtitan/models/common/moe/moe.py",
+      "updated_at": "2026-10-15T01:49:39Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude:\nUpdate: `QuantileBalancedTopKRouter` no longer runs this step eagerly. Its histogram update moved out of the region instead, into eager code after it, like the counts. It reads the region's outputs: the cutoff is the best biased score among the unpicked experts, the same value as the old Top-(k+1) score. So this router gets the region too.\n- Same test, now with the region on: 12 (24 with the update inside the region).\n- The router now selects with the base `_select_experts`: the k+1 was only for the cutoff. Same experts per token except on exact ties.\n- Old vs new path, E=64, K=6, 4096 tokens, fp32: histogram bitwise equal, eager and compiled.\n",
+      "created_at": "2026-10-15T03:15:10Z",
+      "diff_hunk": "@@ -327,6 +323,61 @@ def forward(\n             routing_map_TE,\n         )\n \n+    # Compiled only when \"router\" is listed in the model's local_compile_regions.\n+    # The expert counts and the aux loss stay in forward: under compile\n+    # torch_remat.is_recomputing() is always False, so a RegionAC recompute pass\n+    # would count them twice.\n+    @local_compile(\"router\", batch_invariant=False)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#discussion_r4278640730",
+      "id": 4278640730,
+      "line": null,
+      "original_line": 330,
+      "path": "torchtitan/models/common/moe.py",
+      "updated_at": "2026-10-15T03:15:10Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Follow-up after this lands: Muse Spark doesn't enable the router region yet; it needs a one-line addition to `MuseSparkModel.Config.local_compile_regions`. At Muse Spark's 256-expert router width: 245 -> 169 us per layer at 4k, 651 -> 441 us at 16k (CUDA graphs).\n",
+      "created_at": "2026-10-15T23:31:02Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#issuecomment-6204453525",
+      "id": 6204453525,
+      "updated_at": "2026-10-15T23:31:02Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5343,
+  "refs": {
+    "base": {
+      "commit": "dbbfaefe99a3e3bd605f4eff1456eef6e72200df",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "5d29be697745d2f20bcc36c7c4d57624fa09ada1",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5514278907",
+      "id": 5514278907,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-14T07:14:53Z",
+      "user": {
+        "login": "acisseJZhong"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527052885",
+      "id": 5527052885,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T01:49:36Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527053026",
+      "id": 5527053026,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T01:49:37Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527053155",
+      "id": 5527053155,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T01:49:38Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5343#pullrequestreview-5527612958",
+      "id": 5527612958,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T03:15:10Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ]
+}

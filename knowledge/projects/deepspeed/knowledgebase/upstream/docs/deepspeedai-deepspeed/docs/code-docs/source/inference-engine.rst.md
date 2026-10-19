@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
 path: docs/code-docs/source/inference-engine.rst
-raw_sha256: a04d8aeb7fd5b9641735e0eac6fb43d766a7b4a2387fb631c539c3973c97301d
+raw_sha256: 103a2e526857b12e682c14eba7228d5974fd97581ff6d4bb8b62cd36e236d2a9
 sources: []
-generated_body_sha256: 7a02283cc4dfa315ea8f697e2b2679d192279915b7a96205b011e14e60ee8b6c
+generated_body_sha256: 02a2c43339eac8bab90bbed4b5d6d11caa78078a04043959c55b40d534b83ced
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/code-docs/source/inference-engine.rst
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/docs/code-docs/source/inference-engine.rst)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/docs/code-docs/source/inference-engine.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -131,7 +131,7 @@ configured capacity.
 The experimental path intentionally does not implement paged attention or change the
 default generation semantics. It currently requires one padded prompt width for
 all rows, a model with cache-class support, greedy decoding, and one sample per
-prompt. CUDA Graph capture and shared prompt prefill are rejected until the scheduling semantics are
+prompt. Shared prompt prefill is rejected until the scheduling semantics are
 validated on real workloads. Models that explicitly declare no cache-class
 support are rejected; models with unknown support should be validated against
 the default ``generate()`` path before use.
@@ -165,6 +165,16 @@ measured with accelerator synchronization; otherwise those timing fields are
 ``trim_frequency`` is the number of trims divided by decode steps. Trimming
 statistics remain zero when ``enable_cache_trimming`` is false unless a
 capacity-exhaustion fallback reclaims a dead prefix.
+
+CUDA Graph capture is supported for CUDA inputs with the default
+``align_decode_fronts=False`` and ``enable_cache_trimming=False`` settings. It
+uses a fixed ``continuous_batch_size`` layout, keeps every KV-cache row and
+decode tensor at a stable address, and masks inactive rows while the scheduler
+refills them. Graph state is reused across matching rollout calls and rebuilt
+when the model parameters or static decode shape changes. Aligned decode fronts
+and cache trimming are rejected while graph capture is enabled because they
+move cache rows or columns. ``flash_attention_2`` is also rejected because the
+captured decode uses a four-dimensional additive attention mask.
 
 ``DeepSpeedStaticCache`` accepts one write position per row and can compact
 active rows while preserving its static tensor addresses. This mirrors the

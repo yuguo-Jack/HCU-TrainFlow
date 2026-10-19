@@ -8,33 +8,32 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
 sources:
 - source: baidu-baige-loongforge
   path: docs/source/features/data_parallel_balancing.md
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: f58d64fbdfd9cb61d3bf2577d93928741be9f7f3532a36880bc89e525311b1d4
 - source: baidu-baige-loongforge
   path: docs/source/features/vit_data_parallel_balancing.md
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: a7410b438bace81bba34381a2874cc19d8b091cfe9c36cb45e6bbad08f6d7532
 - source: baidu-baige-loongforge
   path: loongforge/data/dp_balance/train_hooks.py
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: 98ae698ebf87dd8c3412983397b6a74ed9718c71eb038fed50f43c5dcab4ab75
 - source: baidu-baige-loongforge
   path: loongforge/data/dp_balance/patches.py
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: 00cc59f327d372708595e7cfd11ef5137831ce1f88a53d4bb7f421d30216e1ec
 - source: baidu-baige-loongforge
   path: loongforge/data/dp_balance/rerun_iterator.py
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: 59fff9f78b06df2dd88251e34012357b5a8c9dd035ddf8a15f30816439eb92f9
 - source: baidu-baige-loongforge
   path: loongforge/data/dp_balance/rebalance/balance.py
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: 84fcb5795b89a66e655b05c7728c106c864c2d0485599c5d95a29e75d20df24c
 ---
 
@@ -68,11 +67,11 @@ warmup计时避开首轮冷启动，模型为`a×sum(L_i²)+b×sum(L_i)+c×样�
 
 ## 固定证据与复核范围
 
-- [docs/source/features/data_parallel_balancing.md](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/features/data_parallel_balancing.md)
-- [docs/source/features/vit_data_parallel_balancing.md](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/features/vit_data_parallel_balancing.md)
-- [loongforge/data/dp_balance/train_hooks.py](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/loongforge/data/dp_balance/train_hooks.py)
-- [loongforge/data/dp_balance/patches.py](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/loongforge/data/dp_balance/patches.py)
-- [loongforge/data/dp_balance/rerun_iterator.py](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/loongforge/data/dp_balance/rerun_iterator.py)
-- [loongforge/data/dp_balance/rebalance/balance.py](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/loongforge/data/dp_balance/rebalance/balance.py)
+- [docs/source/features/data_parallel_balancing.md](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/docs/source/features/data_parallel_balancing.md)
+- [docs/source/features/vit_data_parallel_balancing.md](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/docs/source/features/vit_data_parallel_balancing.md)
+- [loongforge/data/dp_balance/train_hooks.py](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/loongforge/data/dp_balance/train_hooks.py)
+- [loongforge/data/dp_balance/patches.py](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/loongforge/data/dp_balance/patches.py)
+- [loongforge/data/dp_balance/rerun_iterator.py](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/loongforge/data/dp_balance/rerun_iterator.py)
+- [loongforge/data/dp_balance/rebalance/balance.py](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/loongforge/data/dp_balance/rebalance/balance.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

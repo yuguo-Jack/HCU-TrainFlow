@@ -1,0 +1,749 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "cd41db11f0aca8b2a93950a041dc70c4645b330f37847d61ced49092ae5b6466",
+      "isPrivate": false,
+      "numbers": [
+        5417,
+        5415,
+        5414,
+        5413,
+        5412,
+        5411,
+        5410,
+        5409
+      ],
+      "observed_at": "2026-10-19T18:02:37.601254+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4986,
+        "resetAt": "2026-10-19T18:53:12Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "d51e4b3c6bf409e938dba55c84d9eb58d680371b",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** Trainer microbatches now go over Monarch RDMA by default: `async_loop.batcher.rdma_min_tensor_bytes` goes from `None` (by value) to `1024`. On one host, a 1 GiB microbatch takes 0.55 s by RDMA over ibverbs vs 1.9 s by value, and every read was byte-exact. `rdma_min_tensor_bytes=None` keeps the by-value message.\n\n**Problem**\n1. The RDMA path for trainer microbatches is opt-in: by default each trainer rank gets its column of the batch inside the `forward_backward` RPC message.\n2. By value, the controller pickles every microbatch, Monarch copies it, and the rank unpickles it.\n3. That grows with the microbatch: 16 MiB takes 21 ms per call by value vs 8.4 ms by RDMA, and 1 GiB 1.9 s vs 0.55 s (ibverbs, one host).\n\n**Solution**\n1. `Batcher.Config.rdma_min_tensor_bytes` defaults to 1024: tensors of at least 1 KiB stay in the batcher as RDMA buffers; smaller ones (token counts) stay in the message.\n2. If Monarch has no RDMA backend (`monarch.rdma.get_rdma_backend() == \"none\"`), the batcher logs one warning and sends by value. Otherwise Monarch uses ibverbs where the host has it, else TCP.\n3. The batcher creates the CUDA context that silences Monarch's per-buffer `[RdmaXcel]` log right before its first registration. It used to do it at spawn, where by default it would race trainer rank 0 for GPU 0.\n4. The controller no longer warns about RDMA without `preprocess_microbatch_groups_lazily`: it would fire on every default config.\n5. Unchanged: `None` is exactly the old by-value path.\n\n**Results**\n\nStress, one host (H100 devserver, CPU tensors, Monarch 0.7): the owner registers a fresh microbatch with random bytes each step, a reader process reads it, the owner drops the previous one. 5 steps per size, medians of steps 2-5. Every read was byte-exact. Read = reader side, fresh destination included. Call = one actor call, RDMA vs the same microbatch by value:\n```text\nper microbatch   read, ibverbs   read, TCP   call: ibverbs / TCP / by value\n1023 B           0.12 ms         0.19 ms     2.5 / 3.1 / 2.7 ms     (below 1 KiB: by value)\n1 KiB            7.8 ms          0.5 ms      11 / 2.9 / 3.2 ms\n1 MiB            6.4 ms          1.9 ms      12 / 7.8 / 5.5 ms\n16 MiB           3.6 ms          15 ms       8.4 / 19 / 21 ms\n256 MiB          83 ms           449 ms      0.17 / 0.49 / 0.56 s\n1 GiB            334 ms          1.6 s       0.55 / 1.8 / 1.9 s\n```\n- 4 readers, 256 MiB each, at once: 81 ms over ibverbs (13 GB/s together), 630 ms over TCP.\n- Registering (in the batcher, at pack time) pins memory over ibverbs: 26 ms at 256 MiB, 264 ms at 1 GiB; under 1 ms over TCP.\n- Up to 1 MiB, an ibverbs read costs 6-8 ms, a few ms more than by value.\n\nGPU, Qwen3-0.6B, H100, batch invariant, lockstep, trainer DP 1 + one TP 1 generator (2 GPUs), 4,096-token microbatches, 5 steps:\n```text\n                                    loss/mean, step 5   bit_wise/logprob_diff/max   read_microbatches/max, steps 1-5\nNone (by value)                     0.00061             0                           -\n1024 (default), ibverbs             0.00061             0                           126, 36, 12, 19, 21 ms\n1024, TCP                           0.00061             0                           57, 15, 10, 14, 17 ms\n```\n- `loss/mean` is bitwise equal across the three runs at all 5 steps; 0 `[RdmaXcel]` lines. Step 1 includes RDMA setup.\n- TCP = `MONARCH_RDMA_DISABLE_IBVERBS=1 MONARCH_RDMA_ALLOW_TCP_FALLBACK=1`. The `None` run is from an earlier build of this change; `None` runs none of the changed code.\n- Measured before rebasing onto the current main, which has since changed only generator files under `torchtitan/rl`.\n\nYou may ask:\n- **Why not probe ibverbs at startup?** A failed registration leaves Monarch's RDMA manager dead in its process, so a probe needs a child process. Like TorchStore, we only check that Monarch has an RDMA backend.\n- **What about a host that lists ibverbs devices it can't use?** It fails at the first batch: set `rdma_min_tensor_bytes=None`, or `MONARCH_RDMA_DISABLE_IBVERBS=1` for TCP in every process (weight sync included). The docstring says so.\n- **Why 1 KiB?** Registering one buffer costs 0.4-1 ms (stress above), far more than sending an 8 B token count, and `RDMABuffer` rejects empty tensors.\n\nNOTE:\n- The RL GPU CI now takes the RDMA path (ibverbs or TCP, whichever its containers have).\n- Every default run now holds ~256 MiB on GPU 0 (trainer rank 0's GPU on one host) for that CUDA context, in the batcher process, until Monarch logs the line once (TODO in `create_cuda_context_to_silence_monarch_log`). The first batch's `batcher_pack` span includes creating it.\n- With `preprocess_microbatch_groups_lazily=False` (the default) nothing hides the reads: each rank reads its microbatches one at a time before compute, ~6-8 ms each over ibverbs at small sizes.\n- Not tested on more than one host.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu` (repo root, Monarch 0.7): 510 passed, 5 skipped.\n- `test_rdma_microbatch.py`: the threshold boundary (a 1 KiB tensor goes by RDMA at 1024 and by value at 1025); by value with `None` and with no RDMA backend; the CUDA context created once, at the first batch; 4 rank processes on the default config read their columns byte-exact over real Monarch TCP across 3 released batches, then all read one 42 MiB microbatch.\n- `test_batcher_actor.py`: the batcher process on the default config.\n- The stress script and GPU runs above.\n",
+      "changedFiles": 9,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 5413,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "should we comment\n> Why 1 KiB? Registering one buffer costs 0.4-1 ms (stress above), far more than sending an 8 B token count, and RDMABuffer rejects empty tensors.",
+                  "createdAt": "2026-10-15T06:45:24Z",
+                  "databaseId": 4279904502,
+                  "diffHunk": "@@ -192,12 +193,13 @@ class Config(Configurable.Config):\n         When unset, the trainer uses the microbatch token capacity as the\n         CUDA-graph-safe metadata bound without imposing a tighter packing cap.\n         \"\"\"\n-        rdma_min_tensor_bytes: int | None = None\n+        rdma_min_tensor_bytes: int | None = 1024\n         \"\"\"Send microbatch tensors of at least this many bytes as Monarch RDMA buffers, not in the RPC message:\n-            None (default): every tensor in the message.\n-            e.g. 1024: tensors >= 1 KiB stay in the batcher; token counts (8 B) and empty tensors go in the message.\n-        Monarch uses ibverbs where the host has it, else TCP; a host that lists unusable ibverbs devices\n-        fails instead. MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process, weight sync included.\"\"\"\n+            1024 (default): tensors >= 1 KiB stay in the batcher; token counts (8 B) go in the message.",
+                  "line": 198,
+                  "originalLine": 198,
+                  "path": "torchtitan/rl/trainer/batcher.py",
+                  "updatedAt": "2026-10-15T06:46:07Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5413#discussion_r4279904502"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "why removing?",
+                  "createdAt": "2026-10-15T06:45:59Z",
+                  "databaseId": 4279908688,
+                  "diffHunk": "@@ -349,16 +349,6 @@ def __post_init__(self):\n                     \"to control optimizer-step boundaries.\",\n                     stacklevel=2,\n                 )\n-            if (",
+                  "line": 352,
+                  "originalLine": 352,
+                  "path": "torchtitan/rl/controller/controller.py",
+                  "updatedAt": "2026-10-15T06:46:07Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5413#discussion_r4279908688"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwNjo0NTo1OVrO_xo5UA==",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5529191307,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-15T06:46:07Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5413#pullrequestreview-5529191307"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNVQwNjo0NjowN1q0MjAyNi0xMC0xNVQwNjo0NToyNFrPAAAAAUmQw4s=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[rl] Send trainer microbatches over Monarch RDMA by default",
+      "updatedAt": "2026-10-15T06:46:07Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5413"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5413/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5413/commits"
+      },
+      "html": {
+        "href": "https://github.com/pytorch/torchtitan/pull/5413"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5413"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5413/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5413"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/statuses/b8c3019c77ed16ecc12952d1302266ac6aa78247"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 96,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "pytorch:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "d51e4b3c6bf409e938dba55c84d9eb58d680371b",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "body": "**TLDR:** Trainer microbatches now go over Monarch RDMA by default: `async_loop.batcher.rdma_min_tensor_bytes` goes from `None` (by value) to `1024`. On one host, a 1 GiB microbatch takes 0.55 s by RDMA over ibverbs vs 1.9 s by value, and every read was byte-exact. `rdma_min_tensor_bytes=None` keeps the by-value message.\n\n**Problem**\n1. The RDMA path for trainer microbatches is opt-in: by default each trainer rank gets its column of the batch inside the `forward_backward` RPC message.\n2. By value, the controller pickles every microbatch, Monarch copies it, and the rank unpickles it.\n3. That grows with the microbatch: 16 MiB takes 21 ms per call by value vs 8.4 ms by RDMA, and 1 GiB 1.9 s vs 0.55 s (ibverbs, one host).\n\n**Solution**\n1. `Batcher.Config.rdma_min_tensor_bytes` defaults to 1024: tensors of at least 1 KiB stay in the batcher as RDMA buffers; smaller ones (token counts) stay in the message.\n2. If Monarch has no RDMA backend (`monarch.rdma.get_rdma_backend() == \"none\"`), the batcher logs one warning and sends by value. Otherwise Monarch uses ibverbs where the host has it, else TCP.\n3. The batcher creates the CUDA context that silences Monarch's per-buffer `[RdmaXcel]` log right before its first registration. It used to do it at spawn, where by default it would race trainer rank 0 for GPU 0.\n4. The controller no longer warns about RDMA without `preprocess_microbatch_groups_lazily`: it would fire on every default config.\n5. Unchanged: `None` is exactly the old by-value path.\n\n**Results**\n\nStress, one host (H100 devserver, CPU tensors, Monarch 0.7): the owner registers a fresh microbatch with random bytes each step, a reader process reads it, the owner drops the previous one. 5 steps per size, medians of steps 2-5. Every read was byte-exact. Read = reader side, fresh destination included. Call = one actor call, RDMA vs the same microbatch by value:\n```text\nper microbatch   read, ibverbs   read, TCP   call: ibverbs / TCP / by value\n1023 B           0.12 ms         0.19 ms     2.5 / 3.1 / 2.7 ms     (below 1 KiB: by value)\n1 KiB            7.8 ms          0.5 ms      11 / 2.9 / 3.2 ms\n1 MiB            6.4 ms          1.9 ms      12 / 7.8 / 5.5 ms\n16 MiB           3.6 ms          15 ms       8.4 / 19 / 21 ms\n256 MiB          83 ms           449 ms      0.17 / 0.49 / 0.56 s\n1 GiB            334 ms          1.6 s       0.55 / 1.8 / 1.9 s\n```\n- 4 readers, 256 MiB each, at once: 81 ms over ibverbs (13 GB/s together), 630 ms over TCP.\n- Registering (in the batcher, at pack time) pins memory over ibverbs: 26 ms at 256 MiB, 264 ms at 1 GiB; under 1 ms over TCP.\n- Up to 1 MiB, an ibverbs read costs 6-8 ms, a few ms more than by value.\n\nGPU, Qwen3-0.6B, H100, batch invariant, lockstep, trainer DP 1 + one TP 1 generator (2 GPUs), 4,096-token microbatches, 5 steps:\n```text\n                                    loss/mean, step 5   bit_wise/logprob_diff/max   read_microbatches/max, steps 1-5\nNone (by value)                     0.00061             0                           -\n1024 (default), ibverbs             0.00061             0                           126, 36, 12, 19, 21 ms\n1024, TCP                           0.00061             0                           57, 15, 10, 14, 17 ms\n```\n- `loss/mean` is bitwise equal across the three runs at all 5 steps; 0 `[RdmaXcel]` lines. Step 1 includes RDMA setup.\n- TCP = `MONARCH_RDMA_DISABLE_IBVERBS=1 MONARCH_RDMA_ALLOW_TCP_FALLBACK=1`. The `None` run is from an earlier build of this change; `None` runs none of the changed code.\n- Measured before rebasing onto the current main, which has since changed only generator files under `torchtitan/rl`.\n\nYou may ask:\n- **Why not probe ibverbs at startup?** A failed registration leaves Monarch's RDMA manager dead in its process, so a probe needs a child process. Like TorchStore, we only check that Monarch has an RDMA backend.\n- **What about a host that lists ibverbs devices it can't use?** It fails at the first batch: set `rdma_min_tensor_bytes=None`, or `MONARCH_RDMA_DISABLE_IBVERBS=1` for TCP in every process (weight sync included). The docstring says so.\n- **Why 1 KiB?** Registering one buffer costs 0.4-1 ms (stress above), far more than sending an 8 B token count, and `RDMABuffer` rejects empty tensors.\n\nNOTE:\n- The RL GPU CI now takes the RDMA path (ibverbs or TCP, whichever its containers have).\n- Every default run now holds ~256 MiB on GPU 0 (trainer rank 0's GPU on one host) for that CUDA context, in the batcher process, until Monarch logs the line once (TODO in `create_cuda_context_to_silence_monarch_log`). The first batch's `batcher_pack` span includes creating it.\n- With `preprocess_microbatch_groups_lazily=False` (the default) nothing hides the reads: each rank reads its microbatches one at a time before compute, ~6-8 ms each over ibverbs at small sizes.\n- Not tested on more than one host.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu` (repo root, Monarch 0.7): 510 passed, 5 skipped.\n- `test_rdma_microbatch.py`: the threshold boundary (a 1 KiB tensor goes by RDMA at 1024 and by value at 1025); by value with `None` and with no RDMA backend; the CUDA context created once, at the first batch; 4 rank processes on the default config read their columns byte-exact over real Monarch TCP across 3 released batches, then all read one 42 MiB microbatch.\n- `test_batcher_actor.py`: the batcher process on the default config.\n- The stress script and GPU runs above.\n",
+    "changed_files": 9,
+    "closed_at": null,
+    "comments": 0,
+    "comments_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5413/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5413/commits",
+    "created_at": "2026-10-15T06:36:19Z",
+    "deletions": 56,
+    "diff_url": "https://github.com/pytorch/torchtitan/pull/5413.diff",
+    "draft": false,
+    "head": {
+      "label": "pytorch:felipemello1/trainer-pull/5-rdma-default",
+      "ref": "felipemello1/trainer-pull/5-rdma-default",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5413",
+    "id": 4869270813,
+    "issue_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5413",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "009900",
+        "default": false,
+        "description": "This label is managed by the Meta Open Source bot.",
+        "id": 6319105129,
+        "name": "CLA Signed",
+        "node_id": "LA_kwDOK5EkJM8AAAABeKXkaQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/CLA%20Signed"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10889347594,
+        "name": "ciflow/rl",
+        "node_id": "LA_kwDOK5EkJM8AAAACiQ5CCg",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/rl"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "89F2C0",
+        "default": false,
+        "description": "Run 1-GPU Fake PG integration tests",
+        "id": 12159706465,
+        "name": "ciflow/fake-pg",
+        "node_id": "LA_kwDOK5EkJM8AAAAC1MZlYQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/fake-pg"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOK5EkJM8AAAABIjstHQ",
+    "number": 5413,
+    "patch_url": "https://github.com/pytorch/torchtitan/pull/5413.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/40016222?v=4",
+        "events_url": "https://api.github.com/users/wwwjn/events{/privacy}",
+        "followers_url": "https://api.github.com/users/wwwjn/followers",
+        "following_url": "https://api.github.com/users/wwwjn/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wwwjn/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/wwwjn",
+        "id": 40016222,
+        "login": "wwwjn",
+        "node_id": "MDQ6VXNlcjQwMDE2MjIy",
+        "organizations_url": "https://api.github.com/users/wwwjn/orgs",
+        "received_events_url": "https://api.github.com/users/wwwjn/received_events",
+        "repos_url": "https://api.github.com/users/wwwjn/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/wwwjn/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wwwjn/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/wwwjn",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/62389750?v=4",
+        "events_url": "https://api.github.com/users/pzhan9/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pzhan9/followers",
+        "following_url": "https://api.github.com/users/pzhan9/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pzhan9/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pzhan9",
+        "id": 62389750,
+        "login": "pzhan9",
+        "node_id": "MDQ6VXNlcjYyMzg5NzUw",
+        "organizations_url": "https://api.github.com/users/pzhan9/orgs",
+        "received_events_url": "https://api.github.com/users/pzhan9/received_events",
+        "repos_url": "https://api.github.com/users/pzhan9/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pzhan9/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pzhan9/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/pzhan9",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}",
+    "review_comments": 2,
+    "review_comments_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5413/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/b8c3019c77ed16ecc12952d1302266ac6aa78247",
+    "title": "[rl] Send trainer microbatches over Monarch RDMA by default",
+    "updated_at": "2026-10-15T06:46:07Z",
+    "url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5413",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+      "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+      "followers_url": "https://api.github.com/users/felipemello1/followers",
+      "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+      "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/felipemello1",
+      "id": 23004953,
+      "login": "felipemello1",
+      "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+      "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+      "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+      "repos_url": "https://api.github.com/users/felipemello1/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/felipemello1",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_async_controller.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_async_controller.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 8,
+      "filename": "tests/rl/unit_tests/cpu/test_async_controller.py",
+      "patch": "@@ -116,7 +116,7 @@ def _untrainable_group(group_id: int) -> TrainingSampleGroup:\n def _build_batcher(\n     *, num_prompts_per_train_step: int, num_mtp_layers: int = 0\n ) -> Batcher:\n-    config = Batcher.Config()\n+    config = Batcher.Config(rdma_min_tensor_bytes=None)\n     config.num_mtp_layers = num_mtp_layers\n     return config.build(\n         num_tokens_per_microbatch_per_dp_rank=16384,\n@@ -235,7 +235,7 @@ def test_batcher_raises_at_consecutive_untrainable_group_limit() -> None:\n def test_dp_assignment_avoids_all_padding_ranks_when_possible() -> None:\n     # Five two-token samples need four rank inputs across two microbatches.\n     # Redistributing one sample keeps every rank input trainable.\n-    batcher = Batcher.Config(max_num_documents=4).build(\n+    batcher = Batcher.Config(max_num_documents=4, rdma_min_tensor_bytes=None).build(\n         num_tokens_per_microbatch_per_dp_rank=4,\n         max_context_length=2,\n         num_prompts_per_train_step=1,\n@@ -257,7 +257,7 @@ def test_dp_assignment_avoids_all_padding_ranks_when_possible() -> None:\n \n \n def test_batcher_uses_flat_rank_capacity_and_reports_padding() -> None:\n-    batcher = Batcher.Config().build(\n+    batcher = Batcher.Config(rdma_min_tensor_bytes=None).build(\n         num_tokens_per_microbatch_per_dp_rank=8,\n         max_context_length=4,\n         num_prompts_per_train_step=1,\n@@ -283,7 +283,9 @@ def test_batcher_uses_flat_rank_capacity_and_reports_padding() -> None:\n \n \n def test_flat_rank_packing_preserves_padding_mask() -> None:\n-    batcher = Batcher.Config(per_sample_pad_multiple=4).build(\n+    batcher = Batcher.Config(\n+        per_sample_pad_multiple=4, rdma_min_tensor_bytes=None\n+    ).build(\n         num_tokens_per_microbatch_per_dp_rank=8,\n         max_context_length=4,\n         num_prompts_per_train_step=1,\n@@ -312,7 +314,7 @@ def test_flat_rank_packing_preserves_padding_mask() -> None:\n \n \n def test_batcher_balances_packing_across_dp_ranks() -> None:\n-    batcher = Batcher.Config().build(\n+    batcher = Batcher.Config(rdma_min_tensor_bytes=None).build(\n         num_tokens_per_microbatch_per_dp_rank=8,\n         max_context_length=8,\n         num_prompts_per_train_step=1,\n@@ -427,7 +429,7 @@ def test_batcher_zigzags_workloads_across_dp_ranks() -> None:\n \n \n def test_batcher_reports_padding_when_document_limit_blocks_greedy_order() -> None:\n-    batcher = Batcher.Config(max_num_documents=3).build(\n+    batcher = Batcher.Config(max_num_documents=3, rdma_min_tensor_bytes=None).build(\n         num_tokens_per_microbatch_per_dp_rank=6,\n         max_context_length=3,\n         num_prompts_per_train_step=1,\n@@ -453,7 +455,7 @@ def test_batcher_reports_padding_when_document_limit_blocks_greedy_order() -> No\n def test_document_limit_applies_to_each_local_microbatch() -> None:\n     # A local microbatch is capped at three documents. The batcher must keep all\n     # five documents and distribute them 2 + 3 across two microbatches.\n-    batcher = Batcher.Config(max_num_documents=3).build(\n+    batcher = Batcher.Config(max_num_documents=3, rdma_min_tensor_bytes=None).build(\n         num_tokens_per_microbatch_per_dp_rank=8,\n         max_context_length=4,\n         num_prompts_per_train_step=1,\n@@ -477,7 +479,7 @@ def test_document_limit_applies_to_each_local_microbatch() -> None:\n \n \n def test_document_limit_can_be_smaller_than_rows_per_microbatch() -> None:\n-    batcher = Batcher.Config(max_num_documents=1).build(\n+    batcher = Batcher.Config(max_num_documents=1, rdma_min_tensor_bytes=None).build(\n         num_tokens_per_microbatch_per_dp_rank=4,\n         max_context_length=2,\n         num_prompts_per_train_step=1,",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_async_controller.py",
+      "sha": "a6d81e1c5bba501be69fff56454d27ec5e391958",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 7,
+      "filename": "tests/rl/unit_tests/cpu/test_batcher_actor.py",
+      "patch": "@@ -75,7 +75,7 @@ def test_batcher_actor_returns_the_in_process_batch(tmp_path, monkeypatch) -> No\n         _group(4, [1.0, 0.0]),\n     ]\n \n-    batcher = Batcher.Config().build(**_BATCHER_KWARGS)\n+    batcher = Batcher.Config(rdma_min_tensor_bytes=None).build(**_BATCHER_KWARGS)\n     expected = [batcher.add_group(rollout_group=group) for group in groups]\n \n     async def run() -> tuple[list, list, list]:\n@@ -87,13 +87,13 @@ async def run() -> tuple[list, list, list]:\n                 enable_structured_logging=False,\n             )\n             actor = mesh.spawn(\n-                \"batcher\",\n-                BatcherActor,\n-                Batcher.Config(rdma_min_tensor_bytes=1024),\n-                **spawn_kwargs,\n+                \"batcher\", BatcherActor, Batcher.Config(), **spawn_kwargs\n             )\n             by_value = mesh.spawn(\n-                \"batcher_by_value\", BatcherActor, Batcher.Config(), **spawn_kwargs\n+                \"batcher_by_value\",\n+                BatcherActor,\n+                Batcher.Config(rdma_min_tensor_bytes=None),\n+                **spawn_kwargs,\n             )\n             results = [\n                 await actor.add_group.call_one(rollout_group=group) for group in groups\n@@ -144,7 +144,7 @@ def comparable(batch) -> dict:\n         rtol=0,\n         atol=0,\n     )\n-    # Without the threshold, the batches come back by value and match the in-process ones.\n+    # With rdma_min_tensor_bytes=None, the batches come back by value and match the in-process ones.\n     assert [batch is None for batch, _ in by_value_results] == [\n         batch is None for batch, _ in expected\n     ]",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py",
+      "sha": "d35157354f357676060d87b8eee81aba4a281c82",
+      "status": "modified"
+    },
+    {
+      "additions": 48,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py",
+      "changes": 59,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 11,
+      "filename": "tests/rl/unit_tests/cpu/test_rdma_microbatch.py",
+      "patch": "@@ -83,16 +83,16 @@ def _microbatch(num_tokens: int) -> TrainingMicrobatch:\n     )\n \n \n+@pytest.mark.parametrize(\"min_bytes\", [1024, 1025])\n def test_rdma_microbatch_round_trips_every_field_and_drops_its_buffers(\n-    monkeypatch,\n+    monkeypatch, min_bytes\n ) -> None:\n     monkeypatch.setattr(rdma_microbatch, \"RDMABuffer\", _FakeRDMABuffer)\n     monkeypatch.setattr(rdma_microbatch, \"RDMAAction\", _FakeRDMAAction)\n-    # At 512 tokens the int64 (4 KiB), float (2 KiB) and routed-id (2 KiB, in model_kwargs)\n-    # tensors go by ref; the bool masks (512 B), token counts and empty tensor go by value.\n-    microbatch = _microbatch(num_tokens=512)\n+    # At 256 tokens the int64 tensors are 2 KiB, the float and routed-id (in model_kwargs) ones exactly\n+    # 1 KiB, the bool masks 256 B. So the 1 KiB tensors go by ref at min_bytes=1024 and by value at 1025.\n+    microbatch = _microbatch(num_tokens=256)\n \n-    min_bytes = 1024\n     registered = MonarchRDMAMicrobatch.register(\n         microbatch, min_bytes=min_bytes, batch_index=0, dp_rank=0, microbatch_index=0\n     )\n@@ -147,12 +147,22 @@ def _training_sample_group(group_id: int, num_samples: int = 1) -> TrainingSampl\n     return TrainingSampleGroup(group_id=group_id, training_samples=samples, metrics=[])\n \n \n-def test_batcher_without_rdma_min_tensor_bytes_never_registers(monkeypatch) -> None:\n+@pytest.mark.parametrize(\n+    (\"rdma_min_tensor_bytes\", \"rdma_backend\"),\n+    [(None, \"ibverbs\"), (1024, \"none\")],\n+    ids=[\"opted_out\", \"no_rdma_backend\"],\n+)\n+def test_batcher_sends_by_value_when_opted_out_or_without_rdma(\n+    monkeypatch, rdma_min_tensor_bytes, rdma_backend\n+) -> None:\n     def fail_to_register(tensor: torch.Tensor) -> None:\n-        pytest.fail(\"registered an RDMA buffer with rdma_min_tensor_bytes unset\")\n+        pytest.fail(\"registered an RDMA buffer\")\n \n     monkeypatch.setattr(rdma_microbatch, \"RDMABuffer\", fail_to_register)\n-    batcher = _build_batcher(rdma_min_tensor_bytes=None)\n+    monkeypatch.setattr(\n+        \"torchtitan.rl.trainer.batcher.get_rdma_backend\", lambda: rdma_backend\n+    )\n+    batcher = _build_batcher(rdma_min_tensor_bytes=rdma_min_tensor_bytes)\n \n     batch, _ = batcher.add_training_samples(\n         training_sample_group=_training_sample_group(0)\n@@ -164,7 +174,14 @@ def fail_to_register(tensor: torch.Tensor) -> None:\n \n def test_batcher_registers_each_batch_and_releases_the_oldest(monkeypatch) -> None:\n     monkeypatch.setattr(rdma_microbatch, \"RDMABuffer\", _FakeRDMABuffer)\n+    cuda_contexts_created = []\n+    monkeypatch.setattr(\n+        rdma_microbatch,\n+        \"create_cuda_context_to_silence_monarch_log\",\n+        lambda: cuda_contexts_created.append(1),\n+    )\n     batcher = _build_batcher(rdma_min_tensor_bytes=1024)\n+    assert not cuda_contexts_created\n \n     batches = [\n         batcher.add_training_samples(\n@@ -187,6 +204,8 @@ def test_batcher_registers_each_batch_and_releases_the_oldest(monkeypatch) -> No\n     assert buffers[0] and all(buffer.dropped for buffer in buffers[0])\n     assert buffers[1] and not any(buffer.dropped for buffer in buffers[1])\n     assert [batch.microbatches[0][0].batch_index for batch in batches] == [0, 1]\n+    # Once, at the first batch.\n+    assert len(cuda_contexts_created) == 1\n \n \n def _fake_rdma_microbatch(index: int, started: list[int]) -> SimpleNamespace:\n@@ -272,16 +291,19 @@ def test_four_ranks_read_their_columns_exactly_across_released_batches(\n ) -> None:\n     # Real Monarch RDMA over TCP (works on any CI host; the rank processes inherit the env var).\n     monkeypatch.setenv(\"MONARCH_RDMA_DISABLE_IBVERBS\", \"1\")\n+    # 256 tokens per rank, so the int64 (2 KiB) and float (1 KiB) tensors reach the default 1 KiB.\n     batcher_kwargs = dict(\n-        num_tokens_per_microbatch_per_dp_rank=64,\n+        num_tokens_per_microbatch_per_dp_rank=256,\n         max_context_length=16,\n         num_prompts_per_train_step=1,\n         dp_degree=4,\n         pad_id=0,\n         temperature=1.0,\n     )\n-    rdma_batcher = Batcher.Config(rdma_min_tensor_bytes=256).build(**batcher_kwargs)\n-    by_value_batcher = Batcher.Config().build(**batcher_kwargs)\n+    rdma_batcher = Batcher.Config().build(**batcher_kwargs)\n+    by_value_batcher = Batcher.Config(rdma_min_tensor_bytes=None).build(\n+        **batcher_kwargs\n+    )\n \n     async def run() -> None:\n         mesh = this_host().spawn_procs(per_host={\"procs\": 4})\n@@ -299,6 +321,7 @@ async def run() -> None:\n                 columns = list(\n                     (await ranks.read_column.call(batch.microbatches)).values()\n                 )\n+                assert isinstance(batch.microbatches[0][0].fields[\"input\"], _TensorRef)\n                 for dp_rank, column in enumerate(columns):\n                     torch.testing.assert_close(\n                         [dataclasses.asdict(microbatch) for microbatch in column],\n@@ -313,6 +336,20 @@ async def run() -> None:\n                     # Free the previous batch; the next one registers fresh buffers.\n                     await rdma_batcher.maybe_release_oldest_batch()\n             await rdma_batcher.maybe_release_oldest_batch()\n+\n+            # Large microbatches go by RDMA too: one of 42 MiB, read by all 4 ranks at once.\n+            large = _microbatch(num_tokens=1 << 20)\n+            rdma_large = MonarchRDMAMicrobatch.register(\n+                large, min_bytes=1024, batch_index=0, dp_rank=0, microbatch_index=0\n+            )\n+            for column in (await ranks.read_column.call([[rdma_large] * 4])).values():\n+                torch.testing.assert_close(\n+                    dataclasses.asdict(column[0]),\n+                    dataclasses.asdict(large),\n+                    rtol=0,\n+                    atol=0,\n+                )\n+            await rdma_large.drop()\n         finally:\n             await mesh.stop()\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_rdma_microbatch.py",
+      "sha": "828aa13fd942ea337c7a0df211587954f5c4112e",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 1,
+      "filename": "tests/rl/unit_tests/cpu/test_trainer.py",
+      "patch": "@@ -390,7 +390,7 @@ async def run() -> None:\n             advantages=torch.tensor([1.0]),\n         )\n \n-        # This rank's column (dp_rank 1); with `rdma_min_tensor_bytes` the trainer reads it.\n+        # This rank's column (dp_rank 1); with RDMA, the trainer reads it.\n         microbatches = (\n             [\n                 MagicMock(",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "sha": "23f7fe9e34e7f46d76f603cd97b513c1a46dfe42",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Factors%2Fmonarch%2Fbatcher.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Factors%2Fmonarch%2Fbatcher.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 6,
+      "filename": "torchtitan/rl/actors/monarch/batcher.py",
+      "patch": "@@ -14,9 +14,6 @@\n from torchtitan.observability.logging import init_logger\n from torchtitan.rl.rollout.types import RolloutGroup\n from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch\n-from torchtitan.rl.trainer.rdma_microbatch import (\n-    create_cuda_context_to_silence_monarch_log,\n-)\n \n \n class _BatcherActorEndpoints:\n@@ -40,8 +37,6 @@ def __init__(\n             rank=0,\n             enable=enable_structured_logging,\n         )\n-        if config.rdma_min_tensor_bytes is not None:\n-            create_cuda_context_to_silence_monarch_log()\n         super().__init__(\n             config,\n             num_tokens_per_microbatch_per_dp_rank=num_tokens_per_microbatch_per_dp_rank,\n@@ -81,7 +76,7 @@ class BatcherActor(Actor, _BatcherActorEndpoints, Batcher):\n         batcher = this_host().spawn_procs(per_host={\"cpus\": 1}).spawn(\n             \"batcher\",\n             BatcherActor,\n-            Batcher.Config(rdma_min_tensor_bytes=1024),\n+            Batcher.Config(),\n             num_prompts_per_train_step=2,\n             **other_init_kwargs,  # see `_BatcherActorEndpoints.__init__`\n         )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Factors%2Fmonarch%2Fbatcher.py",
+      "sha": "8a4e8f73b0dfa58f7aa80d150203d49d668a7e12",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Fcontroller%2Fcontroller.py",
+      "changes": 13,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fcontroller%2Fcontroller.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 11,
+      "filename": "torchtitan/rl/controller/controller.py",
+      "patch": "@@ -349,16 +349,6 @@ def __post_init__(self):\n                     \"to control optimizer-step boundaries.\",\n                     stacklevel=2,\n                 )\n-            if (\n-                self.async_loop.batcher.rdma_min_tensor_bytes is not None\n-                and not self.trainer.training.preprocess_microbatch_groups_lazily\n-            ):\n-                warnings.warn(\n-                    \"async_loop.batcher.rdma_min_tensor_bytes is set without \"\n-                    \"trainer.training.preprocess_microbatch_groups_lazily=True: trainer \"\n-                    \"ranks read all microbatches before forward/backward, with no overlap.\",\n-                    stacklevel=2,\n-                )\n             if self.trainer.parallelism.enable_sequence_parallel:\n                 sp_degree = self.trainer.parallelism.tensor_parallel_degree\n                 max_context_length = self.trainer.training.max_context_length\n@@ -1200,7 +1190,8 @@ async def _trainer_loop(\n                     # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).\n                     # Sending the MonarchRDMAMicrobatches during the previous optim_step would hide it.\n                     try:\n-                        # Send each DP rank only its column of the grid.\n+                        # Send each DP rank only its column of the grid. By value, each rank unpickles 1/dp of the\n+                        # bytes; with RDMA, only the message of handles shrinks, which matters at high DP.\n                         fwd_bwd_results = await asyncio.gather(\n                             *(\n                                 trainer_at_dp_rank.forward_backward.call(",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Fcontroller%2Fcontroller.py",
+      "sha": "8a9a6123132e116e948335302d50e9c7e096a05c",
+      "status": "modified"
+    },
+    {
+      "additions": 22,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Ftrainer%2Fbatcher.py",
+      "changes": 30,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer%2Fbatcher.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 8,
+      "filename": "torchtitan/rl/trainer/batcher.py",
+      "patch": "@@ -19,6 +19,7 @@\n \n import numpy as np\n import torch\n+from monarch.rdma import get_rdma_backend\n \n from torchtitan.components.data.types import TokenizedTrainingMicrobatch\n \n@@ -77,7 +78,7 @@ class TrainerStepBatch:\n         # global_routing_token_counts = per-depth non-padding token counts\n     \"\"\"\n \n-    # [num_microbatches][dp_degree]; MonarchRDMAMicrobatches when `rdma_min_tensor_bytes` is set\n+    # [num_microbatches][dp_degree]; MonarchRDMAMicrobatches unless `rdma_min_tensor_bytes` is None\n     microbatches: list[list[TrainingMicrobatch]] | list[list[\"MonarchRDMAMicrobatch\"]]\n     global_loss_token_counts: torch.Tensor\n     global_routing_token_counts: torch.Tensor\n@@ -164,7 +165,7 @@ class Batcher(Configurable):\n     Example:\n         # num_prompts_per_train_step=2, dp_degree=2, 256 tokens/rank\n         # The trigger is 2 trainable GROUPS, regardless of how many samples/tokens each contains.\n-        batcher = Batcher.Config().build(\n+        batcher = Batcher.Config(rdma_min_tensor_bytes=None).build(\n             num_tokens_per_microbatch_per_dp_rank=256,\n             max_context_length=128,\n             num_prompts_per_train_step=2,\n@@ -192,12 +193,13 @@ class Config(Configurable.Config):\n         When unset, the trainer uses the microbatch token capacity as the\n         CUDA-graph-safe metadata bound without imposing a tighter packing cap.\n         \"\"\"\n-        rdma_min_tensor_bytes: int | None = None\n+        rdma_min_tensor_bytes: int | None = 1024\n         \"\"\"Send microbatch tensors of at least this many bytes as Monarch RDMA buffers, not in the RPC message:\n-            None (default): every tensor in the message.\n-            e.g. 1024: tensors >= 1 KiB stay in the batcher; token counts (8 B) and empty tensors go in the message.\n-        Monarch uses ibverbs where the host has it, else TCP; a host that lists unusable ibverbs devices\n-        fails instead. MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process, weight sync included.\"\"\"\n+            1024 (default): tensors >= 1 KiB stay in the batcher; token counts (8 B) go in the message.\n+            None: every tensor in the message; also the fallback when `monarch.rdma.get_rdma_backend()` is \"none\".\n+        Monarch uses ibverbs where the host has it, else TCP. A host that lists ibverbs devices it can't use\n+        fails at the first batch: set this to None, or MONARCH_RDMA_DISABLE_IBVERBS=1 (TCP in every process,\n+        weight sync included).\"\"\"\n         training_sample_builder: TrainingSampleBuilder.Config = field(\n             default_factory=TrainingSampleBuilder.Config\n         )\n@@ -249,6 +251,11 @@ def __init__(\n         self._groups_for_next_batch: list[TrainingSampleGroup] = []\n         self._num_consecutive_zero_output_groups = 0\n         self._rdma_min_tensor_bytes = config.rdma_min_tensor_bytes\n+        if self._rdma_min_tensor_bytes is not None and get_rdma_backend() == \"none\":\n+            logger.warning(\n+                \"Monarch has no RDMA backend, so trainer microbatches go by value.\"\n+            )\n+            self._rdma_min_tensor_bytes = None\n         # Batches that trainer ranks may still read, oldest first; each buffer keeps its tensor alive until drop().\n         self._batches_being_read: deque[list[list[MonarchRDMAMicrobatch]]] = deque()\n         self._num_batches_registered = 0\n@@ -365,7 +372,14 @@ def add_training_samples(\n         if self._rdma_min_tensor_bytes is None:\n             return batch, group_is_trainable\n         # Import lazily to avoid a circular import: rdma_microbatch imports TrainingMicrobatch.\n-        from torchtitan.rl.trainer.rdma_microbatch import MonarchRDMAMicrobatch\n+        from torchtitan.rl.trainer.rdma_microbatch import (\n+            create_cuda_context_to_silence_monarch_log,\n+            MonarchRDMAMicrobatch,\n+        )\n+\n+        # At the first batch, not in __init__: on exclusive-process GPUs, trainer rank 0 must get GPU 0 first.\n+        if self._num_batches_registered == 0:\n+            create_cuda_context_to_silence_monarch_log()\n \n         # Trainer ranks read these tensors from this process.\n         rdma_microbatches = [",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Ftrainer%2Fbatcher.py",
+      "sha": "cd025ae646b51b3576db8dfe7d366ba2dc777107",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Ftrainer%2Frdma_microbatch.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer%2Frdma_microbatch.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 1,
+      "filename": "torchtitan/rl/trainer/rdma_microbatch.py",
+      "patch": "@@ -4,7 +4,7 @@\n # This source code is licensed under the BSD-style license found in the\n # LICENSE file in the root directory of this source tree.\n \n-\"\"\"Opt-in RDMA path for trainer microbatches (`Batcher.Config.rdma_min_tensor_bytes`): the process\n+\"\"\"RDMA path for trainer microbatches (`Batcher.Config.rdma_min_tensor_bytes`): the process\n that registers them keeps the large tensors, and each trainer rank reads its own column.\n \"\"\"\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Ftrainer%2Frdma_microbatch.py",
+      "sha": "71ee66d9a2307973d599dcd0c63d82bc60ec90be",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer%2Ftrainer.py?ref=b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "deletions": 3,
+      "filename": "torchtitan/rl/trainer/trainer.py",
+      "patch": "@@ -253,7 +253,8 @@ async def forward_backward(\n \n         Args:\n             microbatches: This rank's column of the batcher's `[num_microbatches][dp_degree]` grid;\n-                `MonarchRDMAMicrobatch`es when `rdma_min_tensor_bytes` is set, read a few ahead of training.\n+                `MonarchRDMAMicrobatch`es unless `rdma_min_tensor_bytes` is None. With\n+                `preprocess_microbatch_groups_lazily`, they are read a few ahead of training.\n             global_loss_token_counts: Per-objective loss-token counts across the\n                 global batch.\n             global_routing_token_counts: Per-depth non-padding routing-token\n@@ -298,8 +299,8 @@ async def forward_backward(\n                         f\"{identity}, expected {expected}.\"\n                     )\n             self._num_rdma_batches_read += 1\n-            # TODO: the cp * tp ranks of a DP replica read the same column. Read it once per replica\n-            # and broadcast it, to cut the trainer's reads by cp * tp. Needs a per-replica group.\n+            # TODO: the cp * tp ranks at one DP rank read the same column. Read it once and broadcast it\n+            # over that cp * tp group, to cut the trainer's reads by cp * tp.\n             microbatch_groups = RDMAMicrobatchPrefetcher(microbatches)\n         result = engine.forward_backward(\n             microbatch_groups=microbatch_groups,",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/b8c3019c77ed16ecc12952d1302266ac6aa78247/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "sha": "9e0e11c0c9886526f5421d1ec9ba9c0277fae6c6",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "should we comment\n> Why 1 KiB? Registering one buffer costs 0.4-1 ms (stress above), far more than sending an 8 B token count, and RDMABuffer rejects empty tensors.",
+      "created_at": "2026-10-15T06:45:24Z",
+      "diff_hunk": "@@ -192,12 +193,13 @@ class Config(Configurable.Config):\n         When unset, the trainer uses the microbatch token capacity as the\n         CUDA-graph-safe metadata bound without imposing a tighter packing cap.\n         \"\"\"\n-        rdma_min_tensor_bytes: int | None = None\n+        rdma_min_tensor_bytes: int | None = 1024\n         \"\"\"Send microbatch tensors of at least this many bytes as Monarch RDMA buffers, not in the RPC message:\n-            None (default): every tensor in the message.\n-            e.g. 1024: tensors >= 1 KiB stay in the batcher; token counts (8 B) and empty tensors go in the message.\n-        Monarch uses ibverbs where the host has it, else TCP; a host that lists unusable ibverbs devices\n-        fails instead. MONARCH_RDMA_DISABLE_IBVERBS=1 forces TCP in every process, weight sync included.\"\"\"\n+            1024 (default): tensors >= 1 KiB stay in the batcher; token counts (8 B) go in the message.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5413#discussion_r4279904502",
+      "id": 4279904502,
+      "line": 198,
+      "original_line": 198,
+      "path": "torchtitan/rl/trainer/batcher.py",
+      "updated_at": "2026-10-15T06:46:07Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "why removing?",
+      "created_at": "2026-10-15T06:45:59Z",
+      "diff_hunk": "@@ -349,16 +349,6 @@ def __post_init__(self):\n                     \"to control optimizer-step boundaries.\",\n                     stacklevel=2,\n                 )\n-            if (",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5413#discussion_r4279908688",
+      "id": 4279908688,
+      "line": 352,
+      "original_line": 352,
+      "path": "torchtitan/rl/controller/controller.py",
+      "updated_at": "2026-10-15T06:46:07Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ],
+  "issue_comments": [],
+  "number": 5413,
+  "refs": {
+    "base": {
+      "commit": "d51e4b3c6bf409e938dba55c84d9eb58d680371b",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "b8c3019c77ed16ecc12952d1302266ac6aa78247",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5413#pullrequestreview-5529191307",
+      "id": 5529191307,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-15T06:46:07Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ]
+}

@@ -10,45 +10,45 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/dist_optimizer.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 9f1f0ad18cd89a8730a9d9a6bbf91e05f96b1d6e62ccc7c6c93d8cafbe5ffeca
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 3b1c2ea7abaa7a6ce3dec095b736f23b936e8ad6cb013d6582c0992ae9c6a5e5
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/fine_grained_activation_offloading.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 20fd1e02cecb27d05b18ae672ca761583a93471420edd8f3bb3133b100c95a3e
 - source: nvidia-megatron-lm
   path: megatron/core/pipeline_parallel/fine_grained_activation_offload.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 96ebb98249d5d60e8c16df56f4876420146d841e3c1c4b4c9e83557d5fe2ac38
 - source: nvidia-megatron-lm
   path: megatron/core/optimizer/cpu_offloading/README.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 58bb8c15943166199d3066361742f2718536d4792b81cd0d22007e20e984571d
 - source: nvidia-megatron-lm
   path: megatron/core/optimizer/distrib_optimizer.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 892589f868b77a8f209bbcc8861521e7e71ddd46665b3dee38871aa580523389
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 5e0edba9f82b504a1785959824f03b8ea5c13799049c29a579ce0cc3b9a26e7b
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/paged_stash.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 950b8c72253b90e8b6936a5aa8532120bd8e056f6cc88807efa4c818d88d4efc
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/paged_stash.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 053fecb7a457408c19a5c44322c2dfd6a50a3d27e49786ddc6192b503c6d96a1
 - source: nvidia-megatron-lm
   path: tests/unit_tests/pipeline_parallel/test_fine_grained_activation_offloading.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: db30edc4c97846d8a7bef0316b8900fc8c296e8dbb5c04cc28b621821c29e676
 ---
 
@@ -65,6 +65,12 @@ DP/状态分片、microbatch/accumulation、TP/PP/CP/EP与重算共同影响显�
 当前官方dist-optimizer文档给Adam类示例的理论bytes/param：BF16模型参数、FP32main grad下非分片18B，对DP大小d分片为`6+12/d`；FP16/FP16和FP32/FP32另有公式。它假设相应state dtype与算法，不可推广Muon、FSDP、optimizer offload或特殊权重缓存。
 
 实现用连续parameter/main-grad buffers：backward梯度写入main-grad，reduce-scatter后各DP rank更新自己的FP32master slice，再cast并allgather供forward。参数tensor可为buffer views；物理存储、padding和临时gather计入实测，不能把view数量相加当真实字节。
+
+## 注册通信缓冲区的卸载生命周期
+
+当前 NCCL UBR 的 gradient-buffer offload 要在构造时选择可替换梯度池，参数池保持存活。先注销全部相关梯度池，再释放 storage 和池 owner；reload 创建、填充并重新注册新池。MXFP8 参数与梯度共享 storage 的布局显式拒绝该卸载，不能把它与所有低精度存储复用相加计算节省。
+
+注销中途失败会保留 storage，但早先的注销不会回滚；调用方必须终止该次运行，不能在可能部分注册的模型上直接重试 offload。reload 的失败清理是另一条路径，不能推成前述注销失败也可安全重试。HCU 使用实际 RCCL/allocator consumer 验证，不把这份 NVIDIA pool 实现当作现成 HIP 能力。
 
 ## 重算与细粒度激活 offload
 
@@ -104,14 +110,14 @@ offload单测覆盖生命周期和选择规则，缺HCU设备/平台项明示待
 
 ## 固定源码与维护边界
 
-- [docs/user-guide/features/dist_optimizer.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/user-guide/features/dist_optimizer.md)
-- [docs/user-guide/features/fine_grained_activation_offloading.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/user-guide/features/fine_grained_activation_offloading.md)
-- [megatron/core/pipeline_parallel/fine_grained_activation_offload.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/pipeline_parallel/fine_grained_activation_offload.py)
-- [megatron/core/optimizer/cpu_offloading/README.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/optimizer/cpu_offloading/README.md)
-- [megatron/core/optimizer/distrib_optimizer.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/optimizer/distrib_optimizer.py)
-- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/transformer_config.py)
-- [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/paged_stash.py)
-- [docs/user-guide/features/paged_stash.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/user-guide/features/paged_stash.md)
-- [tests/unit_tests/pipeline_parallel/test_fine_grained_activation_offloading.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/tests/unit_tests/pipeline_parallel/test_fine_grained_activation_offloading.py)
+- [docs/user-guide/features/dist_optimizer.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/features/dist_optimizer.md)
+- [docs/user-guide/features/fine_grained_activation_offloading.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/features/fine_grained_activation_offloading.md)
+- [megatron/core/pipeline_parallel/fine_grained_activation_offload.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/pipeline_parallel/fine_grained_activation_offload.py)
+- [megatron/core/optimizer/cpu_offloading/README.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/optimizer/cpu_offloading/README.md)
+- [megatron/core/optimizer/distrib_optimizer.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/optimizer/distrib_optimizer.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/transformer_config.py)
+- [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/paged_stash.py)
+- [docs/user-guide/features/paged_stash.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/features/paged_stash.md)
+- [tests/unit_tests/pipeline_parallel/test_fine_grained_activation_offloading.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/pipeline_parallel/test_fine_grained_activation_offloading.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

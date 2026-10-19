@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/models/muse_glimmer/README.md
-raw_sha256: 08b442753e5c7386825b05bc977dce988fcb9c0f8a8eb5b5cd4117a32a5e4daf
+raw_sha256: efe34a8462c2416d00459f31b73ddd36bd68a72b4ff00ea4b6a117d88c5f27ef
 sources: []
-generated_body_sha256: 44c2f3f90edab7ebfd3ae02646bc591ca0e34abf9eb626faf3b12816e3362469
+generated_body_sha256: 1e6db85d54f12578cc3b3010497c2a57f635c30ecb08fe39ef5515409eec814e
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/muse_glimmer/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/muse_glimmer/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/muse_glimmer/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -75,7 +75,7 @@ built in [`__init__.py`](./__init__.py).
 ## Multimodal (vision)
 
 The `*_mm` flavors make `MuseGlimmerModel` own a vision encoder + adapter
-([`vision_encoder.py`](./vision_encoder.py)) and run them inside `forward`,
+([shared Spark implementation](../muse_spark/vision_encoder.py)) and run them inside `forward`,
 building packed vision features and gathering them into token embeddings using
 bank indices prepared before token sharding. Multimodal fusion is TP-replicated;
 the first decoder layer restores the standard decoder layout (sequence-parallel

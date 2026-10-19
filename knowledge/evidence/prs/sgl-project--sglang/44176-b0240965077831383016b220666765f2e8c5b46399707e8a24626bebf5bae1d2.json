@@ -1,0 +1,886 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "d768dcf6ad2942b269ef05207058a0c2a45ca235bc06644a353a7fa51b29752a",
+      "isPrivate": false,
+      "numbers": [
+        44177,
+        44176,
+        44175,
+        44174,
+        44173,
+        44170,
+        44169,
+        44168
+      ],
+      "observed_at": "2026-10-19T18:29:54.108972+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4681,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "dc81f17b90bbf4563fe94b3cda214504ed23305d",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nWith an FP8 KV cache, `--enable-mixed-chunk` kills the DSA backend on the first mixed batch when the prefill backend is `flashmla_sparse`, `flashmla_sparse_q8` or `triton_sparse_mla`. The root cause is one routing predicate: `get_topk_transform_method` returns `TopkTransformMethod.RAGGED` for `ForwardMode.EXTEND` only, and a mixed-chunk batch carries `ForwardMode.MIXED`. The rest of the stack already treats such a batch as an extend-shaped batch (its decode rows are one-token extends with a full prefix), which is exactly how the gap surfaces:\n\n- The eager runner runs a mixed batch as EXTEND (`eager_runner.execute` rewrites the mode), so without a prefill CUDA graph the backend never sees MIXED and nothing fails.\n- The prefill CUDA graph runner (breakable, the CUDA default) builds the attention metadata from the real MIXED batch and replays the EXTEND-captured graphs, whose in-graph ops see a static batch with mode EXTEND. The metadata is therefore prepared for PAGED and has no `topk_indices_offset`, while the in-graph indexer asks for the RAGGED transform:\n\n  ```\n  RuntimeError: RAGGED topk_transform requires topk_indices_offset; expected extend-without-speculative metadata.\n  ```\n\n- Runs that hand MIXED straight to `forward_extend` (context parallel, NPU) take the PAGED path and the bf16-only kernel receives the packed FP8 pool:\n\n  ```\n  RuntimeError: kv must have dtype torch::kBFloat16          # flashmla_sparse, flashmla_sparse_q8\n  TypeError: sparse_mla_prefill needs a bf16 KV cache, got torch.float8_e4m3fn   # triton_sparse_mla\n  ```\n\nThe gap was pointed out by @ch-wan in the review of #32779 as a pre-existing issue shared with `flashmla_sparse`; this PR fixes it for all three backends.\n\n## Modifications\n\n`get_topk_transform_method` routes `ForwardMode.MIXED` exactly like `ForwardMode.EXTEND` for these three prefill impls (an FP8 pool, or `flashmla_sparse_q8` with any pool since #41790), so the metadata the backend builds from a MIXED batch agrees with what the EXTEND-replaying graph ops, and the eager runner, expect. Nothing else changes: the extend branch of `init_forward_metadata` already builds `page_table_1_flattened` and `topk_indices_offset` for MIXED (it enters through `is_extend()`), and the indexer already runs its ragged top-k for MIXED (`is_extend_without_speculative()`), with the transform method as a parameter. FP8-native impls (`flashmla_kv`, `flashinfer_sparse_mla`, `trtllm`) and bf16 pools keep PAGED in both modes, which is why they never hit this. Born-fp8 q for `flashmla_sparse_q8` stays EXTEND-only; a MIXED batch reaches the q8 helper on the bf16-q hand-off, which casts. The q8 launch validator used to refuse `--enable-mixed-chunk` because a MIXED batch took PAGED; that refusal, its parameter and its test case are removed, and the `forward_extend` message for q8 now names the two shapes that remain unsupported (SPLIT_PREFILL, DLLM_EXTEND).\n\nThe alternative, building the replay metadata from the mode-rewritten static batch inside the prefill graph runner, would change every attention backend's replay contract to fix a predicate that only this backend has; the backend-local change keeps `get_topk_transform_method` consistent with the backend's own `is_extend()` branches.\n\nCost: a RAGGED mixed batch dequantizes the batch's whole ragged KV (`sum(seq_lens)` tokens) per layer, the same work a chunked EXTEND with prefixes already does, now including the decode rows' contexts. That is the price of running a bf16 kernel on an FP8 pool; `flashmla_kv` (main's default for FP8 KV on SM90) is unaffected. Numbers below.\n\n## Accuracy Tests\n\n- `test/registered/attention/unittests/dsa/test_dsa.py`: new `test_sparse_fp8_mixed_chunk_prefill_cases` runs a `ForwardMode.MIXED` FP8 case (one 4-token chunk plus two one-token rows, all with a 2048 prefix) through every prefill impl against the kit's bf16 reference. On the previous code `flashmla_sparse` fails with `kv must have dtype torch::kBFloat16` and `triton_sparse_mla` with the bf16 `TypeError`; `flashmla_kv` passes before and after (PAGED is correct for it); the bf16-only impls skip as before.\n- `test/registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py`: five MIXED rows in the shared `get_topk_transform_method` table (RAGGED for `flashmla_sparse` and `triton_sparse_mla` on an FP8 pool and for `flashmla_sparse_q8` on any pool; PAGED for `flashmla_sparse` on a bf16 pool and for `flashmla_kv`); the RAGGED rows are red on the previous code.\n- End to end (on the tree of 2026-10-06, main `05340e9ecb` plus this change; the branch has since been merged with main and the unit tests re-run on it), SM90, GLM-5.2-FP8 real weights, TP8, `--kv-cache-dtype fp8_e4m3 --chunked-prefill-size 4096 --enable-mixed-chunk`, default (breakable) prefill CUDA graph. Eight short natural prompts start decoding (96 tokens each) and a 12000-token prompt arrives 0.5 s later, so its three chunks are each merged with the eight decode rows. A probe in the server records what reaches `forward_extend`; the mixed batch is `extend_seq_lens = [4088, 1, 1, 1, 1, 1, 1, 1, 1]` with prefixes `[4032, 30, 32, ...]`.\n\n| tree | prefill backend | prefill graph | outcome |\n|---|---|---|---|\n| main | `flashmla_sparse` | breakable (default) | server dies on the first mixed batch: `RuntimeError: RAGGED topk_transform requires topk_indices_offset` |\n| main | `flashmla_sparse`, chunk 1024 (fits the graph buckets) | breakable | same error |\n| main | `flashmla_sparse` | disabled | runs: the eager runner runs the batch as EXTEND, so this path never failed |\n| main | `flashmla_sparse_q8` | breakable | same error |\n| this PR | `flashmla_sparse` | breakable | runs; mixed batch on RAGGED, kernel invoked |\n| this PR | `triton_sparse_mla` | breakable | runs; mixed batch on RAGGED, kernel invoked |\n| this PR | `flashmla_sparse` | disabled | runs (unchanged path) |\n| this PR | `triton_sparse_mla` | disabled | runs (unchanged path) |\n| this PR | `flashmla_sparse_q8` | breakable | runs (merged tree, launch guard removed); mixed batch on RAGGED, q8 kernel invoked |\n| this PR | `flashmla_sparse`, chunk 1024 (fits the graph buckets) | breakable | runs |\n| either | `flashmla_kv` (FP8-native control) | breakable | runs; mixed batch stays on PAGED |\n\n<details>\n<summary>How to reproduce (launch commands, client, probe)</summary>\n\nHardware: one SM90 node, 8 GPUs, TP8. Image: `lmsysorg/sglang:nightly-dev-cu13-20261006-f3fe7534` for the 2026-10-06 runs; the re-validation after merging main ran in `lmsysorg/sglang:nightly-dev-cu13-20261014-684fea8a` (sgl_kernel 0.4.9). Model: `zai-org/GLM-5.2-FP8`.\n\nServer, one per row of the table (the pre-fix rows run main at `05340e9ecb`, the others this branch):\n\n```bash\nPYTHONPATH=<checkout>/python:<dir containing sitecustomize.py> \\\npython3 -m sglang.launch_server --model-path zai-org/GLM-5.2-FP8 --trust-remote-code \\\n  --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --attention-backend dsa \\\n  --dsa-prefill-backend <flashmla_sparse | triton_sparse_mla | flashmla_sparse_q8 | flashmla_kv> \\\n  --mem-fraction-static 0.75 --chunked-prefill-size 4096 --enable-mixed-chunk \\\n  --host 127.0.0.1 --port 30100\n# rows marked \"disabled\": add --cuda-graph-backend-prefill disabled\n# rows marked \"chunk 1024\": --chunked-prefill-size 1024\n# rows marked \"no mixed chunk\": drop --enable-mixed-chunk\n```\n\nClient (forms the mixed batches; note the deliberate absence of `return_logprob`, which the scheduler treats as a reason not to mix):\n\n```bash\npython3 mixed_client.py http://127.0.0.1:30100 out.json 12000\n```\n\n```python\n\"\"\"Drive a server into MIXED batches and record greedy outputs.\n\nEight short natural prompts start first (max_tokens 96) so they are decoding\nwhen, half a second later, one long prompt arrives whose chunked prefill then\nmixes with them. Outputs go to a JSON file for cross-server comparison.\n\nUsage: mixed_client.py <base_url> <out.json> [long_len]\n\"\"\"\n\nimport asyncio\nimport json\nimport random\nimport sys\nimport time\n\nimport aiohttp\n\nURL = sys.argv[1].rstrip(\"/\")\nOUT = sys.argv[2]\nLONG_LEN = int(sys.argv[3]) if len(sys.argv) > 3 else 6000\n\nSHORT_PROMPTS = [\n    \"The capital of France is\",\n    \"Water boils at a temperature of\",\n    \"In computer science, a hash table is\",\n    \"The theory of general relativity was published by\",\n    \"A sonnet is a poem that has\",\n    \"Photosynthesis converts sunlight into\",\n    \"The largest planet in the solar system is\",\n    \"To sort a list in Python you can call\",\n]\n\n\nasync def gen(session, payload):\n    t0 = time.time()\n    async with session.post(f\"{URL}/generate\", json=payload) as r:\n        body = await r.json()\n    body[\"_latency\"] = time.time() - t0\n    return body\n\n\nasync def main():\n    rng = random.Random(1234)\n    long_ids = [rng.randint(1000, 60000) for _ in range(LONG_LEN)]\n    sampling = {\"temperature\": 0.0, \"max_new_tokens\": 96}\n    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1800)) as s:\n        shorts = [\n            asyncio.create_task(\n                # No return_logprob: the scheduler skips mixing whenever the running\n                # batch or the new batch asks for logprobs (scheduler.py, mixed-style\n                # chunked prefill condition), which would hide the very path under test.\n                gen(s, {\"text\": p, \"sampling_params\": sampling})\n            )\n            for p in SHORT_PROMPTS\n        ]\n        await asyncio.sleep(0.5)\n        long_task = asyncio.create_task(\n            gen(s, {\"input_ids\": long_ids, \"sampling_params\": {\"temperature\": 0.0, \"max_new_tokens\": 32}})\n        )\n        short_res = await asyncio.gather(*shorts)\n        long_res = await long_task\n    out = {\n        \"short\": [\n            {\n                \"prompt\": p,\n                \"text\": r.get(\"text\"),\n                \"output_ids\": r.get(\"output_ids\") or (r.get(\"meta_info\") or {}).get(\"output_token_ids\"),\n                \"completion_tokens\": (r.get(\"meta_info\") or {}).get(\"completion_tokens\"),\n                \"latency\": r[\"_latency\"],\n            }\n            for p, r in zip(SHORT_PROMPTS, short_res)\n        ],\n        \"long\": {\n            \"text\": long_res.get(\"text\"),\n            \"prompt_tokens\": (long_res.get(\"meta_info\") or {}).get(\"prompt_tokens\"),\n            \"latency\": long_res[\"_latency\"],\n        },\n    }\n    json.dump(out, open(OUT, \"w\"), indent=1)\n    print(\"short latencies:\", [round(x[\"latency\"], 2) for x in out[\"short\"]])\n    print(\"long: prompt_tokens=%s latency=%.2fs text=%r\" % (out[\"long\"][\"prompt_tokens\"], out[\"long\"][\"latency\"], (out[\"long\"][\"text\"] or \"\")[:60]))\n    for x in out[\"short\"]:\n        print(\"  %-48r -> %r\" % (x[\"prompt\"], (x[\"text\"] or \"\")[:70]))\n\n\nasyncio.run(main())\n```\n\nProbe (drop this file as `sitecustomize.py` on the server's `PYTHONPATH`; set `PROBE_REFCHECK=1` for the fp32 row check, which writes its tensors to `DUMP_DIR`):\n\n```python\n\"\"\"sitecustomize for the mixed-chunk probe.\n\nCounts DSA forward_extend calls per (forward_mode, topk transform, impl,\nuse_mha, in-graph), logs the first mixed batches by shape (the breakable graph\nreplays a mixed batch with the static batch's mode, EXTEND), and, with\nPROBE_REFCHECK=1, recomputes layer-0 attention in fp32 for the decode rows and\nthe last chunk rows of the first mixed batches from the KV pool and the top-k\nthe kernel received, logging cosine / max abs against the kernel's output.\nLogs every 200 calls because the servers are stopped with docker stop.\n\"\"\"\n\nimport os\nfrom collections import Counter\n\n_TAG = os.environ.get(\"PROBE_TAG\", \"probe\")\n_REFCHECK = os.environ.get(\"PROBE_REFCHECK\", \"0\") == \"1\"\n_DUMP = os.environ.get(\"DUMP_DIR\", \"/dump\")\n\n\ndef _refcheck(self, layer, forward_batch, q, kw, out, method, in_bcg):\n    import torch\n\n    from sglang.kernels.ops.attention.dsa.dequant_k_cache import (\n        dequantize_k_cache_paged,\n    )\n\n    if not self.use_fused_topk:\n        print(\"[REFCHECK %s] skipped: unfused topk\" % _TAG, flush=True)\n        return\n    topk_indices = kw.get(\"topk_indices\")\n    q_rope = kw.get(\"q_rope\")\n    if topk_indices is None:\n        print(\"[REFCHECK %s] skipped: no topk_indices\" % _TAG, flush=True)\n        return\n    h = layer.tp_q_head_num\n    T = q.shape[0]\n    if q_rope is None:\n        q_all = q.reshape(T, h, -1)\n    else:\n        q_all = torch.cat([q.reshape(T, h, -1), q_rope.reshape(T, h, -1)], dim=-1)\n    d_qk = q_all.shape[-1]\n    d_v = layer.v_head_dim\n    out3 = out.reshape(T, h, -1)[:, :, :d_v]\n    ext = list(forward_batch.extend_seq_lens_cpu)\n    starts = [0]\n    for e in ext[:-1]:\n        starts.append(starts[-1] + e)\n    decode_rows = [s for s, e in zip(starts, ext) if e == 1]\n    ci = max(range(len(ext)), key=lambda i: ext[i])\n    chunk_rows = list(range(starts[ci] + ext[ci] - 4, starts[ci] + ext[ci]))\n    pool = self.token_to_kv_pool.get_key_buffer(layer.layer_id)\n    md = self.forward_metadata\n    pt = topk_indices.reshape(T, -1)\n    kv_ragged = None\n    if method == \"RAGGED\":\n        kv_ragged = dequantize_k_cache_paged(pool, md.page_table_1_flattened).reshape(\n            -1, d_qk\n        )\n\n    def ref_row(t):\n        idx = pt[t]\n        idx = idx[idx >= 0].long()\n        if kv_ragged is not None:\n            K = kv_ragged[idx].float()\n        else:\n            K = dequantize_k_cache_paged(pool, idx.to(torch.int32)).reshape(-1, d_qk).float()\n        p = torch.softmax(q_all[t].float() @ K.T * layer.scaling, dim=-1)\n        return p @ K[:, :d_v], int(idx.numel())\n\n    rec = {\"rows\": [], \"out\": [], \"ref\": [], \"nvalid\": [], \"group\": []}\n    for group, rows in ((\"decode\", decode_rows), (\"chunk\", chunk_rows)):\n        cos_min, mabs_max = 1.0, 0.0\n        for t in rows:\n            ref, nvalid = ref_row(t)\n            o = out3[t].float()\n            cos = torch.nn.functional.cosine_similarity(o.flatten(), ref.flatten(), dim=0).item()\n            mabs = (o - ref).abs().max().item()\n            cos_min, mabs_max = min(cos_min, cos), max(mabs_max, mabs)\n            rec[\"rows\"].append(t); rec[\"out\"].append(o.cpu()); rec[\"ref\"].append(ref.cpu())\n            rec[\"nvalid\"].append(nvalid); rec[\"group\"].append(group)\n        print(\n            \"[REFCHECK %s] layer=%d %s rows=%d (%s, %s, %s): min cosine %.8f, max abs %.3e, ref |x| max %.3e\"\n            % (_TAG, layer.layer_id, group, len(rows), method, self.dsa_prefill_impl,\n               \"bcg\" if in_bcg else \"eager\", cos_min, mabs_max,\n               max(r.abs().max().item() for r in rec[\"ref\"][-len(rows):]) if rows else 0.0),\n            flush=True,\n        )\n    torch.save(rec, \"%s/%s_refcheck_l%d_%d.pt\" % (_DUMP, _TAG, layer.layer_id, os.getpid()))\n\n\ndef _install():\n    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend\n    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (\n        is_in_breakable_cuda_graph,\n    )\n\n    counts = Counter()\n    state = {\"n\": 0, \"mixed_logged\": 0, \"checked\": 0}\n    orig = DeepseekSparseAttnBackend.forward_extend\n\n    def forward_extend(self, q, k, v, layer, forward_batch, *a, **kw):\n        mode = forward_batch.forward_mode.name\n        method = self.get_topk_transform_method(forward_batch.forward_mode).name\n        in_bcg = is_in_breakable_cuda_graph()\n        key = (mode, method, self.dsa_prefill_impl, bool(self.use_mha), \"bcg\" if in_bcg else \"eager\")\n        counts[key] += 1\n        state[\"n\"] += 1\n        ext = forward_batch.extend_seq_lens_cpu or []\n        looks_mixed = mode == \"MIXED\" or (len(ext) > 1 and max(ext) > 1 and min(ext) == 1)\n        if looks_mixed and state[\"mixed_logged\"] < 3 and layer.layer_id == 0:\n            state[\"mixed_logged\"] += 1\n            print(\n                \"[PROBE %s] MIXED batch: mode=%s extend_seq_lens=%s prefix_lens=%s method=%s impl=%s use_mha=%s %s\"\n                % (_TAG, mode, ext, forward_batch.extend_prefix_lens_cpu, method,\n                   self.dsa_prefill_impl, self.use_mha, \"bcg\" if in_bcg else \"eager\"),\n                flush=True,\n            )\n        if state[\"n\"] % 200 == 0:\n            print(\"[PROBE %s] counts=%s\" % (_TAG, dict(counts)), flush=True)\n        out = orig(self, q, k, v, layer, forward_batch, *a, **kw)\n        if (\n            _REFCHECK and looks_mixed and layer.layer_id == 0\n            and state[\"checked\"] < 2 and not self.use_mha\n        ):\n            state[\"checked\"] += 1\n            try:\n                _refcheck(self, layer, forward_batch, q, kw, out, method, in_bcg)\n            except Exception as exc:  # the check must never take the server down\n                print(\"[REFCHECK %s] failed: %r\" % (_TAG, exc), flush=True)\n        return out\n\n    DeepseekSparseAttnBackend.forward_extend = forward_extend\n    print(\"[PROBE %s] hook installed (refcheck=%s)\" % (_TAG, _REFCHECK), flush=True)\n\n\ntry:\n    _install()\nexcept Exception as exc:  # never take the server down\n    print(\"[PROBE %s] hook install failed: %r\" % (_TAG, exc), flush=True)\n```\n\n</details>\n\nCorrectness of what the mixed batch computes, checked in the server itself: for the first mixed batches at layer 0 the probe recomputes attention in fp32 from the KV pool and the top-k the kernel received, for the eight decode rows and the last four chunk rows, and compares with the kernel's output.\n\n| prefill backend | transform | rows checked (per rank, 8 ranks) | min cosine | max abs error | max abs of reference |\n|---|---|---|---|---|---|\n| `flashmla_sparse` (this PR) | RAGGED | 8 decode rows | 0.99999833 | 6.2e-05 | 1.6e-02 |\n| `flashmla_sparse` (this PR) | RAGGED | 4 chunk rows | 0.99999845 | 3.1e-05 | 1.5e-02 |\n| `triton_sparse_mla` (this PR) | RAGGED | 8 decode rows | 0.99999821 | 6.9e-05 | 1.8e-02 |\n| `triton_sparse_mla` (this PR) | RAGGED | 4 chunk rows | 0.99999833 | 3.1e-05 | 1.5e-02 |\n| `flashmla_sparse_q8` (this PR) | RAGGED | 8 decode rows | 0.98844880 | 1.2e-03 | 1.9e-02 |\n| `flashmla_sparse_q8` (this PR) | RAGGED | 4 chunk rows | 0.99982989 | 6.5e-04 | 1.5e-02 |\n| `flashmla_kv` (control, unchanged) | PAGED | 8 decode rows | 0.99999666 | 7.0e-05 | 1.8e-02 |\n| `flashmla_kv` (control, unchanged) | PAGED | 4 chunk rows | 0.99999833 | 3.3e-05 | 1.5e-02 |\n\nThe two bf16 kernels land at the same distance from the fp32 recomputation as the FP8-native `flashmla_kv` control, i.e. bf16 output rounding (max error ~0.3% of the largest value); these rows are from the merged tree in the 2026-10-14 image, and the 2026-10-06 tree gave the same figures. `flashmla_sparse_q8` computes attention in FP8 (q and KV cast to e4m3 with identity scales), so its rows sit at that kernel's own precision: on plain extend chunks without mixed chunk, the same check gives the same figures (min cosine 0.99978, max abs 6.7e-04 on the chunk rows, against 0.99999845 / 3.1e-05 for `flashmla_sparse` on the same chunks), so the mixed batch adds nothing to the q8 error. Its decode rows sit lower (0.988) because they attend over a dozen keys, where FP8 rounding of P and V does not average out; note that this is the price of sending decode rows through the q8 prefill kernel, which only `--enable-mixed-chunk` does, and that without this PR the configuration does not start at all. The second mixed batch of each run, which fits a graph bucket and replays in-graph, gives the same figures.\n\nGreedy outputs across servers are not a usable metric for this change: the no-mixed `flashmla_sparse` server reproduces its own eight short continuations exactly on a rerun (8/8), but every mixed server agrees with it on only 0-2 of the 8 (first divergence after 0-9 tokens), including the FP8-native `flashmla_kv` control and the eager-prefill `flashmla_sparse` run, neither of which this PR changes. Merging a 4088-token chunk with the decode rows changes the MoE GEMM shapes those rows run under, and on this FP8 stack that is enough to flip near-tie tokens. The row-level check above is the one that isolates the kernel.\n\n## Speed Tests and Profiling\n\nLatency (the eight short prompts, 96 tokens each / the 12000-token prompt): `flashmla_sparse` mixed 5.04 s / 3.88 s, `triton_sparse_mla` mixed 3.78 s / 2.62 s, `flashmla_kv` mixed 5.07 s / 3.92 s, `flashmla_sparse` without mixed chunk 5.08 s / 3.86 s and 4.89 s / 3.68 s on a rerun. With three chunks the decode rows only gain three tokens during the prefill, so mixing does not move these numbers; the dequant cost described above is inside the noise here.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations) (no user-facing change).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n## Review and Merge Process\n\n1. Ping Merge Oncalls to start the process. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).\n2. Get approvals from [CODEOWNERS](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and other reviewers.\n3. Trigger CI tests with [comments](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests) or contact authorized users to do so.\n   - Common commands include `/tag-and-rerun-ci`, `/tag-run-ci-label`, `/rerun-failed-ci`\n4. After green CI and required approvals, ask Merge Oncalls or people with Write permission to merge the PR.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #39208993834](https://github.com/sgl-project/sglang/actions/runs/39208993834)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #39208993659](https://github.com/sgl-project/sglang/actions/runs/39208993659)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #39208993743](https://github.com/sgl-project/sglang/actions/runs/39208993743)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "cc @Oasis-Git since this is related to mixed chunk",
+            "createdAt": "2026-10-15T07:19:20Z",
+            "databaseId": 6186730337,
+            "updatedAt": "2026-10-15T07:19:20Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6186730337"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yunyang1999"
+            },
+            "body": "@nvpohanh thanks, all three are addressed in the latest push (`4e190cb8ae`):\n\n- **q8 launch guard.** You are right that the validator merged from #41790 kept `flashmla_sparse_q8 --enable-mixed-chunk` from starting, which would have left the q8 half of this fix unreachable, and that the q8 end-to-end row predated that guard. I took the first option: the `mixed_chunk_enabled` refusal, its parameter and its test case are gone, and the q8 `forward_extend` message now names the two shapes that remain unsupported (SPLIT_PREFILL under `--enable-pdmux`, DLLM_EXTEND under `--dllm-algorithm`) instead of claiming a launch-time rejection. The q8 row in the description is re-measured on the merged tree, with the same in-server fp32 row check as the other two backends: it launches, the mixed batch is served on the RAGGED q8 path, and the chunk rows match the fp32 recomputation at cosine 0.9998 / max abs 6.5e-04, the same as plain q8 extend chunks measured without mixed chunk (0.9998 / 6.7e-04), so the mixed batch adds nothing to the q8 kernel's own FP8 error. Its decode rows come out at cosine 0.988 because they attend over a dozen keys where FP8 rounding does not average out; that is inherent to running decode rows through the q8 prefill kernel, which only mixed chunk does, and I say so in the description.\n- **Duplicated comments.** One short comment stays on the routing predicate (your wording); the kit case and the routing-table rows each carry a one-line label; the bug history lives in the PR body only.\n- **Reproducibility.** The description now has a collapsible section with the exact launch command per table row, the client script that forms the mixed batches (including why it must not request logprobs), and the probe file behind the counts and the fp32 row check, plus the image tags and the model id. On the GPU model: the runs are on an SM90 node with 8 GPUs at TP8; I would rather keep it at the architecture level in the description, and I am happy to share the exact part privately if it matters for reproduction.\n",
+            "createdAt": "2026-10-15T09:44:41Z",
+            "databaseId": 6189187932,
+            "updatedAt": "2026-10-15T09:44:41Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6189187932"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-test test/registered/attention/unittests/dsa/test_dsa.py test/registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py test/registered/unit/attention/test_triton_sparse_mla_prefill.py\r\n",
+            "createdAt": "2026-10-19T05:34:29Z",
+            "databaseId": 6260439846,
+            "updatedAt": "2026-10-19T05:34:29Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260439846"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "## ⚠️ Rebase Required Before Re-run\nA major update has landed on `main`. Your PR is `diverged` relative to required base commit `6a39ddf1f2e0`.\n\n**Re-run was not dispatched.** What to do:\n- Rebase your branch onto the latest `main` and push again\n- Follow [issue #21065](https://github.com/sgl-project/sglang/issues/21065) for context\n- CI-fix PRs may request the `bypass-maintenance` label to skip this check",
+            "createdAt": "2026-10-19T05:34:52Z",
+            "databaseId": 6260444313,
+            "updatedAt": "2026-10-19T05:34:52Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260444313"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-test test/registered/attention/unittests/dsa/test_dsa.py test/registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py test/registered/unit/attention/test_triton_sparse_mla_prefill.py",
+            "createdAt": "2026-10-19T06:16:44Z",
+            "databaseId": 6260967398,
+            "updatedAt": "2026-10-19T06:16:44Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260967398"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "🚀 `4-gpu-b200` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/39209026692) <!--rrt:0:done-->\n```\ncd test/ && python3 registered/attention/unittests/dsa/test_dsa.py\n```\n\n🚀 `1-gpu-h100` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/39209039191) <!--rrt:1:done-->\n```\ncd test/ && python3 registered/attention/unittests/dsa/test_dsa.py\n```\n\n🚀 `ubuntu-latest` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/39209051623) <!--rrt:2:done-->\n```\ncd test/ && python3 registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py\ncd test/ && python3 registered/unit/attention/test_triton_sparse_mla_prefill.py\n```",
+            "createdAt": "2026-10-19T06:17:05Z",
+            "databaseId": 6260972265,
+            "updatedAt": "2026-10-19T07:01:25Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260972265"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXUu2uk=",
+          "hasNextPage": false
+        },
+        "totalCount": 6
+      },
+      "headRefOid": "2911aea09baf473e95e703ef0fb786c480504d15",
+      "headRepository": {
+        "nameWithOwner": "yunyang1999/sglang"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 44176,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe Accuracy Tests and Speed Tests sections give results, but others cannot rerun them. The description does not include:\n- the GPU model (it says only \"SM90\" and TP8);\n- the full server launch commands, including the model path and the `--dsa-prefill-backend` value for each row;\n- the client command or script that sends the eight short prompts and then the 12000-token prompt 0.5 s later, which forms the mixed batch;\n- how to reproduce the in-server probe behind the cosine table, for example a link to the probe patch.\n\n**Fix**\n\nPlease add these commands and the GPU model to the description.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "nvpohanh"
+                  },
+                  "body": "[by Claude Code] **Severity: functional | Confidence: High**\n\n**Issue**\n\nThis line sends `flashmla_sparse_q8` MIXED batches to RAGGED. But `_validate_flashmla_sparse_q8_backend` (lines 457-466, added by #41790 and merged into this branch) still raises `ValueError` for `--enable-mixed-chunk`, and its comment says a mixed batch takes PAGED. So `--dsa-prefill-backend flashmla_sparse_q8 --enable-mixed-chunk` still fails at launch, and the q8 part of this fix never runs. The q8 E2E row came from a tree without that guard.\n\n**Fix**\n\nPick one. Remove the `mixed_chunk_enabled` check, the `mixed_chunk` case in `test_q8_validator_rejects_combinations_that_used_to_fail_mid_forward`, and the \"rejected at launch\" text at line 2225. Or keep the guard, update its comment and the comment at line 2828, and drop the q8 MIXED claims and routing row.",
+                  "createdAt": "2026-10-15T07:28:24Z",
+                  "databaseId": 4280235841,
+                  "diffHunk": "@@ -4020,7 +4021,11 @@ def get_topk_transform_method(\n             # dequantizes inside the RAGGED branch and its kernel is bf16-only.\n             and self.dsa_prefill_impl\n             in (\"flashmla_sparse\", \"flashmla_sparse_q8\", \"triton_sparse_mla\")\n-            and forward_mode == ForwardMode.EXTEND\n+            # MIXED must answer exactly like EXTEND: the eager runner runs a\n+            # mixed-chunk batch as EXTEND, and the prefill graph runner builds\n+            # this metadata from the MIXED batch while replaying the\n+            # EXTEND-captured graphs, whose in-graph ops see EXTEND.\n+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)",
+                  "line": 4047,
+                  "originalLine": 4028,
+                  "path": "python/sglang/srt/layers/attention/dsa_backend.py",
+                  "updatedAt": "2026-10-15T07:28:24Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/44176#discussion_r4280235841"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "nvpohanh"
+                  },
+                  "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe same MIXED-routing explanation appears three times as long comments: here (7 lines), in `test_dsa_q8kv8_bf16_prefill_routing.py` lines 42-46, and in `get_topk_transform_method` (`dsa_backend.py` lines 4024-4027). The routing-test copy also tells the bug history (\"Routing MIXED to PAGED left that metadata ...\"), which belongs in the PR body. This makes the code harder to read, and the copies can drift apart.\n\n**Fix**\n\nKeep one short comment in `get_topk_transform_method`, for example `# MIXED matches EXTEND: the prefill graph runner builds metadata from MIXED but replays EXTEND graphs.` In the two tests, use one line each, such as `# --enable-mixed-chunk batch: one prefill chunk plus 1-token decode rows.`",
+                  "createdAt": "2026-10-15T07:28:24Z",
+                  "databaseId": 4280235851,
+                  "diffHunk": "@@ -303,6 +303,31 @@ def test_sparse_fp8_prefill_cases(self):\n                 )\n                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)\n \n+    # A mixed-chunk batch: one chunk of a long prefill plus decode requests",
+                  "line": null,
+                  "originalLine": 306,
+                  "path": "test/registered/attention/unittests/dsa/test_dsa.py",
+                  "updatedAt": "2026-10-15T07:28:24Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/44176#discussion_r4280235851"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwNzoyODoyNFrO_x83Sw==",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5529605899,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T07:28:24Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44176#pullrequestreview-5529605899"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNVQwNzoyODoyNFq0MjAyNi0xMC0xNVQwNzoyODoyNFrPAAAAAUmXFws=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Fix] dsa: Route mixed-chunk batches to the RAGGED top-k transform for bf16-only sparse prefill",
+      "updatedAt": "2026-10-19T07:01:25Z",
+      "url": "https://github.com/sgl-project/sglang/pull/44176"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/44176/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/44176/commits"
+      },
+      "html": {
+        "href": "https://github.com/sgl-project/sglang/pull/44176"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/44176"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/44176/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/44176"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/statuses/2911aea09baf473e95e703ef0fb786c480504d15"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 43,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "sgl-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/sgl-project/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/sgl-project/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/sgl-project/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/sgl-project/sglang/branches{/branch}",
+        "clone_url": "https://github.com/sgl-project/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/sgl-project/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/sgl-project/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/sgl-project/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/sgl-project/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/sgl-project/sglang/contributors",
+        "created_at": "2024-01-08T04:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/sgl-project/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/sgl-project/sglang/downloads",
+        "events_url": "https://api.github.com/repos/sgl-project/sglang/events",
+        "fork": false,
+        "forks": 9695,
+        "forks_count": 9695,
+        "forks_url": "https://api.github.com/repos/sgl-project/sglang/forks",
+        "full_name": "sgl-project/sglang",
+        "git_commits_url": "https://api.github.com/repos/sgl-project/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/sgl-project/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/sgl-project/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/sgl-project/sglang.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": false,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/sgl-project/sglang/hooks",
+        "html_url": "https://github.com/sgl-project/sglang",
+        "id": 740303686,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/sgl-project/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/sgl-project/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/sgl-project/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/sgl-project/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/sgl-project/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/sgl-project/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/sgl-project/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/sgl-project/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOLCAjRg",
+        "notifications_url": "https://api.github.com/repos/sgl-project/sglang/notifications{?since,all,participating}",
+        "open_issues": 5963,
+        "open_issues_count": 5963,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+          "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/sgl-project/followers",
+          "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/sgl-project",
+          "id": 147780389,
+          "login": "sgl-project",
+          "node_id": "O_kgDOCM7zJQ",
+          "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+          "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+          "repos_url": "https://api.github.com/users/sgl-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/sgl-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/sgl-project/sglang/pulls{/number}",
+        "pushed_at": "2026-10-19T18:16:22Z",
+        "releases_url": "https://api.github.com/repos/sgl-project/sglang/releases{/id}",
+        "size": 453970,
+        "ssh_url": "git@github.com:sgl-project/sglang.git",
+        "stargazers_count": 37442,
+        "stargazers_url": "https://api.github.com/repos/sgl-project/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/sgl-project/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/sgl-project/sglang/subscription",
+        "svn_url": "https://github.com/sgl-project/sglang",
+        "tags_url": "https://api.github.com/repos/sgl-project/sglang/tags",
+        "teams_url": "https://api.github.com/repos/sgl-project/sglang/teams",
+        "topics": [
+          "attention",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "diffusion",
+          "glm",
+          "gpt-oss",
+          "inference",
+          "llama",
+          "llm",
+          "minimax",
+          "moe",
+          "qwen",
+          "qwen-image",
+          "reinforcement-learning",
+          "transformer",
+          "vlm",
+          "wan"
+        ],
+        "trees_url": "https://api.github.com/repos/sgl-project/sglang/git/trees{/sha}",
+        "updated_at": "2026-10-19T18:27:09Z",
+        "url": "https://api.github.com/repos/sgl-project/sglang",
+        "visibility": "public",
+        "watchers": 37442,
+        "watchers_count": 37442,
+        "web_commit_signoff_required": false
+      },
+      "sha": "dc81f17b90bbf4563fe94b3cda214504ed23305d",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+        "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/sgl-project/followers",
+        "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/sgl-project",
+        "id": 147780389,
+        "login": "sgl-project",
+        "node_id": "O_kgDOCM7zJQ",
+        "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+        "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+        "repos_url": "https://api.github.com/users/sgl-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/sgl-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Motivation\n\nWith an FP8 KV cache, `--enable-mixed-chunk` kills the DSA backend on the first mixed batch when the prefill backend is `flashmla_sparse`, `flashmla_sparse_q8` or `triton_sparse_mla`. The root cause is one routing predicate: `get_topk_transform_method` returns `TopkTransformMethod.RAGGED` for `ForwardMode.EXTEND` only, and a mixed-chunk batch carries `ForwardMode.MIXED`. The rest of the stack already treats such a batch as an extend-shaped batch (its decode rows are one-token extends with a full prefix), which is exactly how the gap surfaces:\n\n- The eager runner runs a mixed batch as EXTEND (`eager_runner.execute` rewrites the mode), so without a prefill CUDA graph the backend never sees MIXED and nothing fails.\n- The prefill CUDA graph runner (breakable, the CUDA default) builds the attention metadata from the real MIXED batch and replays the EXTEND-captured graphs, whose in-graph ops see a static batch with mode EXTEND. The metadata is therefore prepared for PAGED and has no `topk_indices_offset`, while the in-graph indexer asks for the RAGGED transform:\n\n  ```\n  RuntimeError: RAGGED topk_transform requires topk_indices_offset; expected extend-without-speculative metadata.\n  ```\n\n- Runs that hand MIXED straight to `forward_extend` (context parallel, NPU) take the PAGED path and the bf16-only kernel receives the packed FP8 pool:\n\n  ```\n  RuntimeError: kv must have dtype torch::kBFloat16          # flashmla_sparse, flashmla_sparse_q8\n  TypeError: sparse_mla_prefill needs a bf16 KV cache, got torch.float8_e4m3fn   # triton_sparse_mla\n  ```\n\nThe gap was pointed out by @ch-wan in the review of #32779 as a pre-existing issue shared with `flashmla_sparse`; this PR fixes it for all three backends.\n\n## Modifications\n\n`get_topk_transform_method` routes `ForwardMode.MIXED` exactly like `ForwardMode.EXTEND` for these three prefill impls (an FP8 pool, or `flashmla_sparse_q8` with any pool since #41790), so the metadata the backend builds from a MIXED batch agrees with what the EXTEND-replaying graph ops, and the eager runner, expect. Nothing else changes: the extend branch of `init_forward_metadata` already builds `page_table_1_flattened` and `topk_indices_offset` for MIXED (it enters through `is_extend()`), and the indexer already runs its ragged top-k for MIXED (`is_extend_without_speculative()`), with the transform method as a parameter. FP8-native impls (`flashmla_kv`, `flashinfer_sparse_mla`, `trtllm`) and bf16 pools keep PAGED in both modes, which is why they never hit this. Born-fp8 q for `flashmla_sparse_q8` stays EXTEND-only; a MIXED batch reaches the q8 helper on the bf16-q hand-off, which casts. The q8 launch validator used to refuse `--enable-mixed-chunk` because a MIXED batch took PAGED; that refusal, its parameter and its test case are removed, and the `forward_extend` message for q8 now names the two shapes that remain unsupported (SPLIT_PREFILL, DLLM_EXTEND).\n\nThe alternative, building the replay metadata from the mode-rewritten static batch inside the prefill graph runner, would change every attention backend's replay contract to fix a predicate that only this backend has; the backend-local change keeps `get_topk_transform_method` consistent with the backend's own `is_extend()` branches.\n\nCost: a RAGGED mixed batch dequantizes the batch's whole ragged KV (`sum(seq_lens)` tokens) per layer, the same work a chunked EXTEND with prefixes already does, now including the decode rows' contexts. That is the price of running a bf16 kernel on an FP8 pool; `flashmla_kv` (main's default for FP8 KV on SM90) is unaffected. Numbers below.\n\n## Accuracy Tests\n\n- `test/registered/attention/unittests/dsa/test_dsa.py`: new `test_sparse_fp8_mixed_chunk_prefill_cases` runs a `ForwardMode.MIXED` FP8 case (one 4-token chunk plus two one-token rows, all with a 2048 prefix) through every prefill impl against the kit's bf16 reference. On the previous code `flashmla_sparse` fails with `kv must have dtype torch::kBFloat16` and `triton_sparse_mla` with the bf16 `TypeError`; `flashmla_kv` passes before and after (PAGED is correct for it); the bf16-only impls skip as before.\n- `test/registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py`: five MIXED rows in the shared `get_topk_transform_method` table (RAGGED for `flashmla_sparse` and `triton_sparse_mla` on an FP8 pool and for `flashmla_sparse_q8` on any pool; PAGED for `flashmla_sparse` on a bf16 pool and for `flashmla_kv`); the RAGGED rows are red on the previous code.\n- End to end (on the tree of 2026-10-06, main `05340e9ecb` plus this change; the branch has since been merged with main and the unit tests re-run on it), SM90, GLM-5.2-FP8 real weights, TP8, `--kv-cache-dtype fp8_e4m3 --chunked-prefill-size 4096 --enable-mixed-chunk`, default (breakable) prefill CUDA graph. Eight short natural prompts start decoding (96 tokens each) and a 12000-token prompt arrives 0.5 s later, so its three chunks are each merged with the eight decode rows. A probe in the server records what reaches `forward_extend`; the mixed batch is `extend_seq_lens = [4088, 1, 1, 1, 1, 1, 1, 1, 1]` with prefixes `[4032, 30, 32, ...]`.\n\n| tree | prefill backend | prefill graph | outcome |\n|---|---|---|---|\n| main | `flashmla_sparse` | breakable (default) | server dies on the first mixed batch: `RuntimeError: RAGGED topk_transform requires topk_indices_offset` |\n| main | `flashmla_sparse`, chunk 1024 (fits the graph buckets) | breakable | same error |\n| main | `flashmla_sparse` | disabled | runs: the eager runner runs the batch as EXTEND, so this path never failed |\n| main | `flashmla_sparse_q8` | breakable | same error |\n| this PR | `flashmla_sparse` | breakable | runs; mixed batch on RAGGED, kernel invoked |\n| this PR | `triton_sparse_mla` | breakable | runs; mixed batch on RAGGED, kernel invoked |\n| this PR | `flashmla_sparse` | disabled | runs (unchanged path) |\n| this PR | `triton_sparse_mla` | disabled | runs (unchanged path) |\n| this PR | `flashmla_sparse_q8` | breakable | runs (merged tree, launch guard removed); mixed batch on RAGGED, q8 kernel invoked |\n| this PR | `flashmla_sparse`, chunk 1024 (fits the graph buckets) | breakable | runs |\n| either | `flashmla_kv` (FP8-native control) | breakable | runs; mixed batch stays on PAGED |\n\n<details>\n<summary>How to reproduce (launch commands, client, probe)</summary>\n\nHardware: one SM90 node, 8 GPUs, TP8. Image: `lmsysorg/sglang:nightly-dev-cu13-20261006-f3fe7534` for the 2026-10-06 runs; the re-validation after merging main ran in `lmsysorg/sglang:nightly-dev-cu13-20261014-684fea8a` (sgl_kernel 0.4.9). Model: `zai-org/GLM-5.2-FP8`.\n\nServer, one per row of the table (the pre-fix rows run main at `05340e9ecb`, the others this branch):\n\n```bash\nPYTHONPATH=<checkout>/python:<dir containing sitecustomize.py> \\\npython3 -m sglang.launch_server --model-path zai-org/GLM-5.2-FP8 --trust-remote-code \\\n  --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --attention-backend dsa \\\n  --dsa-prefill-backend <flashmla_sparse | triton_sparse_mla | flashmla_sparse_q8 | flashmla_kv> \\\n  --mem-fraction-static 0.75 --chunked-prefill-size 4096 --enable-mixed-chunk \\\n  --host 127.0.0.1 --port 30100\n# rows marked \"disabled\": add --cuda-graph-backend-prefill disabled\n# rows marked \"chunk 1024\": --chunked-prefill-size 1024\n# rows marked \"no mixed chunk\": drop --enable-mixed-chunk\n```\n\nClient (forms the mixed batches; note the deliberate absence of `return_logprob`, which the scheduler treats as a reason not to mix):\n\n```bash\npython3 mixed_client.py http://127.0.0.1:30100 out.json 12000\n```\n\n```python\n\"\"\"Drive a server into MIXED batches and record greedy outputs.\n\nEight short natural prompts start first (max_tokens 96) so they are decoding\nwhen, half a second later, one long prompt arrives whose chunked prefill then\nmixes with them. Outputs go to a JSON file for cross-server comparison.\n\nUsage: mixed_client.py <base_url> <out.json> [long_len]\n\"\"\"\n\nimport asyncio\nimport json\nimport random\nimport sys\nimport time\n\nimport aiohttp\n\nURL = sys.argv[1].rstrip(\"/\")\nOUT = sys.argv[2]\nLONG_LEN = int(sys.argv[3]) if len(sys.argv) > 3 else 6000\n\nSHORT_PROMPTS = [\n    \"The capital of France is\",\n    \"Water boils at a temperature of\",\n    \"In computer science, a hash table is\",\n    \"The theory of general relativity was published by\",\n    \"A sonnet is a poem that has\",\n    \"Photosynthesis converts sunlight into\",\n    \"The largest planet in the solar system is\",\n    \"To sort a list in Python you can call\",\n]\n\n\nasync def gen(session, payload):\n    t0 = time.time()\n    async with session.post(f\"{URL}/generate\", json=payload) as r:\n        body = await r.json()\n    body[\"_latency\"] = time.time() - t0\n    return body\n\n\nasync def main():\n    rng = random.Random(1234)\n    long_ids = [rng.randint(1000, 60000) for _ in range(LONG_LEN)]\n    sampling = {\"temperature\": 0.0, \"max_new_tokens\": 96}\n    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1800)) as s:\n        shorts = [\n            asyncio.create_task(\n                # No return_logprob: the scheduler skips mixing whenever the running\n                # batch or the new batch asks for logprobs (scheduler.py, mixed-style\n                # chunked prefill condition), which would hide the very path under test.\n                gen(s, {\"text\": p, \"sampling_params\": sampling})\n            )\n            for p in SHORT_PROMPTS\n        ]\n        await asyncio.sleep(0.5)\n        long_task = asyncio.create_task(\n            gen(s, {\"input_ids\": long_ids, \"sampling_params\": {\"temperature\": 0.0, \"max_new_tokens\": 32}})\n        )\n        short_res = await asyncio.gather(*shorts)\n        long_res = await long_task\n    out = {\n        \"short\": [\n            {\n                \"prompt\": p,\n                \"text\": r.get(\"text\"),\n                \"output_ids\": r.get(\"output_ids\") or (r.get(\"meta_info\") or {}).get(\"output_token_ids\"),\n                \"completion_tokens\": (r.get(\"meta_info\") or {}).get(\"completion_tokens\"),\n                \"latency\": r[\"_latency\"],\n            }\n            for p, r in zip(SHORT_PROMPTS, short_res)\n        ],\n        \"long\": {\n            \"text\": long_res.get(\"text\"),\n            \"prompt_tokens\": (long_res.get(\"meta_info\") or {}).get(\"prompt_tokens\"),\n            \"latency\": long_res[\"_latency\"],\n        },\n    }\n    json.dump(out, open(OUT, \"w\"), indent=1)\n    print(\"short latencies:\", [round(x[\"latency\"], 2) for x in out[\"short\"]])\n    print(\"long: prompt_tokens=%s latency=%.2fs text=%r\" % (out[\"long\"][\"prompt_tokens\"], out[\"long\"][\"latency\"], (out[\"long\"][\"text\"] or \"\")[:60]))\n    for x in out[\"short\"]:\n        print(\"  %-48r -> %r\" % (x[\"prompt\"], (x[\"text\"] or \"\")[:70]))\n\n\nasyncio.run(main())\n```\n\nProbe (drop this file as `sitecustomize.py` on the server's `PYTHONPATH`; set `PROBE_REFCHECK=1` for the fp32 row check, which writes its tensors to `DUMP_DIR`):\n\n```python\n\"\"\"sitecustomize for the mixed-chunk probe.\n\nCounts DSA forward_extend calls per (forward_mode, topk transform, impl,\nuse_mha, in-graph), logs the first mixed batches by shape (the breakable graph\nreplays a mixed batch with the static batch's mode, EXTEND), and, with\nPROBE_REFCHECK=1, recomputes layer-0 attention in fp32 for the decode rows and\nthe last chunk rows of the first mixed batches from the KV pool and the top-k\nthe kernel received, logging cosine / max abs against the kernel's output.\nLogs every 200 calls because the servers are stopped with docker stop.\n\"\"\"\n\nimport os\nfrom collections import Counter\n\n_TAG = os.environ.get(\"PROBE_TAG\", \"probe\")\n_REFCHECK = os.environ.get(\"PROBE_REFCHECK\", \"0\") == \"1\"\n_DUMP = os.environ.get(\"DUMP_DIR\", \"/dump\")\n\n\ndef _refcheck(self, layer, forward_batch, q, kw, out, method, in_bcg):\n    import torch\n\n    from sglang.kernels.ops.attention.dsa.dequant_k_cache import (\n        dequantize_k_cache_paged,\n    )\n\n    if not self.use_fused_topk:\n        print(\"[REFCHECK %s] skipped: unfused topk\" % _TAG, flush=True)\n        return\n    topk_indices = kw.get(\"topk_indices\")\n    q_rope = kw.get(\"q_rope\")\n    if topk_indices is None:\n        print(\"[REFCHECK %s] skipped: no topk_indices\" % _TAG, flush=True)\n        return\n    h = layer.tp_q_head_num\n    T = q.shape[0]\n    if q_rope is None:\n        q_all = q.reshape(T, h, -1)\n    else:\n        q_all = torch.cat([q.reshape(T, h, -1), q_rope.reshape(T, h, -1)], dim=-1)\n    d_qk = q_all.shape[-1]\n    d_v = layer.v_head_dim\n    out3 = out.reshape(T, h, -1)[:, :, :d_v]\n    ext = list(forward_batch.extend_seq_lens_cpu)\n    starts = [0]\n    for e in ext[:-1]:\n        starts.append(starts[-1] + e)\n    decode_rows = [s for s, e in zip(starts, ext) if e == 1]\n    ci = max(range(len(ext)), key=lambda i: ext[i])\n    chunk_rows = list(range(starts[ci] + ext[ci] - 4, starts[ci] + ext[ci]))\n    pool = self.token_to_kv_pool.get_key_buffer(layer.layer_id)\n    md = self.forward_metadata\n    pt = topk_indices.reshape(T, -1)\n    kv_ragged = None\n    if method == \"RAGGED\":\n        kv_ragged = dequantize_k_cache_paged(pool, md.page_table_1_flattened).reshape(\n            -1, d_qk\n        )\n\n    def ref_row(t):\n        idx = pt[t]\n        idx = idx[idx >= 0].long()\n        if kv_ragged is not None:\n            K = kv_ragged[idx].float()\n        else:\n            K = dequantize_k_cache_paged(pool, idx.to(torch.int32)).reshape(-1, d_qk).float()\n        p = torch.softmax(q_all[t].float() @ K.T * layer.scaling, dim=-1)\n        return p @ K[:, :d_v], int(idx.numel())\n\n    rec = {\"rows\": [], \"out\": [], \"ref\": [], \"nvalid\": [], \"group\": []}\n    for group, rows in ((\"decode\", decode_rows), (\"chunk\", chunk_rows)):\n        cos_min, mabs_max = 1.0, 0.0\n        for t in rows:\n            ref, nvalid = ref_row(t)\n            o = out3[t].float()\n            cos = torch.nn.functional.cosine_similarity(o.flatten(), ref.flatten(), dim=0).item()\n            mabs = (o - ref).abs().max().item()\n            cos_min, mabs_max = min(cos_min, cos), max(mabs_max, mabs)\n            rec[\"rows\"].append(t); rec[\"out\"].append(o.cpu()); rec[\"ref\"].append(ref.cpu())\n            rec[\"nvalid\"].append(nvalid); rec[\"group\"].append(group)\n        print(\n            \"[REFCHECK %s] layer=%d %s rows=%d (%s, %s, %s): min cosine %.8f, max abs %.3e, ref |x| max %.3e\"\n            % (_TAG, layer.layer_id, group, len(rows), method, self.dsa_prefill_impl,\n               \"bcg\" if in_bcg else \"eager\", cos_min, mabs_max,\n               max(r.abs().max().item() for r in rec[\"ref\"][-len(rows):]) if rows else 0.0),\n            flush=True,\n        )\n    torch.save(rec, \"%s/%s_refcheck_l%d_%d.pt\" % (_DUMP, _TAG, layer.layer_id, os.getpid()))\n\n\ndef _install():\n    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend\n    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (\n        is_in_breakable_cuda_graph,\n    )\n\n    counts = Counter()\n    state = {\"n\": 0, \"mixed_logged\": 0, \"checked\": 0}\n    orig = DeepseekSparseAttnBackend.forward_extend\n\n    def forward_extend(self, q, k, v, layer, forward_batch, *a, **kw):\n        mode = forward_batch.forward_mode.name\n        method = self.get_topk_transform_method(forward_batch.forward_mode).name\n        in_bcg = is_in_breakable_cuda_graph()\n        key = (mode, method, self.dsa_prefill_impl, bool(self.use_mha), \"bcg\" if in_bcg else \"eager\")\n        counts[key] += 1\n        state[\"n\"] += 1\n        ext = forward_batch.extend_seq_lens_cpu or []\n        looks_mixed = mode == \"MIXED\" or (len(ext) > 1 and max(ext) > 1 and min(ext) == 1)\n        if looks_mixed and state[\"mixed_logged\"] < 3 and layer.layer_id == 0:\n            state[\"mixed_logged\"] += 1\n            print(\n                \"[PROBE %s] MIXED batch: mode=%s extend_seq_lens=%s prefix_lens=%s method=%s impl=%s use_mha=%s %s\"\n                % (_TAG, mode, ext, forward_batch.extend_prefix_lens_cpu, method,\n                   self.dsa_prefill_impl, self.use_mha, \"bcg\" if in_bcg else \"eager\"),\n                flush=True,\n            )\n        if state[\"n\"] % 200 == 0:\n            print(\"[PROBE %s] counts=%s\" % (_TAG, dict(counts)), flush=True)\n        out = orig(self, q, k, v, layer, forward_batch, *a, **kw)\n        if (\n            _REFCHECK and looks_mixed and layer.layer_id == 0\n            and state[\"checked\"] < 2 and not self.use_mha\n        ):\n            state[\"checked\"] += 1\n            try:\n                _refcheck(self, layer, forward_batch, q, kw, out, method, in_bcg)\n            except Exception as exc:  # the check must never take the server down\n                print(\"[REFCHECK %s] failed: %r\" % (_TAG, exc), flush=True)\n        return out\n\n    DeepseekSparseAttnBackend.forward_extend = forward_extend\n    print(\"[PROBE %s] hook installed (refcheck=%s)\" % (_TAG, _REFCHECK), flush=True)\n\n\ntry:\n    _install()\nexcept Exception as exc:  # never take the server down\n    print(\"[PROBE %s] hook install failed: %r\" % (_TAG, exc), flush=True)\n```\n\n</details>\n\nCorrectness of what the mixed batch computes, checked in the server itself: for the first mixed batches at layer 0 the probe recomputes attention in fp32 from the KV pool and the top-k the kernel received, for the eight decode rows and the last four chunk rows, and compares with the kernel's output.\n\n| prefill backend | transform | rows checked (per rank, 8 ranks) | min cosine | max abs error | max abs of reference |\n|---|---|---|---|---|---|\n| `flashmla_sparse` (this PR) | RAGGED | 8 decode rows | 0.99999833 | 6.2e-05 | 1.6e-02 |\n| `flashmla_sparse` (this PR) | RAGGED | 4 chunk rows | 0.99999845 | 3.1e-05 | 1.5e-02 |\n| `triton_sparse_mla` (this PR) | RAGGED | 8 decode rows | 0.99999821 | 6.9e-05 | 1.8e-02 |\n| `triton_sparse_mla` (this PR) | RAGGED | 4 chunk rows | 0.99999833 | 3.1e-05 | 1.5e-02 |\n| `flashmla_sparse_q8` (this PR) | RAGGED | 8 decode rows | 0.98844880 | 1.2e-03 | 1.9e-02 |\n| `flashmla_sparse_q8` (this PR) | RAGGED | 4 chunk rows | 0.99982989 | 6.5e-04 | 1.5e-02 |\n| `flashmla_kv` (control, unchanged) | PAGED | 8 decode rows | 0.99999666 | 7.0e-05 | 1.8e-02 |\n| `flashmla_kv` (control, unchanged) | PAGED | 4 chunk rows | 0.99999833 | 3.3e-05 | 1.5e-02 |\n\nThe two bf16 kernels land at the same distance from the fp32 recomputation as the FP8-native `flashmla_kv` control, i.e. bf16 output rounding (max error ~0.3% of the largest value); these rows are from the merged tree in the 2026-10-14 image, and the 2026-10-06 tree gave the same figures. `flashmla_sparse_q8` computes attention in FP8 (q and KV cast to e4m3 with identity scales), so its rows sit at that kernel's own precision: on plain extend chunks without mixed chunk, the same check gives the same figures (min cosine 0.99978, max abs 6.7e-04 on the chunk rows, against 0.99999845 / 3.1e-05 for `flashmla_sparse` on the same chunks), so the mixed batch adds nothing to the q8 error. Its decode rows sit lower (0.988) because they attend over a dozen keys, where FP8 rounding of P and V does not average out; note that this is the price of sending decode rows through the q8 prefill kernel, which only `--enable-mixed-chunk` does, and that without this PR the configuration does not start at all. The second mixed batch of each run, which fits a graph bucket and replays in-graph, gives the same figures.\n\nGreedy outputs across servers are not a usable metric for this change: the no-mixed `flashmla_sparse` server reproduces its own eight short continuations exactly on a rerun (8/8), but every mixed server agrees with it on only 0-2 of the 8 (first divergence after 0-9 tokens), including the FP8-native `flashmla_kv` control and the eager-prefill `flashmla_sparse` run, neither of which this PR changes. Merging a 4088-token chunk with the decode rows changes the MoE GEMM shapes those rows run under, and on this FP8 stack that is enough to flip near-tie tokens. The row-level check above is the one that isolates the kernel.\n\n## Speed Tests and Profiling\n\nLatency (the eight short prompts, 96 tokens each / the 12000-token prompt): `flashmla_sparse` mixed 5.04 s / 3.88 s, `triton_sparse_mla` mixed 3.78 s / 2.62 s, `flashmla_kv` mixed 5.07 s / 3.92 s, `flashmla_sparse` without mixed chunk 5.08 s / 3.86 s and 4.89 s / 3.68 s on a rerun. With three chunks the decode rows only gain three tokens during the prefill, so mixing does not move these numbers; the dequant cost described above is inside the noise here.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations) (no user-facing change).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n## Review and Merge Process\n\n1. Ping Merge Oncalls to start the process. See the [PR Merge Process](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md#pull-request-merge-process).\n2. Get approvals from [CODEOWNERS](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and other reviewers.\n3. Trigger CI tests with [comments](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests) or contact authorized users to do so.\n   - Common commands include `/tag-and-rerun-ci`, `/tag-run-ci-label`, `/rerun-failed-ci`\n4. After green CI and required approvals, ask Merge Oncalls or people with Write permission to merge the PR.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #39208993834](https://github.com/sgl-project/sglang/actions/runs/39208993834)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #39208993659](https://github.com/sgl-project/sglang/actions/runs/39208993659)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #39208993743](https://github.com/sgl-project/sglang/actions/runs/39208993743)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 4,
+    "closed_at": null,
+    "comments": 6,
+    "comments_url": "https://api.github.com/repos/sgl-project/sglang/issues/44176/comments",
+    "commits": 7,
+    "commits_url": "https://api.github.com/repos/sgl-project/sglang/pulls/44176/commits",
+    "created_at": "2026-10-14T03:14:10Z",
+    "deletions": 35,
+    "diff_url": "https://github.com/sgl-project/sglang/pull/44176.diff",
+    "draft": false,
+    "head": {
+      "label": "yunyang1999:dsa-mixed-chunk-fp8-kv",
+      "ref": "dsa-mixed-chunk-fp8-kv",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/yunyang1999/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/yunyang1999/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/yunyang1999/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/yunyang1999/sglang/branches{/branch}",
+        "clone_url": "https://github.com/yunyang1999/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/yunyang1999/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/yunyang1999/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/yunyang1999/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/yunyang1999/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/yunyang1999/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/yunyang1999/sglang/contributors",
+        "created_at": "2026-07-29T12:12:12Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/yunyang1999/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/yunyang1999/sglang/downloads",
+        "events_url": "https://api.github.com/repos/yunyang1999/sglang/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/yunyang1999/sglang/forks",
+        "full_name": "yunyang1999/sglang",
+        "git_commits_url": "https://api.github.com/repos/yunyang1999/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/yunyang1999/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/yunyang1999/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/yunyang1999/sglang.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/yunyang1999/sglang/hooks",
+        "html_url": "https://github.com/yunyang1999/sglang",
+        "id": 1316092000,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/yunyang1999/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/yunyang1999/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/yunyang1999/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/yunyang1999/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/yunyang1999/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/yunyang1999/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/yunyang1999/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/yunyang1999/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOTnH4YA",
+        "notifications_url": "https://api.github.com/repos/yunyang1999/sglang/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/257951146?v=4",
+          "events_url": "https://api.github.com/users/yunyang1999/events{/privacy}",
+          "followers_url": "https://api.github.com/users/yunyang1999/followers",
+          "following_url": "https://api.github.com/users/yunyang1999/following{/other_user}",
+          "gists_url": "https://api.github.com/users/yunyang1999/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/yunyang1999",
+          "id": 257951146,
+          "login": "yunyang1999",
+          "node_id": "U_kgDOD2AFqg",
+          "organizations_url": "https://api.github.com/users/yunyang1999/orgs",
+          "received_events_url": "https://api.github.com/users/yunyang1999/received_events",
+          "repos_url": "https://api.github.com/users/yunyang1999/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/yunyang1999/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/yunyang1999/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/yunyang1999",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/yunyang1999/sglang/pulls{/number}",
+        "pushed_at": "2026-10-19T06:16:40Z",
+        "releases_url": "https://api.github.com/repos/yunyang1999/sglang/releases{/id}",
+        "size": 296146,
+        "ssh_url": "git@github.com:yunyang1999/sglang.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/yunyang1999/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/yunyang1999/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/yunyang1999/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/yunyang1999/sglang/subscription",
+        "svn_url": "https://github.com/yunyang1999/sglang",
+        "tags_url": "https://api.github.com/repos/yunyang1999/sglang/tags",
+        "teams_url": "https://api.github.com/repos/yunyang1999/sglang/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/yunyang1999/sglang/git/trees{/sha}",
+        "updated_at": "2026-08-24T06:12:57Z",
+        "url": "https://api.github.com/repos/yunyang1999/sglang",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "2911aea09baf473e95e703ef0fb786c480504d15",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/257951146?v=4",
+        "events_url": "https://api.github.com/users/yunyang1999/events{/privacy}",
+        "followers_url": "https://api.github.com/users/yunyang1999/followers",
+        "following_url": "https://api.github.com/users/yunyang1999/following{/other_user}",
+        "gists_url": "https://api.github.com/users/yunyang1999/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/yunyang1999",
+        "id": 257951146,
+        "login": "yunyang1999",
+        "node_id": "U_kgDOD2AFqg",
+        "organizations_url": "https://api.github.com/users/yunyang1999/orgs",
+        "received_events_url": "https://api.github.com/users/yunyang1999/received_events",
+        "repos_url": "https://api.github.com/users/yunyang1999/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/yunyang1999/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/yunyang1999/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/yunyang1999",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/44176",
+    "id": 4852419988,
+    "issue_url": "https://api.github.com/repos/sgl-project/sglang/issues/44176",
+    "labels": [],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "f1ae99b74dfe89cbfb3fe01e6421f83b95291a00",
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOLCAjRs8AAAABIToNlA",
+    "number": 44176,
+    "patch_url": "https://github.com/sgl-project/sglang/pull/44176.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/3349073?v=4",
+        "events_url": "https://api.github.com/users/HaiShaw/events{/privacy}",
+        "followers_url": "https://api.github.com/users/HaiShaw/followers",
+        "following_url": "https://api.github.com/users/HaiShaw/following{/other_user}",
+        "gists_url": "https://api.github.com/users/HaiShaw/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/HaiShaw",
+        "id": 3349073,
+        "login": "HaiShaw",
+        "node_id": "MDQ6VXNlcjMzNDkwNzM=",
+        "organizations_url": "https://api.github.com/users/HaiShaw/orgs",
+        "received_events_url": "https://api.github.com/users/HaiShaw/received_events",
+        "repos_url": "https://api.github.com/users/HaiShaw/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/HaiShaw/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/HaiShaw/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/HaiShaw",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/11166516?v=4",
+        "events_url": "https://api.github.com/users/hebiao064/events{/privacy}",
+        "followers_url": "https://api.github.com/users/hebiao064/followers",
+        "following_url": "https://api.github.com/users/hebiao064/following{/other_user}",
+        "gists_url": "https://api.github.com/users/hebiao064/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/hebiao064",
+        "id": 11166516,
+        "login": "hebiao064",
+        "node_id": "MDQ6VXNlcjExMTY2NTE2",
+        "organizations_url": "https://api.github.com/users/hebiao064/orgs",
+        "received_events_url": "https://api.github.com/users/hebiao064/received_events",
+        "repos_url": "https://api.github.com/users/hebiao064/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/hebiao064/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/hebiao064/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/hebiao064",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/15100009?v=4",
+        "events_url": "https://api.github.com/users/merrymercy/events{/privacy}",
+        "followers_url": "https://api.github.com/users/merrymercy/followers",
+        "following_url": "https://api.github.com/users/merrymercy/following{/other_user}",
+        "gists_url": "https://api.github.com/users/merrymercy/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/merrymercy",
+        "id": 15100009,
+        "login": "merrymercy",
+        "node_id": "MDQ6VXNlcjE1MTAwMDA5",
+        "organizations_url": "https://api.github.com/users/merrymercy/orgs",
+        "received_events_url": "https://api.github.com/users/merrymercy/received_events",
+        "repos_url": "https://api.github.com/users/merrymercy/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/merrymercy/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/merrymercy/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/merrymercy",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/26454835?v=4",
+        "events_url": "https://api.github.com/users/ispobock/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ispobock/followers",
+        "following_url": "https://api.github.com/users/ispobock/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ispobock/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ispobock",
+        "id": 26454835,
+        "login": "ispobock",
+        "node_id": "MDQ6VXNlcjI2NDU0ODM1",
+        "organizations_url": "https://api.github.com/users/ispobock/orgs",
+        "received_events_url": "https://api.github.com/users/ispobock/received_events",
+        "repos_url": "https://api.github.com/users/ispobock/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ispobock/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ispobock/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ispobock",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/56809903?v=4",
+        "events_url": "https://api.github.com/users/Fridge003/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Fridge003/followers",
+        "following_url": "https://api.github.com/users/Fridge003/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Fridge003/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Fridge003",
+        "id": 56809903,
+        "login": "Fridge003",
+        "node_id": "MDQ6VXNlcjU2ODA5OTAz",
+        "organizations_url": "https://api.github.com/users/Fridge003/orgs",
+        "received_events_url": "https://api.github.com/users/Fridge003/received_events",
+        "repos_url": "https://api.github.com/users/Fridge003/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Fridge003/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Fridge003/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Fridge003",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/90088090?v=4",
+        "events_url": "https://api.github.com/users/Qiaolin-Yu/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Qiaolin-Yu/followers",
+        "following_url": "https://api.github.com/users/Qiaolin-Yu/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Qiaolin-Yu/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Qiaolin-Yu",
+        "id": 90088090,
+        "login": "Qiaolin-Yu",
+        "node_id": "MDQ6VXNlcjkwMDg4MDkw",
+        "organizations_url": "https://api.github.com/users/Qiaolin-Yu/orgs",
+        "received_events_url": "https://api.github.com/users/Qiaolin-Yu/received_events",
+        "repos_url": "https://api.github.com/users/Qiaolin-Yu/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Qiaolin-Yu/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Qiaolin-Yu/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Qiaolin-Yu",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}",
+    "review_comments": 2,
+    "review_comments_url": "https://api.github.com/repos/sgl-project/sglang/pulls/44176/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/2911aea09baf473e95e703ef0fb786c480504d15",
+    "title": "[Fix] dsa: Route mixed-chunk batches to the RAGGED top-k transform for bf16-only sparse prefill",
+    "updated_at": "2026-10-19T07:01:25Z",
+    "url": "https://api.github.com/repos/sgl-project/sglang/pulls/44176",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/257951146?v=4",
+      "events_url": "https://api.github.com/users/yunyang1999/events{/privacy}",
+      "followers_url": "https://api.github.com/users/yunyang1999/followers",
+      "following_url": "https://api.github.com/users/yunyang1999/following{/other_user}",
+      "gists_url": "https://api.github.com/users/yunyang1999/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/yunyang1999",
+      "id": 257951146,
+      "login": "yunyang1999",
+      "node_id": "U_kgDOD2AFqg",
+      "organizations_url": "https://api.github.com/users/yunyang1999/orgs",
+      "received_events_url": "https://api.github.com/users/yunyang1999/received_events",
+      "repos_url": "https://api.github.com/users/yunyang1999/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/yunyang1999/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/yunyang1999/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/yunyang1999",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/2911aea09baf473e95e703ef0fb786c480504d15/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsa_backend.py",
+      "changes": 28,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsa_backend.py?ref=2911aea09baf473e95e703ef0fb786c480504d15",
+      "deletions": 19,
+      "filename": "python/sglang/srt/layers/attention/dsa_backend.py",
+      "patch": "@@ -21,7 +21,6 @@\n     get_exec,\n     get_parallel,\n     get_platform,\n-    get_schedule,\n     get_spec,\n )\n \n@@ -420,7 +419,6 @@ def _validate_flashmla_sparse_q8_backend(\n     qk_rope_head_dim: int,\n     device_sm_major: int,\n     hisparse_enabled: bool = False,\n-    mixed_chunk_enabled: bool = False,\n ) -> None:\n     # flashmla_sparse_q8 casts q and KV to fp8 per call, so the KV cache may be\n     # bfloat16 or fp8_e4m3.\n@@ -455,16 +453,6 @@ def _validate_flashmla_sparse_q8_backend(\n                 \"--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute \"\n                 f\"capability sm_{device_sm_major}x.\"\n             )\n-        # A mixed batch takes the PAGED top-k transform, which belongs to the\n-        # bf16 kernel. forward_extend refuses it, but the flag is readable here,\n-        # so the refusal belongs at launch rather than on the first mixed batch\n-        # formed under load.\n-        if mixed_chunk_enabled:\n-            raise ValueError(\n-                \"--dsa-prefill-backend flashmla_sparse_q8 does not support \"\n-                \"--enable-mixed-chunk: q8 prefill runs on RAGGED extend batches \"\n-                \"only.\"\n-            )\n         # The q8 route hands top-k to the kernel as ragged ids and never binds the\n         # page table HiSparse would translate, so the two cannot be combined.\n         if hisparse_enabled:\n@@ -670,7 +658,6 @@ def __init__(\n             qk_rope_head_dim=self.qk_rope_head_dim,\n             device_sm_major=self.device_sm_major,\n             hisparse_enabled=self.hisparse_coordinator is not None,\n-            mixed_chunk_enabled=get_schedule().enable_mixed_chunk,\n         )\n \n         if self.dsa_prefill_impl == \"triton_sparse_mla\":\n@@ -2253,10 +2240,10 @@ def forward_extend(\n             and topk_transform_method != TopkTransformMethod.RAGGED\n         ):\n             raise NotImplementedError(\n-                \"--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill \"\n-                f\"batches only; got forward_mode={forward_batch.forward_mode.name} \"\n+                \"--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND and MIXED \"\n+                f\"prefill batches only; got forward_mode={forward_batch.forward_mode.name} \"\n                 \"(SPLIT_PREFILL under --enable-pdmux, or DLLM_EXTEND under \"\n-                \"--dllm-algorithm; --enable-mixed-chunk is rejected at launch).\"\n+                \"--dllm-algorithm).\"\n             )\n \n         if self.use_fused_topk:\n@@ -2859,8 +2846,9 @@ def q8kv8_born_fp8_q_eligible(\n         \"\"\"\n         if self.dsa_prefill_impl != \"flashmla_sparse_q8\":\n             return False\n-        # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,\n-        # target-verify and draft-extend, which use dsa_decode_impl anyway).\n+        # Born-fp8 q is EXTEND-only. MIXED routes RAGGED as well but stays on\n+        # the bf16-q hand-off (the helper casts); decode/idle, target-verify and\n+        # draft-extend use dsa_decode_impl.\n         if forward_batch.forward_mode != ForwardMode.EXTEND:\n             return False\n         # Per-batch dense fallback (il <= threshold) reads bf16 q directly.\n@@ -4054,7 +4042,9 @@ def get_topk_transform_method(\n             # dequantizes inside the RAGGED branch and its kernel is bf16-only.\n             and self.dsa_prefill_impl\n             in (\"flashmla_sparse\", \"flashmla_sparse_q8\", \"triton_sparse_mla\")\n-            and forward_mode == ForwardMode.EXTEND\n+            # MIXED matches EXTEND: the prefill graph runner builds metadata from\n+            # MIXED but replays EXTEND graphs.\n+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)\n         ):\n             topk_transform_method = TopkTransformMethod.RAGGED\n         else:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/2911aea09baf473e95e703ef0fb786c480504d15/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsa_backend.py",
+      "sha": "fb67328ade28426bf204d70f8626ea13caaca28d",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/2911aea09baf473e95e703ef0fb786c480504d15/python%2Fsglang%2Ftest%2Fkits%2Fattention_unittest%2Fattention_methods%2Fdsa_attention.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Ftest%2Fkits%2Fattention_unittest%2Fattention_methods%2Fdsa_attention.py?ref=2911aea09baf473e95e703ef0fb786c480504d15",
+      "deletions": 2,
+      "filename": "python/sglang/test/kits/attention_unittest/attention_methods/dsa_attention.py",
+      "patch": "@@ -1392,8 +1392,8 @@ def run_dsa_sparse_fp8_prefill_case(\n     *,\n     dsa_prefill_backend: str = \"flashmla_auto\",\n ) -> None:\n-    \"\"\"FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND + non-empty\n-    prefix, `get_topk_transform_method` returns `RAGGED` (the only path\n+    \"\"\"FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND or MIXED +\n+    non-empty prefix, `get_topk_transform_method` returns `RAGGED` (the only path\n     that exercises `dequantize_k_cache_paged` + the\n     `topk_indices_offset` shift). With `flashmla_kv` or `flashmla_auto`\n     it stays on `PAGED` topk; the auto resolver picks `flashmla_kv` for",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/2911aea09baf473e95e703ef0fb786c480504d15/python%2Fsglang%2Ftest%2Fkits%2Fattention_unittest%2Fattention_methods%2Fdsa_attention.py",
+      "sha": "ddc6bda4ded61a7e6157b3423ebb07307bc0712d",
+      "status": "modified"
+    },
+    {
+      "additions": 21,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/2911aea09baf473e95e703ef0fb786c480504d15/test%2Fregistered%2Fattention%2Funittests%2Fdsa%2Ftest_dsa.py",
+      "changes": 23,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fattention%2Funittests%2Fdsa%2Ftest_dsa.py?ref=2911aea09baf473e95e703ef0fb786c480504d15",
+      "deletions": 2,
+      "filename": "test/registered/attention/unittests/dsa/test_dsa.py",
+      "patch": "@@ -254,8 +254,8 @@ def test_sparse_speculative_forward_mode_cases(self):\n     # noise — same separation principle as the DSV4 SWA fixture so a\n     # silent pack/write bug cannot corrupt both paths identically.\n     #\n-    # FP8 + `flashmla_sparse` prefill + EXTEND + non-empty prefix is the\n-    # only combo that hits `TopkTransformMethod.RAGGED`\n+    # FP8 + `flashmla_sparse` prefill + EXTEND (or MIXED) + non-empty prefix\n+    # is the only combo that hits `TopkTransformMethod.RAGGED`\n     # (`get_topk_transform_method`), which exercises\n     # `dequantize_k_cache_paged` and the `topk_indices_offset` shift —\n     # paths that the BF16 default suite never reaches.\n@@ -304,6 +304,25 @@ def test_sparse_fp8_prefill_cases(self):\n                 )\n                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)\n \n+    # --enable-mixed-chunk batch: one prefill chunk plus 1-token decode rows.\n+    FP8_MIXED_CASE = DSAAttentionCase(\n+        name=\"dsa_sparse_fp8_mixed_chunk\",\n+        backend=\"dsa\",\n+        forward_mode=ForwardMode.MIXED,\n+        num_heads=4,\n+        num_kv_heads=1,\n+        page_size=DSA_PAGE_SIZE,\n+        prefix_lens=(2048, 2048, 2048),\n+        extend_lens=(4, 1, 1),\n+    )\n+\n+    def test_sparse_fp8_mixed_chunk_prefill_cases(self):\n+        for impl in DSA_PREFILL_IMPL_VARIANTS:\n+            with self.subTest(impl=impl):\n+                run_dsa_sparse_fp8_prefill_case(\n+                    self, self.FP8_MIXED_CASE, dsa_prefill_backend=impl\n+                )\n+\n     def test_sparse_fp8_decode_cases(self):\n         for impl in DSA_DECODE_IMPL_VARIANTS:\n             with self.subTest(impl=impl):",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/2911aea09baf473e95e703ef0fb786c480504d15/test%2Fregistered%2Fattention%2Funittests%2Fdsa%2Ftest_dsa.py",
+      "sha": "95fa6ead0b369665d699e10b51d9b84920a42fcb",
+      "status": "modified"
+    },
+    {
+      "additions": 11,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/2911aea09baf473e95e703ef0fb786c480504d15/test%2Fregistered%2Funit%2Flayers%2Fattention%2Ftest_dsa_q8kv8_bf16_prefill_routing.py",
+      "changes": 23,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Flayers%2Fattention%2Ftest_dsa_q8kv8_bf16_prefill_routing.py?ref=2911aea09baf473e95e703ef0fb786c480504d15",
+      "deletions": 12,
+      "filename": "test/registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py",
+      "patch": "@@ -39,6 +39,12 @@ def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):\n         (\"flashmla_sparse_q8\", False, ForwardMode.DECODE, PAGED),\n         (\"flashmla_sparse_q8\", False, ForwardMode.TARGET_VERIFY, PAGED),\n         (\"flashmla_sparse_q8\", False, ForwardMode.DRAFT_EXTEND_V2, PAGED),\n+        # --enable-mixed-chunk batches: MIXED answers like EXTEND.\n+        (\"flashmla_sparse\", True, ForwardMode.MIXED, RAGGED),\n+        (\"flashmla_sparse\", False, ForwardMode.MIXED, PAGED),\n+        (\"flashmla_sparse_q8\", False, ForwardMode.MIXED, RAGGED),\n+        (\"triton_sparse_mla\", True, ForwardMode.MIXED, RAGGED),\n+        (\"flashmla_kv\", True, ForwardMode.MIXED, PAGED),\n     ],\n )\n def test_topk_transform_method(prefill_impl, fp8_kv_cache, forward_mode, expected):\n@@ -82,26 +88,19 @@ def test_q8_validator_rejects_unsupported_configs(\n         )\n \n \n-@pytest.mark.parametrize(\n-    \"extra\",\n-    [\n-        pytest.param({\"hisparse_enabled\": True}, id=\"hisparse\"),\n-        pytest.param({\"mixed_chunk_enabled\": True}, id=\"mixed_chunk\"),\n-    ],\n-)\n-def test_q8_validator_rejects_combinations_that_used_to_fail_mid_forward(extra):\n-    \"\"\"Both used to surface only once a batch of the wrong shape was formed --\n-    HiSparse as an UnboundLocalError, mixed chunks as a NotImplementedError\n-    hours into serving. The launch flags are visible at construction.\"\"\"\n+def test_q8_validator_rejects_hisparse():\n+    \"\"\"Used to surface only once a batch of the wrong shape was formed, as an\n+    UnboundLocalError hours into serving; the launch flag is visible at\n+    construction.\"\"\"\n     kwargs = dict(\n         prefill_impl=\"flashmla_sparse_q8\",\n         decode_impl=\"tilelang\",\n         kv_cache_dtype=torch.bfloat16,\n         kv_cache_store_fp8=False,\n         qk_rope_head_dim=0,\n         device_sm_major=9,\n+        hisparse_enabled=True,\n     )\n-    kwargs.update(extra)\n     with pytest.raises(ValueError):\n         _validate_flashmla_sparse_q8_backend(**kwargs)\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/2911aea09baf473e95e703ef0fb786c480504d15/test%2Fregistered%2Funit%2Flayers%2Fattention%2Ftest_dsa_q8kv8_bf16_prefill_routing.py",
+      "sha": "238afc36a75d995a027b821c3c2bd35e43454fab",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "[by Claude Code] **Severity: functional | Confidence: High**\n\n**Issue**\n\nThis line sends `flashmla_sparse_q8` MIXED batches to RAGGED. But `_validate_flashmla_sparse_q8_backend` (lines 457-466, added by #41790 and merged into this branch) still raises `ValueError` for `--enable-mixed-chunk`, and its comment says a mixed batch takes PAGED. So `--dsa-prefill-backend flashmla_sparse_q8 --enable-mixed-chunk` still fails at launch, and the q8 part of this fix never runs. The q8 E2E row came from a tree without that guard.\n\n**Fix**\n\nPick one. Remove the `mixed_chunk_enabled` check, the `mixed_chunk` case in `test_q8_validator_rejects_combinations_that_used_to_fail_mid_forward`, and the \"rejected at launch\" text at line 2225. Or keep the guard, update its comment and the comment at line 2828, and drop the q8 MIXED claims and routing row.",
+      "created_at": "2026-10-15T07:28:24Z",
+      "diff_hunk": "@@ -4020,7 +4021,11 @@ def get_topk_transform_method(\n             # dequantizes inside the RAGGED branch and its kernel is bf16-only.\n             and self.dsa_prefill_impl\n             in (\"flashmla_sparse\", \"flashmla_sparse_q8\", \"triton_sparse_mla\")\n-            and forward_mode == ForwardMode.EXTEND\n+            # MIXED must answer exactly like EXTEND: the eager runner runs a\n+            # mixed-chunk batch as EXTEND, and the prefill graph runner builds\n+            # this metadata from the MIXED batch while replaying the\n+            # EXTEND-captured graphs, whose in-graph ops see EXTEND.\n+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#discussion_r4280235841",
+      "id": 4280235841,
+      "line": 4047,
+      "original_line": 4028,
+      "path": "python/sglang/srt/layers/attention/dsa_backend.py",
+      "updated_at": "2026-10-15T07:28:24Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe same MIXED-routing explanation appears three times as long comments: here (7 lines), in `test_dsa_q8kv8_bf16_prefill_routing.py` lines 42-46, and in `get_topk_transform_method` (`dsa_backend.py` lines 4024-4027). The routing-test copy also tells the bug history (\"Routing MIXED to PAGED left that metadata ...\"), which belongs in the PR body. This makes the code harder to read, and the copies can drift apart.\n\n**Fix**\n\nKeep one short comment in `get_topk_transform_method`, for example `# MIXED matches EXTEND: the prefill graph runner builds metadata from MIXED but replays EXTEND graphs.` In the two tests, use one line each, such as `# --enable-mixed-chunk batch: one prefill chunk plus 1-token decode rows.`",
+      "created_at": "2026-10-15T07:28:24Z",
+      "diff_hunk": "@@ -303,6 +303,31 @@ def test_sparse_fp8_prefill_cases(self):\n                 )\n                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)\n \n+    # A mixed-chunk batch: one chunk of a long prefill plus decode requests",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#discussion_r4280235851",
+      "id": 4280235851,
+      "line": null,
+      "original_line": 306,
+      "path": "test/registered/attention/unittests/dsa/test_dsa.py",
+      "updated_at": "2026-10-15T07:28:24Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "cc @Oasis-Git since this is related to mixed chunk",
+      "created_at": "2026-10-15T07:19:20Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6186730337",
+      "id": 6186730337,
+      "updated_at": "2026-10-15T07:19:20Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "@nvpohanh thanks, all three are addressed in the latest push (`4e190cb8ae`):\n\n- **q8 launch guard.** You are right that the validator merged from #41790 kept `flashmla_sparse_q8 --enable-mixed-chunk` from starting, which would have left the q8 half of this fix unreachable, and that the q8 end-to-end row predated that guard. I took the first option: the `mixed_chunk_enabled` refusal, its parameter and its test case are gone, and the q8 `forward_extend` message now names the two shapes that remain unsupported (SPLIT_PREFILL under `--enable-pdmux`, DLLM_EXTEND under `--dllm-algorithm`) instead of claiming a launch-time rejection. The q8 row in the description is re-measured on the merged tree, with the same in-server fp32 row check as the other two backends: it launches, the mixed batch is served on the RAGGED q8 path, and the chunk rows match the fp32 recomputation at cosine 0.9998 / max abs 6.5e-04, the same as plain q8 extend chunks measured without mixed chunk (0.9998 / 6.7e-04), so the mixed batch adds nothing to the q8 kernel's own FP8 error. Its decode rows come out at cosine 0.988 because they attend over a dozen keys where FP8 rounding does not average out; that is inherent to running decode rows through the q8 prefill kernel, which only mixed chunk does, and I say so in the description.\n- **Duplicated comments.** One short comment stays on the routing predicate (your wording); the kit case and the routing-table rows each carry a one-line label; the bug history lives in the PR body only.\n- **Reproducibility.** The description now has a collapsible section with the exact launch command per table row, the client script that forms the mixed batches (including why it must not request logprobs), and the probe file behind the counts and the fp32 row check, plus the image tags and the model id. On the GPU model: the runs are on an SM90 node with 8 GPUs at TP8; I would rather keep it at the architecture level in the description, and I am happy to share the exact part privately if it matters for reproduction.\n",
+      "created_at": "2026-10-15T09:44:41Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6189187932",
+      "id": 6189187932,
+      "updated_at": "2026-10-15T09:44:41Z",
+      "user": {
+        "login": "yunyang1999"
+      }
+    },
+    {
+      "body": "/rerun-test test/registered/attention/unittests/dsa/test_dsa.py test/registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py test/registered/unit/attention/test_triton_sparse_mla_prefill.py\r\n",
+      "created_at": "2026-10-19T05:34:29Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260439846",
+      "id": 6260439846,
+      "updated_at": "2026-10-19T05:34:29Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "## ⚠️ Rebase Required Before Re-run\nA major update has landed on `main`. Your PR is `diverged` relative to required base commit `6a39ddf1f2e0`.\n\n**Re-run was not dispatched.** What to do:\n- Rebase your branch onto the latest `main` and push again\n- Follow [issue #21065](https://github.com/sgl-project/sglang/issues/21065) for context\n- CI-fix PRs may request the `bypass-maintenance` label to skip this check",
+      "created_at": "2026-10-19T05:34:52Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260444313",
+      "id": 6260444313,
+      "updated_at": "2026-10-19T05:34:52Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/rerun-test test/registered/attention/unittests/dsa/test_dsa.py test/registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py test/registered/unit/attention/test_triton_sparse_mla_prefill.py",
+      "created_at": "2026-10-19T06:16:44Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260967398",
+      "id": 6260967398,
+      "updated_at": "2026-10-19T06:16:44Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "🚀 `4-gpu-b200` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/39209026692) <!--rrt:0:done-->\n```\ncd test/ && python3 registered/attention/unittests/dsa/test_dsa.py\n```\n\n🚀 `1-gpu-h100` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/39209039191) <!--rrt:1:done-->\n```\ncd test/ && python3 registered/attention/unittests/dsa/test_dsa.py\n```\n\n🚀 `ubuntu-latest` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/39209051623) <!--rrt:2:done-->\n```\ncd test/ && python3 registered/unit/layers/attention/test_dsa_q8kv8_bf16_prefill_routing.py\ncd test/ && python3 registered/unit/attention/test_triton_sparse_mla_prefill.py\n```",
+      "created_at": "2026-10-19T06:17:05Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#issuecomment-6260972265",
+      "id": 6260972265,
+      "updated_at": "2026-10-19T07:01:25Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 44176,
+  "refs": {
+    "base": {
+      "commit": "dc81f17b90bbf4563fe94b3cda214504ed23305d",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "2911aea09baf473e95e703ef0fb786c480504d15",
+      "repository": "yunyang1999/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe Accuracy Tests and Speed Tests sections give results, but others cannot rerun them. The description does not include:\n- the GPU model (it says only \"SM90\" and TP8);\n- the full server launch commands, including the model path and the `--dsa-prefill-backend` value for each row;\n- the client command or script that sends the eight short prompts and then the 12000-token prompt 0.5 s later, which forms the mixed batch;\n- how to reproduce the in-server probe behind the cosine table, for example a link to the probe patch.\n\n**Fix**\n\nPlease add these commands and the GPU model to the description.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44176#pullrequestreview-5529605899",
+      "id": 5529605899,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T07:28:24Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    }
+  ]
+}

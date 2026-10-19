@@ -1,0 +1,639 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "bf715252feb5b4c3a2bb8b24e2fa69b10d18fc104a9fce96a2815742a0fc2ef0",
+      "isPrivate": false,
+      "numbers": [
+        59656,
+        59653,
+        59646,
+        59645,
+        59644,
+        59643,
+        59636,
+        59635
+      ],
+      "observed_at": "2026-10-19T19:27:58.275599+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4722,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "852989f580820849113d67d13fd8053e279d0444",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nStacked on #59625; only the last commit is new. This replaces the earlier lease-based revision of this PR (and the\nclosed #59713): there is no lease and no new protocol between engines.\n\n#59625 refuses sleep mode with NIXL because peers keep the stale KV cache registration. Sleep keeps the virtual\naddresses and maps new physical pages, so everything NIXL bound to the old pages goes stale: the memory registration\n(rkeys), the local prepped dlists, the handshake payload served to peers, and each peer's loaded remote agent.\n\nEvidence on #59625 with the NIXL refusal forced off (GB300, cross-node 1P1D, Qwen3-8B, UCX RDMA over RoCE):\n\n- After a decode sleep and wake: 0/30 outputs match the awake control. After a prefill sleep and wake: 0/30.\n- No errors and no failed transfers: on GB300 there is no `nvidia_peermem`, so UCX registers GPU memory through\n  dmabuf, and the stale MR pins the old pages; peers read old data without any error.\n- Sleep frees nothing of the KV cache (67763 MiB asleep instead of 2077), and after the wake the GPU holds both\n  (150787 MiB instead of 85101).\n\nThis PR implements the #59625 hooks for the NIXL pull connector (`NixlConnector` / `NixlPullConnector`):\n\n- `release_kv_caches()` (before the unmap): waits until no own read is in flight and no handshake is pending (bounded,\n  `TimeoutError` keeps the registration), then releases every local prepped dlist, drops every remote engine (their\n  split handles reference local memory; they are re-handshaked on demand), and deregisters the KV cache.\n- `restore_kv_caches()` (after the remap): registers the same descriptors again, re-preps the local dlist, and\n  rebuilds the handshake payload with the new agent metadata.\n- Peer refresh through the existing handshake only:\n  - After a wake-up that restored the KV cache (`tags` is None or contains `kv_cache`), `EngineCore` hands the\n    workers' payloads to the scheduler (the startup code, extracted).\n  - The scheduler-side connector owns the registration epoch: each republish bumps it and stamps the same epoch on\n    every rank's payload, so ranks cannot advertise different epochs, even after a partly failed release.\n  - The side-channel listener serves the new payloads; `request_finished` adds `remote_registration_epoch` to\n    `kv_transfer_params`.\n  - The reader records the epoch of the payloads it loaded (the minimum over the remote ranks of one handshake, in\n    case it straddled the republish). A request naming a newer epoch drops that remote engine and handshakes again\n    through the existing path; while reads through the old registration are still in flight, the request is\n    re-queued instead. Older epochs never trigger a re-handshake.\n  - The reader checks whether the agent is loaded once per request (`_start_read`), so a handshake that completes\n    concurrently cannot install an old agent between the epoch check and the read.\n- Under sleep mode the worker sets `UCX_RCACHE_ENABLE=n` and `UCX_TLS=^cuda_ipc` right before creating the agent,\n  each only if the user did not set it, and logs once which defaults it applied (as `UCX_RCACHE_MAX_UNRELEASED` in\n  `nixl_utils.py` does). **They are process-wide**: other UCX users in the worker process (the NIXL EPLB communicator,\n  the EC NIXL connector, NVSHMEM with a UCX transport) and child processes inherit them.\n  - UCX's registration cache defers the real deregistration. On GB300 the cached dmabuf MR kept the released pages\n    pinned in about half of the sleeps, and `release_kv_cache_memory` freed nothing. With the cache off, every sleep\n    freed the KV cache.\n  - A peer's cuda_ipc import (intra-node NVLink or MNNVL) pins the exporter's pages inside the peer's UCX cache. Over\n    MNNVL the outputs stayed correct, but the prefiller's KV cache stayed resident asleep and was doubled after the\n    wake. Without cuda_ipc in the exporter's UCX context no peer can import it; reads use RDMA (on one node: RDMA\n    loopback through the NIC). Cost measured below: none on GB300.\n- Static policy, checked once at startup: `NixlPullConnector.supports_sleep_mode` is True only with the UCX backend\n  (`backends == [\"UCX\"]`), the only one validated. `NixlPushConnector` stays refused: the producer writes through the\n  decoder's registration and is not refreshed.\n- `NIXL_CONNECTOR_VERSION` 13 -> 14 (payload field and `kv_transfer_params` key). Routers must forward\n  `kv_transfer_params` unchanged, as they already must for `remote_block_ids`.\n\n## Test Plan\n\n- Unit tests (CPU-capable, fake NIXL agent), organized around invariants:\n  - `test_decoder_reads_from_republished_prefiller[all-ranks|one-rank|straddled]` (scheduler level, real side\n    channel): whichever ranks re-registered, a handshake after the republish loads the epoch the prefiller\n    advertises, so the decoder reads instead of handshaking again; a handshake that straddled the republish is redone\n    exactly once. The `one-rank` row (one rank's restore was a no-op) livelocks on the previous revision of this PR.\n  - `test_sleep_cycle_releases_and_restores_registration`: with a tracking agent, nothing built on the registration\n    survives a release (registrations, local and remote dlists, remote agents), and a restore registers the same memory\n    with exactly one local dlist and publishes the new agent metadata; both calls idempotent over two cycles.\n  - `test_release_waits_for_reads_and_handshakes`: an in-flight read or a pending handshake holds the release; a wedged\n    one times out and keeps the registration; shutdown while released does not deregister again.\n  - `TestPeerReplacement::test_rehandshakes_re_registered_peer`: same epoch reads through the loaded agent; a newer\n    epoch drops it and handshakes again; with reads in flight the request is deferred until they finish.\n  - `test_sleep_mode_ucx_defaults`: the UCX defaults under sleep mode only, and a user setting wins per variable.\n  - `test_config.py`: NIXL pull supported, NIXL with a non-UCX backend and NIXL push refused, MultiConnector rows.\n  - `test_engine_core.py::test_wake_up_republishes_kv_connector_handshake_metadata[all|kv_cache|weights]`: republish\n    after the executor woke up, and only when the KV cache was restored.\n- Mutation check: every piece of the change altered on its own, including the previous revision's worker-owned epoch.\n- `pytest tests/v1/kv_connector/unit/{test_nixl_connector,test_config,test_mooncake_connector,test_multi_connector}.py\n  tests/v1/engine/test_engine_core.py tests/v1/worker/test_sleep_mode_backend.py`; the NIXL and config files 5 times;\n  pre-commit on the changed files.\n- Hardware: NVIDIA GB300 Slurm cluster, NUMA-local to the only active NIC (mlx5_4, RoCE, GID 3). Image: vLLM nightly\n  aarch64 + this branch as per-file mounts with sha256 gates (all 12 mounted files equal to this commit). NIXL 1.4.1\n  (bundled UCX). Qwen3-8B, prefix caching off, `--gpu-memory-utilization 0.3`, level-1 sleep, UCX settings left to\n  the branch defaults. Toy proxy from `tests/v1/kv_connector/nixl_integration`. Each check sends 30 prompts of\n  1.1k-1.7k tokens (greedy, 32 tokens) and compares them with the awake control; transfers are counted from NIXL's KV\n  transfer metrics and the logs are scanned for transfer failures and UCX errors. The UCX protocol in use is taken\n  from `UCX_PROTO_INFO=y`.\n  - Cross-node: P and D on two nodes, one GPU each.\n  - Single node: P on GPUs 0-1 and D on GPUs 2-3 (TP2 each), with and without sleep mode, plus a transfer benchmark\n    (30 sequential requests of ~1.3k and ~5k tokens, twice; 128 requests at concurrency 32), with transfer time and\n    bytes from D's `vllm:nixl_xfer_time_seconds` and `vllm:nixl_bytes_transferred`.\n\n## Test Result\n\nCross-node 1P1D TP1 (final commit; UCX picked `rc_mlx5` zero-copy GPU-to-GPU reads). \"Asleep\" and \"woken\" are MiB on\nthe slept GPU; awake is 85101 MiB.\n\n| Case | Cycles | After every wake | Asleep | Woken | Failed transfers |\n|---|---|---|---|---|---|\n| Sleep D | 3 | 30/30 | 2077 | 85101 | 0 |\n| Sleep P | 3 | 30/30 | 2077 | 85101 | 0 |\n| Sleep both | 3 | 30/30 | 2077 / 2077 | 85101 | 0 |\n| Selective wake, weights then kv_cache (both) | 1 | 30/30 | 2077 -> 19415 -> 85101 | | 0 |\n| Selective wake, kv_cache then weights (both) | 1 | 30/30 | 2077 -> 68809 -> 85101 | | 0 |\n| `release_kv_cache_memory` on both (pause wait, release, wake kv_cache, resume) | 1 | 30/30 | P 20983, D 19415 | 85101 | 0 |\n| P sleep (mode=wait) under load: 90 requests at concurrency 30, wake after 5 s | 1 | 0 errors; 30/30 after | 2077 | 85101 | 0 |\n\n- The decoder re-handshakes exactly once per wake that restored the KV cache, including the selective wakes (the\n  weights-only step no longer republishes); the first request after a wake takes 0.21-0.24 s versus 0.18 s.\n- Under load, 18/90 outputs differ from the sequential control, as in a concurrent run without any sleep (batching\n  noise); every post-wake check is 30/30.\n\nSingle node, P on GPUs 0-1, D on GPUs 2-3, TP2 each (sleep mode with the branch defaults, so reads use RDMA loopback):\n\n| Case | Cycles | After every wake | Asleep (2 GPUs) | Woken | Failed transfers |\n|---|---|---|---|---|---|\n| Sleep D / P / both | 3 each | 30/30 | 7166 | 172934 | 0 |\n| `release_kv_cache_memory` on both | 1 | 30/30 | P 26054, D 25194 | 172934 | 0 |\n\nSingle-node transfer cost of the `UCX_TLS=^cuda_ipc` default (medians of two launches each; \"transfer\" is NIXL's\nper-transfer time, one transfer per TP rank and request):\n\n| Workload | Without sleep mode: cuda_ipc (NVLink) | Sleep mode: RDMA loopback | Without sleep mode, `UCX_TLS=^cuda_ipc` |\n|---|---|---|---|\n| ~1.3k tokens, sequential: request p50 | 59 ms | 54 ms | 52 ms |\n| ~1.3k tokens: transfer time / rate (90 MB) | 8.0-8.9 ms / 10-11 GB/s | 4.0-4.6 ms / 20-22 GB/s | 4.1 ms / 22 GB/s |\n| ~5k tokens, sequential: request p50 | 101-119 ms | 85 ms | 84 ms |\n| ~5k tokens: transfer time / rate (355 MB) | 28-36 ms / 10-13 GB/s | 15.1 ms / 23.5 GB/s | 15.0 ms / 23.7 GB/s |\n| 128 requests at concurrency 32, ~1.3k / ~5k tokens | 91-96 / 30.8 req/s | 117.5 / 32.8 req/s | 120.7 / 32.4 req/s |\n\n- **No NVLink cost was measured on GB300**: with UCX's defaults, RDMA loopback through the NIC was faster than\n  cuda_ipc for these transfers (cuda_ipc spent 5-29 ms per transfer in posting). This is UCX 1.4.1-bundled cuda_ipc\n  between two instances with disjoint `CUDA_VISIBLE_DEVICES`; a tuned cuda_ipc setup, or a node whose NIC is slower\n  relative to NVLink, may differ. Users who want cuda_ipc can set `UCX_TLS` themselves; then a peer's import keeps the\n  slept KV cache resident (measured over MNNVL: 67763 MiB asleep, 150787 MiB after the wake; `UCX_CUDA_IPC_CACHE=n` on\n  the reader frees it at +140 ms per request).\n- Baseline (#59625 head with the refusal forced off) under the cross-node harness: decode sleep 0/30, prefill sleep\n  0/30, 0 errors, KV cache pinned asleep (67763 MiB) and doubled after the wake (150787 MiB).\n- Earlier revision of this PR at scale (same peer-refresh path): V4-Flash TP4+TP4 cross-node 30/30 cycles, 900/900\n  probes, 23,792 transfers, 0 failed; Qwen3-8B 100/100 cycles, 0 failed.\n- Unit: 391 passed across the files above. The failures are tests that need models this node cannot download (gated\n  `meta-llama/Llama-3.2-1B-Instruct`, and `test_engine_core_tp`, `_concurrent_batches` and\n  `_invalid_request_id_type`); run alone on #59625's head, the same 4 fail. The NIXL and config files: 5 repeats,\n  208 passed each time. Mutation check: 37 mutants, all killed; every\n  new test kills at least one. The reviewer's fix probes pass (28/28).\n\nKnown limitations:\n- **Host memory grows by about 1.3 MiB per sleep cycle on both P and D** (measured on the previous revision with\n  `smaps_rollup` Rss at Qwen3-8B TP1, `num_threads=4`: 1.25-1.34 MiB/cycle, linear over 500 cycles; Mooncake and sleep\n  without a connector are flat). Each re-handshake creates and closes UCX RC endpoints, and UCX does not return their\n  send-queue buffers (about 640 KiB pinned per side per re-handshake, plus allocator fragmentation). The cost scales\n  with NIXL threads and TP ranks (`num_threads=1` cuts it to 2/5). This revision keeps exactly one re-handshake per\n  wake. Follow-up: keep the remote agent across a wake and reload only the peer's memory sections (NIXL partial\n  metadata without connection info), which needs NIXL to replace the old sections of a loaded agent; that is not\n  verified for NIXL 1.4.1. The UCX endpoint leak itself is to be reported upstream.\n- NIXL backends other than UCX (refused), push mode (refused), and cuda_ipc/MNNVL transfers under sleep mode (disabled\n  by default; a user who sets `UCX_TLS` with cuda_ipc keeps the peers' imports pinned, as measured above).\n- A release that fails on one TP rank (timeout or deregistration error) leaves that worker released while\n  `Executor.sleep` reports the engine awake, so nothing restores it. Partial-failure handling belongs to the executor\n  and is shared with #59625's other connectors; it is not changed here. The registration epoch no longer diverges\n  across ranks in that case, because the scheduler stamps it.\n- With `enforce_handshake_compat: false`, a version-13 decoder ignores the epoch and never refreshes after a\n  version-14 prefiller wakes; with the rcache-off default that shows up as failed transfers.\n\n---\nThis PR contains AI-assisted code (Claude Code); commits carry a `Co-authored-by` trailer.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 14,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--59635.org.readthedocs.build/en/59635/",
+            "createdAt": "2026-10-01T16:05:06Z",
+            "databaseId": 5935369563,
+            "updatedAt": "2026-10-01T16:05:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-5935369563"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-02T02:18:16Z",
+            "databaseId": 5944381589,
+            "updatedAt": "2026-10-02T02:18:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-5944381589"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-06T04:47:31Z",
+            "databaseId": 6009535600,
+            "updatedAt": "2026-10-06T04:47:31Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6009535600"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "andakai"
+            },
+            "body": "I've rebuilt it on top of #59625.\r\n\r\n## Purpose\r\n\r\nSleep remaps the KV cache to new physical pages at the same virtual addresses, but NIXL's registration and the metadata each decoder loaded still refer to the old pages: after a wake, outputs are wrong (0/30) and the slept KV cache stays resident.\r\n\r\nThis PR supports sleep mode for `NixlConnector` (pull mode, UCX backend):\r\n\r\n- `unregister_kv_caches` / `restore_kv_caches` deregister and re-register the KV cache, rebuild the local dlists and republish the agent metadata.\r\n- Unlike Mooncake, NIXL does not reload a peer's keys by itself. After a wake-up, the scheduler bumps a registration generation when the published metadata changed and sends it in `kv_transfer_params`; a decoder with an older agent handshakes again. Re-registration usually gets the same keys back, so decoders keep their agent.\r\n- Under sleep mode, `UCX_RCACHE_ENABLE=n` and `UCX_TLS=^cuda_ipc` are set unless already set, since UCX's registration cache and cuda_ipc imports keep the slept pages pinned.\r\n- `NixlPushConnector` and non-UCX backends stay refused. `NIXL_CONNECTOR_VERSION` 14 -> 15.\r\n\r\n## Test Result\r\n\r\n1P1D, Qwen3-0.6B, 30 prompts after sleep/wake of P, D and both:\r\n\r\n| | GB200, GPUDirect RDMA | GB300, no GPUDirect |\r\n|---|---|---|\r\n| Outputs vs awake (single node and cross-node on GB200) | 30/30 | 30/30 |\r\n| Slept GPU memory (awake → asleep → after wake, MiB) | 115,059 → 1,405 → 114,503 | 171,767 → 1,413 → 171,211 |\r\n\r\n- With changed keys (test-only extra registration), the decoder handshakes again and outputs stay 30/30.\r\n- gsm8k with `SLEEP_WAKE=1`: 0.4230 (expected 0.41).\r\n- Unit tests: 200 passed.\r\n\r\n---\r\n\r\nAI assistance (Claude Code) was used for this PR; I reviewed the changes and ran the tests listed above.",
+            "createdAt": "2026-10-16T15:08:47Z",
+            "databaseId": 6218454903,
+            "updatedAt": "2026-10-16T15:08:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6218454903"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "@NickLucche Hi nick, could you please take a look?",
+            "createdAt": "2026-10-16T15:15:52Z",
+            "databaseId": 6218588392,
+            "updatedAt": "2026-10-16T15:15:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6218588392"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "Self-review of `nixl/base_worker.py`. I plan the follow-up changes below and will push them after testing.\n\n**1. `restore_kv_caches` decodes the handshake payload, patches one field and re-encodes it.**\n`register_kv_caches` already builds this payload. I'll move the `NixlAgentMetadata` / `NixlHandshakePayload` construction into `_build_handshake_payload()` and call it from both places.\n\n**2. Registration and teardown are duplicated.**\n`restore_kv_caches` repeats two steps of `register_kv_caches`: registering memory and building the local xfer handles. `unregister_kv_caches` repeats the teardown in `_finish_shutdown`: releasing handles, cleaning up remote engines and deregistering memory. I'll add one register helper and one release helper, and use them at init, wake, sleep and shutdown. The descriptor and layout setup in `register_kv_caches` still runs once.\n\n**3. The shutdown loop `for desc in [] if self._kv_unregistered else self._registered_descs` goes away.**\nAfter point 2, shutdown calls the same release helper, and that helper knows whether memory is still registered.\n\n**4. Replace the process-wide UCX env vars with per-agent config.**\nRight now sleep mode calls `os.environ.setdefault` for `UCX_RCACHE_ENABLE=n` and `UCX_TLS=^cuda_ipc`. That also affects other UCX/NIXL users in the same process, such as NIXL-based weight transfer or KV offload.\n- NIXL's UCX backend accepts an `engine_config` init param (`KEY=VALUE,...`). It is applied with `ucp_config_modify` to that agent's UCP context only (`src/plugins/ucx/ucx_utils.cpp`). It is available in NIXL 1.5.0, the version vLLM pins, and already in 0.9.0.\n- An explicit `UCX_*` env var still wins, because `config::modify` skips keys that are set in the env. That matches the current `setdefault` behavior.\n- `nixl_agent_config` cannot pass backend params yet (`TODO: add backend init parameters` in `_api.py`). So the UCX backend would be created explicitly:\n\n```python\nucx_params = {\"num_threads\": str(num_threads)}\nif vllm_config.model_config.enable_sleep_mode:\n    ucx_params[\"engine_config\"] = \"RCACHE_ENABLE=n,TLS=^cuda_ipc\"\nconfig = nixl_agent_config(backends=non_ucx_backends, capture_telemetry=True)\nself.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)\nif \"UCX\" in self.nixl_backends:\n    self.nixl_wrapper.create_backend(\"UCX\", ucx_params)\n```\n\nBefore pushing, I'll verify on hardware that both settings take effect: the KV cache memory is released while asleep, and the UCX info log shows the config.",
+            "createdAt": "2026-10-16T15:20:56Z",
+            "databaseId": 6218692589,
+            "updatedAt": "2026-10-16T15:20:56Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6218692589"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "andakai"
+            },
+            "body": "Thanks! 3 and 4 are fine with me.\r\nFor 1, I think with the previous code, patching only `agent_metadata` makes it clear that is a wake-up change.\r\nFor 2, the shared part is already `_release_local_xfer_handles`. The left can't really be merged, because the two need different behavior on failure:\r\n- `unregister_kv_caches` (sleep) should raise, otherwise we'd go to sleep with the KV cache still registered.\r\n- `_finish_shutdown` should log and keep going, so it still frees everything else.",
+            "createdAt": "2026-10-16T17:53:51Z",
+            "databaseId": 6221486860,
+            "updatedAt": "2026-10-16T17:53:51Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6221486860"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-19T01:55:52Z",
+            "databaseId": 6258000194,
+            "updatedAt": "2026-10-19T01:55:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6258000194"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #95772](https://buildkite.com/vllm/ci/builds/95772) for commit `b617b93e5da5`.",
+            "createdAt": "2026-10-19T01:57:01Z",
+            "databaseId": 6258012138,
+            "updatedAt": "2026-10-19T01:57:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6258012138"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "andakai"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-19T08:17:56Z",
+            "databaseId": 6262822431,
+            "updatedAt": "2026-10-19T08:17:56Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262822431"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "❌ @andakai, Only reviewers with write access can use CI commands before CI is delegated to the PR author.\n\n<!-- vllm-ci-command:6262822431 -->",
+            "createdAt": "2026-10-19T08:18:15Z",
+            "databaseId": 6262827709,
+            "updatedAt": "2026-10-19T08:18:15Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262827709"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-19T08:19:10Z",
+            "databaseId": 6262843602,
+            "updatedAt": "2026-10-19T08:19:10Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262843602"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #95860](https://buildkite.com/vllm/ci/builds/95860) for commit `100f36d44eea`.",
+            "createdAt": "2026-10-19T08:19:29Z",
+            "databaseId": 6262849445,
+            "updatedAt": "2026-10-19T08:19:29Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262849445"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXVLf6U=",
+          "hasNextPage": false
+        },
+        "totalCount": 13
+      },
+      "headRefOid": "100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "headRepository": {
+        "nameWithOwner": "aoshen02/vllm"
+      },
+      "mergeCommit": {
+        "oid": "afe2183f2bab35988de0e6a506a5694b3cc1ef34"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-19T15:44:34Z",
+      "number": 59635,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5518517070,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-14T13:18:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#pullrequestreview-5518517070"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Isotr0py"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5573963482,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-19T15:32:30Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59635#pullrequestreview-5573963482"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xOVQxNTozMjozMFq0MjAyNi0xMC0xOVQxNTozMjozMFrPAAAAAUw77to=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[KV Connector] Support sleep mode with the NIXL pull connector",
+      "updatedAt": "2026-10-19T15:44:35Z",
+      "url": "https://github.com/vllm-project/vllm/pull/59635"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "852989f580820849113d67d13fd8053e279d0444"
+    },
+    "body": "## Purpose\n\nStacked on #59625; only the last commit is new. This replaces the earlier lease-based revision of this PR (and the\nclosed #59713): there is no lease and no new protocol between engines.\n\n#59625 refuses sleep mode with NIXL because peers keep the stale KV cache registration. Sleep keeps the virtual\naddresses and maps new physical pages, so everything NIXL bound to the old pages goes stale: the memory registration\n(rkeys), the local prepped dlists, the handshake payload served to peers, and each peer's loaded remote agent.\n\nEvidence on #59625 with the NIXL refusal forced off (GB300, cross-node 1P1D, Qwen3-8B, UCX RDMA over RoCE):\n\n- After a decode sleep and wake: 0/30 outputs match the awake control. After a prefill sleep and wake: 0/30.\n- No errors and no failed transfers: on GB300 there is no `nvidia_peermem`, so UCX registers GPU memory through\n  dmabuf, and the stale MR pins the old pages; peers read old data without any error.\n- Sleep frees nothing of the KV cache (67763 MiB asleep instead of 2077), and after the wake the GPU holds both\n  (150787 MiB instead of 85101).\n\nThis PR implements the #59625 hooks for the NIXL pull connector (`NixlConnector` / `NixlPullConnector`):\n\n- `release_kv_caches()` (before the unmap): waits until no own read is in flight and no handshake is pending (bounded,\n  `TimeoutError` keeps the registration), then releases every local prepped dlist, drops every remote engine (their\n  split handles reference local memory; they are re-handshaked on demand), and deregisters the KV cache.\n- `restore_kv_caches()` (after the remap): registers the same descriptors again, re-preps the local dlist, and\n  rebuilds the handshake payload with the new agent metadata.\n- Peer refresh through the existing handshake only:\n  - After a wake-up that restored the KV cache (`tags` is None or contains `kv_cache`), `EngineCore` hands the\n    workers' payloads to the scheduler (the startup code, extracted).\n  - The scheduler-side connector owns the registration epoch: each republish bumps it and stamps the same epoch on\n    every rank's payload, so ranks cannot advertise different epochs, even after a partly failed release.\n  - The side-channel listener serves the new payloads; `request_finished` adds `remote_registration_epoch` to\n    `kv_transfer_params`.\n  - The reader records the epoch of the payloads it loaded (the minimum over the remote ranks of one handshake, in\n    case it straddled the republish). A request naming a newer epoch drops that remote engine and handshakes again\n    through the existing path; while reads through the old registration are still in flight, the request is\n    re-queued instead. Older epochs never trigger a re-handshake.\n  - The reader checks whether the agent is loaded once per request (`_start_read`), so a handshake that completes\n    concurrently cannot install an old agent between the epoch check and the read.\n- Under sleep mode the worker sets `UCX_RCACHE_ENABLE=n` and `UCX_TLS=^cuda_ipc` right before creating the agent,\n  each only if the user did not set it, and logs once which defaults it applied (as `UCX_RCACHE_MAX_UNRELEASED` in\n  `nixl_utils.py` does). **They are process-wide**: other UCX users in the worker process (the NIXL EPLB communicator,\n  the EC NIXL connector, NVSHMEM with a UCX transport) and child processes inherit them.\n  - UCX's registration cache defers the real deregistration. On GB300 the cached dmabuf MR kept the released pages\n    pinned in about half of the sleeps, and `release_kv_cache_memory` freed nothing. With the cache off, every sleep\n    freed the KV cache.\n  - A peer's cuda_ipc import (intra-node NVLink or MNNVL) pins the exporter's pages inside the peer's UCX cache. Over\n    MNNVL the outputs stayed correct, but the prefiller's KV cache stayed resident asleep and was doubled after the\n    wake. Without cuda_ipc in the exporter's UCX context no peer can import it; reads use RDMA (on one node: RDMA\n    loopback through the NIC). Cost measured below: none on GB300.\n- Static policy, checked once at startup: `NixlPullConnector.supports_sleep_mode` is True only with the UCX backend\n  (`backends == [\"UCX\"]`), the only one validated. `NixlPushConnector` stays refused: the producer writes through the\n  decoder's registration and is not refreshed.\n- `NIXL_CONNECTOR_VERSION` 13 -> 14 (payload field and `kv_transfer_params` key). Routers must forward\n  `kv_transfer_params` unchanged, as they already must for `remote_block_ids`.\n\n## Test Plan\n\n- Unit tests (CPU-capable, fake NIXL agent), organized around invariants:\n  - `test_decoder_reads_from_republished_prefiller[all-ranks|one-rank|straddled]` (scheduler level, real side\n    channel): whichever ranks re-registered, a handshake after the republish loads the epoch the prefiller\n    advertises, so the decoder reads instead of handshaking again; a handshake that straddled the republish is redone\n    exactly once. The `one-rank` row (one rank's restore was a no-op) livelocks on the previous revision of this PR.\n  - `test_sleep_cycle_releases_and_restores_registration`: with a tracking agent, nothing built on the registration\n    survives a release (registrations, local and remote dlists, remote agents), and a restore registers the same memory\n    with exactly one local dlist and publishes the new agent metadata; both calls idempotent over two cycles.\n  - `test_release_waits_for_reads_and_handshakes`: an in-flight read or a pending handshake holds the release; a wedged\n    one times out and keeps the registration; shutdown while released does not deregister again.\n  - `TestPeerReplacement::test_rehandshakes_re_registered_peer`: same epoch reads through the loaded agent; a newer\n    epoch drops it and handshakes again; with reads in flight the request is deferred until they finish.\n  - `test_sleep_mode_ucx_defaults`: the UCX defaults under sleep mode only, and a user setting wins per variable.\n  - `test_config.py`: NIXL pull supported, NIXL with a non-UCX backend and NIXL push refused, MultiConnector rows.\n  - `test_engine_core.py::test_wake_up_republishes_kv_connector_handshake_metadata[all|kv_cache|weights]`: republish\n    after the executor woke up, and only when the KV cache was restored.\n- Mutation check: every piece of the change altered on its own, including the previous revision's worker-owned epoch.\n- `pytest tests/v1/kv_connector/unit/{test_nixl_connector,test_config,test_mooncake_connector,test_multi_connector}.py\n  tests/v1/engine/test_engine_core.py tests/v1/worker/test_sleep_mode_backend.py`; the NIXL and config files 5 times;\n  pre-commit on the changed files.\n- Hardware: NVIDIA GB300 Slurm cluster, NUMA-local to the only active NIC (mlx5_4, RoCE, GID 3). Image: vLLM nightly\n  aarch64 + this branch as per-file mounts with sha256 gates (all 12 mounted files equal to this commit). NIXL 1.4.1\n  (bundled UCX). Qwen3-8B, prefix caching off, `--gpu-memory-utilization 0.3`, level-1 sleep, UCX settings left to\n  the branch defaults. Toy proxy from `tests/v1/kv_connector/nixl_integration`. Each check sends 30 prompts of\n  1.1k-1.7k tokens (greedy, 32 tokens) and compares them with the awake control; transfers are counted from NIXL's KV\n  transfer metrics and the logs are scanned for transfer failures and UCX errors. The UCX protocol in use is taken\n  from `UCX_PROTO_INFO=y`.\n  - Cross-node: P and D on two nodes, one GPU each.\n  - Single node: P on GPUs 0-1 and D on GPUs 2-3 (TP2 each), with and without sleep mode, plus a transfer benchmark\n    (30 sequential requests of ~1.3k and ~5k tokens, twice; 128 requests at concurrency 32), with transfer time and\n    bytes from D's `vllm:nixl_xfer_time_seconds` and `vllm:nixl_bytes_transferred`.\n\n## Test Result\n\nCross-node 1P1D TP1 (final commit; UCX picked `rc_mlx5` zero-copy GPU-to-GPU reads). \"Asleep\" and \"woken\" are MiB on\nthe slept GPU; awake is 85101 MiB.\n\n| Case | Cycles | After every wake | Asleep | Woken | Failed transfers |\n|---|---|---|---|---|---|\n| Sleep D | 3 | 30/30 | 2077 | 85101 | 0 |\n| Sleep P | 3 | 30/30 | 2077 | 85101 | 0 |\n| Sleep both | 3 | 30/30 | 2077 / 2077 | 85101 | 0 |\n| Selective wake, weights then kv_cache (both) | 1 | 30/30 | 2077 -> 19415 -> 85101 | | 0 |\n| Selective wake, kv_cache then weights (both) | 1 | 30/30 | 2077 -> 68809 -> 85101 | | 0 |\n| `release_kv_cache_memory` on both (pause wait, release, wake kv_cache, resume) | 1 | 30/30 | P 20983, D 19415 | 85101 | 0 |\n| P sleep (mode=wait) under load: 90 requests at concurrency 30, wake after 5 s | 1 | 0 errors; 30/30 after | 2077 | 85101 | 0 |\n\n- The decoder re-handshakes exactly once per wake that restored the KV cache, including the selective wakes (the\n  weights-only step no longer republishes); the first request after a wake takes 0.21-0.24 s versus 0.18 s.\n- Under load, 18/90 outputs differ from the sequential control, as in a concurrent run without any sleep (batching\n  noise); every post-wake check is 30/30.\n\nSingle node, P on GPUs 0-1, D on GPUs 2-3, TP2 each (sleep mode with the branch defaults, so reads use RDMA loopback):\n\n| Case | Cycles | After every wake | Asleep (2 GPUs) | Woken | Failed transfers |\n|---|---|---|---|---|---|\n| Sleep D / P / both | 3 each | 30/30 | 7166 | 172934 | 0 |\n| `release_kv_cache_memory` on both | 1 | 30/30 | P 26054, D 25194 | 172934 | 0 |\n\nSingle-node transfer cost of the `UCX_TLS=^cuda_ipc` default (medians of two launches each; \"transfer\" is NIXL's\nper-transfer time, one transfer per TP rank and request):\n\n| Workload | Without sleep mode: cuda_ipc (NVLink) | Sleep mode: RDMA loopback | Without sleep mode, `UCX_TLS=^cuda_ipc` |\n|---|---|---|---|\n| ~1.3k tokens, sequential: request p50 | 59 ms | 54 ms | 52 ms |\n| ~1.3k tokens: transfer time / rate (90 MB) | 8.0-8.9 ms / 10-11 GB/s | 4.0-4.6 ms / 20-22 GB/s | 4.1 ms / 22 GB/s |\n| ~5k tokens, sequential: request p50 | 101-119 ms | 85 ms | 84 ms |\n| ~5k tokens: transfer time / rate (355 MB) | 28-36 ms / 10-13 GB/s | 15.1 ms / 23.5 GB/s | 15.0 ms / 23.7 GB/s |\n| 128 requests at concurrency 32, ~1.3k / ~5k tokens | 91-96 / 30.8 req/s | 117.5 / 32.8 req/s | 120.7 / 32.4 req/s |\n\n- **No NVLink cost was measured on GB300**: with UCX's defaults, RDMA loopback through the NIC was faster than\n  cuda_ipc for these transfers (cuda_ipc spent 5-29 ms per transfer in posting). This is UCX 1.4.1-bundled cuda_ipc\n  between two instances with disjoint `CUDA_VISIBLE_DEVICES`; a tuned cuda_ipc setup, or a node whose NIC is slower\n  relative to NVLink, may differ. Users who want cuda_ipc can set `UCX_TLS` themselves; then a peer's import keeps the\n  slept KV cache resident (measured over MNNVL: 67763 MiB asleep, 150787 MiB after the wake; `UCX_CUDA_IPC_CACHE=n` on\n  the reader frees it at +140 ms per request).\n- Baseline (#59625 head with the refusal forced off) under the cross-node harness: decode sleep 0/30, prefill sleep\n  0/30, 0 errors, KV cache pinned asleep (67763 MiB) and doubled after the wake (150787 MiB).\n- Earlier revision of this PR at scale (same peer-refresh path): V4-Flash TP4+TP4 cross-node 30/30 cycles, 900/900\n  probes, 23,792 transfers, 0 failed; Qwen3-8B 100/100 cycles, 0 failed.\n- Unit: 391 passed across the files above. The failures are tests that need models this node cannot download (gated\n  `meta-llama/Llama-3.2-1B-Instruct`, and `test_engine_core_tp`, `_concurrent_batches` and\n  `_invalid_request_id_type`); run alone on #59625's head, the same 4 fail. The NIXL and config files: 5 repeats,\n  208 passed each time. Mutation check: 37 mutants, all killed; every\n  new test kills at least one. The reviewer's fix probes pass (28/28).\n\nKnown limitations:\n- **Host memory grows by about 1.3 MiB per sleep cycle on both P and D** (measured on the previous revision with\n  `smaps_rollup` Rss at Qwen3-8B TP1, `num_threads=4`: 1.25-1.34 MiB/cycle, linear over 500 cycles; Mooncake and sleep\n  without a connector are flat). Each re-handshake creates and closes UCX RC endpoints, and UCX does not return their\n  send-queue buffers (about 640 KiB pinned per side per re-handshake, plus allocator fragmentation). The cost scales\n  with NIXL threads and TP ranks (`num_threads=1` cuts it to 2/5). This revision keeps exactly one re-handshake per\n  wake. Follow-up: keep the remote agent across a wake and reload only the peer's memory sections (NIXL partial\n  metadata without connection info), which needs NIXL to replace the old sections of a loaded agent; that is not\n  verified for NIXL 1.4.1. The UCX endpoint leak itself is to be reported upstream.\n- NIXL backends other than UCX (refused), push mode (refused), and cuda_ipc/MNNVL transfers under sleep mode (disabled\n  by default; a user who sets `UCX_TLS` with cuda_ipc keeps the peers' imports pinned, as measured above).\n- A release that fails on one TP rank (timeout or deregistration error) leaves that worker released while\n  `Executor.sleep` reports the engine awake, so nothing restores it. Partial-failure handling belongs to the executor\n  and is shared with #59625's other connectors; it is not changed here. The registration epoch no longer diverges\n  across ranks in that case, because the scheduler stamps it.\n- With `enforce_handshake_compat: false`, a version-13 decoder ignores the epoch and never refreshes after a\n  version-14 prefiller wakes; with the rcache-off default that shows up as failed transfers.\n\n---\nThis PR contains AI-assisted code (Claude Code); commits carry a `Co-authored-by` trailer.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 14,
+    "head": {
+      "repo": {
+        "full_name": "aoshen02/vllm"
+      },
+      "sha": "100f36d44eeaf6a975a35d26b03d944e9d0b4714"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/59635",
+    "merge_commit_sha": "afe2183f2bab35988de0e6a506a5694b3cc1ef34",
+    "merged": true,
+    "merged_at": "2026-10-19T15:44:34Z",
+    "number": 59635,
+    "state": "closed",
+    "title": "[KV Connector] Support sleep mode with the NIXL pull connector",
+    "updated_at": "2026-10-19T15:44:35Z"
+  },
+  "files": [
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/.buildkite%2Ftest_areas%2Fdisaggregated.yaml",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/.buildkite%2Ftest_areas%2Fdisaggregated.yaml?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 0,
+      "filename": ".buildkite/test_areas/disaggregated.yaml",
+      "patch": "@@ -14,6 +14,7 @@ steps:\n   commands:\n     - bash /vllm-workspace/.buildkite/scripts/install-kv-connectors.sh\n     - bash v1/kv_connector/nixl_integration/config_sweep_accuracy_test.sh\n+    - GPU_MEMORY_UTILIZATION=0.6 SLEEP_WAKE=1 bash v1/kv_connector/nixl_integration/run_accuracy_test.sh\n   mirror:\n     amd:\n       label: \":amd: (MI355) Distributed NixlConnector PD accuracy\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/.buildkite%2Ftest_areas%2Fdisaggregated.yaml",
+      "sha": "56ea5a80d3f54d3f93d9c076cef2db594aa8789b",
+      "status": "modified"
+    },
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fengine%2Ftest_engine_core.py",
+      "changes": 17,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fengine%2Ftest_engine_core.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 0,
+      "filename": "tests/v1/engine/test_engine_core.py",
+      "patch": "@@ -834,6 +834,23 @@ def test_kv_cache_release_rejects_unsafe_state(pause_state, has_requests, has_ba\n     core.model_executor.discard.assert_not_called()\n \n \n+@pytest.mark.parametrize(\n+    (\"tags\", \"republished\"), [(None, True), ([\"kv_cache\"], True), ([\"weights\"], False)]\n+)\n+def test_wake_up_republishes_kv_connector_handshake_metadata(tags, republished):\n+    \"\"\"Peers can load the KV cache registration only after the workers redid it.\"\"\"\n+    core = _pausable_engine_core_proc()\n+    calls: list[str] = []\n+    core.model_executor.wake_up.side_effect = lambda tags: calls.append(\"wake_up\")\n+    core.model_executor.get_kv_connector_handshake_metadata.return_value = [{}]\n+    kv_connector = core.scheduler.get_kv_connector.return_value\n+    kv_connector.set_xfer_handshake_metadata_pp_aware.side_effect = (\n+        lambda metadata: calls.append(\"publish\")\n+    )\n+    EngineCore.wake_up(core, tags)\n+    assert calls == ([\"wake_up\", \"publish\"] if republished else [\"wake_up\"])\n+\n+\n @pytest.mark.parametrize(\"deferred\", [False, True])\n def test_pause_synchronizes_device_before_cache_reset(deferred: bool):\n     \"\"\"A resolved pause promises an idle device: the barrier must run before",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fengine%2Ftest_engine_core.py",
+      "sha": "65960c96f2e3e50c527d577b87333c1033ac5eed",
+      "status": "modified"
+    },
+    {
+      "additions": 15,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Fnixl_integration%2Frun_accuracy_test.sh",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Fnixl_integration%2Frun_accuracy_test.sh?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 1,
+      "filename": "tests/v1/kv_connector/nixl_integration/run_accuracy_test.sh",
+      "patch": "@@ -85,6 +85,12 @@ DECODE_BLOCK_SIZE=${DECODE_BLOCK_SIZE:-128}\n ENFORCE_EAGER=${ENFORCE_EAGER:-1}\n # Comma-separated extra args for vllm serve (e.g. --max-model-len,2048)\n VLLM_SERVE_EXTRA_ARGS=${VLLM_SERVE_EXTRA_ARGS:-}\n+# Set to 1 to put every instance to sleep and wake it up before the eval.\n+SLEEP_WAKE=${SLEEP_WAKE:-0}\n+if [[ \"$SLEEP_WAKE\" == \"1\" ]]; then\n+  export VLLM_SERVER_DEV_MODE=1\n+  VLLM_SERVE_EXTRA_ARGS=\"${VLLM_SERVE_EXTRA_ARGS:+${VLLM_SERVE_EXTRA_ARGS},}--enable-sleep-mode\"\n+fi\n # Pin concurrent prefiller and non-DP decoder engines to separate internal\n # port windows. DP decoder ranks retain their existing internal port selection.\n PREFILLER_INTERNAL_PORT_BASE=${PREFILLER_INTERNAL_PORT_BASE:-20000}\n@@ -313,9 +319,17 @@ run_tests_for_model() {\n   # Wait for the proxy to start\n   sleep 5\n \n+  SLEEP_WAKE_URLS=\"\"\n+  if [[ \"$SLEEP_WAKE\" == \"1\" ]]; then\n+    for PORT in \"${PREFILL_PORTS[@]}\" \"${DECODE_PORTS[@]}\"; do\n+      SLEEP_WAKE_URLS=\"${SLEEP_WAKE_URLS:+${SLEEP_WAKE_URLS},}http://localhost:${PORT}\"\n+    done\n+  fi\n+\n   # Run lm eval for this model\n   echo \"Running tests for $model_name\"\n-  TEST_MODEL=$model_name python3 -m pytest -s -x \"${GIT_ROOT}\"/tests/v1/kv_connector/nixl_integration/test_accuracy.py\n+  TEST_MODEL=$model_name SLEEP_WAKE_URLS=$SLEEP_WAKE_URLS \\\n+    python3 -m pytest -s -x \"${GIT_ROOT}\"/tests/v1/kv_connector/nixl_integration/test_accuracy.py\n \n   # Clean up before running next model\n   cleanup_instances",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Fnixl_integration%2Frun_accuracy_test.sh",
+      "sha": "acec3ade2214a0890b0a8089019157955085f5bd",
+      "status": "modified"
+    },
+    {
+      "additions": 14,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Fnixl_integration%2Ftest_accuracy.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Fnixl_integration%2Ftest_accuracy.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/nixl_integration/test_accuracy.py",
+      "patch": "@@ -4,8 +4,13 @@\n \n import lm_eval\n import openai\n+import requests\n \n BASE_URL = \"http://localhost:8192/v1\"\n+# Comma-separated server URLs to sleep and wake up before the eval.\n+SLEEP_WAKE_URLS = [\n+    url for url in os.environ.get(\"SLEEP_WAKE_URLS\", \"\").split(\",\") if url\n+]\n NUM_CONCURRENT = int(os.getenv(\"NUM_CONCURRENT\", \"100\"))\n TASK = \"gsm8k\"\n FILTER = \"exact_match,strict-match\"\n@@ -61,9 +66,18 @@ def run_simple_prompt():\n     print(\"-\" * 50)\n \n \n+def sleep_and_wake_up(urls: list[str]):\n+    for url in urls:\n+        requests.post(f\"{url}/sleep\", params={\"level\": 1}).raise_for_status()\n+    for url in urls:\n+        requests.post(f\"{url}/wake_up\").raise_for_status()\n+\n+\n def test_accuracy():\n     \"\"\"Run the end to end accuracy test.\"\"\"\n     run_simple_prompt()\n+    if SLEEP_WAKE_URLS:\n+        sleep_and_wake_up(SLEEP_WAKE_URLS)\n \n     if \"gemma-4\" in MODEL_NAME:\n         # Gemma4 is quite sensible to having a chat template applied, so we evaluate",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Fnixl_integration%2Ftest_accuracy.py",
+      "sha": "4235f1d7bfdded6b43e5fa85552bd3f93f81c508",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_config.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_config.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 1,
+      "filename": "tests/v1/kv_connector/unit/test_config.py",
+      "patch": "@@ -160,7 +160,8 @@ def test_kv_connector_allows_expandable_segments_with_cumem_allocator(\n @pytest.mark.parametrize(\n     (\"kv_connector\", \"extra_config\", \"env\"),\n     [\n-        (\"NixlConnector\", {}, None),\n+        (\"NixlConnector\", {\"backends\": [\"LIBFABRIC\"]}, None),\n+        (\"NixlPushConnector\", {}, None),\n         (\"MooncakeConnector\", {\"mooncake_protocol\": \"tcp\"}, None),\n         (\"MooncakeConnector\", {}, \"MC_USE_TENT\"),\n     ],",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_config.py",
+      "sha": "44675cf3e972c209a6ef1990f51555d1eea08f84",
+      "status": "modified"
+    },
+    {
+      "additions": 78,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_nixl_connector.py",
+      "changes": 78,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_nixl_connector.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/test_nixl_connector.py",
+      "patch": "@@ -2283,6 +2283,7 @@ def recv_worker():\n     worker._engine_by_address = {}\n     worker._failed_remote_engines = set()\n     worker._invalid_remote_engines = set()\n+    worker._remote_registration_generations = {}\n     worker._replicated_pcp_done_sending = set()\n     worker._invalid_block_ids = queue.Queue()\n     worker._pending_recv_notifs = {}\n@@ -2875,6 +2876,75 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):\n         mock_dereg.assert_any_call(\"desc2\")\n \n \n+@patch(\n+    \"vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper\",\n+    FakeNixlWrapper,\n+)\n+def test_sleep_unregisters_and_restores_kv_caches(dist_init):\n+    \"\"\"Sleep drops everything built on the KV cache registration; wake-up\n+    registers the same memory again and publishes the new agent metadata.\"\"\"\n+    vllm_config = create_vllm_config()\n+    vllm_config.cache_config.kv_cache_layout = \"BLHNC\"\n+    vllm_config.kv_transfer_config.kv_buffer_device = \"cpu\"\n+    spec = FullAttentionSpec(\n+        block_size=16, num_kv_heads=4, head_size=16, dtype=torch.float16\n+    )\n+    kv_cache_config = KVCacheConfig(\n+        num_blocks=2,\n+        kv_cache_tensors=[],\n+        kv_cache_groups=[KVCacheGroupSpec([\"layer0\"], spec)],\n+    )\n+    raw = torch.zeros(spec.page_size_bytes * 2, dtype=torch.int8)\n+    (cache,) = dense_kv_cache_views(\n+        raw, spec, 2, num_layers=1, layout=KVCacheLayout.BLHNC\n+    )\n+    with set_current_vllm_config(vllm_config):\n+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)\n+        connector.register_kv_caches({\"layer0\": cache})\n+    worker = connector.connector_worker\n+    nixl = worker.nixl_wrapper = MagicMock(wraps=worker.nixl_wrapper)\n+    worker._remote_agents[\"remote\"] = {(0, 0): \"agent\"}\n+    descs = list(worker._registered_descs)\n+\n+    connector.unregister_kv_caches()\n+    connector.unregister_kv_caches()  # a discard, then a sleep\n+    assert nixl.deregister_memory.call_args_list == [call(d) for d in descs]\n+    assert not worker._remote_agents\n+\n+    nixl.get_agent_metadata.return_value = b\"re-registered\"\n+    connector.restore_kv_caches()\n+    connector.restore_kv_caches()\n+    assert nixl.register_memory.call_count == len(descs)\n+    payload = worker.xfer_handshake_metadata\n+    agent = msgspec.msgpack.decode(payload.agent_metadata_bytes, type=NixlAgentMetadata)\n+    assert agent.agent_metadata == b\"re-registered\"\n+    connector.shutdown()\n+\n+\n+def test_registration_generation_bumps_on_changed_payload(\n+    default_vllm_config, dist_init\n+):\n+    \"\"\"Requests tell decoders to handshake again only when the published\n+    registration changed.\"\"\"\n+    vllm_config = create_vllm_config()\n+    scheduler = NixlConnectorScheduler(\n+        vllm_config, vllm_config.kv_transfer_config.engine_id, make_kv_cache_config(16)\n+    )\n+    scheduler._nixl_handshake_listener_t = MagicMock()  # already serving\n+    generations: list[int] = []\n+    for i, agent in enumerate((b\"old\", b\"old\", b\"new\")):  # startup, same, changed\n+        payload = NixlHandshakePayload(\n+            compatibility_hash=\"h\", agent_metadata_bytes=agent\n+        )\n+        scheduler.set_xfer_handshake_metadata({(0, 0): payload})\n+        request = create_request(request_id=i, num_tokens=40, do_remote_decode=True)\n+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED\n+        params = scheduler.request_finished(request, ([0, 1, 2],))[1]\n+        assert params is not None\n+        generations.append(params[\"remote_registration_generation\"])\n+    assert generations[0] == generations[1] < generations[2]\n+\n+\n # ── TTL-based remote engine eviction tests ──────────────────────────\n \n \n@@ -3416,6 +3486,14 @@ def test_eviction_clears_pending_recovery(self):\n         assert not self.worker._failed_remote_engines\n         assert not self.worker._invalid_remote_engines\n \n+    def test_rehandshakes_re_registered_peer(self):\n+        metadata = self._request(\"old\")\n+        metadata.reqs_to_recv[\"old-req\"].remote.registration_generation = 1\n+        self.worker.start_load_kv(metadata)\n+        self.transport.make_prepped_xfer.assert_not_called()\n+        self.transport.remove_remote_agent.assert_called_once_with(\"old\")\n+        assert \"old\" in self.worker._handshake_futures\n+\n \n def test_transfer_topology_unregister():\n     \"\"\"TransferTopology.unregister_remote_engine removes the engine.\"\"\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_nixl_connector.py",
+      "sha": "cc4c19bafdce1ddd5f2b367f39619d624be97d13",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_nixl_connector_hma.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_nixl_connector_hma.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/test_nixl_connector_hma.py",
+      "patch": "@@ -64,6 +64,7 @@ def region_pull_worker():\n     worker._recving_transfers = {}\n     worker._failed_remote_engines = set()\n     worker._invalid_remote_engines = set()\n+    worker._remote_registration_generations = {}\n     worker.use_mla, worker._has_mamba = True, False\n     worker.dcp_size = 1\n     worker.dcp_rank = 0\n@@ -696,6 +697,7 @@ def test_read_blocks_for_req_expands_remote_ids(\n     worker = object.__new__(NixlConnectorWorker)\n     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical\n     worker._invalid_remote_engines = set()\n+    worker._remote_registration_generations = {}\n     worker._remote_agents = {\"remote-engine\": {}}\n     worker._engine_last_active = {}\n     worker._recving_transfers = {}",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_nixl_connector_hma.py",
+      "sha": "067fa559ae57ddbedb2be7a02f9ef72dff6eb1f0",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fbase_scheduler.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fbase_scheduler.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 4,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py",
+      "patch": "@@ -113,6 +113,9 @@ def __init__(\n         # Background thread for handling new handshake requests.\n         self._nixl_handshake_listener_t: threading.Thread | None = None\n         self._stop_event = threading.Event()\n+        # Payloads the listener serves; a republish after a wake-up updates them.\n+        self._handshake_data: dict[tuple[int, int], bytes] = {}\n+        self._registration_generation = 0\n \n         # Requests that need to start recv/send.\n         # New requests are added by update_state_after_alloc in\n@@ -299,20 +302,23 @@ def set_xfer_handshake_metadata(\n             metadata (dict): the handshake metadata to set.\n \n         \"\"\"\n-        encoded_data: dict[tuple[int, int], bytes] = {}\n         encoder = msgspec.msgpack.Encoder()\n         for (pp_rank, tp_rank), rank_metadata in metadata.items():\n             if not isinstance(rank_metadata, NixlHandshakePayload):\n                 raise ValueError(\n                     \"NixlConnectorScheduler expects NixlHandshakePayload for \"\n                     \"handshake metadata.\"\n                 )\n-            encoded_data[(pp_rank, tp_rank)] = encoder.encode(rank_metadata)\n+            encoded = encoder.encode(rank_metadata)\n+            if self._handshake_data.get((pp_rank, tp_rank)) != encoded:\n+                # Peers must handshake again to load the changed registration.\n+                self._registration_generation += 1\n+            self._handshake_data[(pp_rank, tp_rank)] = encoded\n             logger.debug(\n                 \"PP rank %d, TP rank %d: encoded NixlHandshakePayload size: %s bytes\",\n                 pp_rank,\n                 tp_rank,\n-                str(len(encoded_data[(pp_rank, tp_rank)])),\n+                str(len(self._handshake_data[(pp_rank, tp_rank)])),\n             )\n \n         # Only start the listener when we have metadata to serve.\n@@ -321,7 +327,7 @@ def set_xfer_handshake_metadata(\n             self._nixl_handshake_listener_t = threading.Thread(\n                 target=self._nixl_handshake_listener,\n                 args=(\n-                    encoded_data,\n+                    self._handshake_data,\n                     ready_event,\n                     self._stop_event,\n                     self.side_channel_host,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fbase_scheduler.py",
+      "sha": "4a9c99d61c3067bb3c65f1a756f762714d5edbe1",
+      "status": "modified"
+    },
+    {
+      "additions": 56,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fbase_worker.py",
+      "changes": 64,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fbase_worker.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 8,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+      "patch": "@@ -702,7 +702,19 @@ def __init__(\n                 else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)\n             )\n \n+        sleep_mode = vllm_config.model_config.enable_sleep_mode and config is not None\n+        if sleep_mode:\n+            config = nixl_agent_config(backends=[], capture_telemetry=True)\n         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)\n+        if sleep_mode:\n+            # Keep slept pages unpinned, for this agent only; UCX_* env vars win.\n+            self.nixl_wrapper.create_backend(\n+                \"UCX\",\n+                {\n+                    \"num_threads\": str(num_threads),\n+                    \"engine_config\": \"RCACHE_ENABLE=n,TLS=^cuda_ipc\",\n+                },\n+            )\n         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.\n         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).\n         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(\n@@ -861,6 +873,7 @@ def __init__(\n         self.dst_uses_region_group_mapping: dict[EngineId, bool] = {}\n         self.dst_region_mem_types: dict[EngineId, list[str]] = {}\n         self._registered_descs: list[Any] = []\n+        self._kv_unregistered = False\n \n         # In progress transfers.\n         # [req_id -> list[handle]]\n@@ -1892,6 +1905,35 @@ def _ple_page_len(self) -> int:\n         )\n         return self._ple_block_len\n \n+    def unregister_kv_caches(self) -> None:\n+        if self._kv_unregistered or not self._registered_descs:\n+            return\n+        self._release_local_xfer_handles()\n+        # Remote engines hold local handles too; they handshake again on demand.\n+        for engine_id in list(self._remote_agents):\n+            self._cleanup_remote_engine(engine_id, log_eviction=False)\n+        for descs in self._registered_descs:\n+            self.nixl_wrapper.deregister_memory(descs)\n+        self._kv_unregistered = True\n+\n+    def restore_kv_caches(self) -> None:\n+        if not self._kv_unregistered:\n+            return\n+        for descs in self._registered_descs:\n+            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)\n+        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (\n+            self.register_local_xfer_handler(self.block_size)\n+        )\n+        # Peers load the new registration from the agent metadata.\n+        payload = self.xfer_handshake_metadata\n+        assert payload is not None\n+        agent_metadata = msgspec.msgpack.decode(\n+            payload.agent_metadata_bytes, type=NixlAgentMetadata\n+        )\n+        agent_metadata.agent_metadata = self.nixl_wrapper.get_agent_metadata()\n+        payload.agent_metadata_bytes = msgspec.msgpack.encode(agent_metadata)\n+        self._kv_unregistered = False\n+\n     def _build_mamba_local(self, base_addresses: list[int]) -> np.ndarray:\n         \"\"\"Build desc regions (conv sub-projections + ssm) per layer for\n         local mamba blocks with DS conv layout, as Nx5 uint64 strided descs.\n@@ -3928,8 +3970,7 @@ def __del__(self):\n         with contextlib.suppress(Exception):\n             self.shutdown()\n \n-    def _finish_shutdown(self) -> None:\n-        self._recving_transfers.clear()\n+    def _release_local_xfer_handles(self) -> None:\n         try:\n             for handle in self.src_xfer_handles_by_block_size.values():\n                 self.nixl_wrapper.release_dlist_handle(handle)\n@@ -3943,20 +3984,27 @@ def _finish_shutdown(self) -> None:\n             for dram_handle in self._dram_src_handles_by_block_size.values():\n                 if dram_handle is not None:\n                     self.nixl_wrapper.release_dlist_handle(dram_handle)\n+        finally:\n+            self.src_xfer_handles_by_block_size.clear()\n+            self.src_xfer_handles_by_tp_ratio.clear()\n+            self._dram_src_handles_by_tp_ratio.clear()\n+            self._dram_src_handles_by_block_size.clear()\n+\n+    def _finish_shutdown(self) -> None:\n+        self._recving_transfers.clear()\n+        try:\n+            self._release_local_xfer_handles()\n         except Exception:\n             logger.exception(\"NIXL dlist-handle release failed at shutdown.\")\n-        self.src_xfer_handles_by_block_size.clear()\n-        self.src_xfer_handles_by_tp_ratio.clear()\n-        self._dram_src_handles_by_tp_ratio.clear()\n-        self._dram_src_handles_by_block_size.clear()\n         try:\n             for engine_id in list(self._remote_agents):\n                 self._cleanup_remote_engine(engine_id, log_eviction=False)\n         except Exception:\n             logger.exception(\"NIXL remote-engine cleanup failed at shutdown.\")\n         try:\n-            for desc in self._registered_descs:\n-                self.nixl_wrapper.deregister_memory(desc)\n+            if not self._kv_unregistered:\n+                for desc in self._registered_descs:\n+                    self.nixl_wrapper.deregister_memory(desc)\n         finally:\n             self._registered_descs.clear()\n             # Drop cache references before their owners release registered",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fbase_worker.py",
+      "sha": "5f4757953e4cf5de9e2cea7bd7934f11b68c7681",
+      "status": "modified"
+    },
+    {
+      "additions": 14,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fconnector.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fconnector.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 0,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+      "patch": "@@ -142,6 +142,7 @@ def __init__(\n     ############################################################\n     @classmethod\n     def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        # Push producers keep the decoder's KV cache registration across its sleep.\n         return False\n \n     @classmethod\n@@ -367,6 +368,19 @@ def __init__(\n                 vllm_config, self.engine_id, kv_cache_config\n             )\n \n+    @classmethod\n+    def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:\n+        # Sleep mode is only validated with the UCX backend.\n+        return kv_transfer_config.get_from_extra_config(\"backends\", [\"UCX\"]) == [\"UCX\"]\n+\n+    def unregister_kv_caches(self) -> None:\n+        assert self.connector_worker is not None\n+        self.connector_worker.unregister_kv_caches()\n+\n+    def restore_kv_caches(self) -> None:\n+        assert self.connector_worker is not None\n+        self.connector_worker.restore_kv_caches()\n+\n     def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs) -> None:\n         assert self.connector_worker is not None\n         assert isinstance(self.connector_worker, NixlPullConnectorWorker)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fconnector.py",
+      "sha": "fecbf462d9920c0fa55e7eba9f3bd1e453cbb90c",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fmetadata.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fmetadata.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 1,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py",
+      "patch": "@@ -50,8 +50,9 @@\n #  12: Add per-region member names for PP push\n #  13: Add packed-member layouts and order-independent packed-push backend hashes\n #  14: Add Qwen3.8-Flash-Next PLE page length - #59997\n+#  15: Add remote_registration_generation to kv_transfer_params\n #\n-NIXL_CONNECTOR_VERSION: int = 14\n+NIXL_CONNECTOR_VERSION: int = 15\n \n \n @dataclass\n@@ -236,6 +237,8 @@ class RemoteMeta:\n     request_id: str\n     blocks_expiry_time: float | None = None\n     num_tokens: int | None = None\n+    # Bumped each time the remote publishes a changed KV cache registration.\n+    registration_generation: int = 0\n \n \n @dataclass\n@@ -336,5 +339,8 @@ def add_new_req_to_recv(\n             port=kv_transfer_params[\"remote_port\"],\n             blocks_expiry_time=kv_transfer_params.get(\"remote_blocks_expiry_time\"),\n             num_tokens=kv_transfer_params.get(\"remote_num_tokens\"),\n+            registration_generation=kv_transfer_params.get(\n+                \"remote_registration_generation\", 0\n+            ),\n         )\n         self.reqs_to_recv[request_id] = req",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fmetadata.py",
+      "sha": "ab3e3f83a3a53cbc6ae8065e7b2cb072ad0901ff",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fpull_scheduler.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fpull_scheduler.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 0,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
+      "patch": "@@ -288,5 +288,6 @@ def request_finished(\n             pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,\n             remote_num_tokens=remote_num_tokens,\n             remote_blocks_expiry_time=blocks_expiry_time,\n+            remote_registration_generation=self._registration_generation,\n             transfer_mode=self._TRANSFER_MODE,\n         )",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fpull_scheduler.py",
+      "sha": "f59e319472f320193b903fb7a8bb7f95191e8a59",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fpull_worker.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fpull_worker.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 1,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py",
+      "patch": "@@ -7,7 +7,7 @@\n \n import numpy as np\n \n-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds\n+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId\n from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (\n     NixlBaseConnectorWorker,\n )\n@@ -43,6 +43,8 @@ def __init__(\n         kv_cache_config: \"KVCacheConfig\",\n     ):\n         super().__init__(vllm_config, engine_id, kv_cache_config)\n+        # Registration generation of each remote engine's loaded agent.\n+        self._remote_registration_generations: dict[EngineId, int] = {}\n \n     def start_load_kv(self, metadata: NixlConnectorMetadata):\n         \"\"\"Start loading by triggering non-blocking nixl_xfer.\n@@ -141,6 +143,12 @@ def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):\n                 req_id, None, self._recv_failures, record_failed_transfer=False\n             )\n             return\n+        generation = meta.remote.registration_generation\n+        if self._remote_registration_generations.get(engine_id, 0) < generation:\n+            # The remote registered its KV cache again, eg after a sleep.\n+            if engine_id in self._remote_agents:\n+                self._cleanup_remote_engine(engine_id, log_eviction=False)\n+            self._remote_registration_generations[engine_id] = generation\n         if engine_id not in self._remote_agents:\n             # Also re-handshakes queued requests that outlived invalid-peer cleanup.\n             self._background_nixl_handshake(req_id, engine_id, meta)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fnixl%2Fpull_worker.py",
+      "sha": "6c436f892866f271cc65ccb5aaa369c30e894b86",
+      "status": "modified"
+    },
+    {
+      "additions": 26,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fv1%2Fengine%2Fcore.py",
+      "changes": 45,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fengine%2Fcore.py?ref=100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "deletions": 19,
+      "filename": "vllm/v1/engine/core.py",
+      "patch": "@@ -193,26 +193,8 @@ def __init__(\n \n         self.mm_receiver_cache = engine_receiver_cache_from_config(vllm_config)\n \n-        # If a KV connector is initialized for scheduler, we want to collect\n-        # handshake metadata from all workers so the connector in the scheduler\n-        # will have the full context\n         kv_connector = self.scheduler.get_kv_connector()\n-        if kv_connector is not None:\n-            # Collect and store KV connector xfer metadata from workers\n-            # (after KV cache registration)\n-            xfer_handshake_metadata = (\n-                self.model_executor.get_kv_connector_handshake_metadata()\n-            )\n-\n-            if xfer_handshake_metadata:\n-                # xfer_handshake_metadata is list of dicts from workers\n-                # Each dict already has structure {(pp_rank, tp_rank): metadata}\n-                # Merge all worker dicts into a single dict\n-                content: dict[tuple[int, int], Any] = {}\n-                for worker_dict in xfer_handshake_metadata:\n-                    if worker_dict is not None:\n-                        content.update(worker_dict)\n-                kv_connector.set_xfer_handshake_metadata_pp_aware(content)\n+        self._set_kv_connector_handshake_metadata()\n \n         # Setup batch queue for pipeline parallelism.\n         # Batch queue for scheduled batches. This enables us to asynchronously\n@@ -896,6 +878,28 @@ def reset_encoder_cache(self) -> None:\n         # Reset the GPU model runner's encoder cache (physical storage)\n         self.model_executor.reset_encoder_cache()\n \n+    def _set_kv_connector_handshake_metadata(self) -> None:\n+        # If a KV connector is initialized for scheduler, we want to collect\n+        # handshake metadata from all workers so the connector in the scheduler\n+        # will have the full context\n+        kv_connector = self.scheduler.get_kv_connector()\n+        if kv_connector is not None:\n+            # Collect and store KV connector xfer metadata from workers\n+            # (after KV cache registration)\n+            xfer_handshake_metadata = (\n+                self.model_executor.get_kv_connector_handshake_metadata()\n+            )\n+\n+            if xfer_handshake_metadata:\n+                # xfer_handshake_metadata is list of dicts from workers\n+                # Each dict already has structure {(pp_rank, tp_rank): metadata}\n+                # Merge all worker dicts into a single dict\n+                content: dict[tuple[int, int], Any] = {}\n+                for worker_dict in xfer_handshake_metadata:\n+                    if worker_dict is not None:\n+                        content.update(worker_dict)\n+                kv_connector.set_xfer_handshake_metadata_pp_aware(content)\n+\n     def _reset_caches(\n         self,\n         reset_running_requests: bool = True,\n@@ -1011,6 +1015,9 @@ def wake_up(self, tags: list[str] | None = None) -> bool:\n \n         if tags is None or tags:\n             self.model_executor.wake_up(tags)\n+            if tags is None or \"kv_cache\" in tags:\n+                # Peers must load the re-registered KV cache.\n+                self._set_kv_connector_handshake_metadata()\n \n         # Partial wakes intentionally keep the remaining allocations asleep.\n         # Resume scheduling only once all executor memory is resident again.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/100f36d44eeaf6a975a35d26b03d944e9d0b4714/vllm%2Fv1%2Fengine%2Fcore.py",
+      "sha": "11f4c1c3e15e28f5d98f4337df2a6cc9cdd3d012",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Documentation preview: https://vllm--59635.org.readthedocs.build/en/59635/",
+      "created_at": "2026-10-01T16:05:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-5935369563",
+      "id": 5935369563,
+      "updated_at": "2026-10-01T16:05:06Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-02T02:18:16Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-5944381589",
+      "id": 5944381589,
+      "updated_at": "2026-10-02T02:18:16Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @aoshen02.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-06T04:47:31Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6009535600",
+      "id": 6009535600,
+      "updated_at": "2026-10-06T04:47:31Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "I've rebuilt it on top of #59625.\r\n\r\n## Purpose\r\n\r\nSleep remaps the KV cache to new physical pages at the same virtual addresses, but NIXL's registration and the metadata each decoder loaded still refer to the old pages: after a wake, outputs are wrong (0/30) and the slept KV cache stays resident.\r\n\r\nThis PR supports sleep mode for `NixlConnector` (pull mode, UCX backend):\r\n\r\n- `unregister_kv_caches` / `restore_kv_caches` deregister and re-register the KV cache, rebuild the local dlists and republish the agent metadata.\r\n- Unlike Mooncake, NIXL does not reload a peer's keys by itself. After a wake-up, the scheduler bumps a registration generation when the published metadata changed and sends it in `kv_transfer_params`; a decoder with an older agent handshakes again. Re-registration usually gets the same keys back, so decoders keep their agent.\r\n- Under sleep mode, `UCX_RCACHE_ENABLE=n` and `UCX_TLS=^cuda_ipc` are set unless already set, since UCX's registration cache and cuda_ipc imports keep the slept pages pinned.\r\n- `NixlPushConnector` and non-UCX backends stay refused. `NIXL_CONNECTOR_VERSION` 14 -> 15.\r\n\r\n## Test Result\r\n\r\n1P1D, Qwen3-0.6B, 30 prompts after sleep/wake of P, D and both:\r\n\r\n| | GB200, GPUDirect RDMA | GB300, no GPUDirect |\r\n|---|---|---|\r\n| Outputs vs awake (single node and cross-node on GB200) | 30/30 | 30/30 |\r\n| Slept GPU memory (awake → asleep → after wake, MiB) | 115,059 → 1,405 → 114,503 | 171,767 → 1,413 → 171,211 |\r\n\r\n- With changed keys (test-only extra registration), the decoder handshakes again and outputs stay 30/30.\r\n- gsm8k with `SLEEP_WAKE=1`: 0.4230 (expected 0.41).\r\n- Unit tests: 200 passed.\r\n\r\n---\r\n\r\nAI assistance (Claude Code) was used for this PR; I reviewed the changes and ran the tests listed above.",
+      "created_at": "2026-10-16T15:08:47Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6218454903",
+      "id": 6218454903,
+      "updated_at": "2026-10-16T15:08:47Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "@NickLucche Hi nick, could you please take a look?",
+      "created_at": "2026-10-16T15:15:52Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6218588392",
+      "id": 6218588392,
+      "updated_at": "2026-10-16T15:15:52Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "Self-review of `nixl/base_worker.py`. I plan the follow-up changes below and will push them after testing.\n\n**1. `restore_kv_caches` decodes the handshake payload, patches one field and re-encodes it.**\n`register_kv_caches` already builds this payload. I'll move the `NixlAgentMetadata` / `NixlHandshakePayload` construction into `_build_handshake_payload()` and call it from both places.\n\n**2. Registration and teardown are duplicated.**\n`restore_kv_caches` repeats two steps of `register_kv_caches`: registering memory and building the local xfer handles. `unregister_kv_caches` repeats the teardown in `_finish_shutdown`: releasing handles, cleaning up remote engines and deregistering memory. I'll add one register helper and one release helper, and use them at init, wake, sleep and shutdown. The descriptor and layout setup in `register_kv_caches` still runs once.\n\n**3. The shutdown loop `for desc in [] if self._kv_unregistered else self._registered_descs` goes away.**\nAfter point 2, shutdown calls the same release helper, and that helper knows whether memory is still registered.\n\n**4. Replace the process-wide UCX env vars with per-agent config.**\nRight now sleep mode calls `os.environ.setdefault` for `UCX_RCACHE_ENABLE=n` and `UCX_TLS=^cuda_ipc`. That also affects other UCX/NIXL users in the same process, such as NIXL-based weight transfer or KV offload.\n- NIXL's UCX backend accepts an `engine_config` init param (`KEY=VALUE,...`). It is applied with `ucp_config_modify` to that agent's UCP context only (`src/plugins/ucx/ucx_utils.cpp`). It is available in NIXL 1.5.0, the version vLLM pins, and already in 0.9.0.\n- An explicit `UCX_*` env var still wins, because `config::modify` skips keys that are set in the env. That matches the current `setdefault` behavior.\n- `nixl_agent_config` cannot pass backend params yet (`TODO: add backend init parameters` in `_api.py`). So the UCX backend would be created explicitly:\n\n```python\nucx_params = {\"num_threads\": str(num_threads)}\nif vllm_config.model_config.enable_sleep_mode:\n    ucx_params[\"engine_config\"] = \"RCACHE_ENABLE=n,TLS=^cuda_ipc\"\nconfig = nixl_agent_config(backends=non_ucx_backends, capture_telemetry=True)\nself.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)\nif \"UCX\" in self.nixl_backends:\n    self.nixl_wrapper.create_backend(\"UCX\", ucx_params)\n```\n\nBefore pushing, I'll verify on hardware that both settings take effect: the KV cache memory is released while asleep, and the UCX info log shows the config.",
+      "created_at": "2026-10-16T15:20:56Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6218692589",
+      "id": 6218692589,
+      "updated_at": "2026-10-16T15:20:56Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "Thanks! 3 and 4 are fine with me.\r\nFor 1, I think with the previous code, patching only `agent_metadata` makes it clear that is a wake-up change.\r\nFor 2, the shared part is already `_release_local_xfer_handles`. The left can't really be merged, because the two need different behavior on failure:\r\n- `unregister_kv_caches` (sleep) should raise, otherwise we'd go to sleep with the KV cache still registered.\r\n- `_finish_shutdown` should log and keep going, so it still frees everything else.",
+      "created_at": "2026-10-16T17:53:51Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6221486860",
+      "id": 6221486860,
+      "updated_at": "2026-10-16T17:53:51Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-19T01:55:52Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6258000194",
+      "id": 6258000194,
+      "updated_at": "2026-10-19T01:55:52Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #95772](https://buildkite.com/vllm/ci/builds/95772) for commit `b617b93e5da5`.",
+      "created_at": "2026-10-19T01:57:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6258012138",
+      "id": 6258012138,
+      "updated_at": "2026-10-19T01:57:01Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-19T08:17:56Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262822431",
+      "id": 6262822431,
+      "updated_at": "2026-10-19T08:17:56Z",
+      "user": {
+        "login": "andakai"
+      }
+    },
+    {
+      "body": "❌ @andakai, Only reviewers with write access can use CI commands before CI is delegated to the PR author.\n\n<!-- vllm-ci-command:6262822431 -->",
+      "created_at": "2026-10-19T08:18:15Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262827709",
+      "id": 6262827709,
+      "updated_at": "2026-10-19T08:18:15Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-19T08:19:10Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262843602",
+      "id": 6262843602,
+      "updated_at": "2026-10-19T08:19:10Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #95860](https://buildkite.com/vllm/ci/builds/95860) for commit `100f36d44eea`.",
+      "created_at": "2026-10-19T08:19:29Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#issuecomment-6262849445",
+      "id": 6262849445,
+      "updated_at": "2026-10-19T08:19:29Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 59635,
+  "refs": {
+    "base": {
+      "commit": "852989f580820849113d67d13fd8053e279d0444",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "100f36d44eeaf6a975a35d26b03d944e9d0b4714",
+      "repository": "aoshen02/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#pullrequestreview-5518517070",
+      "id": 5518517070,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-14T13:18:19Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59635#pullrequestreview-5573963482",
+      "id": 5573963482,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-19T15:32:30Z",
+      "user": {
+        "login": "Isotr0py"
+      }
+    }
+  ]
+}

@@ -15,6 +15,8 @@
 
 优化器容量按实际参数组、精度和分片方式估算；矩阵算法可能需要完整矩阵聚合、正交化中间量和流水通信 buffer，不能套用另一优化器的每参数字节数或默认沿 DP 均分。先核对当前实现是否支持所选状态分片，再计入最重 rank 的峰值。算法/分组变化后的容量和短跑基线要求见[配方核对](../../skills/hcu-train-check-and-adapt/references/workflow.md#优化器和参数分组属于模型训练配方)。
 
+卸载、分页、量化缓存或输出 buffer 复用要对照实际消费者与存储生命周期后再计收益：保留在页池的激活、恢复缓冲区、pinned host 页、量化布局副本及图捕获地址可能同时存活。确认是否共享存储、何时释放和机制间的互斥条件，不能把各自宣称的节省量直接相加；未覆盖这些路径的模拟结果需增加明确假设并用对应配置校准。历史 swap-attention 与当前 fine-grained offload/paged stash 不是可互换的开关，不以旧配方的显存数推定新路径容量。
+
 ## 2. HCU Train Simulator 的实际入口与限制
 
 已核对公开仓 [HYGON-AI/hcu-train-simulator](https://github.com/HYGON-AI/hcu-train-simulator)，固定提交 `b7d8e6f3becebf5d09121bb1c582436a371c6710`。以下是该提交的入口；以后依实际 checkout 的 `--help` 和源码核对，不保证未来命令不变。
@@ -39,11 +41,11 @@ hcu-train-sim run config.yaml --no-report
 | 模型覆盖 | `models/registry.py` 与具体 adapter、ModuleSpec 决定估算结构。当前模型缺少专用 adapter 时，逐项核对混合层型、递归/残差状态、辅助训练头和专家布局；generic 输出不能作为完整结构已覆盖的证明。 |
 | 容量 | `estimators/memory.py` 按 PP/VP stage 估算；静态状态字节、激活 dtype、分片假设必须与实际优化器相符。总显存除参数数目不能代替峰值判断。 |
 | 自动求解 | `commands/solve.py` 的 GBS 输入是偏好下限，可能为气泡限制增大 GBS；不能直接把输出作为保留原训练语义的配方。重新核对样本/token、累积和学习率契约。 |
-| 搜索 | `commands/search.py` 可能随 VP 开启 overlap；逐项展开实际输出配置，不能把多个变量变化归因于单一切分。无结果先查非法候选/错误，不直接宣称全参不可能。 |
-| Profile | 理论、已有校准数据和现场测量分别标记；当前内置 profile 不能替代 DTK 26.10/Torch 2.11 的现场数据。`auto` 可能运行 GPU 算子，仍需资源准入。 |
+| 搜索 | `commands/search.py` 可能随 VP 开启 overlap；逐项展开实际输出配置，不能把多个变量变化归因于单一切分。该提交的搜索直接调用估算器，不经过 `run` 的全部 Profile 命中/测量流程；排名不能当作已应用现场校准。无结果先查非法候选/错误，不直接宣称全参不可能。 |
+| Profile | 理论、已有校准数据和现场测量分别标记；该提交的内置 manifest 只有 BW1000/BW1100、Torch 2.7.1、DTK 26.04、BF16 两条记录。按完整环境指纹和输入匹配，不把新 selector 名称当作已存在的实测数据。`auto` 可能运行 GPU 算子，仍需资源准入。 |
 | 精度与吞吐 | 预测不证明实际实现被调用、loss 等价、峰值安全或性能收益；最终依据目标镜像和源码短跑及正常阶段验证。 |
 
-固定证据：[CLI](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/cli.py)、[模型注册](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/models/registry.py)、[显存估算](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/estimators/memory.py)、[搜索](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/commands/search.py)、[求解](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/commands/solve.py)。普通任务读取这些证据不触发 HCU-Knowledge 更新。
+固定证据：[CLI](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/cli.py)、[模型注册](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/models/registry.py)、[显存估算](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/estimators/memory.py)、[搜索](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/commands/search.py)、[求解](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/commands/solve.py)、[Profile 清单](https://github.com/HYGON-AI/hcu-train-simulator/blob/b7d8e6f3becebf5d09121bb1c582436a371c6710/src/hcu_train_simulator/profiles/builtin/manifest.yaml)。普通任务读取这些证据不触发 HCU-Knowledge 更新。
 
 ## 3. 完整模型的最小可行训练实例
 

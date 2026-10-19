@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/index.md
-raw_sha256: 324b0bf26b400bbcee8752e03af4230941269b05a0c97fa25f5cb610e962bd1f
+raw_sha256: 71ac76ff2b4cc03c5bebd08ba27af002a08763c70c24983f1eb3416ea75d5434
 sources: []
-generated_body_sha256: a97a075ee8ccd8c7137a10e84adbf9122de0fd0bf47f9e9134573c8915868631
+generated_body_sha256: 5cbf9afd904f1c6efa3a9fd1cb325524a62aec47b696bd085fc56c24b9299db6
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/index.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/index.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/index.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -63,7 +63,7 @@ basic/data_prep
 basic/data_decoding
 basic/basics_flow
 basic/task_encoder
-basic/metadataset
+basic/recipe
 basic/save_restore
 basic/glossary
 ```
@@ -80,7 +80,6 @@ advanced/custom_sample_loader
 advanced/repro_scaling
 advanced/packing
 advanced/grouping
-advanced/joining_datasets
 advanced/subsets
 advanced/epochized_blending
 advanced/custom_blending
@@ -106,8 +105,14 @@ api/cli
 caption: Internals
 maxdepth: 2
 ---
-internals/contrib_guidelines
 internals/code_structure
+internals/dataset_formats
+internals/savability
+internals/recipe_checkpoint
+internals/packing_blending
+internals/epath_storage
+internals/compatibility
+internals/contrib_guidelines
 ```
 
 # Indices and tables

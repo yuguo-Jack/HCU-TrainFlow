@@ -9,41 +9,40 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source, official documentation and related PR reading; no HCU runtime validation
 sources:
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/features_manager/memory/chunk_loss.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 9e16aa4684213d3ef289d4662bad1123a08caae279e8052da4885f3d3755ab41
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/core/models/common/chunk_loss.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: bb31c1acb4fdd86af74798775ab902cdb179c23750f923797c8b14f41be0767c
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/features/chunkloss.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: c76c9ad4916cb19cde3ed2582a4919f3d4f4f23ed771aee455ec4ed46731dff1
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/train/trainer.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 067ffa6493ca77d8d6252bff364d05becfd6d72feba7f8d0ebd49b7acdd17a67
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/models/common/modules.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 722d3b3a59dd67e86477e15229557df0d682f3a358e7165ff9cea1adb742101b
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/models/qwen3/qwen3.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 6ef04e7c376283c2d85b22dd02a800f2af2e9287538cb23624452f0d1a8bc578
 - source: ascend-mindspeed-llm
   path: tests/mindspeed_llm/core/models/common/chunk_loss.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: bb31c1acb4fdd86af74798775ab902cdb179c23750f923797c8b14f41be0767c
 - source: ascend-mindspeed-llm
   path: docs/en/pytorch/features/mcore/chunk_loss.md
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 26acb0165f63a2f1e2ceba20489ce5a87c716dd2243ee53e2b0634c0fc3f4d3e
 ---
 
@@ -79,13 +78,13 @@ FSDP2 trainer `_build_chunk_loss` 将预训练已 shift 的 labels 保持原位�
 
 ## 固定证据与复核范围
 
-- [mindspeed_llm/features_manager/memory/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/features_manager/memory/chunk_loss.py)
-- [mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/core/models/common/chunk_loss.py)
-- [mindspeed_llm/fsdp2/features/chunkloss.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/fsdp2/features/chunkloss.py)
-- [mindspeed_llm/fsdp2/train/trainer.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/fsdp2/train/trainer.py)
-- [mindspeed_llm/fsdp2/models/common/modules.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/fsdp2/models/common/modules.py)
-- [mindspeed_llm/fsdp2/models/qwen3/qwen3.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/fsdp2/models/qwen3/qwen3.py)
-- [tests/mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/tests/mindspeed_llm/core/models/common/chunk_loss.py)
-- [docs/en/pytorch/features/mcore/chunk_loss.md](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/mcore/chunk_loss.md)
+- [mindspeed_llm/features_manager/memory/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/features_manager/memory/chunk_loss.py)
+- [mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/core/models/common/chunk_loss.py)
+- [mindspeed_llm/fsdp2/features/chunkloss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/features/chunkloss.py)
+- [mindspeed_llm/fsdp2/train/trainer.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/train/trainer.py)
+- [mindspeed_llm/fsdp2/models/common/modules.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/models/common/modules.py)
+- [mindspeed_llm/fsdp2/models/qwen3/qwen3.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/models/qwen3/qwen3.py)
+- [tests/mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/tests/mindspeed_llm/core/models/common/chunk_loss.py)
+- [docs/en/pytorch/features/mcore/chunk_loss.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/pytorch/features/mcore/chunk_loss.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

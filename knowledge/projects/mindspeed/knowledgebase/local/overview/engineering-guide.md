@@ -10,50 +10,53 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source, official documentation and related PR reading; no HCU runtime validation
 sources:
 - source: ascend-mindspeed
   path: README.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
-  sha256: 10c6731705c141a7f72921b1ec77fbb498adb617d4a2639c7831209b26bbea34
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
+  sha256: f2f0148d8dfbbfae0babf11fb869674846a2f9ad04be763b5718835ed5388378
 - source: ascend-mindspeed
   path: docs/en/user-guide/install_guide.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: fa4261944e07bf3edd1b2c0a4383b2b590ffff5deef8581d4f33c15940cddd52
 - source: ascend-mindspeed
   path: docs/en/user-guide/quickstart.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: d9353c14ad59e1d20b1b3b4f0731db4dcd55036c7de5e546797d7e7eded9887a
 - source: ascend-mindspeed
   path: mindspeed/megatron_adaptor.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: a5dff020efb4e943ee6732f68ca04dfdd90779fca3efb0b044c1b92fda54872c
 - source: ascend-mindspeed
   path: docs/en/release_notes_core.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: bf6691f27e553ebb7c05a6b454eda2cfab77b5d14e8d9072dc28aa903ae82ab6
 - source: ascend-mindspeed-llm
   path: README.md
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: d430843594ba4a40132b49fa856e57f10d03e2e06d0a9563fd716ee95f8c2b7b
 - source: ascend-mindspeed-llm
   path: .gitmodules
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: fffb397bbe3cff135ea88b649129e53d551b010df5c1d411daef7c2ab8731d57
 - source: ascend-mindspeed-llm
   path: docs/en/pytorch/training/install_guide.md
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 6332075f7b8d7da01d50db00c72a585b971ea75381421c6c61fd5a6818ff450f
 - source: ascend-mindspeed-llm
   path: pretrain_gpt.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 57022768d4b4b396cda2de61a1638733fe37767736a7dce0592a560bbac2c9fb
 - source: ascend-mindspeed-llm
   path: docs/en/release_notes_llm.md
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 9c555edc576f5658b40648d4b5a15e3a3d093bfcdedd2fd676d90b648092a921
+- source: ascend-mindspeed-llm
+  path: docs/en/pytorch/features/mcore/mc2.md
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  sha256: 7fc8cbe930c6b653c7f5bfa41b5026d84c2f3b00994082736d23a0ccbdb12a28
 ---
 
 # MindSpeed 与 MindSpeed-LLM：特性底座、模型训练和恢复
@@ -83,7 +86,9 @@ HCU 可以参考其并行算法、通信调度、显存取舍和训练组织，�
 
 MindSpeed 的官方安装要求配套 Ascend driver/CANN、Torch/torch_npu 及对应算子库，不能只 `pip install` 后就认为 HCU 可用。MindSpeed-LLM 的已发布安装指南列出 MindSpeed `26.1.0_core_r0.12.1`、Megatron `core_v0.12.1` 等配对；这是发布指南，与当前 master 代码树应分别核对。最新入口已经存在 `MINDSPEED_LLM_VERSION=018` 与默认 `012` 的分支，不把文件存在当成默认使用0.18。
 
-本轮固定独立 Core `241431d43e02a89556d2d2b3eacc7e24448adee5`、LLM `2fed626696175480ae1ab3342a94017301a25209`。**LLM 父树实际锁定 `3rdparty/MindSpeed@7969e1c6b61c44fdb09d20607561824675bb216f`，URL 指向 GitCode；它不是本轮独立 GitHub Core HEAD。**同树 `3rdparty/Megatron-LM@a845aa7e12b3a117e24c2352b9e3e60bad2e3a17`，还含 FSDPTurbo 依赖。阅读应用运行效果时沿这组依赖，不能随手用最新版 Core 替换。
+本轮固定独立 Core `3c7f3251c4163f5020407dc6fb1706964817ac9b`、LLM `5a8ea03b12066067f39b1771782d12db236267ef`。**LLM 父树实际锁定 `3rdparty/MindSpeed@7969e1c6b61c44fdb09d20607561824675bb216f`，URL 指向 GitCode；它不是本轮独立 GitHub Core HEAD。**同树 `3rdparty/Megatron-LM@a845aa7e12b3a117e24c2352b9e3e60bad2e3a17`，还含 FSDPTurbo 依赖。阅读应用运行效果时沿这组依赖，不能随手用最新版 Core 替换。
+
+MC2 的本轮官方说明明确：MindSpeed-LLM 默认禁用该路径，文档要求检查 `validate_args_decorator` 中的强制关闭逻辑，单加 `--use-ascend-mc2` 不表示实际启用；部分模型还存在精度风险。MCore MoE 的 MLP 不启用 MC2，Ascend 950 也尚不支持。此处是 Ascend 版本与消费者的限制，不能转换为 HCU 的融合通信能力或通用启动步骤。
 
 安装检查包含递归 submodule、环境脚本、实际 import 路径、C++/NPU 扩展和目标硬件。HCU 移植按现场 DTK/Torch/库构建链重做匹配，NPU 自动转换或 wheel 不是 HCU 等价实现。
 
@@ -133,15 +138,17 @@ MoE 卡住查参数互斥、各 rank token 数、collective 顺序、异步句�
 
 ## 固定证据与复核范围
 
-- [README.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/README.md)
-- [docs/en/user-guide/install_guide.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/user-guide/install_guide.md)
-- [docs/en/user-guide/quickstart.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/user-guide/quickstart.md)
-- [mindspeed/megatron_adaptor.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/megatron_adaptor.py)
-- [docs/en/release_notes_core.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/release_notes_core.md)
-- [README.md](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/README.md)
-- [.gitmodules](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/.gitmodules)
-- [docs/en/pytorch/training/install_guide.md](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/install_guide.md)
-- [pretrain_gpt.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/pretrain_gpt.py)
-- [docs/en/release_notes_llm.md](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/release_notes_llm.md)
+- [README.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/README.md)
+- [docs/en/user-guide/install_guide.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/user-guide/install_guide.md)
+- [docs/en/user-guide/quickstart.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/user-guide/quickstart.md)
+- [mindspeed/megatron_adaptor.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/megatron_adaptor.py)
+- [docs/en/release_notes_core.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/release_notes_core.md)
+- [README.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/README.md)
+- [.gitmodules](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/.gitmodules)
+- [docs/en/pytorch/training/install_guide.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/pytorch/training/install_guide.md)
+- [pretrain_gpt.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/pretrain_gpt.py)
+- [docs/en/release_notes_llm.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/release_notes_llm.md)
+
+- [docs/en/pytorch/features/mcore/mc2.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/pytorch/features/mcore/mc2.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

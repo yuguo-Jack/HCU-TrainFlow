@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: examples/fully_async/README.md
-raw_sha256: 325cdf5eea17920f24197317b3cfb30ab7b3375e6b07e19d6b687d0fb133adc3
+raw_sha256: abc9c8ab07e63b2b447061ec58b61011ef087d33f72a7c3af4aabcc9910a5c26
 sources: []
-generated_body_sha256: 38cfc7fce244e181c7d64e3be02e6d0c9e549b0a2b22304ea7269d0cdc514692
+generated_body_sha256: 168100a48a2eb5ea43450573130fd7a8c703f135d627f42c7106038eee18ddf5
 source_state: current-scan
 ---
 
 # THUDM/slime / examples/fully_async/README.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/examples/fully_async/README.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/examples/fully_async/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -36,20 +36,19 @@ directory is just the launch script + CI test.
 
 ## Files
 
-* `run-qwen2.5-0.5B-fully_async.sh` — single-node, 4-GPU, three-rollout demo
-  with Qwen2.5-0.5B-Instruct on dapo-math-17k. Fast enough to be the CI
-  smoke test for the fully-async path.
+* `run-qwen3-4B-fully_async.sh` — single-node, 8-GPU, three-rollout demo
+  with Qwen3-4B-Instruct-2507 on dapo-math-17k, CP=4 and a 128K response limit.
 * `run-qwen3.5-9B-fully_async.sh` — single-node, 8-GPU, three-rollout demo
   with Qwen3.5-9B on dapo-math-17k.
 
-The same script doubles as `tests/test_qwen2.5_0.5B_fully_async_short.py` in
-CI.
+CI keeps a separate short Qwen2.5-0.5B regression in
+`tests/test_qwen2.5_0.5B_fully_async_short.py`.
 
 ## Prerequisites
 
 ```
-/root/models/Qwen2.5-0.5B-Instruct/            # HF checkpoint
-/root/models/Qwen2.5-0.5B-Instruct_torch_dist/ # tools/convert_hf_to_torch_dist.py
+/root/models/Qwen3-4B-Instruct-2507/            # HF checkpoint
+/root/models/Qwen3-4B-Instruct-2507_torch_dist/ # tools/convert_hf_to_torch_dist.py
 /root/datasets/dapo-math-17k/dapo-math-17k.jsonl
 ```
 
@@ -57,7 +56,7 @@ CI.
 
 ```bash
 cd slime
-bash examples/fully_async/run-qwen2.5-0.5B-fully_async.sh
+bash examples/fully_async/run-qwen3-4B-fully_async.sh
 ```
 
 You should see:

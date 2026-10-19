@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/03-configuration-reference/torchtitan-parameters.md
-raw_sha256: 205914d3bea956bd17bfaabd7121989089ba5740fad798f183818015fcc0377d
+raw_sha256: 122f707f8603d4f4861bf4169fab39e10024a0f85e0b2aaccd7350cc04e69e4b
 sources: []
-generated_body_sha256: a2e55e94577d75543778bc1ec8f52393ce9f0ca667a0ebe67a4ea3390ceab565
+generated_body_sha256: 3273de11542f798a2a28f1e74da43bc2f0d9cf413e53e1162406223be08400f5
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/03-configuration-reference/torchtitan-parameters.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/03-configuration-reference/torchtitan-parameters.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/03-configuration-reference/torchtitan-parameters.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -121,6 +121,7 @@ modules:
 | `optimizer.weight_decay` | `0.1` | Weight decay coefficient. |
 | `optimizer.implementation` | `fused` | Kernel implementation (`fused`, `foreach`, …). |
 | `optimizer.early_step_in_backward` | `false` | Experimental: step optimizer during backward when supported. |
+| `optimizer.use_triton_fused_adam` | `true` | Primus: build `AdamW` from `TritonFusedAdamW` (Triton kernels with a device-sized grid, small tensors batched) instead of `torch.optim.AdamW(fused=True)`, whose ATen launches are capped at 320 workgroups and underuse MI455X HBM. State layout matches `torch.optim.AdamW`, so checkpoints are interchangeable; unsupported configurations fall back to the stock step. Set `false` to use the stock optimizer. |
 
 ---
 

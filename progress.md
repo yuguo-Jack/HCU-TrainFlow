@@ -2,6 +2,16 @@
 
 > 本文件是按任务保留的历史记录；每段计数、版本、完成状态和限制仅对应当时的检查。现行用法见 README、AGENTS.md 与对应 Skill/docs，当前任务见 task_plan.md；不将旧安装或发布计划当作当前要求。
 
+## 2026-10-20：两阶段维护的 TrainFlow 阶段
+
+前置 HCU-Knowledge v0.5.6 已提交推送并核验两远端；本阶段不再更新大库。24项官方来源的固定树、登记源码/官网正文、98页作者内容和受影响工作流已集成并独立复核。全树路径分类、46项直接引用PR内容回执及现存上游缺口均已保留，未读机制继续待审。
+
+本阶段已通过1,312项CPU测试（4项平台跳过）和知识/文档/阅读路线/覆盖检查；完整安装、本机六项同步及11个必需Skill/绑定核对成功。最终10,736页、24来源知识校验无错误；新索引 f07ae184a6c1 的12组真实问题均读取完整当前正文，其中11组默认检索直达，1组按已文档化的作者页kind细化后直达。未执行训练或硬件实验，可选KernelWiki原有定制验证脚本保留。
+
+PR原窗口发现及全部可访问条目/周期讨论采集已完成。达到GitHub REST配额时保存队列，按服务重置时间续接；已用当前状态样本比较GraphQL完整讨论/REST文件路线，分页不完整回到原采集器。配额等待期间的严格零REST首轮留存340条，原窗口和公共游标不变。最终22项Git来源的798份登记源码、1,218份选定文档与9,359条PR记录通过来源验收，46项已引用PR的当前原件/作者页哈希绑定通过；其他原件仍为source-reported，未读机制继续待审。
+
+Swift历史PR #10260与vLLM历史PR #48358的认证PR/Issue两入口均返回404，最终又由原生采集器各实际重试一次。仅增加availability注释，保留原来源日期、正文、JSON与失败pending，未推进这两个来源的公共游标，不推断删除或制造新鲜内容。20项其余Git队列为空；所有来源的原发现分页均已结束。目录、新索引及最终证据检查已完成，交付版本为0.6.10；提交main与annotated v0.6.10的发布结果以远端refs核验为准。
+
 ## 2026-10-12: Check/adapt rename and optional KernelWiki verification
 
 - Renamed stage Skill and updated runtime/UI/docs/maintenance routes; exercised migration from the previous entry, verified old installation removal only after replacement succeeded.
@@ -445,3 +455,8 @@ Merged published HCU 30f5dcd then upstream 493f750 in development checkout, merg
 - Added offline documentation checks to CI, full setup and local synchronization, with regressions for stale paths/anchors, examples, versions/names, attribution and stopping installation before package/Skill replacement. The checker also runs with `python -S`, confirming it needs no installed third-party Python package for first setup.
 - Validation: 200 current authored Markdown pages, 68 CLI examples and 38 JSON examples pass; 5,185 knowledge pages / 24 sources pass validation; Wiki coverage and Skill reading routes pass. Full CPU suite: 1,298 passed, 4 platform skips. No new hardware or upstream-source qualification is implied.
 - System Python package and six TrainFlow Skills synchronized and checked at 0.6.8; the Wiki/Skill update Skill now includes the documentation maintenance rules. Source docs are read from the bound checkout. The reviewed changes are ready for main publication under yuguo-Jack; this maintenance does not create another release tag.
+
+
+## 2026-10-20 独立阶段二开始
+
+HCU-Knowledge阶段已提交3829ef06、tag v0.5.6，两远端核对current且工作区干净；本阶段仅维护TrainFlow/Wiki及其选定安装。按AGENTS约定拆分适配/容量/精度和优化/通信/诊断两个互斥审查范围，主控负责官方来源与最终集成。写入映射和允许路径见task_plan，KB只读。

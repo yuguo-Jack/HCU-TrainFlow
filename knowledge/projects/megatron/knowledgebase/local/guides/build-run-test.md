@@ -10,46 +10,46 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: pyproject.toml
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 22dc36250a9c8b155459a3fd6c38fbbee418659eb5c151d023dbf76640f40025
 - source: nvidia-megatron-lm
   path: setup.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 22bb5f7fdf446a831d9261d4cbc8e81503569254941852ec98950792bd22f23c
 - source: nvidia-megatron-lm
   path: docs/get-started/install.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: b5e97dc226f7ff5c18c7f91d5dd0c5439dd2850bb5276b57eb528a664011317a
 - source: nvidia-megatron-lm
   path: docs/get-started/quickstart.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 12facd93f82e65b9ca752faeff7496de268832713ea3746dabc00e3c148db9dc
 - source: nvidia-megatron-lm
   path: tests/README.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: ee9e3ffbb453d7c6ca3c91743b4d412c3068ce97db68cd89347c7fcc6fe128de
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: ead299ef4e42cd444a931fe61d5778b274acae572d9fca3025de5549dd2c02f5
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: b9166c3df5fe4dd90d5f3479871eeecabae61b9d9eb7722e2b72010d3327ccd8
 - source: nvidia-megatron-lm
   path: gpt_builders.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 6cbcee1cfeb9cd6d7d0f89938c59e84380c713c9faf3436c5ff6c0b1a521ba18
 - source: nvidia-megatron-lm
   path: model_provider.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 9e4fde24c6615e43ab242c1c9d69b4785554de3afd39a159488264e61c3ac653
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
 ---
 
 # Megatron 安装、模型配置、数据、运行与分层测试
@@ -76,6 +76,12 @@ SFT/packed数据另外核对response mask、position/cu_seqlens、跨文档atten
 
 保存task-local command card包含selected ref、devices/process groups、model/data/precision、microbatch/accumulation、output路径及与HCU recipe差异。官方CLI参数与typed cfg转换要共同验证。`torchrun --nproc_per_node=...`只是launcher形态，SSH+Docker/Slurm/K8s的网络/设备/env按现场确定，不照搬NGC启动参数。
 
+## 配置定稿与探测范围
+
+当前 `ConfigContainerBase.validate()` 只校验，运行初始化调用幂等的 `finalize()` 才定稿布局、RNG 和 RL/DDP 派生值；不要依赖反复 validate 的副作用。定稿后改变布局或随机策略须建立新容器，不能修改原对象后继续复用。`initialize_megatron` 还可由调用方指定 `build_tokenizer=False`，这表示外部负责分词，不代表数据契约可省略。
+
+`fake_process_group` 跳过真实分布式通信，可用于单卡容量探测；它不能验收 collective、分布式正确性或端到端吞吐。TP user-buffer 初始化使用实际 batch 的 sequence length 与 microbatch，VLM 还需 decoder 的文本加图像长度；模型位置容量不能替代实际输入长度。
+
 ## 测试路线与成功判据
 
 | 层级 | 内容/源码入口 | 必须证明 |
@@ -101,14 +107,14 @@ SFT/packed数据另外核对response mask、position/cu_seqlens、跨文档atten
 
 ## 固定源码与维护边界
 
-- [pyproject.toml](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/pyproject.toml)
-- [setup.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/setup.py)
-- [docs/get-started/install.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/get-started/install.md)
-- [docs/get-started/quickstart.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/get-started/quickstart.md)
-- [tests/README.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/tests/README.md)
-- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/pretrain_gpt.py)
-- [gpt_builders.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/gpt_builders.py)
-- [model_provider.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/model_provider.py)
-- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/arguments.py)
+- [pyproject.toml](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/pyproject.toml)
+- [setup.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/setup.py)
+- [docs/get-started/install.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/get-started/install.md)
+- [docs/get-started/quickstart.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/get-started/quickstart.md)
+- [tests/README.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/README.md)
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/pretrain_gpt.py)
+- [gpt_builders.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/gpt_builders.py)
+- [model_provider.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/model_provider.py)
+- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/arguments.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

@@ -1,0 +1,904 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "a2c7102ac5c28e0c94dad0917840ac927b0e2b6edc9afc6e6f74fcbbd80ac2df",
+      "isPrivate": false,
+      "numbers": [
+        31135,
+        31104,
+        31100,
+        31091,
+        31079,
+        31072,
+        31067,
+        31066
+      ],
+      "observed_at": "2026-10-19T19:40:16.911503+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4904,
+        "resetAt": "2026-10-19T19:53:19Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "afa3c06d1fc9396b13235cfe358ae5a96170feb6",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "\n### Motivation\n\nFixes #31117.\n\nCustom all-reduce hangs permanently — kernels resident, GPU pinned at 100%, no\nerror, no timeout, immune to `SIGTERM` — when two CUDA streams issue an\nall-reduce on the **same** communicator with both in flight at once. It affects\nboth implementations (the JIT `CustomAllReduceV2`, which is the CUDA default, and\nthe legacy AOT `CustomAllreduce`), and it needs nothing exotic to hit: two\nordinary `torch.cuda.Stream()`s reproduce it. Custom all-reduce is on by default\nwhenever NVLink P2P is available, and `--enable-pdmux` makes issuing from two\nstreams easy to do.\n\n### Root cause\n\nThe protocols are **single-in-flight-per-communicator by construction**, but\nnothing enforces it.\n\n1. **The push buffer *is* the \"has my peer arrived?\" flag.**\n   `all_reduce_one_shot_push_kernel` has no flag array: positive zero is the\n   \"not here yet\" sentinel. Block `b` pushes its slice into every peer's buffer\n   and then spin-polls that same slice in its own buffer until no positive zero\n   remains (`poll_impl`). After reducing, it writes the sentinel back over the\n   buffer — **the poll phase is also the re-arm for the next all-reduce**\n   (`custom_all_reduce_push.cuh`). Two concurrent all-reduces of one communicator\n   read the same epoch and therefore land in the same buffer half, so one\n   kernel's poll re-arms the slice the other kernel's block is still waiting on.\n   That block then spins forever on data that has already been consumed.\n\n2. **The epoch counter is a non-atomic read-modify-write.** Which half is used\n   comes from `PushController::epoch()` = `m_local_signal[blockIdx.x]`, advanced\n   by `signal = (signal + 1) % kNumStages` from thread 0 (`common.cuh`). Two\n   concurrent kernels can lose an update; if the ranks lose it differently their\n   epochs are permanently out of step — one rank polls the half the other is not\n   pushing into.\n\nEither one is sufficient on its own. The same shape exists in the pull path\n(`PullController::sync` keeps per-communicator, per-block counters and spins on\nan exact value) and in the legacy AOT `multi_gpu_barrier`.\n\nNothing detects it from inside the kernel, because **both spin loops are\nunbounded**. A spinning block never retires, so it holds its SM for the life of\nthe process — hence 100% utilization forever and immunity to `SIGTERM`.\n\nTwo all-reduces on **distinct** communicators are fine: the state is per\ncommunicator (verified, 220/220 iterations, including one custom-AR communicator\nper green-context partition).\n\n### Fix\n\nTwo parts, one for each way a second all-reduce can get in flight.\n\n**1. Host side — `SingleStreamGuard`** (`custom_all_reduce_utils.py`, used by\nboth `CustomAllReduceV2._all_reduce` and `CustomAllreduce._all_reduce_impl`).\n\nRemember the stream the communicator's last all-reduce was issued on. When the\nnext one arrives on a *different* stream, record an event on the previous stream\nand `wait_event` it on the new one, so the second all-reduce is **serialized\nbehind** the first instead of aliasing its buffer. Restores the total order the\nprotocol already assumes; no kernel change, no semantic change for anyone\nalready using one stream.\n\nThe steady state (one stream forever) is a raw-stream-pointer compare — the\nevent is only recorded when a second stream is actually seen. Graph *capture* is\nskipped (it records a dependency DAG, it does not execute anything).\n\n**2. Device side — `SpinDeadline`** (`common.cuh`).\n\nBound both peer-rendezvous spins by `SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT`\nseconds (default **600**, matching the NCCL watchdog's `TORCH_NCCL_TIMEOUT`; `0`\ndisables) and `__trap()` with a message naming the cause.\n\nThis covers the case the host guard *cannot* see: **two CUDA graphs replayed\nconcurrently on two streams** — a replay makes no host call at all. It turns an\nunkillable, silent, 100%-GPU hang into an immediate, attributable CUDA error:\n\n```\n[sglang] custom all-reduce timed out waiting for its peers. Two all-reduces of the\nSAME communicator were in flight at once -- e.g. two CUDA graphs replayed concurrently\non two streams. The protocol supports only one in-flight all-reduce per communicator;\nuse one communicator per concurrent stream. (Bound: SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT\nseconds, 0 disables.)\nRuntimeError: CUDA error: unspecified launch failure\n```\n\nTwo details keep this free on the healthy path (both measured, see below):\n* the clock is read **lazily** — only after 4096 spin iterations, which a healthy\n  rendezvous never reaches — so the common path never touches `%globaltimer`;\n* the message takes **no printf arguments**. Passing any makes the kernel\n  allocate a per-thread stack frame for the varargs buffer (`STACK:8` in\n  `cuobjdump -res-usage`), and setting that local-memory window up costs ~45 ns\n  on *every* launch (~1.5% of a small all-reduce), for a buffer only the dead\n  path ever writes.\n\nNet kernel resources (bf16, world size 2, sm80): `REG 30 → 31`, `STACK 0 → 0`,\nkernel params `456 → 464 B`.\n\n### The contract\n\nDocumented on the guard and in the kernel comment: **one in-flight all-reduce per\ncommunicator.** Concurrency must come from *distinct* communicators — one per\nconcurrently-issuing stream.\n\n### Test\n\n`test/registered/jit/test_custom_all_reduce.py::test_concurrent_issue_on_two_streams`\n(existing multi-GPU harness; runs at world size 2/4/8, all three algos).\n\nIt issues on the same communicator from two streams with both all-reduces in\nflight, then asserts the run *terminates* and that every result matches NCCL\n(serialized, not merely un-wedged — an aliased buffer comes back with holes even\nwhen the rendezvous happens to finish).\n\nIt has to be a deadlock *detector*: the kernels spin, so a wedged rank cannot be\ninterrupted from Python, `pytest.fail()` could not run, and its teardown would\nhang on the same GPU. A watchdog thread hard-exits the worker with an explanatory\nmessage, which fails the torchrun run.\n\n* on **unpatched** code: fails (both ranks hard-exit via the watchdog);\n* on **patched** code: `3 passed in 0.4s`.\n\n### Benchmark\n\n`test/registered/jit/benchmark/bench_custom_all_reduce.py`, world size 2, bf16,\n`jit` provider, 2× A100-SXM4-40GB NVLink. **Interleaved A/B** (unpatched/patched\nalternating in one time window, 3 pairs, median), so environmental drift cancels.\nThe `aot` provider is untouched by this PR and is shown as the noise floor.\n\n| message | algo | before (µs) | after (µs) | delta | aot control |\n|---:|---|---:|---:|---:|---:|\n| 4 KB | one-shot push | 3.000 | 3.031 | +1.02% | −0.25% |\n| 16 KB | one-shot push | 3.164 | 3.185 | +0.64% | +0.00% |\n| 64 KB | one-shot push | 3.758 | 3.809 | +1.36% | +0.00% |\n| 128 KB | one-shot push | 4.618 | 4.659 | +0.89% | −0.18% |\n| 192 KB | one-shot push | 5.509 | 5.550 | +0.74% | −0.15% |\n| 256 KB | one-shot push | 6.339 | 6.390 | +0.81% | +0.00% |\n| 384 KB | one-shot push | 8.038 | 8.079 | +0.51% | −0.11% |\n| 512 KB | one-shot push | 9.626 | 9.656 | +0.32% | +0.00% |\n| 640 KB | one-shot push | 11.264 | 11.295 | +0.27% | −0.08% |\n| 768 KB | one-shot push | 12.974 | 12.995 | +0.16% | +0.00% |\n| 896 KB | one-shot push | 14.633 | 14.613 | −0.14% | +0.00% |\n| 1 MB | one-shot push | 16.251 | 16.230 | −0.13% | +0.00% |\n| 2 MB | one-shot push | 30.013 | 29.931 | −0.27% | +0.00% |\n| 3 MB | one-shot pull | 45.508 | 45.583 | +0.17% | −0.02% |\n| 4 MB | one-shot pull | 59.422 | 59.513 | +0.15% | +0.00% |\n| 8 MB | one-shot pull | 115.230 | 115.299 | +0.06% | +0.00% |\n| 16 MB | one-shot pull | 226.661 | 226.670 | +0.00% | −0.01% |\n| 32 MB | one-shot pull | 448.286 | 449.073 | +0.18% | −0.00% |\n\n`jit` mean **+0.37%**, median +0.22%, max +1.36%; `aot` (untouched) max 0.25%.\nIn absolute terms the residual is a **fixed ~30–50 ns per launch** (one extra\nregister, 8 bytes of kernel params, and the bounded-spin counter), which is\n~1% of the smallest all-reduce and ~0% from 896 KB up.\n\n**Host side.** The kernel benchmark captures CUDA graphs, so the guard never runs\nin it (replay makes no host call — it is exactly 0 there). Measured separately on\nthe *eager* path, A/B inside one process (real guard vs. a no-op, interleaved,\n9×2000 calls): **+0.36 µs on a 31 µs enqueue, +1.2%.**\n\n### Notes / things a reviewer may want to weigh in on\n\n1. **Default bound (600 s).** Chosen to match `TORCH_NCCL_TIMEOUT` and to be far\n   above any legitimate *launch* skew (a peer stalled on the host by a JIT\n   compile, a debugger, or a profiler — the rendezvous itself is microseconds).\n   Lower is more useful for debugging, higher is safer against false trips.\n   Env-tunable; `0` disables.\n2. **`__trap()` surfaces on the host as `unspecified launch failure`.** The\n   diagnosis is the device-side message printed immediately above it. A\n   `__assertfail`-based variant would give `device-side assert triggered` instead,\n   which is arguably a better host-side error; happy to switch.\n3. **The remaining ~30–50 ns/launch** could be taken to zero by making the\n   timeout a compile-time template argument of the JIT kernels (it would drop the\n   kernel param and the register). That adds JIT-arg plumbing, so I left it out —\n   say the word if you want it.\n4. **The AOT (`sgl-kernel`) V1 kernel's spin is still unbounded.** Its *host*\n   wrapper gets the same guard (so the reported bug is fixed for it too), but\n   bounding its device loop would need a wheel rebuild, which I could not\n   validate here. Happy to add it in a follow-up.\n5. **The guard assumes a communicator's all-reduces are issued from one host\n   thread**, which is true of every SGLang path. A lock spanning the launch would\n   make it unconditional; it is not worth ~200 ns on this path, and the kernel\n   bound turns that race into an error rather than a hang.\n6. **The pull path deadlocks too**, not just the push kernel the issue was filed\n   against — the regression test covers all three algos, and the bound is applied\n   to both spin loops.\n\n\n\n\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #29314190804](https://github.com/sgl-project/sglang/actions/runs/29314190804)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #29314190501](https://github.com/sgl-project/sglang/actions/runs/29314190501)<!-- slot:pr-test-extra:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 8,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hanyax"
+            },
+            "body": "CI is blocked on the `run-ci` label, which I can't add as an external contributor\n— could a maintainer apply it (or `/tag-and-rerun-ci`) when convenient?\n\nIn the meantime, everything was validated locally on 2× A100-SXM4-40GB (NVLink):\n\n| arm | before | after |\n|---|---|---|\n| two streams, one communicator (`CustomAllReduceV2`) | deadlock | 200/200 pass |\n| two streams, one communicator (`CustomAllreduce`, ahead-of-time) | deadlock | 220/220 pass |\n| two concurrent CUDA-graph replays, one communicator | deadlock | traps in 2 s with a diagnostic |\n| two *distinct* communicators / NCCL / plain compute (controls) | pass | still pass |\n| new regression test `test_concurrent_issue_on_two_streams` | fails on unpatched | 3 passed in 0.4 s |\n| `pre-commit run --all-files` | — | 26 hooks pass |\n\nPerformance (`bench_custom_all_reduce.py`, just-in-time provider, interleaved A/B ×3):\nmean +0.37%, ~0% at ≥896 KB — a fixed ~30–50 ns per launch. The host-side guard costs\n+0.36 µs on a 31 µs eager all-reduce and **exactly zero under CUDA graphs** (replay makes\nno host call).\n\nHappy to adjust anything — the spin-timeout default, the `__trap()` vs `__assertfail`\nchoice, and making the timeout a compile-time template argument to remove the residual\nper-launch cost are all called out in the description as open questions.\n",
+            "createdAt": "2026-07-14T07:24:30Z",
+            "databaseId": 4966442044,
+            "updatedAt": "2026-07-14T07:24:30Z",
+            "url": "https://github.com/sgl-project/sglang/pull/31135#issuecomment-4966442044"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "Thanks @hanyax. Closing this because it has had no updates in 91 days.\n\nReopen it if the work is still relevant.\n\nSome directories moved recently, so an older branch may need retargeting:\n`sgl-kernel/` -> `python/sglang/kernels/aot/`, `python/sglang/jit_kernel/`\n-> `python/sglang/kernels/jit/`, `docs/` -> `docs/docs/` (`.mdx`),\n`bench_serving.py` -> `benchmark/serving.py`, `test/srt/` -> `test/registered/`.",
+            "createdAt": "2026-10-14T01:20:59Z",
+            "databaseId": 6158744986,
+            "updatedAt": "2026-10-14T01:20:59Z",
+            "url": "https://github.com/sgl-project/sglang/pull/31135#issuecomment-6158744986"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW8W_Zo=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "headRepository": {
+        "nameWithOwner": "he-actlab/sglang"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 31135,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "gemini-code-assist"
+            },
+            "body": "## Code Review\n\nThis pull request addresses silent deadlocks in custom all-reduce operations by introducing a `SingleStreamGuard` to serialize operations on the same communicator across different CUDA streams, and a device-side `SpinDeadline` watchdog to bound spin-wait times. The review feedback suggests suppressing an unused variable warning in `custom_all_reduce_pull.cuh` and optimizing the synchronization event in `SingleStreamGuard` by disabling timing overhead.\n\n> [!IMPORTANT]\n> The [consumer version of Gemini Code Assist on GitHub](https://developers.google.com/gemini-code-assist/docs/review-repo-code) is being sunset. Starting **June 18, 2026**, new organization installations will be blocked, and all code review activity will officially cease on **July 17, 2026**.\n> For more details on the timeline and next steps, please review the [Help Documentation](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review).",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "gemini-code-assist"
+                  },
+                  "body": "![medium](https://www.gstatic.com/codereviewagent/medium-priority.svg)\n\nThe variable `spin_timeout_ns` is unpacked from `params` but is not used anywhere within `all_reduce_impl`. This can trigger unused variable warnings or compilation errors depending on the compiler flags (e.g., `-Wunused-variable` or `-Werror`). Casting it to `void` suppresses this warning.\n\n```\n  const auto& [output, rank, num_items, spin_timeout_ns] = params;\n  (void)spin_timeout_ns;\n```",
+                  "createdAt": "2026-07-14T07:21:25Z",
+                  "databaseId": 3576827209,
+                  "diffHunk": "@@ -45,7 +47,7 @@ SGL_DEVICE void all_reduce_impl(const AllReduceParams& params, DType* (&input)[k\n   constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);\n   using DType2 = packed_t<DType>;\n   using Storage = AlignedVector<DType2, kVecSize>;\n-  const auto& [output, rank, num_items] = params;\n+  const auto& [output, rank, num_items, spin_timeout_ns] = params;",
+                  "line": 50,
+                  "originalLine": 50,
+                  "path": "python/sglang/jit_kernel/csrc/distributed/custom_all_reduce_pull.cuh",
+                  "updatedAt": "2026-07-14T07:21:25Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/31135#discussion_r3576827209"
+                },
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "gemini-code-assist"
+                  },
+                  "body": "![medium](https://www.gstatic.com/codereviewagent/medium-priority.svg)\n\nCreating a `torch.cuda.Event` with `enable_timing=True` (the default in some PyTorch versions/configurations) incurs additional driver and GPU overhead. Since this event is used purely for stream synchronization (`stream.wait_event(self._event)`), timing is not required. Disabling timing by passing `enable_timing=False` is a recommended performance best practice on hot paths.\n\n```suggestion\n                self._event = torch.cuda.Event(enable_timing=False)\n```",
+                  "createdAt": "2026-07-14T07:21:25Z",
+                  "databaseId": 3576827215,
+                  "diffHunk": "@@ -398,6 +398,85 @@ def is_weak_contiguous(inp: torch.Tensor):\n     )\n \n \n+# torch._C._cuda_getCurrentRawStream returns the raw cudaStream_t as an int. It\n+# is ~20x cheaper than torch.cuda.current_stream() (which builds a Stream\n+# object), which matters because the guard below runs on every all-reduce.\n+_get_raw_stream = getattr(torch._C, \"_cuda_getCurrentRawStream\", None)\n+\n+\n+class SingleStreamGuard:\n+    \"\"\"Serializes the all-reduces of one custom all-reduce communicator.\n+\n+    Both custom all-reduce implementations keep per-communicator, per-block\n+    rendezvous state: a two-stage counter, and -- for the JIT one-shot push\n+    kernel -- the push buffer itself, which the poll phase re-arms for the next\n+    all-reduce. The protocol is correct only while the all-reduces of a\n+    communicator are *totally ordered*, i.e. at most one is in flight at a time,\n+    which is exactly what issuing them on a single stream provides.\n+\n+    Two all-reduces of one communicator that execute concurrently -- e.g. issued\n+    from two CUDA streams -- alias that state: one kernel's poll phase overwrites\n+    (re-arms) the buffer slice the other kernel is still waiting for, and the\n+    non-atomic epoch update can leave the ranks permanently out of step. Neither\n+    is recoverable, and since the kernels spin-wait, the result is a silent,\n+    permanent, 100%-utilization hang that survives SIGTERM (issue #31117).\n+\n+    This guard makes the second issue *wait* instead of corrupting the first:\n+    when the stream changes, it records an event on the previous stream and has\n+    the new stream wait on it, which restores the total order. The normal path --\n+    one stream forever -- pays only a raw-stream-pointer compare.\n+\n+    Not covered: two CUDA graphs replayed concurrently on two streams, because a\n+    replay makes no host call at all. The kernels bound their own wait for that\n+    case and fail with an error instead of hanging (see ``SpinDeadline`` in\n+    ``jit_kernel/include/sgl_kernel/distributed/common.cuh``).\n+\n+    Assumes the all-reduces of one communicator are issued from one host thread,\n+    which is how every SGLang path uses them (the model runner owns its group).\n+    Two threads racing to issue on one communicator would need a lock here, and\n+    that lock would have to span the launch; it is not worth the cost on a path\n+    this hot, and the kernels' bound turns that race into an error, not a hang.\n+    \"\"\"\n+\n+    def __init__(self, device: torch.device) -> None:\n+        self.device_index = 0 if device.index is None else device.index\n+        # Bound once: an attribute lookup, not a branch, on the fast path.\n+        self._raw_stream = _get_raw_stream or (\n+            lambda index: torch.cuda.current_stream(index).cuda_stream\n+        )\n+        self._last_stream: Optional[torch.cuda.Stream] = None\n+        self._last_raw_stream: Optional[int] = None\n+        self._event: Optional[torch.cuda.Event] = None\n+\n+    def maybe_serialize(self) -> None:\n+        \"\"\"Order this all-reduce behind the previous one if the stream changed.\n+\n+        Call immediately before issuing. The steady state (one stream forever) is\n+        a raw-pointer compare; everything else is in the cold path below.\n+        \"\"\"\n+        if self._raw_stream(self.device_index) != self._last_raw_stream:\n+            self._switch_stream()\n+\n+    def _switch_stream(self) -> None:\n+        if torch.cuda.is_current_stream_capturing():\n+            # CUDA-graph capture records a dependency graph; it does not execute\n+            # anything, so there is nothing in flight to serialize against, and a\n+            # dependency on work outside the capture cannot be expressed in the\n+            # graph anyway. Leave the eager bookkeeping untouched.\n+            return\n+        stream = torch.cuda.current_stream(self.device_index)\n+        if self._last_stream is not None:\n+            if self._event is None:\n+                self._event = torch.cuda.Event()",
+                  "line": 470,
+                  "originalLine": 470,
+                  "path": "python/sglang/srt/distributed/device_communicators/custom_all_reduce_utils.py",
+                  "updatedAt": "2026-07-14T07:21:25Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/31135#discussion_r3576827215"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNy0xNFQwNzoyMToyNVrO1TINTw==",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 4691789615,
+            "state": "COMMENTED",
+            "submittedAt": "2026-07-14T07:21:25Z",
+            "url": "https://github.com/sgl-project/sglang/pull/31135#pullrequestreview-4691789615"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wNy0xNFQwNzoyMToyNVq0MjAyNi0wNy0xNFQwNzoyMToyNVrPAAAAARenBy8=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "CLOSED",
+      "title": "Fix custom all-reduce deadlock when one communicator is issued from two CUDA streams",
+      "updatedAt": "2026-10-14T01:21:00Z",
+      "url": "https://github.com/sgl-project/sglang/pull/31135"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/31135/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/31135/commits"
+      },
+      "html": {
+        "href": "https://github.com/sgl-project/sglang/pull/31135"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/31135"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/31135/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/31135"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/statuses/66140d97c9d5ba4fa0e949b11c6615b6228e01c6"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 336,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "auto_merge": null,
+    "base": {
+      "label": "sgl-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/sgl-project/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/sgl-project/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/sgl-project/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/sgl-project/sglang/branches{/branch}",
+        "clone_url": "https://github.com/sgl-project/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/sgl-project/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/sgl-project/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/sgl-project/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/sgl-project/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/sgl-project/sglang/contributors",
+        "created_at": "2024-01-08T04:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/sgl-project/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/sgl-project/sglang/downloads",
+        "events_url": "https://api.github.com/repos/sgl-project/sglang/events",
+        "fork": false,
+        "forks": 9697,
+        "forks_count": 9697,
+        "forks_url": "https://api.github.com/repos/sgl-project/sglang/forks",
+        "full_name": "sgl-project/sglang",
+        "git_commits_url": "https://api.github.com/repos/sgl-project/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/sgl-project/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/sgl-project/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/sgl-project/sglang.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": false,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/sgl-project/sglang/hooks",
+        "html_url": "https://github.com/sgl-project/sglang",
+        "id": 740303686,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/sgl-project/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/sgl-project/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/sgl-project/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/sgl-project/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/sgl-project/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/sgl-project/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/sgl-project/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/sgl-project/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOLCAjRg",
+        "notifications_url": "https://api.github.com/repos/sgl-project/sglang/notifications{?since,all,participating}",
+        "open_issues": 5964,
+        "open_issues_count": 5964,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+          "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/sgl-project/followers",
+          "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/sgl-project",
+          "id": 147780389,
+          "login": "sgl-project",
+          "node_id": "O_kgDOCM7zJQ",
+          "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+          "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+          "repos_url": "https://api.github.com/users/sgl-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/sgl-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/sgl-project/sglang/pulls{/number}",
+        "pushed_at": "2026-10-19T19:40:04Z",
+        "releases_url": "https://api.github.com/repos/sgl-project/sglang/releases{/id}",
+        "size": 453851,
+        "ssh_url": "git@github.com:sgl-project/sglang.git",
+        "stargazers_count": 37444,
+        "stargazers_url": "https://api.github.com/repos/sgl-project/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/sgl-project/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/sgl-project/sglang/subscription",
+        "svn_url": "https://github.com/sgl-project/sglang",
+        "tags_url": "https://api.github.com/repos/sgl-project/sglang/tags",
+        "teams_url": "https://api.github.com/repos/sgl-project/sglang/teams",
+        "topics": [
+          "attention",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "diffusion",
+          "glm",
+          "gpt-oss",
+          "inference",
+          "llama",
+          "llm",
+          "minimax",
+          "moe",
+          "qwen",
+          "qwen-image",
+          "reinforcement-learning",
+          "transformer",
+          "vlm",
+          "wan"
+        ],
+        "trees_url": "https://api.github.com/repos/sgl-project/sglang/git/trees{/sha}",
+        "updated_at": "2026-10-19T19:21:38Z",
+        "url": "https://api.github.com/repos/sgl-project/sglang",
+        "visibility": "public",
+        "watchers": 37444,
+        "watchers_count": 37444,
+        "web_commit_signoff_required": false
+      },
+      "sha": "afa3c06d1fc9396b13235cfe358ae5a96170feb6",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+        "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/sgl-project/followers",
+        "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/sgl-project",
+        "id": 147780389,
+        "login": "sgl-project",
+        "node_id": "O_kgDOCM7zJQ",
+        "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+        "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+        "repos_url": "https://api.github.com/users/sgl-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/sgl-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "\n### Motivation\n\nFixes #31117.\n\nCustom all-reduce hangs permanently — kernels resident, GPU pinned at 100%, no\nerror, no timeout, immune to `SIGTERM` — when two CUDA streams issue an\nall-reduce on the **same** communicator with both in flight at once. It affects\nboth implementations (the JIT `CustomAllReduceV2`, which is the CUDA default, and\nthe legacy AOT `CustomAllreduce`), and it needs nothing exotic to hit: two\nordinary `torch.cuda.Stream()`s reproduce it. Custom all-reduce is on by default\nwhenever NVLink P2P is available, and `--enable-pdmux` makes issuing from two\nstreams easy to do.\n\n### Root cause\n\nThe protocols are **single-in-flight-per-communicator by construction**, but\nnothing enforces it.\n\n1. **The push buffer *is* the \"has my peer arrived?\" flag.**\n   `all_reduce_one_shot_push_kernel` has no flag array: positive zero is the\n   \"not here yet\" sentinel. Block `b` pushes its slice into every peer's buffer\n   and then spin-polls that same slice in its own buffer until no positive zero\n   remains (`poll_impl`). After reducing, it writes the sentinel back over the\n   buffer — **the poll phase is also the re-arm for the next all-reduce**\n   (`custom_all_reduce_push.cuh`). Two concurrent all-reduces of one communicator\n   read the same epoch and therefore land in the same buffer half, so one\n   kernel's poll re-arms the slice the other kernel's block is still waiting on.\n   That block then spins forever on data that has already been consumed.\n\n2. **The epoch counter is a non-atomic read-modify-write.** Which half is used\n   comes from `PushController::epoch()` = `m_local_signal[blockIdx.x]`, advanced\n   by `signal = (signal + 1) % kNumStages` from thread 0 (`common.cuh`). Two\n   concurrent kernels can lose an update; if the ranks lose it differently their\n   epochs are permanently out of step — one rank polls the half the other is not\n   pushing into.\n\nEither one is sufficient on its own. The same shape exists in the pull path\n(`PullController::sync` keeps per-communicator, per-block counters and spins on\nan exact value) and in the legacy AOT `multi_gpu_barrier`.\n\nNothing detects it from inside the kernel, because **both spin loops are\nunbounded**. A spinning block never retires, so it holds its SM for the life of\nthe process — hence 100% utilization forever and immunity to `SIGTERM`.\n\nTwo all-reduces on **distinct** communicators are fine: the state is per\ncommunicator (verified, 220/220 iterations, including one custom-AR communicator\nper green-context partition).\n\n### Fix\n\nTwo parts, one for each way a second all-reduce can get in flight.\n\n**1. Host side — `SingleStreamGuard`** (`custom_all_reduce_utils.py`, used by\nboth `CustomAllReduceV2._all_reduce` and `CustomAllreduce._all_reduce_impl`).\n\nRemember the stream the communicator's last all-reduce was issued on. When the\nnext one arrives on a *different* stream, record an event on the previous stream\nand `wait_event` it on the new one, so the second all-reduce is **serialized\nbehind** the first instead of aliasing its buffer. Restores the total order the\nprotocol already assumes; no kernel change, no semantic change for anyone\nalready using one stream.\n\nThe steady state (one stream forever) is a raw-stream-pointer compare — the\nevent is only recorded when a second stream is actually seen. Graph *capture* is\nskipped (it records a dependency DAG, it does not execute anything).\n\n**2. Device side — `SpinDeadline`** (`common.cuh`).\n\nBound both peer-rendezvous spins by `SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT`\nseconds (default **600**, matching the NCCL watchdog's `TORCH_NCCL_TIMEOUT`; `0`\ndisables) and `__trap()` with a message naming the cause.\n\nThis covers the case the host guard *cannot* see: **two CUDA graphs replayed\nconcurrently on two streams** — a replay makes no host call at all. It turns an\nunkillable, silent, 100%-GPU hang into an immediate, attributable CUDA error:\n\n```\n[sglang] custom all-reduce timed out waiting for its peers. Two all-reduces of the\nSAME communicator were in flight at once -- e.g. two CUDA graphs replayed concurrently\non two streams. The protocol supports only one in-flight all-reduce per communicator;\nuse one communicator per concurrent stream. (Bound: SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT\nseconds, 0 disables.)\nRuntimeError: CUDA error: unspecified launch failure\n```\n\nTwo details keep this free on the healthy path (both measured, see below):\n* the clock is read **lazily** — only after 4096 spin iterations, which a healthy\n  rendezvous never reaches — so the common path never touches `%globaltimer`;\n* the message takes **no printf arguments**. Passing any makes the kernel\n  allocate a per-thread stack frame for the varargs buffer (`STACK:8` in\n  `cuobjdump -res-usage`), and setting that local-memory window up costs ~45 ns\n  on *every* launch (~1.5% of a small all-reduce), for a buffer only the dead\n  path ever writes.\n\nNet kernel resources (bf16, world size 2, sm80): `REG 30 → 31`, `STACK 0 → 0`,\nkernel params `456 → 464 B`.\n\n### The contract\n\nDocumented on the guard and in the kernel comment: **one in-flight all-reduce per\ncommunicator.** Concurrency must come from *distinct* communicators — one per\nconcurrently-issuing stream.\n\n### Test\n\n`test/registered/jit/test_custom_all_reduce.py::test_concurrent_issue_on_two_streams`\n(existing multi-GPU harness; runs at world size 2/4/8, all three algos).\n\nIt issues on the same communicator from two streams with both all-reduces in\nflight, then asserts the run *terminates* and that every result matches NCCL\n(serialized, not merely un-wedged — an aliased buffer comes back with holes even\nwhen the rendezvous happens to finish).\n\nIt has to be a deadlock *detector*: the kernels spin, so a wedged rank cannot be\ninterrupted from Python, `pytest.fail()` could not run, and its teardown would\nhang on the same GPU. A watchdog thread hard-exits the worker with an explanatory\nmessage, which fails the torchrun run.\n\n* on **unpatched** code: fails (both ranks hard-exit via the watchdog);\n* on **patched** code: `3 passed in 0.4s`.\n\n### Benchmark\n\n`test/registered/jit/benchmark/bench_custom_all_reduce.py`, world size 2, bf16,\n`jit` provider, 2× A100-SXM4-40GB NVLink. **Interleaved A/B** (unpatched/patched\nalternating in one time window, 3 pairs, median), so environmental drift cancels.\nThe `aot` provider is untouched by this PR and is shown as the noise floor.\n\n| message | algo | before (µs) | after (µs) | delta | aot control |\n|---:|---|---:|---:|---:|---:|\n| 4 KB | one-shot push | 3.000 | 3.031 | +1.02% | −0.25% |\n| 16 KB | one-shot push | 3.164 | 3.185 | +0.64% | +0.00% |\n| 64 KB | one-shot push | 3.758 | 3.809 | +1.36% | +0.00% |\n| 128 KB | one-shot push | 4.618 | 4.659 | +0.89% | −0.18% |\n| 192 KB | one-shot push | 5.509 | 5.550 | +0.74% | −0.15% |\n| 256 KB | one-shot push | 6.339 | 6.390 | +0.81% | +0.00% |\n| 384 KB | one-shot push | 8.038 | 8.079 | +0.51% | −0.11% |\n| 512 KB | one-shot push | 9.626 | 9.656 | +0.32% | +0.00% |\n| 640 KB | one-shot push | 11.264 | 11.295 | +0.27% | −0.08% |\n| 768 KB | one-shot push | 12.974 | 12.995 | +0.16% | +0.00% |\n| 896 KB | one-shot push | 14.633 | 14.613 | −0.14% | +0.00% |\n| 1 MB | one-shot push | 16.251 | 16.230 | −0.13% | +0.00% |\n| 2 MB | one-shot push | 30.013 | 29.931 | −0.27% | +0.00% |\n| 3 MB | one-shot pull | 45.508 | 45.583 | +0.17% | −0.02% |\n| 4 MB | one-shot pull | 59.422 | 59.513 | +0.15% | +0.00% |\n| 8 MB | one-shot pull | 115.230 | 115.299 | +0.06% | +0.00% |\n| 16 MB | one-shot pull | 226.661 | 226.670 | +0.00% | −0.01% |\n| 32 MB | one-shot pull | 448.286 | 449.073 | +0.18% | −0.00% |\n\n`jit` mean **+0.37%**, median +0.22%, max +1.36%; `aot` (untouched) max 0.25%.\nIn absolute terms the residual is a **fixed ~30–50 ns per launch** (one extra\nregister, 8 bytes of kernel params, and the bounded-spin counter), which is\n~1% of the smallest all-reduce and ~0% from 896 KB up.\n\n**Host side.** The kernel benchmark captures CUDA graphs, so the guard never runs\nin it (replay makes no host call — it is exactly 0 there). Measured separately on\nthe *eager* path, A/B inside one process (real guard vs. a no-op, interleaved,\n9×2000 calls): **+0.36 µs on a 31 µs enqueue, +1.2%.**\n\n### Notes / things a reviewer may want to weigh in on\n\n1. **Default bound (600 s).** Chosen to match `TORCH_NCCL_TIMEOUT` and to be far\n   above any legitimate *launch* skew (a peer stalled on the host by a JIT\n   compile, a debugger, or a profiler — the rendezvous itself is microseconds).\n   Lower is more useful for debugging, higher is safer against false trips.\n   Env-tunable; `0` disables.\n2. **`__trap()` surfaces on the host as `unspecified launch failure`.** The\n   diagnosis is the device-side message printed immediately above it. A\n   `__assertfail`-based variant would give `device-side assert triggered` instead,\n   which is arguably a better host-side error; happy to switch.\n3. **The remaining ~30–50 ns/launch** could be taken to zero by making the\n   timeout a compile-time template argument of the JIT kernels (it would drop the\n   kernel param and the register). That adds JIT-arg plumbing, so I left it out —\n   say the word if you want it.\n4. **The AOT (`sgl-kernel`) V1 kernel's spin is still unbounded.** Its *host*\n   wrapper gets the same guard (so the reported bug is fixed for it too), but\n   bounding its device loop would need a wheel rebuild, which I could not\n   validate here. Happy to add it in a follow-up.\n5. **The guard assumes a communicator's all-reduces are issued from one host\n   thread**, which is true of every SGLang path. A lock spanning the launch would\n   make it unconditional; it is not worth ~200 ns on this path, and the kernel\n   bound turns that race into an error rather than a hang.\n6. **The pull path deadlocks too**, not just the push kernel the issue was filed\n   against — the regression test covers all three algos, and the bound is applied\n   to both spin loops.\n\n\n\n\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #29314190804](https://github.com/sgl-project/sglang/actions/runs/29314190804)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #29314190501](https://github.com/sgl-project/sglang/actions/runs/29314190501)<!-- slot:pr-test-extra:end -->\n<!-- pr-states:end -->",
+    "changed_files": 8,
+    "closed_at": "2026-10-14T01:21:00Z",
+    "comments": 2,
+    "comments_url": "https://api.github.com/repos/sgl-project/sglang/issues/31135/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/sgl-project/sglang/pulls/31135/commits",
+    "created_at": "2026-07-14T07:19:44Z",
+    "deletions": 11,
+    "diff_url": "https://github.com/sgl-project/sglang/pull/31135.diff",
+    "draft": false,
+    "head": {
+      "label": "he-actlab:fix/custom-allreduce-concurrent-stream-deadlock",
+      "ref": "fix/custom-allreduce-concurrent-stream-deadlock",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/he-actlab/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/he-actlab/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/he-actlab/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/he-actlab/sglang/branches{/branch}",
+        "clone_url": "https://github.com/he-actlab/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/he-actlab/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/he-actlab/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/he-actlab/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/he-actlab/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/he-actlab/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/he-actlab/sglang/contributors",
+        "created_at": "2026-07-01T07:24:39Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/he-actlab/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models. Fork SGLang to support ACTLab research.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/he-actlab/sglang/downloads",
+        "events_url": "https://api.github.com/repos/he-actlab/sglang/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/he-actlab/sglang/forks",
+        "full_name": "he-actlab/sglang",
+        "git_commits_url": "https://api.github.com/repos/he-actlab/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/he-actlab/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/he-actlab/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/he-actlab/sglang.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/he-actlab/sglang/hooks",
+        "html_url": "https://github.com/he-actlab/sglang",
+        "id": 1285830641,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/he-actlab/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/he-actlab/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/he-actlab/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/he-actlab/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/he-actlab/sglang/labels{/name}",
+        "language": null,
+        "languages_url": "https://api.github.com/repos/he-actlab/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/he-actlab/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/he-actlab/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOTKQ38Q",
+        "notifications_url": "https://api.github.com/repos/he-actlab/sglang/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/30554636?v=4",
+          "events_url": "https://api.github.com/users/he-actlab/events{/privacy}",
+          "followers_url": "https://api.github.com/users/he-actlab/followers",
+          "following_url": "https://api.github.com/users/he-actlab/following{/other_user}",
+          "gists_url": "https://api.github.com/users/he-actlab/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/he-actlab",
+          "id": 30554636,
+          "login": "he-actlab",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjMwNTU0NjM2",
+          "organizations_url": "https://api.github.com/users/he-actlab/orgs",
+          "received_events_url": "https://api.github.com/users/he-actlab/received_events",
+          "repos_url": "https://api.github.com/users/he-actlab/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/he-actlab/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/he-actlab/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/he-actlab",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/he-actlab/sglang/pulls{/number}",
+        "pushed_at": "2026-09-18T06:53:13Z",
+        "releases_url": "https://api.github.com/repos/he-actlab/sglang/releases{/id}",
+        "size": 153963,
+        "ssh_url": "git@github.com:he-actlab/sglang.git",
+        "stargazers_count": 1,
+        "stargazers_url": "https://api.github.com/repos/he-actlab/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/he-actlab/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/he-actlab/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/he-actlab/sglang/subscription",
+        "svn_url": "https://github.com/he-actlab/sglang",
+        "tags_url": "https://api.github.com/repos/he-actlab/sglang/tags",
+        "teams_url": "https://api.github.com/repos/he-actlab/sglang/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/he-actlab/sglang/git/trees{/sha}",
+        "updated_at": "2026-07-17T02:49:51Z",
+        "url": "https://api.github.com/repos/he-actlab/sglang",
+        "visibility": "public",
+        "watchers": 1,
+        "watchers_count": 1,
+        "web_commit_signoff_required": false
+      },
+      "sha": "66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/30554636?v=4",
+        "events_url": "https://api.github.com/users/he-actlab/events{/privacy}",
+        "followers_url": "https://api.github.com/users/he-actlab/followers",
+        "following_url": "https://api.github.com/users/he-actlab/following{/other_user}",
+        "gists_url": "https://api.github.com/users/he-actlab/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/he-actlab",
+        "id": 30554636,
+        "login": "he-actlab",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjMwNTU0NjM2",
+        "organizations_url": "https://api.github.com/users/he-actlab/orgs",
+        "received_events_url": "https://api.github.com/users/he-actlab/received_events",
+        "repos_url": "https://api.github.com/users/he-actlab/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/he-actlab/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/he-actlab/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/he-actlab",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/31135",
+    "id": 4050469175,
+    "issue_url": "https://api.github.com/repos/sgl-project/sglang/issues/31135",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10414858054,
+        "name": "jit-kernel",
+        "node_id": "LA_kwDOLCAjRs8AAAACbMYfRg",
+        "url": "https://api.github.com/repos/sgl-project/sglang/labels/jit-kernel"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOLCAjRs7xbUE3",
+    "number": 31135,
+    "patch_url": "https://github.com/sgl-project/sglang/pull/31135.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/4908075?v=4",
+        "events_url": "https://api.github.com/users/yuan-luo/events{/privacy}",
+        "followers_url": "https://api.github.com/users/yuan-luo/followers",
+        "following_url": "https://api.github.com/users/yuan-luo/following{/other_user}",
+        "gists_url": "https://api.github.com/users/yuan-luo/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/yuan-luo",
+        "id": 4908075,
+        "login": "yuan-luo",
+        "node_id": "MDQ6VXNlcjQ5MDgwNzU=",
+        "organizations_url": "https://api.github.com/users/yuan-luo/orgs",
+        "received_events_url": "https://api.github.com/users/yuan-luo/received_events",
+        "repos_url": "https://api.github.com/users/yuan-luo/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/yuan-luo/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/yuan-luo/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/yuan-luo",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/15100009?v=4",
+        "events_url": "https://api.github.com/users/merrymercy/events{/privacy}",
+        "followers_url": "https://api.github.com/users/merrymercy/followers",
+        "following_url": "https://api.github.com/users/merrymercy/following{/other_user}",
+        "gists_url": "https://api.github.com/users/merrymercy/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/merrymercy",
+        "id": 15100009,
+        "login": "merrymercy",
+        "node_id": "MDQ6VXNlcjE1MTAwMDA5",
+        "organizations_url": "https://api.github.com/users/merrymercy/orgs",
+        "received_events_url": "https://api.github.com/users/merrymercy/received_events",
+        "repos_url": "https://api.github.com/users/merrymercy/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/merrymercy/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/merrymercy/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/merrymercy",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/25844240?v=4",
+        "events_url": "https://api.github.com/users/yizhang2077/events{/privacy}",
+        "followers_url": "https://api.github.com/users/yizhang2077/followers",
+        "following_url": "https://api.github.com/users/yizhang2077/following{/other_user}",
+        "gists_url": "https://api.github.com/users/yizhang2077/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/yizhang2077",
+        "id": 25844240,
+        "login": "yizhang2077",
+        "node_id": "MDQ6VXNlcjI1ODQ0MjQw",
+        "organizations_url": "https://api.github.com/users/yizhang2077/orgs",
+        "received_events_url": "https://api.github.com/users/yizhang2077/received_events",
+        "repos_url": "https://api.github.com/users/yizhang2077/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/yizhang2077/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/yizhang2077/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/yizhang2077",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/35585791?v=4",
+        "events_url": "https://api.github.com/users/BBuf/events{/privacy}",
+        "followers_url": "https://api.github.com/users/BBuf/followers",
+        "following_url": "https://api.github.com/users/BBuf/following{/other_user}",
+        "gists_url": "https://api.github.com/users/BBuf/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/BBuf",
+        "id": 35585791,
+        "login": "BBuf",
+        "node_id": "MDQ6VXNlcjM1NTg1Nzkx",
+        "organizations_url": "https://api.github.com/users/BBuf/orgs",
+        "received_events_url": "https://api.github.com/users/BBuf/received_events",
+        "repos_url": "https://api.github.com/users/BBuf/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/BBuf/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/BBuf/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/BBuf",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/45795032?v=4",
+        "events_url": "https://api.github.com/users/HydraQYH/events{/privacy}",
+        "followers_url": "https://api.github.com/users/HydraQYH/followers",
+        "following_url": "https://api.github.com/users/HydraQYH/following{/other_user}",
+        "gists_url": "https://api.github.com/users/HydraQYH/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/HydraQYH",
+        "id": 45795032,
+        "login": "HydraQYH",
+        "node_id": "MDQ6VXNlcjQ1Nzk1MDMy",
+        "organizations_url": "https://api.github.com/users/HydraQYH/orgs",
+        "received_events_url": "https://api.github.com/users/HydraQYH/received_events",
+        "repos_url": "https://api.github.com/users/HydraQYH/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/HydraQYH/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/HydraQYH/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/HydraQYH",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/54331508?v=4",
+        "events_url": "https://api.github.com/users/ch-wan/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ch-wan/followers",
+        "following_url": "https://api.github.com/users/ch-wan/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ch-wan/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ch-wan",
+        "id": 54331508,
+        "login": "ch-wan",
+        "node_id": "MDQ6VXNlcjU0MzMxNTA4",
+        "organizations_url": "https://api.github.com/users/ch-wan/orgs",
+        "received_events_url": "https://api.github.com/users/ch-wan/received_events",
+        "repos_url": "https://api.github.com/users/ch-wan/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ch-wan/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ch-wan/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ch-wan",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/76582120?v=4",
+        "events_url": "https://api.github.com/users/DarkSharpness/events{/privacy}",
+        "followers_url": "https://api.github.com/users/DarkSharpness/followers",
+        "following_url": "https://api.github.com/users/DarkSharpness/following{/other_user}",
+        "gists_url": "https://api.github.com/users/DarkSharpness/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/DarkSharpness",
+        "id": 76582120,
+        "login": "DarkSharpness",
+        "node_id": "MDQ6VXNlcjc2NTgyMTIw",
+        "organizations_url": "https://api.github.com/users/DarkSharpness/orgs",
+        "received_events_url": "https://api.github.com/users/DarkSharpness/received_events",
+        "repos_url": "https://api.github.com/users/DarkSharpness/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/DarkSharpness/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/DarkSharpness/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/DarkSharpness",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/95223577?v=4",
+        "events_url": "https://api.github.com/users/celve/events{/privacy}",
+        "followers_url": "https://api.github.com/users/celve/followers",
+        "following_url": "https://api.github.com/users/celve/following{/other_user}",
+        "gists_url": "https://api.github.com/users/celve/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/celve",
+        "id": 95223577,
+        "login": "celve",
+        "node_id": "U_kgDOBaz_GQ",
+        "organizations_url": "https://api.github.com/users/celve/orgs",
+        "received_events_url": "https://api.github.com/users/celve/received_events",
+        "repos_url": "https://api.github.com/users/celve/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/celve/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/celve/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/celve",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}",
+    "review_comments": 2,
+    "review_comments_url": "https://api.github.com/repos/sgl-project/sglang/pulls/31135/comments",
+    "state": "closed",
+    "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+    "title": "Fix custom all-reduce deadlock when one communicator is issued from two CUDA streams",
+    "updated_at": "2026-10-14T01:21:00Z",
+    "url": "https://api.github.com/repos/sgl-project/sglang/pulls/31135",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/26683437?v=4",
+      "events_url": "https://api.github.com/users/hanyax/events{/privacy}",
+      "followers_url": "https://api.github.com/users/hanyax/followers",
+      "following_url": "https://api.github.com/users/hanyax/following{/other_user}",
+      "gists_url": "https://api.github.com/users/hanyax/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/hanyax",
+      "id": 26683437,
+      "login": "hanyax",
+      "node_id": "MDQ6VXNlcjI2NjgzNDM3",
+      "organizations_url": "https://api.github.com/users/hanyax/orgs",
+      "received_events_url": "https://api.github.com/users/hanyax/received_events",
+      "repos_url": "https://api.github.com/users/hanyax/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/hanyax/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/hanyax/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/hanyax",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Fcsrc%2Fdistributed%2Fcustom_all_reduce_pull.cuh",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fjit_kernel%2Fcsrc%2Fdistributed%2Fcustom_all_reduce_pull.cuh?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 5,
+      "filename": "python/sglang/jit_kernel/csrc/distributed/custom_all_reduce_pull.cuh",
+      "patch": "@@ -24,11 +24,13 @@ namespace {\n using device::distributed::PullController;\n using host::distributed::AllReduceData;\n using host::distributed::CustomAllReduceBase, host::distributed::CustomAllReduceRef;\n+using host::distributed::get_spin_timeout_ns;\n \n struct AllReduceParams {\n   void* __restrict__ output;\n   uint32_t rank;\n   uint32_t num_items;  // NOTE: support at most 4G, but that's too much\n+  uint64_t spin_timeout_ns;\n };\n \n [[maybe_unused]]\n@@ -45,7 +47,7 @@ SGL_DEVICE void all_reduce_impl(const AllReduceParams& params, DType* (&input)[k\n   constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);\n   using DType2 = packed_t<DType>;\n   using Storage = AlignedVector<DType2, kVecSize>;\n-  const auto& [output, rank, num_items] = params;\n+  const auto& [output, rank, num_items, spin_timeout_ns] = params;\n \n   for (auto i = blockIdx.x;; i += gridDim.x) {\n     const auto offset = i * blockDim.x + threadIdx.x;\n@@ -81,11 +83,11 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_kernel(\n     input[i] = static_cast<DType*>(data->input[i]);\n   device::PDLWaitPrimary<kUsePDL>();\n \n-  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU);\n+  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU, params.spin_timeout_ns);\n   all_reduce_impl</*kBroadcast=*/false>(params, input);\n \n   device::PDLTriggerSecondary<kUsePDL>();\n-  ctrl.sync</*kFence=*/0, /*kStart=*/0>(params.rank, kNumGPU);\n+  ctrl.sync</*kFence=*/0, /*kStart=*/0>(params.rank, kNumGPU, params.spin_timeout_ns);\n }\n \n template <typename DType, uint32_t kNumGPU, bool kUsePDL>\n@@ -114,6 +116,7 @@ CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(\n       .output = nullptr,  // this is not used for 2-shot all reduce\n       .rank = params.rank,\n       .num_items = local_length,\n+      .spin_timeout_ns = params.spin_timeout_ns,\n   };\n \n #pragma unroll\n@@ -122,11 +125,11 @@ CUSTOM_AR_KERNEL void all_reduce_two_shot_kernel(\n \n   device::PDLWaitPrimary<kUsePDL>();\n \n-  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU);\n+  ctrl.sync</*kFence=*/0, /*kStart=*/1>(params.rank, kNumGPU, params.spin_timeout_ns);\n   all_reduce_impl</*kBroadcast=*/true>(local_params, input);\n \n   device::PDLTriggerSecondary<kUsePDL>();\n-  ctrl.sync</*kFence=*/1, /*kStart=*/0>(params.rank, kNumGPU);\n+  ctrl.sync</*kFence=*/1, /*kStart=*/0>(params.rank, kNumGPU, params.spin_timeout_ns);\n }\n \n template <typename DType, uint32_t kNumGPU, bool kUsePDL>\n@@ -154,6 +157,7 @@ struct CustomAllReducePull : public CustomAllReduceBase {\n         .output = use_2shot ? nullptr : output.data_ptr(),\n         .rank = m_rank,\n         .num_items = num_items,\n+        .spin_timeout_ns = get_spin_timeout_ns(),\n     };\n \n     RuntimeCheck(input.IsContiguous(), \"Input tensor must be contiguous\");",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Fcsrc%2Fdistributed%2Fcustom_all_reduce_pull.cuh",
+      "sha": "d499c5c9bfe4b948a74de7896807573edcbbddfc",
+      "status": "modified"
+    },
+    {
+      "additions": 11,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Fcsrc%2Fdistributed%2Fcustom_all_reduce_push.cuh",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fjit_kernel%2Fcsrc%2Fdistributed%2Fcustom_all_reduce_push.cuh?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 3,
+      "filename": "python/sglang/jit_kernel/csrc/distributed/custom_all_reduce_push.cuh",
+      "patch": "@@ -19,6 +19,7 @@ namespace {\n \n using device::distributed::PushController;\n using host::distributed::CustomAllReduceBase, host::distributed::CustomAllReduceRef;\n+using host::distributed::get_spin_timeout_ns;\n \n struct AllReducePushData {\n   void* __restrict__ buffer[device::distributed::kMaxNumGPU];\n@@ -28,6 +29,7 @@ struct AllReducePushData {\n   uint32_t num_items;\n   uint32_t buffer_bytes;\n   uint32_t epoch_bytes;\n+  uint64_t spin_timeout_ns;\n };\n \n #define CUSTOM_AR_KERNEL __global__ __launch_bounds__(1024, 1)\n@@ -128,11 +130,15 @@ SGL_DEVICE void push_impl(DType* (&push_buf)[kNumGPU], const void* data, uint32_\n }\n \n template <typename DType, uint32_t kNumGPU>\n-SGL_DEVICE void poll_impl(DType* (&poll_buf)[kNumGPU], void* data, uint32_t num_items) {\n+SGL_DEVICE void poll_impl(DType* (&poll_buf)[kNumGPU], void* data, uint32_t num_items, uint64_t spin_timeout_ns) {\n   using namespace device;\n   constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);\n   using Storage = AlignedVector<packed_t<DType>, kVecSize>;\n \n+  // Bounds the wait below: a peer that never arrives is a bug, not a slow peer.\n+  // See `device::distributed::SpinDeadline`.\n+  distributed::SpinDeadline deadline(spin_timeout_ns);\n+\n   for (auto i = blockIdx.x;; i += gridDim.x) {\n     const auto offset = i * blockDim.x + threadIdx.x;\n     if (offset * kVecSize * 2 >= num_items) break;\n@@ -150,6 +156,7 @@ SGL_DEVICE void poll_impl(DType* (&poll_buf)[kNumGPU], void* data, uint32_t num_\n         }\n       }\n       if (!has_pos_zero) break;\n+      deadline.tick();\n     }\n \n     const Storage result = distributed::reduce_impl(storage);\n@@ -170,7 +177,7 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(\n     const PushController __grid_constant__ ctrl) {\n   using namespace device;\n \n-  const auto [buffer, input, output, rank, num_items, buffer_bytes, epoch_bytes] = params;\n+  const auto [buffer, input, output, rank, num_items, buffer_bytes, epoch_bytes, spin_timeout_ns] = params;\n \n   PDLWaitPrimary<kUsePDL>();\n \n@@ -191,7 +198,7 @@ CUSTOM_AR_KERNEL void all_reduce_one_shot_push_kernel(\n   for (uint32_t i = 0; i < kNumGPU; ++i) {\n     poll_buf[i] = static_cast<DType*>(pointer::offset(buffer[rank], i * buffer_bytes, epoch_offset));\n   }\n-  poll_impl(poll_buf, output, num_items);\n+  poll_impl(poll_buf, output, num_items, spin_timeout_ns);\n   ctrl.exit();\n }\n \n@@ -224,6 +231,7 @@ struct CustomAllReducePush : public CustomAllReduceBase {\n     params.num_items = num_items;\n     params.buffer_bytes = m_push_buffer_bytes;\n     params.epoch_bytes = kNumGPU * params.buffer_bytes;\n+    params.spin_timeout_ns = get_spin_timeout_ns();\n \n     RuntimeCheck(input.IsContiguous(), \"Input must be contiguous\");\n     RuntimeCheck(m_num_gpu == kNumGPU, \"Number of GPUs mismatch\");",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Fcsrc%2Fdistributed%2Fcustom_all_reduce_push.cuh",
+      "sha": "66cdff5ff8513c688445cb578106e86f340008a7",
+      "status": "modified"
+    },
+    {
+      "additions": 90,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Finclude%2Fsgl_kernel%2Fdistributed%2Fcommon.cuh",
+      "changes": 92,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fjit_kernel%2Finclude%2Fsgl_kernel%2Fdistributed%2Fcommon.cuh?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 2,
+      "filename": "python/sglang/jit_kernel/include/sgl_kernel/distributed/common.cuh",
+      "patch": "@@ -1,10 +1,96 @@\n #pragma once\n #include <sgl_kernel/utils.cuh>\n \n+#include <cstdint>\n+#include <cstdio>\n+\n namespace device::distributed {\n \n inline constexpr uint32_t kMaxNumGPU = 8;\n \n+/// Device-wide nanosecond wall clock. Unlike `clock64()` this is independent of\n+/// the SM clock, so it can be used to express a real time bound.\n+SGL_DEVICE uint64_t global_timer_ns() {\n+  uint64_t ns;\n+  asm volatile(\"mov.u64 %0, %%globaltimer;\" : \"=l\"(ns));\n+  return ns;\n+}\n+\n+/// A time bound for the cross-rank rendezvous spins below.\n+///\n+/// Both custom all-reduce protocols assume that the all-reduces of one\n+/// communicator are *totally ordered*, i.e. at most one is in flight at a time,\n+/// which is exactly what issuing them on a single stream provides. The state\n+/// that encodes \"has my peer arrived?\" is per communicator and per block -- a\n+/// two-stage counter here, and in the push kernel the push buffer itself -- so\n+/// two all-reduces of one communicator that execute concurrently (e.g. issued\n+/// from two CUDA streams) alias that state: one kernel's poll phase re-arms the\n+/// buffer slice the other one is still waiting for, and the non-atomic epoch\n+/// update can leave the ranks permanently out of step. The rendezvous then never\n+/// completes. Since these loops spin, that used to manifest as a silent,\n+/// permanent, unkillable 100%-utilization hang (issue #31117).\n+///\n+/// The host side now serializes a second stream's issue behind the first, which\n+/// removes the hazard for every issue it can see. It cannot see two CUDA graphs\n+/// replayed concurrently on two streams -- a replay makes no host call -- so this\n+/// deadline is the backstop for that case: on expiry the kernel traps, turning\n+/// the hang into an immediate, attributable CUDA error. Override the bound with\n+/// `SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT` (seconds; 0 disables it).\n+struct SpinDeadline {\n+ public:\n+  /// Spin iterations between two clock reads. A healthy rendezvous completes in\n+  /// far fewer than this, so the common path never reads `%globaltimer` at all:\n+  /// the clock is only started once a wait is already long enough to be\n+  /// suspicious. (Reading it eagerly, once per thread, was measurable -- ~1% of\n+  /// the one-shot push kernel at small message sizes.)\n+  static constexpr uint32_t kCheckInterval = 4096;\n+\n+  SGL_DEVICE explicit SpinDeadline(uint64_t timeout_ns)\n+      : m_timeout_ns(timeout_ns), m_start_ns(0), m_countdown(kCheckInterval) {}\n+\n+  /// Call once per spin iteration. Never returns once the deadline has passed.\n+  SGL_DEVICE void tick() {\n+    if (m_timeout_ns == 0) return;   // bound disabled\n+    if (--m_countdown != 0) return;  // amortize the clock read\n+    m_countdown = kCheckInterval;\n+    const uint64_t now = global_timer_ns();\n+    if (m_start_ns == 0) {\n+      m_start_ns = now;  // first suspiciously long wait: start the clock\n+    } else if (now - m_start_ns > m_timeout_ns) {\n+      expire();\n+    }\n+  }\n+\n+ private:\n+  /// Cold path: `noinline` + `noreturn` so the hot loop keeps no state alive\n+  /// across the call. The trap tears the context down, so the message above it\n+  /// is the only diagnosis the user gets; one line per stuck warp keeps it\n+  /// readable.\n+  ///\n+  /// NOTE: the message deliberately takes no printf arguments. Passing any would\n+  /// make the kernel allocate a per-thread stack frame for the varargs buffer\n+  /// (`STACK:8` in `cuobjdump -res-usage`), and setting that local-memory window\n+  /// up costs ~45ns on *every* launch of this kernel -- ~1.5% of a small\n+  /// all-reduce, for a buffer only the dead path ever writes.\n+  [[noreturn]] __noinline__ __device__ void expire() const {\n+    const uint32_t lane = threadIdx.x % kWarpThreads;\n+    if (lane == static_cast<uint32_t>(__ffs(__activemask()) - 1)) {\n+      printf(\n+          \"[sglang] custom all-reduce timed out waiting for its peers. Two all-reduces of the \"\n+          \"SAME communicator were in flight at once -- e.g. two CUDA graphs replayed concurrently \"\n+          \"on two streams. The protocol supports only one in-flight all-reduce per communicator; \"\n+          \"use one communicator per concurrent stream. (Bound: \"\n+          \"SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT seconds, 0 disables.)\\n\");\n+    }\n+    __trap();\n+    __builtin_unreachable();\n+  }\n+\n+  uint64_t m_timeout_ns;\n+  uint64_t m_start_ns;\n+  uint32_t m_countdown;\n+};\n+\n struct alignas(128) Semaphore {\n  public:\n   constexpr Semaphore() : m_flag(0), m_counter(0) {}\n@@ -59,8 +145,9 @@ struct PullController {\n   /// Synchronize all GPUs.\n   /// When kFence is true, establishes happens-before across GPUs using\n   /// release/acquire semantics, ensuring prior writes are visible system-wide.\n+  /// `spin_timeout_ns` bounds the wait for the peers (see `SpinDeadline`).\n   template <bool kFence, bool kStart>\n-  SGL_DEVICE void sync(uint32_t rank, uint32_t num_gpu) const {\n+  SGL_DEVICE void sync(uint32_t rank, uint32_t num_gpu, uint64_t spin_timeout_ns) const {\n     // For fenced sync: ensure all threads in this block have completed their writes,\n     // so the signaling thread's release carries them transitively.\n     static_assert(!(kFence && kStart), \"Start stage does not need to wait fence\");\n@@ -76,8 +163,9 @@ struct PullController {\n         /// NOTE: correctness here:\n         /// - base is only read/updated locally by the owning GPU\n         const auto base = signal.get_counter();\n+        SpinDeadline deadline(spin_timeout_ns);\n         while (signal.get<kFence>() - base < target)\n-          ;\n+          deadline.tick();\n         if constexpr (!kStart) {\n           signal.set_counter(base + target);\n         }",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Finclude%2Fsgl_kernel%2Fdistributed%2Fcommon.cuh",
+      "sha": "1ff512372e0c8348aec0f0f843a53a5c59a471e8",
+      "status": "modified"
+    },
+    {
+      "additions": 20,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Finclude%2Fsgl_kernel%2Fdistributed%2Fcustom_all_reduce.cuh",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fjit_kernel%2Finclude%2Fsgl_kernel%2Fdistributed%2Fcustom_all_reduce.cuh?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 0,
+      "filename": "python/sglang/jit_kernel/include/sgl_kernel/distributed/custom_all_reduce.cuh",
+      "patch": "@@ -13,6 +13,7 @@\n #include <algorithm>\n #include <array>\n #include <cstdint>\n+#include <cstdlib>\n #include <cstring>\n #include <functional>\n #include <numeric>\n@@ -25,6 +26,25 @@ namespace host::distributed {\n \n using device::distributed::PullController, device::distributed::PushController;\n \n+/// Wall-clock bound (nanoseconds) on the kernels' wait for their peers, from\n+/// `SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT` (seconds; 0 disables the bound).\n+///\n+/// The rendezvous takes microseconds once both peers have launched, so this only\n+/// has to be above the worst *launch* skew between the ranks -- a peer stalled on\n+/// the host by a JIT compile, a debugger, or a profiler. The default matches the\n+/// NCCL watchdog's (`TORCH_NCCL_TIMEOUT`, 600s): a collective that has not landed\n+/// after ten minutes is not slow, it is dead, and here it is dead in a way no\n+/// amount of waiting recovers from (see `device::distributed::SpinDeadline`).\n+inline uint64_t get_spin_timeout_ns() {\n+  static const uint64_t value = [] {\n+    constexpr double kDefaultSeconds = 600.0;\n+    const char* env = std::getenv(\"SGLANG_CUSTOM_ALL_REDUCE_SPIN_TIMEOUT\");\n+    const double seconds = env == nullptr ? kDefaultSeconds : std::strtod(env, nullptr);\n+    return seconds <= 0.0 ? uint64_t{0} : static_cast<uint64_t>(seconds * 1e9);\n+  }();\n+  return value;\n+}\n+\n struct AllReduceData {\n   constexpr AllReduceData() {}\n   void* __restrict__ input[device::distributed::kMaxNumGPU];",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fjit_kernel%2Finclude%2Fsgl_kernel%2Fdistributed%2Fcustom_all_reduce.cuh",
+      "sha": "42fae79e3b7249031f2fe2cbd83a11c7a09e6aa8",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce.py?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 0,
+      "filename": "python/sglang/srt/distributed/device_communicators/custom_all_reduce.py",
+      "patch": "@@ -15,6 +15,7 @@\n import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops\n from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary\n from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (\n+    SingleStreamGuard,\n     can_use_custom_all_reduce_with_nvlink,\n     is_weak_contiguous,\n )\n@@ -84,6 +85,8 @@ def __init__(\n         # now `device` is a `torch.device` object\n         assert isinstance(device, torch.device)\n         self.device = device\n+        # One in-flight all-reduce per communicator; see SingleStreamGuard.\n+        self.stream_guard = SingleStreamGuard(device)\n         full_nvlink = can_use_custom_all_reduce_with_nvlink(\n             group=group,\n             device=device,\n@@ -284,6 +287,11 @@ def should_custom_ar(self, inp: torch.Tensor):\n \n     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):\n         out = torch.empty_like(inp)\n+        # The kernel's per-communicator barrier state (`multi_gpu_barrier`)\n+        # assumes one in-flight all-reduce per communicator: if this issue comes\n+        # from a different stream than the previous one, order it behind that\n+        # one rather than let the two kernels corrupt each other's counters.\n+        self.stream_guard.maybe_serialize()\n         if not _is_hip:  # CUDA-like\n             if registered:\n                 ops.all_reduce(self._ptr, inp, out, 0, 0)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce.py",
+      "sha": "b0e8283b3de05b014a42c58f80a04f2d6896f583",
+      "status": "modified"
+    },
+    {
+      "additions": 79,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_utils.py",
+      "changes": 79,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_utils.py?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 0,
+      "filename": "python/sglang/srt/distributed/device_communicators/custom_all_reduce_utils.py",
+      "patch": "@@ -398,6 +398,85 @@ def is_weak_contiguous(inp: torch.Tensor):\n     )\n \n \n+# torch._C._cuda_getCurrentRawStream returns the raw cudaStream_t as an int. It\n+# is ~20x cheaper than torch.cuda.current_stream() (which builds a Stream\n+# object), which matters because the guard below runs on every all-reduce.\n+_get_raw_stream = getattr(torch._C, \"_cuda_getCurrentRawStream\", None)\n+\n+\n+class SingleStreamGuard:\n+    \"\"\"Serializes the all-reduces of one custom all-reduce communicator.\n+\n+    Both custom all-reduce implementations keep per-communicator, per-block\n+    rendezvous state: a two-stage counter, and -- for the JIT one-shot push\n+    kernel -- the push buffer itself, which the poll phase re-arms for the next\n+    all-reduce. The protocol is correct only while the all-reduces of a\n+    communicator are *totally ordered*, i.e. at most one is in flight at a time,\n+    which is exactly what issuing them on a single stream provides.\n+\n+    Two all-reduces of one communicator that execute concurrently -- e.g. issued\n+    from two CUDA streams -- alias that state: one kernel's poll phase overwrites\n+    (re-arms) the buffer slice the other kernel is still waiting for, and the\n+    non-atomic epoch update can leave the ranks permanently out of step. Neither\n+    is recoverable, and since the kernels spin-wait, the result is a silent,\n+    permanent, 100%-utilization hang that survives SIGTERM (issue #31117).\n+\n+    This guard makes the second issue *wait* instead of corrupting the first:\n+    when the stream changes, it records an event on the previous stream and has\n+    the new stream wait on it, which restores the total order. The normal path --\n+    one stream forever -- pays only a raw-stream-pointer compare.\n+\n+    Not covered: two CUDA graphs replayed concurrently on two streams, because a\n+    replay makes no host call at all. The kernels bound their own wait for that\n+    case and fail with an error instead of hanging (see ``SpinDeadline`` in\n+    ``jit_kernel/include/sgl_kernel/distributed/common.cuh``).\n+\n+    Assumes the all-reduces of one communicator are issued from one host thread,\n+    which is how every SGLang path uses them (the model runner owns its group).\n+    Two threads racing to issue on one communicator would need a lock here, and\n+    that lock would have to span the launch; it is not worth the cost on a path\n+    this hot, and the kernels' bound turns that race into an error, not a hang.\n+    \"\"\"\n+\n+    def __init__(self, device: torch.device) -> None:\n+        self.device_index = 0 if device.index is None else device.index\n+        # Bound once: an attribute lookup, not a branch, on the fast path.\n+        self._raw_stream = _get_raw_stream or (\n+            lambda index: torch.cuda.current_stream(index).cuda_stream\n+        )\n+        self._last_stream: Optional[torch.cuda.Stream] = None\n+        self._last_raw_stream: Optional[int] = None\n+        self._event: Optional[torch.cuda.Event] = None\n+\n+    def maybe_serialize(self) -> None:\n+        \"\"\"Order this all-reduce behind the previous one if the stream changed.\n+\n+        Call immediately before issuing. The steady state (one stream forever) is\n+        a raw-pointer compare; everything else is in the cold path below.\n+        \"\"\"\n+        if self._raw_stream(self.device_index) != self._last_raw_stream:\n+            self._switch_stream()\n+\n+    def _switch_stream(self) -> None:\n+        if torch.cuda.is_current_stream_capturing():\n+            # CUDA-graph capture records a dependency graph; it does not execute\n+            # anything, so there is nothing in flight to serialize against, and a\n+            # dependency on work outside the capture cannot be expressed in the\n+            # graph anyway. Leave the eager bookkeeping untouched.\n+            return\n+        stream = torch.cuda.current_stream(self.device_index)\n+        if self._last_stream is not None:\n+            if self._event is None:\n+                self._event = torch.cuda.Event()\n+            # Everything already issued on the previous stream -- in particular\n+            # the previous all-reduce of this communicator -- must complete\n+            # before this stream may start its own.\n+            self._event.record(self._last_stream)\n+            stream.wait_event(self._event)\n+        self._last_stream = stream\n+        self._last_raw_stream = stream.cuda_stream\n+\n+\n def can_p2p(rank: int, world_size: int) -> bool:\n     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang\n     SGLANG_SKIP_P2P_CHECK = os.getenv(\"SGLANG_SKIP_P2P_CHECK\", \"0\") == \"1\"",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_utils.py",
+      "sha": "53a4da8362159f23624e2495ac84b25673f973fd",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_v2.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_v2.py?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 0,
+      "filename": "python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py",
+      "patch": "@@ -9,6 +9,7 @@\n \n from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_custom_all_reduce_cls\n from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (\n+    SingleStreamGuard,\n     can_use_custom_all_reduce_with_nvlink,\n     is_weak_contiguous,\n )\n@@ -47,6 +48,8 @@ def __init__(\n     ) -> None:\n         _maybe_init_config()\n         self.disabled = True\n+        # One in-flight all-reduce per communicator; see SingleStreamGuard.\n+        self.stream_guard = SingleStreamGuard(device)\n         if not can_use_custom_all_reduce_v2(group=group, device=device):\n             return\n \n@@ -161,6 +164,11 @@ def close(self):\n     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:\n         \"\"\"Perform the actual all-reduce via JIT kernel.\"\"\"\n         algo = self._determine_algo(input)\n+        # The kernels support exactly one in-flight all-reduce per communicator:\n+        # if this issue comes from a different stream than the previous one, order\n+        # it behind that one instead of letting the two kernels corrupt the\n+        # communicator's shared rendezvous state.\n+        self.stream_guard.maybe_serialize()\n         return torch.from_dlpack(self.obj.all_reduce(input, algo))\n \n     def _determine_algo(self, input: torch.Tensor) -> AllReduceAlgo:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/python%2Fsglang%2Fsrt%2Fdistributed%2Fdevice_communicators%2Fcustom_all_reduce_v2.py",
+      "sha": "5c3c6d7c6e3d14c78f2028e62f8d8233d65406af",
+      "status": "modified"
+    },
+    {
+      "additions": 111,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/test%2Fregistered%2Fjit%2Ftest_custom_all_reduce.py",
+      "changes": 112,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fjit%2Ftest_custom_all_reduce.py?ref=66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "deletions": 1,
+      "filename": "test/registered/jit/test_custom_all_reduce.py",
+      "patch": "@@ -18,12 +18,15 @@\n from __future__ import annotations\n \n import atexit\n+import contextlib\n import itertools\n import logging\n import multiprocessing\n import os\n+import sys\n+import threading\n from multiprocessing.context import SpawnProcess\n-from typing import List\n+from typing import Iterator, List\n \n import pytest\n import torch\n@@ -226,6 +229,113 @@ def run(x: torch.Tensor) -> torch.Tensor:\n         torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)\n \n \n+# ---------------------------------------------------------------------------\n+# Regression test: concurrent issue on one communicator (issue #31117)\n+# ---------------------------------------------------------------------------\n+\n+CONCURRENT_ITERS = 32\n+CONCURRENT_NUMEL = 64 * 1024  # 128 KB in bf16\n+# Long enough that a merely slow machine never trips it, short enough to leave\n+# room in the per-file CI budget. It is only ever reached by the bug: the\n+# healthy path finishes in well under a second.\n+DEADLOCK_TIMEOUT_S = 120\n+DEADLOCK_EXIT_CODE = 87\n+\n+\n+@contextlib.contextmanager\n+def _deadlock_watchdog(what: str) -> Iterator[None]:\n+    \"\"\"Turn a wedged custom all-reduce into a hard, attributable failure.\n+\n+    The kernels spin-wait on their peers, so a rank whose all-reduce can no\n+    longer complete is stuck inside a CUDA call forever: it cannot be\n+    interrupted from Python, `pytest.fail()` could not run (and its teardown\n+    would hang on the same GPU), and even SIGTERM does not free the device.\n+    Hard-exiting the worker is the only reliable escape; torchrun then fails the\n+    run with the message printed here.\n+    \"\"\"\n+\n+    def _fire() -> None:\n+        print(\n+            f\"\\nDEADLOCK: {what} made no progress for {DEADLOCK_TIMEOUT_S}s. The \"\n+            f\"custom all-reduce kernels are resident and spinning (the GPU is \"\n+            f\"pinned at 100%): two all-reduces of one communicator were in flight \"\n+            f\"at once and corrupted its rendezvous state (issue #31117).\",\n+            file=sys.stderr,\n+            flush=True,\n+        )\n+        os._exit(DEADLOCK_EXIT_CODE)\n+\n+    timer = threading.Timer(DEADLOCK_TIMEOUT_S, _fire)\n+    timer.daemon = True\n+    timer.start()\n+    try:\n+        yield\n+    finally:\n+        timer.cancel()\n+\n+\n+@pytest.mark.parametrize(\"algo\", TEST_ALGOS)\n+@torch.inference_mode()\n+def test_concurrent_issue_on_two_streams(algo: AllReduceAlgo) -> None:\n+    \"\"\"Two streams issue on the SAME communicator with both all-reduces in flight.\n+\n+    The kernels keep their rendezvous state per communicator and per block (a\n+    two-stage counter, and for the one-shot push kernel the push buffer itself,\n+    which the poll phase re-arms). The protocol is therefore correct only while\n+    the all-reduces of a communicator are totally ordered, which a single stream\n+    guarantees and two concurrent streams do not: the kernels alias that state,\n+    one poll phase re-arms the buffer the other is still waiting on, and the\n+    rendezvous never completes -- a permanent, unkillable, 100%-utilization hang\n+    (issue #31117).\n+\n+    The communicator must serialize the second issue behind the first, so the\n+    concurrent issue both terminates and still matches NCCL.\n+    \"\"\"\n+    nccl_group = _init_nccl_group_once()\n+    comm = _init_comm_once()\n+    device = torch.device(f\"cuda:{int(os.environ['LOCAL_RANK'])}\")\n+    dtype = torch.bfloat16\n+\n+    # NOTE: 15 * 8 < 128, which is the precision limit for bf16.\n+    inputs = [\n+        torch.randint(0, 16, (CONCURRENT_NUMEL,), dtype=dtype, device=device)\n+        for _ in range(2)\n+    ]\n+    refs = [inp.clone() for inp in inputs]\n+    for ref in refs:\n+        dist.all_reduce(ref, group=nccl_group)\n+\n+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]\n+    for stream in streams:\n+        stream.wait_stream(torch.cuda.current_stream())\n+\n+    previous_algo = comm.override_algo\n+    comm.override_algo = algo\n+    try:\n+        outs: list[list[torch.Tensor]] = []\n+        with _deadlock_watchdog(f\"concurrent custom all-reduce ({algo.name})\"):\n+            for _ in range(CONCURRENT_ITERS):\n+                # Both all-reduces are issued back-to-back with no dependency\n+                # between their streams, so without serialization the kernels do\n+                # overlap on the device.\n+                step = []\n+                for inp, stream in zip(inputs, streams):\n+                    with torch.cuda.stream(stream):\n+                        step.append(comm.custom_all_reduce(inp.clone()))\n+                outs.append(step)\n+            for stream in streams:\n+                torch.cuda.current_stream().wait_stream(stream)\n+            torch.cuda.synchronize()  # never returns once the kernels have wedged\n+    finally:\n+        comm.override_algo = previous_algo\n+\n+    # Serialized, not just unwedged: a buffer that another kernel re-armed under\n+    # us would come back with holes even when the rendezvous happened to finish.\n+    for step in outs:\n+        for out, ref in zip(step, refs):\n+            torch.testing.assert_close(out, ref, atol=0, rtol=0)\n+\n+\n if __name__ == \"__main__\":\n     # Only sweep the common world sizes (2, 4, 8) by default: testing every\n     # count in 2..8 serially overruns the per-file CI time budget, and 3/5/6/7",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/66140d97c9d5ba4fa0e949b11c6615b6228e01c6/test%2Fregistered%2Fjit%2Ftest_custom_all_reduce.py",
+      "sha": "fb73dc9309e698ece618ccc8d902cedb02efc3d6",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "![medium](https://www.gstatic.com/codereviewagent/medium-priority.svg)\n\nThe variable `spin_timeout_ns` is unpacked from `params` but is not used anywhere within `all_reduce_impl`. This can trigger unused variable warnings or compilation errors depending on the compiler flags (e.g., `-Wunused-variable` or `-Werror`). Casting it to `void` suppresses this warning.\n\n```\n  const auto& [output, rank, num_items, spin_timeout_ns] = params;\n  (void)spin_timeout_ns;\n```",
+      "created_at": "2026-07-14T07:21:25Z",
+      "diff_hunk": "@@ -45,7 +47,7 @@ SGL_DEVICE void all_reduce_impl(const AllReduceParams& params, DType* (&input)[k\n   constexpr uint32_t kVecSize = 16 / (sizeof(DType) * 2);\n   using DType2 = packed_t<DType>;\n   using Storage = AlignedVector<DType2, kVecSize>;\n-  const auto& [output, rank, num_items] = params;\n+  const auto& [output, rank, num_items, spin_timeout_ns] = params;",
+      "html_url": "https://github.com/sgl-project/sglang/pull/31135#discussion_r3576827209",
+      "id": 3576827209,
+      "line": 50,
+      "original_line": 50,
+      "path": "python/sglang/jit_kernel/csrc/distributed/custom_all_reduce_pull.cuh",
+      "updated_at": "2026-07-14T07:21:25Z",
+      "user": {
+        "login": "gemini-code-assist[bot]"
+      }
+    },
+    {
+      "body": "![medium](https://www.gstatic.com/codereviewagent/medium-priority.svg)\n\nCreating a `torch.cuda.Event` with `enable_timing=True` (the default in some PyTorch versions/configurations) incurs additional driver and GPU overhead. Since this event is used purely for stream synchronization (`stream.wait_event(self._event)`), timing is not required. Disabling timing by passing `enable_timing=False` is a recommended performance best practice on hot paths.\n\n```suggestion\n                self._event = torch.cuda.Event(enable_timing=False)\n```",
+      "created_at": "2026-07-14T07:21:25Z",
+      "diff_hunk": "@@ -398,6 +398,85 @@ def is_weak_contiguous(inp: torch.Tensor):\n     )\n \n \n+# torch._C._cuda_getCurrentRawStream returns the raw cudaStream_t as an int. It\n+# is ~20x cheaper than torch.cuda.current_stream() (which builds a Stream\n+# object), which matters because the guard below runs on every all-reduce.\n+_get_raw_stream = getattr(torch._C, \"_cuda_getCurrentRawStream\", None)\n+\n+\n+class SingleStreamGuard:\n+    \"\"\"Serializes the all-reduces of one custom all-reduce communicator.\n+\n+    Both custom all-reduce implementations keep per-communicator, per-block\n+    rendezvous state: a two-stage counter, and -- for the JIT one-shot push\n+    kernel -- the push buffer itself, which the poll phase re-arms for the next\n+    all-reduce. The protocol is correct only while the all-reduces of a\n+    communicator are *totally ordered*, i.e. at most one is in flight at a time,\n+    which is exactly what issuing them on a single stream provides.\n+\n+    Two all-reduces of one communicator that execute concurrently -- e.g. issued\n+    from two CUDA streams -- alias that state: one kernel's poll phase overwrites\n+    (re-arms) the buffer slice the other kernel is still waiting for, and the\n+    non-atomic epoch update can leave the ranks permanently out of step. Neither\n+    is recoverable, and since the kernels spin-wait, the result is a silent,\n+    permanent, 100%-utilization hang that survives SIGTERM (issue #31117).\n+\n+    This guard makes the second issue *wait* instead of corrupting the first:\n+    when the stream changes, it records an event on the previous stream and has\n+    the new stream wait on it, which restores the total order. The normal path --\n+    one stream forever -- pays only a raw-stream-pointer compare.\n+\n+    Not covered: two CUDA graphs replayed concurrently on two streams, because a\n+    replay makes no host call at all. The kernels bound their own wait for that\n+    case and fail with an error instead of hanging (see ``SpinDeadline`` in\n+    ``jit_kernel/include/sgl_kernel/distributed/common.cuh``).\n+\n+    Assumes the all-reduces of one communicator are issued from one host thread,\n+    which is how every SGLang path uses them (the model runner owns its group).\n+    Two threads racing to issue on one communicator would need a lock here, and\n+    that lock would have to span the launch; it is not worth the cost on a path\n+    this hot, and the kernels' bound turns that race into an error, not a hang.\n+    \"\"\"\n+\n+    def __init__(self, device: torch.device) -> None:\n+        self.device_index = 0 if device.index is None else device.index\n+        # Bound once: an attribute lookup, not a branch, on the fast path.\n+        self._raw_stream = _get_raw_stream or (\n+            lambda index: torch.cuda.current_stream(index).cuda_stream\n+        )\n+        self._last_stream: Optional[torch.cuda.Stream] = None\n+        self._last_raw_stream: Optional[int] = None\n+        self._event: Optional[torch.cuda.Event] = None\n+\n+    def maybe_serialize(self) -> None:\n+        \"\"\"Order this all-reduce behind the previous one if the stream changed.\n+\n+        Call immediately before issuing. The steady state (one stream forever) is\n+        a raw-pointer compare; everything else is in the cold path below.\n+        \"\"\"\n+        if self._raw_stream(self.device_index) != self._last_raw_stream:\n+            self._switch_stream()\n+\n+    def _switch_stream(self) -> None:\n+        if torch.cuda.is_current_stream_capturing():\n+            # CUDA-graph capture records a dependency graph; it does not execute\n+            # anything, so there is nothing in flight to serialize against, and a\n+            # dependency on work outside the capture cannot be expressed in the\n+            # graph anyway. Leave the eager bookkeeping untouched.\n+            return\n+        stream = torch.cuda.current_stream(self.device_index)\n+        if self._last_stream is not None:\n+            if self._event is None:\n+                self._event = torch.cuda.Event()",
+      "html_url": "https://github.com/sgl-project/sglang/pull/31135#discussion_r3576827215",
+      "id": 3576827215,
+      "line": 470,
+      "original_line": 470,
+      "path": "python/sglang/srt/distributed/device_communicators/custom_all_reduce_utils.py",
+      "updated_at": "2026-07-14T07:21:25Z",
+      "user": {
+        "login": "gemini-code-assist[bot]"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "CI is blocked on the `run-ci` label, which I can't add as an external contributor\n— could a maintainer apply it (or `/tag-and-rerun-ci`) when convenient?\n\nIn the meantime, everything was validated locally on 2× A100-SXM4-40GB (NVLink):\n\n| arm | before | after |\n|---|---|---|\n| two streams, one communicator (`CustomAllReduceV2`) | deadlock | 200/200 pass |\n| two streams, one communicator (`CustomAllreduce`, ahead-of-time) | deadlock | 220/220 pass |\n| two concurrent CUDA-graph replays, one communicator | deadlock | traps in 2 s with a diagnostic |\n| two *distinct* communicators / NCCL / plain compute (controls) | pass | still pass |\n| new regression test `test_concurrent_issue_on_two_streams` | fails on unpatched | 3 passed in 0.4 s |\n| `pre-commit run --all-files` | — | 26 hooks pass |\n\nPerformance (`bench_custom_all_reduce.py`, just-in-time provider, interleaved A/B ×3):\nmean +0.37%, ~0% at ≥896 KB — a fixed ~30–50 ns per launch. The host-side guard costs\n+0.36 µs on a 31 µs eager all-reduce and **exactly zero under CUDA graphs** (replay makes\nno host call).\n\nHappy to adjust anything — the spin-timeout default, the `__trap()` vs `__assertfail`\nchoice, and making the timeout a compile-time template argument to remove the residual\nper-launch cost are all called out in the description as open questions.\n",
+      "created_at": "2026-07-14T07:24:30Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/31135#issuecomment-4966442044",
+      "id": 4966442044,
+      "updated_at": "2026-07-14T07:24:30Z",
+      "user": {
+        "login": "hanyax"
+      }
+    },
+    {
+      "body": "Thanks @hanyax. Closing this because it has had no updates in 91 days.\n\nReopen it if the work is still relevant.\n\nSome directories moved recently, so an older branch may need retargeting:\n`sgl-kernel/` -> `python/sglang/kernels/aot/`, `python/sglang/jit_kernel/`\n-> `python/sglang/kernels/jit/`, `docs/` -> `docs/docs/` (`.mdx`),\n`bench_serving.py` -> `benchmark/serving.py`, `test/srt/` -> `test/registered/`.",
+      "created_at": "2026-10-14T01:20:59Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/31135#issuecomment-6158744986",
+      "id": 6158744986,
+      "updated_at": "2026-10-14T01:20:59Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 31135,
+  "refs": {
+    "base": {
+      "commit": "afa3c06d1fc9396b13235cfe358ae5a96170feb6",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "66140d97c9d5ba4fa0e949b11c6615b6228e01c6",
+      "repository": "he-actlab/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "## Code Review\n\nThis pull request addresses silent deadlocks in custom all-reduce operations by introducing a `SingleStreamGuard` to serialize operations on the same communicator across different CUDA streams, and a device-side `SpinDeadline` watchdog to bound spin-wait times. The review feedback suggests suppressing an unused variable warning in `custom_all_reduce_pull.cuh` and optimizing the synchronization event in `SingleStreamGuard` by disabling timing overhead.\n\n> [!IMPORTANT]\n> The [consumer version of Gemini Code Assist on GitHub](https://developers.google.com/gemini-code-assist/docs/review-repo-code) is being sunset. Starting **June 18, 2026**, new organization installations will be blocked, and all code review activity will officially cease on **July 17, 2026**.\n> For more details on the timeline and next steps, please review the [Help Documentation](https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review).",
+      "html_url": "https://github.com/sgl-project/sglang/pull/31135#pullrequestreview-4691789615",
+      "id": 4691789615,
+      "state": "COMMENTED",
+      "submitted_at": "2026-07-14T07:21:25Z",
+      "user": {
+        "login": "gemini-code-assist[bot]"
+      }
+    }
+  ]
+}

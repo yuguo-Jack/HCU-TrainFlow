@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: ab1a28486b92adb3702f1289ff3a332cdb74294f
+commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
 path: docs/user-guide/features/dist_optimizer.md
-raw_sha256: 9f1f0ad18cd89a8730a9d9a6bbf91e05f96b1d6e62ccc7c6c93d8cafbe5ffeca
+raw_sha256: 3b1c2ea7abaa7a6ce3dec095b736f23b936e8ad6cb013d6582c0992ae9c6a5e5
 sources: []
-generated_body_sha256: 599bf04668c11c93448d57c16a3deb6557db118f4389c538f5822db270fa8812
+generated_body_sha256: 409d25fc9b1f03027bbce0b37a7d9971e48ca5aafab776fcc1dc502a7d280cbf
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / docs/user-guide/features/dist_optimizer.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/ab1a28486b92adb3702f1289ff3a332cdb74294f/docs/user-guide/features/dist_optimizer.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/features/dist_optimizer.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -48,6 +48,18 @@ Theoretical memory savings depend on the data types of the model parameters (`pa
 | `fp32` parameters, `fp32` gradients       | 16 | 8 + 8/d  |
 
 This distributed optimizer uses contiguous buffers for parameters and main gradients. Model gradients copy into the main gradients as soon as they finish computing.
+
+Models may retain selected parameters in `fp32` alongside `fp16` or `bf16` weights,
+as mHC does. Optimizer checkpoint lookups follow the main-parameter group order
+(native `fp32` shards, then low-precision master shards), independently of the
+order of the parameter and gradient buffers.
+DP-reshardable checkpoints include padding inside the unpadded bucket extent;
+padding added only to divide the buffer across DP ranks is excluded.
+
+Checkpoints written before the mixed-dtype index fix in PR #7336 may already
+associate optimizer state with the wrong parameter in a mixed-dtype group.
+The corrected mapping does not repair affected checkpoint contents; such
+checkpoints need independent validation before resuming training.
 
 The following figures show the sharding scheme and the main steps of the parameter update.
 

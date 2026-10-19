@@ -9,20 +9,20 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e436206da1fe3ec5b8b5da8a06e1c8d6a7e08f149a0079107d83f1d68284e469
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 560336b88b52060544ca76ceb8c9e0b9274472cdea043b76e2a87db467532883
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
 - source: nvidia-megatron-lm
   path: megatron/training/config/common_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 14cebf41822c0e3fdcb9ea560f35f878bc69659b7b0418452b57b08a791aa159
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: e8be4ca3cdb981348734ff2aedb1622dfa30f0e69218d1326ebd6d08703321e3
 kind: authored
 ---
 
@@ -53,13 +53,19 @@ Chrome trace 输出为 TensorBoard 目录相邻 `torch_profile/rank-<rank>.json.
 
 TrainFlow 的区间扫描将同 rank 重叠区间等份归因，作为可检查的排序代理；不是分布式关键路径证明。未归因/CPU/等待留在分母，覆盖不足显示 incomplete，不能偷偷换成 kernel 总时间。使用 TraceLens 的算子关联/collective/overlap 报告补足细节，跨 rank 对齐另保留校时依据。
 
+## Graph 与容量探测的测量边界
+
+full_iteration replay 后仍执行主机数值验证；若比较完整训练步，应把必要检查与同步留在墙钟范围，不能只计图内 kernel 后宣称全部开销消失。首次捕获/编译、验证快照、异步保存及各轮独立计算基准分别标记。
+
+`fake_process_group` 可观察一个进程的容量路径，但真实通信被跳过，不产生多 rank 链路、偏斜、overlap 或模型吞吐的验证结论。TraceLens 的输入仍须来自实际目标环境的完整对应窗口。
+
 ## TraceLens 分析接口
 
 官方工具机制见 [TraceLens Wiki](../../../../tracelens/README.md)。HCU 运行版本的命令、Graph、Replay、Roofline、Agent 与 DTK 输入边界统一见 [TrainFlow 分析契约](../../../../../../docs/tracelens-analysis.md)。本页负责 Megatron 的采样与消费关系，不重复维护 HCU fork 的实现知识。更换工具或 profiler 版本时复核接口和真实原件；理论上限、实测 sustained 参考和同 shape 实测分别保留来源。
 
 ## 固定源码与更新范围
 
-- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/training.py)
-- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/arguments.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/training.py)
+- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/arguments.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。

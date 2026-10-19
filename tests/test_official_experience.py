@@ -101,6 +101,150 @@ def test_pr_sync_resume_does_not_advance_cursor_on_failure(tmp_path,monkeypatch)
     assert json.loads(ledger.read_text())['discovered_through']
 
 
+def mock_pr_sync_retention(monkeypatch):
+    reads=[]; retained=[]
+    def read(store,repo,number,token=None):
+        reads.append(number)
+        return {'number':number}
+    def retain(store,root,result,engine,token=None):
+        retained.append(result['number'])
+        return {'id':'engine-pr-'+str(result['number']),'updated_at':'2026-10-08T00:00:00Z'}
+    monkeypatch.setattr(official,'read_pr',read)
+    monkeypatch.setattr(official,'retain_pr',retain)
+    return reads,retained
+
+
+def test_pr_discovery_resumes_beyond_twenty_pages_before_retaining(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    ledger=root/'knowledge/catalog/pr-ledgers/engine.json'
+    now=official.datetime.now(official.timezone.utc)
+    write_json(ledger,{'records':{
+        '77':{'id':'engine-pr-77','updated_at':'2026-09-01T00:00:00Z',
+              'checked_at':(now-official.timedelta(days=8)).isoformat()},
+        '88':{'id':'engine-pr-88','updated_at':'2026-10-08T00:00:00Z','checked_at':now.isoformat()},
+    },'discovered_through':'2026-09-01T00:00:00Z'})
+    original=ledger.read_bytes();calls=[]
+    def api(repo,suffix,token=None):
+        page=int(suffix.rsplit('=',1)[1]);calls.append(page)
+        numbers=[100+page] if page<=20 else [120,77,88,150,149]
+        return ([{'number':n,'updated_at':'2026-10-08T00:00:00Z'} for n in numbers],
+                '<next>; rel="next"' if page<=20 else '')
+    monkeypatch.setattr(official,'api',api)
+    reads,retained=mock_pr_sync_retention(monkeypatch)
+    first=official.sync_prs(store,root,'engine',max_prs=2,since='2026-10-01T00:00:00Z')
+    state_path=store.root/'wiki/pr-sync/engine.json';checkpoint=read_json(state_path)
+    assert calls==list(range(1,21))
+    assert first['status']=='partial' and first['discovery_pending'] and first['next_page']==21
+    assert first['processed']==[] and reads==retained==[] and ledger.read_bytes()==original
+    assert checkpoint['pending']==list(range(120,100,-1))+[77]
+    assert checkpoint['discovery']=={'status':'in-progress','next_page':21}
+    # No new --since is needed: resume the original window, not a newly
+    # calculated window from the old public ledger cursor.
+    second=official.sync_prs(store,root,'engine',max_prs=2)
+    resumed=read_json(state_path)
+    assert calls==list(range(1,22))
+    assert not second['discovery_pending'] and second['next_page'] is None
+    assert second['scope_since']==checkpoint['since'] and resumed['started']==checkpoint['started']
+    assert second['processed']==[150,149] and 'discovery' not in resumed
+    assert read_json(ledger)['discovered_through']=='2026-09-01T00:00:00Z'
+    monkeypatch.setattr(official,'api',lambda *a: (_ for _ in ()).throw(AssertionError('discovery restarted')))
+    final=official.sync_prs(store,root,'engine',max_prs=100)
+    assert final['status']=='collected-not-reviewed' and final['pending']==0
+    assert reads==retained==[150,149]+list(range(120,100,-1))+[77]
+    assert len(reads)==len(set(reads)) and 88 not in reads
+    assert read_json(ledger)['discovered_through']==checkpoint['started']
+    assert read_json(ledger)['discovery_since']==checkpoint['since']
+
+
+@pytest.mark.parametrize('failure',['http','not-list','invalid-row'])
+def test_pr_discovery_failure_retries_failed_page_without_partial_commit(tmp_path,monkeypatch,failure):
+    root=project(tmp_path);store=Store(tmp_path/'s');calls=[]
+    def broken(repo,suffix,token=None):
+        page=int(suffix.rsplit('=',1)[1]);calls.append(page)
+        if page==1:return [{'number':20,'updated_at':'2026-10-08T00:00:00Z'}],'<next>; rel="next"'
+        if failure=='http':raise OSError('upstream unavailable')
+        if failure=='not-list':return {'message':'unexpected response'},''
+        return [{'number':999,'updated_at':'2026-10-08T00:00:00Z'},
+                {'number':30,'updated_at':'invalid timestamp'}],''
+    monkeypatch.setattr(official,'api',broken)
+    reads,retained=mock_pr_sync_retention(monkeypatch)
+    failed=official.sync_prs(store,root,'engine',since='2026-10-01T00:00:00Z')
+    state_path=store.root/'wiki/pr-sync/engine.json';checkpoint=read_json(state_path)
+    assert calls==[1,2] and failed['discovery_pending'] and failed['next_page']==2
+    assert failed['status']=='partial' and failed['errors'][0]['phase']=='discovery'
+    assert failed['errors'][0]['page']==2 and checkpoint['errors']==failed['errors']
+    assert checkpoint['pending']==[20] and checkpoint['discovery']['next_page']==2
+    assert reads==retained==[] and not (root/'knowledge/catalog/pr-ledgers/engine.json').exists()
+    def recovered(repo,suffix,token=None):
+        page=int(suffix.rsplit('=',1)[1]);calls.append(page)
+        assert page==2
+        return [{'number':30,'updated_at':'2026-10-08T00:00:00Z'}],''
+    monkeypatch.setattr(official,'api',recovered)
+    completed=official.sync_prs(store,root,'engine',max_prs=2)
+    assert calls==[1,2,2] and completed['errors']==[] and not completed['discovery_pending']
+    assert reads==retained==[30,20] and completed['pending']==0
+    state=read_json(state_path)
+    assert state['started']==checkpoint['started'] and state['since']==checkpoint['since']
+    assert 'discovery' not in state and state['errors']==[]
+    ledger=read_json(root/'knowledge/catalog/pr-ledgers/engine.json')
+    assert ledger['discovered_through']==checkpoint['started']
+
+
+def test_pr_discovery_checkpoints_first_request_failure_and_audit_queue(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    ledger=root/'knowledge/catalog/pr-ledgers/engine.json'
+    write_json(ledger,{'records':{'7':{'id':'old-pr','updated_at':'2020-01-01T00:00:00Z'}}})
+    original=ledger.read_bytes()
+    monkeypatch.setattr(official,'api',lambda *a: (_ for _ in ()).throw(FlowError('rate limit')))
+    reads,retained=mock_pr_sync_retention(monkeypatch)
+    result=official.sync_prs(store,root,'engine',since='2026-10-01T00:00:00Z')
+    state=read_json(store.root/'wiki/pr-sync/engine.json')
+    assert result['discovery_pending'] and result['next_page']==1 and result['processed']==[]
+    assert state['pending']==[7] and state['since']=='2026-10-01T00:00:00Z' and state['started']
+    assert reads==retained==[] and ledger.read_bytes()==original
+
+
+def test_pr_discovery_with_empty_queue_still_resumes_until_exhausted(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s');calls=[]
+    ledger=root/'knowledge/catalog/pr-ledgers/engine.json'
+    write_json(ledger,{'records':{'5':{'id':'existing','updated_at':'2026-10-08T00:00:00Z',
+                                    'checked_at':official.utc()}}})
+    original=ledger.read_bytes()
+    def api(repo,suffix,token=None):
+        page=int(suffix.rsplit('=',1)[1]);calls.append(page)
+        if page<=20:return [{'number':5,'updated_at':'2026-10-08T00:00:00Z'}],'<next>; rel="next"'
+        return [],''
+    monkeypatch.setattr(official,'api',api)
+    reads,retained=mock_pr_sync_retention(monkeypatch)
+    first=official.sync_prs(store,root,'engine',since='2026-10-01T00:00:00Z')
+    checkpoint=read_json(store.root/'wiki/pr-sync/engine.json')
+    assert first['pending']==0 and first['status']=='partial' and first['discovery_pending']
+    assert first['next_page']==21 and ledger.read_bytes()==original
+    completed=official.sync_prs(store,root,'engine')
+    assert calls==list(range(1,22)) and not completed['discovery_pending']
+    assert completed['status']=='collected-not-reviewed' and reads==retained==[]
+    assert read_json(ledger)['discovered_through']==checkpoint['started']
+
+
+def test_pr_sync_legacy_pending_state_drains_without_discovery(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'s')
+    state_path=store.root/'wiki/pr-sync/engine.json'
+    legacy={'pending':[1,3,1,2],'started':'2026-10-08T00:00:00+00:00',
+            'since':'2026-10-01T00:00:00Z','errors':[]}
+    write_json(state_path,legacy)
+    monkeypatch.setattr(official,'api',lambda *a: (_ for _ in ()).throw(AssertionError('legacy queue rediscovered')))
+    reads,retained=mock_pr_sync_retention(monkeypatch)
+    first=official.sync_prs(store,root,'engine',max_prs=2)
+    assert first['processed']==[3,2] and first['pending']==1 and not first['discovery_pending']
+    assert read_json(state_path)['pending']==[1]
+    ledger=root/'knowledge/catalog/pr-ledgers/engine.json'
+    assert 'discovered_through' not in read_json(ledger)
+    completed=official.sync_prs(store,root,'engine')
+    assert completed['pending']==0 and reads==retained==[3,2,1]
+    assert read_json(ledger)['discovered_through']==legacy['started']
+    assert read_json(ledger)['discovery_since']==legacy['since']
+
+
 def test_deferred_workflow_stays_pending_on_unchanged_refresh(tmp_path):
     root=project(tmp_path);store=Store(tmp_path/'s')
     (root/'skill.md').write_text('instruction')

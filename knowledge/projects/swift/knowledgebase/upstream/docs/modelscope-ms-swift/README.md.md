@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: modelscope/ms-swift
-commit: 22249748429ce7e8516640e35cbe997e572a233a
+commit: 2efb43ffe61294735be6816abca991fb2ca16011
 path: README.md
-raw_sha256: 4cf3ac10fe15d52a4bbf6886e1d158e10b202f04980a0be3e4050a33ba9fc942
+raw_sha256: c011d9962ce6eb5ad01f7759a748b9f5a1062271d9f563e3061e64d36557ead3
 sources: []
-generated_body_sha256: 8007104981372a11f859c589ec4d734b94c4c262b7b19288b36c96a28e4c7300
+generated_body_sha256: ebfa3e4a29e89e6d24756fc89e53b33cb8126b1698c4acd5805c5226663466e3
 source_state: current-scan
 ---
 
 # modelscope/ms-swift / README.md
 
-[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/README.md)
+[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -105,6 +105,8 @@ You can contact us and communicate with us by adding our group:
 
 
 ## 🎉 News
+- 🔥 2026.10.19: Support for [EmbeddingGemma-2](https://www.modelscope.cn/models/google/embeddinggemma-2) (740M, multimodal embedding model, unifying text/image/video/audio in a single 768d vector space). Inference and training verified with infonce loss fine-tuning.
+- 🔥 2026.10.15: Day-0 Support for [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B](https://www.modelscope.cn/models/nv-community/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16), Refer to the [SFT examples](examples/models/nemotron_super_vl).
 - 🔥 2026.10.01: Support for [Xing4.0-29B-A4B](https://www.modelscope.cn/models/XingChen-AGI/Xing4.0-29B-A4B): transformers-backend training and inference, with LoRA & full-parameter SFT on single/multi-GPU (DDP & DeepSpeed ZeRO-3) and grouped_mm expert acceleration (~3.7x). Refer to the [examples](examples/models/xing4_0).
 - 🔥 2026.09.21: Support for [DeepSeek-V4.1-Flash](https://www.modelscope.cn/models/deepseek-ai/DeepSeek-V4.1-Flash): Megatron-SWIFT full-parameter training (SFT and GRPO) plus vLLM inference. Refer to the [examples](examples/models/deepseek_v41).
 - 🔥 2026.09.01: Support inference and training for the Tencent Hunyuan multimodal embedding model [WeMM-Embedding](https://www.modelscope.cn/models/Tencent-Hunyuan/WeMM-Embedding-2B) (2B/4B/9B), supporting image-text mixed input for vector representation. Refer to [embedding example](examples/train/embedding).

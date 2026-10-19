@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
 path: docs/developer/graph-api.mdx
-raw_sha256: 6bbfc6300243b6ba9234ead990fab86e68b18a185284bf9705c25581d4d5cc4c
+raw_sha256: 70e4a64b5341538895fc178ff027d27ce61e10c051ea5d229b793ad5c9ffa597
 sources: []
-generated_body_sha256: 7f67a49af44b7a70687f6b0ef93f0b4d2d4de51d523ddf11998d2d9bfb132881
+generated_body_sha256: 859cb22554711ba6d851540076777095836c90b11b51aac7032a252b13c456a0
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / docs/developer/graph-api.mdx
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/docs/developer/graph-api.mdx)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/developer/graph-api.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -389,8 +389,8 @@ There are three operation nodes that represent different types of convolutions n
 |  | Input Tensor Attribute Name | Output Tensor Attribute Name |
 | --- | --- | --- |
 | `ConvolutionFwd` | `CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X`, `CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W` | `CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y` |
-| `ConvolutionBwdFilter` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W` |
-| `ConvolutionBwdData` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X` |
+| `ConvolutionBwdFilter` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW` |
+| `ConvolutionBwdData` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W`, `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY` | `CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX` |
 
 The FP8 data type since NVIDIA Ada Lovelace architecture has two variants: `CUDNN_DATA_FP8_E4M3` and `CUDNN_DATA_FP8_E5M2` as I/O data types. Using them as inputs to the operation will result in FP8 Tensor Cores being used. The precision of the accumulation inside the FP8 Tensor Cores is controlled by the compute type, which may have one of two possible values: `CUDNN_DATA_FLOAT` and `CUDNN_DATA_FAST_FLOAT_FOR_FP8`.
 

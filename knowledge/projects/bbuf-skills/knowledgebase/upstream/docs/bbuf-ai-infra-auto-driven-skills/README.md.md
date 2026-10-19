@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: BBuf/AI-Infra-Auto-Driven-SKILLS
-commit: 154cc565d0374746442bac17bd69368b888f4775
+commit: e51089a7b5b25939d5ab6f2216df0ba07be30225
 path: README.md
-raw_sha256: 3f4c7f87ad45e01449eb519a9f2a3fe302867ee221b9a234488d63def1193fff
+raw_sha256: 3b99889424fbaf96c02094b359469873890be51c9580c5c1204f30cc1c51e892
 sources: []
-generated_body_sha256: 8033527935e187523a48f4f0c9ed1a98e30a48e13fee29d9b05497177ebfadde
+generated_body_sha256: 618759bb3cb767c14a653f6c88028c08d16e9edab1a2b709fd96a917b5abeed2
 source_state: current-scan
 ---
 
 # BBuf/AI-Infra-Auto-Driven-SKILLS / README.md
 
-[Original at fixed commit](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/154cc565d0374746442bac17bd69368b888f4775/README.md)
+[Original at fixed commit](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/e51089a7b5b25939d5ab6f2216df0ba07be30225/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -71,7 +71,7 @@ Previous release: [v0.1.0](release-notes/v0.1.0.md).
 | [`sglang-humanize-review`](skills/sglang-humanize-review/) | Review an SGLang PR the way maintainers do, grounded in the full human review corpus. |
 | [`sglang-prod-incident-triage`](skills/sglang-prod-incident-triage/) | Turn queue growth, timeouts, wrong outputs, crashes, or stalls into a replay and the next debug step. |
 | [`model-architecture-diagram`](skills/model-architecture-diagram/) | Return original public architecture diagrams for popular LLM, VLM, MoE, OCR, and diffusion families. |
-| [`sglang-explainer-video`](skills/sglang-explainer-video/) | Turn an SGLang PR number or a technical article into a 1–3 min Chinese explainer video with edge-tts narration, word-synced bilingual captions, and the unified SGLang cover, rendered with HyperFrames. |
+| [`sglang-explainer-video`](skills/sglang-explainer-video/) | Turn an SGLang PR number or a technical article into a Chinese explainer video that fully explains its algorithms and code (length follows the material), with edge-tts narration, word-synced bilingual captions, and the unified SGLang cover, rendered with HyperFrames. |
 
 ## Model PR History
 

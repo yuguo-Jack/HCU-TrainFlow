@@ -14,6 +14,19 @@
 
 无依赖且资源独立的理想 overlap 窗口下界可参考 `max(Tcompute, Tcomm)`，真实数据依赖、启动和资源竞争会抬高下界。此式只用于边界清楚的窗口，不作为整个训练步的理论上限。报告整步时间/吞吐、暴露通信、纯计算与并发计算差异、显存峰值和尾延迟；不要把多个 stream 的时间求和当作端到端时间。
 
+### 1.1 数值协议与后端策略必须一起核对
+
+低精度载荷不能只按 dtype 名和通信字节验收。先确定数据含义、参与 rank 的 scale、求和顺序与最终舍入，再选 oracle 和回退；普通 CAR、通信量化 QR、EP dispatch/combine 分别保留契约。
+
+| 接入点 | 需要查证和验证的差异 |
+| --- | --- |
+| AITER INT8/FP8 AG 与 RS | 当前 AG 保留原始位，RS 则进行数值 SUM：INT8 为 INT32 累加后保留低 8 位；E4M3FN/E5M2 为按源 rank 顺序 FP32 累加后一次非饱和 RNE 转回，不隐含外部 scale。FNUZ 与不满足 custom 准入的 FP8 RS 明确拒绝，原生 RCCL FP8 SUM 不能作为等价兜底。用匹配合同的独立 oracle 覆盖特殊值、溢出、dim、对齐、变化输入及真实 rank 组。 |
+| 原地输出与回退 | 先看准入和真实输出所有权。当前 AITER 的低层 RS 成功写 out 仍返回 None，不支持时也可能返回 None；不能按返回值再调用一次 collective。框架封装返回新 tensor 与底层原地接口分别检查，失败须在修改数据前安全回退或明确报错。 |
+| rocSHMEM 的 host collective 路由 | 按当前消费者固定版本检查策略。新 develop 分节点内/间和 collective 读取 `ROCSHMEM_RCCL_MIN_SIZE_INTRA` / `_INTER`，旧单一变量不再读取，等于阈值也可进入 RCCL；alltoallv 的 device counts 使 size 阈值不适用。team capability、symbol 和组内配置一致性仍有门禁；不要把一套默认阈值固化到所有拓扑或旧消费者。 |
+| EP async、plan 与工作区视图 | 返回 event 不自动取消 host planning、跨 rank 校验或单 in-flight 限制。MoonEP 当前 async 返回完成 event，消费 stream 需要 join；zero-copy 视图仍受 generation/工作区寿命约束。UltraEP 专家副本梯度归并会消费并清零源缓冲，异常后直接重跑并非幂等；优化器前的 grad join、新权重消费前的 weight join 及迭代 flush 分别验收。 |
+
+能力依据从大库 `aiter-int8-fp8-collective-contract`、`rocshmem-hcu-engineering`、`moonep-g1-contributor-capacity` 和 `ultraep-replica-gradient-lifecycle` 进入。以上说明对应版本的检查点，不能当成任意已安装库都支持的能力表。微基准含 copy-in、host 直接绑定或 Graph event 的口径须明确；某 dtype/拓扑的局部收益不推导成模型整步收益。
+
 ## 2. 先调调度与粒度，再判断融合
 
 | 层面 | 重点实验 | 约束 |

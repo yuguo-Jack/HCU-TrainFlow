@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: bde4d001130e5112d984ba99f0546e22c09e1a89
 path: docs/training/sampling_mask.md
-raw_sha256: a87f9da35bc1ad6fedaef5117b31291099c99ff08a8c7ad5bdc46c2160c01dac
+raw_sha256: 67d9e7761d5f08f15a9b17be6d79e08b82c843ca250d3bba70230418c5912ed4
 sources: []
-generated_body_sha256: 730d39fa5bda2c7bbcffc12c334ee4f6fcc50d5cba34e9ebb22c0045bd179c69
+generated_body_sha256: 247800538e237f8364bb6f03eca98c0a05e056f8df9d0676f236bc3e5d9b75de
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/sampling_mask.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/docs/training/sampling_mask.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/sampling_mask.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -167,8 +167,9 @@ Each position then carries the sampled token's logprob and the top-128
   drop them. The finite entries are the sampling mask when it has at most `k`
   tokens.
 - The sampled token is always the first entry and may repeat inside the top-k.
-- `/inference/v1/generate` encodes IDs as `token_id:<id>`; the OpenAI
-  endpoints need `return_tokens_as_token_ids`.
+- The `token_id:<id>` strings come from the OpenAI endpoints with
+  `return_tokens_as_token_ids`; `/inference/v1/generate` returns an integer
+  `token_id` instead.
 
 ## Limitations
 

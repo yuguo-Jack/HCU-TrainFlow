@@ -1,0 +1,405 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "7d4b8b68f467296ffa77cd2269631ae8071054478f8728796c13455ef026e93b",
+      "isPrivate": false,
+      "numbers": [
+        5316,
+        5315,
+        5314,
+        5313,
+        5312,
+        5309,
+        5307,
+        5305
+      ],
+      "observed_at": "2026-10-19T18:04:05.507378+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4919,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "9a14d251c2a3991e5b4c46146dbe297a4241037d",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** The controller called `trainer.forward_backward` on the whole trainer mesh with the step's whole `[num_microbatches][dp_degree]` grid, and each rank kept only its column. Now each trainer DP rank receives only its column. By value (the default), a 2.6 GB step at dp 4 goes from 5.3 to 2.1 s and peak memory per rank from 7.6 to 1.9 GB (CPU Monarch, one host, an earlier version of this PR). With RDMA handles each rank already reads just its column; this shrinks the handle message (41 -> 19 ms per call at dp 2, 1.5 s -> 22 ms with a dp-64 grid sent to 4 ranks on one host), so it matters at high DP.\n\n**Problem**\n1. The batcher packs each step as a `[num_microbatches][dp_degree]` grid: `TrainingMicrobatch`es by value, or `MonarchRDMAMicrobatch` handles (~5 KB each) with the fast path.\n2. The controller calls `trainer.forward_backward` on the whole trainer mesh with the whole grid.\n3. Every rank receives and unpickles every column, then keeps (or reads) only its own.\n4. By value, each rank unpickles dp times the bytes it trains on. With handles, at dp 64 that is 14.4 MB per rank and ~1.5 s per call; at dp 2 it is 0.45 MB.\n\n**Solution**\n1. The trainer lays its ranks out as `(dp, cp, tp)`, and RL rejects PP, so the ranks at one DP rank are `cp * tp` consecutive ranks.\n2. `Controller.setup_async` cuts the trainer mesh into one sub-mesh per DP rank with Monarch's `split`, once. It checks that layout once: each rank reports its DP rank through a new `get_dp_rank` endpoint, and setup raises if a sub-mesh's ranks don't all report its DP rank.\n3. `Controller._trainer_loop` sends one call per DP rank, each with its column, and awaits them together. It reads rank 0's metrics as before.\n4. `Trainer.forward_backward` takes that column, `microbatches: [num_microbatches]` (by value or handles), instead of the grid.\n5. Unchanged: the batcher, the grid, the global loss and routing token counts, the reads, and every other trainer call.\n\n```text\nbefore: trainer[0..3].forward_backward(grid [M][2])               -> each of the 4 ranks receives M x 2 microbatches\nafter:  trainer[0, 1].forward_backward([row[0] for row in grid])  -> M each\n        trainer[2, 3].forward_backward([row[1] for row in grid])  -> M each\n```\n\n**Results**\n\nBy value, CPU Monarch, one host, 2.6 GB step (an earlier version of this PR; a separate run from the RDMA PR's table):\n```text\n               per step         peak memory per rank\ndp 2 x tp 2    5.0 -> 3.0 s     7.6 -> 3.8 GB\ndp 4           5.3 -> 2.1 s     7.6 -> 1.9 GB\n```\nHandles, CPU Monarch, one host, 4 rank processes, 46 microbatches per DP rank, routed expert ids and top-32 logprobs in `model_kwargs`. Bytes are `len(cloudpickle.dumps(...))` of the grid vs one column; the call is a median of 5 to an endpoint that returns `len()`:\n```text\n          handles per rank           call to 4 ranks\ndp        whole grid -> column       whole grid -> column\n2         0.45 MB -> 0.22 MB         41 ms -> 19 ms\n8         1.8 MB  -> 0.22 MB         153 ms -> 16 ms\n32        7.2 MB  -> 0.22 MB         946 ms -> 20 ms\n64        14.4 MB -> 0.22 MB         1475 ms -> 22 ms\n```\n- Summed over dp 64 x tp 4 ranks: 3.7 GB -> 58 MB per step (computed, not measured).\n- These handles carry only TCP contexts; on ibverbs hosts and across hosts each is larger, so these bytes are a lower bound.\n\nGPU, Qwen3-0.6B, H100, batch invariant, lockstep, one TP 1 generator, Monarch 0.7, 5 steps:\n- Trainer DP 2 (3 GPUs), TCP, with RDMA buffers (an earlier version of this stack): `loss/mean` bitwise equal to main's DP 2 run at every step.\n- The previous push of the whole stack, trainer DP 1 (2 GPUs): `loss/mean` with `rdma_min_tensor_bytes=1024` bitwise equal to a by-value run of an earlier push (same config and seed); `timing/trainer/read_microbatches/max` 147, 17, 10, 12, 15 ms at steps 1-5 (step 1 includes RDMA setup).\n\nCPU mesh check: the controller's real setup and `_trainer_loop` code against real Monarch actor meshes, with a fake trainer that has the real DP-rank lines and a collective spanning DP ranks (an earlier version of this PR, same split and layout check):\n- dp 2 x tp 2, dp 4, dp 1 x tp 4, dp 2 x cp 2, and HSDP 2 x 2 x 2 on a 2-level mesh: each rank got exactly its column every step, and rank 0's metrics came from global rank 0.\n- With DP as the innermost dimension, the startup check raised.\n- When one DP rank's call raised, the step raised within 20 ms and the batch release ran once.\n\nYou may ask:\n- **Why not one call per rank?** Each column would be pickled `cp * tp` times on the controller's event loop.\n- **Why slice by layout instead of asking each rank where it belongs?** A Monarch slice needs consecutive ranks anyway; the startup check turns a layout drift into an error instead of silently wrong gradients.\n- **Why scatter handles too?** It's the same code on both paths; a by-value-only scatter would need `forward_backward` to take the grid again (a second signature or a shape branch).\n- **Does it make the controller cheaper?** No: pickling 64 columns costs the same as one grid (0.43 vs 0.42 s at dp 64). It cuts what each rank receives and unpickles.\n\nNOTE:\n- The `cp * tp` ranks at one DP rank still each receive the same column (the read-once-and-broadcast TODO in `Trainer.forward_backward`).\n- The GPU run is DP 2 x TP 1, so one rank sits at each DP rank; the CPU mesh check covers several ranks per DP rank.\n- Not tested on more than one host.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu` (repo root, Monarch 0.7, merged with main): 498 passed, 5 skipped.\n- `test_trainer.py`: `forward_backward` trains a column by value, and a column of `MonarchRDMAMicrobatch`es through the read-ahead prefetcher.\n- GPU parity and the CPU mesh check above.\n\n",
+      "changedFiles": 5,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "82e673c5081eacffd32d3409badce1865edcf46a",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": {
+        "oid": "d67ad137eeaa7932c86a4c5873795feffdf04304"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-15T06:10:13Z",
+      "number": 5309,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "comments",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "\"replica\" is not a great name with FSDP, which shards the params across the dp axis. Could you come up with something more accurate?",
+                  "createdAt": "2026-10-15T04:45:03Z",
+                  "databaseId": 4279095221,
+                  "diffHunk": "@@ -700,6 +702,27 @@ async def setup_async(\n                 ),\n             )\n \n+        # Torch ranks follow this mesh's order and the trainer lays them out as\n+        # (dp, cp, tp) with no PP, so a DP replica is cp * tp consecutive ranks.\n+        trainer_by_dp_rank = self.trainer.flatten(\"rank\").split(\n+            rank=(\"dp\", \"cp_tp\"), dp=self.trainer_dp_degree\n+        )\n+        self._trainer_dp_replicas = [",
+                  "line": null,
+                  "originalLine": 710,
+                  "path": "torchtitan/rl/controller/controller.py",
+                  "updatedAt": "2026-10-15T04:50:24Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279095221"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "seems no change to the `RDMAMicrobatch` path as it's passing by reference anyway",
+                  "createdAt": "2026-10-15T04:50:18Z",
+                  "databaseId": 4279122255,
+                  "diffHunk": "@@ -1177,13 +1200,20 @@ async def _trainer_loop(\n                     # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).\n                     # Sending the MonarchRDMAMicrobatches during the previous optim_step would hide it.\n                     try:\n-                        fwd_bwd_metrics = self._get_rank_0_value(\n-                            await self.trainer.forward_backward.call(\n-                                packed.microbatches,\n-                                packed.global_loss_token_counts,\n-                                packed.global_routing_token_counts,\n+                        # Each DP replica receives only its column of the grid.\n+                        fwd_bwd_results = await asyncio.gather(\n+                            *(\n+                                trainer_dp_replica.forward_backward.call(\n+                                    [row[dp_rank] for row in packed.microbatches],",
+                  "line": 1207,
+                  "originalLine": 1207,
+                  "path": "torchtitan/rl/controller/controller.py",
+                  "updatedAt": "2026-10-15T04:50:24Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279122255"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwNDo1MDoxOFrO_w45Tw==",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5528162251,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-15T04:50:24Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5309#pullrequestreview-5528162251"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude: Renamed to the trainer's existing `dp_rank` vocabulary: `self._trainer_by_dp_rank[i]` is the `cp * tp` trainer ranks at DP rank `i`, and the loop variable is `trainer_at_dp_rank`. The title and body now say \"each trainer DP rank\" too.\n",
+                  "createdAt": "2026-10-15T05:09:09Z",
+                  "databaseId": 4279252188,
+                  "diffHunk": "@@ -700,6 +702,27 @@ async def setup_async(\n                 ),\n             )\n \n+        # Torch ranks follow this mesh's order and the trainer lays them out as\n+        # (dp, cp, tp) with no PP, so a DP replica is cp * tp consecutive ranks.\n+        trainer_by_dp_rank = self.trainer.flatten(\"rank\").split(\n+            rank=(\"dp\", \"cp_tp\"), dp=self.trainer_dp_degree\n+        )\n+        self._trainer_dp_replicas = [",
+                  "line": null,
+                  "originalLine": 710,
+                  "path": "torchtitan/rl/controller/controller.py",
+                  "updatedAt": "2026-10-15T05:09:09Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279252188"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwNTowOTowOVrO_xA03A==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5528389965,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T05:09:09Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5309#pullrequestreview-5528389965"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "reply from claude: Right: with handles each rank already reads only its own column, so here the scatter only shrinks the handle message. I kept one path because it's the same line for both; a by-value-only scatter would need `forward_backward` to take the grid again (a second signature or a shape branch).\nWhat it's worth: by value, 5.3 -> 2.1 s per step at dp 4 (2.6 GB step); with RDMA, 41 -> 19 ms per call at dp 2 and 1.5 s -> 22 ms with a dp-64 grid (4 ranks, one host). So if RDMA becomes the default, this PR matters mainly at high DP.\n",
+                  "createdAt": "2026-10-15T05:09:10Z",
+                  "databaseId": 4279252408,
+                  "diffHunk": "@@ -1177,13 +1200,20 @@ async def _trainer_loop(\n                     # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).\n                     # Sending the MonarchRDMAMicrobatches during the previous optim_step would hide it.\n                     try:\n-                        fwd_bwd_metrics = self._get_rank_0_value(\n-                            await self.trainer.forward_backward.call(\n-                                packed.microbatches,\n-                                packed.global_loss_token_counts,\n-                                packed.global_routing_token_counts,\n+                        # Each DP replica receives only its column of the grid.\n+                        fwd_bwd_results = await asyncio.gather(\n+                            *(\n+                                trainer_dp_replica.forward_backward.call(\n+                                    [row[dp_rank] for row in packed.microbatches],",
+                  "line": 1207,
+                  "originalLine": 1207,
+                  "path": "torchtitan/rl/controller/controller.py",
+                  "updatedAt": "2026-10-15T05:09:11Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279252408"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNVQwNTowOToxMFrO_xA1uA==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5528390226,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T05:09:10Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5309#pullrequestreview-5528390226"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNVQwNTowOToxMFq0MjAyNi0xMC0xNVQwNTowOToxMFrPAAAAAUmEilI=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "MERGED",
+      "title": "[rl] Send each trainer DP rank only its column of the grid",
+      "updatedAt": "2026-10-15T06:10:14Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5309"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "9a14d251c2a3991e5b4c46146dbe297a4241037d"
+    },
+    "body": "**TLDR:** The controller called `trainer.forward_backward` on the whole trainer mesh with the step's whole `[num_microbatches][dp_degree]` grid, and each rank kept only its column. Now each trainer DP rank receives only its column. By value (the default), a 2.6 GB step at dp 4 goes from 5.3 to 2.1 s and peak memory per rank from 7.6 to 1.9 GB (CPU Monarch, one host, an earlier version of this PR). With RDMA handles each rank already reads just its column; this shrinks the handle message (41 -> 19 ms per call at dp 2, 1.5 s -> 22 ms with a dp-64 grid sent to 4 ranks on one host), so it matters at high DP.\n\n**Problem**\n1. The batcher packs each step as a `[num_microbatches][dp_degree]` grid: `TrainingMicrobatch`es by value, or `MonarchRDMAMicrobatch` handles (~5 KB each) with the fast path.\n2. The controller calls `trainer.forward_backward` on the whole trainer mesh with the whole grid.\n3. Every rank receives and unpickles every column, then keeps (or reads) only its own.\n4. By value, each rank unpickles dp times the bytes it trains on. With handles, at dp 64 that is 14.4 MB per rank and ~1.5 s per call; at dp 2 it is 0.45 MB.\n\n**Solution**\n1. The trainer lays its ranks out as `(dp, cp, tp)`, and RL rejects PP, so the ranks at one DP rank are `cp * tp` consecutive ranks.\n2. `Controller.setup_async` cuts the trainer mesh into one sub-mesh per DP rank with Monarch's `split`, once. It checks that layout once: each rank reports its DP rank through a new `get_dp_rank` endpoint, and setup raises if a sub-mesh's ranks don't all report its DP rank.\n3. `Controller._trainer_loop` sends one call per DP rank, each with its column, and awaits them together. It reads rank 0's metrics as before.\n4. `Trainer.forward_backward` takes that column, `microbatches: [num_microbatches]` (by value or handles), instead of the grid.\n5. Unchanged: the batcher, the grid, the global loss and routing token counts, the reads, and every other trainer call.\n\n```text\nbefore: trainer[0..3].forward_backward(grid [M][2])               -> each of the 4 ranks receives M x 2 microbatches\nafter:  trainer[0, 1].forward_backward([row[0] for row in grid])  -> M each\n        trainer[2, 3].forward_backward([row[1] for row in grid])  -> M each\n```\n\n**Results**\n\nBy value, CPU Monarch, one host, 2.6 GB step (an earlier version of this PR; a separate run from the RDMA PR's table):\n```text\n               per step         peak memory per rank\ndp 2 x tp 2    5.0 -> 3.0 s     7.6 -> 3.8 GB\ndp 4           5.3 -> 2.1 s     7.6 -> 1.9 GB\n```\nHandles, CPU Monarch, one host, 4 rank processes, 46 microbatches per DP rank, routed expert ids and top-32 logprobs in `model_kwargs`. Bytes are `len(cloudpickle.dumps(...))` of the grid vs one column; the call is a median of 5 to an endpoint that returns `len()`:\n```text\n          handles per rank           call to 4 ranks\ndp        whole grid -> column       whole grid -> column\n2         0.45 MB -> 0.22 MB         41 ms -> 19 ms\n8         1.8 MB  -> 0.22 MB         153 ms -> 16 ms\n32        7.2 MB  -> 0.22 MB         946 ms -> 20 ms\n64        14.4 MB -> 0.22 MB         1475 ms -> 22 ms\n```\n- Summed over dp 64 x tp 4 ranks: 3.7 GB -> 58 MB per step (computed, not measured).\n- These handles carry only TCP contexts; on ibverbs hosts and across hosts each is larger, so these bytes are a lower bound.\n\nGPU, Qwen3-0.6B, H100, batch invariant, lockstep, one TP 1 generator, Monarch 0.7, 5 steps:\n- Trainer DP 2 (3 GPUs), TCP, with RDMA buffers (an earlier version of this stack): `loss/mean` bitwise equal to main's DP 2 run at every step.\n- The previous push of the whole stack, trainer DP 1 (2 GPUs): `loss/mean` with `rdma_min_tensor_bytes=1024` bitwise equal to a by-value run of an earlier push (same config and seed); `timing/trainer/read_microbatches/max` 147, 17, 10, 12, 15 ms at steps 1-5 (step 1 includes RDMA setup).\n\nCPU mesh check: the controller's real setup and `_trainer_loop` code against real Monarch actor meshes, with a fake trainer that has the real DP-rank lines and a collective spanning DP ranks (an earlier version of this PR, same split and layout check):\n- dp 2 x tp 2, dp 4, dp 1 x tp 4, dp 2 x cp 2, and HSDP 2 x 2 x 2 on a 2-level mesh: each rank got exactly its column every step, and rank 0's metrics came from global rank 0.\n- With DP as the innermost dimension, the startup check raised.\n- When one DP rank's call raised, the step raised within 20 ms and the batch release ran once.\n\nYou may ask:\n- **Why not one call per rank?** Each column would be pickled `cp * tp` times on the controller's event loop.\n- **Why slice by layout instead of asking each rank where it belongs?** A Monarch slice needs consecutive ranks anyway; the startup check turns a layout drift into an error instead of silently wrong gradients.\n- **Why scatter handles too?** It's the same code on both paths; a by-value-only scatter would need `forward_backward` to take the grid again (a second signature or a shape branch).\n- **Does it make the controller cheaper?** No: pickling 64 columns costs the same as one grid (0.43 vs 0.42 s at dp 64). It cuts what each rank receives and unpickles.\n\nNOTE:\n- The `cp * tp` ranks at one DP rank still each receive the same column (the read-once-and-broadcast TODO in `Trainer.forward_backward`).\n- The GPU run is DP 2 x TP 1, so one rank sits at each DP rank; the CPU mesh check covers several ranks per DP rank.\n- Not tested on more than one host.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu` (repo root, Monarch 0.7, merged with main): 498 passed, 5 skipped.\n- `test_trainer.py`: `forward_backward` trains a column by value, and a column of `MonarchRDMAMicrobatch`es through the read-ahead prefetcher.\n- GPU parity and the CPU mesh check above.\n\n",
+    "changed_files": 5,
+    "head": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "82e673c5081eacffd32d3409badce1865edcf46a"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5309",
+    "merge_commit_sha": "d67ad137eeaa7932c86a4c5873795feffdf04304",
+    "merged": true,
+    "merged_at": "2026-10-15T06:10:13Z",
+    "number": 5309,
+    "state": "closed",
+    "title": "[rl] Send each trainer DP rank only its column of the grid",
+    "updated_at": "2026-10-15T06:10:14Z"
+  },
+  "files": [
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/82e673c5081eacffd32d3409badce1865edcf46a/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "changes": 17,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py?ref=82e673c5081eacffd32d3409badce1865edcf46a",
+      "deletions": 9,
+      "filename": "tests/rl/unit_tests/cpu/test_trainer.py",
+      "patch": "@@ -390,10 +390,9 @@ async def run() -> None:\n             advantages=torch.tensor([1.0]),\n         )\n \n-        # This rank (dp_rank 1) reads only its own column.\n-        if rdma:\n-            other_rank = MagicMock(spec=MonarchRDMAMicrobatch)\n-            own = [\n+        # This rank's column (dp_rank 1); with `rdma_min_tensor_bytes` the trainer reads it.\n+        microbatches = (\n+            [\n                 MagicMock(\n                     spec=MonarchRDMAMicrobatch,\n                     read=AsyncMock(return_value=batch),\n@@ -403,12 +402,13 @@ async def run() -> None:\n                 )\n                 for microbatch_index in range(2)\n             ]\n-        else:\n-            other_rank, own = MagicMock(spec=TrainingMicrobatch), [batch, batch]\n+            if rdma\n+            else [batch, batch]\n+        )\n \n         result = await Trainer.forward_backward(\n             trainer,\n-            [[other_rank, own[0]], [other_rank, own[1]]],\n+            microbatches,\n             torch.tensor([3]),\n             torch.tensor([2]),\n         )\n@@ -426,7 +426,6 @@ async def run() -> None:\n             2 * trainer.config.training.num_tokens_per_microbatch_per_dp_rank\n         )\n         if rdma:\n-            other_rank.read.assert_not_called()\n             assert trainer._num_rdma_batches_read == 1\n             # The read time is reported only when there was a read.\n             assert result.pop(\"timing/trainer/read_microbatches/max\") >= 0\n@@ -459,7 +458,7 @@ def test_forward_backward_rejects_a_misplaced_rdma_microbatch(\n     with pytest.raises(ValueError, match=r\"expected \\(0, 1, 0\\)\"):\n         asyncio.run(\n             Trainer.forward_backward(\n-                trainer, [[MagicMock(), wrong]], torch.tensor([1]), torch.tensor([1])\n+                trainer, [wrong], torch.tensor([1]), torch.tensor([1])\n             )\n         )\n     wrong.read.assert_not_called()",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/82e673c5081eacffd32d3409badce1865edcf46a/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer.py",
+      "sha": "1647d507f9d8592f63e3830d0d453bc23ee6037a",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/82e673c5081eacffd32d3409badce1865edcf46a/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer_loop.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer_loop.py?ref=82e673c5081eacffd32d3409badce1865edcf46a",
+      "deletions": 2,
+      "filename": "tests/rl/unit_tests/cpu/test_trainer_loop.py",
+      "patch": "@@ -90,6 +90,8 @@ async def release_active_groups(count, *, reason):\n         optim_step=_Endpoint(optim_step),\n         push_model_state_dict=_Endpoint(push),\n     )\n+    # DP degree 1: every trainer rank is at DP rank 0.\n+    controller._trainer_by_dp_rank = [controller.trainer]\n     controller.generator_router = SimpleNamespace(\n         sync_log_step=_Endpoint(), pull_model_state_dict=_Endpoint(pull)\n     )\n@@ -149,12 +151,13 @@ def test_push_then_pull_then_release_after_each_optimizer_step() -> None:\n     assert events == [\n         \"fwd_bwd 1\",\n         \"optim 1\",\n-        # Step 1's push -> pull -> release starts in the background ...\n-        \"fwd_bwd 2\",\n+        # Step 1's push -> pull -> release starts in the background. The per-DP-rank\n+        # forward_backward calls run as tasks, so with these instant fakes it finishes first ...\n         \"push start\",\n         \"push end\",\n         \"pull 1\",\n         \"release 5 trained\",\n+        \"fwd_bwd 2\",\n         # ... and lands before step 2's optimizer step.\n         \"optim 2\",\n         \"push start\",",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/82e673c5081eacffd32d3409badce1865edcf46a/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_trainer_loop.py",
+      "sha": "56ce4a4dc8343eebe555a9f7ea34a3d57bb1972b",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/82e673c5081eacffd32d3409badce1865edcf46a/torchtitan%2Frl%2Factors%2Fmonarch%2Ftrainer.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Factors%2Fmonarch%2Ftrainer.py?ref=82e673c5081eacffd32d3409badce1865edcf46a",
+      "deletions": 4,
+      "filename": "torchtitan/rl/actors/monarch/trainer.py",
+      "patch": "@@ -28,6 +28,10 @@ async def initialize_torchstore_client(self) -> None:\n     async def get_policy_version(self) -> int:\n         return super().policy_version\n \n+    @concurrent_endpoint\n+    async def get_dp_rank(self) -> int:\n+        return self.dp_rank\n+\n     @concurrent_endpoint\n     async def get_controller_state(self) -> dict[str, Any] | None:\n         return await super().get_controller_state()\n@@ -43,14 +47,12 @@ async def sync_log_step(self, step: int, relative_step: int | None = None) -> No\n     @concurrent_endpoint\n     async def forward_backward(\n         self,\n-        training_data: (\n-            list[list[TrainingMicrobatch]] | list[list[MonarchRDMAMicrobatch]]\n-        ),\n+        microbatches: list[TrainingMicrobatch] | list[MonarchRDMAMicrobatch],\n         global_loss_token_counts: torch.Tensor,\n         global_routing_token_counts: torch.Tensor,\n     ) -> dict[str, float]:\n         return await super().forward_backward(\n-            training_data,\n+            microbatches,\n             global_loss_token_counts,\n             global_routing_token_counts,\n         )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/82e673c5081eacffd32d3409badce1865edcf46a/torchtitan%2Frl%2Factors%2Fmonarch%2Ftrainer.py",
+      "sha": "3dd314da2d7b8814a831aead0f31e679b5408f67",
+      "status": "modified"
+    },
+    {
+      "additions": 35,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/82e673c5081eacffd32d3409badce1865edcf46a/torchtitan%2Frl%2Fcontroller%2Fcontroller.py",
+      "changes": 40,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fcontroller%2Fcontroller.py?ref=82e673c5081eacffd32d3409badce1865edcf46a",
+      "deletions": 5,
+      "filename": "torchtitan/rl/controller/controller.py",
+      "patch": "@@ -419,6 +419,8 @@ def __init__(self, config: Config):\n             apply_overrides(config.override, config)\n         config.maybe_log()\n         self.trainer: Trainer | None = None\n+        # One trainer sub-mesh per DP rank (its cp * tp ranks); set in setup_async.\n+        self._trainer_by_dp_rank = []\n         self.generator_router: InterGeneratorRouter | None = None\n         self.batcher: BatcherActor | None = None\n         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.\n@@ -700,6 +702,27 @@ async def setup_async(\n                 ),\n             )\n \n+        # Torch ranks follow this mesh's order and the trainer lays them out as\n+        # (dp, cp, tp) with no PP, so each DP rank's cp * tp ranks are consecutive.\n+        trainer_dp_cp_tp = self.trainer.flatten(\"rank\").split(\n+            rank=(\"dp\", \"cp_tp\"), dp=self.trainer_dp_degree\n+        )\n+        self._trainer_by_dp_rank = [\n+            trainer_dp_cp_tp.slice(dp=dp_rank)\n+            for dp_rank in range(self.trainer_dp_degree)\n+        ]\n+        # Check that layout once: if it drifts, one TP group's ranks get different columns.\n+        for dp_rank, trainer_at_dp_rank in enumerate(self._trainer_by_dp_rank):\n+            reported_dp_ranks = list(\n+                (await trainer_at_dp_rank.get_dp_rank.call()).values()\n+            )\n+            if set(reported_dp_ranks) != {dp_rank}:\n+                raise RuntimeError(\n+                    f\"Trainer ranks at DP rank {dp_rank} report DP ranks \"\n+                    f\"{reported_dp_ranks}; the controller assumes the trainer orders \"\n+                    \"ranks as (dp, cp, tp).\"\n+                )\n+\n         # Resume: __init__ ran CheckpointManager.load(); read back the restored\n         # policy version and controller-owned data state.\n         rank_0_trainer = self.trainer.flatten(\"rank\").slice(rank=0)\n@@ -1177,13 +1200,20 @@ async def _trainer_loop(\n                     # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).\n                     # Sending the MonarchRDMAMicrobatches during the previous optim_step would hide it.\n                     try:\n-                        fwd_bwd_metrics = self._get_rank_0_value(\n-                            await self.trainer.forward_backward.call(\n-                                packed.microbatches,\n-                                packed.global_loss_token_counts,\n-                                packed.global_routing_token_counts,\n+                        # Send each DP rank only its column of the grid.\n+                        fwd_bwd_results = await asyncio.gather(\n+                            *(\n+                                trainer_at_dp_rank.forward_backward.call(\n+                                    [row[dp_rank] for row in packed.microbatches],\n+                                    packed.global_loss_token_counts,\n+                                    packed.global_routing_token_counts,\n+                                )\n+                                for dp_rank, trainer_at_dp_rank in enumerate(\n+                                    self._trainer_by_dp_rank\n+                                )\n                             )\n                         )\n+                        fwd_bwd_metrics = self._get_rank_0_value(fwd_bwd_results[0])\n                     finally:\n                         # With RDMA, every rank has read its column (or the step failed).\n                         # Not awaited: it would wait behind an in-flight add_group.",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/82e673c5081eacffd32d3409badce1865edcf46a/torchtitan%2Frl%2Fcontroller%2Fcontroller.py",
+      "sha": "af24f93ce363364e122d7be398719b7e14c117f2",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/82e673c5081eacffd32d3409badce1865edcf46a/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "changes": 15,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer%2Ftrainer.py?ref=82e673c5081eacffd32d3409badce1865edcf46a",
+      "deletions": 7,
+      "filename": "torchtitan/rl/trainer/trainer.py",
+      "patch": "@@ -245,33 +245,34 @@ def _reduce_forward_backward_metrics(\n     @sl.log_trace_span(\"forward_backward\")\n     async def forward_backward(\n         self,\n-        training_data: (\n-            list[list[TrainingMicrobatch]] | list[list[MonarchRDMAMicrobatch]]\n-        ),\n+        microbatches: list[TrainingMicrobatch] | list[MonarchRDMAMicrobatch],\n         global_loss_token_counts: torch.Tensor,\n         global_routing_token_counts: torch.Tensor,\n     ) -> dict[str, float]:\n         \"\"\"Run one optimizer step's forward/backward microbatches.\n \n         Args:\n-            training_data: Microbatch-major grid with shape\n-                ``[num_microbatches][dp_degree]``; `MonarchRDMAMicrobatch`es when\n-                `rdma_min_tensor_bytes` is set, read a few microbatches ahead of training.\n+            microbatches: This rank's column of the batcher's `[num_microbatches][dp_degree]` grid;\n+                `MonarchRDMAMicrobatch`es when `rdma_min_tensor_bytes` is set, read a few ahead of training.\n             global_loss_token_counts: Per-objective loss-token counts across the\n                 global batch.\n             global_routing_token_counts: Per-depth non-padding routing-token\n                 counts across the global batch.\n \n         Returns:\n             dict[str, float]: Globally-reduced metrics.\n+\n+        Example:\n+            # dp_degree=2, tp=2, grid = [[mb_00, mb_01], [mb_10, mb_11]]\n+            # ranks 0, 1 (DP rank 0) get microbatches = [mb_00, mb_10]\n+            # ranks 2, 3 (DP rank 1) get microbatches = [mb_01, mb_11]\n         \"\"\"\n         logger.debug(\n             f\"{os.getpid()=} Trainer forward_backward \"\n             f\"policy_version={self.policy_version}\"\n         )\n         engine = self.engine\n         self._step_compute_start = time.perf_counter()\n-        microbatches = [rank_batches[self.dp_rank] for rank_batches in training_data]\n         # The batcher pads every microbatch to the same token count.\n         self._step_num_tokens_per_dp_rank = (\n             len(microbatches)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/82e673c5081eacffd32d3409badce1865edcf46a/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "sha": "9b888647b9b93c06dd6d161613137de9079cab49",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "\"replica\" is not a great name with FSDP, which shards the params across the dp axis. Could you come up with something more accurate?",
+      "created_at": "2026-10-15T04:45:03Z",
+      "diff_hunk": "@@ -700,6 +702,27 @@ async def setup_async(\n                 ),\n             )\n \n+        # Torch ranks follow this mesh's order and the trainer lays them out as\n+        # (dp, cp, tp) with no PP, so a DP replica is cp * tp consecutive ranks.\n+        trainer_by_dp_rank = self.trainer.flatten(\"rank\").split(\n+            rank=(\"dp\", \"cp_tp\"), dp=self.trainer_dp_degree\n+        )\n+        self._trainer_dp_replicas = [",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279095221",
+      "id": 4279095221,
+      "line": null,
+      "original_line": 710,
+      "path": "torchtitan/rl/controller/controller.py",
+      "updated_at": "2026-10-15T04:50:24Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "seems no change to the `RDMAMicrobatch` path as it's passing by reference anyway",
+      "created_at": "2026-10-15T04:50:18Z",
+      "diff_hunk": "@@ -1177,13 +1200,20 @@ async def _trainer_loop(\n                     # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).\n                     # Sending the MonarchRDMAMicrobatches during the previous optim_step would hide it.\n                     try:\n-                        fwd_bwd_metrics = self._get_rank_0_value(\n-                            await self.trainer.forward_backward.call(\n-                                packed.microbatches,\n-                                packed.global_loss_token_counts,\n-                                packed.global_routing_token_counts,\n+                        # Each DP replica receives only its column of the grid.\n+                        fwd_bwd_results = await asyncio.gather(\n+                            *(\n+                                trainer_dp_replica.forward_backward.call(\n+                                    [row[dp_rank] for row in packed.microbatches],",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279122255",
+      "id": 4279122255,
+      "line": 1207,
+      "original_line": 1207,
+      "path": "torchtitan/rl/controller/controller.py",
+      "updated_at": "2026-10-15T04:50:24Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "reply from claude: Renamed to the trainer's existing `dp_rank` vocabulary: `self._trainer_by_dp_rank[i]` is the `cp * tp` trainer ranks at DP rank `i`, and the loop variable is `trainer_at_dp_rank`. The title and body now say \"each trainer DP rank\" too.\n",
+      "created_at": "2026-10-15T05:09:09Z",
+      "diff_hunk": "@@ -700,6 +702,27 @@ async def setup_async(\n                 ),\n             )\n \n+        # Torch ranks follow this mesh's order and the trainer lays them out as\n+        # (dp, cp, tp) with no PP, so a DP replica is cp * tp consecutive ranks.\n+        trainer_by_dp_rank = self.trainer.flatten(\"rank\").split(\n+            rank=(\"dp\", \"cp_tp\"), dp=self.trainer_dp_degree\n+        )\n+        self._trainer_dp_replicas = [",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279252188",
+      "id": 4279252188,
+      "line": null,
+      "original_line": 710,
+      "path": "torchtitan/rl/controller/controller.py",
+      "updated_at": "2026-10-15T05:09:09Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "reply from claude: Right: with handles each rank already reads only its own column, so here the scatter only shrinks the handle message. I kept one path because it's the same line for both; a by-value-only scatter would need `forward_backward` to take the grid again (a second signature or a shape branch).\nWhat it's worth: by value, 5.3 -> 2.1 s per step at dp 4 (2.6 GB step); with RDMA, 41 -> 19 ms per call at dp 2 and 1.5 s -> 22 ms with a dp-64 grid (4 ranks, one host). So if RDMA becomes the default, this PR matters mainly at high DP.\n",
+      "created_at": "2026-10-15T05:09:10Z",
+      "diff_hunk": "@@ -1177,13 +1200,20 @@ async def _trainer_loop(\n                     # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).\n                     # Sending the MonarchRDMAMicrobatches during the previous optim_step would hide it.\n                     try:\n-                        fwd_bwd_metrics = self._get_rank_0_value(\n-                            await self.trainer.forward_backward.call(\n-                                packed.microbatches,\n-                                packed.global_loss_token_counts,\n-                                packed.global_routing_token_counts,\n+                        # Each DP replica receives only its column of the grid.\n+                        fwd_bwd_results = await asyncio.gather(\n+                            *(\n+                                trainer_dp_replica.forward_backward.call(\n+                                    [row[dp_rank] for row in packed.microbatches],",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5309#discussion_r4279252408",
+      "id": 4279252408,
+      "line": 1207,
+      "original_line": 1207,
+      "path": "torchtitan/rl/controller/controller.py",
+      "updated_at": "2026-10-15T05:09:11Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [],
+  "number": 5309,
+  "refs": {
+    "base": {
+      "commit": "9a14d251c2a3991e5b4c46146dbe297a4241037d",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "82e673c5081eacffd32d3409badce1865edcf46a",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "comments",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5309#pullrequestreview-5528162251",
+      "id": 5528162251,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-15T04:50:24Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5309#pullrequestreview-5528389965",
+      "id": 5528389965,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T05:09:09Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5309#pullrequestreview-5528390226",
+      "id": 5528390226,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T05:09:10Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ]
+}

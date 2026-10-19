@@ -1,0 +1,661 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "24cc58bbea791ae4d88fe6a062825139c93f28c7a09c071b6e4e64959d4b2867",
+      "isPrivate": false,
+      "numbers": [
+        7789,
+        7787,
+        7785,
+        7782,
+        7781,
+        7780,
+        7779,
+        7778
+      ],
+      "observed_at": "2026-10-19T18:03:27.632752+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4934,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "c75a269efd3fdf6d82ba5a07fff00ed40f350cba",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "Thanks to @TKONIY for the contribution to this fix.\r\n\r\n- [x] I, the PR author, have personally reviewed every line of this PR.\r\n\r\n## Summary\r\n\r\nThe Triton kernels in `megatron/core/fusions/fused_mla_yarn_rope_apply.py`, which implement the\r\nfused RoPE (`apply_rope_fusion`) of MLA and DSA, compute element offsets in 32 bits:\r\n\r\n- every kernel computes each row's offset with a 32-bit multiply, and\r\n- the packing kernel (`fused_mla_rope_concat`) also computes the head and channel offsets of its\r\n  inputs in 32 bits, although its inputs may have any strides and the absorbed-MLA query it packs\r\n  is head-major.\r\n\r\nOnce an offset reaches `2**31`, the kernel reads (and, for the rows, also writes) at a wrapped\r\noffset, a multiple of `2**32` elements (8 GiB in bf16) before the right place. Nothing reports it:\r\nthe output is silently wrong, and an illegal memory access is raised only when the wrapped address\r\nhappens to be unmapped.\r\n\r\n| Entry point | Caller |\r\n|---|---|\r\n| `fused_apply_mla_rope_for_q` (in place) | MLA query, `multi_latent_attention.py` |\r\n| `fused_apply_mla_rope_for_kv` (key/value split) | MLA key and value, `multi_latent_attention.py` |\r\n| `fused_mla_rope_concat` (packing) | absorbed-MLA query and compressed key/value, `absorbed_mla.py` (the attention module of the DSA layer spec) |\r\n| `fused_mla_rope_inplace(..., rope_first=True)` (in place) | DSA indexer query and key, `dsa.py` |\r\n\r\nEvery other caller of these kernels has the same limits. For GLM-5 (MLA + DSA), counting the\r\ntokens on one context-parallel rank:\r\n\r\n- the DSA indexer query wraps from 524288 tokens at every tensor-parallel size;\r\n- the absorbed-MLA query packing wraps from 58255 tokens at TP 1 (466034 at TP 8) through its\r\n  output rows, and from 66577 tokens at TP 1 (599187 at TP 8) through the heads of `q_absorbed`.\r\n\r\nSo a 1M-token sequence on one context-parallel rank is affected at every TP size, and with CP 8 the\r\nabsorbed query is still wrong at TP 1 and 2.\r\n\r\nThis PR makes the row index 64-bit in all six kernels and the head and channel indices 64-bit in\r\nthe packing forward kernel, and adds GPU regression tests that fail without the fix.\r\n\r\n## Root cause\r\n\r\n### 1. Row offsets (all six kernels)\r\n\r\nEvery kernel in the file addresses its row as `X + pid_m * stride_seq`, for example in the\r\nin-place forward kernel:\r\n\r\n```python\r\npid_m = tl.program_id(axis=0)                                       # int32\r\n...\r\nQ = Q + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads\r\n```\r\n\r\n`tl.program_id` returns int32, and Triton specializes an integer kernel argument whose value is\r\nbelow `2**31`, such as `stride_x_seq`, to int32 as well. The product is therefore computed in 32\r\nbits and only then sign-extended into the 64-bit pointer offset. Compiled for the DSA indexer query\r\ncall (THD, `rope_first=True`, `[t, 32, 128]`):\r\n\r\n```\r\n%Q_32 = arith.muli %pid_m, %stride_x_seq : i32\r\n%Q_33 = tt.addptr %Q, %Q_32 : !tt.ptr<bf16>, i32\r\nPTX:   mul.lo.s32   %r11, %r6, %r5           // stride_x_seq * ctaid.x, wraps\r\n       mad.wide.s32 %rd34, %r11, 2, %rd17    // Q + sign_extend(offset) * 2 bytes\r\n```\r\n\r\nThe same kernel already widens `pid_m` to 64 bits for its token-index lookup in `cu_seqlens_q`,\r\nbut not for the row offset. So the first wrapped row is `ceil(2**31 / elements_per_row)`: row `r`\r\nis addressed correctly only while `r * elements_per_row < 2**31`. The in-place backward kernel adds\r\nthe head-block offset to the row offset in the same 32-bit sum\r\n(`row_off = pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads`), so when\r\n`elements_per_row` does not divide `2**31`, the higher heads of the row just below that one wrap as\r\nwell (for the 128-head MLA query below: gradient rows 87381 and 87382). The GLM-5 rows of 4096 and\r\n16384 elements divide `2**31`. Grid limits play no part: the grid is\r\n`(rows, cdiv(heads, BLOCK_H))`, and `gridDim.x` allows `2**31 - 1` programs.\r\n\r\nWorked example, the GLM-5 DSA indexer query (32 heads x 128 channels = 4096 elements per row):\r\n\r\n| Row | True offset (elements) | int32 offset | Where the program reads and writes |\r\n|---|---|---|---|\r\n| 524287 | 2147479552 = `2**31 - 4096` | 2147479552 | in place (the last correct row) |\r\n| 524288 | 2147483648 = `2**31` | -2147483648 | `2**31` elements (4 GiB in bf16) **before** the start of the tensor |\r\n| 524289 | 2147487744 | -2147479552 | 8 KiB above that |\r\n| 1048575 | 4294963200 = `2**32 - 4096` | -4096 | the last row before the tensor |\r\n\r\nEvery wrapped row is addressed a multiple of `2**32` elements before its place: first below the\r\ntensor, and once the offsets pass `2**32`, onto earlier rows of the same tensor.\r\n\r\n### 2. Head and channel offsets of the packing inputs\r\n\r\n`fused_mla_rope_concat` documents that its inputs \"may use arbitrary input strides\", and its\r\nforward kernel adds the head and channel offsets to the row pointer in 32 bits:\r\n\r\n```python\r\nhead_idx = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)                 # int32\r\nnope_idx = tl.arange(0, NOPE_BLOCK)                                    # int32\r\nnope_offsets = head_idx[:, None] * stride_nope_head + nope_idx[None, :] * stride_nope_dim\r\nnope = tl.load(nope_row + nope_offsets, mask=nope_mask)\r\n```\r\n\r\nThe absorbed-MLA module passes it a head-major tensor. In `absorbed_mla.py`:\r\n\r\n```python\r\nq_absorbed = torch.einsum(\"...nd,ndk->...nk\", q_no_pe, k_up_weight)  # [t, n, 512]\r\nq_absorbed = fused_mla_rope_concat(q_absorbed, q_pos_emb, ...)\r\n```\r\n\r\n`einsum` computes this as a matmul batched over the heads, so its output keeps the heads outermost:\r\nstrides `(512, t * 512, 1)`. Head `h` therefore starts at element `h * t * 512`. Compiled for this\r\ncall, the head offset is `arith.muli %nope_offsets, %nope_offsets_22 : tensor<8x1xi32>` followed by\r\n`tt.addptr ... tensor<8x512xi32>`, so it wraps once `h * t * 512 + 511 >= 2**31`, for every token,\r\nlong before the rows of `q_absorbed` do. Worked example, GLM-5 at TP 8 (8 heads) with 1M tokens on\r\none context-parallel rank (`t = 2**20`, head stride `2**29`):\r\n\r\n| Head | True start (elements) | int32 offset | Where the program reads |\r\n|---|---|---|---|\r\n| 3 | 1610612736 = `3 * 2**29` | 1610612736 | in place |\r\n| 4 | 2147483648 = `2**31` | -2147483648 | 4 GiB (bf16) below the start of `q_absorbed` |\r\n| 5 | 2684354560 | -1610612736 | 3 GiB below the start |\r\n| 6 | 3221225472 | -1073741824 | 2 GiB below the start |\r\n| 7 | 3758096384 | -536870912 | 1 GiB below the start |\r\n\r\nEach wrapped head is read `2**32` elements (8 GiB) before its place. The RoPE input (`q_pos_emb`, a\r\nview of the row-major query) and the packed output are head-minor and stay in range. The channel\r\noffsets would wrap the same way for an input whose channels are outermost in memory; no caller\r\npasses one, but the kernel accepts it.\r\n\r\n### Why it is silent, and when it crashes\r\n\r\n- The wrapped rows are left unrotated, and the memory at the wrapped offsets is rotated or\r\n  overwritten in their place. Nothing checks the address.\r\n- When an in-place kernel autotunes (on its first call in a process), the autotuner's\r\n  `restore_value` copy of the input was placed right below the input in our runs. The wrapped\r\n  writes land in that copy, which is copied back afterwards, so rows *below* the limit come back\r\n  corrupted as well. A CUDA caching-allocator trace of a 524289-row indexer query shows this: the\r\n  autotuner's two restore copies lie at [-8.81, -4.81) and [-4.78, -0.78) GiB relative to the\r\n  input, row 524288 is accessed at -4.00 GiB, inside the second copy at its row 102400, and after\r\n  the copy-back row 102400 of the input comes back wrong.\r\n- Otherwise the wrapped accesses hit whatever tensor lies below, for example a gradient buffer,\r\n  and an illegal memory access is raised only when they reach unmapped memory. A trace of a\r\n  1048576-row indexer query faulted because its restore copy lay at [-9, -1) GiB, so the wrapped\r\n  range [-4, 0) GiB reached the unmapped gap above it.\r\n- The wrapped heads of `q_absorbed` are only read: the packed query gets whatever lies there in\r\n  those heads, without an error, or the read faults.\r\n\r\nMeasured on B200 (Triton 3.6.0, torch 2.11). Each case runs in a fresh process, with the arguments\r\nthe Core caller passes (`q_absorbed` as the `einsum` output), on one THD sequence in bf16. Every\r\noutput and gradient row is compared bitwise with the same call on chunks of at most 4096 tokens.\r\n\"First call\" means the large call autotunes; \"tuned\" means the op (and its backward) ran on a\r\n16-token input first, which is the state after the first call of a process.\r\n\r\n| Call (tokens per rank) | Pass | `dev` (`ac100f773`) | This PR |\r\n|---|---|---|---|\r\n| GLM-5 DSA indexer query (524288, exactly `2**31` elements) | fwd, first call | correct | correct |\r\n| GLM-5 DSA indexer query (524289) | fwd, first call | wrong: rows 524288 and 237568, no error | correct |\r\n| GLM-5 DSA indexer query (524289) | fwd, tuned | illegal memory access | correct |\r\n| GLM-5 DSA indexer query (1048576) | fwd, first call | wrong: all 524288 rows from 524288, no error | correct |\r\n| GLM-5 DSA indexer query (1048576) | fwd + bwd, tuned | wrong: 524288 output rows and 524288 gradient rows, no error | correct (1) |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (58255) | fwd, first call | correct | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (58256) | fwd + bwd, first call | illegal memory access | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (58256) | fwd + bwd, tuned | wrong: token 58255 of the output and of both input gradients, no error | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (66577 and 131072) | fwd, first call | illegal memory access | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 2 (262144) and TP 4 (524288) | fwd, first call | illegal memory access | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 8 (1048576) | fwd, first call; fwd + bwd, tuned | illegal memory access | correct |\r\n| MLA query, 128 x 192 (87382) | fwd, first call | correct | correct |\r\n| MLA query, 128 x 192 (87383) | fwd, first call | wrong: row 87382 and 2 rows below the limit, no error | correct |\r\n| MLA query, 128 x 192 (87383) | fwd + bwd, tuned | wrong: output row 87382, gradient rows 87381 and 87382, no error | correct (1) |\r\n| MLA key/value split, 128 x 256 (65536) | fwd, first call | correct | correct |\r\n| MLA key/value split, 128 x 256 (65537) | fwd + bwd, first call / tuned | illegal memory access | correct |\r\n\r\nWith only the `pid_m` change, the absorbed query is still wrong through its heads: correct at 66576\r\ntokens (TP 1), but head 63 of every token wrong at 66577, heads 32-63 at 131072 (TP 1), heads 8-15\r\nat 524288 (TP 4), all without an error, and illegal memory accesses at 262144 (TP 2) and 1048576\r\n(TP 8).\r\n\r\n(1) The in-place backward with `remove_interleaving=False` (as the DSA indexer and the MLA query\r\ncall it) also has a separate ordering race when the autotuner picks `BLOCK_H=2`, fixed in its own\r\nPR (see Notes for reviewers). In runs where the autotuner picked `BLOCK_H=2`, scattered gradient\r\nrows were wrong at any length (also at 262144 tokens, where no offset comes near `2**31`), with\r\nthis PR alone; with both PRs they are correct. The results above are from runs that picked other\r\nvalues.\r\n\r\n### When it triggers\r\n\r\nThe limits count the tokens of one call on one GPU: the tokens on one context-parallel rank\r\n(sequence length / CP size, also with the load-balanced zigzag split) for THD inputs, and\r\n`seq * micro_batch` for SBHD inputs. Tensor parallelism divides the attention heads, and with them\r\nthe elements per row and the heads of `q_absorbed`, but not the DSA indexer heads, which every TP\r\nrank holds in full.\r\n\r\n| Tensor (per GPU) | What wraps | First wrapped token |\r\n|---|---|---|\r\n| GLM-5 DSA indexer query `[t, 32, 128]` | rows of 4096 elements | 524288 (any TP) |\r\n| GLM-5 absorbed-MLA query packing output `[t, 64/TP, 512 + 64]` | rows of 36864 / TP elements | 58255 (TP 1), 116509 (TP 2), 233017 (TP 4), 466034 (TP 8) |\r\n| GLM-5 `q_absorbed` `[t, 64/TP, 512]`, strides `(512, t * 512, 1)` | head `64/TP - 1`, at element `(64/TP - 1) * t * 512` | 66577 (TP 1), 135301 (TP 2), 279621 (TP 4), 599187 (TP 8) |\r\n| MLA query, 128 heads of 128 + 64 `[t, 128, 192]` | rows of 24576 elements | 87382 (TP 1) |\r\n| MLA key/value split input, 128 heads of 128 + 128 `[t, 128, 256]` | rows of 32768 elements | 65536 (TP 1) |\r\n| Absorbed-MLA packing output, 128 heads of 512 + 64 `[t, 128, 576]` | rows of 73728 elements | 29128 (TP 1) |\r\n| DSA indexer query, 64 heads of 128 `[t, 64, 128]` | rows of 8192 elements | 262144 (any TP) |\r\n\r\nGLM-5: 64 attention heads, `qk_nope_head_dim` 192, `qk_rope_head_dim` 64, `kv_lora_rank` 512, 32\r\nindexer heads of 128 channels. For a 1M-token GLM-5 sequence:\r\n\r\n| CP size | Tokens per rank | DSA indexer query wraps | Packing output wraps | `q_absorbed` heads wrap |\r\n|---|---|---|---|---|\r\n| 1 | 1048576 | yes | at TP 1, 2, 4 and 8 | at TP 1, 2, 4 and 8 (TP 8: heads 4-7) |\r\n| 2 | 524288 | no (exactly `2**31` elements) | at TP 1, 2, 4 and 8 | at TP 1, 2 and 4 (TP 4: heads 8-15) |\r\n| 4 | 262144 | no | at TP 1, 2 and 4 | at TP 1 and 2 (TP 2: heads 16-31) |\r\n| 8 | 131072 | no | at TP 1 and 2 | at TP 1 (heads 32-63) |\r\n\r\n### How it was found\r\n\r\nIn long-sequence tests (sequences of up to 1M tokens), a fused RoPE call on a long local sequence\r\nfailed with an illegal memory access. Checking every output row then showed silently wrong rows at\r\nshorter lengths that did not fail. The head offsets of `q_absorbed` showed up when the packing was\r\nchecked with `q_absorbed` in the layout the absorbed-MLA module passes (the `einsum` output) rather\r\nthan as a contiguous copy. All examples here were reproduced with the MLA and DSA entry points.\r\n\r\n## Fix\r\n\r\nIn each of the six kernels (in-place forward and backward, packing forward and backward,\r\nkey/value split forward and backward):\r\n\r\n```python\r\n# Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\r\npid_m = tl.program_id(axis=0).to(tl.int64)\r\n```\r\n\r\nand in the packing forward kernel:\r\n\r\n```python\r\n# The inputs may have any strides, and the absorbed MLA query (an einsum output) is\r\n# head-major, so head and channel offsets can pass 2**31 too; keep these indices 64-bit.\r\nhead_idx = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)\r\n...\r\nnope_idx = tl.arange(0, NOPE_BLOCK).to(tl.int64)\r\n...\r\nrope_idx = tl.arange(0, ROT_BLOCK).to(tl.int64)\r\n```\r\n\r\n### Why it is correct and complete\r\n\r\n- Every row offset in these kernels is derived from `pid_m`: the row pointers of all inputs,\r\n  outputs and gradients, and in SBHD layouts `pid_m // batch_size` and `pid_m % batch_size`. With\r\n  `pid_m` in int64 they are all computed in 64 bits. For the indexer call above the row offset now\r\n  compiles to `arith.muli %pid_m_2, %Q_32 : i64` and `tt.addptr %Q, %Q_33 : !tt.ptr<bf16>, i64`\r\n  (PTX `mul.lo.s64`).\r\n- In the packing forward kernel every other offset is a head, channel or RoPE-pair index times a\r\n  stride, and all three indices are now int64, so every offset into its inputs and its output is\r\n  computed in 64 bits whatever the strides. For the `q_absorbed` call the head offset now compiles\r\n  to `arith.muli %nope_offsets, %nope_offsets_25 : tensor<8x1xi64>` and\r\n  `tt.addptr %nope, %nope_offsets_29 : tensor<8x512x!tt.ptr<bf16>>, tensor<8x512xi64>`.\r\n- The other five kernels address `[rows, heads, channels]` tensors with unit channel stride (their\r\n  wrappers assert it or make the tensor contiguous) whose heads lie within each row: the\r\n  activations the MLA and DSA callers pass (linear-layer outputs) and their gradients, and the\r\n  tensors the wrappers allocate. Their head and channel offsets therefore stay below one row of a\r\n  tensor. The cos/sin offsets are a position times the table's row stride.\r\n- These six are all the kernels in the file; its two `@triton.jit` helpers, which map a THD row to\r\n  its token position, already work in 64 bits. The regression tests cover all three entry points,\r\n  forward and backward, and head-major and channel-major packing inputs; each of the three index\r\n  changes in the packing kernel is needed for one of them to pass.\r\n\r\n### What it does not change\r\n\r\n- Below the limits the results are bitwise identical at the same `BLOCK_H`, apart from last-bit\r\n  FMA-contraction differences in the packing kernel at `BLOCK_H=128` (see Tests).\r\n- Kernel times are unchanged within 1%, except the packing of the one-head compressed key/value,\r\n  which is about 1.7% slower (see Tests).\r\n- No API, argument, autotuning or launch change.\r\n\r\nAlternatives considered: widening each offset expression instead of the indices gives the same\r\nresults for a larger diff; chunking on the host would need a row-offset argument for the zigzag\r\ncontext-parallel and `position_ids` paths, and making `q_absorbed` contiguous before packing would\r\ncost an extra read and write of it.\r\n\r\n## Tests and results\r\n\r\nNew tests in `tests/unit_tests/fusions/test_mla_yarn_rope_apply.py`. Like their neighbours they\r\nare `experimental` and `internal` and skip on torch < 2.5 or without CUDA; each also skips without\r\nenough free GPU memory.\r\n\r\n- `test_mla_rope_inplace_rows_past_int32_element_offsets[mla_query, dsa_indexer_query]`, about\r\n  9 GiB: an MLA query of 64 heads of 192 + 64 channels and a DSA indexer query of 32 heads of 128\r\n  channels with `rope_first=True` (the GLM-5 shapes at TP 1), 16 rows past the limit. It runs the\r\n  in-place forward kernel and then the in-place backward kernel (`mla_rope_unapply_raw`). The 32\r\n  rows around the limit must match, bitwise, the same rows rotated as a small tensor. The input is\r\n  carved out of a buffer twice its size, and the guard rows below it must stay untouched, so a\r\n  wrapped write fails as an assertion instead of an illegal memory access.\r\n- `test_mla_rope_kv_split_rows_past_int32_element_offsets`, about 19 GiB: MLA key/value split,\r\n  128 heads of 128 + 128 channels, 65552 rows, forward and backward, bitwise against the\r\n  small-tensor result.\r\n- `test_mla_rope_concat_rows_past_int32_element_offsets`, about 19 GiB: absorbed-MLA packing,\r\n  128 heads of 512 + 64 channels, 32784 rows (the output wraps from 29128), forward and backward.\r\n- `test_mla_rope_concat_strided_inputs_past_int32_element_offsets[head_major, channel_major]`,\r\n  about 9 GiB: packing of 64 heads of 512 + 64 channels whose inputs are the first 16 rows of\r\n  tensors of just over `2**31` elements with the heads (as in `q_absorbed`) or the channels\r\n  outermost in memory, sized so that the last heads (or channels) start past `2**31`. The output\r\n  must match, bitwise, the same rows packed from contiguous copies.\r\n\r\nResults on B200 (Triton 3.6.0, torch 2.11.0+cu130), one pytest process per test:\r\n\r\n| Test | `ac100f773` + new tests only | This PR |\r\n|---|---|---|\r\n| `inplace...[mla_query]` | **failed**: 64819 of 524288 elements differ (the 16 wrapped rows) | passed |\r\n| `inplace...[dsa_indexer_query]` | **failed**: 32466 of 131072 elements differ (the 16 wrapped rows) | passed |\r\n| `kv_split...` | **failed**: illegal memory access | passed |\r\n| `concat_rows...` | **failed**: illegal memory access | passed |\r\n| `concat_strided_inputs...[head_major]` | **failed**: illegal memory access | passed |\r\n| `concat_strided_inputs...[channel_major]` | **failed**: illegal memory access | passed |\r\n\r\nWith only the `pid_m` change, the first four pass and both strided cases still fail; with the head\r\nindex widened but not the channel indices, `channel_major` still fails; with all but the RoPE-pair\r\nindex, `channel_major` still fails.\r\n\r\nRun separately for each kernel, the in-place check fails for both the forward and the backward\r\nkernel on the unfixed tree: exactly the 16 rows from the limit differ, and the guard rows below the\r\ninput are overwritten. With the fix, no row differs and the guard is untouched.\r\n\r\nExisting tests, compared per test (JUnit) before and after:\r\n`tests/unit_tests/fusions/test_mla_yarn_rope_apply.py` and\r\n`tests/unit_tests/transformer/experimental_attention_variant/test_csa_cp_utils.py` (a\r\ncontext-parallel RoPE wrapper that also calls these kernels), in CI's two dev passes plus the\r\n`flaky_in_dev` tests:\r\n\r\n| Pass | `ac100f773` | This PR |\r\n|---|---|---|\r\n| prod (`not experimental and not flaky_in_dev`) | 17 passed, 1 skipped | 17 passed, 1 skipped |\r\n| experimental (`--experimental`, `experimental and not flaky_in_dev`) | 24 passed | 30 passed (the 24 plus the 6 new cases) |\r\n| `flaky_in_dev` (includes the main forward/backward test of the in-place kernels) | 4 passed | 4 passed |\r\n\r\nNo existing test changed its outcome. The skipped test needs two ranks.\r\n\r\nBelow the limits the fixed kernels give the same results as before. With the old module's\r\nautotuned `BLOCK_H` forced on both modules (the result legitimately depends on `BLOCK_H` in the\r\nlast bit), on GLM-5 shapes:\r\n\r\n| Case | BLOCK_H | Bitwise | new / old time |\r\n|---|---|---|---|\r\n| DSA indexer query fwd, 262144 x 32 x 128 | 8 | equal | 0.999 |\r\n| DSA indexer query bwd, 262144 x 32 x 128 | 4 | equal | 1.001 |\r\n| MLA query fwd, 65536 x 64 x 256 | 8 | equal | 1.000 |\r\n| MLA query bwd, 65536 x 64 x 256 | 4 | equal | 1.001 |\r\n| absorbed-MLA query packing fwd, 32768 x 64 x (512 + 64) | 8 | equal | 0.992 |\r\n| absorbed-MLA query packing bwd, 32768 x 64 x (512 + 64) | 8 | equal | - |\r\n\r\nFor the packing forward kernel, every `BLOCK_H` was run on both modules: the outputs are bitwise\r\nequal at every `BLOCK_H`, and the fastest configuration of each module (the autotuner's choice)\r\ncompares as follows:\r\n\r\n| Packing forward case | old (best `BLOCK_H`) | new (best `BLOCK_H`) | new / old |\r\n|---|---|---|---|\r\n| `q_absorbed` as the einsum output, 32768 x 64 x 512 (TP 1) | 751.9 us (8) | 747.4 us (8) | 0.994 |\r\n| `q_absorbed` contiguous, 32768 x 64 x 512 (TP 1) | 775.9 us (8) | 769.3 us (8) | 0.991 |\r\n| `q_absorbed` as the einsum output, 131072 x 8 x 512 (TP 8) | 365.6 us (8) | 363.3 us (8) | 0.994 |\r\n| `q_absorbed` contiguous, 131072 x 8 x 512 (TP 8) | 363.2 us (8) | 364.6 us (8) | 1.004 |\r\n| compressed key/value, 262144 x 1 x 512 | 145.8 us (2) | 148.3 us (1) | 1.017 |\r\n\r\nTimes are `triton.testing.do_bench` with an L2 flush before every repetition, median of 5 (7 for\r\nthe second table). The compressed key/value packing does little work per program (one head of 576\r\nchannels), so the few extra 64-bit address instructions show; it is about 2.5 us per call at\r\n262144 tokens.\r\n\r\nA broader comparison of the two versions of the kernel file covered 2182 checks: every entry\r\npoint, forward and backward, SBHD and THD layouts, zigzag context parallelism, `position_ids`, both\r\n`remove_interleaving` and `rope_first` values, bf16 and fp32, every `BLOCK_H`, strided packing\r\ninputs, and the largest inputs that do not overflow (at `BLOCK_H` 16 and 128). 2168 were bitwise\r\nequal. Five checks of the packing kernel at `BLOCK_H=128` differ in the last bit, because the\r\ncompiler contracts multiply-adds into FMAs differently; the error against fp64 is the same, and\r\nthe autotuner picked `BLOCK_H` 8 or 16 for the packing kernel on large inputs in our runs. Nine\r\nchecks were not compared because they are nondeterministic in both versions: the in-place backward\r\nwith `remove_interleaving=False` at `BLOCK_H=2`, the race that #7789\r\nfixes.\r\n\r\nLint: black (the repo's black 26 configuration) and isort pass on both files; `git diff --check` is\r\nclean; no added line exceeds 100 columns.\r\n\r\n## Risk and compatibility\r\n\r\n- The kernel changes are the types of `pid_m` (all six kernels) and of the head, channel and\r\n  RoPE-pair indices (packing forward). Below the limits, results are bitwise identical at the same\r\n  `BLOCK_H`, apart from the last-bit FMA-contraction differences in the packing kernel at\r\n  `BLOCK_H=128` described above.\r\n- No API, configuration or checkpoint change. Inputs below the limits behave as before; larger\r\n  inputs, which were silently wrong or crashed, are now correct.\r\n- The new tests need about 9 GiB (in place, strided packing) and 19 GiB (key/value split, row\r\n  packing) of free GPU memory and skip otherwise. Together they take about 35 s on B200.\r\n\r\n## Notes for reviewers\r\n\r\n- The in-place test uses `remove_interleaving=True`, while the MLA query and DSA indexer callers\r\n  use `False`. The row offset does not depend on the channel layout, and with `True` every rotated\r\n  pair is written back to the slots it was read from, so the result does not depend on how a\r\n  program orders its loads and stores. The `remove_interleaving=False` in-place kernels have a\r\n  separate ordering race at `BLOCK_H=2`, which #7789 fixes.\r\n- #7789, #7803 (key/value split for non-power-of-two head dims) and #7806 (binary search for the\r\n  THD row lookup) change the same two files at different lines. The four PRs apply without\r\n  conflicts, and on the combined tree every test of the four passes. None of them depends on\r\n  another; #7806 should be merged after #7789.\r\n- The key/value split test uses 128 heads of 128 + 128 channels because the key/value split kernel\r\n  needs power-of-two key and value head dims (`tl.arange`). GLM-5's 192 / 256 cannot use it, and\r\n  its DSA layers use the absorbed-MLA packing instead. That limitation is unrelated to this PR; #7803 fixes it.\r\n- The strided packing test allocates inputs of just over `2**31` elements but packs only their\r\n  first 16 rows, so its output stays small. The two calls it compares share the autotuned\r\n  `BLOCK_H`, so they are compared bitwise.\r\n\r\n## Pre-checks\r\n\r\n- [x] I have added relevant unit tests (GPU tests that fail without the fix; they skip without enough free GPU memory)\r\n- [ ] I have added relevant functional tests (not applicable)\r\n- [x] I have added proper typing to my code (no new Python API)\r\n- [ ] I have added relevant documentation (not applicable)\r\n- [x] I have run the autoformatter.sh on my PR (its checks in check mode on the two changed files,\r\n      with the repository settings: `black` and `isort` leave them unchanged, `ruff` passes,\r\n      `pylint` rates them 10.00/10, and `git diff --check` is clean)\r\n\r\nLinked issue: none (bug fix).\r\n\r\n## Reviewers\r\n\r\ncc @hxbai @buptzyb @yuzhongw-nvidia, could you please take a look?\r\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+            "createdAt": "2026-10-01T14:23:18Z",
+            "databaseId": 5933443751,
+            "updatedAt": "2026-10-01T14:23:18Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-5933443751"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Heisenberg-Yin"
+            },
+            "body": "Thanks @TKONIY for the contribution to this fix! (added as co-author)\n\ncc @hxbai @buptzyb @yuzhongw-nvidia, this fixes 32-bit row offset overflow in the fused MLA/DSA RoPE Triton kernels for inputs with 2**31 or more elements. Could you please take a look? Thanks!",
+            "createdAt": "2026-10-01T14:28:22Z",
+            "databaseId": 5933533074,
+            "updatedAt": "2026-10-01T14:28:22Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-5933533074"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yaox12"
+            },
+            "body": "/ok to test 2550027432b2f32437d6c4cb30614539c456d950",
+            "createdAt": "2026-10-14T09:45:52Z",
+            "databaseId": 6165535098,
+            "updatedAt": "2026-10-14T09:45:52Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-6165535098"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yaox12"
+            },
+            "body": "/review model=claude mode=strict",
+            "createdAt": "2026-10-14T09:46:04Z",
+            "databaseId": 6165538451,
+            "updatedAt": "2026-10-14T09:46:04Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-6165538451"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW9-ppM=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "2550027432b2f32437d6c4cb30614539c456d950",
+      "headRepository": {
+        "nameWithOwner": "Heisenberg-Yin/Megatron-LM"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 7787,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "svcnvidia-nemo-ci"
+            },
+            "body": "<!-- nemo-ci-review-impact:v1 ceiling=moderate -->\n\n## Strict review: [dev] Fix fused MLA RoPE for inputs of 2**31 or more elements\n\n**Findings:** CRITICAL: 0, IMPORTANT: 1, SUGGESTION: 0\n\n### Kernel change: correct and complete for its scope\nI checked all six kernels in [fused_mla_yarn_rope_apply.py](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py) against the base tree:\n\n- **Row offsets.** In every kernel, each row pointer of each input, output and gradient comes from `pid_m`. That includes the SBHD `pid_m // batch_size` and `pid_m % batch_size` in the packing forward ([L762-L766](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L762-L766)). With `pid_m` cast to int64, all of these offsets are computed in 64 bits.\n- **`token_idx` branches.** The branches that pick `token_idx` (`position_ids is None`, `cu_seqlens is None`, `HAS_THD_GLOBAL_START`, `IS_THD`) are all resolved at compile time. So moving the SBHD branch from int32 to int64 cannot cause a type mismatch between branches.\n- **Runtime branch in the key/value split backward.** The `if pid_head == 0` branch ([L1233-L1266](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L1233-L1266)) only reassigns pointer and mask values, whose types do not change.\n- **Helpers.** Both THD helpers already cast to int64 ([L36](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L36), [L72](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L72)).\n- **Packing forward.** The head, channel and RoPE-pair indices are now int64 ([L770-L781](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L770-L781)). This covers the head-major `q_absorbed` that the `einsum` in [absorbed_mla.py L651-L666](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py#L651-L666) passes to it.\n- **Packing backward.** It only touches `grad_output.contiguous()` and buffers it allocates itself with `new_empty`, so its int32 head offsets stay within one row.\n- **No API change.** There is no API, argument, autotune-key or default change, and no new identifiers in production code. Everything added in the tests is used.\n\n### Tests\nThe four new tests each run the small and the large call with the same autotuned `BLOCK_H`: the small call autotunes and the large call reuses the cached config. That makes the bitwise comparisons valid, and the autotuner's `restore_value` clone is never made on the large input.\n\n- **In-place test guard region.** Its row sizes divide `2**31`, so wrapped row `F+i` lands exactly on `buffer[i]` (`guard = buffer[:16]`). A wrapped write therefore fails the guard assertion instead of faulting.\n- **Strided packing test.** Its head-major and channel-major shapes put head 63, channel 510 (non-positional input) and channel 62 (positional input) past `2**31`. So each of the three widened indices is actually exercised.\n\n### Most impactful finding\n- **[IMPORTANT Testing]** The new 9–19 GiB tests allocate on whatever CUDA device is current, and nothing in them or in the file sets that device. The repo's unit-test harness runs 8 ranks per node through `torch.distributed.run`. When no earlier test in the process has called `Utils.initialize_distributed`, all 8 ranks allocate on `cuda:0`. That happens, for example, with the single-file invocation documented in the testing guide. The per-process free-memory check cannot account for the other ranks, so the key/value split and row-packing cases can fail with an out-of-memory error instead of skipping. Inline comment on `_skip_unless_free_gpu_memory` has the fix and checks.\n\n### Overall risk\n**Low.** The production change is a narrow, well-argued index-width change. The only open issue is test reliability under the multi-rank harness.\n\n### Notes on review scope\n- The `style-guide.md` the rubric points to does not exist in the base tree, so I did no separate style-guide pass.\n- The testing guide asks Triton kernel changes to add a determinism replay test (`tests/unit_tests/determinism/kernels/` and `manifest.py`). That does not apply here: neither that directory nor `tools/check_kernel_determinism_coverage.py` exists on this branch.\n- I could not run the tests. Everything above is from reading the source.\n\n*Review generated by claude*\n\n<!-- nemo-ci-review-rendering:inline-v1 -->\n<!-- nemo-ci-formal-review:4e599c1da63e6f19e0674f380ca8af657dbf8e7a06bfb7c17790f27a09fa62c5:d9257a36407f880b42b1c91ffd62fe73c75f3d698570cf1d3ded521fa3d5463b -->",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "svcnvidia-nemo-ci"
+                  },
+                  "body": "**[IMPORTANT Testing]** The large-input tests never choose a GPU per rank, so under the 8-rank unit-test harness they can run out of memory instead of skipping.\n\n**Failure**\n- The four new tests allocate everything with `device=\"cuda\"`, i.e. on the current device. Nothing in this file selects that device: no test before L616 calls `Utils.initialize_*` or `torch.cuda.set_device`.\n- [`run_ci_test.sh`](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/tests/unit_tests/run_ci_test.sh#L135-L186) runs pytest with `torch.distributed.run --nproc_per_node 8`, and so does the testing guide's single-file command. Only [`Utils.initialize_distributed`](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/tests/unit_tests/test_utilities.py#L62) sets a per-rank device.\n- So, unless an earlier test in the same process happened to call it, all 8 ranks run these tests on `cuda:0`. In the catch-all CI bucket this depends on test order.\n- The key/value split and row-packing tests each need about 18 GiB, so 8 ranks need about 144 GiB on one 80 GB GPU.\n- This free-memory check runs per process, before most of the memory is allocated. The outputs and gradients are only allocated after the small reference call has finished Triton autotuning. Concurrent ranks therefore all pass the check, and some then fail with `torch.OutOfMemoryError`, which pytest reports as a failure, not a skip.\n- The in-place tests (about 8 GiB each, about 64 GiB for 8 ranks) only just fit.\n- **Expected:** each rank uses its own GPU, the way `Utils.initialize_distributed` maps them, and the memory check describes that GPU.\n\n**Correction:** select the rank's GPU in this helper, before the memory query. Every test calls the helper before its first allocation (L655, L706, L748, L801). Suggested change (author to verify):\n\n```python\n# top of file, with the other stdlib imports\nimport os\n\n\ndef _skip_unless_free_gpu_memory(num_bytes):\n    \"\"\"Skip the calling test unless this rank's GPU has ``num_bytes`` of free memory.\"\"\"\n    # Every rank of torch.distributed.run runs these single-GPU tests. Use this rank's GPU\n    # (the mapping Utils.initialize_distributed uses) so the ranks do not all allocate on\n    # cuda:0, where a per-process free-memory check cannot account for the other ranks.\n    torch.cuda.set_device(int(os.environ.get(\"LOCAL_RANK\", \"0\")) % torch.cuda.device_count())\n    torch.cuda.empty_cache()\n    free_bytes, _ = torch.cuda.mem_get_info()\n    ...  # unchanged\n```\n\n**Invariant to restore:** every allocation in these four tests lands on GPU `LOCAL_RANK % device_count`.\n\nAn equally valid alternative is to skip these tests on every rank except local rank 0, since they are single-GPU checks.\n\n**Preservation**\n- A plain single-process `pytest` run (no `LOCAL_RANK`) still uses `cuda:0`.\n- The skip still fires when the selected GPU lacks the memory.\n- The bitwise small-vs-large comparisons are unchanged.\n- Later tests that call `Utils.initialize_model_parallel` (e.g. `TestApplyRotaryPosEmbMlaFusionConflict.setup_method`) set the same device (`rank % device_count`), so nothing downstream changes.\n\n**Acceptance** (proposed checks, not run)\n1. On an 8-GPU node, run:\n   `uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q --experimental tests/unit_tests/fusions/test_mla_yarn_rope_apply.py -k int32_element_offsets`\n   - **Before the fix:** `nvidia-smi` shows all 8 processes on GPU 0, and `kv_split`/`concat_rows` fail with out-of-memory on some ranks.\n   - **After the fix:** one process per GPU, and all 6 cases pass on every rank.\n2. A single-process run, `pytest -q --experimental tests/unit_tests/fusions/test_mla_yarn_rope_apply.py -k int32_element_offsets`, still reports 6 passed on `cuda:0`.\n3. Static check: in each test, the helper call comes before the first `torch.*(..., device=\"cuda\")` allocation.",
+                  "createdAt": "2026-10-14T09:57:53Z",
+                  "databaseId": 4269335415,
+                  "diffHunk": "@@ -611,6 +613,210 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)\n     torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)\n \n \n+def _skip_unless_free_gpu_memory(num_bytes):",
+                  "line": 616,
+                  "originalLine": 616,
+                  "path": "tests/unit_tests/fusions/test_mla_yarn_rope_apply.py",
+                  "updatedAt": "2026-10-14T09:57:53Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#discussion_r4269335415"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNFQwOTo1Nzo1M1rO_njjdw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5516173693,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-14T09:57:53Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#pullrequestreview-5516173693"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNFQwOTo1Nzo1M1q0MjAyNi0xMC0xNFQwOTo1Nzo1M1rPAAAAAUjKIX0=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[dev] Fix fused MLA RoPE for inputs of 2**31 or more elements",
+      "updatedAt": "2026-10-14T09:57:53Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/7787"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7787/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7787/commits"
+      },
+      "html": {
+        "href": "https://github.com/NVIDIA/Megatron-LM/pull/7787"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7787"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7787/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7787"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/2550027432b2f32437d6c4cb30614539c456d950"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 223,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "auto_merge": null,
+    "base": {
+      "label": "NVIDIA:dev",
+      "ref": "dev",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/NVIDIA/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contributors",
+        "created_at": "2019-03-21T16:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/events",
+        "fork": false,
+        "forks": 4637,
+        "forks_count": 4637,
+        "forks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/forks",
+        "full_name": "NVIDIA/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/NVIDIA/Megatron-LM.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/hooks",
+        "html_url": "https://github.com/NVIDIA/Megatron-LM",
+        "id": 176982014,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "MDEwOlJlcG9zaXRvcnkxNzY5ODIwMTQ=",
+        "notifications_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 1658,
+        "open_issues_count": 1658,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+          "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NVIDIA/followers",
+          "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NVIDIA",
+          "id": 1728152,
+          "login": "NVIDIA",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+          "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+          "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+          "repos_url": "https://api.github.com/users/NVIDIA/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/NVIDIA",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-10-19T18:00:41Z",
+        "releases_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/releases{/id}",
+        "size": 158784,
+        "ssh_url": "git@github.com:NVIDIA/Megatron-LM.git",
+        "stargazers_count": 18197,
+        "stargazers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscription",
+        "svn_url": "https://github.com/NVIDIA/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/teams",
+        "topics": [
+          "large-language-models",
+          "model-para",
+          "transformers"
+        ],
+        "trees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-10-19T16:28:39Z",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM",
+        "visibility": "public",
+        "watchers": 18197,
+        "watchers_count": 18197,
+        "web_commit_signoff_required": false
+      },
+      "sha": "c75a269efd3fdf6d82ba5a07fff00ed40f350cba",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+        "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NVIDIA/followers",
+        "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NVIDIA",
+        "id": 1728152,
+        "login": "NVIDIA",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+        "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+        "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+        "repos_url": "https://api.github.com/users/NVIDIA/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/NVIDIA",
+        "user_view_type": "public"
+      }
+    },
+    "body": "Thanks to @TKONIY for the contribution to this fix.\r\n\r\n- [x] I, the PR author, have personally reviewed every line of this PR.\r\n\r\n## Summary\r\n\r\nThe Triton kernels in `megatron/core/fusions/fused_mla_yarn_rope_apply.py`, which implement the\r\nfused RoPE (`apply_rope_fusion`) of MLA and DSA, compute element offsets in 32 bits:\r\n\r\n- every kernel computes each row's offset with a 32-bit multiply, and\r\n- the packing kernel (`fused_mla_rope_concat`) also computes the head and channel offsets of its\r\n  inputs in 32 bits, although its inputs may have any strides and the absorbed-MLA query it packs\r\n  is head-major.\r\n\r\nOnce an offset reaches `2**31`, the kernel reads (and, for the rows, also writes) at a wrapped\r\noffset, a multiple of `2**32` elements (8 GiB in bf16) before the right place. Nothing reports it:\r\nthe output is silently wrong, and an illegal memory access is raised only when the wrapped address\r\nhappens to be unmapped.\r\n\r\n| Entry point | Caller |\r\n|---|---|\r\n| `fused_apply_mla_rope_for_q` (in place) | MLA query, `multi_latent_attention.py` |\r\n| `fused_apply_mla_rope_for_kv` (key/value split) | MLA key and value, `multi_latent_attention.py` |\r\n| `fused_mla_rope_concat` (packing) | absorbed-MLA query and compressed key/value, `absorbed_mla.py` (the attention module of the DSA layer spec) |\r\n| `fused_mla_rope_inplace(..., rope_first=True)` (in place) | DSA indexer query and key, `dsa.py` |\r\n\r\nEvery other caller of these kernels has the same limits. For GLM-5 (MLA + DSA), counting the\r\ntokens on one context-parallel rank:\r\n\r\n- the DSA indexer query wraps from 524288 tokens at every tensor-parallel size;\r\n- the absorbed-MLA query packing wraps from 58255 tokens at TP 1 (466034 at TP 8) through its\r\n  output rows, and from 66577 tokens at TP 1 (599187 at TP 8) through the heads of `q_absorbed`.\r\n\r\nSo a 1M-token sequence on one context-parallel rank is affected at every TP size, and with CP 8 the\r\nabsorbed query is still wrong at TP 1 and 2.\r\n\r\nThis PR makes the row index 64-bit in all six kernels and the head and channel indices 64-bit in\r\nthe packing forward kernel, and adds GPU regression tests that fail without the fix.\r\n\r\n## Root cause\r\n\r\n### 1. Row offsets (all six kernels)\r\n\r\nEvery kernel in the file addresses its row as `X + pid_m * stride_seq`, for example in the\r\nin-place forward kernel:\r\n\r\n```python\r\npid_m = tl.program_id(axis=0)                                       # int32\r\n...\r\nQ = Q + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads\r\n```\r\n\r\n`tl.program_id` returns int32, and Triton specializes an integer kernel argument whose value is\r\nbelow `2**31`, such as `stride_x_seq`, to int32 as well. The product is therefore computed in 32\r\nbits and only then sign-extended into the 64-bit pointer offset. Compiled for the DSA indexer query\r\ncall (THD, `rope_first=True`, `[t, 32, 128]`):\r\n\r\n```\r\n%Q_32 = arith.muli %pid_m, %stride_x_seq : i32\r\n%Q_33 = tt.addptr %Q, %Q_32 : !tt.ptr<bf16>, i32\r\nPTX:   mul.lo.s32   %r11, %r6, %r5           // stride_x_seq * ctaid.x, wraps\r\n       mad.wide.s32 %rd34, %r11, 2, %rd17    // Q + sign_extend(offset) * 2 bytes\r\n```\r\n\r\nThe same kernel already widens `pid_m` to 64 bits for its token-index lookup in `cu_seqlens_q`,\r\nbut not for the row offset. So the first wrapped row is `ceil(2**31 / elements_per_row)`: row `r`\r\nis addressed correctly only while `r * elements_per_row < 2**31`. The in-place backward kernel adds\r\nthe head-block offset to the row offset in the same 32-bit sum\r\n(`row_off = pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads`), so when\r\n`elements_per_row` does not divide `2**31`, the higher heads of the row just below that one wrap as\r\nwell (for the 128-head MLA query below: gradient rows 87381 and 87382). The GLM-5 rows of 4096 and\r\n16384 elements divide `2**31`. Grid limits play no part: the grid is\r\n`(rows, cdiv(heads, BLOCK_H))`, and `gridDim.x` allows `2**31 - 1` programs.\r\n\r\nWorked example, the GLM-5 DSA indexer query (32 heads x 128 channels = 4096 elements per row):\r\n\r\n| Row | True offset (elements) | int32 offset | Where the program reads and writes |\r\n|---|---|---|---|\r\n| 524287 | 2147479552 = `2**31 - 4096` | 2147479552 | in place (the last correct row) |\r\n| 524288 | 2147483648 = `2**31` | -2147483648 | `2**31` elements (4 GiB in bf16) **before** the start of the tensor |\r\n| 524289 | 2147487744 | -2147479552 | 8 KiB above that |\r\n| 1048575 | 4294963200 = `2**32 - 4096` | -4096 | the last row before the tensor |\r\n\r\nEvery wrapped row is addressed a multiple of `2**32` elements before its place: first below the\r\ntensor, and once the offsets pass `2**32`, onto earlier rows of the same tensor.\r\n\r\n### 2. Head and channel offsets of the packing inputs\r\n\r\n`fused_mla_rope_concat` documents that its inputs \"may use arbitrary input strides\", and its\r\nforward kernel adds the head and channel offsets to the row pointer in 32 bits:\r\n\r\n```python\r\nhead_idx = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)                 # int32\r\nnope_idx = tl.arange(0, NOPE_BLOCK)                                    # int32\r\nnope_offsets = head_idx[:, None] * stride_nope_head + nope_idx[None, :] * stride_nope_dim\r\nnope = tl.load(nope_row + nope_offsets, mask=nope_mask)\r\n```\r\n\r\nThe absorbed-MLA module passes it a head-major tensor. In `absorbed_mla.py`:\r\n\r\n```python\r\nq_absorbed = torch.einsum(\"...nd,ndk->...nk\", q_no_pe, k_up_weight)  # [t, n, 512]\r\nq_absorbed = fused_mla_rope_concat(q_absorbed, q_pos_emb, ...)\r\n```\r\n\r\n`einsum` computes this as a matmul batched over the heads, so its output keeps the heads outermost:\r\nstrides `(512, t * 512, 1)`. Head `h` therefore starts at element `h * t * 512`. Compiled for this\r\ncall, the head offset is `arith.muli %nope_offsets, %nope_offsets_22 : tensor<8x1xi32>` followed by\r\n`tt.addptr ... tensor<8x512xi32>`, so it wraps once `h * t * 512 + 511 >= 2**31`, for every token,\r\nlong before the rows of `q_absorbed` do. Worked example, GLM-5 at TP 8 (8 heads) with 1M tokens on\r\none context-parallel rank (`t = 2**20`, head stride `2**29`):\r\n\r\n| Head | True start (elements) | int32 offset | Where the program reads |\r\n|---|---|---|---|\r\n| 3 | 1610612736 = `3 * 2**29` | 1610612736 | in place |\r\n| 4 | 2147483648 = `2**31` | -2147483648 | 4 GiB (bf16) below the start of `q_absorbed` |\r\n| 5 | 2684354560 | -1610612736 | 3 GiB below the start |\r\n| 6 | 3221225472 | -1073741824 | 2 GiB below the start |\r\n| 7 | 3758096384 | -536870912 | 1 GiB below the start |\r\n\r\nEach wrapped head is read `2**32` elements (8 GiB) before its place. The RoPE input (`q_pos_emb`, a\r\nview of the row-major query) and the packed output are head-minor and stay in range. The channel\r\noffsets would wrap the same way for an input whose channels are outermost in memory; no caller\r\npasses one, but the kernel accepts it.\r\n\r\n### Why it is silent, and when it crashes\r\n\r\n- The wrapped rows are left unrotated, and the memory at the wrapped offsets is rotated or\r\n  overwritten in their place. Nothing checks the address.\r\n- When an in-place kernel autotunes (on its first call in a process), the autotuner's\r\n  `restore_value` copy of the input was placed right below the input in our runs. The wrapped\r\n  writes land in that copy, which is copied back afterwards, so rows *below* the limit come back\r\n  corrupted as well. A CUDA caching-allocator trace of a 524289-row indexer query shows this: the\r\n  autotuner's two restore copies lie at [-8.81, -4.81) and [-4.78, -0.78) GiB relative to the\r\n  input, row 524288 is accessed at -4.00 GiB, inside the second copy at its row 102400, and after\r\n  the copy-back row 102400 of the input comes back wrong.\r\n- Otherwise the wrapped accesses hit whatever tensor lies below, for example a gradient buffer,\r\n  and an illegal memory access is raised only when they reach unmapped memory. A trace of a\r\n  1048576-row indexer query faulted because its restore copy lay at [-9, -1) GiB, so the wrapped\r\n  range [-4, 0) GiB reached the unmapped gap above it.\r\n- The wrapped heads of `q_absorbed` are only read: the packed query gets whatever lies there in\r\n  those heads, without an error, or the read faults.\r\n\r\nMeasured on B200 (Triton 3.6.0, torch 2.11). Each case runs in a fresh process, with the arguments\r\nthe Core caller passes (`q_absorbed` as the `einsum` output), on one THD sequence in bf16. Every\r\noutput and gradient row is compared bitwise with the same call on chunks of at most 4096 tokens.\r\n\"First call\" means the large call autotunes; \"tuned\" means the op (and its backward) ran on a\r\n16-token input first, which is the state after the first call of a process.\r\n\r\n| Call (tokens per rank) | Pass | `dev` (`ac100f773`) | This PR |\r\n|---|---|---|---|\r\n| GLM-5 DSA indexer query (524288, exactly `2**31` elements) | fwd, first call | correct | correct |\r\n| GLM-5 DSA indexer query (524289) | fwd, first call | wrong: rows 524288 and 237568, no error | correct |\r\n| GLM-5 DSA indexer query (524289) | fwd, tuned | illegal memory access | correct |\r\n| GLM-5 DSA indexer query (1048576) | fwd, first call | wrong: all 524288 rows from 524288, no error | correct |\r\n| GLM-5 DSA indexer query (1048576) | fwd + bwd, tuned | wrong: 524288 output rows and 524288 gradient rows, no error | correct (1) |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (58255) | fwd, first call | correct | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (58256) | fwd + bwd, first call | illegal memory access | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (58256) | fwd + bwd, tuned | wrong: token 58255 of the output and of both input gradients, no error | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 1 (66577 and 131072) | fwd, first call | illegal memory access | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 2 (262144) and TP 4 (524288) | fwd, first call | illegal memory access | correct |\r\n| GLM-5 absorbed-MLA query packing, TP 8 (1048576) | fwd, first call; fwd + bwd, tuned | illegal memory access | correct |\r\n| MLA query, 128 x 192 (87382) | fwd, first call | correct | correct |\r\n| MLA query, 128 x 192 (87383) | fwd, first call | wrong: row 87382 and 2 rows below the limit, no error | correct |\r\n| MLA query, 128 x 192 (87383) | fwd + bwd, tuned | wrong: output row 87382, gradient rows 87381 and 87382, no error | correct (1) |\r\n| MLA key/value split, 128 x 256 (65536) | fwd, first call | correct | correct |\r\n| MLA key/value split, 128 x 256 (65537) | fwd + bwd, first call / tuned | illegal memory access | correct |\r\n\r\nWith only the `pid_m` change, the absorbed query is still wrong through its heads: correct at 66576\r\ntokens (TP 1), but head 63 of every token wrong at 66577, heads 32-63 at 131072 (TP 1), heads 8-15\r\nat 524288 (TP 4), all without an error, and illegal memory accesses at 262144 (TP 2) and 1048576\r\n(TP 8).\r\n\r\n(1) The in-place backward with `remove_interleaving=False` (as the DSA indexer and the MLA query\r\ncall it) also has a separate ordering race when the autotuner picks `BLOCK_H=2`, fixed in its own\r\nPR (see Notes for reviewers). In runs where the autotuner picked `BLOCK_H=2`, scattered gradient\r\nrows were wrong at any length (also at 262144 tokens, where no offset comes near `2**31`), with\r\nthis PR alone; with both PRs they are correct. The results above are from runs that picked other\r\nvalues.\r\n\r\n### When it triggers\r\n\r\nThe limits count the tokens of one call on one GPU: the tokens on one context-parallel rank\r\n(sequence length / CP size, also with the load-balanced zigzag split) for THD inputs, and\r\n`seq * micro_batch` for SBHD inputs. Tensor parallelism divides the attention heads, and with them\r\nthe elements per row and the heads of `q_absorbed`, but not the DSA indexer heads, which every TP\r\nrank holds in full.\r\n\r\n| Tensor (per GPU) | What wraps | First wrapped token |\r\n|---|---|---|\r\n| GLM-5 DSA indexer query `[t, 32, 128]` | rows of 4096 elements | 524288 (any TP) |\r\n| GLM-5 absorbed-MLA query packing output `[t, 64/TP, 512 + 64]` | rows of 36864 / TP elements | 58255 (TP 1), 116509 (TP 2), 233017 (TP 4), 466034 (TP 8) |\r\n| GLM-5 `q_absorbed` `[t, 64/TP, 512]`, strides `(512, t * 512, 1)` | head `64/TP - 1`, at element `(64/TP - 1) * t * 512` | 66577 (TP 1), 135301 (TP 2), 279621 (TP 4), 599187 (TP 8) |\r\n| MLA query, 128 heads of 128 + 64 `[t, 128, 192]` | rows of 24576 elements | 87382 (TP 1) |\r\n| MLA key/value split input, 128 heads of 128 + 128 `[t, 128, 256]` | rows of 32768 elements | 65536 (TP 1) |\r\n| Absorbed-MLA packing output, 128 heads of 512 + 64 `[t, 128, 576]` | rows of 73728 elements | 29128 (TP 1) |\r\n| DSA indexer query, 64 heads of 128 `[t, 64, 128]` | rows of 8192 elements | 262144 (any TP) |\r\n\r\nGLM-5: 64 attention heads, `qk_nope_head_dim` 192, `qk_rope_head_dim` 64, `kv_lora_rank` 512, 32\r\nindexer heads of 128 channels. For a 1M-token GLM-5 sequence:\r\n\r\n| CP size | Tokens per rank | DSA indexer query wraps | Packing output wraps | `q_absorbed` heads wrap |\r\n|---|---|---|---|---|\r\n| 1 | 1048576 | yes | at TP 1, 2, 4 and 8 | at TP 1, 2, 4 and 8 (TP 8: heads 4-7) |\r\n| 2 | 524288 | no (exactly `2**31` elements) | at TP 1, 2, 4 and 8 | at TP 1, 2 and 4 (TP 4: heads 8-15) |\r\n| 4 | 262144 | no | at TP 1, 2 and 4 | at TP 1 and 2 (TP 2: heads 16-31) |\r\n| 8 | 131072 | no | at TP 1 and 2 | at TP 1 (heads 32-63) |\r\n\r\n### How it was found\r\n\r\nIn long-sequence tests (sequences of up to 1M tokens), a fused RoPE call on a long local sequence\r\nfailed with an illegal memory access. Checking every output row then showed silently wrong rows at\r\nshorter lengths that did not fail. The head offsets of `q_absorbed` showed up when the packing was\r\nchecked with `q_absorbed` in the layout the absorbed-MLA module passes (the `einsum` output) rather\r\nthan as a contiguous copy. All examples here were reproduced with the MLA and DSA entry points.\r\n\r\n## Fix\r\n\r\nIn each of the six kernels (in-place forward and backward, packing forward and backward,\r\nkey/value split forward and backward):\r\n\r\n```python\r\n# Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\r\npid_m = tl.program_id(axis=0).to(tl.int64)\r\n```\r\n\r\nand in the packing forward kernel:\r\n\r\n```python\r\n# The inputs may have any strides, and the absorbed MLA query (an einsum output) is\r\n# head-major, so head and channel offsets can pass 2**31 too; keep these indices 64-bit.\r\nhead_idx = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)\r\n...\r\nnope_idx = tl.arange(0, NOPE_BLOCK).to(tl.int64)\r\n...\r\nrope_idx = tl.arange(0, ROT_BLOCK).to(tl.int64)\r\n```\r\n\r\n### Why it is correct and complete\r\n\r\n- Every row offset in these kernels is derived from `pid_m`: the row pointers of all inputs,\r\n  outputs and gradients, and in SBHD layouts `pid_m // batch_size` and `pid_m % batch_size`. With\r\n  `pid_m` in int64 they are all computed in 64 bits. For the indexer call above the row offset now\r\n  compiles to `arith.muli %pid_m_2, %Q_32 : i64` and `tt.addptr %Q, %Q_33 : !tt.ptr<bf16>, i64`\r\n  (PTX `mul.lo.s64`).\r\n- In the packing forward kernel every other offset is a head, channel or RoPE-pair index times a\r\n  stride, and all three indices are now int64, so every offset into its inputs and its output is\r\n  computed in 64 bits whatever the strides. For the `q_absorbed` call the head offset now compiles\r\n  to `arith.muli %nope_offsets, %nope_offsets_25 : tensor<8x1xi64>` and\r\n  `tt.addptr %nope, %nope_offsets_29 : tensor<8x512x!tt.ptr<bf16>>, tensor<8x512xi64>`.\r\n- The other five kernels address `[rows, heads, channels]` tensors with unit channel stride (their\r\n  wrappers assert it or make the tensor contiguous) whose heads lie within each row: the\r\n  activations the MLA and DSA callers pass (linear-layer outputs) and their gradients, and the\r\n  tensors the wrappers allocate. Their head and channel offsets therefore stay below one row of a\r\n  tensor. The cos/sin offsets are a position times the table's row stride.\r\n- These six are all the kernels in the file; its two `@triton.jit` helpers, which map a THD row to\r\n  its token position, already work in 64 bits. The regression tests cover all three entry points,\r\n  forward and backward, and head-major and channel-major packing inputs; each of the three index\r\n  changes in the packing kernel is needed for one of them to pass.\r\n\r\n### What it does not change\r\n\r\n- Below the limits the results are bitwise identical at the same `BLOCK_H`, apart from last-bit\r\n  FMA-contraction differences in the packing kernel at `BLOCK_H=128` (see Tests).\r\n- Kernel times are unchanged within 1%, except the packing of the one-head compressed key/value,\r\n  which is about 1.7% slower (see Tests).\r\n- No API, argument, autotuning or launch change.\r\n\r\nAlternatives considered: widening each offset expression instead of the indices gives the same\r\nresults for a larger diff; chunking on the host would need a row-offset argument for the zigzag\r\ncontext-parallel and `position_ids` paths, and making `q_absorbed` contiguous before packing would\r\ncost an extra read and write of it.\r\n\r\n## Tests and results\r\n\r\nNew tests in `tests/unit_tests/fusions/test_mla_yarn_rope_apply.py`. Like their neighbours they\r\nare `experimental` and `internal` and skip on torch < 2.5 or without CUDA; each also skips without\r\nenough free GPU memory.\r\n\r\n- `test_mla_rope_inplace_rows_past_int32_element_offsets[mla_query, dsa_indexer_query]`, about\r\n  9 GiB: an MLA query of 64 heads of 192 + 64 channels and a DSA indexer query of 32 heads of 128\r\n  channels with `rope_first=True` (the GLM-5 shapes at TP 1), 16 rows past the limit. It runs the\r\n  in-place forward kernel and then the in-place backward kernel (`mla_rope_unapply_raw`). The 32\r\n  rows around the limit must match, bitwise, the same rows rotated as a small tensor. The input is\r\n  carved out of a buffer twice its size, and the guard rows below it must stay untouched, so a\r\n  wrapped write fails as an assertion instead of an illegal memory access.\r\n- `test_mla_rope_kv_split_rows_past_int32_element_offsets`, about 19 GiB: MLA key/value split,\r\n  128 heads of 128 + 128 channels, 65552 rows, forward and backward, bitwise against the\r\n  small-tensor result.\r\n- `test_mla_rope_concat_rows_past_int32_element_offsets`, about 19 GiB: absorbed-MLA packing,\r\n  128 heads of 512 + 64 channels, 32784 rows (the output wraps from 29128), forward and backward.\r\n- `test_mla_rope_concat_strided_inputs_past_int32_element_offsets[head_major, channel_major]`,\r\n  about 9 GiB: packing of 64 heads of 512 + 64 channels whose inputs are the first 16 rows of\r\n  tensors of just over `2**31` elements with the heads (as in `q_absorbed`) or the channels\r\n  outermost in memory, sized so that the last heads (or channels) start past `2**31`. The output\r\n  must match, bitwise, the same rows packed from contiguous copies.\r\n\r\nResults on B200 (Triton 3.6.0, torch 2.11.0+cu130), one pytest process per test:\r\n\r\n| Test | `ac100f773` + new tests only | This PR |\r\n|---|---|---|\r\n| `inplace...[mla_query]` | **failed**: 64819 of 524288 elements differ (the 16 wrapped rows) | passed |\r\n| `inplace...[dsa_indexer_query]` | **failed**: 32466 of 131072 elements differ (the 16 wrapped rows) | passed |\r\n| `kv_split...` | **failed**: illegal memory access | passed |\r\n| `concat_rows...` | **failed**: illegal memory access | passed |\r\n| `concat_strided_inputs...[head_major]` | **failed**: illegal memory access | passed |\r\n| `concat_strided_inputs...[channel_major]` | **failed**: illegal memory access | passed |\r\n\r\nWith only the `pid_m` change, the first four pass and both strided cases still fail; with the head\r\nindex widened but not the channel indices, `channel_major` still fails; with all but the RoPE-pair\r\nindex, `channel_major` still fails.\r\n\r\nRun separately for each kernel, the in-place check fails for both the forward and the backward\r\nkernel on the unfixed tree: exactly the 16 rows from the limit differ, and the guard rows below the\r\ninput are overwritten. With the fix, no row differs and the guard is untouched.\r\n\r\nExisting tests, compared per test (JUnit) before and after:\r\n`tests/unit_tests/fusions/test_mla_yarn_rope_apply.py` and\r\n`tests/unit_tests/transformer/experimental_attention_variant/test_csa_cp_utils.py` (a\r\ncontext-parallel RoPE wrapper that also calls these kernels), in CI's two dev passes plus the\r\n`flaky_in_dev` tests:\r\n\r\n| Pass | `ac100f773` | This PR |\r\n|---|---|---|\r\n| prod (`not experimental and not flaky_in_dev`) | 17 passed, 1 skipped | 17 passed, 1 skipped |\r\n| experimental (`--experimental`, `experimental and not flaky_in_dev`) | 24 passed | 30 passed (the 24 plus the 6 new cases) |\r\n| `flaky_in_dev` (includes the main forward/backward test of the in-place kernels) | 4 passed | 4 passed |\r\n\r\nNo existing test changed its outcome. The skipped test needs two ranks.\r\n\r\nBelow the limits the fixed kernels give the same results as before. With the old module's\r\nautotuned `BLOCK_H` forced on both modules (the result legitimately depends on `BLOCK_H` in the\r\nlast bit), on GLM-5 shapes:\r\n\r\n| Case | BLOCK_H | Bitwise | new / old time |\r\n|---|---|---|---|\r\n| DSA indexer query fwd, 262144 x 32 x 128 | 8 | equal | 0.999 |\r\n| DSA indexer query bwd, 262144 x 32 x 128 | 4 | equal | 1.001 |\r\n| MLA query fwd, 65536 x 64 x 256 | 8 | equal | 1.000 |\r\n| MLA query bwd, 65536 x 64 x 256 | 4 | equal | 1.001 |\r\n| absorbed-MLA query packing fwd, 32768 x 64 x (512 + 64) | 8 | equal | 0.992 |\r\n| absorbed-MLA query packing bwd, 32768 x 64 x (512 + 64) | 8 | equal | - |\r\n\r\nFor the packing forward kernel, every `BLOCK_H` was run on both modules: the outputs are bitwise\r\nequal at every `BLOCK_H`, and the fastest configuration of each module (the autotuner's choice)\r\ncompares as follows:\r\n\r\n| Packing forward case | old (best `BLOCK_H`) | new (best `BLOCK_H`) | new / old |\r\n|---|---|---|---|\r\n| `q_absorbed` as the einsum output, 32768 x 64 x 512 (TP 1) | 751.9 us (8) | 747.4 us (8) | 0.994 |\r\n| `q_absorbed` contiguous, 32768 x 64 x 512 (TP 1) | 775.9 us (8) | 769.3 us (8) | 0.991 |\r\n| `q_absorbed` as the einsum output, 131072 x 8 x 512 (TP 8) | 365.6 us (8) | 363.3 us (8) | 0.994 |\r\n| `q_absorbed` contiguous, 131072 x 8 x 512 (TP 8) | 363.2 us (8) | 364.6 us (8) | 1.004 |\r\n| compressed key/value, 262144 x 1 x 512 | 145.8 us (2) | 148.3 us (1) | 1.017 |\r\n\r\nTimes are `triton.testing.do_bench` with an L2 flush before every repetition, median of 5 (7 for\r\nthe second table). The compressed key/value packing does little work per program (one head of 576\r\nchannels), so the few extra 64-bit address instructions show; it is about 2.5 us per call at\r\n262144 tokens.\r\n\r\nA broader comparison of the two versions of the kernel file covered 2182 checks: every entry\r\npoint, forward and backward, SBHD and THD layouts, zigzag context parallelism, `position_ids`, both\r\n`remove_interleaving` and `rope_first` values, bf16 and fp32, every `BLOCK_H`, strided packing\r\ninputs, and the largest inputs that do not overflow (at `BLOCK_H` 16 and 128). 2168 were bitwise\r\nequal. Five checks of the packing kernel at `BLOCK_H=128` differ in the last bit, because the\r\ncompiler contracts multiply-adds into FMAs differently; the error against fp64 is the same, and\r\nthe autotuner picked `BLOCK_H` 8 or 16 for the packing kernel on large inputs in our runs. Nine\r\nchecks were not compared because they are nondeterministic in both versions: the in-place backward\r\nwith `remove_interleaving=False` at `BLOCK_H=2`, the race that #7789\r\nfixes.\r\n\r\nLint: black (the repo's black 26 configuration) and isort pass on both files; `git diff --check` is\r\nclean; no added line exceeds 100 columns.\r\n\r\n## Risk and compatibility\r\n\r\n- The kernel changes are the types of `pid_m` (all six kernels) and of the head, channel and\r\n  RoPE-pair indices (packing forward). Below the limits, results are bitwise identical at the same\r\n  `BLOCK_H`, apart from the last-bit FMA-contraction differences in the packing kernel at\r\n  `BLOCK_H=128` described above.\r\n- No API, configuration or checkpoint change. Inputs below the limits behave as before; larger\r\n  inputs, which were silently wrong or crashed, are now correct.\r\n- The new tests need about 9 GiB (in place, strided packing) and 19 GiB (key/value split, row\r\n  packing) of free GPU memory and skip otherwise. Together they take about 35 s on B200.\r\n\r\n## Notes for reviewers\r\n\r\n- The in-place test uses `remove_interleaving=True`, while the MLA query and DSA indexer callers\r\n  use `False`. The row offset does not depend on the channel layout, and with `True` every rotated\r\n  pair is written back to the slots it was read from, so the result does not depend on how a\r\n  program orders its loads and stores. The `remove_interleaving=False` in-place kernels have a\r\n  separate ordering race at `BLOCK_H=2`, which #7789 fixes.\r\n- #7789, #7803 (key/value split for non-power-of-two head dims) and #7806 (binary search for the\r\n  THD row lookup) change the same two files at different lines. The four PRs apply without\r\n  conflicts, and on the combined tree every test of the four passes. None of them depends on\r\n  another; #7806 should be merged after #7789.\r\n- The key/value split test uses 128 heads of 128 + 128 channels because the key/value split kernel\r\n  needs power-of-two key and value head dims (`tl.arange`). GLM-5's 192 / 256 cannot use it, and\r\n  its DSA layers use the absorbed-MLA packing instead. That limitation is unrelated to this PR; #7803 fixes it.\r\n- The strided packing test allocates inputs of just over `2**31` elements but packs only their\r\n  first 16 rows, so its output stays small. The two calls it compares share the autotuned\r\n  `BLOCK_H`, so they are compared bitwise.\r\n\r\n## Pre-checks\r\n\r\n- [x] I have added relevant unit tests (GPU tests that fail without the fix; they skip without enough free GPU memory)\r\n- [ ] I have added relevant functional tests (not applicable)\r\n- [x] I have added proper typing to my code (no new Python API)\r\n- [ ] I have added relevant documentation (not applicable)\r\n- [x] I have run the autoformatter.sh on my PR (its checks in check mode on the two changed files,\r\n      with the repository settings: `black` and `isort` leave them unchanged, `ruff` passes,\r\n      `pylint` rates them 10.00/10, and `git diff --check` is clean)\r\n\r\nLinked issue: none (bug fix).\r\n\r\n## Reviewers\r\n\r\ncc @hxbai @buptzyb @yuzhongw-nvidia, could you please take a look?\r\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 4,
+    "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7787/comments",
+    "commits": 4,
+    "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7787/commits",
+    "created_at": "2026-10-01T14:23:13Z",
+    "deletions": 9,
+    "diff_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787.diff",
+    "draft": false,
+    "head": {
+      "label": "Heisenberg-Yin:fix-fused-mla-rope-int64-offset",
+      "ref": "fix-fused-mla-rope-int64-offset",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/Heisenberg-Yin/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/contributors",
+        "created_at": "2026-09-14T17:45:12Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/forks",
+        "full_name": "Heisenberg-Yin/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/Heisenberg-Yin/Megatron-LM.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/hooks",
+        "html_url": "https://github.com/Heisenberg-Yin/Megatron-LM",
+        "id": 1370330631,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/labels{/name}",
+        "language": null,
+        "languages_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "R_kgDOUa2WBw",
+        "notifications_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/62246771?v=4",
+          "events_url": "https://api.github.com/users/Heisenberg-Yin/events{/privacy}",
+          "followers_url": "https://api.github.com/users/Heisenberg-Yin/followers",
+          "following_url": "https://api.github.com/users/Heisenberg-Yin/following{/other_user}",
+          "gists_url": "https://api.github.com/users/Heisenberg-Yin/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/Heisenberg-Yin",
+          "id": 62246771,
+          "login": "Heisenberg-Yin",
+          "node_id": "MDQ6VXNlcjYyMjQ2Nzcx",
+          "organizations_url": "https://api.github.com/users/Heisenberg-Yin/orgs",
+          "received_events_url": "https://api.github.com/users/Heisenberg-Yin/received_events",
+          "repos_url": "https://api.github.com/users/Heisenberg-Yin/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/Heisenberg-Yin/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/Heisenberg-Yin/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/Heisenberg-Yin",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-10-14T09:45:27Z",
+        "releases_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/releases{/id}",
+        "size": 140516,
+        "ssh_url": "git@github.com:Heisenberg-Yin/Megatron-LM.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/subscription",
+        "svn_url": "https://github.com/Heisenberg-Yin/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-09-14T17:45:12Z",
+        "url": "https://api.github.com/repos/Heisenberg-Yin/Megatron-LM",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "2550027432b2f32437d6c4cb30614539c456d950",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/62246771?v=4",
+        "events_url": "https://api.github.com/users/Heisenberg-Yin/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Heisenberg-Yin/followers",
+        "following_url": "https://api.github.com/users/Heisenberg-Yin/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Heisenberg-Yin/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Heisenberg-Yin",
+        "id": 62246771,
+        "login": "Heisenberg-Yin",
+        "node_id": "MDQ6VXNlcjYyMjQ2Nzcx",
+        "organizations_url": "https://api.github.com/users/Heisenberg-Yin/orgs",
+        "received_events_url": "https://api.github.com/users/Heisenberg-Yin/received_events",
+        "repos_url": "https://api.github.com/users/Heisenberg-Yin/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Heisenberg-Yin/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Heisenberg-Yin/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Heisenberg-Yin",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787",
+    "id": 4704984913,
+    "issue_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7787",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "aaaaaa",
+        "default": false,
+        "description": null,
+        "id": 8998491541,
+        "name": "community-request",
+        "node_id": "LA_kwDOCoyH_s8AAAACGFoVlQ",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/community-request"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": null,
+    "mergeable": false,
+    "mergeable_state": "dirty",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOCoyH_s8AAAABGHBfUQ",
+    "number": 7787,
+    "patch_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}",
+    "review_comments": 1,
+    "review_comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7787/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/2550027432b2f32437d6c4cb30614539c456d950",
+    "title": "[dev] Fix fused MLA RoPE for inputs of 2**31 or more elements",
+    "updated_at": "2026-10-14T09:57:53Z",
+    "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7787",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/62246771?v=4",
+      "events_url": "https://api.github.com/users/Heisenberg-Yin/events{/privacy}",
+      "followers_url": "https://api.github.com/users/Heisenberg-Yin/followers",
+      "following_url": "https://api.github.com/users/Heisenberg-Yin/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Heisenberg-Yin/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/Heisenberg-Yin",
+      "id": 62246771,
+      "login": "Heisenberg-Yin",
+      "node_id": "MDQ6VXNlcjYyMjQ2Nzcx",
+      "organizations_url": "https://api.github.com/users/Heisenberg-Yin/orgs",
+      "received_events_url": "https://api.github.com/users/Heisenberg-Yin/received_events",
+      "repos_url": "https://api.github.com/users/Heisenberg-Yin/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/Heisenberg-Yin/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Heisenberg-Yin/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/Heisenberg-Yin",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron%2Fcore%2Ffusions%2Ffused_mla_yarn_rope_apply.py",
+      "changes": 26,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ffusions%2Ffused_mla_yarn_rope_apply.py?ref=2550027432b2f32437d6c4cb30614539c456d950",
+      "deletions": 9,
+      "filename": "megatron/core/fusions/fused_mla_yarn_rope_apply.py",
+      "patch": "@@ -147,7 +147,8 @@ def _mla_rope_fwd_inplace_kernel(\n         seq_num: number of sequences for thd format, not used for sbhd format\n         cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format\n     \"\"\"\n-    pid_m = tl.program_id(axis=0)\n+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\n+    pid_m = tl.program_id(axis=0).to(tl.int64)\n     pid_head = tl.program_id(axis=1)\n \n     if position_ids is not None:\n@@ -262,7 +263,8 @@ def _mla_rope_bwd_kernel(\n     Output:\n         DO_OUT: same shape and strides as DO_IN\n     \"\"\"\n-    pid_m = tl.program_id(axis=0)\n+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\n+    pid_m = tl.program_id(axis=0).to(tl.int64)\n     pid_head = tl.program_id(axis=1)\n \n     if position_ids is not None:\n@@ -748,7 +750,8 @@ def _mla_rope_concat_fwd_kernel(\n     BLOCK_H: tl.constexpr,\n ):\n     \"\"\"Concatenate the non-RoPE part with a rotated positional part.\"\"\"\n-    pid_m = tl.program_id(axis=0)\n+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\n+    pid_m = tl.program_id(axis=0).to(tl.int64)\n     pid_head = tl.program_id(axis=1)\n \n     if IS_THD:\n@@ -762,15 +765,17 @@ def _mla_rope_concat_fwd_kernel(\n         nope_row = NOPE + seq_idx * stride_nope_seq + batch_idx * stride_nope_batch\n         rope_row = ROPE + seq_idx * stride_rope_seq + batch_idx * stride_rope_batch\n \n-    head_idx = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)\n+    # The inputs may have any strides, and the absorbed MLA query (an einsum output) is\n+    # head-major, so head and channel offsets can pass 2**31 too; keep these indices 64-bit.\n+    head_idx = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)\n     head_mask = head_idx < head_num\n \n-    nope_idx = tl.arange(0, NOPE_BLOCK)\n+    nope_idx = tl.arange(0, NOPE_BLOCK).to(tl.int64)\n     nope_mask = head_mask[:, None] & (nope_idx[None, :] < nope_dim)\n     nope_offsets = head_idx[:, None] * stride_nope_head + nope_idx[None, :] * stride_nope_dim\n     nope = tl.load(nope_row + nope_offsets, mask=nope_mask)\n \n-    rope_idx = tl.arange(0, ROT_BLOCK)\n+    rope_idx = tl.arange(0, ROT_BLOCK).to(tl.int64)\n     rope_mask = head_mask[:, None] & (rope_idx[None, :] < emb_dim // 2)\n     rope_base = head_idx[:, None] * stride_rope_head\n     rope_pair = rope_idx[None, :] * 2 * stride_rope_dim\n@@ -839,7 +844,8 @@ def _mla_rope_concat_bwd_kernel(\n     BLOCK_H: tl.constexpr,\n ):\n     \"\"\"Split the output gradient and apply the inverse rotation.\"\"\"\n-    pid_m = tl.program_id(axis=0)\n+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\n+    pid_m = tl.program_id(axis=0).to(tl.int64)\n     pid_head = tl.program_id(axis=1)\n \n     if IS_THD:\n@@ -1084,7 +1090,8 @@ def _mla_rope_fwd_kv_split_kernel(\n             or [total_seq_len, head_num, emb_dim + k_dim]\n         O_VALUE: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]\n     \"\"\"\n-    pid_m = tl.program_id(axis=0)\n+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\n+    pid_m = tl.program_id(axis=0).to(tl.int64)\n     pid_head = tl.program_id(axis=1)\n \n     if cu_seqlens_kv is None:\n@@ -1199,7 +1206,8 @@ def _mla_rope_bwd_kv_split_kernel(\n             or [total_seq_len, head_num, k_dim + v_dim]\n         dEMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]\n     \"\"\"\n-    pid_m = tl.program_id(axis=0)\n+    # Row offsets are pid_m * row stride; keep them 64-bit for inputs of 2**31+ elements.\n+    pid_m = tl.program_id(axis=0).to(tl.int64)\n     pid_head = tl.program_id(axis=1)\n \n     if cu_seqlens_kv is None:",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2550027432b2f32437d6c4cb30614539c456d950/megatron%2Fcore%2Ffusions%2Ffused_mla_yarn_rope_apply.py",
+      "sha": "5989b49cf967eb4a5fb7267e33072bb70acc8d97",
+      "status": "modified"
+    },
+    {
+      "additions": 206,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/tests%2Funit_tests%2Ffusions%2Ftest_mla_yarn_rope_apply.py",
+      "changes": 206,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Ffusions%2Ftest_mla_yarn_rope_apply.py?ref=2550027432b2f32437d6c4cb30614539c456d950",
+      "deletions": 0,
+      "filename": "tests/unit_tests/fusions/test_mla_yarn_rope_apply.py",
+      "patch": "@@ -23,12 +23,14 @@\n         fused_mla_rope_inplace,\n         fused_mla_rope_kv_split,\n         fused_mla_rope_out_of_place,\n+        mla_rope_unapply_raw,\n     )\n except Exception:\n     fused_mla_rope_concat = None\n     fused_mla_rope_inplace = None\n     fused_mla_rope_kv_split = None\n     fused_mla_rope_out_of_place = None\n+    mla_rope_unapply_raw = None\n \n \n @pytest.mark.parametrize(\n@@ -611,6 +613,210 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)\n     torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)\n \n \n+def _skip_unless_free_gpu_memory(num_bytes):\n+    \"\"\"Skip the calling test unless the current GPU has ``num_bytes`` of free memory.\"\"\"\n+    torch.cuda.empty_cache()\n+    free_bytes, _ = torch.cuda.mem_get_info()\n+    if free_bytes < num_bytes:\n+        pytest.skip(\n+            f\"Needs {num_bytes / 2**30:.1f} GiB of free GPU memory, \"\n+            f\"{free_bytes / 2**30:.1f} GiB available.\"\n+        )\n+\n+\n+@pytest.mark.experimental\n+@pytest.mark.internal\n+@pytest.mark.skipif(not is_torch_min_version(\"2.5.0\"), reason=\"Requires PyTorch >= 2.5.0\")\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"CUDA not available\")\n+@pytest.mark.parametrize(\n+    (\"num_heads\", \"head_dim\", \"rope_first\"),\n+    [(64, 256, False), (32, 128, True)],\n+    ids=[\"mla_query\", \"dsa_indexer_query\"],\n+)\n+def test_mla_rope_inplace_rows_past_int32_element_offsets(num_heads, head_dim, rope_first):\n+    \"\"\"Rows that start at element 2**31 or later must be rotated where they are.\n+\n+    The MLA query (``fused_apply_mla_rope_for_q``) and the DSA indexer query\n+    (``rope_first=True``) are rotated in place. With the GLM-5 shapes, 64 query heads of\n+    192 + 64 channels and 32 indexer heads of 128 channels, rows 131072 and 524288 start at\n+    element 2**31. A 32-bit row offset wraps there, and the forward and backward kernels read\n+    and write those rows up to 4 GiB below the tensor instead.\n+    \"\"\"\n+    assert fused_mla_rope_inplace is not None and mla_rope_unapply_raw is not None\n+    emb_dim = 64\n+    nope_dim = head_dim - emb_dim\n+    first_wrapped_row = 2**31 // (num_heads * head_dim)\n+    rows = first_wrapped_row + 16\n+    # Both row sizes divide 2**31, so a wrapped row first_wrapped_row + i is addressed exactly\n+    # 2**31 elements below row i. Carve the input out of a larger buffer so that an affected\n+    # kernel overwrites this guard region (checked below) rather than faulting on unmapped\n+    # memory.\n+    guard_rows = first_wrapped_row\n+    _skip_unless_free_gpu_memory((guard_rows + rows) * num_heads * head_dim * 2 + 2**30)\n+\n+    torch.manual_seed(1234)\n+    freqs = torch.randn(rows, emb_dim, dtype=torch.float32, device=\"cuda\")\n+    cos = freqs.cos().to(torch.bfloat16)\n+    sin = freqs.sin().to(torch.bfloat16)\n+\n+    def rotate(kernel, t, positions):\n+        # ``t`` is one THD sequence whose positions are the given rows of the cos/sin tables.\n+        return kernel(\n+            t,\n+            cos[positions],\n+            sin[positions],\n+            nope_dim,\n+            emb_dim,\n+            cu_seqlens_q=torch.tensor([0, t.size(0)], dtype=torch.int32, device=\"cuda\"),\n+            # The row offsets do not depend on the channel layout. remove_interleaving=True\n+            # writes every rotated pair back to the slots it was read from, so the results do\n+            # not depend on how a program orders its loads and stores.\n+            remove_interleaving=True,\n+            rope_first=rope_first,\n+        )\n+\n+    buffer = torch.empty(\n+        guard_rows + rows, num_heads, head_dim, dtype=torch.bfloat16, device=\"cuda\"\n+    )\n+    x = buffer[guard_rows:]\n+    guard = buffer[: rows - first_wrapped_row]\n+    checked = slice(first_wrapped_row - 16, rows)\n+    # The forward kernel, then the backward kernel, both in place.\n+    for kernel in (fused_mla_rope_inplace, mla_rope_unapply_raw):\n+        buffer.normal_()\n+        guard_before = guard.clone()\n+        # The same rows rotated as a small tensor, whose row offsets cannot overflow.\n+        expected = rotate(kernel, x[checked].clone(), checked)\n+        rotate(kernel, x, slice(None))\n+        torch.testing.assert_close(x[checked], expected, rtol=0, atol=0)\n+        torch.testing.assert_close(guard, guard_before, rtol=0, atol=0)\n+\n+\n+@pytest.mark.experimental\n+@pytest.mark.internal\n+@pytest.mark.skipif(not is_torch_min_version(\"2.5.0\"), reason=\"Requires PyTorch >= 2.5.0\")\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"CUDA not available\")\n+def test_mla_rope_kv_split_rows_past_int32_element_offsets():\n+    \"\"\"The MLA key/value split must not wrap once its input passes 2**31 elements.\"\"\"\n+    assert fused_mla_rope_kv_split is not None\n+    num_heads, k_dim, v_dim, emb_dim = 128, 128, 128, 64\n+    first_wrapped_row = 2**31 // (num_heads * (k_dim + v_dim))\n+    seqlen = first_wrapped_row + 16\n+    # kv, key, value, the key and value gradients and the kv gradient, in bf16.\n+    _skip_unless_free_gpu_memory(\n+        seqlen * num_heads * (4 * (k_dim + v_dim) + 2 * emb_dim) * 2 + 2**30\n+    )\n+\n+    torch.manual_seed(1234)\n+    freqs = torch.randn(seqlen, emb_dim, dtype=torch.float32, device=\"cuda\")\n+    cos = freqs.cos().to(torch.bfloat16)\n+    sin = freqs.sin().to(torch.bfloat16)\n+    shape = (seqlen, 1, num_heads)\n+    kv = torch.randn(*shape, k_dim + v_dim, dtype=torch.bfloat16, device=\"cuda\")\n+    k_pos_emb = torch.randn(seqlen, 1, 1, emb_dim, dtype=torch.bfloat16, device=\"cuda\")\n+    grad_key = torch.randn(*shape, k_dim + emb_dim, dtype=torch.bfloat16, device=\"cuda\")\n+    grad_value = torch.randn(*shape, v_dim, dtype=torch.bfloat16, device=\"cuda\")\n+\n+    def run(rows):\n+        kv_input = kv[rows].detach().requires_grad_(True)\n+        emb_input = k_pos_emb[rows].detach().requires_grad_(True)\n+        key, value = fused_mla_rope_kv_split(\n+            kv_input, emb_input, cos[rows], sin[rows], emb_dim, k_dim, v_dim\n+        )\n+        torch.autograd.backward((key, value), (grad_key[rows], grad_value[rows]))\n+        return key.detach(), value.detach(), kv_input.grad, emb_input.grad\n+\n+    checked = slice(first_wrapped_row - 16, seqlen)\n+    # The same rows computed as a small input, whose row offsets cannot overflow.\n+    expected = run(checked)\n+    for actual, reference in zip(run(slice(None)), expected):\n+        torch.testing.assert_close(actual[checked], reference, rtol=0, atol=0)\n+\n+\n+@pytest.mark.experimental\n+@pytest.mark.internal\n+@pytest.mark.skipif(not is_torch_min_version(\"2.5.0\"), reason=\"Requires PyTorch >= 2.5.0\")\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"CUDA not available\")\n+def test_mla_rope_concat_rows_past_int32_element_offsets():\n+    \"\"\"Fused MLA packing must not wrap once its output and inputs pass 2**31 elements.\"\"\"\n+    assert fused_mla_rope_concat is not None\n+    num_heads, nope_dim, emb_dim = 128, 512, 64\n+    # The packed output wraps first, the non-positional input (and its gradient) last.\n+    first_wrapped_row = 2**31 // (num_heads * (nope_dim + emb_dim))\n+    seqlen = 2**31 // (num_heads * nope_dim) + 16\n+    # nope, rope, the output and its gradient, and the two input gradients, in bf16.\n+    _skip_unless_free_gpu_memory(seqlen * num_heads * 4 * (nope_dim + emb_dim) * 2 + 2**30)\n+\n+    torch.manual_seed(1234)\n+    freqs = torch.randn(seqlen, emb_dim, dtype=torch.float32, device=\"cuda\")\n+    cos = freqs.cos().to(torch.bfloat16)\n+    sin = freqs.sin().to(torch.bfloat16)\n+    shape = (seqlen, 1, num_heads)\n+    nope = torch.randn(*shape, nope_dim, dtype=torch.bfloat16, device=\"cuda\")\n+    rope = torch.randn(*shape, emb_dim, dtype=torch.bfloat16, device=\"cuda\")\n+    grad = torch.randn(*shape, nope_dim + emb_dim, dtype=torch.bfloat16, device=\"cuda\")\n+\n+    def run(rows):\n+        nope_input = nope[rows].detach().requires_grad_(True)\n+        rope_input = rope[rows].detach().requires_grad_(True)\n+        output = fused_mla_rope_concat(nope_input, rope_input, cos[rows], sin[rows])\n+        output.backward(grad[rows])\n+        return output.detach(), nope_input.grad, rope_input.grad\n+\n+    checked = slice(first_wrapped_row - 16, seqlen)\n+    # The same rows computed as a small input, whose row offsets cannot overflow.\n+    expected = run(checked)\n+    for actual, reference in zip(run(slice(None)), expected):\n+        torch.testing.assert_close(actual[checked], reference, rtol=0, atol=0)\n+\n+\n+@pytest.mark.experimental\n+@pytest.mark.internal\n+@pytest.mark.skipif(not is_torch_min_version(\"2.5.0\"), reason=\"Requires PyTorch >= 2.5.0\")\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"CUDA not available\")\n+@pytest.mark.parametrize(\"outermost\", [\"head\", \"channel\"], ids=[\"head_major\", \"channel_major\"])\n+def test_mla_rope_concat_strided_inputs_past_int32_element_offsets(outermost):\n+    \"\"\"Fused MLA packing must not wrap the head or channel offsets of strided inputs.\n+\n+    The packing takes inputs of any strides. The absorbed-MLA query it packs is the output of\n+    ``torch.einsum(\"...nd,ndk->...nk\", q_no_pe, k_up_weight)``, which is head-major: head h of a\n+    [t, n, d] query starts at element h * t * d. With the GLM-5 shape at TP 1, 64 heads of 512\n+    channels, head 63 starts at element 2**31 or later from t = 66577 on. The inputs here are the\n+    first rows of tensors whose heads (or channels) are outermost in memory and whose last heads\n+    (or channels) start past 2**31, so only the head (or channel) offsets are large.\n+    \"\"\"\n+    assert fused_mla_rope_concat is not None\n+    num_heads, nope_dim, emb_dim, rows = 64, 512, 64, 16\n+\n+    def full_shape(dim):\n+        if outermost == \"head\":\n+            # Viewed as [t, num_heads, dim]: strides (dim, t * dim, 1), like the einsum output.\n+            return (num_heads, -(-(2**31) // ((num_heads - 1) * dim)), dim)\n+        # Viewed as [t, num_heads, dim]: strides (num_heads, 1, t * num_heads). The RoPE channels\n+        # are read in pairs, so channel dim - 2 starts past 2**31 as well.\n+        return (dim, -(-(2**31) // ((dim - 2) * num_heads)), num_heads)\n+\n+    shapes = (full_shape(nope_dim), full_shape(emb_dim))\n+    # Two inputs of just over 2**31 elements each, in bf16.\n+    _skip_unless_free_gpu_memory(sum(torch.Size(s).numel() for s in shapes) * 2 + 2**30)\n+\n+    torch.manual_seed(1234)\n+    order = (1, 0, 2) if outermost == \"head\" else (1, 2, 0)\n+    nope, rope = (\n+        torch.randn(*shape, dtype=torch.bfloat16, device=\"cuda\").permute(*order)[:rows]\n+        for shape in shapes\n+    )\n+    freqs = torch.randn(rows, emb_dim, dtype=torch.float32, device=\"cuda\")\n+    cos = freqs.cos().to(torch.bfloat16)\n+    sin = freqs.sin().to(torch.bfloat16)\n+    cu_seqlens = torch.tensor([0, rows], dtype=torch.int32, device=\"cuda\")\n+\n+    # The same rows packed from contiguous copies, whose offsets cannot overflow.\n+    expected = fused_mla_rope_concat(nope.contiguous(), rope.contiguous(), cos, sin, cu_seqlens)\n+    actual = fused_mla_rope_concat(nope, rope, cos, sin, cu_seqlens)\n+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)\n+\n+\n class TestApplyRotaryPosEmbMlaFusionConflict:\n     \"\"\"Test apply_rotary_pos_emb: mla_rotary_interleaved vs apply_rope_fusion conflict.\"\"\"\n ",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/2550027432b2f32437d6c4cb30614539c456d950/tests%2Funit_tests%2Ffusions%2Ftest_mla_yarn_rope_apply.py",
+      "sha": "939a3feb366b362cdea041cbafa324c0e9778ea1",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "**[IMPORTANT Testing]** The large-input tests never choose a GPU per rank, so under the 8-rank unit-test harness they can run out of memory instead of skipping.\n\n**Failure**\n- The four new tests allocate everything with `device=\"cuda\"`, i.e. on the current device. Nothing in this file selects that device: no test before L616 calls `Utils.initialize_*` or `torch.cuda.set_device`.\n- [`run_ci_test.sh`](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/tests/unit_tests/run_ci_test.sh#L135-L186) runs pytest with `torch.distributed.run --nproc_per_node 8`, and so does the testing guide's single-file command. Only [`Utils.initialize_distributed`](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/tests/unit_tests/test_utilities.py#L62) sets a per-rank device.\n- So, unless an earlier test in the same process happened to call it, all 8 ranks run these tests on `cuda:0`. In the catch-all CI bucket this depends on test order.\n- The key/value split and row-packing tests each need about 18 GiB, so 8 ranks need about 144 GiB on one 80 GB GPU.\n- This free-memory check runs per process, before most of the memory is allocated. The outputs and gradients are only allocated after the small reference call has finished Triton autotuning. Concurrent ranks therefore all pass the check, and some then fail with `torch.OutOfMemoryError`, which pytest reports as a failure, not a skip.\n- The in-place tests (about 8 GiB each, about 64 GiB for 8 ranks) only just fit.\n- **Expected:** each rank uses its own GPU, the way `Utils.initialize_distributed` maps them, and the memory check describes that GPU.\n\n**Correction:** select the rank's GPU in this helper, before the memory query. Every test calls the helper before its first allocation (L655, L706, L748, L801). Suggested change (author to verify):\n\n```python\n# top of file, with the other stdlib imports\nimport os\n\n\ndef _skip_unless_free_gpu_memory(num_bytes):\n    \"\"\"Skip the calling test unless this rank's GPU has ``num_bytes`` of free memory.\"\"\"\n    # Every rank of torch.distributed.run runs these single-GPU tests. Use this rank's GPU\n    # (the mapping Utils.initialize_distributed uses) so the ranks do not all allocate on\n    # cuda:0, where a per-process free-memory check cannot account for the other ranks.\n    torch.cuda.set_device(int(os.environ.get(\"LOCAL_RANK\", \"0\")) % torch.cuda.device_count())\n    torch.cuda.empty_cache()\n    free_bytes, _ = torch.cuda.mem_get_info()\n    ...  # unchanged\n```\n\n**Invariant to restore:** every allocation in these four tests lands on GPU `LOCAL_RANK % device_count`.\n\nAn equally valid alternative is to skip these tests on every rank except local rank 0, since they are single-GPU checks.\n\n**Preservation**\n- A plain single-process `pytest` run (no `LOCAL_RANK`) still uses `cuda:0`.\n- The skip still fires when the selected GPU lacks the memory.\n- The bitwise small-vs-large comparisons are unchanged.\n- Later tests that call `Utils.initialize_model_parallel` (e.g. `TestApplyRotaryPosEmbMlaFusionConflict.setup_method`) set the same device (`rank % device_count`), so nothing downstream changes.\n\n**Acceptance** (proposed checks, not run)\n1. On an 8-GPU node, run:\n   `uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q --experimental tests/unit_tests/fusions/test_mla_yarn_rope_apply.py -k int32_element_offsets`\n   - **Before the fix:** `nvidia-smi` shows all 8 processes on GPU 0, and `kv_split`/`concat_rows` fail with out-of-memory on some ranks.\n   - **After the fix:** one process per GPU, and all 6 cases pass on every rank.\n2. A single-process run, `pytest -q --experimental tests/unit_tests/fusions/test_mla_yarn_rope_apply.py -k int32_element_offsets`, still reports 6 passed on `cuda:0`.\n3. Static check: in each test, the helper call comes before the first `torch.*(..., device=\"cuda\")` allocation.",
+      "created_at": "2026-10-14T09:57:53Z",
+      "diff_hunk": "@@ -611,6 +613,210 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)\n     torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)\n \n \n+def _skip_unless_free_gpu_memory(num_bytes):",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#discussion_r4269335415",
+      "id": 4269335415,
+      "line": 616,
+      "original_line": 616,
+      "path": "tests/unit_tests/fusions/test_mla_yarn_rope_apply.py",
+      "updated_at": "2026-10-14T09:57:53Z",
+      "user": {
+        "login": "svcnvidia-nemo-ci"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+      "created_at": "2026-10-01T14:23:18Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-5933443751",
+      "id": 5933443751,
+      "updated_at": "2026-10-01T14:23:18Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    },
+    {
+      "body": "Thanks @TKONIY for the contribution to this fix! (added as co-author)\n\ncc @hxbai @buptzyb @yuzhongw-nvidia, this fixes 32-bit row offset overflow in the fused MLA/DSA RoPE Triton kernels for inputs with 2**31 or more elements. Could you please take a look? Thanks!",
+      "created_at": "2026-10-01T14:28:22Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-5933533074",
+      "id": 5933533074,
+      "updated_at": "2026-10-01T14:28:22Z",
+      "user": {
+        "login": "Heisenberg-Yin"
+      }
+    },
+    {
+      "body": "/ok to test 2550027432b2f32437d6c4cb30614539c456d950",
+      "created_at": "2026-10-14T09:45:52Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-6165535098",
+      "id": 6165535098,
+      "updated_at": "2026-10-14T09:45:52Z",
+      "user": {
+        "login": "yaox12"
+      }
+    },
+    {
+      "body": "/review model=claude mode=strict",
+      "created_at": "2026-10-14T09:46:04Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#issuecomment-6165538451",
+      "id": 6165538451,
+      "updated_at": "2026-10-14T09:46:04Z",
+      "user": {
+        "login": "yaox12"
+      }
+    }
+  ],
+  "number": 7787,
+  "refs": {
+    "base": {
+      "commit": "c75a269efd3fdf6d82ba5a07fff00ed40f350cba",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "2550027432b2f32437d6c4cb30614539c456d950",
+      "repository": "Heisenberg-Yin/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": [
+    {
+      "body": "<!-- nemo-ci-review-impact:v1 ceiling=moderate -->\n\n## Strict review: [dev] Fix fused MLA RoPE for inputs of 2**31 or more elements\n\n**Findings:** CRITICAL: 0, IMPORTANT: 1, SUGGESTION: 0\n\n### Kernel change: correct and complete for its scope\nI checked all six kernels in [fused_mla_yarn_rope_apply.py](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py) against the base tree:\n\n- **Row offsets.** In every kernel, each row pointer of each input, output and gradient comes from `pid_m`. That includes the SBHD `pid_m // batch_size` and `pid_m % batch_size` in the packing forward ([L762-L766](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L762-L766)). With `pid_m` cast to int64, all of these offsets are computed in 64 bits.\n- **`token_idx` branches.** The branches that pick `token_idx` (`position_ids is None`, `cu_seqlens is None`, `HAS_THD_GLOBAL_START`, `IS_THD`) are all resolved at compile time. So moving the SBHD branch from int32 to int64 cannot cause a type mismatch between branches.\n- **Runtime branch in the key/value split backward.** The `if pid_head == 0` branch ([L1233-L1266](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L1233-L1266)) only reassigns pointer and mask values, whose types do not change.\n- **Helpers.** Both THD helpers already cast to int64 ([L36](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L36), [L72](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L72)).\n- **Packing forward.** The head, channel and RoPE-pair indices are now int64 ([L770-L781](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/fusions/fused_mla_yarn_rope_apply.py#L770-L781)). This covers the head-major `q_absorbed` that the `einsum` in [absorbed_mla.py L651-L666](https://github.com/NVIDIA/Megatron-LM/blob/2550027432b2f32437d6c4cb30614539c456d950/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py#L651-L666) passes to it.\n- **Packing backward.** It only touches `grad_output.contiguous()` and buffers it allocates itself with `new_empty`, so its int32 head offsets stay within one row.\n- **No API change.** There is no API, argument, autotune-key or default change, and no new identifiers in production code. Everything added in the tests is used.\n\n### Tests\nThe four new tests each run the small and the large call with the same autotuned `BLOCK_H`: the small call autotunes and the large call reuses the cached config. That makes the bitwise comparisons valid, and the autotuner's `restore_value` clone is never made on the large input.\n\n- **In-place test guard region.** Its row sizes divide `2**31`, so wrapped row `F+i` lands exactly on `buffer[i]` (`guard = buffer[:16]`). A wrapped write therefore fails the guard assertion instead of faulting.\n- **Strided packing test.** Its head-major and channel-major shapes put head 63, channel 510 (non-positional input) and channel 62 (positional input) past `2**31`. So each of the three widened indices is actually exercised.\n\n### Most impactful finding\n- **[IMPORTANT Testing]** The new 9–19 GiB tests allocate on whatever CUDA device is current, and nothing in them or in the file sets that device. The repo's unit-test harness runs 8 ranks per node through `torch.distributed.run`. When no earlier test in the process has called `Utils.initialize_distributed`, all 8 ranks allocate on `cuda:0`. That happens, for example, with the single-file invocation documented in the testing guide. The per-process free-memory check cannot account for the other ranks, so the key/value split and row-packing cases can fail with an out-of-memory error instead of skipping. Inline comment on `_skip_unless_free_gpu_memory` has the fix and checks.\n\n### Overall risk\n**Low.** The production change is a narrow, well-argued index-width change. The only open issue is test reliability under the multi-rank harness.\n\n### Notes on review scope\n- The `style-guide.md` the rubric points to does not exist in the base tree, so I did no separate style-guide pass.\n- The testing guide asks Triton kernel changes to add a determinism replay test (`tests/unit_tests/determinism/kernels/` and `manifest.py`). That does not apply here: neither that directory nor `tools/check_kernel_determinism_coverage.py` exists on this branch.\n- I could not run the tests. Everything above is from reading the source.\n\n*Review generated by claude*\n\n<!-- nemo-ci-review-rendering:inline-v1 -->\n<!-- nemo-ci-formal-review:4e599c1da63e6f19e0674f380ca8af657dbf8e7a06bfb7c17790f27a09fa62c5:d9257a36407f880b42b1c91ffd62fe73c75f3d698570cf1d3ded521fa3d5463b -->",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7787#pullrequestreview-5516173693",
+      "id": 5516173693,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-14T09:57:53Z",
+      "user": {
+        "login": "svcnvidia-nemo-ci"
+      }
+    }
+  ]
+}

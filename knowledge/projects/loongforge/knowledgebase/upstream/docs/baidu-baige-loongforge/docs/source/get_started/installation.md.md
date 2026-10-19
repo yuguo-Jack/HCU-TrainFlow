@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
 path: docs/source/get_started/installation.md
-raw_sha256: 26895f45d8228110188e9f569dcdb81202e2ea2932b953f3f4cae67ac5352f76
+raw_sha256: a29dea2df8e116fd42eb4fd292ecf269636321e35702adacf409d1b4bd43c63a
 sources: []
-generated_body_sha256: 21c4b39b117b28d51b89785d81d9578284e752a275ce95181f5a7445ec2d3913
+generated_body_sha256: d6da25500663536e2994e7ddbf6ee94559e2609eba09b1ce1203adb2737bee45
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/get_started/installation.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/get_started/installation.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/docs/source/get_started/installation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -60,7 +60,7 @@ LoongForge uses two different strategies to manage its key upstream dependencies
 | Dependency | Strategy | Location |
 |---|---|---|
 | **Megatron-LM** | git submodule (LoongForge fork) | `third_party/Loong-Megatron/` |
-| **TransformerEngine** | patch against upstream NVIDIA tag | `patches/TransformerEngine_<tag>/` |
+| **TransformerEngine** | patch against upstream NVIDIA tag | `third_party/patches/TransformerEngine_<tag>/` |
 
 **Megatron-LM** is pinned to a specific commit of the
 [Loong-Megatron](https://github.com/baidu-baige/Loong-Megatron) fork via git
@@ -70,7 +70,7 @@ no patches are applied.
 **TransformerEngine** is cloned from the upstream NVIDIA repository, checked out
 at the specified community tag, and then patched with LoongForge-specific fixes.
 The patch directory suffix matches the upstream tag it targets
-(e.g. `patches/TransformerEngine_v2.9/`).
+(e.g. `third_party/patches/TransformerEngine_v2.9/`).
 
 ---
 
@@ -187,7 +187,7 @@ This script will automatically:
 
 1. Clone `TransformerEngine` from the upstream NVIDIA repository.
 2. Checkout the specified TE tag and create a local branch (`loongforge_<tag>`).
-3. Apply patches from `patches/TransformerEngine_<tag>/` to TransformerEngine.
+3. Apply patches from `third_party/patches/TransformerEngine_<tag>/` to TransformerEngine.
 4. Compile and install `TransformerEngine`.
 
 Tips: Some model architectures (e.g. DeepSeek-series) require additional compiled

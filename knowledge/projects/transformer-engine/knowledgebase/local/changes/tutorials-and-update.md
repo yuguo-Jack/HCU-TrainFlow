@@ -9,39 +9,39 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-transformerengine
   path: docs/index.rst
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 5700756d8b7445529c088737a2640d20b6a33e612d916280cceaf5121660be47
 - source: nvidia-transformerengine
   path: docs/getting_started/getting_started_pytorch.py
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: fd8a9c69dcba4a6bd8b9e126a95a4ed26de37f653e6645f6a946ac158626bb01
 - source: nvidia-transformerengine
   path: docs/examples/fp8_primer.ipynb
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 05b00252a257326ce76759dce02bf8bb5d5221d45359ea13988f3c90996c108f
 - source: nvidia-transformerengine
   path: docs/examples/advanced_optimizations.ipynb
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 0d5d703679a7d3c16773112e8879879560a945600c168a95b27b22bc44f9a22a
 - source: nvidia-transformerengine
   path: docs/examples/attention/attention.ipynb
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 055093bf03f8b79cbfc84abad66d282b4de86ab4672ffc402f1c927d2c2b065a
 - source: nvidia-transformerengine
   path: docs/examples/op_fuser/op_fuser.rst
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 95497fc7b153ba375d9687e6ce2333bdfee40da6f3653555624c274f9cf5f71d
 - source: nvidia-transformerengine
   path: docs/examples/gemm_profiling/gemm_profiling.rst
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 31444db2fe36482719a7262091ea25ae69a95d13f898c19148b0b0efe91c52f2
 - source: nvidia-transformerengine
   path: docs/release_notes.md
-  commit: 2e959f352c8e2d4b2709e6775867f2c7494656f3
+  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
   sha256: 7e0ea32b48936420fa0d70a274917bfa15358a03b2925317a0c29872408f3824
 - source: nvidia-transformerengine-docs
   path: getting-started
@@ -93,14 +93,16 @@ sources:
 
 ## 来源与版本复核
 
-- [nvidia-transformerengine: docs/index.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/index.rst)
-- [nvidia-transformerengine: docs/getting_started/getting_started_pytorch.py](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/getting_started/getting_started_pytorch.py)
-- [nvidia-transformerengine: docs/examples/fp8_primer.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/fp8_primer.ipynb)
-- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/advanced_optimizations.ipynb)
-- [nvidia-transformerengine: docs/examples/attention/attention.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/attention/attention.ipynb)
-- [nvidia-transformerengine: docs/examples/op_fuser/op_fuser.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/op_fuser/op_fuser.rst)
-- [nvidia-transformerengine: docs/examples/gemm_profiling/gemm_profiling.rst](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/examples/gemm_profiling/gemm_profiling.rst)
-- [nvidia-transformerengine: docs/release_notes.md](https://github.com/NVIDIA/TransformerEngine/blob/2e959f352c8e2d4b2709e6775867f2c7494656f3/docs/release_notes.md)
+2026-10-20 复核的源码为 `eb3c860a4d33`；登记官网 HTML 本次内容指纹未变，继续保留自己的 web-content-fingerprint。源码的 FA4/GroupedLinear/融合测试差异已更新相关作者页，RMSNorm-MXFP8 案例的直接实现/测试保持原机制。低精度 helper 的局部逐字节测试、后端选择测试、完整训练质量是不同证据，不因教程或合入状态自动提升。
+
+- [nvidia-transformerengine: docs/index.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/index.rst)
+- [nvidia-transformerengine: docs/getting_started/getting_started_pytorch.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/getting_started/getting_started_pytorch.py)
+- [nvidia-transformerengine: docs/examples/fp8_primer.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/fp8_primer.ipynb)
+- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/advanced_optimizations.ipynb)
+- [nvidia-transformerengine: docs/examples/attention/attention.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/attention/attention.ipynb)
+- [nvidia-transformerengine: docs/examples/op_fuser/op_fuser.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/op_fuser/op_fuser.rst)
+- [nvidia-transformerengine: docs/examples/gemm_profiling/gemm_profiling.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/gemm_profiling/gemm_profiling.rst)
+- [nvidia-transformerengine: docs/release_notes.md](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/release_notes.md)
 - [nvidia-transformerengine-docs: getting-started](https://docs.nvidia.com/deeplearning/transformer-engine/getting_started/index.html)
 - [nvidia-transformerengine-docs: fp8-primer](https://docs.nvidia.com/deeplearning/transformer-engine/examples/fp8_primer.html)
 - [nvidia-transformerengine-docs: advanced-optimizations](https://docs.nvidia.com/deeplearning/transformer-engine/examples/advanced_optimizations.html)

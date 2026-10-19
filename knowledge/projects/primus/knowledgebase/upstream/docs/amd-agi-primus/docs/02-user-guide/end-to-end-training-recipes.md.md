@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/02-user-guide/end-to-end-training-recipes.md
-raw_sha256: e86f7594ed1ea9fb439e00ffa3c0810630ca13130a311a74233ac54e69b04668
+raw_sha256: f5a3c9803c44f5c3abc51421e7f427d42d26e14b00decb64631ab3d0cd451041
 sources: []
-generated_body_sha256: 28c3020cd33cdf99b866fcff5f3b8e7bed4af5e8048013481b9a174e53703657
+generated_body_sha256: fbd10eb3e6eac4f47f9a92d68ac7206a1e90ffdba735bc2e417c4aa33d16c9ff
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/02-user-guide/end-to-end-training-recipes.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/02-user-guide/end-to-end-training-recipes.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/02-user-guide/end-to-end-training-recipes.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -40,11 +40,11 @@ This page covers what is common to every backend — image, architecture folders
 | TorchTitan (PyTorch) | `rocm/primus` | `examples/torchtitan/configs/<ARCH>/` | [TorchTitan training](torchtitan-training.md) |
 | JAX MaxText | `rocm/jax-training:maxtext-…` | `examples/maxtext/configs/<ARCH>/` | [JAX MaxText training](jax-maxtext-training.md) |
 | Megatron Bridge (post-training) | `rocm/primus` | `examples/megatron_bridge/configs/<ARCH>/` | [Post-training](posttraining.md) |
-| SpecForge (capture / offline train / online) | `lmsysorg/sglang` + [`examples/specforge/docker`](../../examples/specforge/docker) | `examples/specforge/configs/` | [SpecForge on Primus](../../examples/specforge/README.md) |
+| SpecForge (capture / offline train / online) | `lmsysorg/sglang` + [runtime image](../04-technical-guides/specforge/runtime-image.md) | `examples/specforge/configs/` | [Run SpecForge with Primus](../04-technical-guides/specforge/running.md) |
 
 Each backend recipe page opens with an **Important notes** section listing the settings that release requires, the architecture-specific tuning, and any known issues. Read it before your first run on a new image tag.
 
-SpecForge uses the dedicated image in `examples/specforge/docker` and `primus-cli direct` inside that container, not the default `rocm/primus` container recipe.
+SpecForge uses the dedicated [runtime image](../04-technical-guides/specforge/runtime-image.md) and `primus-cli direct` inside that container, not the default `rocm/primus` container recipe.
 
 > **Image contents.** The exact ROCm, PyTorch/JAX, Transformer Engine, and RCCL versions in every published tag are in [Release notes](../01-getting-started/release-notes.md), which is the single source of truth for image contents.
 

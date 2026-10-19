@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/advanced/epochized_blending.md
-raw_sha256: ea2ecd02d03226f7ba0195b508c27def1618f678179679103bd517dfc883b495
+raw_sha256: da6e3e52f5daf6a905eb8ed92a0a8a0b7616d04f3554a3427761210bb9fb6f7e
 sources: []
-generated_body_sha256: 62420414be2cf4a2dbbd1c560df5998728c5a6e2fa5e1b2e16b744b4a5f409ee
+generated_body_sha256: 5743aca0208ccacf6e3894c06cb09cd0e101cb121d1b027cfd02cb5634908116
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/epochized_blending.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/advanced/epochized_blending.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/epochized_blending.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -34,11 +34,11 @@ SPDX-License-Identifier: BSD-3-Clause -->
 As an alternative to blending with a weight for each dataset, blending can be made accurate and
 iterating the dataset can follow epochs (i.e. interrupt iteration after an epoch) with this concept.
 
-Here is an example `metadataset.yaml` config file that changes to epochized blending:
+Here is an example `recipe.yaml` config file that changes to epochized blending:
 
 ```yaml
 __module__: megatron.energon
-__class__: MetadatasetV2
+__class__: Recipe
 splits:
   train:
     # Blend the following datasets, repeating coco 5 times, coyo-train 2 times and coyo-val 1 times
@@ -60,7 +60,7 @@ from megatron.energon import get_train_dataset, get_loader, WorkerConfig
 
 
 loader = get_loader(get_train_dataset(
-    'metadataset.yaml',
+    'recipe.yaml',
     batch_size=2,
     shuffle_buffer_size=100,
     max_samples_per_sequence=100,
@@ -81,4 +81,4 @@ for batch in loader:
 ```
 
 If used as dataset for `get_val_dataset`, the `repetitions` are ignored.
-The metadataset would also work without setting `repeat=False`, but then the shuffle buffer will shuffle samples across bounderies of epochs.
+The recipe would also work without setting `repeat=False`, but then the shuffle buffer will shuffle samples across bounderies of epochs.

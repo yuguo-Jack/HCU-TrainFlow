@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/distributed/PARALLELISM_CONTEXT.md
-raw_sha256: b3592c4fd1279ec85a188510a3cf13b9dc63ecfc3e10a50270047fff8f044948
+raw_sha256: 7df6f250d92b8a4bf37557a330a571cd4273062fce08a2f3268abfce7ee58916
 sources: []
-generated_body_sha256: 0e1cca392a1819d8cede3add8df87f8b34271d6754355ed0741d696e94313a79
+generated_body_sha256: 5b520a88c8a62d003def64e5d9684d8317006227ca47f88090604d5e85e7b1d2
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/distributed/PARALLELISM_CONTEXT.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/PARALLELISM_CONTEXT.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/PARALLELISM_CONTEXT.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -81,7 +81,7 @@ ep must divide (dp_shard * cp * tp)
 Equivalently `dp_shard * cp * tp == edp_shard * ep`. Dense modules (attention,
 shared experts, embeddings) stay on the dense mesh. Routed experts use the
 sparse mesh: expert weights `Shard(0)` on `ep`, leftover FSDP on `edp_shard`.
-Placements are in [MoE sharding](../models/common/MOE_SHARDING.md).
+Placements are in [MoE sharding](../models/common/moe/SHARDING.md).
 
 ## Worked example
 

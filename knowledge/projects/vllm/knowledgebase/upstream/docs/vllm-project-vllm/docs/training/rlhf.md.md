@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: bde4d001130e5112d984ba99f0546e22c09e1a89
 path: docs/training/rlhf.md
-raw_sha256: b523c750e27aabd2c342609a6eb042a2d97a5d37aff6db56e48164d23442e290
+raw_sha256: d5f1075d027de319baf6e7698cf21701d90a7026d3c1807b2439b38c6e2a4ec5
 sources: []
-generated_body_sha256: 5670af847390d51a9a9c2a510e732a2fb14b48e3c9123a15532601e6864195eb
+generated_body_sha256: 5c4eeea2d644e0ea987a7ffb6014c4f0399cb689748740273e7899019d3ab847
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/rlhf.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/docs/training/rlhf.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/rlhf.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -45,6 +45,8 @@ The following open-source RL libraries use vLLM for fast rollouts (sorted alphab
 - [verl](https://github.com/volcengine/verl)
 
 For weight synchronization between training and inference, see the [Weight Transfer](weight_transfer/README.md) documentation, which covers the pluggable backend system with [NCCL](weight_transfer/nccl.md) (multi-GPU) and [IPC](weight_transfer/ipc.md) (same-GPU) engines. To verify that an update landed on every rank, see the [Weight Checker](weight_checker.md).
+
+For MoE policies, see [Routed Experts Return](routed_experts.md) (`--enable-return-routed-experts`) to get the per-token expert routing of each rollout for routing replay (R3) in the trainer.
 
 For pipelining generation and training to improve GPU utilization and throughput, see the [Async Reinforcement Learning](async_rl.md) guide, which covers the pause/resume API for safely updating weights mid-flight.
 

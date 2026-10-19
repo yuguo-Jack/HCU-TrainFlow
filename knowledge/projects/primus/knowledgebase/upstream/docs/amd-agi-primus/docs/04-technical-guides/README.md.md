@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/04-technical-guides/README.md
-raw_sha256: 11374e297603ab56aa6f42ad975d2a8553a49aa5ddbfa5b66eacaa308d6a4d6f
+raw_sha256: 8a079e689e7404e990b2572b8f831a6f44547085812cb719b585c6b20b963412
 sources: []
-generated_body_sha256: 82ee9dc9e6aa152ed38b90ad525e3cab015ebd100b512e345d217397bb95d1a4
+generated_body_sha256: 8c94c1d8d912849d104fa44ae0cb4ec8bcc89dac7b3b1dc8874edd9939b63355
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/04-technical-guides/README.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/04-technical-guides/README.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/04-technical-guides/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -48,6 +48,7 @@ Deep technical topics for advanced users.
 - [Hybrid models](hybrid-models/README.md): Zebra-Llama hybrid recurrent-attention (Mamba/KDA/GDN + MLA) models, FLA-parity recipes, and checkpoint conversion
 - [Native SFT and LoRA](native-sft-lora.md): Megatron-native SFT/LoRA runbook (BF16 / FP8 / FP4), no Megatron-Bridge dependency
 - [Native SFT LoRA on MI455X](LoRA_Native_Trainer_MI455_README.md): 1-GPU gfx1250 recipes (Llama-3.2-1B + 70B/72B/235B proxies)
+- [SpecForge](specforge/introduction.md): speculative-decoding draft training — capture, offline train, and online train through `primus-cli`
 
 ---
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/experiments/torchft/README.md
-raw_sha256: d46632a55b147e5085c3ff1e0e05fb00a6ceb2be6001dabf102759fb63a87572
+raw_sha256: c34880d0431703971a752863782dd75680656e1d1639d8da1713cca7782e3c0b
 sources: []
-generated_body_sha256: fd3439a98e6937c0d6c50fded86f679e6205a122ccc39a3052e3abe1a17388cd
+generated_body_sha256: a97d6dd6b7b66520d8b8bd55dcef0807b8eb5de4996969b5aabae02d4bbb2be6
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/experiments/torchft/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/experiments/torchft/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/experiments/torchft/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -42,7 +42,7 @@ Alternatively, you can install TorchFT with `pip install torchft-nightly`.
 
 ## Configuring TorchTitan for Using TorchFT
 
-When using TorchFT with TorchTitan, you need to launch multiple replica groups, each of which is a separate TorchTitan instance. Each replica group is responsible for maintaining a copy of the model weights. In case of a failure, the other replica groups can continue training without lossing weight information.
+When using TorchFT with TorchTitan, you need to launch multiple replica groups, each of which is a separate TorchTitan instance. Each replica group is responsible for maintaining a copy of the model weights. In case of a failure, the other replica groups can continue training without losing weight information.
 
 For example, if you want to run HSDP on a single machine with eight GPUs, where weights are sharded within four GPUs with two replica groups (2, 4 device mesh), set `data_parallel_replicate_degree=2` and `data_parallel_shard_degree=4` in the selected recipe. However, to utilize TorchFT, you will need to launch two TorchTitan instances, each managing four GPUs and communicating with each other through TorchFT.
 
@@ -122,7 +122,26 @@ For all training modes:
 - `config.fault_tolerance.sync_steps`: The number of training steps before synchronization.
 - `config.fault_tolerance.semi_sync_method`: Synchronization method (e.g., "local_sgd", "diloco")
 
-For more semi-synchronouse configuration options, see [config/job_config.py](config/job_config.py).
+For more semi-synchronous configuration options, see [config/job_config.py](config/job_config.py).
+
+### Timeout configuration
+
+For TorchFT to heal correctly, the timeouts below must form a strict hierarchy:
+each layer must be longer than the one above it, so that lower-level timeouts
+trigger recovery before higher-level timeouts kill the process.
+
+| Parameter | Recommended value | Purpose |
+| --- | --- | --- |
+| `fault_tolerance.process_group_timeout_ms` | 60s | Shortest timeout — detects a stalled inter-replica collective (e.g. an allreduce hanging because a peer died). TorchFT catches it and marks the step as errored. Must be shorter than `comm.train_timeout_seconds`: TorchFT's FSDP all-reduce hook runs inline within FSDP ops, blocking the default process-group collectives. |
+| `comm.train_timeout_seconds` | 120s | Default process-group timeout for intra-replica FSDP collectives during steady-state training. Must exceed `process_group_timeout_ms` so the TorchFT process group can time out and recover before the watchdog kills the process. |
+| `comm.init_timeout_seconds` | 180s | Same as above, for initialization, with extra buffer for lazy init, data loading, and JIT compilation. |
+| `TORCH_NCCL_NONBLOCKING_TIMEOUT` | 200s | NCCL's internal C++ timeout for non-blocking process-group ops. Must exceed the Python-level timeouts so PyTorch's timeout fires first, allowing graceful handling before NCCL aborts at the C++ level. |
+| `TORCHFT_TIMEOUT_SEC` | 180s | Overall deadline for `ft.Manager` operations (quorum, should_commit, ...). Must be shorter than `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC`. |
+| `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC` | 900s | Must exceed all of the above so NCCL doesn't kill the process while TorchFT is still handling a timeout. Set via environment variable. |
+| `TORCHFT_QUORUM_TIMEOUT_SEC` | 3600s | Longest timeout — how long a replica waits to join a quorum. Must cover node provisioning time. |
+
+Note: `TORCH_NCCL_NONBLOCKING_TIMEOUT` only needs to beat the Python-level
+timeouts above it, so its ordering relative to `TORCHFT_TIMEOUT_SEC` can be relaxed.
 
 ## Environment Variables
 

@@ -10,49 +10,48 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: reviewed implementation chains and official guides; not all models, backends
-  or HCU runtime qualification
+reviewed_on: '2026-10-20'
+coverage: reviewed implementation chains and official guides; not all models, backends or HCU runtime qualification
 sources:
 - source: vllm-project-vllm
   path: docs/features/sleep_mode.md
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
   sha256: 85bd01f925e1ad92c80ac023214ec1a1dd7d431fc8ae03ba4ee214cfb8ab13de
 - source: vllm-project-vllm
   path: docs/design/hybrid_kv_cache_manager.md
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
-  sha256: 5a3138f8d3fddc44d69f7782510c0c97b394ee073bb743cae34bfbf281985b4a
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  sha256: 46668c028e946aba3604f9509ae07ced27353628d836a91427145c502ea5ee22
 - source: vllm-project-vllm
   path: vllm/device_allocator/sleep_mode_backend.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
   sha256: 4c90c6aa44b50dc5bbdd6b09d1e6a91d56d3481a109a8d7f8cc351927401196b
 - source: vllm-project-vllm
   path: vllm/v1/worker/gpu_worker.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
-  sha256: e970aa29a738aa15cd963d9f9202ca6d3d504e98fd344959fd998e940472a5a0
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  sha256: b401a1e0579df877f16184cb2850f4ddf034bb60f9877500e324fd586a563e20
 - source: vllm-project-vllm
   path: vllm/v1/core/kv_cache_manager.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
-  sha256: 940d4cba8c5ad2c5f2d209beddbac97c812e83302266dc8e38f8e4b8683dccd1
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  sha256: cdd0185bd11f301631856336818987baa3520084134de65ab4abb9ecbf714623
 - source: vllm-project-vllm
   path: vllm/v1/core/sched/scheduler.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
-  sha256: d546a324891860fbaeb2d82a85b2a7970825972cac7c8f7327d84632fa53d04d
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  sha256: 7c56bb15fb3a21386ea312a2320fe42346b348cfe51635581070e77ce8a741f7
 - source: vllm-project-vllm
   path: vllm/config/scheduler.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
-  sha256: 2fb86b1572a4925be59f304d13b4f6ec03d496b67a7c4abbb976ecda2232839a
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  sha256: 61485c7a1ef1c7c65339767f4b223f55de76d2ca152eb19df915c88f526be9de
 - source: vllm-project-vllm
   path: tests/v1/worker/test_sleep_mode_backend.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
   sha256: 80cbeef15c516e2dcf936987117b2a8e392405ec4f627e1ea1cb2870e3fdad8e
 - source: vllm-project-vllm
   path: tests/model_executor/test_sleep_mode_tensor_ownership.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
   sha256: be4d7b31c31e75d048b66a99849be15cff8de4c93bcdc1c6f5dced53afddbfd1
 - source: vllm-project-vllm
   path: examples/rl/rlhf_async_new_apis.py
-  commit: 8d7b93fec2eb72ce01f2217472ac1f51b9bce600
+  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
   sha256: b422474b8ae8d7d6b5e7fb52fb5e7ba50bbd48c79be76f1b856502cfe0fe1fae
 ---
 
@@ -91,6 +90,10 @@ KV不足时preemption/recompute会增加工作。异步调度包含inflight/stal
 
 ## 混合 KV 模型
 
+当前 `prefill_schedule_interval=N` 覆盖所有 prefill，包括已接纳长 prompt 的后续 chunks；间隔步完全留给 decode。长 prompt 完成 prefill 可能需要接近 N 倍调度步，选择该参数时同时看首 token、decode 和 RL 尾延迟，不能仅按 DP 单步均衡判断。
+
+GPU worker 在 sleep/discard KV 前注销 KV-transfer connector 的 cache registration，恢复 KV tag 后再注册；只恢复 weights 不应提前暴露旧 KV 地址。allocator 返回不自动完成外部 connector 的存储所有权，远端 KV transfer 与 sleep 切换需独立验证。初始化也提前创建 matmul/biased-linear handle 再采集基线，避免遗漏底层库直接申请的内存；HCU 分配行为另查。
+
 full attention保存全历史；sliding-window仅需有效窗口，SSM/混合模型还含独立state。官方hybrid-KV设计文档明确它基于历史提交并可能变动，源码当前`KVCacheManager`/coordinator/spec为最终依据。
 
 估算不能一律总层数×序列长度：需按真实KV group、head/dim/dtype、TP分片、window、state和padding/page开销分别算。不同attention类型组的页大小约束会引入padding；文档的group page size与单层`KVCacheSpec.page_size_bytes`不是一个数量。
@@ -98,6 +101,8 @@ full attention保存全历史；sliding-window仅需有效窗口，SSM/混合模
 prefix cache是有效模型版本下的已有计算，不等于任意weight update之后仍有效。refit/wake后清理旧KV及相关connector状态，remote-KV异步失败/转移仍需协调。缓存命中和warmup与冷启动分开测。
 
 ## 数值、诊断与回退
+
+当前混合 Mamba/full-attention 文档已说明 block-boundary Mamba state prefix caching，仍需核对具体模型、block size 和 state；不能推广到任意 token 位置恢复。cascade attention 则已移除，`KVCacheManager.get_num_common_prefix_blocks` 仅为外部 scheduler 保留接口、固定返回各组0；不能从这个0推断整个 prefix cache 没有命中，或继续按旧 cascade 机制解释收益。
 
 固定token输入对比sleep前后、分tag恢复后及两轮weight更新后的logits/logprob；覆盖量化scale、buffers、frozen weights、draft/target和所有replica。生成token随机不同不必然错误，rank间参数/scale不同、旧KV和错误mask必须定位。
 
@@ -107,15 +112,15 @@ worker sleep-backend与tensor-ownership测试是状态/接口回归，真实模�
 
 ## 固定证据与验证范围
 
-- [docs/features/sleep_mode.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/features/sleep_mode.md)
-- [docs/design/hybrid_kv_cache_manager.md](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/docs/design/hybrid_kv_cache_manager.md)
-- [vllm/device_allocator/sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/vllm/device_allocator/sleep_mode_backend.py)
-- [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/vllm/v1/worker/gpu_worker.py)
-- [vllm/v1/core/kv_cache_manager.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/vllm/v1/core/kv_cache_manager.py)
-- [vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/vllm/v1/core/sched/scheduler.py)
-- [vllm/config/scheduler.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/vllm/config/scheduler.py)
-- [tests/v1/worker/test_sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/tests/v1/worker/test_sleep_mode_backend.py)
-- [tests/model_executor/test_sleep_mode_tensor_ownership.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/tests/model_executor/test_sleep_mode_tensor_ownership.py)
-- [examples/rl/rlhf_async_new_apis.py](https://github.com/vllm-project/vllm/blob/8d7b93fec2eb72ce01f2217472ac1f51b9bce600/examples/rl/rlhf_async_new_apis.py)
+- [docs/features/sleep_mode.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/features/sleep_mode.md)
+- [docs/design/hybrid_kv_cache_manager.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/design/hybrid_kv_cache_manager.md)
+- [vllm/device_allocator/sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/device_allocator/sleep_mode_backend.py)
+- [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/worker/gpu_worker.py)
+- [vllm/v1/core/kv_cache_manager.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/core/kv_cache_manager.py)
+- [vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/core/sched/scheduler.py)
+- [vllm/config/scheduler.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/config/scheduler.py)
+- [tests/v1/worker/test_sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/tests/v1/worker/test_sleep_mode_backend.py)
+- [tests/model_executor/test_sleep_mode_tensor_ownership.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/tests/model_executor/test_sleep_mode_tensor_ownership.py)
+- [examples/rl/rlhf_async_new_apis.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/examples/rl/rlhf_async_new_apis.py)
 
-本页在 2026-10-12 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+本页在 2026-10-20 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。

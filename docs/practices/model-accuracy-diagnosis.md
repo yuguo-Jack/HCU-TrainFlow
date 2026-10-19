@@ -21,12 +21,18 @@
 
 任务先前采用缩层代理时，对照双方必须是同一代理；不能拿全模型和缩层 loss 相比。保留完整目标的未覆盖范围，不为精度排查擅自改 hidden dim、优化器或训练目标。数据敏感时在授权环境内对比，外发问题包使用经核对的脱敏复现，不上传真实样本/权重。
 
+### 低精度状态与 checkpoint 版本
+
+权重 dtype 相同不代表训练状态相同。分别核对 recipe、量化 scale/amax 历史、权重缓存与 optimizer master/state 的所有者和保存范围；恢复后执行相同输入的下一步，比较实际状态更新与输出/梯度。无状态 recipe 的空附加状态可能符合格式，带历史的 recipe 则不能靠丢弃该状态绕过加载错误；状态是否必需须由实际版本的序列化与加载代码判定。
+
+HCU-Knowledge 的 `te-fp8-state-and-recompute` 保留了这种版本差异：TE `main@73dbcf534252`（2.18 开发线）对已识别的 stateless recipe 不再保存/反序列化 pickle 附加状态；DelayedScaling 历史、旧格式或未知 payload 默认可能被拒绝。`NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE=1` 是可信旧 checkpoint 的显式兼容选择，不是通用训练默认，更不能代替 scale/history 恢复后的数值验收。`release_v2.16` 和现场制品需分别查实现，不能由 main 新策略推定其行为。普通模型权重转换往返、完整训练状态恢复和异步写入完成仍是不同检查。
+
 ## 2. 有 NVIDIA 环境：分层建立跨平台对照
 
 1. **确定可比实现。** 以支持该模型的官方训练配方/实现为语义依据，HCU 端使用适用的 HCU 启动方式。记录官方与 HCU 补丁差异；NV 运行也需通过自身基本正确性检查，不能把某张卡的输出自动当作数学真值。
 2. **导出共同初态与固定 batch。** 优先从同一权重和训练状态加载；转换 QKV 排布、转置、expert 顺序、分片或绑定权重时，校验转换后实际逻辑张量。硬件数量不一致时先比较可对应的局部模块，或按逻辑切片重建比较；不直接配对不同意义的 rank0。
 3. **先固定一个短窗口。** 对照输入 → block 边界 → logits/各 loss 项 → 输入和参数梯度 → unscale/clip/规约 → 参数更新与状态。梯度相同但更新不同，优先查 optimizer/master/state；前向接近但 backward 不同，查保存量、重算、梯度缩放与分布式归约。
-4. **区分算法差异与实现错误。** 核对两端矩阵乘和 attention 精度、融合边界、累加/舍入点、低精度状态；NV 的 TF32 等设置只能按 NV 实际版本核对，不能假设 HCU 同名选项等价。先以两端各自重复运行估计波动；跨平台不默认要求逐位一致。控制 dropout 时需对齐实际随机输入/掩码；临时关闭只能定位，修复后回到原训练语义验证。
+4. **区分算法差异与实现错误。** 核对两端矩阵乘和 attention 精度、融合边界、累加/舍入点、低精度状态；TF32、flush-to-zero 等设置分别沿各自 Torch/编译器/库版本的真实消费者确认，不能假设 HCU/NV 同名选项等价。改变计算精度或 subnormal 处理后检查生成代码/实际 dispatch 与对应边界输入，不能只比较全局配置或复用另一精度条件的调优结论。先以两端各自重复运行估计波动；跨平台不默认要求逐位一致。控制 dropout 时需对齐实际随机输入/掩码；临时关闭只能定位，修复后回到原训练语义验证。
 5. **对可疑模块交叉验证。** 相同捕获输入分别跑 HCU 候选、NV 路径，以及可获得的独立/更高精度参考。判断差异从哪里产生，而不是只看谁更接近谁。NV 卡放不下全模型时可只承担局部参考，不能把它写成全模型 NV 对照通过。
 6. **修复后恢复真实配置。** 局部输出、梯度与更新通过，再在稳定阶段从相同初态验证实际配方的 loss。两端不同并行规约次序时记录可比层级；无法做逐 step 等价，另设计有依据的统计评估，不能把不匹配数据送入 `quality-check` 凑通过。
 
@@ -53,6 +59,8 @@
 ### 先发现当前工具
 
 用 `$hcu-knowledge-search` 查询项目 `dcu_probe` 的工程报告、`hcuprobe-hook-tensor-lifecycle` 和 `hcuprobe-cross-rank-first-diff`，再核对目标环境当前源码与入口。已核对的固定版本为 `26.2.0-dev@b8dddb57`：distribution 是 `hcu-probe`，import/CLI 为 `hcuprobe`，实现位于 `python/hcuprobe/`。这是查证起点，不是固定要求所有环境安装此版本；历史 `dcu_probe`/`msprobe` 命名、配置和目录不能混用。
+
+公开参考 [HYGON-AI/hcu_probe-das@de68655e](https://github.com/HYGON-AI/hcu_probe-das/tree/de68655e9bd3a3678fd29889982135c473d25f94) 已可读取，但不能据仓名推导 import 命名空间。其 pyproject 仍打包 `python/hcuprobe` 并提供 `hcuprobe` CLI，新增 `python/hcuprobe/tools/compare.py` 却残留 `hcu_probe.core...` 导入；该包装器及仓内框架接入示例尚不能视为已验证安装入口。先用当前制品的正式 CLI/API 核验，不自动安装仓内附带的其他 Agent Skill，也不因新增框架文档就认定训练、推理及所有后端均已通过。
 
 在实际采集环境确认包来源、Torch/HCU 兼容性以及：
 
@@ -139,6 +147,8 @@ Probe 自动首差分析是候选定位，不能代替因果确认。多 rank �
 ## 8. 查证与后续维护
 
 本方法依据 HCU-Knowledge 已保留的 `dcu_probe` 工程报告及两个专题，并核对 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5` 的 PyTorch debugger 生命周期。该来源为内部工程，通过已绑定 HCU 知识库查询；不把其私有源码复制进公共 TrainFlow。
+
+2026-10-20 增量复核还使用公开 Probe `de68655e9bd3a3678fd29889982135c473d25f94` 的包元数据和包装器、HCU TE `main@73dbcf534252d13f463d63c439cf7c41bb05150e` 的 `_extra_state.py`/`module/base.py`，以及 HCU PyTorch 公开 `2.12.0-dev@acf085724329a8c07556709324cb757ce7046fbd` 的精度消费者与数值修正。它们补充本页的版本/状态核验方法；没有安装 Probe、重放 checkpoint 或进行 HCU/NV 精度实测。具体来源与未覆盖项继续从大库工程指南查询，不把开发线文档、UT 记录或同号 wheel 当作现场兼容证明。
 
 通用边界参考 [PyTorch 数值精度](https://docs.pytorch.org/docs/2.11/notes/numerical_accuracy.html)、[可复现性](https://docs.pytorch.org/docs/2.11/notes/randomness.html)、[autograd 调试](https://docs.pytorch.org/docs/2.11/autograd.html#debugging-and-anomaly-detection)。这里核对的是 2.11 文档，实际命令/配置仍须匹配部署版本；CPU/NV/其他平台的文档不证明 HCU 分支已实现同样能力。
 

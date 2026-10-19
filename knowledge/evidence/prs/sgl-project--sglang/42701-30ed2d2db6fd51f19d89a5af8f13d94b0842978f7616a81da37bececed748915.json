@@ -1,0 +1,794 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "48af8eed3924d113d2a07023d8d729f911ec05edaa0d2d23be8b1c64e9bf52ee",
+      "isPrivate": false,
+      "numbers": [
+        42713,
+        42712,
+        42711,
+        42710,
+        42703,
+        42702,
+        42701,
+        42700
+      ],
+      "observed_at": "2026-10-19T19:24:33.595398+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4769,
+        "resetAt": "2026-10-19T19:47:51Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "aaf5f397a5a6565ad2cbcfe64bab56bdebbe4b75",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nWith HiCache on, a conversation's later turns can produce different output depending on whether its prefix was reused from device memory or loaded back from host memory. The host copy of the previous turn's last output token can be stale, so a load-back restores wrong KV for that token.\n\nUnder the overlap scheduler, `process_batch_result` for step N runs after step N+1 was launched. A request that finished at step N is still in batch N+1, and that forward writes the KV of the request's last output token on the forward stream. Meanwhile `release_kv_cache` already inserts that token into the tree and the write-through starts. `HiCacheController.start_writing` -> `L2TransferEngine.submit_device_to_host` orders the device-to-host copy only after an event recorded on the scheduler stream, never after the forward stream, so the copy can read that token's KV before or while it is written. Load-back already has the equivalent fence (`load_fence_stream`, set by the scheduler to the forward stream and used in `start_loading`); write-through had none.\n\nThe stale token sits at the end of the previous reply, which is exactly where the next turn's prompt resumes, so the next turn diverges within its first few tokens.\n\n## Modifications\n\n- `HiCacheController.start_writing`: before submitting the copy, make the device-to-host stream wait on `load_fence_stream` (the forward stream). `wait_stream` orders the copy after the work queued so far, which at this point is the forward that writes the node's last token; forwards launched later still overlap with the copy. When `load_fence_stream` is unset (no scheduler wiring) nothing changes.\n- The comment on `load_fence_stream` now names both uses.\n- Test `test_write_copy_waits_for_queued_forwards` in `test/registered/unit/mem_cache/test_hicache_staged_write_back_dispatch.py`: a write submitted through a real `L2TransferEngine` must wait on the forward stream before its copy. It fails without the fix. Five existing tests in that file build controllers with `__new__` and now set `load_fence_stream = None`, as the load-path test there already does.\n\nThis is the default behavior, not an option. The alternative is a data race that silently corrupts host KV, and the fence only adds a GPU-side stream dependency on work already queued (no CPU synchronization). Its costs: a write ack can arrive up to one forward later, so a just-written node stays unevictable a little longer; and on the paths that wait synchronously for a write (write-back on eviction), the scheduler also waits for the in-flight forward in that step. Without the overlap scheduler the forward stream is idle when the write is submitted, and the wait is free.\n\nOther device-to-host copies checked:\n- Write-back on eviction, buffer mode and `flush_pending_backups` all go through `start_writing` and get the fence.\n- `UnifiedRadixCache.backup_kv_cache` (PD decode retraction backup) copies only `seqlen - 1` tokens; the forward in flight at retraction writes position `seqlen - 1`, so that copy is not exposed.\n- `DecodeKVCacheOffloadManager` builds its own controller without `load_fence_stream`, but offloads `origin_input_ids + output_ids[:-1]`, so it is not exposed either.\n\nHiSparse orders its decode backups the same way (`decode_backup_stream.wait_stream(self.decode_producer_stream)` in `hisparse_coordinator.py`).\n\nRelated: #42702 orders PD decode retraction restores after the in-flight forward, the same kind of race on the restore side. The two PRs are independent.\n\n## Accuracy Tests\n\nGreedy multi-turn outputs at concurrency 1 on a public model, `Qwen/Qwen3-8B` (no sliding window), one RTX 5090. Six sessions x three turns. Each turn sends the previous turn's `input_ids` + its `output_ids` + 200 new tokens, so a turn reuses the previous sequence including its last output token. Turns run turn-major (all sessions' turn 0, then turn 1, ...).\n\n- Reference: no HiCache, default device pool, so every later turn reuses its prefix from device.\n- HiCache: `--enable-hierarchical-cache --hicache-size 4 --hicache-write-policy write_through --max-total-tokens 8192`. The small device pool evicts each session's prefix to host between its turns, so every later turn is a load-back. Defaults otherwise (flashinfer attention, `kernel` io backend, `page_first` layout, overlap scheduler on).\n\nBoth arms report the same `cached_tokens` for every turn (3128 for turn 1, 3456 for turn 2).\n\n| run (order) | turn 0 identical to reference | turns 1-2 identical to reference |\n|---|---|---|\n| main, 1st | 6/6 | 0/12 (first differing token at 3-51) |\n| this PR, 1st | 6/6 | 12/12 |\n| this PR, 2nd | 6/6 | 12/12 |\n| main, 2nd | 6/6 | 0/12 |\n\nReproduce:\n\n```bash\n# reference\npython -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000\npython multiturn_exact.py --model Qwen/Qwen3-8B --out ref.json\n# HiCache with load-backs\npython -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000 \\\n  --enable-hierarchical-cache --hicache-size 4 --hicache-write-policy write_through \\\n  --max-total-tokens 8192\npython multiturn_exact.py --model Qwen/Qwen3-8B --out hicache.json\npython compare_exact.py ref.json hicache.json\n```\n\n<details>\n<summary>multiturn_exact.py / compare_exact.py</summary>\n\n```python\n# multiturn_exact.py\nimport argparse, json, random\nimport requests\nfrom transformers import AutoTokenizer\n\np = argparse.ArgumentParser()\np.add_argument(\"--url\", default=\"http://127.0.0.1:30000\")\np.add_argument(\"--model\", required=True)\np.add_argument(\"--sessions\", type=int, default=6)\np.add_argument(\"--turns\", type=int, default=3)\np.add_argument(\"--out\", required=True)\nargs = p.parse_args()\n\ntok = AutoTokenizer.from_pretrained(args.model)\nvocab = [i for i in range(min(tok.vocab_size, 60000))\n         if (s := tok.decode([i])).startswith(\" \") and s[1:].isalpha() and len(s) > 3]\nrng = random.Random(0)\nseqs = [rng.choices(vocab, k=3000) for _ in range(args.sessions)]\nrecords = []\nfor turn in range(args.turns):\n    for s in range(args.sessions):\n        if turn > 0:\n            seqs[s] += rng.choices(vocab, k=200)\n        r = requests.post(args.url + \"/generate\", json={\n            \"input_ids\": seqs[s],\n            \"sampling_params\": {\"temperature\": 0, \"max_new_tokens\": 128, \"ignore_eos\": True},\n        }).json()\n        records.append({\"session\": s, \"turn\": turn,\n                        \"cached_tokens\": r[\"meta_info\"][\"cached_tokens\"],\n                        \"output_ids\": r[\"output_ids\"]})\n        seqs[s] += r[\"output_ids\"]\njson.dump(records, open(args.out, \"w\"))\n```\n\n```python\n# compare_exact.py\nimport json, sys\nref, run = (json.load(open(p)) for p in sys.argv[1:3])\nfor turn in sorted({r[\"turn\"] for r in ref}):\n    pairs = [(a, b) for a, b in zip(ref, run) if a[\"turn\"] == turn]\n    same = sum(a[\"output_ids\"] == b[\"output_ids\"] for a, b in pairs)\n    print(f\"turn {turn}: {same}/{len(pairs)} identical\")\n```\n\n</details>\n\n## Speed Tests and Profiling\n\n`Qwen/Qwen3-8B` on one RTX 5090 with `--enable-hierarchical-cache --hicache-size 8 --hicache-write-policy write_through` and the default device pool, so every finished request starts a write-through. Load: `python -m sglang.benchmark.serving --backend sglang --dataset-name random-ids --random-input-len 2048 --random-output-len 256 --random-range-ratio 1.0 --num-prompts 320 --max-concurrency 32 --request-rate inf --seed 1`. Runs interleaved ABBA, a fresh server per run.\n\n| run (order) | output tok/s | median TPOT (ms) | median TTFT (ms) |\n|---|---|---|---|\n| main, 1st | 772.1 | 24.07 | 3353 |\n| this PR, 1st | 771.6 | 23.11 | 3364 |\n| this PR, 2nd | 772.4 | 23.09 | 3356 |\n| main, 2nd | 773.1 | 24.23 | 3350 |\n\nOutput throughput: main 772.6 mean, this PR 772.0 (-0.08%). That is inside the spread between the two `main` runs (0.13%), so no throughput cost is measurable at this load. Median TPOT is not worse.\n\nAn earlier measurement on a heavier HiCache load: Gemma-4-26B-A4B-it (FP8) at 20-32 concurrent multi-turn sessions with frequent load-backs, one RTX 5090, single runs per point against the unfenced build. It showed -1.0% to -1.8% output tok/s, consistent across points. Without repeats that is close to noise, so a small real cost under heavy write-through cannot be excluded.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (no user-facing change)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\nUnit tests (pytest on a GPU host, rebased on f2f0be731c): `test_hicache_staged_write_back_dispatch.py` and `test_hicache_pp_sync_drain.py` pass (25). Before the rebase, `test/registered/unit/managers` and `test/registered/unit/mem_cache` matched `main` plus the new case; the one failure there (`test_mm_process_config.py::TestStreamOrderedMmFeaturePool::test_consumer_slot_uses_global_tp_rank`) also fails on `main` in the same environment.\n\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38981811326](https://github.com/sgl-project/sglang/actions/runs/38981811326)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38981811016](https://github.com/sgl-project/sglang/actions/runs/38981811016)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38981811048](https://github.com/sgl-project/sglang/actions/runs/38981811048)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jumanzii"
+            },
+            "body": "@ispobock @xiezhq-hermann gentle ping on this one. small fix, repro numbers are in the description. would be great if someone can trigger ci 🙏",
+            "createdAt": "2026-10-12T00:41:39Z",
+            "databaseId": 6115722783,
+            "updatedAt": "2026-10-12T00:41:39Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6115722783"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=38973422131 -->\nRequired checks failed on 4bd9d0a; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38973422131))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+            "createdAt": "2026-10-16T22:07:40Z",
+            "databaseId": 6225626187,
+            "updatedAt": "2026-10-16T23:29:55Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6225626187"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=38981715215 -->\nRequired checks failed on 4bd9d0a; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38981715215))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+            "createdAt": "2026-10-16T23:29:54Z",
+            "databaseId": 6226619564,
+            "updatedAt": "2026-10-16T23:33:47Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6226619564"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=38981808894 -->\nRequired checks failed on 4567af6; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38981808894))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+            "createdAt": "2026-10-16T23:33:46Z",
+            "databaseId": 6226665601,
+            "updatedAt": "2026-10-16T23:39:31Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6226665601"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "xiezhq-hermann"
+            },
+            "body": "@jumanzii this branch conflicts with `main` since #44800 landed (`start_writing` grew a `wait_for_forward` kwarg that only fences the blocking write-back drain). `fractalyze/sglang` is an organization-owned fork, so GitHub does not let upstream maintainers push the resolution here. I published the resolved merge as branch `xiezhq/42701-merge-main` on sgl-project/sglang (`0a0ee5ff3b` = this branch + `main`, a fast-forward of your branch):\n\n- `start_writing()` now always waits on `write_fence_stream` (covers this PR's write-through overlap race and #44800's evicted-SWA-page case); the kwarg and its `writing_check(write_back=True)` call site are dropped, `load_fence_stream` is untouched.\n- this PR's test setups set `controller.write_fence_stream = None`; the new test fences via `write_fence_stream`.\n- `test_hicache_staged_write_back_dispatch.py` + `test_unified_hicache_regressions.py`: 29 passed, 1 skipped locally.\n\nCould you fast-forward the branch from it?\n\n```\ngit fetch https://github.com/sgl-project/sglang.git xiezhq/42701-merge-main\ngit push <fractalyze remote> FETCH_HEAD:fix/hicache-write-through-fence\n```\n",
+            "createdAt": "2026-10-19T17:39:43Z",
+            "databaseId": 6273398261,
+            "updatedAt": "2026-10-19T17:39:43Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6273398261"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXXsdfU=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "headRefOid": "4567af60ee638a284042d3c36710bf4cb8fa2681",
+      "headRepository": {
+        "nameWithOwner": "fractalyze/sglang"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 42701,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "xiezhq-hermann"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5554700261,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-16T23:30:17Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42701#pullrequestreview-5554700261"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNlQyMzozMDoxN1q0MjAyNi0xMC0xNlQyMzozMDoxN1rPAAAAAUsV_-U=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Fix] HiCache: stale host KV from write-through copies racing the in-flight forward",
+      "updatedAt": "2026-10-19T17:39:43Z",
+      "url": "https://github.com/sgl-project/sglang/pull/42701"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/42701/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/42701/commits"
+      },
+      "html": {
+        "href": "https://github.com/sgl-project/sglang/pull/42701"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/42701"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/42701/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/42701"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/statuses/4567af60ee638a284042d3c36710bf4cb8fa2681"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 39,
+    "assignee": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/22819949?v=4",
+      "events_url": "https://api.github.com/users/xiezhq-hermann/events{/privacy}",
+      "followers_url": "https://api.github.com/users/xiezhq-hermann/followers",
+      "following_url": "https://api.github.com/users/xiezhq-hermann/following{/other_user}",
+      "gists_url": "https://api.github.com/users/xiezhq-hermann/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/xiezhq-hermann",
+      "id": 22819949,
+      "login": "xiezhq-hermann",
+      "node_id": "MDQ6VXNlcjIyODE5OTQ5",
+      "organizations_url": "https://api.github.com/users/xiezhq-hermann/orgs",
+      "received_events_url": "https://api.github.com/users/xiezhq-hermann/received_events",
+      "repos_url": "https://api.github.com/users/xiezhq-hermann/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/xiezhq-hermann/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/xiezhq-hermann/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/xiezhq-hermann",
+      "user_view_type": "public"
+    },
+    "assignees": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/22819949?v=4",
+        "events_url": "https://api.github.com/users/xiezhq-hermann/events{/privacy}",
+        "followers_url": "https://api.github.com/users/xiezhq-hermann/followers",
+        "following_url": "https://api.github.com/users/xiezhq-hermann/following{/other_user}",
+        "gists_url": "https://api.github.com/users/xiezhq-hermann/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/xiezhq-hermann",
+        "id": 22819949,
+        "login": "xiezhq-hermann",
+        "node_id": "MDQ6VXNlcjIyODE5OTQ5",
+        "organizations_url": "https://api.github.com/users/xiezhq-hermann/orgs",
+        "received_events_url": "https://api.github.com/users/xiezhq-hermann/received_events",
+        "repos_url": "https://api.github.com/users/xiezhq-hermann/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/xiezhq-hermann/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/xiezhq-hermann/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/xiezhq-hermann",
+        "user_view_type": "public"
+      }
+    ],
+    "author_association": "NONE",
+    "auto_merge": null,
+    "base": {
+      "label": "sgl-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/sgl-project/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/sgl-project/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/sgl-project/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/sgl-project/sglang/branches{/branch}",
+        "clone_url": "https://github.com/sgl-project/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/sgl-project/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/sgl-project/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/sgl-project/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/sgl-project/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/sgl-project/sglang/contributors",
+        "created_at": "2024-01-08T04:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/sgl-project/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/sgl-project/sglang/downloads",
+        "events_url": "https://api.github.com/repos/sgl-project/sglang/events",
+        "fork": false,
+        "forks": 9697,
+        "forks_count": 9697,
+        "forks_url": "https://api.github.com/repos/sgl-project/sglang/forks",
+        "full_name": "sgl-project/sglang",
+        "git_commits_url": "https://api.github.com/repos/sgl-project/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/sgl-project/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/sgl-project/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/sgl-project/sglang.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": false,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/sgl-project/sglang/hooks",
+        "html_url": "https://github.com/sgl-project/sglang",
+        "id": 740303686,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/sgl-project/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/sgl-project/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/sgl-project/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/sgl-project/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/sgl-project/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/sgl-project/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/sgl-project/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/sgl-project/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOLCAjRg",
+        "notifications_url": "https://api.github.com/repos/sgl-project/sglang/notifications{?since,all,participating}",
+        "open_issues": 5963,
+        "open_issues_count": 5963,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+          "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/sgl-project/followers",
+          "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/sgl-project",
+          "id": 147780389,
+          "login": "sgl-project",
+          "node_id": "O_kgDOCM7zJQ",
+          "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+          "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+          "repos_url": "https://api.github.com/users/sgl-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/sgl-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/sgl-project/sglang/pulls{/number}",
+        "pushed_at": "2026-10-19T19:11:02Z",
+        "releases_url": "https://api.github.com/repos/sgl-project/sglang/releases{/id}",
+        "size": 453851,
+        "ssh_url": "git@github.com:sgl-project/sglang.git",
+        "stargazers_count": 37444,
+        "stargazers_url": "https://api.github.com/repos/sgl-project/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/sgl-project/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/sgl-project/sglang/subscription",
+        "svn_url": "https://github.com/sgl-project/sglang",
+        "tags_url": "https://api.github.com/repos/sgl-project/sglang/tags",
+        "teams_url": "https://api.github.com/repos/sgl-project/sglang/teams",
+        "topics": [
+          "attention",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "diffusion",
+          "glm",
+          "gpt-oss",
+          "inference",
+          "llama",
+          "llm",
+          "minimax",
+          "moe",
+          "qwen",
+          "qwen-image",
+          "reinforcement-learning",
+          "transformer",
+          "vlm",
+          "wan"
+        ],
+        "trees_url": "https://api.github.com/repos/sgl-project/sglang/git/trees{/sha}",
+        "updated_at": "2026-10-19T19:21:38Z",
+        "url": "https://api.github.com/repos/sgl-project/sglang",
+        "visibility": "public",
+        "watchers": 37444,
+        "watchers_count": 37444,
+        "web_commit_signoff_required": false
+      },
+      "sha": "aaf5f397a5a6565ad2cbcfe64bab56bdebbe4b75",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+        "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/sgl-project/followers",
+        "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/sgl-project",
+        "id": 147780389,
+        "login": "sgl-project",
+        "node_id": "O_kgDOCM7zJQ",
+        "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+        "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+        "repos_url": "https://api.github.com/users/sgl-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/sgl-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Motivation\n\nWith HiCache on, a conversation's later turns can produce different output depending on whether its prefix was reused from device memory or loaded back from host memory. The host copy of the previous turn's last output token can be stale, so a load-back restores wrong KV for that token.\n\nUnder the overlap scheduler, `process_batch_result` for step N runs after step N+1 was launched. A request that finished at step N is still in batch N+1, and that forward writes the KV of the request's last output token on the forward stream. Meanwhile `release_kv_cache` already inserts that token into the tree and the write-through starts. `HiCacheController.start_writing` -> `L2TransferEngine.submit_device_to_host` orders the device-to-host copy only after an event recorded on the scheduler stream, never after the forward stream, so the copy can read that token's KV before or while it is written. Load-back already has the equivalent fence (`load_fence_stream`, set by the scheduler to the forward stream and used in `start_loading`); write-through had none.\n\nThe stale token sits at the end of the previous reply, which is exactly where the next turn's prompt resumes, so the next turn diverges within its first few tokens.\n\n## Modifications\n\n- `HiCacheController.start_writing`: before submitting the copy, make the device-to-host stream wait on `load_fence_stream` (the forward stream). `wait_stream` orders the copy after the work queued so far, which at this point is the forward that writes the node's last token; forwards launched later still overlap with the copy. When `load_fence_stream` is unset (no scheduler wiring) nothing changes.\n- The comment on `load_fence_stream` now names both uses.\n- Test `test_write_copy_waits_for_queued_forwards` in `test/registered/unit/mem_cache/test_hicache_staged_write_back_dispatch.py`: a write submitted through a real `L2TransferEngine` must wait on the forward stream before its copy. It fails without the fix. Five existing tests in that file build controllers with `__new__` and now set `load_fence_stream = None`, as the load-path test there already does.\n\nThis is the default behavior, not an option. The alternative is a data race that silently corrupts host KV, and the fence only adds a GPU-side stream dependency on work already queued (no CPU synchronization). Its costs: a write ack can arrive up to one forward later, so a just-written node stays unevictable a little longer; and on the paths that wait synchronously for a write (write-back on eviction), the scheduler also waits for the in-flight forward in that step. Without the overlap scheduler the forward stream is idle when the write is submitted, and the wait is free.\n\nOther device-to-host copies checked:\n- Write-back on eviction, buffer mode and `flush_pending_backups` all go through `start_writing` and get the fence.\n- `UnifiedRadixCache.backup_kv_cache` (PD decode retraction backup) copies only `seqlen - 1` tokens; the forward in flight at retraction writes position `seqlen - 1`, so that copy is not exposed.\n- `DecodeKVCacheOffloadManager` builds its own controller without `load_fence_stream`, but offloads `origin_input_ids + output_ids[:-1]`, so it is not exposed either.\n\nHiSparse orders its decode backups the same way (`decode_backup_stream.wait_stream(self.decode_producer_stream)` in `hisparse_coordinator.py`).\n\nRelated: #42702 orders PD decode retraction restores after the in-flight forward, the same kind of race on the restore side. The two PRs are independent.\n\n## Accuracy Tests\n\nGreedy multi-turn outputs at concurrency 1 on a public model, `Qwen/Qwen3-8B` (no sliding window), one RTX 5090. Six sessions x three turns. Each turn sends the previous turn's `input_ids` + its `output_ids` + 200 new tokens, so a turn reuses the previous sequence including its last output token. Turns run turn-major (all sessions' turn 0, then turn 1, ...).\n\n- Reference: no HiCache, default device pool, so every later turn reuses its prefix from device.\n- HiCache: `--enable-hierarchical-cache --hicache-size 4 --hicache-write-policy write_through --max-total-tokens 8192`. The small device pool evicts each session's prefix to host between its turns, so every later turn is a load-back. Defaults otherwise (flashinfer attention, `kernel` io backend, `page_first` layout, overlap scheduler on).\n\nBoth arms report the same `cached_tokens` for every turn (3128 for turn 1, 3456 for turn 2).\n\n| run (order) | turn 0 identical to reference | turns 1-2 identical to reference |\n|---|---|---|\n| main, 1st | 6/6 | 0/12 (first differing token at 3-51) |\n| this PR, 1st | 6/6 | 12/12 |\n| this PR, 2nd | 6/6 | 12/12 |\n| main, 2nd | 6/6 | 0/12 |\n\nReproduce:\n\n```bash\n# reference\npython -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000\npython multiturn_exact.py --model Qwen/Qwen3-8B --out ref.json\n# HiCache with load-backs\npython -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000 \\\n  --enable-hierarchical-cache --hicache-size 4 --hicache-write-policy write_through \\\n  --max-total-tokens 8192\npython multiturn_exact.py --model Qwen/Qwen3-8B --out hicache.json\npython compare_exact.py ref.json hicache.json\n```\n\n<details>\n<summary>multiturn_exact.py / compare_exact.py</summary>\n\n```python\n# multiturn_exact.py\nimport argparse, json, random\nimport requests\nfrom transformers import AutoTokenizer\n\np = argparse.ArgumentParser()\np.add_argument(\"--url\", default=\"http://127.0.0.1:30000\")\np.add_argument(\"--model\", required=True)\np.add_argument(\"--sessions\", type=int, default=6)\np.add_argument(\"--turns\", type=int, default=3)\np.add_argument(\"--out\", required=True)\nargs = p.parse_args()\n\ntok = AutoTokenizer.from_pretrained(args.model)\nvocab = [i for i in range(min(tok.vocab_size, 60000))\n         if (s := tok.decode([i])).startswith(\" \") and s[1:].isalpha() and len(s) > 3]\nrng = random.Random(0)\nseqs = [rng.choices(vocab, k=3000) for _ in range(args.sessions)]\nrecords = []\nfor turn in range(args.turns):\n    for s in range(args.sessions):\n        if turn > 0:\n            seqs[s] += rng.choices(vocab, k=200)\n        r = requests.post(args.url + \"/generate\", json={\n            \"input_ids\": seqs[s],\n            \"sampling_params\": {\"temperature\": 0, \"max_new_tokens\": 128, \"ignore_eos\": True},\n        }).json()\n        records.append({\"session\": s, \"turn\": turn,\n                        \"cached_tokens\": r[\"meta_info\"][\"cached_tokens\"],\n                        \"output_ids\": r[\"output_ids\"]})\n        seqs[s] += r[\"output_ids\"]\njson.dump(records, open(args.out, \"w\"))\n```\n\n```python\n# compare_exact.py\nimport json, sys\nref, run = (json.load(open(p)) for p in sys.argv[1:3])\nfor turn in sorted({r[\"turn\"] for r in ref}):\n    pairs = [(a, b) for a, b in zip(ref, run) if a[\"turn\"] == turn]\n    same = sum(a[\"output_ids\"] == b[\"output_ids\"] for a, b in pairs)\n    print(f\"turn {turn}: {same}/{len(pairs)} identical\")\n```\n\n</details>\n\n## Speed Tests and Profiling\n\n`Qwen/Qwen3-8B` on one RTX 5090 with `--enable-hierarchical-cache --hicache-size 8 --hicache-write-policy write_through` and the default device pool, so every finished request starts a write-through. Load: `python -m sglang.benchmark.serving --backend sglang --dataset-name random-ids --random-input-len 2048 --random-output-len 256 --random-range-ratio 1.0 --num-prompts 320 --max-concurrency 32 --request-rate inf --seed 1`. Runs interleaved ABBA, a fresh server per run.\n\n| run (order) | output tok/s | median TPOT (ms) | median TTFT (ms) |\n|---|---|---|---|\n| main, 1st | 772.1 | 24.07 | 3353 |\n| this PR, 1st | 771.6 | 23.11 | 3364 |\n| this PR, 2nd | 772.4 | 23.09 | 3356 |\n| main, 2nd | 773.1 | 24.23 | 3350 |\n\nOutput throughput: main 772.6 mean, this PR 772.0 (-0.08%). That is inside the spread between the two `main` runs (0.13%), so no throughput cost is measurable at this load. Median TPOT is not worse.\n\nAn earlier measurement on a heavier HiCache load: Gemma-4-26B-A4B-it (FP8) at 20-32 concurrent multi-turn sessions with frequent load-backs, one RTX 5090, single runs per point against the unfenced build. It showed -1.0% to -1.8% output tok/s, consistent across points. Without repeats that is close to noise, so a small real cost under heavy write-through cannot be excluded.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (no user-facing change)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\nUnit tests (pytest on a GPU host, rebased on f2f0be731c): `test_hicache_staged_write_back_dispatch.py` and `test_hicache_pp_sync_drain.py` pass (25). Before the rebase, `test/registered/unit/managers` and `test/registered/unit/mem_cache` matched `main` plus the new case; the one failure there (`test_mm_process_config.py::TestStreamOrderedMmFeaturePool::test_consumer_slot_uses_global_tp_rank`) also fails on `main` in the same environment.\n\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38981811326](https://github.com/sgl-project/sglang/actions/runs/38981811326)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38981811016](https://github.com/sgl-project/sglang/actions/runs/38981811016)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38981811048](https://github.com/sgl-project/sglang/actions/runs/38981811048)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 5,
+    "comments_url": "https://api.github.com/repos/sgl-project/sglang/issues/42701/comments",
+    "commits": 4,
+    "commits_url": "https://api.github.com/repos/sgl-project/sglang/pulls/42701/commits",
+    "created_at": "2026-10-06T02:34:39Z",
+    "deletions": 2,
+    "diff_url": "https://github.com/sgl-project/sglang/pull/42701.diff",
+    "draft": false,
+    "head": {
+      "label": "fractalyze:fix/hicache-write-through-fence",
+      "ref": "fix/hicache-write-through-fence",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/fractalyze/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/fractalyze/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/fractalyze/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/fractalyze/sglang/branches{/branch}",
+        "clone_url": "https://github.com/fractalyze/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/fractalyze/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/fractalyze/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/fractalyze/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/fractalyze/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/fractalyze/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/fractalyze/sglang/contributors",
+        "created_at": "2026-09-23T03:57:42Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/fractalyze/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/fractalyze/sglang/downloads",
+        "events_url": "https://api.github.com/repos/fractalyze/sglang/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/fractalyze/sglang/forks",
+        "full_name": "fractalyze/sglang",
+        "git_commits_url": "https://api.github.com/repos/fractalyze/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/fractalyze/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/fractalyze/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/fractalyze/sglang.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/fractalyze/sglang/hooks",
+        "html_url": "https://github.com/fractalyze/sglang",
+        "id": 1382711075,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/fractalyze/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/fractalyze/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/fractalyze/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/fractalyze/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/fractalyze/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/fractalyze/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/fractalyze/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/fractalyze/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOUmp_Iw",
+        "notifications_url": "https://api.github.com/repos/fractalyze/sglang/notifications{?since,all,participating}",
+        "open_issues": 4,
+        "open_issues_count": 4,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/243340970?v=4",
+          "events_url": "https://api.github.com/users/fractalyze/events{/privacy}",
+          "followers_url": "https://api.github.com/users/fractalyze/followers",
+          "following_url": "https://api.github.com/users/fractalyze/following{/other_user}",
+          "gists_url": "https://api.github.com/users/fractalyze/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/fractalyze",
+          "id": 243340970,
+          "login": "fractalyze",
+          "node_id": "O_kgDODoEWqg",
+          "organizations_url": "https://api.github.com/users/fractalyze/orgs",
+          "received_events_url": "https://api.github.com/users/fractalyze/received_events",
+          "repos_url": "https://api.github.com/users/fractalyze/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/fractalyze/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/fractalyze/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/fractalyze",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/fractalyze/sglang/pulls{/number}",
+        "pushed_at": "2026-10-19T06:47:19Z",
+        "releases_url": "https://api.github.com/repos/fractalyze/sglang/releases{/id}",
+        "size": 297274,
+        "ssh_url": "git@github.com:fractalyze/sglang.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/fractalyze/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/fractalyze/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/fractalyze/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/fractalyze/sglang/subscription",
+        "svn_url": "https://github.com/fractalyze/sglang",
+        "tags_url": "https://api.github.com/repos/fractalyze/sglang/tags",
+        "teams_url": "https://api.github.com/repos/fractalyze/sglang/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/fractalyze/sglang/git/trees{/sha}",
+        "updated_at": "2026-10-18T05:52:34Z",
+        "url": "https://api.github.com/repos/fractalyze/sglang",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "4567af60ee638a284042d3c36710bf4cb8fa2681",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/243340970?v=4",
+        "events_url": "https://api.github.com/users/fractalyze/events{/privacy}",
+        "followers_url": "https://api.github.com/users/fractalyze/followers",
+        "following_url": "https://api.github.com/users/fractalyze/following{/other_user}",
+        "gists_url": "https://api.github.com/users/fractalyze/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/fractalyze",
+        "id": 243340970,
+        "login": "fractalyze",
+        "node_id": "O_kgDODoEWqg",
+        "organizations_url": "https://api.github.com/users/fractalyze/orgs",
+        "received_events_url": "https://api.github.com/users/fractalyze/received_events",
+        "repos_url": "https://api.github.com/users/fractalyze/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/fractalyze/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/fractalyze/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/fractalyze",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/42701",
+    "id": 4753354925,
+    "issue_url": "https://api.github.com/repos/sgl-project/sglang/issues/42701",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "c5def5",
+        "default": false,
+        "description": "Hierarchical Caching for SGLang",
+        "id": 8388254410,
+        "name": "hicache",
+        "node_id": "LA_kwDOLCAjRs8AAAAB8_qayg",
+        "url": "https://api.github.com/repos/sgl-project/sglang/labels/hicache"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "9FE30D",
+        "default": false,
+        "description": "CI: run the baseline test suite on this PR",
+        "id": 9283445059,
+        "name": "run-ci",
+        "node_id": "LA_kwDOLCAjRs8AAAACKVYhQw",
+        "url": "https://api.github.com/repos/sgl-project/sglang/labels/run-ci"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D93F0B",
+        "default": false,
+        "description": "CI: all three control labels, plus never batch-cancelled or stale-closed",
+        "id": 12298664708,
+        "name": "highest-priority",
+        "node_id": "LA_kwDOLCAjRs8AAAAC3Q67BA",
+        "url": "https://api.github.com/repos/sgl-project/sglang/labels/highest-priority"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": null,
+    "mergeable": false,
+    "mergeable_state": "dirty",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOLCAjRs8AAAABG1JwrQ",
+    "number": 42701,
+    "patch_url": "https://github.com/sgl-project/sglang/pull/42701.patch",
+    "rebaseable": false,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/9302255?v=4",
+        "events_url": "https://api.github.com/users/Ying1123/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Ying1123/followers",
+        "following_url": "https://api.github.com/users/Ying1123/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Ying1123/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Ying1123",
+        "id": 9302255,
+        "login": "Ying1123",
+        "node_id": "MDQ6VXNlcjkzMDIyNTU=",
+        "organizations_url": "https://api.github.com/users/Ying1123/orgs",
+        "received_events_url": "https://api.github.com/users/Ying1123/received_events",
+        "repos_url": "https://api.github.com/users/Ying1123/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Ying1123/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Ying1123/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Ying1123",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/15100009?v=4",
+        "events_url": "https://api.github.com/users/merrymercy/events{/privacy}",
+        "followers_url": "https://api.github.com/users/merrymercy/followers",
+        "following_url": "https://api.github.com/users/merrymercy/following{/other_user}",
+        "gists_url": "https://api.github.com/users/merrymercy/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/merrymercy",
+        "id": 15100009,
+        "login": "merrymercy",
+        "node_id": "MDQ6VXNlcjE1MTAwMDA5",
+        "organizations_url": "https://api.github.com/users/merrymercy/orgs",
+        "received_events_url": "https://api.github.com/users/merrymercy/received_events",
+        "repos_url": "https://api.github.com/users/merrymercy/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/merrymercy/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/merrymercy/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/merrymercy",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/95566987?v=4",
+        "events_url": "https://api.github.com/users/hnyls2002/events{/privacy}",
+        "followers_url": "https://api.github.com/users/hnyls2002/followers",
+        "following_url": "https://api.github.com/users/hnyls2002/following{/other_user}",
+        "gists_url": "https://api.github.com/users/hnyls2002/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/hnyls2002",
+        "id": 95566987,
+        "login": "hnyls2002",
+        "node_id": "U_kgDOBbI8iw",
+        "organizations_url": "https://api.github.com/users/hnyls2002/orgs",
+        "received_events_url": "https://api.github.com/users/hnyls2002/received_events",
+        "repos_url": "https://api.github.com/users/hnyls2002/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/hnyls2002/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/hnyls2002/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/hnyls2002",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/sgl-project/sglang/pulls/42701/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/4567af60ee638a284042d3c36710bf4cb8fa2681",
+    "title": "[Fix] HiCache: stale host KV from write-through copies racing the in-flight forward",
+    "updated_at": "2026-10-19T17:39:43Z",
+    "url": "https://api.github.com/repos/sgl-project/sglang/pulls/42701",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/102151423?v=4",
+      "events_url": "https://api.github.com/users/jumanzii/events{/privacy}",
+      "followers_url": "https://api.github.com/users/jumanzii/followers",
+      "following_url": "https://api.github.com/users/jumanzii/following{/other_user}",
+      "gists_url": "https://api.github.com/users/jumanzii/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/jumanzii",
+      "id": 102151423,
+      "login": "jumanzii",
+      "node_id": "U_kgDOBha0_w",
+      "organizations_url": "https://api.github.com/users/jumanzii/orgs",
+      "received_events_url": "https://api.github.com/users/jumanzii/received_events",
+      "repos_url": "https://api.github.com/users/jumanzii/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/jumanzii/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/jumanzii/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/jumanzii",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/4567af60ee638a284042d3c36710bf4cb8fa2681/python%2Fsglang%2Fsrt%2Fmanagers%2Fcache_controller.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fcache_controller.py?ref=4567af60ee638a284042d3c36710bf4cb8fa2681",
+      "deletions": 2,
+      "filename": "python/sglang/srt/managers/cache_controller.py",
+      "patch": "@@ -370,8 +370,8 @@ def __init__(\n         self.load_queue: List[CacheOperation] = []\n         self.write_queue: List[CacheOperation] = []\n         self.ack_load_queue: List[HiCacheAck] = []\n-        # Set by the scheduler to the forward stream; gates load-back H2D\n-        # behind in-flight forwards (see start_loading).\n+        # Set by the scheduler to the forward stream; gates load-back H2D and\n+        # write D2H behind in-flight forwards (see start_loading, start_writing).\n         self.load_fence_stream = None\n         self.ack_write_queue: List[HiCacheAck] = []\n \n@@ -839,6 +839,13 @@ def start_writing(self) -> None:\n         host_indices, device_indices, pool_transfers = self._move_write_operation(op)\n         self.write_queue.clear()\n \n+        if self.load_fence_stream is not None:\n+            # Overlap scheduling caches a finished request while the next forward\n+            # still writes its last token's KV; later forwards still overlap.\n+            self.l2_transfer_engine.device_to_host_stream.wait_stream(\n+                self.load_fence_stream\n+            )\n+\n         completion = self.l2_transfer_engine.submit_device_to_host(\n             self._l2_transfers(host_indices, device_indices, pool_transfers)\n         )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/4567af60ee638a284042d3c36710bf4cb8fa2681/python%2Fsglang%2Fsrt%2Fmanagers%2Fcache_controller.py",
+      "sha": "36d3145e6ab69d1bca51ffac5f6ef1e1b3dc2eeb",
+      "status": "modified"
+    },
+    {
+      "additions": 30,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/4567af60ee638a284042d3c36710bf4cb8fa2681/test%2Fregistered%2Funit%2Fmem_cache%2Ftest_hicache_staged_write_back_dispatch.py",
+      "changes": 30,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmem_cache%2Ftest_hicache_staged_write_back_dispatch.py?ref=4567af60ee638a284042d3c36710bf4cb8fa2681",
+      "deletions": 0,
+      "filename": "test/registered/unit/mem_cache/test_hicache_staged_write_back_dispatch.py",
+      "patch": "@@ -1162,6 +1162,7 @@ def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):\n         controller.mem_pool_device = None\n         controller.mem_pool_device_allocator = mock.Mock()\n         controller.ack_write_queue = []\n+        controller.load_fence_stream = None\n         controller.move_hybrid_indices = mock.Mock(\n             side_effect=AssertionError(\n                 \"write-back JIT kernel write should not move indices\"\n@@ -1197,6 +1198,7 @@ def test_hybrid_write_moves_indices_without_write_back_jit(self):\n         controller.mem_pool_device = None\n         controller.mem_pool_device_allocator = mock.Mock()\n         controller.ack_write_queue = []\n+        controller.load_fence_stream = None\n         controller.move_hybrid_indices = mock.Mock(\n             return_value=(op.host_indices, op.device_indices, op.pool_transfers)\n         )\n@@ -1255,6 +1257,7 @@ def backup_from_device_all_layer(\n         controller.mem_pool_device = None\n         controller.mem_pool_device_allocator = mock.Mock()\n         controller.ack_write_queue = []\n+        controller.load_fence_stream = None\n         with mock.patch.object(transfer_module, \"device_module\", _FakeDeviceModule):\n             controller.l2_transfer_engine = L2TransferEngine(\"kernel\")\n         return controller\n@@ -1285,6 +1288,31 @@ def test_hybrid_write_without_flush_merges_chain_into_one_submit(self):\n         self.assertEqual(controller.ack_write_queue[0].node_ids, [1, 2])\n         self.assertEqual(controller.ack_write_queue[0].num_tokens, 8)\n \n+    def test_write_copy_waits_for_queued_forwards(self):\n+        # Under overlap scheduling a finished request is cached while the next\n+        # forward still writes its last token's KV; the D2H copy must start\n+        # after that forward, or the host keeps a half-written token.\n+        events = []\n+\n+        class RecordingStream:\n+            def __init__(self, name):\n+                self.name = name\n+\n+            def wait_stream(self, other):\n+                events.append(f\"{self.name} waits {other.name}\")\n+\n+        controller = self._chain_write_controller(events)\n+        controller.l2_transfer_engine.device_to_host_stream = RecordingStream(\"d2h\")\n+        controller.load_fence_stream = RecordingStream(\"forward\")\n+\n+        with mock.patch.object(transfer_module, \"device_module\", _FakeDeviceModule):\n+            controller.write(_indices(4, 8), node_id=1)\n+\n+        self.assertEqual(len(events), 2)\n+        self.assertEqual(events[0], \"d2h waits forward\")\n+        # Then the write's one copy, of the node's device slots.\n+        self.assertEqual(events[1][1].tolist(), [4, 5, 6, 7])\n+\n     def test_hybrid_write_flushes_by_default(self):\n         captured = []\n         controller = self._chain_write_controller(captured)\n@@ -1323,6 +1351,7 @@ def backup_from_device_all_layer(\n         controller.mem_pool_device_allocator = mock.Mock()\n         controller.device = \"cuda\"\n         controller.ack_write_queue = []\n+        controller.load_fence_stream = None\n         controller.move_indices = mock.Mock(\n             side_effect=AssertionError(\n                 \"write-back JIT kernel write should not move indices\"\n@@ -1360,6 +1389,7 @@ def backup_from_device_all_layer(\n         controller.mem_pool_device_allocator = mock.Mock()\n         controller.device = \"cuda\"\n         controller.ack_write_queue = []\n+        controller.load_fence_stream = None\n         controller.move_indices = mock.Mock(\n             return_value=(op.host_indices, op.device_indices)\n         )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/4567af60ee638a284042d3c36710bf4cb8fa2681/test%2Fregistered%2Funit%2Fmem_cache%2Ftest_hicache_staged_write_back_dispatch.py",
+      "sha": "824a95fe1ea932c87324a75c29b99ae41268353c",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "@ispobock @xiezhq-hermann gentle ping on this one. small fix, repro numbers are in the description. would be great if someone can trigger ci 🙏",
+      "created_at": "2026-10-12T00:41:39Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6115722783",
+      "id": 6115722783,
+      "updated_at": "2026-10-12T00:41:39Z",
+      "user": {
+        "login": "jumanzii"
+      }
+    },
+    {
+      "body": "<!-- pr-check-comment runs=38973422131 -->\nRequired checks failed on 4bd9d0a; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38973422131))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+      "created_at": "2026-10-16T22:07:40Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6225626187",
+      "id": 6225626187,
+      "updated_at": "2026-10-16T23:29:55Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "<!-- pr-check-comment runs=38981715215 -->\nRequired checks failed on 4bd9d0a; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38981715215))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+      "created_at": "2026-10-16T23:29:54Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6226619564",
+      "id": 6226619564,
+      "updated_at": "2026-10-16T23:33:47Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "<!-- pr-check-comment runs=38981808894 -->\nRequired checks failed on 4567af6; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/38981808894))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+      "created_at": "2026-10-16T23:33:46Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6226665601",
+      "id": 6226665601,
+      "updated_at": "2026-10-16T23:39:31Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "@jumanzii this branch conflicts with `main` since #44800 landed (`start_writing` grew a `wait_for_forward` kwarg that only fences the blocking write-back drain). `fractalyze/sglang` is an organization-owned fork, so GitHub does not let upstream maintainers push the resolution here. I published the resolved merge as branch `xiezhq/42701-merge-main` on sgl-project/sglang (`0a0ee5ff3b` = this branch + `main`, a fast-forward of your branch):\n\n- `start_writing()` now always waits on `write_fence_stream` (covers this PR's write-through overlap race and #44800's evicted-SWA-page case); the kwarg and its `writing_check(write_back=True)` call site are dropped, `load_fence_stream` is untouched.\n- this PR's test setups set `controller.write_fence_stream = None`; the new test fences via `write_fence_stream`.\n- `test_hicache_staged_write_back_dispatch.py` + `test_unified_hicache_regressions.py`: 29 passed, 1 skipped locally.\n\nCould you fast-forward the branch from it?\n\n```\ngit fetch https://github.com/sgl-project/sglang.git xiezhq/42701-merge-main\ngit push <fractalyze remote> FETCH_HEAD:fix/hicache-write-through-fence\n```\n",
+      "created_at": "2026-10-19T17:39:43Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42701#issuecomment-6273398261",
+      "id": 6273398261,
+      "updated_at": "2026-10-19T17:39:43Z",
+      "user": {
+        "login": "xiezhq-hermann"
+      }
+    }
+  ],
+  "number": 42701,
+  "refs": {
+    "base": {
+      "commit": "aaf5f397a5a6565ad2cbcfe64bab56bdebbe4b75",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "4567af60ee638a284042d3c36710bf4cb8fa2681",
+      "repository": "fractalyze/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42701#pullrequestreview-5554700261",
+      "id": 5554700261,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-16T23:30:17Z",
+      "user": {
+        "login": "xiezhq-hermann"
+      }
+    }
+  ]
+}

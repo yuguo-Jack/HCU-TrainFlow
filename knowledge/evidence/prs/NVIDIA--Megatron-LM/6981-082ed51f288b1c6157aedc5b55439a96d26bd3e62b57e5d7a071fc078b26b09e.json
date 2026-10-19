@@ -1,0 +1,553 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "75443a1e9cc24262f766498b58f13cacbedc825675e0c723158cad8cf8ef34be",
+      "isPrivate": false,
+      "numbers": [
+        6981,
+        6971,
+        6958,
+        6944,
+        6938,
+        6925,
+        6914,
+        6886
+      ],
+      "observed_at": "2026-10-19T18:06:26.390013+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4864,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "36731acc3f0dac859ee7369bdc3a6af58bac546c",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [x] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\n## The bug\n\n`GPTDataset.__getitem__` caches the loss mask, then masks in place:\n\n```python\nif not cacheable or not cached:                   # FILL — first sample only\n    loss_mask = _get_ltor_masks_and_position_ids(...)\n    if cacheable:\n        self.cached_loss_mask = loss_mask         # 303: stores the tensor\nelse:                                             # HIT — every later sample\n    loss_mask = self.cached_loss_mask.clone()     # 308: stores a copy\n\nloss_mask[labels == self._pad_token_id] = 0.0     # 312: in-place\n```\n\nLine 303 stores the tensor itself rather than a copy, so line 312 writes *through* that reference\ninto the cache. Only the first sample served can do this — FILL runs once per dataset\n(`masks_and_position_ids_are_cached` is set `True` there and never reset) and every later sample\nmasks a clone.\n\n```\n·  loss counted    ×  masked\n\nCase B — the masked sample is served anywhere but first       NO EFFECT\n──────────────────────────────────────────────────────────────────────\n              self.cached_loss_mask       per-call tensor        returned\n\n 1st  s0      ┌───────────────┐\n      FILL    │ A ··········· │ ← the only write that ever happens     A\n              └───────────────┘\n\n 2nd  s_k     ┌───────────────┐\n      HIT     │ A ··········· │ ─clone→ B ···········                  B\n              └───────────────┘  read    312 masks B: ······×××××\n                A not touched            the zeros land in B only\n\n 3rd  s_j     ┌───────────────┐\n      HIT     │ A ··········· │ ─clone→ C ···········                  C\n              └───────────────┘         clones A — NOT B\n\n\nCase A — the masked sample is served FIRST                        BUG\n──────────────────────────────────────────────────────────────────────\n 1st  s_k     ┌───────────────┐\n      FILL    │ A ··········· │ ←── 303 stored the tensor itself, so the\n              └───────────────┘     slot and the tensor masked at 312\n                     ↑              are THE SAME OBJECT\n                     └── 312 writes here: A ······×××××            A\n\n 2nd  s0      ┌───────────────┐\n      HIT     │ A ······××××× │ ─clone→ B ······×××××                  B  WRONG\n              └───────────────┘         a dirty base\n\n 3rd  s_j     ┌───────────────┐\n      HIT     │ A ······××××× │ ─clone→ C ······×××××                  C  WRONG\n              └───────────────┘                ^^^^^\n                                        s_k's zeros, on every sample\n```\n\nStep 3 does not reuse \"the cache from step 2\" — step 2 never wrote one. Line 308\nalways clones the slot, which has held `A` since step 1.\n\n## Impact\n\n**The cached mask is masked in place, so the first sample's padding poisons every batch after\nit.** Line 303 stores the tensor itself, then line 312 writes into that same object — so whatever\nthe first sample masks (real padding, or the pad id among its tokens) is written straight into the\ncache and silently inherited by every following batch. Later samples are harmless by comparison:\nthey clone the cache first, so their own padding lands on a throwaway copy.\n\nTwo ways a sample gets masked positions:\n\n- **Real padding**, when a sample is shorter than `sequence_length`. Training never hits this\n  (`drop_last_partial_sequence` is hardcoded `True` at line 248), but validation can, with\n  `drop_last_partial_validation_sequence=False`.\n- **The pad id as ordinary data.** `_pad_token_id` is `tokenizer.pad` verbatim\n  (`megatron_dataset.py:75`), so any occurrence in the token stream is masked, on any sample.\n  `MockGPTLowLevelDataset` generates `(arange(length - 1) + 1) % vocab_size` — a ramp over the whole\n  vocabulary — so under `--mock-data` this fires on essentially every sample.\n\n**It breaks bitwise checkpoint resume, silently.** Which sample runs FILL is a property of the\n*process*: a fresh run fills from its first training sample, a resumed run from whatever sample its\nstep maps to. The two then serve different masks for the same sample, so gradients diverge from the\nfirst step after the resume even with checkpoint state, `tokens`, `labels` and `position_ids` all\nbitwise identical. Nothing errors — the loss stays plausible because it is normalised by the mask sum.\n\n`MockGPTDataset` and `GPTFIMDataset` inherit this `__getitem__`. `SFTDataset` defines its own and is\nunaffected.\n\n## The fix\n\nCache a clone at 303, mirroring the clone already made at 308. One line — the first\nsample's in-place write then lands on a throwaway and the slot stays clean.\n\n## Test\n\n`test_mask_cache_does_not_leak_padding` builds two dataset instances, serves the\nmasked sample first in one, and asserts both return the same `loss_mask` for\nindex 0. It first asserts that sample really is masked, so it fails loudly rather\nthan passing vacuously if the fixture stops producing one. It reproduces the defect\nvia trigger 1, which is the one constructible from an in-tree tokenizer; both\ntriggers exercise the same aliasing.\n\nFails before the change (`AssertionError: padding from the first served sample\nleaked into a later sample's loss_mask`), passes after.\n\n`cached_attention_mask` and `cached_position_ids` are stored by reference too.\nNeither is mutated today so neither is buggy; left unchanged to keep the diff\nminimal.\n\n## Issue tracking\n\nFor PRs from open-source community contributors:\n\n- **New features**: a linked issue is **required**. Please open a [feature request](https://github.com/NVIDIA/Megatron-LM/issues/new?template=feature_request.md) and reference it here before submitting the PR.\n- **Small updates (bug fixes, minor improvements)**: a linked issue is **recommended** and will accelerate the PR review process.\n\nLinked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n### Code review\n\nFeel free to message or comment @NVIDIA/mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!\n\nAll PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.\n\n#### Step 1: Mark PR as \"Ready for Review\"\n\n1. When your PR is ready, click **Ready for Review**.\n2. An oncall reviewer is auto-assigned and expert reviewers are notified based on your changes.\n   - Some PRs may jump straight to step 2. This is determined by `.github/CODEOWNERS`.\n\n:warning: Only mark as ready once merge-conflicts are resolved and the CI is passing.\nFinal Review might get declined if these requirements are not fulfilled.\n\n#### Step 2: Final Review\n\nFor PRs that change `megatron/core`, once all expert reviewers have approved, the `Final Review` label is applied **automatically** and final reviewers are assigned.\n\nFor PRs outside `megatron/core`, this step is skipped.\n\n#### Step 3: Approved\n\nOnce all required reviewers have approved, the `Approved` label is applied **automatically**.\n\n### Merge\n\nAny member of [mcore-engineers](https://github.com/orgs/NVIDIA/teams/mcore-engineers) will be able to merge your PR.\n\n\n\n\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+            "createdAt": "2026-08-30T08:25:17Z",
+            "databaseId": 5467624704,
+            "updatedAt": "2026-08-30T08:25:17Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5467624704"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhiyuLi-Nvidia"
+            },
+            "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/898c1f1eb8326d20f278cd322c0142d470996f4c",
+            "createdAt": "2026-09-28T17:59:26Z",
+            "databaseId": 5875633036,
+            "updatedAt": "2026-09-28T17:59:26Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5875633036"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "asolergi-nv"
+            },
+            "body": "/review model=codex",
+            "createdAt": "2026-09-29T21:07:09Z",
+            "databaseId": 5898906687,
+            "updatedAt": "2026-09-29T21:07:09Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5898906687"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "asolergi-nv"
+            },
+            "body": "/ok to test [f0b6489](https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/f0b648939645be6c698a3494c0497596a6cabf17)",
+            "createdAt": "2026-09-30T11:56:31Z",
+            "databaseId": 5910744415,
+            "updatedAt": "2026-09-30T11:56:31Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5910744415"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhiyuLi-Nvidia"
+            },
+            "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/ef5bb22657fe93d1ebf5c50f8d049ce08fa75575",
+            "createdAt": "2026-10-15T08:19:54Z",
+            "databaseId": 6187712130,
+            "updatedAt": "2026-10-15T08:19:54Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6187712130"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "balasaajay"
+            },
+            "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/d911617fd08ffcb44863bf1e5420eab27d30dc80",
+            "createdAt": "2026-10-15T18:01:34Z",
+            "databaseId": 6198817374,
+            "updatedAt": "2026-10-15T18:01:34Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6198817374"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZhiyuLi-Nvidia"
+            },
+            "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/ebe23f65ace385d629be3866790061f70e0b824c",
+            "createdAt": "2026-10-17T00:28:21Z",
+            "databaseId": 6227335625,
+            "updatedAt": "2026-10-17T00:28:21Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6227335625"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39008209351",
+            "createdAt": "2026-10-17T05:59:03Z",
+            "databaseId": 6230438122,
+            "updatedAt": "2026-10-17T05:59:03Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6230438122"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39013385653",
+            "createdAt": "2026-10-17T07:22:28Z",
+            "databaseId": 6231162372,
+            "updatedAt": "2026-10-17T07:22:28Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6231162372"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39058747236",
+            "createdAt": "2026-10-17T18:35:17Z",
+            "databaseId": 6238673758,
+            "updatedAt": "2026-10-17T18:35:17Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6238673758"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39078424421",
+            "createdAt": "2026-10-17T23:17:14Z",
+            "databaseId": 6242956946,
+            "updatedAt": "2026-10-17T23:17:14Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6242956946"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39078551039",
+            "createdAt": "2026-10-17T23:19:12Z",
+            "databaseId": 6242985216,
+            "updatedAt": "2026-10-17T23:19:12Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6242985216"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39102022579",
+            "createdAt": "2026-10-18T05:52:05Z",
+            "databaseId": 6246277562,
+            "updatedAt": "2026-10-18T05:52:05Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6246277562"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXROobo=",
+          "hasNextPage": false
+        },
+        "totalCount": 13
+      },
+      "headRefOid": "ebe23f65ace385d629be3866790061f70e0b824c",
+      "headRepository": {
+        "nameWithOwner": "ZhiyuLi-Nvidia/Megatron-LM"
+      },
+      "mergeCommit": {
+        "oid": "85c950c074533bd4386ea7b48fe87e4727d8d48e"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-18T07:01:48Z",
+      "number": 6981,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jaredcasper"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5226043455,
+            "state": "APPROVED",
+            "submittedAt": "2026-09-16T17:27:56Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5226043455"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Phlip79"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5252213711,
+            "state": "APPROVED",
+            "submittedAt": "2026-09-18T20:14:57Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5252213711"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "svcnvidia-nemo-ci"
+            },
+            "body": "LGTM. Cloning the loss mask before caching prevents the first sample’s padding from contaminating later samples. The regression test covers the padded-first access order. Tests were not run in this read-only environment.\n\n*Review generated by codex*\n\n<!-- nemo-ci-formal-review:2e124a92ef2cc6a211c939ca4c25c66c880d30d283970dccc85680a12d74885e:e45f2af5b9423bb025e638e49ac3273b583e0b464338598583e36a730b8a6abf -->",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5358509694,
+            "state": "APPROVED",
+            "submittedAt": "2026-09-29T21:10:18Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5358509694"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "asolergi-nv"
+            },
+            "body": "Good catch! LGTM",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5358539624,
+            "state": "APPROVED",
+            "submittedAt": "2026-09-29T21:13:09Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5358539624"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wOS0yOVQyMToxMzowOVq0MjAyNi0wOS0yOVQyMToxMzoxMFrPAAAAAT9k02g=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "state": "MERGED",
+      "title": "fix: cache a copy of the GPT dataset loss mask",
+      "updatedAt": "2026-10-18T07:01:50Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/6981"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "NVIDIA/Megatron-LM"
+      },
+      "sha": "36731acc3f0dac859ee7369bdc3a6af58bac546c"
+    },
+    "body": "- [x] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\n## The bug\n\n`GPTDataset.__getitem__` caches the loss mask, then masks in place:\n\n```python\nif not cacheable or not cached:                   # FILL — first sample only\n    loss_mask = _get_ltor_masks_and_position_ids(...)\n    if cacheable:\n        self.cached_loss_mask = loss_mask         # 303: stores the tensor\nelse:                                             # HIT — every later sample\n    loss_mask = self.cached_loss_mask.clone()     # 308: stores a copy\n\nloss_mask[labels == self._pad_token_id] = 0.0     # 312: in-place\n```\n\nLine 303 stores the tensor itself rather than a copy, so line 312 writes *through* that reference\ninto the cache. Only the first sample served can do this — FILL runs once per dataset\n(`masks_and_position_ids_are_cached` is set `True` there and never reset) and every later sample\nmasks a clone.\n\n```\n·  loss counted    ×  masked\n\nCase B — the masked sample is served anywhere but first       NO EFFECT\n──────────────────────────────────────────────────────────────────────\n              self.cached_loss_mask       per-call tensor        returned\n\n 1st  s0      ┌───────────────┐\n      FILL    │ A ··········· │ ← the only write that ever happens     A\n              └───────────────┘\n\n 2nd  s_k     ┌───────────────┐\n      HIT     │ A ··········· │ ─clone→ B ···········                  B\n              └───────────────┘  read    312 masks B: ······×××××\n                A not touched            the zeros land in B only\n\n 3rd  s_j     ┌───────────────┐\n      HIT     │ A ··········· │ ─clone→ C ···········                  C\n              └───────────────┘         clones A — NOT B\n\n\nCase A — the masked sample is served FIRST                        BUG\n──────────────────────────────────────────────────────────────────────\n 1st  s_k     ┌───────────────┐\n      FILL    │ A ··········· │ ←── 303 stored the tensor itself, so the\n              └───────────────┘     slot and the tensor masked at 312\n                     ↑              are THE SAME OBJECT\n                     └── 312 writes here: A ······×××××            A\n\n 2nd  s0      ┌───────────────┐\n      HIT     │ A ······××××× │ ─clone→ B ······×××××                  B  WRONG\n              └───────────────┘         a dirty base\n\n 3rd  s_j     ┌───────────────┐\n      HIT     │ A ······××××× │ ─clone→ C ······×××××                  C  WRONG\n              └───────────────┘                ^^^^^\n                                        s_k's zeros, on every sample\n```\n\nStep 3 does not reuse \"the cache from step 2\" — step 2 never wrote one. Line 308\nalways clones the slot, which has held `A` since step 1.\n\n## Impact\n\n**The cached mask is masked in place, so the first sample's padding poisons every batch after\nit.** Line 303 stores the tensor itself, then line 312 writes into that same object — so whatever\nthe first sample masks (real padding, or the pad id among its tokens) is written straight into the\ncache and silently inherited by every following batch. Later samples are harmless by comparison:\nthey clone the cache first, so their own padding lands on a throwaway copy.\n\nTwo ways a sample gets masked positions:\n\n- **Real padding**, when a sample is shorter than `sequence_length`. Training never hits this\n  (`drop_last_partial_sequence` is hardcoded `True` at line 248), but validation can, with\n  `drop_last_partial_validation_sequence=False`.\n- **The pad id as ordinary data.** `_pad_token_id` is `tokenizer.pad` verbatim\n  (`megatron_dataset.py:75`), so any occurrence in the token stream is masked, on any sample.\n  `MockGPTLowLevelDataset` generates `(arange(length - 1) + 1) % vocab_size` — a ramp over the whole\n  vocabulary — so under `--mock-data` this fires on essentially every sample.\n\n**It breaks bitwise checkpoint resume, silently.** Which sample runs FILL is a property of the\n*process*: a fresh run fills from its first training sample, a resumed run from whatever sample its\nstep maps to. The two then serve different masks for the same sample, so gradients diverge from the\nfirst step after the resume even with checkpoint state, `tokens`, `labels` and `position_ids` all\nbitwise identical. Nothing errors — the loss stays plausible because it is normalised by the mask sum.\n\n`MockGPTDataset` and `GPTFIMDataset` inherit this `__getitem__`. `SFTDataset` defines its own and is\nunaffected.\n\n## The fix\n\nCache a clone at 303, mirroring the clone already made at 308. One line — the first\nsample's in-place write then lands on a throwaway and the slot stays clean.\n\n## Test\n\n`test_mask_cache_does_not_leak_padding` builds two dataset instances, serves the\nmasked sample first in one, and asserts both return the same `loss_mask` for\nindex 0. It first asserts that sample really is masked, so it fails loudly rather\nthan passing vacuously if the fixture stops producing one. It reproduces the defect\nvia trigger 1, which is the one constructible from an in-tree tokenizer; both\ntriggers exercise the same aliasing.\n\nFails before the change (`AssertionError: padding from the first served sample\nleaked into a later sample's loss_mask`), passes after.\n\n`cached_attention_mask` and `cached_position_ids` are stored by reference too.\nNeither is mutated today so neither is buggy; left unchanged to keep the diff\nminimal.\n\n## Issue tracking\n\nFor PRs from open-source community contributors:\n\n- **New features**: a linked issue is **required**. Please open a [feature request](https://github.com/NVIDIA/Megatron-LM/issues/new?template=feature_request.md) and reference it here before submitting the PR.\n- **Small updates (bug fixes, minor improvements)**: a linked issue is **recommended** and will accelerate the PR review process.\n\nLinked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n### Code review\n\nFeel free to message or comment @NVIDIA/mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!\n\nAll PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.\n\n#### Step 1: Mark PR as \"Ready for Review\"\n\n1. When your PR is ready, click **Ready for Review**.\n2. An oncall reviewer is auto-assigned and expert reviewers are notified based on your changes.\n   - Some PRs may jump straight to step 2. This is determined by `.github/CODEOWNERS`.\n\n:warning: Only mark as ready once merge-conflicts are resolved and the CI is passing.\nFinal Review might get declined if these requirements are not fulfilled.\n\n#### Step 2: Final Review\n\nFor PRs that change `megatron/core`, once all expert reviewers have approved, the `Final Review` label is applied **automatically** and final reviewers are assigned.\n\nFor PRs outside `megatron/core`, this step is skipped.\n\n#### Step 3: Approved\n\nOnce all required reviewers have approved, the `Approved` label is applied **automatically**.\n\n### Merge\n\nAny member of [mcore-engineers](https://github.com/orgs/NVIDIA/teams/mcore-engineers) will be able to merge your PR.\n\n\n\n\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "ZhiyuLi-Nvidia/Megatron-LM"
+      },
+      "sha": "ebe23f65ace385d629be3866790061f70e0b824c"
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981",
+    "merge_commit_sha": "85c950c074533bd4386ea7b48fe87e4727d8d48e",
+    "merged": true,
+    "merged_at": "2026-10-18T07:01:48Z",
+    "number": 6981,
+    "state": "closed",
+    "title": "fix: cache a copy of the GPT dataset loss mask",
+    "updated_at": "2026-10-18T07:01:50Z"
+  },
+  "files": [
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/ebe23f65ace385d629be3866790061f70e0b824c/megatron%2Fcore%2Fdatasets%2Fgpt_dataset.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Fdatasets%2Fgpt_dataset.py?ref=ebe23f65ace385d629be3866790061f70e0b824c",
+      "deletions": 1,
+      "filename": "megatron/core/datasets/gpt_dataset.py",
+      "patch": "@@ -300,7 +300,10 @@ def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:\n             )\n             if self.masks_and_position_ids_are_cacheable:\n                 self.cached_attention_mask = attention_mask\n-                self.cached_loss_mask = loss_mask\n+                # Cache a copy: loss_mask is masked in place below, so caching the\n+                # tensor itself would bake this sample's padding into every\n+                # subsequent sample served by this dataset.\n+                self.cached_loss_mask = loss_mask.clone()\n                 self.cached_position_ids = position_ids\n                 self.masks_and_position_ids_are_cached = True\n         else:",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/ebe23f65ace385d629be3866790061f70e0b824c/megatron%2Fcore%2Fdatasets%2Fgpt_dataset.py",
+      "sha": "076179f4448aa73af5f361eacf223f23e6db99e7",
+      "status": "modified"
+    },
+    {
+      "additions": 57,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/ebe23f65ace385d629be3866790061f70e0b824c/tests%2Funit_tests%2Fdata%2Ftest_gpt_dataset.py",
+      "changes": 57,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fdata%2Ftest_gpt_dataset.py?ref=ebe23f65ace385d629be3866790061f70e0b824c",
+      "deletions": 0,
+      "filename": "tests/unit_tests/data/test_gpt_dataset.py",
+      "patch": "@@ -190,5 +190,62 @@ def test_inter_document_masking():\n     assert \"cu_seqlens\" in sample\n \n \n+def test_mask_cache_does_not_leak_padding():\n+    \"\"\"A sample's loss_mask must not depend on which sample was served first.\n+\n+    The mask cache is populated with the first sample's mask, which is then masked\n+    in place for that sample's padding. Caching the tensor itself rather than a copy\n+    bakes that padding into every subsequent sample, so a dataset instance whose\n+    first served sample is padded returns wrong masks from then on.\n+    \"\"\"\n+    if torch.distributed.is_available():\n+        Utils.initialize_distributed()\n+        if torch.distributed.get_rank() == 0:\n+            compile_helpers()\n+        torch.distributed.barrier()\n+    else:\n+        compile_helpers()\n+\n+    tokenizer = MegatronTokenizer.from_pretrained(\n+        metadata_path={\"library\": \"null-text\"}, vocab_size=_MOCK_VOCAB_SIZE\n+    )\n+\n+    def build_dataset():\n+        config = GPTDatasetConfig(\n+            random_seed=1234,\n+            sequence_length=1024,\n+            split=\"990,10,0\",\n+            # All three False is what makes the masks cacheable.\n+            reset_position_ids=False,\n+            reset_attention_mask=False,\n+            eod_mask_loss=False,\n+            create_attention_mask=False,\n+            # Keeps the padded trailing sequence, which is what poisons the cache.\n+            drop_last_partial_validation_sequence=False,\n+            add_extra_token_to_sequence=False,\n+            tokenizer=tokenizer,\n+            mid_level_dataset_surplus=0.005,\n+        )\n+        return BlendedMegatronDatasetBuilder(\n+            MockGPTDataset, [0, None, 0], lambda: True, config\n+        ).build()[1]\n+\n+    # An instance served in index order, so the cache is filled by an unpadded sample.\n+    expected = build_dataset()[0][\"loss_mask\"]\n+\n+    dataset = build_dataset()\n+    assert dataset.masks_and_position_ids_are_cacheable, \"config no longer uses the cache\"\n+\n+    # Serve the padded trailing sequence first, filling the cache from it. Asserting\n+    # that it really is padded keeps the comparison below from passing vacuously.\n+    padded_index = int(dataset.shuffle_index.argmax())\n+    padded_mask = dataset[padded_index][\"loss_mask\"]\n+    assert int((padded_mask == 0).sum()) > 1, f\"index {padded_index} is no longer padded\"\n+\n+    assert torch.equal(\n+        dataset[0][\"loss_mask\"], expected\n+    ), \"padding from the first served sample leaked into a later sample's loss_mask\"\n+\n+\n if __name__ == \"__main__\":\n     test_mock_gpt_dataset()",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/ebe23f65ace385d629be3866790061f70e0b824c/tests%2Funit_tests%2Fdata%2Ftest_gpt_dataset.py",
+      "sha": "d311f7b08b32f89cb2bc1e9c1b1bdf17f410a93d",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+      "created_at": "2026-08-30T08:25:17Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5467624704",
+      "id": 5467624704,
+      "updated_at": "2026-08-30T08:25:17Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    },
+    {
+      "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/898c1f1eb8326d20f278cd322c0142d470996f4c",
+      "created_at": "2026-09-28T17:59:26Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5875633036",
+      "id": 5875633036,
+      "updated_at": "2026-09-28T17:59:26Z",
+      "user": {
+        "login": "ZhiyuLi-Nvidia"
+      }
+    },
+    {
+      "body": "/review model=codex",
+      "created_at": "2026-09-29T21:07:09Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5898906687",
+      "id": 5898906687,
+      "updated_at": "2026-09-29T21:07:09Z",
+      "user": {
+        "login": "asolergi-nv"
+      }
+    },
+    {
+      "body": "/ok to test [f0b6489](https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/f0b648939645be6c698a3494c0497596a6cabf17)",
+      "created_at": "2026-09-30T11:56:31Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-5910744415",
+      "id": 5910744415,
+      "updated_at": "2026-09-30T11:56:31Z",
+      "user": {
+        "login": "asolergi-nv"
+      }
+    },
+    {
+      "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/ef5bb22657fe93d1ebf5c50f8d049ce08fa75575",
+      "created_at": "2026-10-15T08:19:54Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6187712130",
+      "id": 6187712130,
+      "updated_at": "2026-10-15T08:19:54Z",
+      "user": {
+        "login": "ZhiyuLi-Nvidia"
+      }
+    },
+    {
+      "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/d911617fd08ffcb44863bf1e5420eab27d30dc80",
+      "created_at": "2026-10-15T18:01:34Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6198817374",
+      "id": 6198817374,
+      "updated_at": "2026-10-15T18:01:34Z",
+      "user": {
+        "login": "balasaajay"
+      }
+    },
+    {
+      "body": "/ok to test https://github.com/NVIDIA/Megatron-LM/pull/6981/commits/ebe23f65ace385d629be3866790061f70e0b824c",
+      "created_at": "2026-10-17T00:28:21Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6227335625",
+      "id": 6227335625,
+      "updated_at": "2026-10-17T00:28:21Z",
+      "user": {
+        "login": "ZhiyuLi-Nvidia"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39008209351",
+      "created_at": "2026-10-17T05:59:03Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6230438122",
+      "id": 6230438122,
+      "updated_at": "2026-10-17T05:59:03Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39013385653",
+      "created_at": "2026-10-17T07:22:28Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6231162372",
+      "id": 6231162372,
+      "updated_at": "2026-10-17T07:22:28Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39058747236",
+      "created_at": "2026-10-17T18:35:17Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6238673758",
+      "id": 6238673758,
+      "updated_at": "2026-10-17T18:35:17Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39078424421",
+      "created_at": "2026-10-17T23:17:14Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6242956946",
+      "id": 6242956946,
+      "updated_at": "2026-10-17T23:17:14Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39078551039",
+      "created_at": "2026-10-17T23:19:12Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6242985216",
+      "id": 6242985216,
+      "updated_at": "2026-10-17T23:19:12Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39102022579",
+      "created_at": "2026-10-18T05:52:05Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#issuecomment-6246277562",
+      "id": 6246277562,
+      "updated_at": "2026-10-18T05:52:05Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    }
+  ],
+  "number": 6981,
+  "refs": {
+    "base": {
+      "commit": "36731acc3f0dac859ee7369bdc3a6af58bac546c",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "ebe23f65ace385d629be3866790061f70e0b824c",
+      "repository": "ZhiyuLi-Nvidia/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5226043455",
+      "id": 5226043455,
+      "state": "APPROVED",
+      "submitted_at": "2026-09-16T17:27:56Z",
+      "user": {
+        "login": "jaredcasper"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5252213711",
+      "id": 5252213711,
+      "state": "APPROVED",
+      "submitted_at": "2026-09-18T20:14:57Z",
+      "user": {
+        "login": "Phlip79"
+      }
+    },
+    {
+      "body": "LGTM. Cloning the loss mask before caching prevents the first sample’s padding from contaminating later samples. The regression test covers the padded-first access order. Tests were not run in this read-only environment.\n\n*Review generated by codex*\n\n<!-- nemo-ci-formal-review:2e124a92ef2cc6a211c939ca4c25c66c880d30d283970dccc85680a12d74885e:e45f2af5b9423bb025e638e49ac3273b583e0b464338598583e36a730b8a6abf -->",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5358509694",
+      "id": 5358509694,
+      "state": "APPROVED",
+      "submitted_at": "2026-09-29T21:10:18Z",
+      "user": {
+        "login": "svcnvidia-nemo-ci"
+      }
+    },
+    {
+      "body": "Good catch! LGTM",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/6981#pullrequestreview-5358539624",
+      "id": 5358539624,
+      "state": "APPROVED",
+      "submitted_at": "2026-09-29T21:13:09Z",
+      "user": {
+        "login": "asolergi-nv"
+      }
+    }
+  ]
+}

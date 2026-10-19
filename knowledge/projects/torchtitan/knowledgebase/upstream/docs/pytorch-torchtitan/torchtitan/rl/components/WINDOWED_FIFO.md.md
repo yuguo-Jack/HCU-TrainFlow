@@ -15,7 +15,7 @@ path: torchtitan/rl/components/WINDOWED_FIFO.md
 raw_sha256: bb40d346dfed5696c225f63df3ab405a01489e8611a7186bb77417e03b831695
 sources: []
 generated_body_sha256: a63eef4b4f2ff2a37d8ce0dd2fbacf81b8a1000d1bc179070195e1c2af8ba480
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # pytorch/torchtitan / torchtitan/rl/components/WINDOWED_FIFO.md

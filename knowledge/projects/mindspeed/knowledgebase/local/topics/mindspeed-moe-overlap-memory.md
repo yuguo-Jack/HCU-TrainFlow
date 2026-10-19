@@ -8,33 +8,32 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source, official documentation and related PR reading; no HCU runtime validation
 sources:
 - source: ascend-mindspeed
   path: mindspeed/features_manager/moe/moe_alltoall_overlap.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: 98f147c94abd5db221b522a34a396d8a046f571e0d2075d3f6eb574aa322f6ec
 - source: ascend-mindspeed
   path: mindspeed/features_manager/moe/moe_zero_memory.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: ef0f3874ed9f81d07aa70d701f2b2a62e78bf8c913832c4ab078bda371658248
 - source: ascend-mindspeed
   path: mindspeed/core/transformer/moe/moe_feature/overlap/moe_layer_overlap_all2all.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: 5269dbf099be5a4cbfd4804511ca5108c1a23a8094b4696915f4330a94b9beb5
 - source: ascend-mindspeed
   path: mindspeed/core/transformer/moe/moe_feature/overlap/grouped_mlp_with_comp_and_comm_overlap_all2all.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: a9b58be1b4c74c9c485fadb385ade818f23fbba464442f138bfb6d85a9dc4648
 - source: ascend-mindspeed
   path: docs/en/features/megatron_moe/megatron-moe-alltoall-overlap-comm.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: 465129ba55e6466177a97aec18342cb47c0b90d4b9eefd9404b542419e7b64d4
 - source: ascend-mindspeed
   path: docs/en/features/megatron_moe/megatron-moe-zero-memory.md
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: 1d4c360ee5c3a6df9dbf0ebff17eb2049a156f2b1faabc9a9958b7c2c84561b1
 ---
 
@@ -68,11 +67,11 @@ Zero Memory 的 feature 另行校验 level0/level1、逐 PP rank 层数范围和
 
 ## 固定证据与复核范围
 
-- [mindspeed/features_manager/moe/moe_alltoall_overlap.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/features_manager/moe/moe_alltoall_overlap.py)
-- [mindspeed/features_manager/moe/moe_zero_memory.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/features_manager/moe/moe_zero_memory.py)
-- [mindspeed/core/transformer/moe/moe_feature/overlap/moe_layer_overlap_all2all.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/core/transformer/moe/moe_feature/overlap/moe_layer_overlap_all2all.py)
-- [mindspeed/core/transformer/moe/moe_feature/overlap/grouped_mlp_with_comp_and_comm_overlap_all2all.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/core/transformer/moe/moe_feature/overlap/grouped_mlp_with_comp_and_comm_overlap_all2all.py)
-- [docs/en/features/megatron_moe/megatron-moe-alltoall-overlap-comm.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/features/megatron_moe/megatron-moe-alltoall-overlap-comm.md)
-- [docs/en/features/megatron_moe/megatron-moe-zero-memory.md](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/features/megatron_moe/megatron-moe-zero-memory.md)
+- [mindspeed/features_manager/moe/moe_alltoall_overlap.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/features_manager/moe/moe_alltoall_overlap.py)
+- [mindspeed/features_manager/moe/moe_zero_memory.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/features_manager/moe/moe_zero_memory.py)
+- [mindspeed/core/transformer/moe/moe_feature/overlap/moe_layer_overlap_all2all.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/core/transformer/moe/moe_feature/overlap/moe_layer_overlap_all2all.py)
+- [mindspeed/core/transformer/moe/moe_feature/overlap/grouped_mlp_with_comp_and_comm_overlap_all2all.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/core/transformer/moe/moe_feature/overlap/grouped_mlp_with_comp_and_comm_overlap_all2all.py)
+- [docs/en/features/megatron_moe/megatron-moe-alltoall-overlap-comm.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/features/megatron_moe/megatron-moe-alltoall-overlap-comm.md)
+- [docs/en/features/megatron_moe/megatron-moe-zero-memory.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/features/megatron_moe/megatron-moe-zero-memory.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

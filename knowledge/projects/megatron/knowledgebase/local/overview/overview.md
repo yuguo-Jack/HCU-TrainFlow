@@ -10,29 +10,29 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: README.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 9da0af3c6ccb7fb9dae98930e369293d5872dce1ca9fc22e506d302a83d5f91f
 - source: nvidia-megatron-lm
   path: pyproject.toml
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 22dc36250a9c8b155459a3fd6c38fbbee418659eb5c151d023dbf76640f40025
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: ead299ef4e42cd444a931fe61d5778b274acae572d9fca3025de5549dd2c02f5
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: b9166c3df5fe4dd90d5f3479871eeecabae61b9d9eb7722e2b72010d3327ccd8
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e436206da1fe3ec5b8b5da8a06e1c8d6a7e08f149a0079107d83f1d68284e469
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 560336b88b52060544ca76ceb8c9e0b9274472cdea043b76e2a87db467532883
 - source: nvidia-megatron-lm
   path: docs/get-started/releasenotes.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 17defec4cce9926d3fc43aecaab98c8364d44e0cc3ec1d19cde7a91c53684243
 ---
 
@@ -78,9 +78,11 @@ recipe/`pretrain_gpt.py`读取模型、tokenizer、batch和loss回调；`gpt_bui
 
 ## 发布、roadmap 与当前证据
 
-本轮固定main为`e30d863a6d82a3c45f2d71355dc73fbf5610967b`。2026-10-12可见release列表同时有[`core_v0.19.2`](https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v0.19.2)与`26.09-alpha/beta.rc*`候选标签；候选名中的月份、main和Core正式release不能互换。当前pyproject的Python要求与旧安装教程也有漂移，详见安装页。
+本轮固定main为`e8a302ac5bfeb98c6701020cc6cba977d05ab1d4`。2026-10-20核对release列表，新增 `26.09-lambda.rc1` 与 `26.09-alpha.rc3`（10-13发布，API的prerelease字段为false），同时保留[`core_v0.19.2`](https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v0.19.2)与`26.09-alpha/beta.rc*`候选标签；标签命名、API发布标记、main和Core发布线不能互相替代。当前pyproject的Python要求与旧安装教程也有漂移，详见安装页。
 
-[官方开发指南](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)、[Releases](https://github.com/NVIDIA/Megatron-LM/releases)、[源码release notes](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/get-started/releasenotes.md)、README 所链[Core roadmap #4003](https://github.com/NVIDIA/Megatron-LM/issues/4003)、[2026 Q2 roadmap #4997](https://github.com/NVIDIA/Megatron-LM/issues/4997)、[MoE roadmap #4815](https://github.com/NVIDIA/Megatron-LM/issues/4815)、[Issues](https://github.com/NVIDIA/Megatron-LM/issues)和[PR](https://github.com/NVIDIA/Megatron-LM/pulls)分别检查。某期roadmap是计划证据，不永远代表最新路线。
+[官方开发指南](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)、[Releases](https://github.com/NVIDIA/Megatron-LM/releases)、[源码release notes](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/get-started/releasenotes.md)、README 所链[Core roadmap #4003](https://github.com/NVIDIA/Megatron-LM/issues/4003)、[2026 Q2 roadmap #4997](https://github.com/NVIDIA/Megatron-LM/issues/4997)、[MoE roadmap #4815](https://github.com/NVIDIA/Megatron-LM/issues/4815)、[Issues](https://github.com/NVIDIA/Megatron-LM/issues)和[PR](https://github.com/NVIDIA/Megatron-LM/pulls)分别检查。某期roadmap是计划证据，不永远代表最新路线。
+
+Q1 #4003、Q2 #4997 与 MoE #4815 均已关闭；当前继续跟进 [Q3 carry-over #5676](https://github.com/NVIDIA/Megatron-LM/issues/5676)（10-15更新）及其组件 tracker。它明确区分 main/dev 合入、发布包含和端到端资格，不能用旧季度计划或部分 mHC PP 实现宣称全部组合已完成。
 
 重点保留[PR #7897](../../upstream/prs/NVIDIA--Megatron-LM/PR-7897.md)、[#7942](../../upstream/prs/NVIDIA--Megatron-LM/PR-7942.md)、[1F1B文档#7534](../../upstream/prs/NVIDIA--Megatron-LM/PR-7534.md)与[MXFP8内存#6878](../../upstream/prs/NVIDIA--Megatron-LM/PR-6878.md)的来源入口。open/dev PR继续按head/base阅读，不标成main已实现；已有等价官方优化合入部署分支后，经回归退役本地patch。
 
@@ -88,10 +90,10 @@ recipe/`pretrain_gpt.py`读取模型、tokenizer、batch和loss回调；`gpt_bui
 
 ## 固定源码与维护边界
 
-- [README.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/README.md)
-- [pyproject.toml](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/pyproject.toml)
-- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/pretrain_gpt.py)
-- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/training.py)
-- [docs/get-started/releasenotes.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/get-started/releasenotes.md)
+- [README.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/README.md)
+- [pyproject.toml](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/pyproject.toml)
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/pretrain_gpt.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/training.py)
+- [docs/get-started/releasenotes.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/get-started/releasenotes.md)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

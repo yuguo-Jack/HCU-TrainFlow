@@ -9,26 +9,25 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
 sources:
 - source: baidu-baige-loongforge
   path: loongforge/embodied/distributed/checkpoint.py
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: 15dee38364ca4e3da741ad9f2b9a793220557a4a4224fdb556f8b6fd7fb2a124
 - source: baidu-baige-loongforge
   path: loongforge/embodied/train/trainers/base_trainer.py
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: 24c31c517d4d2a712ba1e0ed31327ebe32b5f2a896be85e9207fb0853027e86b
 - source: baidu-baige-loongforge
   path: tests/embodied/unit/test_async_checkpoint_finalize.py
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
   sha256: d63a03a60df4ad26c83023409869a7c9e8f8eed47df9cadb30a8bb2b2965c5ce
 - source: baidu-baige-loongforge
   path: loongforge/embodied/README.md
-  commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
-  sha256: cea16e85bafe721b0a31015891d18b948974706c2acc263c871c0e98cac5217b
+  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
+  sha256: 5a3d342052d0cc370c096d49d8115b8a1be936170f7c9fb37db06b8667afae3f
 ---
 
 # LoongForge Torch-native：异步保存完成投票与 DCP 恢复
@@ -42,6 +41,8 @@ Embodied Torch栈用`resume_meta.json`标记可恢复checkpoint。若只在下�
 [#261](../../upstream/prs/baidu-baige--LoongForge/PR-261.md)的当前实现由BaseTrainer每optimizer step调用`maybe_finalize_pending_save`。无pending直接返回；有pending时**所有rank**对完成状态`all_reduce(MIN)`，只有共同完成才进入`flush_pending_save`。rank-local `Future.done()`不能决定只有部分rank进入后者，否则内部collective会死锁。
 
 `_async_save_completion`识别`AsyncSaveResponse.upload_completion`，等待持久写入的completion而非只等staging。`flush_pending_save`在`future.result()`成功后由主rank写marker，失败则共同处理并保留原错误；不能先写marker再在后台补数据。DCP resume将权重加载到unwrapped module，避免同一参数多属性alias在DDP FQN还原时丢键。
+
+完成投票只检查 Future 已结束，不等于它没有异常；flush 再取结果并做全 rank 成功投票。rank0 的 marker 写入与其他 rank 的成功确认不是一个原子事务，失败集合会清理相应未完成目录。因此保留实际 Future/投票/marker 次序和失败日志，不能把单个 done、marker 或退出码作为跨 rank 持久化成功证明。当前父仓这三份实现/单测原件与上一快照相同，本次依赖安装整理不增加新的运行验证。
 
 ## 运行契约与开销
 
@@ -59,9 +60,9 @@ PR描述另明确没有解决某些async-save与detail-log的Gloo abort；其临
 
 ## 固定证据与复核范围
 
-- [loongforge/embodied/distributed/checkpoint.py](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/loongforge/embodied/distributed/checkpoint.py)
-- [loongforge/embodied/train/trainers/base_trainer.py](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/loongforge/embodied/train/trainers/base_trainer.py)
-- [tests/embodied/unit/test_async_checkpoint_finalize.py](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/tests/embodied/unit/test_async_checkpoint_finalize.py)
-- [loongforge/embodied/README.md](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/loongforge/embodied/README.md)
+- [loongforge/embodied/distributed/checkpoint.py](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/loongforge/embodied/distributed/checkpoint.py)
+- [loongforge/embodied/train/trainers/base_trainer.py](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/loongforge/embodied/train/trainers/base_trainer.py)
+- [tests/embodied/unit/test_async_checkpoint_finalize.py](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/tests/embodied/unit/test_async_checkpoint_finalize.py)
+- [loongforge/embodied/README.md](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/loongforge/embodied/README.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

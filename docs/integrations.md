@@ -154,6 +154,8 @@ fork 保留原有模块、API 和 13 个上游 console 命令；HCU 扩展通过
 
 统一入口外的原生工具不自动继承任务权限或归档；执行时使用任务私有目录并保留命令、版本和证据。HCU hipprof 与 XProf/XCompute 使用各自明确的适配器，不伪装成 rocprofv3 输入。已做真实 gfx936 资格测试的能力与尚未覆盖的平台/功能分开记录，不能用 help/import 代替真实分析。详见 fork 的 [能力与维护说明](https://github.com/yuguo-Jack/TraceLens/blob/hcu/docs/hcu-integration.md)。
 
+官方上游与固定 HCU fork 的原生细节可能不同。例如当前上游 compare 的 `--sheets all` 可跳过缺失的 kernel_summary，而现用 HCU fork 的该原生默认仍要求此表；TrainFlow 受管 compare 会先显式生成该表。消费外部报告时按所用版本和实际已有表选择，不把跳过可选表推成完整分析已通过。split 使用回执的实际 output_path；不同版本的范围文件名不同，不能自行拼接。官方微基准的 AMD 架构/低精度上限启发式也不自动成为 HCU 架构资格，仍按实际 ISA、计算精度与有效实测核对。
+
 ## 更新与回退
 
 1. TraceLens 同时查看 AMD 上游与 HCU fork 的差异、实际脚本/API；新版本可能修改报告字段、Skill 步骤和依赖。优先复用现有模块及扩展接口；需要核心修改时保留复现证据与回归。

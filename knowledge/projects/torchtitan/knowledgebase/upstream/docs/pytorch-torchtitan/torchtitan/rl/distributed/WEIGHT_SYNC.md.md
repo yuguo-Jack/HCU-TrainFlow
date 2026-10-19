@@ -15,7 +15,7 @@ path: torchtitan/rl/distributed/WEIGHT_SYNC.md
 raw_sha256: f04cf9beb18c900eab1c2aff5d079e1fe4fa4db03fda74286cf72ebd6ff3e669
 sources: []
 generated_body_sha256: 08d81b5517e89036949372ca0ea1f1dfa3fbc70e662ae0af52bff6113d6066ea
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # pytorch/torchtitan / torchtitan/rl/distributed/WEIGHT_SYNC.md

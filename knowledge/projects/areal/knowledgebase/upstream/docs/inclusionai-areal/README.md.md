@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: 3b93679888e9f4929f6f155f13c6a286a62dfd72
 path: README.md
-raw_sha256: bfa381a165d6bacd068f027bf3b66761cf549c3a40f9e7098e68e0ec382b66c8
+raw_sha256: ed1b3db840b6e56ede09fadb18f11894900cef42c76d4b5f1558786d6ffdd3b6
 sources: []
-generated_body_sha256: d23659f22afcae47837732fe48034a7dbb0e2506db41f284bb7cd73f9c474255
+generated_body_sha256: a56f61967880c8d8033b6991890a4b18cd4fd95d4f77e57732c9d12ac19f4e12
 source_state: current-scan
 ---
 
 # areal-project/AReaL / README.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/README.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/3b93679888e9f4929f6f155f13c6a286a62dfd72/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -192,6 +192,9 @@ python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml \
 For comprehensive setup instructions, see
 [our quickstart guide](https://areal-project.github.io/AReaL/en/tutorial/quickstart.html).
 
+For Megatron MoE router replay experiments, see the
+[R3 Router Replay guide](r3/README.md).
+
 ## 📚 Examples
 
 ### Math & Reasoning
@@ -269,6 +272,12 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | **Qwen3-VL**               | ✅       | ✅           | ❌             | Vision-language model                                    |
 | **Gemma 3**                | ❌       | ✅           | ❌             | Vision-language model                                    |
 | **Other Hugging Face LLM** | ❌       | ✅           | ❌             | Compatibility depending on the version of `transformers` |
+
+Qwen2 and Qwen2.5 **text models** support RL weight updates with
+`actor.weight_update_mode=disk` in both v1 and v2. XCCL weight updates require
+`actor._version=v1`, `rollout._version=v1`, and `actor.weight_update_mode=xccl`. AWEX
+weight updates are not supported for these models. This restriction does not apply to
+Qwen2.5-VL.
 
 Check the [AI Coding Assistant Guide](docs/en/reference/ai_assisted_dev.md) and
 [Archon Reference](docs/en/tutorial/archon.md) for how to integrate new models into

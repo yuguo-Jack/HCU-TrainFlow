@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed
-commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
 path: docs/zh/features/virtual-pipeline-parallel.md
-raw_sha256: 0336e444c870770c45b34cd707d43e5eb5771164e35d09dd6dd37ce0badd7182
+raw_sha256: dd39b0de09fe75937910ab3009714cebd33b98d2719e4448c3d9cf3e365ee07d
 sources: []
-generated_body_sha256: 8a4a9fa7237a7896fdd525a06ac4b217834bfd91111f65e464d2445761bf82c4
+generated_body_sha256: 56107675f38f07180a5e74498c482613ff57f668c3901c534f0aefee9a82e396
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed / docs/zh/features/virtual-pipeline-parallel.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/features/virtual-pipeline-parallel.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/zh/features/virtual-pipeline-parallel.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -42,7 +42,7 @@ Upstream source document; original commands, claims and links require their stat
 
 ![虚拟流水线并行示意图](../figures/virtual-pipeline.PNG)
 
-具体细节请参见文献[Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM](https://people.eecs.berkeley.edu/~matei/papers/2021/sc_megatron_lm.pdf)。
+具体细节请参见文献[Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM](https://dl.acm.org/doi/10.1145/3458817.3476209)。
 
 例如，假设模型总层数为16，张量并行大小为1，流水线并行大小为4，虚拟流水线并行大小为2，则模型将被划分为4 * 2 = 8个阶段，每个阶段包含16 / 8 = 2个层。如下所示：
 

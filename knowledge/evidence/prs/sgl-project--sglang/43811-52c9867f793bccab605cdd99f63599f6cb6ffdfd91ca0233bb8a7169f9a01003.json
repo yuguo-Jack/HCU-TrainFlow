@@ -1,0 +1,1067 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "e76c30b61db603d6a0c003e555f2ed967213692530b4b56f40663633c2435ab4",
+      "isPrivate": false,
+      "numbers": [
+        43817,
+        43816,
+        43815,
+        43814,
+        43813,
+        43812,
+        43811,
+        43809
+      ],
+      "observed_at": "2026-10-19T18:33:45.712227+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4612,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "f006fb49ecd93322802ddebff80821f8e6296893",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "# [PD] Send prefill KV chunks as soon as the batch result copy completes\n\n## Motivation\n\nWith the overlap scheduler, a prefill batch's KV transfer is only started when its result is processed in `process_batch_result_disagg_prefill`, which runs after the *next* batch has been launched. In addition, `send_kv_chunk` runs on the schedule stream behind the WAR barrier of the next forward. As a result the KV transfer of batch N starts roughly one full batch duration after batch N finished on the GPU.\n\nOn a prefill-saturated 1P1D setup we measured a median delay of 0.08-4.4 s between \"batch GPU done\" and \"KV transfer enqueued\". This delay scales with batch duration and adds directly to TTFT.\n\n## Modifications\n\nAdds an opt-in path, `SGLANG_DISAGG_PREFILL_EARLY_SEND_KV=1` (default off), in which a dedicated worker thread (`EarlyKVChunkSender`) sends a batch's KV chunks as soon as the batch's `copy_done` event completes. The worker uses its own CUDA stream, so it does not wait for the next forward.\n\n- **Per-request ownership** (`KVSendOwner`: `NONE` / `EARLY` / `SCHEDULER`, stored on `Req`).\n  - Ownership is fixed when the request's first batch result is submitted. An eligible request is owned by the worker for its whole lifetime: all middle chunks, the last chunk, and appending the first token.\n  - All other requests stay on the existing scheduler path, and the scheduler skips sends for `EARLY` requests.\n  - Each request's KV is therefore always sent by exactly one sender, in order.\n  - A request is eligible when it has a bootstrap room, has finished bootstrapping, has no output yet, and does not need logprobs, a sampling mask, or grammar. Those features need the scheduler-side result processing before the last chunk.\n- **Delayed sampling** (grammar / `SGLANG_ENABLE_DELAY_SAMPLE`): `copy_done` is only recorded after `launch_batch_sample_if_needed`, so submission happens after that call in that case.\n- **KV lifetime and aborts.**\n  - Paths that release an `EARLY` request's KV hold `EarlyKVChunkSender.lock` via `early_kv_send_lock(req)`, so the worker never reads freed KV pages. These paths are `_retire_aborted_prefill_result`, `handle_inflight_transfer_failure`, and `process_pending_chunked_abort`.\n  - The worker skips requests that were aborted or whose KV was already released.\n  - When an `EARLY` request is aborted after the worker may have started sending, the scheduler aborts its sender (`KVPoll.Failed`) and lets it drain through the inflight queue instead of retiring it directly.\n  - A failed middle-chunk send aborts the sender and skips the request's remaining chunks.\n- **`handle_inflight_transfer_failure`** now keeps an existing `FINISH_ABORT` reason instead of always overwriting it with `FINISH_LENGTH(0)`. Without this, a client abort that surfaces as a transfer failure is reported as a normal length finish. **Behavior change:** this also applies with the flag off.\n- **Lifecycle:** the worker is stopped in `teardown_disaggregation` (PD role switch). `optimistic_release_and_requeue` resets ownership.\n- **Support matrix.** When enabled with an unsupported configuration, the flag is ignored with a warning and the scheduler path is used.\n  - Requires: CUDA, the overlap scheduler, and the Mooncake backend.\n  - Not supported with: staging buffer, KV checksum, speculative decoding, the `prefill_complete` decode allocation policy, unified memory, or models that transfer extra state (`state_types`, e.g. Mamba / SWA / DSA).\n- **Cached-prefix early send** (`maybe_send_cached_prefix_chunk`) is skipped for `EARLY` requests.\n- **Docs:** the new variable is added to the Mooncake prefill configuration table in `pd_disaggregation.mdx`.\n- **Tests:**\n  - New unit tests in `test/registered/unit/disaggregation/test_prefill_early_send.py`: support matrix, ownership, submit, worker send / abort / failure handling.\n  - New e2e test `test/registered/disaggregation/test_disaggregation_early_send_kv.py`: GSM8K accuracy, greedy consistency between sequential and concurrent requests, and mixed logprob / regex requests. The prefill server runs with `--enable-deterministic-inference` so the consistency check is not affected by batch-dependent numerics (without it, concurrent vs sequential first tokens also differ with the flag OFF).\n  - Existing test fakes (`test_prefill_abort_result_cleanup.py`, `test_auxiliary_output.py`) get the new `kv_send_owner` field.\n\n## Accuracy Tests\n\n1P1D, TP4 each, Mooncake RDMA, same server code with the flag OFF vs ON.\n\nGSM8K, `few_shot_gsm8k`, 500 questions, 5-shot:\n\n| | Accuracy | Invalid |\n|---|---|---|\n| OFF | 0.898 | 0.000 |\n| ON | 0.908 | 0.000 |\n\nOutput consistency, from an earlier prototype of this change (same copy-done trigger):\n\n- **Greedy, sequential (30 prompts):** 30/30 identical outputs between ON and OFF.\n- **Concurrent (200 prompts):** ON vs OFF differs in about 33% of outputs. This matches the OFF-vs-OFF control (69/200 differ) and the ON-vs-ON control (70/200 differ), so the differences come from batch-dependent numerics, not from the change.\n- **Regex and logprob requests (which stay on the scheduler path):** regex 20/20 full match and logprobs 20/20 present in both modes.\n\n## Speed Tests and Profiling\n\n**Setup.**\n- 1P1D, TP4 each (H20), Mooncake RDMA, `--page-size 16`, radix cache on, chunked prefill off.\n- Workload: `bench_serving --dataset-name generated-shared-prefix`, 200 prompts, input 1024 / output 100. \"Prefix\" is the shared system-prompt fraction of the input.\n- Each cell is the mean of 2 runs with identical seeds in both modes, and the cache is flushed before every run.\n- All 24 runs completed 200/200 requests with no errors. With ON, every request was sent by the early sender.\n\n<!-- Upload figs/ttft.png here -->\n<img width=\"1950\" height=\"630\" alt=\"image\" src=\"https://github.com/user-attachments/assets/77ed6aa8-dead-4b22-bdcb-a13f18cad9b0\" />\n\n\n| prefix | QPS | TTFT mean OFF → ON (ms) | Δ | TTFT p99 Δ | E2E mean Δ | ITL p99 Δ | throughput Δ |\n|---|---|---|---|---|---|---|---|\n| 60% | 10 | 7480 → 3731 | -50.1% | -43.6% | -42.2% | -25.2% | +3.9% |\n| 60% | 20 | 15207 → 10213 | -32.8% | -19.0% | -30.5% | -26.1% | +3.7% |\n| 70% | 10 | 2722 → 1323 | -51.4% | -52.1% | -24.9% | -5.6% | +0.8% |\n| 70% | 20 | 10529 → 6543 | -37.9% | -27.2% | -35.8% | -42.8% | +6.9% |\n| 80% | 10 | 312 → 240 | -23.0% | -30.8% | -4.2% | -8.7% | +0.1% |\n| 80% | 20 | 4422 → 2189 | -50.5% | -44.6% | -35.3% | -39.0% | +8.7% |\n\nClient-side mean TPOT goes up in some cells (up to +52% at 70% / QPS 10) but down in others (-23% at 70% / QPS 20). This is a measurement artifact: with OFF, tokens produced while the first token is delayed arrive in a burst right after it, which lowers the client TPOT average. ITL p99 is lower with ON in every cell.\n\n**Where the time goes.** These numbers come from local-only timestamp instrumentation, which is not part of this PR. The metric is the time from a prefill batch finishing on the GPU to the last KV chunk's send being enqueued. Median: 1267 ms with OFF vs 3.2 ms with ON. p99: 4440 ms vs 42 ms.\n\n<!-- Upload figs/gpu_to_send_cdf.png here -->\n<img width=\"975\" height=\"600\" alt=\"image\" src=\"https://github.com/user-attachments/assets/a7480581-f69f-4acb-8b45-fd1540f1639c\" />\n\n\nThe breakdown of mean TTFT shows that with OFF, this wait (red) is 0.07-3.45 s per request, and ON removes it:\n\n<!-- Upload figs/ttft_breakdown.png here -->\n<img width=\"1500\" height=\"1125\" alt=\"image\" src=\"https://github.com/user-attachments/assets/84b7bfc6-3304-4676-ae1a-dcc954aaa71a\" />\n\n\nPrefill batches on the GPU, with the moment each request's KV send is enqueued (70% prefix, QPS 10):\n- **OFF:** a batch's KV is only sent after the *next* batch has finished on the GPU.\n- **ON:** the send starts as soon as the batch finishes.\n\n<!-- Upload figs/prefill_gantt.png here -->\n<img width=\"1800\" height=\"690\" alt=\"image\" src=\"https://github.com/user-attachments/assets/782f6d37-b744-48ed-871d-1863c126497a\" />\n\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38229627983](https://github.com/sgl-project/sglang/actions/runs/38229627983)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38229627536](https://github.com/sgl-project/sglang/actions/runs/38229627536)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38229627936](https://github.com/sgl-project/sglang/actions/runs/38229627936)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 12,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "wcwuwc"
+            },
+            "body": "@ShangmingCai @hnyls2002 Could you take a look when you have time? This touches the prefill result path / KV send ownership and the Mooncake send timing. Thanks!",
+            "createdAt": "2026-10-13T03:25:28Z",
+            "databaseId": 6137509458,
+            "updatedAt": "2026-10-13T03:25:28Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43811#issuecomment-6137509458"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW3S9lI=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "headRepository": {
+        "nameWithOwner": "wcwuwc/sglang"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 43811,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ShangmingCai"
+            },
+            "body": "What about SGLANG_ENABLE_PREFILL_WAR_READ_DONE? Does this PR work with speculative decoding or extra-state models (DSV4, Mamba, SWA, DSA)?\n\nAlso, the results are good, but the test set seems to test an unusual case. And the accuracy test needs to include GPQA, MMLU, or AIME. GSM8K is too simple and won't reveal the potential risk of an accuracy drop caused by KVCache corruption due to early sending.  \n",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "ShangmingCai"
+                  },
+                  "body": "This can race with the radix dedup. After the worker sends, the scheduler still runs `checkpoint_disagg_prefill(req)` in `process_batch_result_disagg_prefill`. If another req already inserted the same prefix, `_insert_cache` frees this req's duplicate pages and rewrites its `req_to_token` row. That path doesn't hold `self.lock`, and the row write is on `schedule_stream` behind the WAR barrier anyway, so the worker sends the old dup pages here. They get freed and can be allocated to the next batch while Mooncake is still reading them, so decode gets corrupted KV silently.\n\nThis is easy to hit with shared-prefix traffic (two reqs with the same uncached prefix in the same or adjacent batch), which is basically the benchmark setup. I reproduced it on CPU with the real `_send_chunk` + `RadixCache.checkpoint`: the worker sends pages [7..12] and the next alloc returns exactly [7..12]. The scheduler path is safe because it sends after checkpoint on the same stream.\n\nMiddle chunks have the same issue vs the checkpoint in `process_prefill_chunk`. I think we need to keep the sent pages alive (e.g. defer freeing the dup pages for EARLY reqs) until the transfer concludes.",
+                  "createdAt": "2026-10-14T03:42:44Z",
+                  "databaseId": 4266535868,
+                  "diffHunk": "@@ -0,0 +1,204 @@\n+\"\"\"Early send of prefill KV chunks.\n+\n+Enabled by ``SGLANG_DISAGG_PREFILL_EARLY_SEND_KV``.\n+\n+Under overlap scheduling the result of prefill batch N is processed only after\n+batch N+1 has been launched, and the page-index reads in ``send_kv_chunk`` run\n+on the schedule stream, which the WAR barrier fences behind N+1's forward. Every\n+KV chunk computed by N, including the last one that decode waits on, is\n+therefore handed to the transfer engine roughly one forward late.\n+\n+``EarlyKVChunkSender`` sends the chunks of N from a worker thread as soon as N's\n+result copy (``copy_done``) completes, reading page indices on its own stream.\n+\n+Each request's KV is sent by exactly one side, fixed at its first launched\n+batch (``Req.kv_send_owner``):\n+\n+- ``EARLY``: the worker sends every chunk, in launch order, and appends the\n+  first output token with the last one. The scheduler sends nothing for it.\n+- ``SCHEDULER``: requests whose last chunk depends on the processed result\n+  (logprobs, grammar, sampling mask) or on a pending bootstrap keep the\n+  original path.\n+\n+Paths that release an ``EARLY`` request's KV before its transfer concludes\n+hold ``lock`` so no worker send is reading it; the worker skips requests that\n+are aborted or no longer hold KV.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import logging\n+import queue\n+import threading\n+import weakref\n+from dataclasses import dataclass\n+from typing import TYPE_CHECKING, List, Optional\n+\n+import torch\n+\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend, is_aborted\n+from sglang.srt.environ import envs\n+from sglang.srt.runtime_context import get_disagg\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch\n+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+@dataclass\n+class _ChunkSend:\n+    batch_index: int\n+    req: Req\n+    # KV computed through this batch; snapshotted at launch since the next\n+    # chunk's scheduling moves req.extend_end.\n+    end_idx: int\n+    is_last: bool\n+\n+\n+@dataclass\n+class _BatchSend:\n+    copy_done: torch.cuda.Event\n+    next_token_ids: torch.Tensor\n+    chunks: List[_ChunkSend]\n+\n+\n+class EarlyKVChunkSender:\n+    def __init__(self, scheduler: Scheduler):\n+        self._scheduler = scheduler\n+        self.lock = threading.Lock()\n+        # None stops the worker.\n+        self._queue: queue.SimpleQueue[Optional[_BatchSend]] = queue.SimpleQueue()\n+        # Worker-thread only: requests whose earlier chunk failed to send.\n+        self._failed_reqs: weakref.WeakSet[Req] = weakref.WeakSet()\n+        self._device = torch.cuda.current_device()\n+        # Must not be the schedule stream: the WAR barrier makes it wait for the\n+        # next batch's forward, which is the delay this class removes.\n+        self._stream = torch.cuda.Stream(device=self._device)\n+        threading.Thread(\n+            target=self._worker,\n+            name=\"prefill-early-kv-chunk-send\",\n+            daemon=True,\n+        ).start()\n+        logger.info(\"Prefill early KV chunk send enabled\")\n+\n+    @classmethod\n+    def maybe_create(cls, scheduler: Scheduler) -> Optional[EarlyKVChunkSender]:\n+        if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.get():\n+            return None\n+        if not cls.is_supported(scheduler):\n+            logger.warning(\n+                \"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV is not supported with this \"\n+                \"configuration; KV chunks are sent by the scheduler\"\n+            )\n+            return None\n+        return cls(scheduler)\n+\n+    @staticmethod\n+    def is_supported(scheduler: Scheduler) -> bool:\n+        return (\n+            torch.cuda.is_available()\n+            and scheduler.enable_overlap\n+            and not scheduler.enable_staging\n+            and scheduler.kv_checksum_computer is None\n+            and scheduler.spec_algorithm.is_none()\n+            and get_disagg().disaggregation_decode_allocation_policy\n+            != \"prefill_complete\"\n+            # Sends run off the scheduler thread; only Mooncake is verified.\n+            and scheduler.transfer_backend == TransferBackend.MOONCAKE\n+            # Compaction may move pages while the worker reads their ids.\n+            and not scheduler.enable_unified_memory\n+            # Extra state payloads (mamba, SWA, DSA, ...) are unverified.\n+            and not scheduler.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types\n+        )\n+\n+    def stop(self) -> None:\n+        self._queue.put(None)\n+\n+    @staticmethod\n+    def is_eligible(req: Req) -> bool:\n+        return (\n+            req.bootstrap_room is not None\n+            and not req.pending_bootstrap\n+            and len(req.output_ids) == 0\n+            and not req.return_logprob\n+            and not req.return_sampling_mask\n+            and req.grammar is None\n+        )\n+\n+    def submit(self, batch: ScheduleBatch, result: GenerationBatchResult) -> None:\n+        \"\"\"Queue a launched batch; call once its result copy has been recorded.\n+\n+        Fixes the KV send owner of requests seen for the first time.\n+        \"\"\"\n+        can_send = result.copy_done is not None and isinstance(\n+            result.next_token_ids, torch.Tensor\n+        )\n+        chunks = []\n+        for i, req in enumerate(batch.reqs):\n+            if req.kv_send_owner == KVSendOwner.NONE:\n+                req.kv_send_owner = (\n+                    KVSendOwner.EARLY\n+                    if can_send and self.is_eligible(req)\n+                    else KVSendOwner.SCHEDULER\n+                )\n+            if req.kv_send_owner != KVSendOwner.EARLY:\n+                continue\n+            input_len = len(req.origin_input_ids)\n+            chunks.append(\n+                _ChunkSend(\n+                    batch_index=i,\n+                    req=req,\n+                    end_idx=min(req.extend_end, input_len),\n+                    is_last=req.extend_end >= input_len,\n+                )\n+            )\n+        if chunks:\n+            assert can_send, \"EARLY-owned request in a batch without a result copy\"\n+            self._queue.put(_BatchSend(result.copy_done, result.next_token_ids, chunks))\n+\n+    def _worker(self) -> None:\n+        torch.cuda.set_device(self._device)\n+        while True:\n+            batch_send = self._queue.get()\n+            if batch_send is None:\n+                return\n+            try:\n+                with torch.cuda.stream(self._stream):\n+                    self._send_batch(batch_send)\n+            except Exception:\n+                logger.exception(\"Early KV chunk send failed\")\n+\n+    def _send_batch(self, batch_send: _BatchSend) -> None:\n+        batch_send.copy_done.synchronize()\n+        token_ids = None\n+        for chunk in batch_send.chunks:\n+            if chunk.is_last and token_ids is None:\n+                token_ids = batch_send.next_token_ids.tolist()\n+            with self.lock:\n+                self._send_chunk(\n+                    chunk, token_ids[chunk.batch_index] if chunk.is_last else None\n+                )\n+\n+    def _send_chunk(self, chunk: _ChunkSend, token_id: int | None) -> None:\n+        req = chunk.req\n+        if req in self._failed_reqs or is_aborted(req) or not req.kv.holds_kv:\n+            # The scheduler concludes it through the inflight queue or abort.\n+            return\n+        try:\n+            if chunk.is_last:\n+                req.output_ids.append(token_id)\n+                self._scheduler.send_kv_chunk(req, last_chunk=True)",
+                  "line": 192,
+                  "originalLine": 192,
+                  "path": "python/sglang/srt/disaggregation/prefill_early_send.py",
+                  "updatedAt": "2026-10-14T06:07:03Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/43811#discussion_r4266535868"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "ShangmingCai"
+                  },
+                  "body": "After rebasing, this also needs to check `req.discard_output_reason` from #40896. It's set at the end of `run_batch` when the external linker load fails, before `submit()`, but only turns into `to_finish` in result processing. So with the linker on, the worker will send KV that never landed plus a first token computed from it, and decode may already get Success before we abort the sender. Please check it in both `is_eligible` and here, or just mark the linker as unsupported.",
+                  "createdAt": "2026-10-14T03:42:44Z",
+                  "databaseId": 4266535872,
+                  "diffHunk": "@@ -0,0 +1,204 @@\n+\"\"\"Early send of prefill KV chunks.\n+\n+Enabled by ``SGLANG_DISAGG_PREFILL_EARLY_SEND_KV``.\n+\n+Under overlap scheduling the result of prefill batch N is processed only after\n+batch N+1 has been launched, and the page-index reads in ``send_kv_chunk`` run\n+on the schedule stream, which the WAR barrier fences behind N+1's forward. Every\n+KV chunk computed by N, including the last one that decode waits on, is\n+therefore handed to the transfer engine roughly one forward late.\n+\n+``EarlyKVChunkSender`` sends the chunks of N from a worker thread as soon as N's\n+result copy (``copy_done``) completes, reading page indices on its own stream.\n+\n+Each request's KV is sent by exactly one side, fixed at its first launched\n+batch (``Req.kv_send_owner``):\n+\n+- ``EARLY``: the worker sends every chunk, in launch order, and appends the\n+  first output token with the last one. The scheduler sends nothing for it.\n+- ``SCHEDULER``: requests whose last chunk depends on the processed result\n+  (logprobs, grammar, sampling mask) or on a pending bootstrap keep the\n+  original path.\n+\n+Paths that release an ``EARLY`` request's KV before its transfer concludes\n+hold ``lock`` so no worker send is reading it; the worker skips requests that\n+are aborted or no longer hold KV.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import logging\n+import queue\n+import threading\n+import weakref\n+from dataclasses import dataclass\n+from typing import TYPE_CHECKING, List, Optional\n+\n+import torch\n+\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend, is_aborted\n+from sglang.srt.environ import envs\n+from sglang.srt.runtime_context import get_disagg\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch\n+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+@dataclass\n+class _ChunkSend:\n+    batch_index: int\n+    req: Req\n+    # KV computed through this batch; snapshotted at launch since the next\n+    # chunk's scheduling moves req.extend_end.\n+    end_idx: int\n+    is_last: bool\n+\n+\n+@dataclass\n+class _BatchSend:\n+    copy_done: torch.cuda.Event\n+    next_token_ids: torch.Tensor\n+    chunks: List[_ChunkSend]\n+\n+\n+class EarlyKVChunkSender:\n+    def __init__(self, scheduler: Scheduler):\n+        self._scheduler = scheduler\n+        self.lock = threading.Lock()\n+        # None stops the worker.\n+        self._queue: queue.SimpleQueue[Optional[_BatchSend]] = queue.SimpleQueue()\n+        # Worker-thread only: requests whose earlier chunk failed to send.\n+        self._failed_reqs: weakref.WeakSet[Req] = weakref.WeakSet()\n+        self._device = torch.cuda.current_device()\n+        # Must not be the schedule stream: the WAR barrier makes it wait for the\n+        # next batch's forward, which is the delay this class removes.\n+        self._stream = torch.cuda.Stream(device=self._device)\n+        threading.Thread(\n+            target=self._worker,\n+            name=\"prefill-early-kv-chunk-send\",\n+            daemon=True,\n+        ).start()\n+        logger.info(\"Prefill early KV chunk send enabled\")\n+\n+    @classmethod\n+    def maybe_create(cls, scheduler: Scheduler) -> Optional[EarlyKVChunkSender]:\n+        if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.get():\n+            return None\n+        if not cls.is_supported(scheduler):\n+            logger.warning(\n+                \"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV is not supported with this \"\n+                \"configuration; KV chunks are sent by the scheduler\"\n+            )\n+            return None\n+        return cls(scheduler)\n+\n+    @staticmethod\n+    def is_supported(scheduler: Scheduler) -> bool:\n+        return (\n+            torch.cuda.is_available()\n+            and scheduler.enable_overlap\n+            and not scheduler.enable_staging\n+            and scheduler.kv_checksum_computer is None\n+            and scheduler.spec_algorithm.is_none()\n+            and get_disagg().disaggregation_decode_allocation_policy\n+            != \"prefill_complete\"\n+            # Sends run off the scheduler thread; only Mooncake is verified.\n+            and scheduler.transfer_backend == TransferBackend.MOONCAKE\n+            # Compaction may move pages while the worker reads their ids.\n+            and not scheduler.enable_unified_memory\n+            # Extra state payloads (mamba, SWA, DSA, ...) are unverified.\n+            and not scheduler.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types\n+        )\n+\n+    def stop(self) -> None:\n+        self._queue.put(None)\n+\n+    @staticmethod\n+    def is_eligible(req: Req) -> bool:\n+        return (\n+            req.bootstrap_room is not None\n+            and not req.pending_bootstrap\n+            and len(req.output_ids) == 0\n+            and not req.return_logprob\n+            and not req.return_sampling_mask\n+            and req.grammar is None\n+        )\n+\n+    def submit(self, batch: ScheduleBatch, result: GenerationBatchResult) -> None:\n+        \"\"\"Queue a launched batch; call once its result copy has been recorded.\n+\n+        Fixes the KV send owner of requests seen for the first time.\n+        \"\"\"\n+        can_send = result.copy_done is not None and isinstance(\n+            result.next_token_ids, torch.Tensor\n+        )\n+        chunks = []\n+        for i, req in enumerate(batch.reqs):\n+            if req.kv_send_owner == KVSendOwner.NONE:\n+                req.kv_send_owner = (\n+                    KVSendOwner.EARLY\n+                    if can_send and self.is_eligible(req)\n+                    else KVSendOwner.SCHEDULER\n+                )\n+            if req.kv_send_owner != KVSendOwner.EARLY:\n+                continue\n+            input_len = len(req.origin_input_ids)\n+            chunks.append(\n+                _ChunkSend(\n+                    batch_index=i,\n+                    req=req,\n+                    end_idx=min(req.extend_end, input_len),\n+                    is_last=req.extend_end >= input_len,\n+                )\n+            )\n+        if chunks:\n+            assert can_send, \"EARLY-owned request in a batch without a result copy\"\n+            self._queue.put(_BatchSend(result.copy_done, result.next_token_ids, chunks))\n+\n+    def _worker(self) -> None:\n+        torch.cuda.set_device(self._device)\n+        while True:\n+            batch_send = self._queue.get()\n+            if batch_send is None:\n+                return\n+            try:\n+                with torch.cuda.stream(self._stream):\n+                    self._send_batch(batch_send)\n+            except Exception:\n+                logger.exception(\"Early KV chunk send failed\")\n+\n+    def _send_batch(self, batch_send: _BatchSend) -> None:\n+        batch_send.copy_done.synchronize()\n+        token_ids = None\n+        for chunk in batch_send.chunks:\n+            if chunk.is_last and token_ids is None:\n+                token_ids = batch_send.next_token_ids.tolist()\n+            with self.lock:\n+                self._send_chunk(\n+                    chunk, token_ids[chunk.batch_index] if chunk.is_last else None\n+                )\n+\n+    def _send_chunk(self, chunk: _ChunkSend, token_id: int | None) -> None:\n+        req = chunk.req\n+        if req in self._failed_reqs or is_aborted(req) or not req.kv.holds_kv:",
+                  "line": 186,
+                  "originalLine": 186,
+                  "path": "python/sglang/srt/disaggregation/prefill_early_send.py",
+                  "updatedAt": "2026-10-14T06:07:03Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/43811#discussion_r4266535872"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNFQwMzo0Mjo0NFrO_k4rwA==",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5512797464,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-14T06:07:03Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43811#pullrequestreview-5512797464"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "wcwuwc"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "wcwuwc"
+                  },
+                  "body": "Thanks for the detailed analysis and reproduction! I’ll take a closer look at this race condition and work on a proper fix.",
+                  "createdAt": "2026-10-16T10:35:51Z",
+                  "databaseId": 4293677446,
+                  "diffHunk": "@@ -0,0 +1,204 @@\n+\"\"\"Early send of prefill KV chunks.\n+\n+Enabled by ``SGLANG_DISAGG_PREFILL_EARLY_SEND_KV``.\n+\n+Under overlap scheduling the result of prefill batch N is processed only after\n+batch N+1 has been launched, and the page-index reads in ``send_kv_chunk`` run\n+on the schedule stream, which the WAR barrier fences behind N+1's forward. Every\n+KV chunk computed by N, including the last one that decode waits on, is\n+therefore handed to the transfer engine roughly one forward late.\n+\n+``EarlyKVChunkSender`` sends the chunks of N from a worker thread as soon as N's\n+result copy (``copy_done``) completes, reading page indices on its own stream.\n+\n+Each request's KV is sent by exactly one side, fixed at its first launched\n+batch (``Req.kv_send_owner``):\n+\n+- ``EARLY``: the worker sends every chunk, in launch order, and appends the\n+  first output token with the last one. The scheduler sends nothing for it.\n+- ``SCHEDULER``: requests whose last chunk depends on the processed result\n+  (logprobs, grammar, sampling mask) or on a pending bootstrap keep the\n+  original path.\n+\n+Paths that release an ``EARLY`` request's KV before its transfer concludes\n+hold ``lock`` so no worker send is reading it; the worker skips requests that\n+are aborted or no longer hold KV.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import logging\n+import queue\n+import threading\n+import weakref\n+from dataclasses import dataclass\n+from typing import TYPE_CHECKING, List, Optional\n+\n+import torch\n+\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend, is_aborted\n+from sglang.srt.environ import envs\n+from sglang.srt.runtime_context import get_disagg\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch\n+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+@dataclass\n+class _ChunkSend:\n+    batch_index: int\n+    req: Req\n+    # KV computed through this batch; snapshotted at launch since the next\n+    # chunk's scheduling moves req.extend_end.\n+    end_idx: int\n+    is_last: bool\n+\n+\n+@dataclass\n+class _BatchSend:\n+    copy_done: torch.cuda.Event\n+    next_token_ids: torch.Tensor\n+    chunks: List[_ChunkSend]\n+\n+\n+class EarlyKVChunkSender:\n+    def __init__(self, scheduler: Scheduler):\n+        self._scheduler = scheduler\n+        self.lock = threading.Lock()\n+        # None stops the worker.\n+        self._queue: queue.SimpleQueue[Optional[_BatchSend]] = queue.SimpleQueue()\n+        # Worker-thread only: requests whose earlier chunk failed to send.\n+        self._failed_reqs: weakref.WeakSet[Req] = weakref.WeakSet()\n+        self._device = torch.cuda.current_device()\n+        # Must not be the schedule stream: the WAR barrier makes it wait for the\n+        # next batch's forward, which is the delay this class removes.\n+        self._stream = torch.cuda.Stream(device=self._device)\n+        threading.Thread(\n+            target=self._worker,\n+            name=\"prefill-early-kv-chunk-send\",\n+            daemon=True,\n+        ).start()\n+        logger.info(\"Prefill early KV chunk send enabled\")\n+\n+    @classmethod\n+    def maybe_create(cls, scheduler: Scheduler) -> Optional[EarlyKVChunkSender]:\n+        if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.get():\n+            return None\n+        if not cls.is_supported(scheduler):\n+            logger.warning(\n+                \"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV is not supported with this \"\n+                \"configuration; KV chunks are sent by the scheduler\"\n+            )\n+            return None\n+        return cls(scheduler)\n+\n+    @staticmethod\n+    def is_supported(scheduler: Scheduler) -> bool:\n+        return (\n+            torch.cuda.is_available()\n+            and scheduler.enable_overlap\n+            and not scheduler.enable_staging\n+            and scheduler.kv_checksum_computer is None\n+            and scheduler.spec_algorithm.is_none()\n+            and get_disagg().disaggregation_decode_allocation_policy\n+            != \"prefill_complete\"\n+            # Sends run off the scheduler thread; only Mooncake is verified.\n+            and scheduler.transfer_backend == TransferBackend.MOONCAKE\n+            # Compaction may move pages while the worker reads their ids.\n+            and not scheduler.enable_unified_memory\n+            # Extra state payloads (mamba, SWA, DSA, ...) are unverified.\n+            and not scheduler.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types\n+        )\n+\n+    def stop(self) -> None:\n+        self._queue.put(None)\n+\n+    @staticmethod\n+    def is_eligible(req: Req) -> bool:\n+        return (\n+            req.bootstrap_room is not None\n+            and not req.pending_bootstrap\n+            and len(req.output_ids) == 0\n+            and not req.return_logprob\n+            and not req.return_sampling_mask\n+            and req.grammar is None\n+        )\n+\n+    def submit(self, batch: ScheduleBatch, result: GenerationBatchResult) -> None:\n+        \"\"\"Queue a launched batch; call once its result copy has been recorded.\n+\n+        Fixes the KV send owner of requests seen for the first time.\n+        \"\"\"\n+        can_send = result.copy_done is not None and isinstance(\n+            result.next_token_ids, torch.Tensor\n+        )\n+        chunks = []\n+        for i, req in enumerate(batch.reqs):\n+            if req.kv_send_owner == KVSendOwner.NONE:\n+                req.kv_send_owner = (\n+                    KVSendOwner.EARLY\n+                    if can_send and self.is_eligible(req)\n+                    else KVSendOwner.SCHEDULER\n+                )\n+            if req.kv_send_owner != KVSendOwner.EARLY:\n+                continue\n+            input_len = len(req.origin_input_ids)\n+            chunks.append(\n+                _ChunkSend(\n+                    batch_index=i,\n+                    req=req,\n+                    end_idx=min(req.extend_end, input_len),\n+                    is_last=req.extend_end >= input_len,\n+                )\n+            )\n+        if chunks:\n+            assert can_send, \"EARLY-owned request in a batch without a result copy\"\n+            self._queue.put(_BatchSend(result.copy_done, result.next_token_ids, chunks))\n+\n+    def _worker(self) -> None:\n+        torch.cuda.set_device(self._device)\n+        while True:\n+            batch_send = self._queue.get()\n+            if batch_send is None:\n+                return\n+            try:\n+                with torch.cuda.stream(self._stream):\n+                    self._send_batch(batch_send)\n+            except Exception:\n+                logger.exception(\"Early KV chunk send failed\")\n+\n+    def _send_batch(self, batch_send: _BatchSend) -> None:\n+        batch_send.copy_done.synchronize()\n+        token_ids = None\n+        for chunk in batch_send.chunks:\n+            if chunk.is_last and token_ids is None:\n+                token_ids = batch_send.next_token_ids.tolist()\n+            with self.lock:\n+                self._send_chunk(\n+                    chunk, token_ids[chunk.batch_index] if chunk.is_last else None\n+                )\n+\n+    def _send_chunk(self, chunk: _ChunkSend, token_id: int | None) -> None:\n+        req = chunk.req\n+        if req in self._failed_reqs or is_aborted(req) or not req.kv.holds_kv:\n+            # The scheduler concludes it through the inflight queue or abort.\n+            return\n+        try:\n+            if chunk.is_last:\n+                req.output_ids.append(token_id)\n+                self._scheduler.send_kv_chunk(req, last_chunk=True)",
+                  "line": 192,
+                  "originalLine": 192,
+                  "path": "python/sglang/srt/disaggregation/prefill_early_send.py",
+                  "updatedAt": "2026-10-16T10:35:51Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/43811#discussion_r4293677446"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNlQxMDozNTo1MVrO_-xRhg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5546547362,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-16T10:35:51Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43811#pullrequestreview-5546547362"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNlQxMDozNTo1MVq0MjAyNi0xMC0xNlQxMDozNTo1MFrPAAAAAUqZmKI=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "OPEN",
+      "title": "[PD] Send prefill KV chunks as soon as the batch result copy completes",
+      "updatedAt": "2026-10-16T10:35:51Z",
+      "url": "https://github.com/sgl-project/sglang/pull/43811"
+    },
+    "reused_files": {
+      "artifact_path": "knowledge/evidence/prs/sgl-project--sglang/43811-800deb72c2ca4c1f4d2af7f84adaa810d261e55ac77b74f71b6f0a004289b5d2.json",
+      "artifact_sha256": "800deb72c2ca4c1f4d2af7f84adaa810d261e55ac77b74f71b6f0a004289b5d2",
+      "reason": "Same immutable head/base repository+commit pair and changed_files; original fully paginated files response reused. Discussions are freshly queried.",
+      "refs": {
+        "base": {
+          "commit": "f006fb49ecd93322802ddebff80821f8e6296893",
+          "repository": "sgl-project/sglang"
+        },
+        "head": {
+          "commit": "c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+          "repository": "wcwuwc/sglang"
+        }
+      }
+    },
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/43811/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/43811/commits"
+      },
+      "html": {
+        "href": "https://github.com/sgl-project/sglang/pull/43811"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/43811"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/43811/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/43811"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/statuses/c96b1095555caa61a3c74ae7f2135f0ff472fd74"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 670,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "auto_merge": null,
+    "base": {
+      "label": "sgl-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/sgl-project/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/sgl-project/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/sgl-project/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/sgl-project/sglang/branches{/branch}",
+        "clone_url": "https://github.com/sgl-project/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/sgl-project/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/sgl-project/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/sgl-project/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/sgl-project/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/sgl-project/sglang/contributors",
+        "created_at": "2024-01-08T04:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/sgl-project/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/sgl-project/sglang/downloads",
+        "events_url": "https://api.github.com/repos/sgl-project/sglang/events",
+        "fork": false,
+        "forks": 9695,
+        "forks_count": 9695,
+        "forks_url": "https://api.github.com/repos/sgl-project/sglang/forks",
+        "full_name": "sgl-project/sglang",
+        "git_commits_url": "https://api.github.com/repos/sgl-project/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/sgl-project/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/sgl-project/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/sgl-project/sglang.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": false,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/sgl-project/sglang/hooks",
+        "html_url": "https://github.com/sgl-project/sglang",
+        "id": 740303686,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/sgl-project/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/sgl-project/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/sgl-project/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/sgl-project/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/sgl-project/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/sgl-project/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/sgl-project/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/sgl-project/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOLCAjRg",
+        "notifications_url": "https://api.github.com/repos/sgl-project/sglang/notifications{?since,all,participating}",
+        "open_issues": 5963,
+        "open_issues_count": 5963,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+          "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/sgl-project/followers",
+          "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/sgl-project",
+          "id": 147780389,
+          "login": "sgl-project",
+          "node_id": "O_kgDOCM7zJQ",
+          "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+          "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+          "repos_url": "https://api.github.com/users/sgl-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/sgl-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/sgl-project/sglang/pulls{/number}",
+        "pushed_at": "2026-10-19T18:16:22Z",
+        "releases_url": "https://api.github.com/repos/sgl-project/sglang/releases{/id}",
+        "size": 453970,
+        "ssh_url": "git@github.com:sgl-project/sglang.git",
+        "stargazers_count": 37442,
+        "stargazers_url": "https://api.github.com/repos/sgl-project/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/sgl-project/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/sgl-project/sglang/subscription",
+        "svn_url": "https://github.com/sgl-project/sglang",
+        "tags_url": "https://api.github.com/repos/sgl-project/sglang/tags",
+        "teams_url": "https://api.github.com/repos/sgl-project/sglang/teams",
+        "topics": [
+          "attention",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "diffusion",
+          "glm",
+          "gpt-oss",
+          "inference",
+          "llama",
+          "llm",
+          "minimax",
+          "moe",
+          "qwen",
+          "qwen-image",
+          "reinforcement-learning",
+          "transformer",
+          "vlm",
+          "wan"
+        ],
+        "trees_url": "https://api.github.com/repos/sgl-project/sglang/git/trees{/sha}",
+        "updated_at": "2026-10-19T18:27:09Z",
+        "url": "https://api.github.com/repos/sgl-project/sglang",
+        "visibility": "public",
+        "watchers": 37442,
+        "watchers_count": 37442,
+        "web_commit_signoff_required": false
+      },
+      "sha": "f006fb49ecd93322802ddebff80821f8e6296893",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+        "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/sgl-project/followers",
+        "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/sgl-project",
+        "id": 147780389,
+        "login": "sgl-project",
+        "node_id": "O_kgDOCM7zJQ",
+        "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+        "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+        "repos_url": "https://api.github.com/users/sgl-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/sgl-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "# [PD] Send prefill KV chunks as soon as the batch result copy completes\n\n## Motivation\n\nWith the overlap scheduler, a prefill batch's KV transfer is only started when its result is processed in `process_batch_result_disagg_prefill`, which runs after the *next* batch has been launched. In addition, `send_kv_chunk` runs on the schedule stream behind the WAR barrier of the next forward. As a result the KV transfer of batch N starts roughly one full batch duration after batch N finished on the GPU.\n\nOn a prefill-saturated 1P1D setup we measured a median delay of 0.08-4.4 s between \"batch GPU done\" and \"KV transfer enqueued\". This delay scales with batch duration and adds directly to TTFT.\n\n## Modifications\n\nAdds an opt-in path, `SGLANG_DISAGG_PREFILL_EARLY_SEND_KV=1` (default off), in which a dedicated worker thread (`EarlyKVChunkSender`) sends a batch's KV chunks as soon as the batch's `copy_done` event completes. The worker uses its own CUDA stream, so it does not wait for the next forward.\n\n- **Per-request ownership** (`KVSendOwner`: `NONE` / `EARLY` / `SCHEDULER`, stored on `Req`).\n  - Ownership is fixed when the request's first batch result is submitted. An eligible request is owned by the worker for its whole lifetime: all middle chunks, the last chunk, and appending the first token.\n  - All other requests stay on the existing scheduler path, and the scheduler skips sends for `EARLY` requests.\n  - Each request's KV is therefore always sent by exactly one sender, in order.\n  - A request is eligible when it has a bootstrap room, has finished bootstrapping, has no output yet, and does not need logprobs, a sampling mask, or grammar. Those features need the scheduler-side result processing before the last chunk.\n- **Delayed sampling** (grammar / `SGLANG_ENABLE_DELAY_SAMPLE`): `copy_done` is only recorded after `launch_batch_sample_if_needed`, so submission happens after that call in that case.\n- **KV lifetime and aborts.**\n  - Paths that release an `EARLY` request's KV hold `EarlyKVChunkSender.lock` via `early_kv_send_lock(req)`, so the worker never reads freed KV pages. These paths are `_retire_aborted_prefill_result`, `handle_inflight_transfer_failure`, and `process_pending_chunked_abort`.\n  - The worker skips requests that were aborted or whose KV was already released.\n  - When an `EARLY` request is aborted after the worker may have started sending, the scheduler aborts its sender (`KVPoll.Failed`) and lets it drain through the inflight queue instead of retiring it directly.\n  - A failed middle-chunk send aborts the sender and skips the request's remaining chunks.\n- **`handle_inflight_transfer_failure`** now keeps an existing `FINISH_ABORT` reason instead of always overwriting it with `FINISH_LENGTH(0)`. Without this, a client abort that surfaces as a transfer failure is reported as a normal length finish. **Behavior change:** this also applies with the flag off.\n- **Lifecycle:** the worker is stopped in `teardown_disaggregation` (PD role switch). `optimistic_release_and_requeue` resets ownership.\n- **Support matrix.** When enabled with an unsupported configuration, the flag is ignored with a warning and the scheduler path is used.\n  - Requires: CUDA, the overlap scheduler, and the Mooncake backend.\n  - Not supported with: staging buffer, KV checksum, speculative decoding, the `prefill_complete` decode allocation policy, unified memory, or models that transfer extra state (`state_types`, e.g. Mamba / SWA / DSA).\n- **Cached-prefix early send** (`maybe_send_cached_prefix_chunk`) is skipped for `EARLY` requests.\n- **Docs:** the new variable is added to the Mooncake prefill configuration table in `pd_disaggregation.mdx`.\n- **Tests:**\n  - New unit tests in `test/registered/unit/disaggregation/test_prefill_early_send.py`: support matrix, ownership, submit, worker send / abort / failure handling.\n  - New e2e test `test/registered/disaggregation/test_disaggregation_early_send_kv.py`: GSM8K accuracy, greedy consistency between sequential and concurrent requests, and mixed logprob / regex requests. The prefill server runs with `--enable-deterministic-inference` so the consistency check is not affected by batch-dependent numerics (without it, concurrent vs sequential first tokens also differ with the flag OFF).\n  - Existing test fakes (`test_prefill_abort_result_cleanup.py`, `test_auxiliary_output.py`) get the new `kv_send_owner` field.\n\n## Accuracy Tests\n\n1P1D, TP4 each, Mooncake RDMA, same server code with the flag OFF vs ON.\n\nGSM8K, `few_shot_gsm8k`, 500 questions, 5-shot:\n\n| | Accuracy | Invalid |\n|---|---|---|\n| OFF | 0.898 | 0.000 |\n| ON | 0.908 | 0.000 |\n\nOutput consistency, from an earlier prototype of this change (same copy-done trigger):\n\n- **Greedy, sequential (30 prompts):** 30/30 identical outputs between ON and OFF.\n- **Concurrent (200 prompts):** ON vs OFF differs in about 33% of outputs. This matches the OFF-vs-OFF control (69/200 differ) and the ON-vs-ON control (70/200 differ), so the differences come from batch-dependent numerics, not from the change.\n- **Regex and logprob requests (which stay on the scheduler path):** regex 20/20 full match and logprobs 20/20 present in both modes.\n\n## Speed Tests and Profiling\n\n**Setup.**\n- 1P1D, TP4 each (H20), Mooncake RDMA, `--page-size 16`, radix cache on, chunked prefill off.\n- Workload: `bench_serving --dataset-name generated-shared-prefix`, 200 prompts, input 1024 / output 100. \"Prefix\" is the shared system-prompt fraction of the input.\n- Each cell is the mean of 2 runs with identical seeds in both modes, and the cache is flushed before every run.\n- All 24 runs completed 200/200 requests with no errors. With ON, every request was sent by the early sender.\n\n<!-- Upload figs/ttft.png here -->\n<img width=\"1950\" height=\"630\" alt=\"image\" src=\"https://github.com/user-attachments/assets/77ed6aa8-dead-4b22-bdcb-a13f18cad9b0\" />\n\n\n| prefix | QPS | TTFT mean OFF → ON (ms) | Δ | TTFT p99 Δ | E2E mean Δ | ITL p99 Δ | throughput Δ |\n|---|---|---|---|---|---|---|---|\n| 60% | 10 | 7480 → 3731 | -50.1% | -43.6% | -42.2% | -25.2% | +3.9% |\n| 60% | 20 | 15207 → 10213 | -32.8% | -19.0% | -30.5% | -26.1% | +3.7% |\n| 70% | 10 | 2722 → 1323 | -51.4% | -52.1% | -24.9% | -5.6% | +0.8% |\n| 70% | 20 | 10529 → 6543 | -37.9% | -27.2% | -35.8% | -42.8% | +6.9% |\n| 80% | 10 | 312 → 240 | -23.0% | -30.8% | -4.2% | -8.7% | +0.1% |\n| 80% | 20 | 4422 → 2189 | -50.5% | -44.6% | -35.3% | -39.0% | +8.7% |\n\nClient-side mean TPOT goes up in some cells (up to +52% at 70% / QPS 10) but down in others (-23% at 70% / QPS 20). This is a measurement artifact: with OFF, tokens produced while the first token is delayed arrive in a burst right after it, which lowers the client TPOT average. ITL p99 is lower with ON in every cell.\n\n**Where the time goes.** These numbers come from local-only timestamp instrumentation, which is not part of this PR. The metric is the time from a prefill batch finishing on the GPU to the last KV chunk's send being enqueued. Median: 1267 ms with OFF vs 3.2 ms with ON. p99: 4440 ms vs 42 ms.\n\n<!-- Upload figs/gpu_to_send_cdf.png here -->\n<img width=\"975\" height=\"600\" alt=\"image\" src=\"https://github.com/user-attachments/assets/a7480581-f69f-4acb-8b45-fd1540f1639c\" />\n\n\nThe breakdown of mean TTFT shows that with OFF, this wait (red) is 0.07-3.45 s per request, and ON removes it:\n\n<!-- Upload figs/ttft_breakdown.png here -->\n<img width=\"1500\" height=\"1125\" alt=\"image\" src=\"https://github.com/user-attachments/assets/84b7bfc6-3304-4676-ae1a-dcc954aaa71a\" />\n\n\nPrefill batches on the GPU, with the moment each request's KV send is enqueued (70% prefix, QPS 10):\n- **OFF:** a batch's KV is only sent after the *next* batch has finished on the GPU.\n- **ON:** the send starts as soon as the batch finishes.\n\n<!-- Upload figs/prefill_gantt.png here -->\n<img width=\"1800\" height=\"690\" alt=\"image\" src=\"https://github.com/user-attachments/assets/782f6d37-b744-48ed-871d-1863c126497a\" />\n\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #38229627983](https://github.com/sgl-project/sglang/actions/runs/38229627983)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38229627536](https://github.com/sgl-project/sglang/actions/runs/38229627536)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38229627936](https://github.com/sgl-project/sglang/actions/runs/38229627936)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 12,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/sgl-project/sglang/issues/43811/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/sgl-project/sglang/pulls/43811/commits",
+    "created_at": "2026-10-12T09:23:50Z",
+    "deletions": 20,
+    "diff_url": "https://github.com/sgl-project/sglang/pull/43811.diff",
+    "draft": false,
+    "head": {
+      "label": "wcwuwc:feat/prefill-early-send-kv",
+      "ref": "feat/prefill-early-send-kv",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/wcwuwc/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/wcwuwc/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/wcwuwc/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/wcwuwc/sglang/branches{/branch}",
+        "clone_url": "https://github.com/wcwuwc/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/wcwuwc/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/wcwuwc/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/wcwuwc/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/wcwuwc/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/wcwuwc/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/wcwuwc/sglang/contributors",
+        "created_at": "2026-06-25T07:27:08Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/wcwuwc/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/wcwuwc/sglang/downloads",
+        "events_url": "https://api.github.com/repos/wcwuwc/sglang/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/wcwuwc/sglang/forks",
+        "full_name": "wcwuwc/sglang",
+        "git_commits_url": "https://api.github.com/repos/wcwuwc/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/wcwuwc/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/wcwuwc/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/wcwuwc/sglang.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/wcwuwc/sglang/hooks",
+        "html_url": "https://github.com/wcwuwc/sglang",
+        "id": 1280005530,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/wcwuwc/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/wcwuwc/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/wcwuwc/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/wcwuwc/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/wcwuwc/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/wcwuwc/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/wcwuwc/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/wcwuwc/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOTEtVmg",
+        "notifications_url": "https://api.github.com/repos/wcwuwc/sglang/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/72850361?v=4",
+          "events_url": "https://api.github.com/users/wcwuwc/events{/privacy}",
+          "followers_url": "https://api.github.com/users/wcwuwc/followers",
+          "following_url": "https://api.github.com/users/wcwuwc/following{/other_user}",
+          "gists_url": "https://api.github.com/users/wcwuwc/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/wcwuwc",
+          "id": 72850361,
+          "login": "wcwuwc",
+          "node_id": "MDQ6VXNlcjcyODUwMzYx",
+          "organizations_url": "https://api.github.com/users/wcwuwc/orgs",
+          "received_events_url": "https://api.github.com/users/wcwuwc/received_events",
+          "repos_url": "https://api.github.com/users/wcwuwc/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/wcwuwc/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/wcwuwc/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/wcwuwc",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/wcwuwc/sglang/pulls{/number}",
+        "pushed_at": "2026-10-12T09:20:40Z",
+        "releases_url": "https://api.github.com/repos/wcwuwc/sglang/releases{/id}",
+        "size": 264485,
+        "ssh_url": "git@github.com:wcwuwc/sglang.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/wcwuwc/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/wcwuwc/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/wcwuwc/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/wcwuwc/sglang/subscription",
+        "svn_url": "https://github.com/wcwuwc/sglang",
+        "tags_url": "https://api.github.com/repos/wcwuwc/sglang/tags",
+        "teams_url": "https://api.github.com/repos/wcwuwc/sglang/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/wcwuwc/sglang/git/trees{/sha}",
+        "updated_at": "2026-10-12T07:45:19Z",
+        "url": "https://api.github.com/repos/wcwuwc/sglang",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/72850361?v=4",
+        "events_url": "https://api.github.com/users/wcwuwc/events{/privacy}",
+        "followers_url": "https://api.github.com/users/wcwuwc/followers",
+        "following_url": "https://api.github.com/users/wcwuwc/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wcwuwc/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/wcwuwc",
+        "id": 72850361,
+        "login": "wcwuwc",
+        "node_id": "MDQ6VXNlcjcyODUwMzYx",
+        "organizations_url": "https://api.github.com/users/wcwuwc/orgs",
+        "received_events_url": "https://api.github.com/users/wcwuwc/received_events",
+        "repos_url": "https://api.github.com/users/wcwuwc/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/wcwuwc/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wcwuwc/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/wcwuwc",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/43811",
+    "id": 4827415248,
+    "issue_url": "https://api.github.com/repos/sgl-project/sglang/issues/43811",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "0075ca",
+        "default": true,
+        "description": "Improvements or additions to documentation",
+        "id": 6403845273,
+        "name": "documentation",
+        "node_id": "LA_kwDOLCAjRs8AAAABfbLsmQ",
+        "url": "https://api.github.com/repos/sgl-project/sglang/labels/documentation"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOLCAjRs8AAAABH7yC0A",
+    "number": 43811,
+    "patch_url": "https://github.com/sgl-project/sglang/pull/43811.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/3349073?v=4",
+        "events_url": "https://api.github.com/users/HaiShaw/events{/privacy}",
+        "followers_url": "https://api.github.com/users/HaiShaw/followers",
+        "following_url": "https://api.github.com/users/HaiShaw/following{/other_user}",
+        "gists_url": "https://api.github.com/users/HaiShaw/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/HaiShaw",
+        "id": 3349073,
+        "login": "HaiShaw",
+        "node_id": "MDQ6VXNlcjMzNDkwNzM=",
+        "organizations_url": "https://api.github.com/users/HaiShaw/orgs",
+        "received_events_url": "https://api.github.com/users/HaiShaw/received_events",
+        "repos_url": "https://api.github.com/users/HaiShaw/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/HaiShaw/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/HaiShaw/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/HaiShaw",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/9302255?v=4",
+        "events_url": "https://api.github.com/users/Ying1123/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Ying1123/followers",
+        "following_url": "https://api.github.com/users/Ying1123/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Ying1123/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Ying1123",
+        "id": 9302255,
+        "login": "Ying1123",
+        "node_id": "MDQ6VXNlcjkzMDIyNTU=",
+        "organizations_url": "https://api.github.com/users/Ying1123/orgs",
+        "received_events_url": "https://api.github.com/users/Ying1123/received_events",
+        "repos_url": "https://api.github.com/users/Ying1123/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Ying1123/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Ying1123/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Ying1123",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/15100009?v=4",
+        "events_url": "https://api.github.com/users/merrymercy/events{/privacy}",
+        "followers_url": "https://api.github.com/users/merrymercy/followers",
+        "following_url": "https://api.github.com/users/merrymercy/following{/other_user}",
+        "gists_url": "https://api.github.com/users/merrymercy/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/merrymercy",
+        "id": 15100009,
+        "login": "merrymercy",
+        "node_id": "MDQ6VXNlcjE1MTAwMDA5",
+        "organizations_url": "https://api.github.com/users/merrymercy/orgs",
+        "received_events_url": "https://api.github.com/users/merrymercy/received_events",
+        "repos_url": "https://api.github.com/users/merrymercy/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/merrymercy/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/merrymercy/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/merrymercy",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/22819949?v=4",
+        "events_url": "https://api.github.com/users/xiezhq-hermann/events{/privacy}",
+        "followers_url": "https://api.github.com/users/xiezhq-hermann/followers",
+        "following_url": "https://api.github.com/users/xiezhq-hermann/following{/other_user}",
+        "gists_url": "https://api.github.com/users/xiezhq-hermann/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/xiezhq-hermann",
+        "id": 22819949,
+        "login": "xiezhq-hermann",
+        "node_id": "MDQ6VXNlcjIyODE5OTQ5",
+        "organizations_url": "https://api.github.com/users/xiezhq-hermann/orgs",
+        "received_events_url": "https://api.github.com/users/xiezhq-hermann/received_events",
+        "repos_url": "https://api.github.com/users/xiezhq-hermann/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/xiezhq-hermann/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/xiezhq-hermann/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/xiezhq-hermann",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/24364830?v=4",
+        "events_url": "https://api.github.com/users/ByronHsu/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ByronHsu/followers",
+        "following_url": "https://api.github.com/users/ByronHsu/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ByronHsu/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ByronHsu",
+        "id": 24364830,
+        "login": "ByronHsu",
+        "node_id": "MDQ6VXNlcjI0MzY0ODMw",
+        "organizations_url": "https://api.github.com/users/ByronHsu/orgs",
+        "received_events_url": "https://api.github.com/users/ByronHsu/received_events",
+        "repos_url": "https://api.github.com/users/ByronHsu/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ByronHsu/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ByronHsu/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ByronHsu",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/27337995?v=4",
+        "events_url": "https://api.github.com/users/wisclmy0611/events{/privacy}",
+        "followers_url": "https://api.github.com/users/wisclmy0611/followers",
+        "following_url": "https://api.github.com/users/wisclmy0611/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wisclmy0611/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/wisclmy0611",
+        "id": 27337995,
+        "login": "wisclmy0611",
+        "node_id": "MDQ6VXNlcjI3MzM3OTk1",
+        "organizations_url": "https://api.github.com/users/wisclmy0611/orgs",
+        "received_events_url": "https://api.github.com/users/wisclmy0611/received_events",
+        "repos_url": "https://api.github.com/users/wisclmy0611/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/wisclmy0611/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wisclmy0611/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/wisclmy0611",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/37504505?v=4",
+        "events_url": "https://api.github.com/users/zijiexia/events{/privacy}",
+        "followers_url": "https://api.github.com/users/zijiexia/followers",
+        "following_url": "https://api.github.com/users/zijiexia/following{/other_user}",
+        "gists_url": "https://api.github.com/users/zijiexia/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/zijiexia",
+        "id": 37504505,
+        "login": "zijiexia",
+        "node_id": "MDQ6VXNlcjM3NTA0NTA1",
+        "organizations_url": "https://api.github.com/users/zijiexia/orgs",
+        "received_events_url": "https://api.github.com/users/zijiexia/received_events",
+        "repos_url": "https://api.github.com/users/zijiexia/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/zijiexia/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/zijiexia/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/zijiexia",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/39478626?v=4",
+        "events_url": "https://api.github.com/users/sogalin/events{/privacy}",
+        "followers_url": "https://api.github.com/users/sogalin/followers",
+        "following_url": "https://api.github.com/users/sogalin/following{/other_user}",
+        "gists_url": "https://api.github.com/users/sogalin/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/sogalin",
+        "id": 39478626,
+        "login": "sogalin",
+        "node_id": "MDQ6VXNlcjM5NDc4NjI2",
+        "organizations_url": "https://api.github.com/users/sogalin/orgs",
+        "received_events_url": "https://api.github.com/users/sogalin/received_events",
+        "repos_url": "https://api.github.com/users/sogalin/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/sogalin/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/sogalin/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/sogalin",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/83744562?v=4",
+        "events_url": "https://api.github.com/users/Duyi-Wang/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Duyi-Wang/followers",
+        "following_url": "https://api.github.com/users/Duyi-Wang/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Duyi-Wang/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Duyi-Wang",
+        "id": 83744562,
+        "login": "Duyi-Wang",
+        "node_id": "MDQ6VXNlcjgzNzQ0NTYy",
+        "organizations_url": "https://api.github.com/users/Duyi-Wang/orgs",
+        "received_events_url": "https://api.github.com/users/Duyi-Wang/received_events",
+        "repos_url": "https://api.github.com/users/Duyi-Wang/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Duyi-Wang/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Duyi-Wang/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Duyi-Wang",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/95566987?v=4",
+        "events_url": "https://api.github.com/users/hnyls2002/events{/privacy}",
+        "followers_url": "https://api.github.com/users/hnyls2002/followers",
+        "following_url": "https://api.github.com/users/hnyls2002/following{/other_user}",
+        "gists_url": "https://api.github.com/users/hnyls2002/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/hnyls2002",
+        "id": 95566987,
+        "login": "hnyls2002",
+        "node_id": "U_kgDOBbI8iw",
+        "organizations_url": "https://api.github.com/users/hnyls2002/orgs",
+        "received_events_url": "https://api.github.com/users/hnyls2002/received_events",
+        "repos_url": "https://api.github.com/users/hnyls2002/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/hnyls2002/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/hnyls2002/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/hnyls2002",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/115166877?v=4",
+        "events_url": "https://api.github.com/users/JustinTong0323/events{/privacy}",
+        "followers_url": "https://api.github.com/users/JustinTong0323/followers",
+        "following_url": "https://api.github.com/users/JustinTong0323/following{/other_user}",
+        "gists_url": "https://api.github.com/users/JustinTong0323/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/JustinTong0323",
+        "id": 115166877,
+        "login": "JustinTong0323",
+        "node_id": "U_kgDOBt1OnQ",
+        "organizations_url": "https://api.github.com/users/JustinTong0323/orgs",
+        "received_events_url": "https://api.github.com/users/JustinTong0323/received_events",
+        "repos_url": "https://api.github.com/users/JustinTong0323/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/JustinTong0323/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/JustinTong0323/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/JustinTong0323",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}",
+    "review_comments": 3,
+    "review_comments_url": "https://api.github.com/repos/sgl-project/sglang/pulls/43811/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+    "title": "[PD] Send prefill KV chunks as soon as the batch result copy completes",
+    "updated_at": "2026-10-16T10:35:51Z",
+    "url": "https://api.github.com/repos/sgl-project/sglang/pulls/43811",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/72850361?v=4",
+      "events_url": "https://api.github.com/users/wcwuwc/events{/privacy}",
+      "followers_url": "https://api.github.com/users/wcwuwc/followers",
+      "following_url": "https://api.github.com/users/wcwuwc/following{/other_user}",
+      "gists_url": "https://api.github.com/users/wcwuwc/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/wcwuwc",
+      "id": 72850361,
+      "login": "wcwuwc",
+      "node_id": "MDQ6VXNlcjcyODUwMzYx",
+      "organizations_url": "https://api.github.com/users/wcwuwc/orgs",
+      "received_events_url": "https://api.github.com/users/wcwuwc/received_events",
+      "repos_url": "https://api.github.com/users/wcwuwc/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/wcwuwc/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/wcwuwc/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/wcwuwc",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/docs%2Fdocs%2Fadvanced_features%2Fpd_disaggregation.mdx",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/docs%2Fdocs%2Fadvanced_features%2Fpd_disaggregation.mdx?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "docs/docs/advanced_features/pd_disaggregation.mdx",
+      "patch": "@@ -297,6 +297,11 @@ The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom me\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>Interval (seconds) between cleanups of bootstrap entries</td>\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.02)\"}}><code>120</code></td>\n     </tr>\n+    <tr>\n+      <td style={{padding: \"9px 12px\", fontWeight: 500, backgroundColor: \"rgba(255,255,255,0.02)\"}}><strong><code>SGLANG_DISAGG_PREFILL_EARLY_SEND_KV</code></strong></td>\n+      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>Send each prefill batch's KV chunks from a worker thread as soon as the batch's result copy completes, instead of after the next batch's forward. Lowers TTFT under the overlap scheduler. Requests that need logprobs, grammar, or a sampling mask, or that are still bootstrapping, keep the default path. Requires the overlap scheduler and the Mooncake backend; ignored with a warning together with the staging buffer, KV checksum, speculative decoding, unified memory, models that transfer extra state (e.g. Mamba, SWA, DSA), or the <code>prefill_complete</code> decode allocation policy</td>\n+      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.02)\"}}><code>false</code></td>\n+    </tr>\n </tbody>\n </table>\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/docs%2Fdocs%2Fadvanced_features%2Fpd_disaggregation.mdx",
+      "sha": "89715120559f48a46ff948554c4a38290a298691",
+      "status": "modified"
+    },
+    {
+      "additions": 58,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Fprefill.py",
+      "changes": 68,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdisaggregation%2Fprefill.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 10,
+      "filename": "python/sglang/srt/disaggregation/prefill.py",
+      "patch": "@@ -19,6 +19,7 @@\n \n from __future__ import annotations\n \n+import contextlib\n import hashlib\n import logging\n import time\n@@ -43,10 +44,12 @@\n     compute_grid_segments,\n     staging_grid_tokens,\n )\n+from sglang.srt.disaggregation.prefill_early_send import EarlyKVChunkSender\n from sglang.srt.disaggregation.utils import (\n     FAKE_BOOTSTRAP_HOST,\n     DisaggregationMode,\n     KVClassType,\n+    KVSendOwner,\n     MetadataBuffers,\n     ReqToMetadataIdxAllocator,\n     TransferBackend,\n@@ -738,6 +741,7 @@ def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:\n             self._is_continuous_input_polling_enabled()\n         )\n         self.result_queue = deque()\n+        self.early_kv_chunk_sender = EarlyKVChunkSender.maybe_create(self)\n         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device=\"cpu\")\n         # True when intake repeats while the oldest batch result is unfinished.\n         waiting_for_batch_result = False\n@@ -795,6 +799,11 @@ def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:\n                     batch_result = self.run_batch(batch)\n                     self._apply_war_barrier()\n                     self.result_queue.append((batch.copy(), batch_result))\n+                    if (\n+                        self.early_kv_chunk_sender is not None\n+                        and batch_result.delay_sample_func is None\n+                    ):\n+                        self.early_kv_chunk_sender.submit(batch, batch_result)\n                 else:\n                     batch_result = None\n \n@@ -822,7 +831,12 @@ def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:\n \n             # Run sample of the current batch\n             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.\n+            sample_delayed = (\n+                batch_result is not None and batch_result.delay_sample_func is not None\n+            )\n             self.launch_batch_sample_if_needed(batch_result, batch)\n+            if sample_delayed and self.early_kv_chunk_sender is not None:\n+                self.early_kv_chunk_sender.submit(batch, batch_result)\n \n             # Update last_batch and scheduler status\n             self._sched_idled = batch is None\n@@ -931,7 +945,13 @@ def advance_logprob_pt(i: int, req: Req) -> None:\n             if req.inflight_middle_chunks <= 0:\n                 req.time_stats.set_prefill_finished_time()\n \n-                if is_aborted(req):\n+                sends_last_chunk = req.kv_send_owner != KVSendOwner.EARLY\n+                if is_aborted(req) and not sends_last_chunk:\n+                    # The early sender may already be transferring; conclude\n+                    # through the inflight queue like a request aborted after\n+                    # its send.\n+                    req.disagg_kv_sender.abort()\n+                elif is_aborted(req):\n                     if self._retire_aborted_prefill_result(req):\n                         req.time_stats.set_completion_time()\n                         aborted_reqs.append(req)\n@@ -965,7 +985,8 @@ def advance_logprob_pt(i: int, req: Req) -> None:\n                     advance_logprob_pt(i, req)\n                     continue\n \n-                req.output_ids.append(next_token_id)\n+                if sends_last_chunk:\n+                    req.output_ids.append(next_token_id)\n                 if req.grammar is not None:\n                     try:\n                         req.grammar.accept_token(next_token_id)\n@@ -1023,9 +1044,10 @@ def advance_logprob_pt(i: int, req: Req) -> None:\n                     == \"prefill_complete\"\n                 ):\n                     req.disagg_kv_sender.mark_prefill_complete()\n-                if not req.pending_bootstrap:\n-                    self.send_kv_chunk(req, last_chunk=True)\n-                req.time_stats.set_prefill_transfer_queue_entry_time()\n+                if sends_last_chunk:\n+                    if not req.pending_bootstrap:\n+                        self.send_kv_chunk(req, last_chunk=True)\n+                    req.time_stats.set_prefill_transfer_queue_entry_time()\n \n             else:\n                 # being chunked reqs' prefill is not finished\n@@ -1072,7 +1094,11 @@ def advance_logprob_pt(i: int, req: Req) -> None:\n \n                 # In non-overlap-mode, KV is sent in process_prefill_chunk\n                 # Only send when req's sender is initialized\n-                if self.enable_overlap and not req.pending_bootstrap:\n+                if (\n+                    self.enable_overlap\n+                    and not req.pending_bootstrap\n+                    and req.kv_send_owner != KVSendOwner.EARLY\n+                ):\n                     assert req.metadata_buffer_index >= 0, (\n                         f\"Req {req.rid} does not have metadata buffer allocated\"\n                     )\n@@ -1252,10 +1278,17 @@ def handle_inflight_transfer_failure(\n             logger.warning(error_message)\n         req.time_stats.trace_ctx.abort(abort_info={\"reason\": error_message})\n         if req.finished_reason is None:\n-            req.finished_reason = FINISH_LENGTH(length=0)\n-        # unlock the tree\n-        release_kv_cache(req, self.tree_cache, checkpoint=True)\n-        self._release_aborted_request(req)\n+            # Keep a client abort that failed the transfer, e.g. after an\n+            # early send already handed the KV to the transfer engine.\n+            req.finished_reason = (\n+                req.to_finish\n+                if isinstance(req.to_finish, FINISH_ABORT)\n+                else FINISH_LENGTH(length=0)\n+            )\n+        with self.early_kv_send_lock(req):\n+            # unlock the tree\n+            release_kv_cache(req, self.tree_cache, checkpoint=True)\n+            self._release_aborted_request(req)\n         if not isinstance(req.finished_reason, FINISH_ABORT):\n             prepare_abort(\n                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR\n@@ -1275,6 +1308,10 @@ def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:\n \n     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:\n         \"\"\"Release an aborted request when its last prefill result is safe.\"\"\"\n+        with self.early_kv_send_lock(req):\n+            return self._retire_aborted_prefill_result_locked(req)\n+\n+    def _retire_aborted_prefill_result_locked(self: Scheduler, req: Req) -> bool:\n         self.clear_pending_chunk_send(req)\n         owns_resources = (\n             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0\n@@ -1412,6 +1449,9 @@ def process_prefill_chunk(\n     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:\n         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():\n             return\n+        # The early sender sends every chunk of the requests it owns.\n+        if req.kv_send_owner == KVSendOwner.EARLY:\n+            return\n \n         # Staging sends into positional grid slots, so the early-send boundary\n         # must stay stable across the request's batches: snapshot the at-rest\n@@ -1446,6 +1486,13 @@ def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:\n             req.disagg_kv_sender._early_send_wait_event = ev\n         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)\n \n+    def early_kv_send_lock(self: Scheduler, req: Req):\n+        \"\"\"Hold while releasing `req`'s KV so no early send is reading it.\"\"\"\n+        sender = getattr(self, \"early_kv_chunk_sender\", None)\n+        if sender is None or req.kv_send_owner != KVSendOwner.EARLY:\n+            return contextlib.nullcontext()\n+        return sender.lock\n+\n     def send_kv_chunk(\n         self,\n         req: Req,\n@@ -1691,6 +1738,7 @@ def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:\n         req.start_send_idx = 0\n         self.clear_pending_chunk_send(req)  # re-sends from scratch\n         req.tmp_end_idx = -1\n+        req.kv_send_owner = KVSendOwner.NONE\n         req.disagg_decode_prefix_len = 0\n         req.early_send_prefix_end = None\n         req.hidden_states_tensor = None",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Fprefill.py",
+      "sha": "cc63e4f17dad9348a74d3c6f0c6c9a59a519c6fa",
+      "status": "modified"
+    },
+    {
+      "additions": 204,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Fprefill_early_send.py",
+      "changes": 204,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdisaggregation%2Fprefill_early_send.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "python/sglang/srt/disaggregation/prefill_early_send.py",
+      "patch": "@@ -0,0 +1,204 @@\n+\"\"\"Early send of prefill KV chunks.\n+\n+Enabled by ``SGLANG_DISAGG_PREFILL_EARLY_SEND_KV``.\n+\n+Under overlap scheduling the result of prefill batch N is processed only after\n+batch N+1 has been launched, and the page-index reads in ``send_kv_chunk`` run\n+on the schedule stream, which the WAR barrier fences behind N+1's forward. Every\n+KV chunk computed by N, including the last one that decode waits on, is\n+therefore handed to the transfer engine roughly one forward late.\n+\n+``EarlyKVChunkSender`` sends the chunks of N from a worker thread as soon as N's\n+result copy (``copy_done``) completes, reading page indices on its own stream.\n+\n+Each request's KV is sent by exactly one side, fixed at its first launched\n+batch (``Req.kv_send_owner``):\n+\n+- ``EARLY``: the worker sends every chunk, in launch order, and appends the\n+  first output token with the last one. The scheduler sends nothing for it.\n+- ``SCHEDULER``: requests whose last chunk depends on the processed result\n+  (logprobs, grammar, sampling mask) or on a pending bootstrap keep the\n+  original path.\n+\n+Paths that release an ``EARLY`` request's KV before its transfer concludes\n+hold ``lock`` so no worker send is reading it; the worker skips requests that\n+are aborted or no longer hold KV.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import logging\n+import queue\n+import threading\n+import weakref\n+from dataclasses import dataclass\n+from typing import TYPE_CHECKING, List, Optional\n+\n+import torch\n+\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend, is_aborted\n+from sglang.srt.environ import envs\n+from sglang.srt.runtime_context import get_disagg\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch\n+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+@dataclass\n+class _ChunkSend:\n+    batch_index: int\n+    req: Req\n+    # KV computed through this batch; snapshotted at launch since the next\n+    # chunk's scheduling moves req.extend_end.\n+    end_idx: int\n+    is_last: bool\n+\n+\n+@dataclass\n+class _BatchSend:\n+    copy_done: torch.cuda.Event\n+    next_token_ids: torch.Tensor\n+    chunks: List[_ChunkSend]\n+\n+\n+class EarlyKVChunkSender:\n+    def __init__(self, scheduler: Scheduler):\n+        self._scheduler = scheduler\n+        self.lock = threading.Lock()\n+        # None stops the worker.\n+        self._queue: queue.SimpleQueue[Optional[_BatchSend]] = queue.SimpleQueue()\n+        # Worker-thread only: requests whose earlier chunk failed to send.\n+        self._failed_reqs: weakref.WeakSet[Req] = weakref.WeakSet()\n+        self._device = torch.cuda.current_device()\n+        # Must not be the schedule stream: the WAR barrier makes it wait for the\n+        # next batch's forward, which is the delay this class removes.\n+        self._stream = torch.cuda.Stream(device=self._device)\n+        threading.Thread(\n+            target=self._worker,\n+            name=\"prefill-early-kv-chunk-send\",\n+            daemon=True,\n+        ).start()\n+        logger.info(\"Prefill early KV chunk send enabled\")\n+\n+    @classmethod\n+    def maybe_create(cls, scheduler: Scheduler) -> Optional[EarlyKVChunkSender]:\n+        if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.get():\n+            return None\n+        if not cls.is_supported(scheduler):\n+            logger.warning(\n+                \"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV is not supported with this \"\n+                \"configuration; KV chunks are sent by the scheduler\"\n+            )\n+            return None\n+        return cls(scheduler)\n+\n+    @staticmethod\n+    def is_supported(scheduler: Scheduler) -> bool:\n+        return (\n+            torch.cuda.is_available()\n+            and scheduler.enable_overlap\n+            and not scheduler.enable_staging\n+            and scheduler.kv_checksum_computer is None\n+            and scheduler.spec_algorithm.is_none()\n+            and get_disagg().disaggregation_decode_allocation_policy\n+            != \"prefill_complete\"\n+            # Sends run off the scheduler thread; only Mooncake is verified.\n+            and scheduler.transfer_backend == TransferBackend.MOONCAKE\n+            # Compaction may move pages while the worker reads their ids.\n+            and not scheduler.enable_unified_memory\n+            # Extra state payloads (mamba, SWA, DSA, ...) are unverified.\n+            and not scheduler.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types\n+        )\n+\n+    def stop(self) -> None:\n+        self._queue.put(None)\n+\n+    @staticmethod\n+    def is_eligible(req: Req) -> bool:\n+        return (\n+            req.bootstrap_room is not None\n+            and not req.pending_bootstrap\n+            and len(req.output_ids) == 0\n+            and not req.return_logprob\n+            and not req.return_sampling_mask\n+            and req.grammar is None\n+        )\n+\n+    def submit(self, batch: ScheduleBatch, result: GenerationBatchResult) -> None:\n+        \"\"\"Queue a launched batch; call once its result copy has been recorded.\n+\n+        Fixes the KV send owner of requests seen for the first time.\n+        \"\"\"\n+        can_send = result.copy_done is not None and isinstance(\n+            result.next_token_ids, torch.Tensor\n+        )\n+        chunks = []\n+        for i, req in enumerate(batch.reqs):\n+            if req.kv_send_owner == KVSendOwner.NONE:\n+                req.kv_send_owner = (\n+                    KVSendOwner.EARLY\n+                    if can_send and self.is_eligible(req)\n+                    else KVSendOwner.SCHEDULER\n+                )\n+            if req.kv_send_owner != KVSendOwner.EARLY:\n+                continue\n+            input_len = len(req.origin_input_ids)\n+            chunks.append(\n+                _ChunkSend(\n+                    batch_index=i,\n+                    req=req,\n+                    end_idx=min(req.extend_end, input_len),\n+                    is_last=req.extend_end >= input_len,\n+                )\n+            )\n+        if chunks:\n+            assert can_send, \"EARLY-owned request in a batch without a result copy\"\n+            self._queue.put(_BatchSend(result.copy_done, result.next_token_ids, chunks))\n+\n+    def _worker(self) -> None:\n+        torch.cuda.set_device(self._device)\n+        while True:\n+            batch_send = self._queue.get()\n+            if batch_send is None:\n+                return\n+            try:\n+                with torch.cuda.stream(self._stream):\n+                    self._send_batch(batch_send)\n+            except Exception:\n+                logger.exception(\"Early KV chunk send failed\")\n+\n+    def _send_batch(self, batch_send: _BatchSend) -> None:\n+        batch_send.copy_done.synchronize()\n+        token_ids = None\n+        for chunk in batch_send.chunks:\n+            if chunk.is_last and token_ids is None:\n+                token_ids = batch_send.next_token_ids.tolist()\n+            with self.lock:\n+                self._send_chunk(\n+                    chunk, token_ids[chunk.batch_index] if chunk.is_last else None\n+                )\n+\n+    def _send_chunk(self, chunk: _ChunkSend, token_id: int | None) -> None:\n+        req = chunk.req\n+        if req in self._failed_reqs or is_aborted(req) or not req.kv.holds_kv:\n+            # The scheduler concludes it through the inflight queue or abort.\n+            return\n+        try:\n+            if chunk.is_last:\n+                req.output_ids.append(token_id)\n+                self._scheduler.send_kv_chunk(req, last_chunk=True)\n+                req.time_stats.set_prefill_transfer_queue_entry_time()\n+            else:\n+                self._scheduler.send_kv_chunk(\n+                    req, last_chunk=False, end_idx=chunk.end_idx\n+                )\n+        except Exception:\n+            # A missing range cannot be resent safely; fail the transfer so the\n+            # scheduler concludes the request through the inflight queue.\n+            logger.exception(\"Early KV chunk send failed for %s\", req.rid)\n+            if not chunk.is_last:\n+                self._failed_reqs.add(req)\n+            req.disagg_kv_sender.abort()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Fprefill_early_send.py",
+      "sha": "55d596097f42a89143ddbee474315676500f0aa8",
+      "status": "added"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Frole_switch.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdisaggregation%2Frole_switch.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "python/sglang/srt/disaggregation/role_switch.py",
+      "patch": "@@ -238,6 +238,10 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:\n                 km.teardown()\n             scheduler.disagg_prefill_bootstrap_queue = None\n         scheduler.disagg_prefill_inflight_queue = []\n+        sender = getattr(scheduler, \"early_kv_chunk_sender\", None)\n+        if sender is not None:\n+            sender.stop()\n+            scheduler.early_kv_chunk_sender = None\n     elif mode == DisaggregationMode.DECODE:\n         q = getattr(scheduler, \"disagg_decode_prealloc_queue\", None)\n         if q is not None:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Frole_switch.py",
+      "sha": "19e823d9a5d3bf25050cb5da36ea1e0f95aaac97",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Futils.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fdisaggregation%2Futils.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "python/sglang/srt/disaggregation/utils.py",
+      "patch": "@@ -145,6 +145,14 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:\n     return np.array([int(req_pool_idx)], dtype=np.int32)\n \n \n+class KVSendOwner(Enum):\n+    \"\"\"Who sends a prefill request's KV chunks (and appends its first token).\"\"\"\n+\n+    NONE = \"none\"  # not decided yet\n+    EARLY = \"early\"  # EarlyKVChunkSender worker thread\n+    SCHEDULER = \"scheduler\"  # process_batch_result_disagg_prefill\n+\n+\n class DisaggregationMode(Enum):\n     NULL = \"null\"\n     PREFILL = \"prefill\"",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fdisaggregation%2Futils.py",
+      "sha": "1c8b0bb6a955a4c8bf73fbe1a1f7c4f1db0ea4f3",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fenviron.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fenviron.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "python/sglang/srt/environ.py",
+      "patch": "@@ -712,6 +712,7 @@ class Envs:\n     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr(\"UCX\")\n     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr(\"{}\")\n     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)\n+    SGLANG_DISAGG_PREFILL_EARLY_SEND_KV = EnvBool(False)\n     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)\n     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)\n     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fenviron.py",
+      "sha": "3bd0a46b2bee19f2fe5281206804dac0e19cca5f",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 1,
+      "filename": "python/sglang/srt/managers/schedule_batch.py",
+      "patch": "@@ -92,7 +92,11 @@\n from sglang.srt.disaggregation.decode_schedule_batch_mixin import (\n     ScheduleBatchDisaggregationDecodeMixin,\n )\n-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode\n+from sglang.srt.disaggregation.utils import (\n+    FAKE_BOOTSTRAP_HOST,\n+    DisaggregationMode,\n+    KVSendOwner,\n+)\n from sglang.srt.dllm.mixin.req import ReqDllmMixin\n from sglang.srt.environ import envs\n from sglang.srt.managers.embed_types import PositionalEmbeds\n@@ -1387,6 +1391,7 @@ def __init__(\n         # This is because kv is not ready in `process_prefill_chunk`.\n         # We use `tmp_end_idx` to store the end index of the kv cache to send.\n         self.tmp_end_idx: int = -1\n+        self.kv_send_owner: KVSendOwner = KVSendOwner.NONE\n         # Decode-side cached-prefix length; base of the staging chunk grid\n         # (start_send_idx starts here but advances with every send).\n         self.disagg_decode_prefix_len: int = 0",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py",
+      "sha": "2513158ad68e644de50668612521855371c22d52",
+      "status": "modified"
+    },
+    {
+      "additions": 15,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py",
+      "changes": 24,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 9,
+      "filename": "python/sglang/srt/managers/scheduler.py",
+      "patch": "@@ -61,6 +61,8 @@\n if TYPE_CHECKING:\n     from torch.cuda import Stream as CudaStream\n \n+    from sglang.srt.disaggregation.prefill_early_send import EarlyKVChunkSender\n+\n try:\n     from sglang.kernels.ops.mamba.triton_ops import (\n         initialize_mamba_selective_state_update_backend,\n@@ -1588,6 +1590,8 @@ def init_disaggregation(self):\n             self.disagg_prefill_inflight_queue: List[Req] = []\n             # Requests with a sent chunk that are not yet on the inflight queue.\n             self.disagg_prefill_pending_chunk_rids: Set[str] = set()\n+            # Created by the overlap event loop when supported.\n+            self.early_kv_chunk_sender: Optional[EarlyKVChunkSender] = None\n \n             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()\n \n@@ -3666,15 +3670,17 @@ def process_pending_chunked_abort(self) -> None:\n         prepare_abort(req, \"Aborted\")\n         req.time_stats.trace_ctx.abort(abort_info={\"reason\": \"Aborted\"})\n         req.to_finish = None\n-        if self.disaggregation_mode == DisaggregationMode.PREFILL:\n-            self.clear_pending_chunk_send(req)\n-            req.disagg_kv_sender.abort()\n-            maybe_release_metadata_buffer(\n-                req, self.req_to_metadata_buffer_idx_allocator\n-            )\n-            req.pending_bootstrap = False\n-        self._release_aborted_request(req)\n-        release_kv_cache(req, self.tree_cache, checkpoint=False)\n+        # An early KV sender may be reading this request's KV indices.\n+        with self.early_kv_send_lock(req):\n+            if self.disaggregation_mode == DisaggregationMode.PREFILL:\n+                self.clear_pending_chunk_send(req)\n+                req.disagg_kv_sender.abort()\n+                maybe_release_metadata_buffer(\n+                    req, self.req_to_metadata_buffer_idx_allocator\n+                )\n+                req.pending_bootstrap = False\n+            self._release_aborted_request(req)\n+            release_kv_cache(req, self.tree_cache, checkpoint=False)\n \n         self.chunked_req = None\n         self._pending_chunked_abort_req = None",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py",
+      "sha": "f6ce09bdfd0c07993ab0ac4380ddd9e53536c4e9",
+      "status": "modified"
+    },
+    {
+      "additions": 99,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Fdisaggregation%2Ftest_disaggregation_early_send_kv.py",
+      "changes": 99,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fdisaggregation%2Ftest_disaggregation_early_send_kv.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "test/registered/disaggregation/test_disaggregation_early_send_kv.py",
+      "patch": "@@ -0,0 +1,99 @@\n+import re\n+import unittest\n+from concurrent.futures import ThreadPoolExecutor\n+from types import SimpleNamespace\n+\n+import requests\n+\n+from sglang.test.ci.ci_register import register_cuda_ci\n+from sglang.test.server_fixtures.disaggregation_fixture import (\n+    PDDisaggregationServerBase,\n+)\n+from sglang.test.sgl_eval_utils import run_sgl_eval\n+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST\n+\n+register_cuda_ci(est_time=400, stage=\"base-b\", runner_config=\"2-gpu-large\")\n+\n+\n+class TestDisaggregationEarlySendKV(PDDisaggregationServerBase):\n+    extra_prefill_env = {\"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV\": \"1\"}\n+    # Batch-invariant prefill so concurrent and sequential first tokens must match.\n+    extra_prefill_args = [\"--enable-deterministic-inference\"]\n+\n+    @classmethod\n+    def setUpClass(cls):\n+        super().setUpClass()\n+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST\n+        cls.launch_all()\n+\n+    def test_gsm8k(self):\n+        args = SimpleNamespace(\n+            base_url=f\"http://{self.base_host}:{self.lb_port}\",\n+            eval_name=\"gsm8k\",\n+            max_tokens=512,\n+            num_examples=200,\n+            num_threads=128,\n+        )\n+        metrics = run_sgl_eval(args)\n+        print(f\"Evaluation metrics: {metrics}\")\n+        self.assertGreater(metrics[\"score\"], 0.62)\n+\n+    def test_greedy_matches_sequential(self):\n+        \"\"\"Concurrent greedy outputs match the same prompts run one at a time.\"\"\"\n+        prompts = [\n+            f\"Shared instructions: answer briefly and precisely. Question {i}: \"\n+            f\"what is {i} times {i + 3}?\"\n+            for i in range(32)\n+        ]\n+\n+        def generate(prompt):\n+            res = requests.post(\n+                self.lb_url + \"/generate\",\n+                json={\n+                    \"text\": prompt,\n+                    \"sampling_params\": {\"temperature\": 0, \"max_new_tokens\": 1},\n+                },\n+            )\n+            res.raise_for_status()\n+            return res.json()[\"text\"]\n+\n+        sequential = [generate(p) for p in prompts]\n+        with ThreadPoolExecutor(16) as pool:\n+            concurrent = list(pool.map(generate, prompts))\n+        # A single output token is produced by prefill alone, so it does not\n+        # depend on decode batching; it checks the first token handed to decode.\n+        self.assertEqual(sequential, concurrent)\n+\n+    def test_fallback_requests_concurrent(self):\n+        \"\"\"Logprob and grammar requests take the scheduler path alongside plain ones.\"\"\"\n+        regex = r\"Answer: [0-9]{3}-[a-z]{4}\\.\"\n+\n+        def generate(i):\n+            body = {\n+                \"text\": f\"Request {i}: give a short reply.\",\n+                \"sampling_params\": {\"temperature\": 0, \"max_new_tokens\": 16},\n+            }\n+            if i % 3 == 1:\n+                body[\"return_logprob\"] = True\n+            elif i % 3 == 2:\n+                body[\"sampling_params\"][\"regex\"] = regex\n+            res = requests.post(self.lb_url + \"/generate\", json=body)\n+            res.raise_for_status()\n+            return i, res.json()\n+\n+        with ThreadPoolExecutor(24) as pool:\n+            results = list(pool.map(generate, range(48)))\n+\n+        for i, out in results:\n+            self.assertTrue(out[\"text\"], f\"empty output for request {i}\")\n+            meta = out[\"meta_info\"]\n+            if i % 3 == 1:\n+                self.assertEqual(\n+                    len(meta[\"output_token_logprobs\"]), meta[\"completion_tokens\"]\n+                )\n+            elif i % 3 == 2:\n+                self.assertIsNotNone(re.fullmatch(regex, out[\"text\"]), out[\"text\"])\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Fdisaggregation%2Ftest_disaggregation_early_send_kv.py",
+      "sha": "85f19d2acc2c2a8114c8ecfef0f8152e77c88cd4",
+      "status": "added"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Funit%2Fdisaggregation%2Ftest_prefill_abort_result_cleanup.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fdisaggregation%2Ftest_prefill_abort_result_cleanup.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "test/registered/unit/disaggregation/test_prefill_abort_result_cleanup.py",
+      "patch": "@@ -5,6 +5,7 @@\n import torch\n \n from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin\n+from sglang.srt.disaggregation.utils import KVSendOwner\n from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus\n from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo\n from sglang.srt.managers.scheduler_components.batch_result_processor import (\n@@ -43,6 +44,7 @@ def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):\n         self.output_ids = []\n         self.origin_input_ids = list(range(100))\n         self.extend_end = None\n+        self.kv_send_owner = KVSendOwner.NONE\n         self.time_stats = SimpleNamespace(\n             set_prefill_finished_time=Mock(),\n             set_last_chunked_prefill_finish_time=Mock(),",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Funit%2Fdisaggregation%2Ftest_prefill_abort_result_cleanup.py",
+      "sha": "b87a98d030fb97ebe6a3bce2b932d8d0d5617bb3",
+      "status": "modified"
+    },
+    {
+      "additions": 266,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Funit%2Fdisaggregation%2Ftest_prefill_early_send.py",
+      "changes": 266,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fdisaggregation%2Ftest_prefill_early_send.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "test/registered/unit/disaggregation/test_prefill_early_send.py",
+      "patch": "@@ -0,0 +1,266 @@\n+\"\"\"CPU coverage for EarlyKVChunkSender (SGLANG_DISAGG_PREFILL_EARLY_SEND_KV).\"\"\"\n+\n+import threading\n+import unittest\n+import weakref\n+from array import array\n+from types import SimpleNamespace\n+from unittest.mock import Mock, call, patch\n+\n+import torch\n+\n+from sglang.srt.disaggregation.prefill_early_send import (\n+    EarlyKVChunkSender,\n+    _BatchSend,\n+    _ChunkSend,\n+)\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend\n+from sglang.srt.environ import envs\n+from sglang.srt.managers.schedule_batch import FINISH_ABORT\n+from sglang.test.ci.ci_register import register_cpu_ci\n+from sglang.test.test_utils import CustomTestCase\n+\n+register_cpu_ci(est_time=5, suite=\"base-a-test-cpu\")\n+\n+INPUT_LEN = 100\n+\n+\n+class _Event:\n+    def __init__(self):\n+        self.synchronized = False\n+\n+    def synchronize(self):\n+        self.synchronized = True\n+\n+\n+class _Req(SimpleNamespace):\n+    # Hashable by identity, like Req, so it can sit in the failed WeakSet.\n+    __hash__ = object.__hash__\n+    __eq__ = object.__eq__\n+\n+\n+def _req(**overrides):\n+    req = _Req(\n+        rid=\"r\",\n+        bootstrap_room=1,\n+        kv_send_owner=KVSendOwner.NONE,\n+        origin_input_ids=list(range(INPUT_LEN)),\n+        extend_end=INPUT_LEN,\n+        output_ids=array(\"q\"),\n+        return_logprob=False,\n+        return_sampling_mask=False,\n+        grammar=None,\n+        pending_bootstrap=False,\n+        to_finish=None,\n+        finished_reason=None,\n+        kv=SimpleNamespace(holds_kv=True),\n+        disagg_kv_sender=Mock(),\n+        time_stats=Mock(),\n+    )\n+    for k, v in overrides.items():\n+        setattr(req, k, v)\n+    return req\n+\n+\n+def _sender(send_kv_chunk=None):\n+    \"\"\"Build a sender without its CUDA worker thread.\"\"\"\n+    sender = EarlyKVChunkSender.__new__(EarlyKVChunkSender)\n+    sender._scheduler = SimpleNamespace(send_kv_chunk=send_kv_chunk or Mock())\n+    sender.lock = threading.Lock()\n+    sender._queue = Mock()\n+    sender._failed_reqs = weakref.WeakSet()\n+    return sender\n+\n+\n+def _scheduler(**overrides):\n+    scheduler = SimpleNamespace(\n+        enable_overlap=True,\n+        enable_staging=False,\n+        kv_checksum_computer=None,\n+        spec_algorithm=SimpleNamespace(is_none=lambda: True),\n+        transfer_backend=TransferBackend.MOONCAKE,\n+        enable_unified_memory=False,\n+        disagg_prefill_bootstrap_queue=SimpleNamespace(\n+            kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))\n+        ),\n+    )\n+    for k, v in overrides.items():\n+        setattr(scheduler, k, v)\n+    return scheduler\n+\n+\n+def _result(token_ids, copy_done=True):\n+    return SimpleNamespace(\n+        copy_done=_Event() if copy_done else None,\n+        next_token_ids=torch.tensor(token_ids),\n+    )\n+\n+\n+def _batch_send(token_ids, *chunks):\n+    return _BatchSend(_Event(), torch.tensor(token_ids), list(chunks))\n+\n+\n+def _patch_disagg(policy=\"default\"):\n+    return patch(\n+        \"sglang.srt.disaggregation.prefill_early_send.get_disagg\",\n+        return_value=SimpleNamespace(disaggregation_decode_allocation_policy=policy),\n+    )\n+\n+\n+class TestIsSupported(CustomTestCase):\n+    def _supported(self, policy=\"default\", **overrides):\n+        with _patch_disagg(policy), patch(\"torch.cuda.is_available\", return_value=True):\n+            return EarlyKVChunkSender.is_supported(_scheduler(**overrides))\n+\n+    def test_supported(self):\n+        self.assertTrue(self._supported())\n+\n+    def test_unsupported_configs(self):\n+        self.assertFalse(self._supported(enable_overlap=False))\n+        self.assertFalse(self._supported(enable_staging=True))\n+        self.assertFalse(self._supported(kv_checksum_computer=object()))\n+        self.assertFalse(\n+            self._supported(spec_algorithm=SimpleNamespace(is_none=lambda: False))\n+        )\n+        self.assertFalse(self._supported(policy=\"prefill_complete\"))\n+        self.assertFalse(self._supported(transfer_backend=TransferBackend.NIXL))\n+        self.assertFalse(self._supported(enable_unified_memory=True))\n+        self.assertFalse(\n+            self._supported(\n+                disagg_prefill_bootstrap_queue=SimpleNamespace(\n+                    kv_manager=SimpleNamespace(\n+                        kv_args=SimpleNamespace(state_types=[\"mamba\"])\n+                    )\n+                )\n+            )\n+        )\n+\n+\n+class TestMaybeCreate(CustomTestCase):\n+    def test_disabled_by_default(self):\n+        with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.override(False):\n+            self.assertIsNone(EarlyKVChunkSender.maybe_create(_scheduler()))\n+\n+    def test_unsupported_config_warns(self):\n+        with (\n+            envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.override(True),\n+            _patch_disagg(),\n+            patch(\"torch.cuda.is_available\", return_value=True),\n+            self.assertLogs(\n+                \"sglang.srt.disaggregation.prefill_early_send\", level=\"WARNING\"\n+            ),\n+        ):\n+            self.assertIsNone(\n+                EarlyKVChunkSender.maybe_create(_scheduler(enable_overlap=False))\n+            )\n+\n+\n+class TestOwnership(CustomTestCase):\n+    def test_owner_fixed_at_first_submit(self):\n+        sender = _sender()\n+        plain, logprob = _req(), _req(return_logprob=True)\n+        pending = _req(pending_bootstrap=True)\n+        sender.submit(\n+            SimpleNamespace(reqs=[plain, logprob, pending]), _result([1, 2, 3])\n+        )\n+        self.assertEqual(plain.kv_send_owner, KVSendOwner.EARLY)\n+        self.assertEqual(logprob.kv_send_owner, KVSendOwner.SCHEDULER)\n+        self.assertEqual(pending.kv_send_owner, KVSendOwner.SCHEDULER)\n+\n+        # Later eligibility changes do not move the owner.\n+        pending.pending_bootstrap = False\n+        sender.submit(SimpleNamespace(reqs=[pending]), _result([4]))\n+        self.assertEqual(pending.kv_send_owner, KVSendOwner.SCHEDULER)\n+\n+    def test_no_result_copy_means_scheduler(self):\n+        sender = _sender()\n+        req = _req()\n+        sender.submit(SimpleNamespace(reqs=[req]), _result([1], copy_done=False))\n+        self.assertEqual(req.kv_send_owner, KVSendOwner.SCHEDULER)\n+        sender._queue.put.assert_not_called()\n+\n+\n+class TestSubmit(CustomTestCase):\n+    def test_queues_middle_and_last_chunks(self):\n+        sender = _sender()\n+        middle, last, logprob = _req(extend_end=64), _req(), _req(return_logprob=True)\n+        result = _result([3, 4, 5])\n+        sender.submit(SimpleNamespace(reqs=[logprob, middle, last]), result)\n+        (item,), _ = sender._queue.put.call_args\n+        self.assertIs(item.copy_done, result.copy_done)\n+        self.assertEqual(\n+            item.chunks,\n+            [\n+                _ChunkSend(batch_index=1, req=middle, end_idx=64, is_last=False),\n+                _ChunkSend(batch_index=2, req=last, end_idx=INPUT_LEN, is_last=True),\n+            ],\n+        )\n+\n+    def test_snapshots_end_idx(self):\n+        sender = _sender()\n+        req = _req(extend_end=64)\n+        sender.submit(SimpleNamespace(reqs=[req]), _result([3]))\n+        req.extend_end = INPUT_LEN  # next chunk scheduled\n+        (item,), _ = sender._queue.put.call_args\n+        self.assertEqual(item.chunks[0].end_idx, 64)\n+        self.assertFalse(item.chunks[0].is_last)\n+\n+\n+class TestSend(CustomTestCase):\n+    def test_chunks_sent_in_order(self):\n+        sender = _sender()\n+        req = _req(kv_send_owner=KVSendOwner.EARLY)\n+        first = _batch_send([0], _ChunkSend(0, req, 48, is_last=False))\n+        second = _batch_send([42], _ChunkSend(0, req, INPUT_LEN, is_last=True))\n+        sender._send_batch(first)\n+        sender._send_batch(second)\n+\n+        self.assertTrue(first.copy_done.synchronized)\n+        self.assertEqual(\n+            sender._scheduler.send_kv_chunk.call_args_list,\n+            [call(req, last_chunk=False, end_idx=48), call(req, last_chunk=True)],\n+        )\n+        self.assertEqual(list(req.output_ids), [42])\n+        req.time_stats.set_prefill_transfer_queue_entry_time.assert_called_once()\n+\n+    def test_skips_aborted_and_released(self):\n+        for req in (\n+            _req(to_finish=FINISH_ABORT(\"aborted\")),\n+            _req(kv=SimpleNamespace(holds_kv=False)),\n+        ):\n+            sender = _sender()\n+            sender._send_batch(\n+                _batch_send([42], _ChunkSend(0, req, INPUT_LEN, is_last=True))\n+            )\n+            sender._scheduler.send_kv_chunk.assert_not_called()\n+            self.assertEqual(len(req.output_ids), 0)\n+\n+    def test_failed_middle_aborts_and_skips_rest(self):\n+        sender = _sender(send_kv_chunk=Mock(side_effect=RuntimeError(\"boom\")))\n+        req = _req()\n+        with self.assertLogs(\n+            \"sglang.srt.disaggregation.prefill_early_send\", level=\"ERROR\"\n+        ):\n+            sender._send_batch(_batch_send([0], _ChunkSend(0, req, 48, is_last=False)))\n+        req.disagg_kv_sender.abort.assert_called_once()\n+\n+        sender._scheduler.send_kv_chunk.reset_mock()\n+        sender._send_batch(\n+            _batch_send([42], _ChunkSend(0, req, INPUT_LEN, is_last=True))\n+        )\n+        sender._scheduler.send_kv_chunk.assert_not_called()\n+\n+    def test_failed_last_aborts_transfer(self):\n+        sender = _sender(send_kv_chunk=Mock(side_effect=RuntimeError(\"boom\")))\n+        req = _req()\n+        with self.assertLogs(\n+            \"sglang.srt.disaggregation.prefill_early_send\", level=\"ERROR\"\n+        ):\n+            sender._send_batch(\n+                _batch_send([42], _ChunkSend(0, req, INPUT_LEN, is_last=True))\n+            )\n+        req.disagg_kv_sender.abort.assert_called_once()\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Funit%2Fdisaggregation%2Ftest_prefill_early_send.py",
+      "sha": "b3713b0960e96ea663fa2ad5399ef78eff800e1f",
+      "status": "added"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Funit%2Fmanagers%2Ftest_auxiliary_output.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmanagers%2Ftest_auxiliary_output.py?ref=c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "deletions": 0,
+      "filename": "test/registered/unit/managers/test_auxiliary_output.py",
+      "patch": "@@ -6,6 +6,7 @@\n import torch\n \n from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin\n+from sglang.srt.disaggregation.utils import KVSendOwner\n from sglang.srt.layers.logits_processor import (\n     LogitsProcessorOutput,\n     SamplingMaskOutput,\n@@ -578,6 +579,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():\n         finished_reason=None,\n         inflight_middle_chunks=0,\n         pending_bootstrap=False,\n+        kv_send_owner=KVSendOwner.NONE,\n         return_logprob=False,\n         return_sampling_mask=False,\n         grammar=None,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/c96b1095555caa61a3c74ae7f2135f0ff472fd74/test%2Fregistered%2Funit%2Fmanagers%2Ftest_auxiliary_output.py",
+      "sha": "1cb4b268780813623e681bb226a24bee01f3e336",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "This can race with the radix dedup. After the worker sends, the scheduler still runs `checkpoint_disagg_prefill(req)` in `process_batch_result_disagg_prefill`. If another req already inserted the same prefix, `_insert_cache` frees this req's duplicate pages and rewrites its `req_to_token` row. That path doesn't hold `self.lock`, and the row write is on `schedule_stream` behind the WAR barrier anyway, so the worker sends the old dup pages here. They get freed and can be allocated to the next batch while Mooncake is still reading them, so decode gets corrupted KV silently.\n\nThis is easy to hit with shared-prefix traffic (two reqs with the same uncached prefix in the same or adjacent batch), which is basically the benchmark setup. I reproduced it on CPU with the real `_send_chunk` + `RadixCache.checkpoint`: the worker sends pages [7..12] and the next alloc returns exactly [7..12]. The scheduler path is safe because it sends after checkpoint on the same stream.\n\nMiddle chunks have the same issue vs the checkpoint in `process_prefill_chunk`. I think we need to keep the sent pages alive (e.g. defer freeing the dup pages for EARLY reqs) until the transfer concludes.",
+      "created_at": "2026-10-14T03:42:44Z",
+      "diff_hunk": "@@ -0,0 +1,204 @@\n+\"\"\"Early send of prefill KV chunks.\n+\n+Enabled by ``SGLANG_DISAGG_PREFILL_EARLY_SEND_KV``.\n+\n+Under overlap scheduling the result of prefill batch N is processed only after\n+batch N+1 has been launched, and the page-index reads in ``send_kv_chunk`` run\n+on the schedule stream, which the WAR barrier fences behind N+1's forward. Every\n+KV chunk computed by N, including the last one that decode waits on, is\n+therefore handed to the transfer engine roughly one forward late.\n+\n+``EarlyKVChunkSender`` sends the chunks of N from a worker thread as soon as N's\n+result copy (``copy_done``) completes, reading page indices on its own stream.\n+\n+Each request's KV is sent by exactly one side, fixed at its first launched\n+batch (``Req.kv_send_owner``):\n+\n+- ``EARLY``: the worker sends every chunk, in launch order, and appends the\n+  first output token with the last one. The scheduler sends nothing for it.\n+- ``SCHEDULER``: requests whose last chunk depends on the processed result\n+  (logprobs, grammar, sampling mask) or on a pending bootstrap keep the\n+  original path.\n+\n+Paths that release an ``EARLY`` request's KV before its transfer concludes\n+hold ``lock`` so no worker send is reading it; the worker skips requests that\n+are aborted or no longer hold KV.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import logging\n+import queue\n+import threading\n+import weakref\n+from dataclasses import dataclass\n+from typing import TYPE_CHECKING, List, Optional\n+\n+import torch\n+\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend, is_aborted\n+from sglang.srt.environ import envs\n+from sglang.srt.runtime_context import get_disagg\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch\n+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+@dataclass\n+class _ChunkSend:\n+    batch_index: int\n+    req: Req\n+    # KV computed through this batch; snapshotted at launch since the next\n+    # chunk's scheduling moves req.extend_end.\n+    end_idx: int\n+    is_last: bool\n+\n+\n+@dataclass\n+class _BatchSend:\n+    copy_done: torch.cuda.Event\n+    next_token_ids: torch.Tensor\n+    chunks: List[_ChunkSend]\n+\n+\n+class EarlyKVChunkSender:\n+    def __init__(self, scheduler: Scheduler):\n+        self._scheduler = scheduler\n+        self.lock = threading.Lock()\n+        # None stops the worker.\n+        self._queue: queue.SimpleQueue[Optional[_BatchSend]] = queue.SimpleQueue()\n+        # Worker-thread only: requests whose earlier chunk failed to send.\n+        self._failed_reqs: weakref.WeakSet[Req] = weakref.WeakSet()\n+        self._device = torch.cuda.current_device()\n+        # Must not be the schedule stream: the WAR barrier makes it wait for the\n+        # next batch's forward, which is the delay this class removes.\n+        self._stream = torch.cuda.Stream(device=self._device)\n+        threading.Thread(\n+            target=self._worker,\n+            name=\"prefill-early-kv-chunk-send\",\n+            daemon=True,\n+        ).start()\n+        logger.info(\"Prefill early KV chunk send enabled\")\n+\n+    @classmethod\n+    def maybe_create(cls, scheduler: Scheduler) -> Optional[EarlyKVChunkSender]:\n+        if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.get():\n+            return None\n+        if not cls.is_supported(scheduler):\n+            logger.warning(\n+                \"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV is not supported with this \"\n+                \"configuration; KV chunks are sent by the scheduler\"\n+            )\n+            return None\n+        return cls(scheduler)\n+\n+    @staticmethod\n+    def is_supported(scheduler: Scheduler) -> bool:\n+        return (\n+            torch.cuda.is_available()\n+            and scheduler.enable_overlap\n+            and not scheduler.enable_staging\n+            and scheduler.kv_checksum_computer is None\n+            and scheduler.spec_algorithm.is_none()\n+            and get_disagg().disaggregation_decode_allocation_policy\n+            != \"prefill_complete\"\n+            # Sends run off the scheduler thread; only Mooncake is verified.\n+            and scheduler.transfer_backend == TransferBackend.MOONCAKE\n+            # Compaction may move pages while the worker reads their ids.\n+            and not scheduler.enable_unified_memory\n+            # Extra state payloads (mamba, SWA, DSA, ...) are unverified.\n+            and not scheduler.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types\n+        )\n+\n+    def stop(self) -> None:\n+        self._queue.put(None)\n+\n+    @staticmethod\n+    def is_eligible(req: Req) -> bool:\n+        return (\n+            req.bootstrap_room is not None\n+            and not req.pending_bootstrap\n+            and len(req.output_ids) == 0\n+            and not req.return_logprob\n+            and not req.return_sampling_mask\n+            and req.grammar is None\n+        )\n+\n+    def submit(self, batch: ScheduleBatch, result: GenerationBatchResult) -> None:\n+        \"\"\"Queue a launched batch; call once its result copy has been recorded.\n+\n+        Fixes the KV send owner of requests seen for the first time.\n+        \"\"\"\n+        can_send = result.copy_done is not None and isinstance(\n+            result.next_token_ids, torch.Tensor\n+        )\n+        chunks = []\n+        for i, req in enumerate(batch.reqs):\n+            if req.kv_send_owner == KVSendOwner.NONE:\n+                req.kv_send_owner = (\n+                    KVSendOwner.EARLY\n+                    if can_send and self.is_eligible(req)\n+                    else KVSendOwner.SCHEDULER\n+                )\n+            if req.kv_send_owner != KVSendOwner.EARLY:\n+                continue\n+            input_len = len(req.origin_input_ids)\n+            chunks.append(\n+                _ChunkSend(\n+                    batch_index=i,\n+                    req=req,\n+                    end_idx=min(req.extend_end, input_len),\n+                    is_last=req.extend_end >= input_len,\n+                )\n+            )\n+        if chunks:\n+            assert can_send, \"EARLY-owned request in a batch without a result copy\"\n+            self._queue.put(_BatchSend(result.copy_done, result.next_token_ids, chunks))\n+\n+    def _worker(self) -> None:\n+        torch.cuda.set_device(self._device)\n+        while True:\n+            batch_send = self._queue.get()\n+            if batch_send is None:\n+                return\n+            try:\n+                with torch.cuda.stream(self._stream):\n+                    self._send_batch(batch_send)\n+            except Exception:\n+                logger.exception(\"Early KV chunk send failed\")\n+\n+    def _send_batch(self, batch_send: _BatchSend) -> None:\n+        batch_send.copy_done.synchronize()\n+        token_ids = None\n+        for chunk in batch_send.chunks:\n+            if chunk.is_last and token_ids is None:\n+                token_ids = batch_send.next_token_ids.tolist()\n+            with self.lock:\n+                self._send_chunk(\n+                    chunk, token_ids[chunk.batch_index] if chunk.is_last else None\n+                )\n+\n+    def _send_chunk(self, chunk: _ChunkSend, token_id: int | None) -> None:\n+        req = chunk.req\n+        if req in self._failed_reqs or is_aborted(req) or not req.kv.holds_kv:\n+            # The scheduler concludes it through the inflight queue or abort.\n+            return\n+        try:\n+            if chunk.is_last:\n+                req.output_ids.append(token_id)\n+                self._scheduler.send_kv_chunk(req, last_chunk=True)",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43811#discussion_r4266535868",
+      "id": 4266535868,
+      "line": 192,
+      "original_line": 192,
+      "path": "python/sglang/srt/disaggregation/prefill_early_send.py",
+      "updated_at": "2026-10-14T06:07:03Z",
+      "user": {
+        "login": "ShangmingCai"
+      }
+    },
+    {
+      "body": "After rebasing, this also needs to check `req.discard_output_reason` from #40896. It's set at the end of `run_batch` when the external linker load fails, before `submit()`, but only turns into `to_finish` in result processing. So with the linker on, the worker will send KV that never landed plus a first token computed from it, and decode may already get Success before we abort the sender. Please check it in both `is_eligible` and here, or just mark the linker as unsupported.",
+      "created_at": "2026-10-14T03:42:44Z",
+      "diff_hunk": "@@ -0,0 +1,204 @@\n+\"\"\"Early send of prefill KV chunks.\n+\n+Enabled by ``SGLANG_DISAGG_PREFILL_EARLY_SEND_KV``.\n+\n+Under overlap scheduling the result of prefill batch N is processed only after\n+batch N+1 has been launched, and the page-index reads in ``send_kv_chunk`` run\n+on the schedule stream, which the WAR barrier fences behind N+1's forward. Every\n+KV chunk computed by N, including the last one that decode waits on, is\n+therefore handed to the transfer engine roughly one forward late.\n+\n+``EarlyKVChunkSender`` sends the chunks of N from a worker thread as soon as N's\n+result copy (``copy_done``) completes, reading page indices on its own stream.\n+\n+Each request's KV is sent by exactly one side, fixed at its first launched\n+batch (``Req.kv_send_owner``):\n+\n+- ``EARLY``: the worker sends every chunk, in launch order, and appends the\n+  first output token with the last one. The scheduler sends nothing for it.\n+- ``SCHEDULER``: requests whose last chunk depends on the processed result\n+  (logprobs, grammar, sampling mask) or on a pending bootstrap keep the\n+  original path.\n+\n+Paths that release an ``EARLY`` request's KV before its transfer concludes\n+hold ``lock`` so no worker send is reading it; the worker skips requests that\n+are aborted or no longer hold KV.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import logging\n+import queue\n+import threading\n+import weakref\n+from dataclasses import dataclass\n+from typing import TYPE_CHECKING, List, Optional\n+\n+import torch\n+\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend, is_aborted\n+from sglang.srt.environ import envs\n+from sglang.srt.runtime_context import get_disagg\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch\n+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+@dataclass\n+class _ChunkSend:\n+    batch_index: int\n+    req: Req\n+    # KV computed through this batch; snapshotted at launch since the next\n+    # chunk's scheduling moves req.extend_end.\n+    end_idx: int\n+    is_last: bool\n+\n+\n+@dataclass\n+class _BatchSend:\n+    copy_done: torch.cuda.Event\n+    next_token_ids: torch.Tensor\n+    chunks: List[_ChunkSend]\n+\n+\n+class EarlyKVChunkSender:\n+    def __init__(self, scheduler: Scheduler):\n+        self._scheduler = scheduler\n+        self.lock = threading.Lock()\n+        # None stops the worker.\n+        self._queue: queue.SimpleQueue[Optional[_BatchSend]] = queue.SimpleQueue()\n+        # Worker-thread only: requests whose earlier chunk failed to send.\n+        self._failed_reqs: weakref.WeakSet[Req] = weakref.WeakSet()\n+        self._device = torch.cuda.current_device()\n+        # Must not be the schedule stream: the WAR barrier makes it wait for the\n+        # next batch's forward, which is the delay this class removes.\n+        self._stream = torch.cuda.Stream(device=self._device)\n+        threading.Thread(\n+            target=self._worker,\n+            name=\"prefill-early-kv-chunk-send\",\n+            daemon=True,\n+        ).start()\n+        logger.info(\"Prefill early KV chunk send enabled\")\n+\n+    @classmethod\n+    def maybe_create(cls, scheduler: Scheduler) -> Optional[EarlyKVChunkSender]:\n+        if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.get():\n+            return None\n+        if not cls.is_supported(scheduler):\n+            logger.warning(\n+                \"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV is not supported with this \"\n+                \"configuration; KV chunks are sent by the scheduler\"\n+            )\n+            return None\n+        return cls(scheduler)\n+\n+    @staticmethod\n+    def is_supported(scheduler: Scheduler) -> bool:\n+        return (\n+            torch.cuda.is_available()\n+            and scheduler.enable_overlap\n+            and not scheduler.enable_staging\n+            and scheduler.kv_checksum_computer is None\n+            and scheduler.spec_algorithm.is_none()\n+            and get_disagg().disaggregation_decode_allocation_policy\n+            != \"prefill_complete\"\n+            # Sends run off the scheduler thread; only Mooncake is verified.\n+            and scheduler.transfer_backend == TransferBackend.MOONCAKE\n+            # Compaction may move pages while the worker reads their ids.\n+            and not scheduler.enable_unified_memory\n+            # Extra state payloads (mamba, SWA, DSA, ...) are unverified.\n+            and not scheduler.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types\n+        )\n+\n+    def stop(self) -> None:\n+        self._queue.put(None)\n+\n+    @staticmethod\n+    def is_eligible(req: Req) -> bool:\n+        return (\n+            req.bootstrap_room is not None\n+            and not req.pending_bootstrap\n+            and len(req.output_ids) == 0\n+            and not req.return_logprob\n+            and not req.return_sampling_mask\n+            and req.grammar is None\n+        )\n+\n+    def submit(self, batch: ScheduleBatch, result: GenerationBatchResult) -> None:\n+        \"\"\"Queue a launched batch; call once its result copy has been recorded.\n+\n+        Fixes the KV send owner of requests seen for the first time.\n+        \"\"\"\n+        can_send = result.copy_done is not None and isinstance(\n+            result.next_token_ids, torch.Tensor\n+        )\n+        chunks = []\n+        for i, req in enumerate(batch.reqs):\n+            if req.kv_send_owner == KVSendOwner.NONE:\n+                req.kv_send_owner = (\n+                    KVSendOwner.EARLY\n+                    if can_send and self.is_eligible(req)\n+                    else KVSendOwner.SCHEDULER\n+                )\n+            if req.kv_send_owner != KVSendOwner.EARLY:\n+                continue\n+            input_len = len(req.origin_input_ids)\n+            chunks.append(\n+                _ChunkSend(\n+                    batch_index=i,\n+                    req=req,\n+                    end_idx=min(req.extend_end, input_len),\n+                    is_last=req.extend_end >= input_len,\n+                )\n+            )\n+        if chunks:\n+            assert can_send, \"EARLY-owned request in a batch without a result copy\"\n+            self._queue.put(_BatchSend(result.copy_done, result.next_token_ids, chunks))\n+\n+    def _worker(self) -> None:\n+        torch.cuda.set_device(self._device)\n+        while True:\n+            batch_send = self._queue.get()\n+            if batch_send is None:\n+                return\n+            try:\n+                with torch.cuda.stream(self._stream):\n+                    self._send_batch(batch_send)\n+            except Exception:\n+                logger.exception(\"Early KV chunk send failed\")\n+\n+    def _send_batch(self, batch_send: _BatchSend) -> None:\n+        batch_send.copy_done.synchronize()\n+        token_ids = None\n+        for chunk in batch_send.chunks:\n+            if chunk.is_last and token_ids is None:\n+                token_ids = batch_send.next_token_ids.tolist()\n+            with self.lock:\n+                self._send_chunk(\n+                    chunk, token_ids[chunk.batch_index] if chunk.is_last else None\n+                )\n+\n+    def _send_chunk(self, chunk: _ChunkSend, token_id: int | None) -> None:\n+        req = chunk.req\n+        if req in self._failed_reqs or is_aborted(req) or not req.kv.holds_kv:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43811#discussion_r4266535872",
+      "id": 4266535872,
+      "line": 186,
+      "original_line": 186,
+      "path": "python/sglang/srt/disaggregation/prefill_early_send.py",
+      "updated_at": "2026-10-14T06:07:03Z",
+      "user": {
+        "login": "ShangmingCai"
+      }
+    },
+    {
+      "body": "Thanks for the detailed analysis and reproduction! I’ll take a closer look at this race condition and work on a proper fix.",
+      "created_at": "2026-10-16T10:35:51Z",
+      "diff_hunk": "@@ -0,0 +1,204 @@\n+\"\"\"Early send of prefill KV chunks.\n+\n+Enabled by ``SGLANG_DISAGG_PREFILL_EARLY_SEND_KV``.\n+\n+Under overlap scheduling the result of prefill batch N is processed only after\n+batch N+1 has been launched, and the page-index reads in ``send_kv_chunk`` run\n+on the schedule stream, which the WAR barrier fences behind N+1's forward. Every\n+KV chunk computed by N, including the last one that decode waits on, is\n+therefore handed to the transfer engine roughly one forward late.\n+\n+``EarlyKVChunkSender`` sends the chunks of N from a worker thread as soon as N's\n+result copy (``copy_done``) completes, reading page indices on its own stream.\n+\n+Each request's KV is sent by exactly one side, fixed at its first launched\n+batch (``Req.kv_send_owner``):\n+\n+- ``EARLY``: the worker sends every chunk, in launch order, and appends the\n+  first output token with the last one. The scheduler sends nothing for it.\n+- ``SCHEDULER``: requests whose last chunk depends on the processed result\n+  (logprobs, grammar, sampling mask) or on a pending bootstrap keep the\n+  original path.\n+\n+Paths that release an ``EARLY`` request's KV before its transfer concludes\n+hold ``lock`` so no worker send is reading it; the worker skips requests that\n+are aborted or no longer hold KV.\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import logging\n+import queue\n+import threading\n+import weakref\n+from dataclasses import dataclass\n+from typing import TYPE_CHECKING, List, Optional\n+\n+import torch\n+\n+from sglang.srt.disaggregation.utils import KVSendOwner, TransferBackend, is_aborted\n+from sglang.srt.environ import envs\n+from sglang.srt.runtime_context import get_disagg\n+\n+if TYPE_CHECKING:\n+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch\n+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+@dataclass\n+class _ChunkSend:\n+    batch_index: int\n+    req: Req\n+    # KV computed through this batch; snapshotted at launch since the next\n+    # chunk's scheduling moves req.extend_end.\n+    end_idx: int\n+    is_last: bool\n+\n+\n+@dataclass\n+class _BatchSend:\n+    copy_done: torch.cuda.Event\n+    next_token_ids: torch.Tensor\n+    chunks: List[_ChunkSend]\n+\n+\n+class EarlyKVChunkSender:\n+    def __init__(self, scheduler: Scheduler):\n+        self._scheduler = scheduler\n+        self.lock = threading.Lock()\n+        # None stops the worker.\n+        self._queue: queue.SimpleQueue[Optional[_BatchSend]] = queue.SimpleQueue()\n+        # Worker-thread only: requests whose earlier chunk failed to send.\n+        self._failed_reqs: weakref.WeakSet[Req] = weakref.WeakSet()\n+        self._device = torch.cuda.current_device()\n+        # Must not be the schedule stream: the WAR barrier makes it wait for the\n+        # next batch's forward, which is the delay this class removes.\n+        self._stream = torch.cuda.Stream(device=self._device)\n+        threading.Thread(\n+            target=self._worker,\n+            name=\"prefill-early-kv-chunk-send\",\n+            daemon=True,\n+        ).start()\n+        logger.info(\"Prefill early KV chunk send enabled\")\n+\n+    @classmethod\n+    def maybe_create(cls, scheduler: Scheduler) -> Optional[EarlyKVChunkSender]:\n+        if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_KV.get():\n+            return None\n+        if not cls.is_supported(scheduler):\n+            logger.warning(\n+                \"SGLANG_DISAGG_PREFILL_EARLY_SEND_KV is not supported with this \"\n+                \"configuration; KV chunks are sent by the scheduler\"\n+            )\n+            return None\n+        return cls(scheduler)\n+\n+    @staticmethod\n+    def is_supported(scheduler: Scheduler) -> bool:\n+        return (\n+            torch.cuda.is_available()\n+            and scheduler.enable_overlap\n+            and not scheduler.enable_staging\n+            and scheduler.kv_checksum_computer is None\n+            and scheduler.spec_algorithm.is_none()\n+            and get_disagg().disaggregation_decode_allocation_policy\n+            != \"prefill_complete\"\n+            # Sends run off the scheduler thread; only Mooncake is verified.\n+            and scheduler.transfer_backend == TransferBackend.MOONCAKE\n+            # Compaction may move pages while the worker reads their ids.\n+            and not scheduler.enable_unified_memory\n+            # Extra state payloads (mamba, SWA, DSA, ...) are unverified.\n+            and not scheduler.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types\n+        )\n+\n+    def stop(self) -> None:\n+        self._queue.put(None)\n+\n+    @staticmethod\n+    def is_eligible(req: Req) -> bool:\n+        return (\n+            req.bootstrap_room is not None\n+            and not req.pending_bootstrap\n+            and len(req.output_ids) == 0\n+            and not req.return_logprob\n+            and not req.return_sampling_mask\n+            and req.grammar is None\n+        )\n+\n+    def submit(self, batch: ScheduleBatch, result: GenerationBatchResult) -> None:\n+        \"\"\"Queue a launched batch; call once its result copy has been recorded.\n+\n+        Fixes the KV send owner of requests seen for the first time.\n+        \"\"\"\n+        can_send = result.copy_done is not None and isinstance(\n+            result.next_token_ids, torch.Tensor\n+        )\n+        chunks = []\n+        for i, req in enumerate(batch.reqs):\n+            if req.kv_send_owner == KVSendOwner.NONE:\n+                req.kv_send_owner = (\n+                    KVSendOwner.EARLY\n+                    if can_send and self.is_eligible(req)\n+                    else KVSendOwner.SCHEDULER\n+                )\n+            if req.kv_send_owner != KVSendOwner.EARLY:\n+                continue\n+            input_len = len(req.origin_input_ids)\n+            chunks.append(\n+                _ChunkSend(\n+                    batch_index=i,\n+                    req=req,\n+                    end_idx=min(req.extend_end, input_len),\n+                    is_last=req.extend_end >= input_len,\n+                )\n+            )\n+        if chunks:\n+            assert can_send, \"EARLY-owned request in a batch without a result copy\"\n+            self._queue.put(_BatchSend(result.copy_done, result.next_token_ids, chunks))\n+\n+    def _worker(self) -> None:\n+        torch.cuda.set_device(self._device)\n+        while True:\n+            batch_send = self._queue.get()\n+            if batch_send is None:\n+                return\n+            try:\n+                with torch.cuda.stream(self._stream):\n+                    self._send_batch(batch_send)\n+            except Exception:\n+                logger.exception(\"Early KV chunk send failed\")\n+\n+    def _send_batch(self, batch_send: _BatchSend) -> None:\n+        batch_send.copy_done.synchronize()\n+        token_ids = None\n+        for chunk in batch_send.chunks:\n+            if chunk.is_last and token_ids is None:\n+                token_ids = batch_send.next_token_ids.tolist()\n+            with self.lock:\n+                self._send_chunk(\n+                    chunk, token_ids[chunk.batch_index] if chunk.is_last else None\n+                )\n+\n+    def _send_chunk(self, chunk: _ChunkSend, token_id: int | None) -> None:\n+        req = chunk.req\n+        if req in self._failed_reqs or is_aborted(req) or not req.kv.holds_kv:\n+            # The scheduler concludes it through the inflight queue or abort.\n+            return\n+        try:\n+            if chunk.is_last:\n+                req.output_ids.append(token_id)\n+                self._scheduler.send_kv_chunk(req, last_chunk=True)",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43811#discussion_r4293677446",
+      "id": 4293677446,
+      "line": 192,
+      "original_line": 192,
+      "path": "python/sglang/srt/disaggregation/prefill_early_send.py",
+      "updated_at": "2026-10-16T10:35:51Z",
+      "user": {
+        "login": "wcwuwc"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "@ShangmingCai @hnyls2002 Could you take a look when you have time? This touches the prefill result path / KV send ownership and the Mooncake send timing. Thanks!",
+      "created_at": "2026-10-13T03:25:28Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43811#issuecomment-6137509458",
+      "id": 6137509458,
+      "updated_at": "2026-10-13T03:25:28Z",
+      "user": {
+        "login": "wcwuwc"
+      }
+    }
+  ],
+  "number": 43811,
+  "refs": {
+    "base": {
+      "commit": "f006fb49ecd93322802ddebff80821f8e6296893",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "c96b1095555caa61a3c74ae7f2135f0ff472fd74",
+      "repository": "wcwuwc/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "What about SGLANG_ENABLE_PREFILL_WAR_READ_DONE? Does this PR work with speculative decoding or extra-state models (DSV4, Mamba, SWA, DSA)?\n\nAlso, the results are good, but the test set seems to test an unusual case. And the accuracy test needs to include GPQA, MMLU, or AIME. GSM8K is too simple and won't reveal the potential risk of an accuracy drop caused by KVCache corruption due to early sending.  \n",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43811#pullrequestreview-5512797464",
+      "id": 5512797464,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-14T06:07:03Z",
+      "user": {
+        "login": "ShangmingCai"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43811#pullrequestreview-5546547362",
+      "id": 5546547362,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-16T10:35:51Z",
+      "user": {
+        "login": "wcwuwc"
+      }
+    }
+  ]
+}

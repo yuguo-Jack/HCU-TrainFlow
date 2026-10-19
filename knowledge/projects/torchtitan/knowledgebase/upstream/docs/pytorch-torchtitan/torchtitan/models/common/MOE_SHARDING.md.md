@@ -15,7 +15,7 @@ path: torchtitan/models/common/MOE_SHARDING.md
 raw_sha256: 6b7bdb31f102c463d674132b497cc60390b17545d45b26438897f7b703ca92e8
 sources: []
 generated_body_sha256: 002717f3bce9c9a70f9dbef2a10183747cd5322cba753cba65e3bdd5997bdf5f
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # pytorch/torchtitan / torchtitan/models/common/MOE_SHARDING.md

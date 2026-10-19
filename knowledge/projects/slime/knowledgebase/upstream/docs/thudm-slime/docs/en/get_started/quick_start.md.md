@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/get_started/quick_start.md
-raw_sha256: ef7d054608be36ced9033189a1d9dc90cfa50475ef40b2599d07135157468497
+raw_sha256: 63be929c874a50862172c7fe923d122b4211a8d73592ad25ca1fb47ddb0e8b69
 sources: []
-generated_body_sha256: e7e827f063422a79b50e9d857fce964649d037487534b5d53a005664e9da5930
+generated_body_sha256: 3a5636575b024e6d0f116f736d64551e0dfe7293e1d2eacea9354bc332090d74
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/get_started/quick_start.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/get_started/quick_start.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/get_started/quick_start.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,10 +38,10 @@ Use the provided Docker images to get a compatible SGLang, Megatron, and patch s
 
 | Hardware | Image | CUDA |
 | --- | --- | --- |
-| H100/H200 | `slimerl/slime:latest` or `slimerl/slime:latest-cu129` | 12.9 |
+| H100/H200 | `slimerl/slime:latest` or `slimerl/slime:latest-cu130` | 13.0 |
 | B200/B300 (Blackwell, x86) | `slimerl/slime:latest-cu130` | 13.0 |
 
-The default `latest` tag follows the CUDA 12 image. For Blackwell, replace the image in the commands below with `slimerl/slime:latest-cu130`. The two variants use different kernel and Transformer Engine builds. See the [Docker guide](https://github.com/THUDM/slime/blob/main/docker/README.md) for source pins and build options.
+New builds use the same CUDA 13 image for Hopper and Blackwell. On supported data-center GPUs, the image automatically enables CUDA 13 forward-compatibility libraries for older drivers, including 535 and 570, without replacing the host driver. Older versioned CUDA 12 images remain usable. See the [Docker guide](https://github.com/THUDM/slime/blob/main/docker/README.md) for build options, driver compatibility and explicit CUDA 12 image selection.
 
 GPU CI primarily covers H100/H200. Check each recipe's hardware and parallelism requirements before running it on other platforms.
 
@@ -52,7 +52,7 @@ For installation without Docker, use the {ref}`conda path below <conda>`. For AM
 On a Linux x86_64 GPU host, prepare Git, Docker, a compatible NVIDIA driver and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Run these commands on the **host** to pull the image, clone slime and start a container:
 
 ```shell
-SLIME_IMAGE=slimerl/slime:latest-cu129
+SLIME_IMAGE=slimerl/slime:latest-cu130
 docker pull "$SLIME_IMAGE"
 git clone https://github.com/THUDM/slime.git
 cd slime
@@ -77,9 +77,9 @@ The GPU count should match the devices exposed to the container. Save the builde
 (conda)=
 ## Conda / micromamba
 
-[build_conda.sh](https://github.com/THUDM/slime/blob/main/build_conda.sh) installs micromamba and creates the `slime` environment with Python 3.12 and CUDA 12.9. It builds Megatron, SGLang and native dependencies, installs slime, and applies the repository's matching patches. This takes longer than starting a prepared image.
+[build_conda.sh](https://github.com/THUDM/slime/blob/main/build_conda.sh) installs micromamba and creates the `slime` environment with Python 3.12 and CUDA 13.0. It builds Megatron, SGLang and native dependencies, installs slime, and applies the repository's matching patches. This takes longer than starting a prepared image.
 
-Use a Linux x86_64 NVIDIA machine with Bash, Git, curl, patch, a C/C++ toolchain and a compatible GPU driver. The current script writes to `/root` (including `/root/.cargo`) and expects permission to do so; the commands below use its default `/root` source directory. For B200/B300, use the CUDA 13 Docker image instead.
+Use a Linux x86_64 NVIDIA machine with Bash, Git, curl, patch, a C/C++ toolchain and a compatible GPU driver. The current script writes to `/root` (including `/root/.cargo`) and expects permission to do so; the commands below use its default `/root` source directory. The script installs the same CUDA compatibility libraries as the Docker image.
 
 From a Bash shell:
 

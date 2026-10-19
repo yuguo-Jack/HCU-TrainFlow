@@ -15,7 +15,7 @@ path: docs/source/advanced/joining_datasets.md
 raw_sha256: 5d2f0c93e56ccacb16f00e9355044ce606ada436f860141be7e89c00aa7c3c97
 sources: []
 generated_body_sha256: 2330da5a752a9ffa7b1ea0c757ee7fcb4ea0061062ff335350b3ec1b1f08a2cb
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/joining_datasets.md

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
 path: docs/source/basic/quickstart.md
-raw_sha256: 59e78a090549aecec01aa86c5ae75ef37f56637a1045cf740446f6cc4c051a9f
+raw_sha256: 9008ae07c7bb1736b733e379ffc76a9373b1dc8cdb5838c29e438e0fd4501690
 sources: []
-generated_body_sha256: abca7bff5610866666208b71fa81851fd7ff9c65fae3d54e60f41676fbab96ee
+generated_body_sha256: 96c5533b37de0b14947f3a2a40d4e660698b1d287fe4042ceaa53743eb721b07
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/basic/quickstart.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/basic/quickstart.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/basic/quickstart.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -211,17 +211,17 @@ Hence, we can
 - either use an existing task encoder
 - or define a custom one (see [](task_encoder))
 
-## Tutorial 3: Blending using Metadataset
+## Tutorial 3: Blending using Recipe
 
 A typical use case is to blend multiple datasets of the same (or similar type) together.
 For example, you may want to blend the COCO dataset with the COYO dataset.
-The easiest way to do this, is to use the metadataset pattern. 
+The easiest way to do this, is to use the recipe pattern.
 For this you need to create a new `yaml` file that defines the meta dataset:
 
 `coyo-coco-dataset.yaml`:
 ```yaml
 __module__: megatron.energon
-__class__: MetadatasetV2
+__class__: Recipe
 splits:
   # Train dataset, the datasets will be blended according to their weights 
   train:
@@ -257,8 +257,8 @@ for batch in loader:
 
 ```
 
-If you need to handle samples from different datasets differently in your pipeline, you will want to use `subflavors`.
-For these and other details, check out the [](metadataset) section. Energon also supports blending by specifying the number of repetitions for each dataset using [](../advanced/epochized_blending).
+If you need to handle samples from different datasets differently in your pipeline, you will want to use `tags`.
+For these and other details, check out the [](recipe) section. Energon also supports blending by specifying the number of repetitions for each dataset using [](../advanced/epochized_blending).
 
 ## Tutorial 4: Distributed Loading
 

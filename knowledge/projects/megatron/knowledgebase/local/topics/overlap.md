@@ -10,38 +10,38 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/distributed/distributed_data_parallel.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: a19f8e1300dd8c7b294d1d52defe22ecb6e9c79fbcbae61a41dc5bf0de460f67
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 26a06023687b3ab6a9d89fc2d1776997e619dc9d34649d38b90c2b85cb3f7b07
 - source: nvidia-megatron-lm
   path: megatron/core/distributed/param_and_grad_buffer.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: ac2b7c8a3ae6bfc307886ca0d84f72b06e47874aa0c9170c8a11662912c48ff3
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 4cf9cf4c1e8cdd4ae9c2e8f190486f39cdaa6b6a9405ce57a46acbb94ba49024
 - source: nvidia-megatron-lm
   path: megatron/core/optimizer/distrib_optimizer.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 892589f868b77a8f209bbcc8861521e7e71ddd46665b3dee38871aa580523389
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 5e0edba9f82b504a1785959824f03b8ea5c13799049c29a579ce0cc3b9a26e7b
 - source: nvidia-megatron-lm
   path: megatron/core/pipeline_parallel/schedules.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 3719d850b8822e221f30472881b8802b8f88ce02167856130fae97849d1d91ee
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 4d1c5904df165b8917029602466ebb0f5409db591b912e6969f4561ecc385171
 - source: nvidia-megatron-lm
   path: megatron/core/extensions/transformer_engine.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 6ee4807baa38389691e5ecf19472ee933f2ac5b6fe51b3e3cf26539388b77bf4
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 402dd8cf540b17fac15f0f77fba603acaa5fb4f6d9493536ff6550719f0bda47
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
 ---
 
 # Megatron 通信重叠：DP bucket、TP、PP与EP的依赖和限制
@@ -72,6 +72,12 @@ trace中collective总时长不等于暴露端到端开销。先与环境/同shap
 
 若用了DeepEP/HybridEP/NCCL-EP等后端，查实际源码和consumer接入，不将同名capability视为HCU已实现。更多见[MoE](moe.md)与[memory](memory.md)。
 
+## 新机制的组合边界
+
+MoonEP 在 preprocess 启动规划，再与共享专家或配对计算重叠；它复用 HybridEP transport，却不等同已有跨微批 EP-overlap。当前 config 拒绝同时开启这些调度，也拒绝 shared-expert-overlap 等冲突项，详见[虚拟专家生命周期](moe.md#moonep把负载搬到虚拟专家的训练契约)。配置互斥、stream/event 完成和反向梯度 owner 要一起验证。
+
+TP user-buffer 的容量由实际 batch 长度与 microbatch 推导；VLM 的 decoder 长度和模型位置容量是不同输入。恢复、换 shape 或重建 communicator 后核对实际 buffer，不能以旧一次 init 成功证明新布局仍匹配。
+
 ## 以端到端和余量检验
 
 固定模型/数据/有效batch、拓扑和数值baseline，先无候选overlap短跑，再比较耦合设置。采实际group中代表rank的同一稳态窗口，记录通信启动/完成、计算争用、最长rank、wait/event与buffer峰值；吞吐另用profiler-off。
@@ -88,12 +94,12 @@ trace中collective总时长不等于暴露端到端开销。先与环境/同shap
 
 ## 固定源码与维护边界
 
-- [megatron/core/distributed/distributed_data_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/distributed/distributed_data_parallel.py)
-- [megatron/core/distributed/param_and_grad_buffer.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/distributed/param_and_grad_buffer.py)
-- [megatron/core/optimizer/distrib_optimizer.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/optimizer/distrib_optimizer.py)
-- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/pipeline_parallel/schedules.py)
-- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/extensions/transformer_engine.py)
-- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/transformer_config.py)
-- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/arguments.py)
+- [megatron/core/distributed/distributed_data_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/distributed/distributed_data_parallel.py)
+- [megatron/core/distributed/param_and_grad_buffer.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/distributed/param_and_grad_buffer.py)
+- [megatron/core/optimizer/distrib_optimizer.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/optimizer/distrib_optimizer.py)
+- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/pipeline_parallel/schedules.py)
+- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/extensions/transformer_engine.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/transformer_config.py)
+- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/arguments.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

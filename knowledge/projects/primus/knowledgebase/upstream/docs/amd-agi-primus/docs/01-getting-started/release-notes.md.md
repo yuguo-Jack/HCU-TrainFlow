@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/01-getting-started/release-notes.md
-raw_sha256: 8b2104077479072816058568dffd575a4c5f39a475cb717b41690704d5945143
+raw_sha256: 20edb8970b99c41b5e11b77cebfe297af4e8bce627dd53913fc6bfbf5dbec6c5
 sources: []
-generated_body_sha256: 8deb10bbf7e9d62a123f195e6ab3b0f7ef8ae465afea054a3c3371011eb2dcdf
+generated_body_sha256: b9be08d245a6986d339c56da19990fa8ccb011d5fb2444f3530ec8ebf93a5444
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/01-getting-started/release-notes.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/01-getting-started/release-notes.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/01-getting-started/release-notes.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -72,7 +72,7 @@ Every version below was read out of the published image itself. From v26.4 on, t
 - **GPT-OSS-20B dense QKVO GEMMs run on Turbo FlyDSL** in both the FP8 and MXFP4 recipes ([#1127](https://github.com/AMD-AGI/Primus/pull/1127)), on top of BF16 de-oscillation snapshots and a simplified 20B recipe ([#1070](https://github.com/AMD-AGI/Primus/pull/1070)).
 - **Llama-3.1-8B FP4 building blocks** — fused FP4 dense MLP, residual RMSNorm and skip-y — upstreamed from MLPerf, default-off ([#1156](https://github.com/AMD-AGI/Primus/pull/1156)).
 - **New recipes:** Qwen3-30B-A3B and Qwen2.5-72B MXFP4 pretraining on MI355X ([#1119](https://github.com/AMD-AGI/Primus/pull/1119)), Llama-3.1-8B BF16 LoRA-SFT on MI355X ([#1113](https://github.com/AMD-AGI/Primus/pull/1113)), and native LoRA-SFT proxies for gfx1250 ([#1155](https://github.com/AMD-AGI/Primus/pull/1155)).
-- **SpecForge backend** for speculative-decoding draft training, offline ([#1139](https://github.com/AMD-AGI/Primus/pull/1139)) and online with Mooncake + SGLang ([#1191](https://github.com/AMD-AGI/Primus/pull/1191)). It runs on its own ROCm runtime image under `examples/specforge/docker`.
+- **SpecForge backend** for speculative-decoding draft training, offline ([#1139](https://github.com/AMD-AGI/Primus/pull/1139)) and online with Mooncake + SGLang ([#1191](https://github.com/AMD-AGI/Primus/pull/1191)). It runs on its own ROCm runtime image; see the [SpecForge guide](../04-technical-guides/specforge/introduction.md).
 
 #### Performance
 

@@ -9,25 +9,24 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source, official documentation and related PR reading; no HCU runtime validation
 sources:
 - source: ascend-mindspeed-llm
   path: docs/en/pytorch/features/mcore/high_availability.md
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: a8d47b4b928372aedc48a08798f11ccad2d6273c51166b578e93ae1f517d7fc6
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/core/high_availability/tft_replica_optimizer.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: a323eab370c55231c87a2b2be00808efb70a8a3cf4f2dcb9230fe922400671e6
 - source: ascend-mindspeed-llm
   path: pretrain_gpt.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 57022768d4b4b396cda2de61a1638733fe37767736a7dce0592a560bbac2c9fb
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/training/training.py
-  commit: 2fed626696175480ae1ab3342a94017301a25209
+  commit: 5a8ea03b12066067f39b1771782d12db236267ef
   sha256: 4b0d387be430c0e4521db48950cd8554647ed2b52eafd71fc79a70cc4ea09599
 ---
 
@@ -59,9 +58,9 @@ HCU任务以既有Cluster Manager等单一恢复系统为主，可以参考冗�
 
 ## 固定证据与复核范围
 
-- [docs/en/pytorch/features/mcore/high_availability.md](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/mcore/high_availability.md)
-- [mindspeed_llm/core/high_availability/tft_replica_optimizer.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/core/high_availability/tft_replica_optimizer.py)
-- [pretrain_gpt.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/pretrain_gpt.py)
-- [mindspeed_llm/training/training.py](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/mindspeed_llm/training/training.py)
+- [docs/en/pytorch/features/mcore/high_availability.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/pytorch/features/mcore/high_availability.md)
+- [mindspeed_llm/core/high_availability/tft_replica_optimizer.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/core/high_availability/tft_replica_optimizer.py)
+- [pretrain_gpt.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/pretrain_gpt.py)
+- [mindspeed_llm/training/training.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/training/training.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: 3b93679888e9f4929f6f155f13c6a286a62dfd72
 path: docs/en/reference/checkpointing.md
-raw_sha256: e477f1a57bee59e5e9e281c08536cc4baf7212081d80c5e10b46fd8984b8b12c
+raw_sha256: 6b00349b9355a58f34cd3eed907671a172e341e4c2bcc1f20b8e3d40ca6b7e78
 sources: []
-generated_body_sha256: 196ba48a80e78bcf67a4c70c445dcb4646d24c65aa21d2056557520bf916f713
+generated_body_sha256: df968147f387c76ce9cc3e02f449152d1194ee99a5a1f10a9e32c7288673018f
 source_state: current-scan
 ---
 
 # areal-project/AReaL / docs/en/reference/checkpointing.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/docs/en/reference/checkpointing.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/3b93679888e9f4929f6f155f13c6a286a62dfd72/docs/en/reference/checkpointing.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -67,6 +67,14 @@ Used by `RecoverHandler` for fault tolerance:
 - In single-controller mode, writes an immutable generation and atomically publishes it
   through a `LATEST` pointer
 - Retains the legacy overwrite layout in SPMD mode
+
+FSDP checkpoints saved with `with_optim=True` also contain `lr_scheduler.pt`, which
+restores learning-rate scheduler progress alongside the optimizer. This applies to both
+DCP and HF training checkpoints. Keep the scheduler configuration and total training
+steps unchanged when resuming. Older checkpoints without this file remain loadable, but
+emit a warning and leave the current scheduler unchanged; their original learning-rate
+trajectory cannot be restored exactly. Model-only loading (`with_optim=False`) does not
+restore scheduler state.
 
 ## Architecture
 

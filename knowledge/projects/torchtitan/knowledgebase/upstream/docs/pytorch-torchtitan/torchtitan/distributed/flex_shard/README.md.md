@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/distributed/flex_shard/README.md
-raw_sha256: 3e4158c050d9a83f3e311fb9becb8ac9455bcfa1394fd093dc79467f48c4a6fb
+raw_sha256: 8bcbe53ddd0da60f0918c4bbc1c1603264285491aacf0c7f13da7d2eddca2c56
 sources: []
-generated_body_sha256: 66bc64b284bf44f7e78ac0c8a125492c503e1877e5a5c1ab5290d95dbfe5c5dc
+generated_body_sha256: 94ff8714c05d03c746e8a7012ad23fafc348e84de3f63a6b300bea61250e2676
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/distributed/flex_shard/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/distributed/flex_shard/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/flex_shard/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -41,6 +41,11 @@ The public API is exported from `torchtitan.distributed.flex_shard`:
   `DeviceMesh` axes using PyTorch DTensor placements plus `BlockShard` or
   `Owned`, and optionally the order in which several axes shard one tensor
   dimension.
+- `ComputeLayout.compute_dtype` is the dtype the optimizer computes in for
+  that parameter; `None` keeps the storage dtype. DistMuon runs Newton-Schulz
+  in BF16 and accepts only `torch.bfloat16`, so every FP32 parameter sets it.
+  Inputs are sent to the compute ranks and directions are sent back in this
+  dtype.
 - `BlockShard` shards complete contiguous blocks along one tensor dimension. It
   preserves the tensor's rank and global shape and never creates a tensor view.
 - `Owned` assigns a complete subgroup-local logical tensor to one dynamically

@@ -1,0 +1,582 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "71d535ea37f8fa73204ea47bc0f24bfef194e929ca61a8bbcefc853b87dbeee6",
+      "isPrivate": false,
+      "numbers": [
+        39754,
+        39741,
+        39738,
+        39734,
+        39730,
+        39728,
+        39727,
+        39724
+      ],
+      "observed_at": "2026-10-19T19:32:16.123712+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4936,
+        "resetAt": "2026-10-19T19:53:19Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "c0584cf9afefdb4a3004a57af8b1aec501d44a4a",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nThe score API takes per-request embedding overrides (`query_embed_overrides` / `item_embed_overrides`, #20960) that replace the embeddings at placeholder token positions. Override tensors on the GPU were pickled by value from the tokenizer to the scheduler: copied to the host, sent over ZMQ, and copied back. With hundreds of override rows per request, that transfer dominates scoring time.\n\n## Changes\n\n- **`stacked_query_item_embed_overrides`** on `Engine.score` / `Engine.async_score` / `score_request`: one `[N, hidden]` tensor per sequence (one per item, or one under `--enable-mis`), query rows first, used as-is without a restack. Mutually exclusive with `query_embed_overrides` / `item_embed_overrides`.\n- **CUDA override embeds go through a CUDA IPC pool.** The tokenizer copies them into a slot of its `MmItemMemoryPool` (created on first use, sized by `SGLANG_MM_FEATURE_CACHE_MB`; a multimodal model's existing pool is reused), and each scheduler rank copies them out and acknowledges the slot when the request arrives (`PositionalEmbeds.reconstruct`), so TP works. They still go by value when the pool is full, with pipeline parallelism, across nodes, or with msgpack IPC.\n- **Fix:** a request with embed overrides no longer inserts its KV into the radix cache. Before, a later request with the same token ids and no overrides reused that KV and got wrong scores.\n\nNo behavior change for requests without CUDA override embeds, except the radix cache fix.\n\n## Verification\n\n- `test_score_engine.py::TestCausalLMScoring::test_stacked_embed_overrides_match_by_value`: stacked scores equal by-value scores, the overrides change the scores, the pool is used, and a plain request with the same tokens afterwards gets uncached scores.\n- `test_embed_overrides.py`: placeholder positions on the single-item and `--enable-mis` paths.\n- TP=2: stacked equals by-value, checked on 2x H200.\n\nThroughput on H200, Qwen3-8B, 16 samples per run, query 128 tokens, items 96 tokens; by-value CPU vectors vs stacked GPU tensors. Scores are identical in every row (max abs diff 0).\n\n| placeholders (query + item) | items per query | TP size | by-value (calls/s) | stacked (calls/s) | speedup (x) |\n|---|---|---|---|---|---|\n| 2 + 1 | 8 | 1 | 21.4 | 21.2 | 0.99 |\n| 2 + 1 | 8 | 2 | 28.9 | 30.0 | 1.04 |\n| 64 + 32 | 32 | 1 | 3.1 | 5.7 | 1.83 |\n| 64 + 32 | 32 | 2 | 2.7 | 8.9 | 3.33 |\n| 64 + 48 | 64 | 1 | 1.4 | 2.8 | 2.05 |\n| 64 + 48 | 64 | 2 | 1.3 | 4.5 | 3.57 |\n\n<details>\n<summary>Reproduction script</summary>\n\n```bash\npython repro_stacked_embeds.py --model-path Qwen/Qwen3-8B \\\n    --num-samples 16 --iters 10 --warmup 2 --query-len 128 --item-len 96 \\\n    --query-placeholders 64 --item-placeholders 32 --items-per-query 32 --tp-size 1\n```\n\n```python\n\"\"\"\nSGLang Score API: stacked GPU embedding overrides vs per-placeholder CPU vectors (Engine API)\n\nGPU tensors cannot travel over the HTTP/JSON API, so this drives the in-process\n``sglang.Engine`` directly.\n\nScores synthetic token-id samples with ``query_/item_embed_overrides`` (CPU\nvectors) and ``stacked_query_item_embed_overrides`` (GPU tensors), checks the scores\nmatch, and times both.\n\nUsage\n-----\n    python repro_stacked_embeds.py \\\n        --model-path Qwen/Qwen3-4B \\\n        --num-samples 64 --items-per-query 8 --iters 20 --warmup 5\n\n    # correctness only:\n    python repro_stacked_embeds.py \\\n        --model-path Qwen/Qwen3-0.6B --skip-perf\n\"\"\"\n\nimport argparse\nimport statistics\nimport sys\nimport time\nfrom typing import List, Optional, Tuple\n\nimport torch\n\nimport sglang as sgl\n\n\ndef parse_args() -> argparse.Namespace:\n    p = argparse.ArgumentParser(\n        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter\n    )\n    p.add_argument(\n        \"--model-path\", default=\"Qwen/Qwen3-4B\", help=\"HF model path/id for the Engine.\"\n    )\n    p.add_argument(\n        \"--placeholder-token-id\",\n        type=int,\n        default=50,\n        help=\"Token id marking positions replaced by an override vector.\",\n    )\n    p.add_argument(\n        \"--label-token-ids\",\n        type=int,\n        nargs=\"+\",\n        default=None,\n        help=\"label_token_ids for the score call. Defaults to two valid mid-vocab ids.\",\n    )\n    p.add_argument(\n        \"--hidden-size\",\n        type=int,\n        default=None,\n        help=\"Override vector dim. Default: read from the model config.\",\n    )\n    p.add_argument(\n        \"--num-samples\", type=int, default=32, help=\"Number of (query, items) samples.\"\n    )\n    p.add_argument(\"--items-per-query\", type=int, default=8, help=\"Items per query.\")\n    p.add_argument(\"--query-len\", type=int, default=32, help=\"Query token length.\")\n    p.add_argument(\"--item-len\", type=int, default=24, help=\"Item token length.\")\n    p.add_argument(\n        \"--query-placeholders\",\n        type=int,\n        default=2,\n        help=\"# override positions per query.\",\n    )\n    p.add_argument(\n        \"--item-placeholders\",\n        type=int,\n        default=1,\n        help=\"# override positions per item.\",\n    )\n    p.add_argument(\n        \"--iters\",\n        type=int,\n        default=20,\n        help=\"Timed iterations over the dataset per path.\",\n    )\n    p.add_argument(\n        \"--warmup\", type=int, default=5, help=\"Warmup iterations per path (not timed).\"\n    )\n    p.add_argument(\n        \"--atol\",\n        type=float,\n        default=1e-4,\n        help=\"Absolute tolerance for score equivalence.\",\n    )\n    p.add_argument(\n        \"--rtol\",\n        type=float,\n        default=1e-4,\n        help=\"Relative tolerance for score equivalence.\",\n    )\n    p.add_argument(\"--seed\", type=int, default=1234)\n    p.add_argument(\"--tp-size\", type=int, default=1)\n    p.add_argument(\"--mem-fraction-static\", type=float, default=0.6)\n    p.add_argument(\n        \"--skip-perf\", action=\"store_true\", help=\"Only run the equivalence check.\"\n    )\n    return p.parse_args()\n\n\ndef resolve_hidden_size(\n    engine: \"sgl.Engine\", model_path: str, override: Optional[int]\n) -> int:\n    if override is not None:\n        return override\n    for getter in (\n        lambda: engine.tokenizer_manager.model_config.hf_config.hidden_size,\n        lambda: engine.tokenizer_manager.model_config.hidden_size,\n    ):\n        try:\n            return int(getter())\n        except Exception:\n            pass\n    from transformers import AutoConfig\n\n    return int(AutoConfig.from_pretrained(model_path).hidden_size)\n\n\ndef resolve_vocab_size(engine: \"sgl.Engine\") -> int:\n    try:\n        return int(engine.tokenizer_manager.tokenizer.vocab_size)\n    except Exception:\n        return int(engine.tokenizer_manager.model_config.vocab_size)\n\n\ndef synth_dataset(args: argparse.Namespace, vocab_size: int) -> List[dict]:\n    g = torch.Generator().manual_seed(args.seed)\n    ph = args.placeholder_token_id\n\n    def rand_tokens(n: int) -> List[int]:\n        toks = torch.randint(0, vocab_size, (n,), generator=g).tolist()\n        return [t if t != ph else (t + 1) % vocab_size for t in toks]\n\n    samples = []\n    for _ in range(args.num_samples):\n        q = rand_tokens(args.query_len)\n        for pos in range(min(args.query_placeholders, len(q))):\n            q[pos] = ph\n        items = []\n        for _ in range(args.items_per_query):\n            it = rand_tokens(args.item_len)\n            for pos in range(min(args.item_placeholders, len(it))):\n                it[pos] = ph\n            items.append(it)\n        samples.append({\"query\": q, \"items\": items})\n    return samples\n\n\ndef count_placeholders(seq: List[int], ph: int) -> int:\n    return sum(1 for t in seq if t == ph)\n\n\nclass OverrideVectors:\n    def __init__(self, hidden: int, seed: int):\n        self.hidden = hidden\n        self.g = torch.Generator().manual_seed(seed)\n\n    def make(self, n: int) -> torch.Tensor:\n        return torch.randn(n, self.hidden, generator=self.g, dtype=torch.float32)\n\n\ndef build_byvalue_inputs(sample: dict, ph: int, ov: OverrideVectors):\n    q_ph = count_placeholders(sample[\"query\"], ph)\n    q_master = ov.make(q_ph) if q_ph else torch.empty(0, ov.hidden)\n    query_embed_overrides = [q_master[i].clone() for i in range(q_ph)] if q_ph else None\n\n    item_embed_overrides: List[Optional[List[torch.Tensor]]] = []\n    item_masters = []\n    for it in sample[\"items\"]:\n        m = count_placeholders(it, ph)\n        if m == 0:\n            item_embed_overrides.append(None)\n            item_masters.append(torch.empty(0, ov.hidden))\n            continue\n        im = ov.make(m)\n        item_masters.append(im)\n        item_embed_overrides.append([im[i].clone() for i in range(m)])\n    if all(x is None for x in item_embed_overrides):\n        item_embed_overrides = [None] * len(sample[\"items\"])\n    return query_embed_overrides, item_embed_overrides, (q_master, item_masters)\n\n\ndef build_stacked_inputs(masters) -> List[Optional[torch.Tensor]]:\n    q_master, item_masters = masters\n    stacked: List[Optional[torch.Tensor]] = []\n    for im in item_masters:\n        rows = torch.cat([q_master, im])\n        stacked.append(rows.cuda() if rows.shape[0] else None)\n    return stacked\n\n\ndef scores_close(a, b, atol: float, rtol: float) -> Tuple[bool, float]:\n    ta = torch.tensor(a, dtype=torch.float64)\n    tb = torch.tensor(b, dtype=torch.float64)\n    if ta.shape != tb.shape:\n        return False, float(\"inf\")\n    max_abs = (ta - tb).abs().max().item() if ta.numel() else 0.0\n    return torch.allclose(ta, tb, atol=atol, rtol=rtol), max_abs\n\n\ndef main() -> int:\n    args = parse_args()\n    torch.manual_seed(args.seed)\n\n    print(f\"[init] launching Engine: {args.model_path} (tp_size={args.tp_size})\")\n    engine = sgl.Engine(\n        model_path=args.model_path,\n        tp_size=args.tp_size,\n        mem_fraction_static=args.mem_fraction_static,\n        disable_cuda_graph=True,\n        disable_radix_cache=True,\n    )\n\n    try:\n        hidden = resolve_hidden_size(engine, args.model_path, args.hidden_size)\n        vocab = resolve_vocab_size(engine)\n        ph = args.placeholder_token_id\n        label_ids = args.label_token_ids or [vocab // 3, vocab // 2]\n        assert all(t < vocab for t in label_ids), \"label_token_ids out of vocab\"\n        print(\n            f\"[init] hidden={hidden} vocab={vocab} placeholder={ph} labels={label_ids}\"\n        )\n\n        samples = synth_dataset(args, vocab)\n        print(\n            f\"[data] synthesized {len(samples)} samples ({args.items_per_query} items/query)\"\n        )\n\n        ov = OverrideVectors(hidden, args.seed)\n\n        prepared = []\n        for s in samples:\n            qbv, ibv, masters = build_byvalue_inputs(s, ph, ov)\n            prepared.append((s, qbv, ibv, build_stacked_inputs(masters)))\n\n        def run_byvalue(s, qbv, ibv):\n            return engine.score(\n                query=s[\"query\"],\n                items=s[\"items\"],\n                label_token_ids=label_ids,\n                embed_override_token_id=ph,\n                query_embed_overrides=qbv,\n                item_embed_overrides=ibv,\n                apply_softmax=False,\n            )\n\n        def run_stacked(s, stacked):\n            return engine.score(\n                query=s[\"query\"],\n                items=s[\"items\"],\n                label_token_ids=label_ids,\n                embed_override_token_id=ph,\n                stacked_query_item_embed_overrides=stacked,\n                apply_softmax=False,\n            )\n\n        print(\"\\n[equivalence] comparing by-value vs stacked scores ...\")\n        n_ok, worst = 0, 0.0\n        for idx, (s, qbv, ibv, stacked) in enumerate(prepared):\n            r_bv = run_byvalue(s, qbv, ibv)\n            r_stacked = run_stacked(s, stacked)\n            ok, max_abs = scores_close(\n                r_bv.scores, r_stacked.scores, args.atol, args.rtol\n            )\n            worst = max(worst, max_abs)\n            n_ok += int(ok)\n            if not ok:\n                print(f\"  sample {idx}: MISMATCH max_abs_diff={max_abs:.3e}\")\n        all_ok = n_ok == len(prepared)\n        print(\n            f\"[equivalence] {n_ok}/{len(prepared)} matched \"\n            f\"(max abs diff {worst:.3e}) -> {'PASS' if all_ok else 'FAIL'}\"\n        )\n\n        if not args.skip_perf:\n\n            def bench(fn) -> List[float]:\n                for _ in range(args.warmup):\n                    for s, qbv, ibv, stacked in prepared:\n                        fn(s, qbv, ibv, stacked)\n                torch.cuda.synchronize()\n                out = []\n                for _ in range(args.iters):\n                    t0 = time.perf_counter()\n                    for s, qbv, ibv, stacked in prepared:\n                        fn(s, qbv, ibv, stacked)\n                    torch.cuda.synchronize()\n                    out.append((time.perf_counter() - t0) * 1e3)\n                return out\n\n            print(\n                f\"\\n[perf] warmup={args.warmup} iters={args.iters} \"\n                f\"({len(prepared)} score calls / iter)\"\n            )\n            bv_ms = bench(lambda s, qbv, ibv, stacked: run_byvalue(s, qbv, ibv))\n            stacked_ms = bench(lambda s, qbv, ibv, stacked: run_stacked(s, stacked))\n\n            def summarize(name, ms):\n                srt = sorted(ms)\n                p50 = statistics.median(srt)\n                p90 = srt[min(len(srt) - 1, int(0.9 * len(srt)))]\n                calls = len(prepared) * len(ms)\n                print(\n                    f\"  {name:<12} mean={statistics.mean(ms):7.2f}ms  \"\n                    f\"p50={p50:7.2f}ms  p90={p90:7.2f}ms  \"\n                    f\"throughput={calls / (sum(ms) / 1e3):8.1f} calls/s\"\n                )\n                return statistics.mean(ms)\n\n            print(\"[perf] per-iteration wall time over the dataset:\")\n            m_bv = summarize(\"by-value\", bv_ms)\n            m_stacked = summarize(\"stacked\", stacked_ms)\n            if m_stacked > 0:\n                print(f\"[perf] stacked speedup vs by-value: {m_bv / m_stacked:.2f}x\")\n\n        print(\"\\n[result] EQUIVALENCE \" + (\"PASS\" if all_ok else \"FAIL\"))\n        return 0 if all_ok else 1\n    finally:\n        engine.shutdown()\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n```\n\n</details>\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:hourglass_flowing_sand: [Run #38474281000](https://github.com/sgl-project/sglang/actions/runs/38474281000)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:hourglass_flowing_sand: [Run #38474280773](https://github.com/sgl-project/sglang/actions/runs/38474280773)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:hourglass_flowing_sand: [Run #38474280963](https://github.com/sgl-project/sglang/actions/runs/38474280963)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 11,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-16T19:17:02Z",
+            "databaseId": 5703169071,
+            "updatedAt": "2026-09-16T19:17:02Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5703169071"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-16T23:30:34Z",
+            "databaseId": 5706059741,
+            "updatedAt": "2026-09-16T23:30:34Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5706059741"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-17T19:12:24Z",
+            "databaseId": 5719835766,
+            "updatedAt": "2026-09-17T19:12:24Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5719835766"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-21T20:01:14Z",
+            "databaseId": 5766700819,
+            "updatedAt": "2026-09-21T20:01:14Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5766700819"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-22T04:34:50Z",
+            "databaseId": 5771259676,
+            "updatedAt": "2026-09-22T04:34:50Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5771259676"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-22T17:11:01Z",
+            "databaseId": 5780741481,
+            "updatedAt": "2026-09-22T17:11:01Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5780741481"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-28T18:27:00Z",
+            "databaseId": 5876047043,
+            "updatedAt": "2026-09-28T18:27:00Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5876047043"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-09-28T23:05:53Z",
+            "databaseId": 5880325451,
+            "updatedAt": "2026-09-28T23:05:53Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5880325451"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hnyls2002"
+            },
+            "body": "/rerun-test registered/prefill_only/test_score_engine.py registered/unit/multimodal/test_cuda_ipc_transport.py",
+            "createdAt": "2026-10-13T22:03:34Z",
+            "databaseId": 6156145106,
+            "updatedAt": "2026-10-13T22:03:34Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6156145106"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "🚀 `1-gpu-5090` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/38475175583) <!--rrt:0:done-->\n```\ncd test/ && python3 registered/prefill_only/test_score_engine.py\n```\n\n🚀 `1-gpu-h100` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/38475193735) <!--rrt:1:done-->\n```\ncd test/ && python3 registered/unit/multimodal/test_cuda_ipc_transport.py\n```",
+            "createdAt": "2026-10-13T22:03:59Z",
+            "databaseId": 6156151475,
+            "updatedAt": "2026-10-13T22:34:02Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6156151475"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hnyls2002"
+            },
+            "body": "@Qiaolin-Yu Switched to them in 5dca0ba: CUDA override embeds are now copied into the tokenizer's `MmItemMemoryPool` and rebuilt on each scheduler rank from `CudaIpcTensorTransportProxy`, so the caller-supplied IPC handle and the `TransportProxyTensor` changes are gone, and TP > 1 works.\n",
+            "createdAt": "2026-10-13T22:07:48Z",
+            "databaseId": 6156209829,
+            "updatedAt": "2026-10-13T22:07:48Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6156209829"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chuanrui"
+            },
+            "body": "> Why not use the existing `CudaIpcTensorTransportProxy` and `MmItemMemoryPool`?\r\n\r\nThanks for the update! The original one was designed to support true zero-copy for tp=1 case with raw per-request IPC handle on `TransportProxyTensor`. Agree your update is more robust to support general use case. \r\n\r\nI do want to point out that there is a small trade-off in this change due to an extra D2D copy from input tensor pool to MmItemMemoryPool, which is unavoidable since ipc handle is removed.",
+            "createdAt": "2026-10-14T01:06:33Z",
+            "databaseId": 6158571763,
+            "updatedAt": "2026-10-14T01:06:33Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6158571763"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW8UWPM=",
+          "hasNextPage": false
+        },
+        "totalCount": 12
+      },
+      "headRefOid": "d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "headRepository": {
+        "nameWithOwner": "chuanrui/sglang"
+      },
+      "mergeCommit": {
+        "oid": "baa632b04970742e7622afe308f270c86720de84"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-13T22:46:51Z",
+      "number": 39730,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "sundar24295s"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5499193241,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-13T05:30:43Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#pullrequestreview-5499193241"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Qiaolin-Yu"
+            },
+            "body": "Why not use the existing `CudaIpcTensorTransportProxy` and `MmItemMemoryPool`?",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5510053201,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-13T21:16:09Z",
+            "url": "https://github.com/sgl-project/sglang/pull/39730#pullrequestreview-5510053201"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xM1QyMToxNjowOVq0MjAyNi0xMC0xM1QyMToxNjowOVrPAAAAAUhsvVE=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Score] Send stacked GPU embedding overrides through a CUDA IPC pool",
+      "updatedAt": "2026-10-14T01:06:33Z",
+      "url": "https://github.com/sgl-project/sglang/pull/39730"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "c0584cf9afefdb4a3004a57af8b1aec501d44a4a"
+    },
+    "body": "## Motivation\n\nThe score API takes per-request embedding overrides (`query_embed_overrides` / `item_embed_overrides`, #20960) that replace the embeddings at placeholder token positions. Override tensors on the GPU were pickled by value from the tokenizer to the scheduler: copied to the host, sent over ZMQ, and copied back. With hundreds of override rows per request, that transfer dominates scoring time.\n\n## Changes\n\n- **`stacked_query_item_embed_overrides`** on `Engine.score` / `Engine.async_score` / `score_request`: one `[N, hidden]` tensor per sequence (one per item, or one under `--enable-mis`), query rows first, used as-is without a restack. Mutually exclusive with `query_embed_overrides` / `item_embed_overrides`.\n- **CUDA override embeds go through a CUDA IPC pool.** The tokenizer copies them into a slot of its `MmItemMemoryPool` (created on first use, sized by `SGLANG_MM_FEATURE_CACHE_MB`; a multimodal model's existing pool is reused), and each scheduler rank copies them out and acknowledges the slot when the request arrives (`PositionalEmbeds.reconstruct`), so TP works. They still go by value when the pool is full, with pipeline parallelism, across nodes, or with msgpack IPC.\n- **Fix:** a request with embed overrides no longer inserts its KV into the radix cache. Before, a later request with the same token ids and no overrides reused that KV and got wrong scores.\n\nNo behavior change for requests without CUDA override embeds, except the radix cache fix.\n\n## Verification\n\n- `test_score_engine.py::TestCausalLMScoring::test_stacked_embed_overrides_match_by_value`: stacked scores equal by-value scores, the overrides change the scores, the pool is used, and a plain request with the same tokens afterwards gets uncached scores.\n- `test_embed_overrides.py`: placeholder positions on the single-item and `--enable-mis` paths.\n- TP=2: stacked equals by-value, checked on 2x H200.\n\nThroughput on H200, Qwen3-8B, 16 samples per run, query 128 tokens, items 96 tokens; by-value CPU vectors vs stacked GPU tensors. Scores are identical in every row (max abs diff 0).\n\n| placeholders (query + item) | items per query | TP size | by-value (calls/s) | stacked (calls/s) | speedup (x) |\n|---|---|---|---|---|---|\n| 2 + 1 | 8 | 1 | 21.4 | 21.2 | 0.99 |\n| 2 + 1 | 8 | 2 | 28.9 | 30.0 | 1.04 |\n| 64 + 32 | 32 | 1 | 3.1 | 5.7 | 1.83 |\n| 64 + 32 | 32 | 2 | 2.7 | 8.9 | 3.33 |\n| 64 + 48 | 64 | 1 | 1.4 | 2.8 | 2.05 |\n| 64 + 48 | 64 | 2 | 1.3 | 4.5 | 3.57 |\n\n<details>\n<summary>Reproduction script</summary>\n\n```bash\npython repro_stacked_embeds.py --model-path Qwen/Qwen3-8B \\\n    --num-samples 16 --iters 10 --warmup 2 --query-len 128 --item-len 96 \\\n    --query-placeholders 64 --item-placeholders 32 --items-per-query 32 --tp-size 1\n```\n\n```python\n\"\"\"\nSGLang Score API: stacked GPU embedding overrides vs per-placeholder CPU vectors (Engine API)\n\nGPU tensors cannot travel over the HTTP/JSON API, so this drives the in-process\n``sglang.Engine`` directly.\n\nScores synthetic token-id samples with ``query_/item_embed_overrides`` (CPU\nvectors) and ``stacked_query_item_embed_overrides`` (GPU tensors), checks the scores\nmatch, and times both.\n\nUsage\n-----\n    python repro_stacked_embeds.py \\\n        --model-path Qwen/Qwen3-4B \\\n        --num-samples 64 --items-per-query 8 --iters 20 --warmup 5\n\n    # correctness only:\n    python repro_stacked_embeds.py \\\n        --model-path Qwen/Qwen3-0.6B --skip-perf\n\"\"\"\n\nimport argparse\nimport statistics\nimport sys\nimport time\nfrom typing import List, Optional, Tuple\n\nimport torch\n\nimport sglang as sgl\n\n\ndef parse_args() -> argparse.Namespace:\n    p = argparse.ArgumentParser(\n        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter\n    )\n    p.add_argument(\n        \"--model-path\", default=\"Qwen/Qwen3-4B\", help=\"HF model path/id for the Engine.\"\n    )\n    p.add_argument(\n        \"--placeholder-token-id\",\n        type=int,\n        default=50,\n        help=\"Token id marking positions replaced by an override vector.\",\n    )\n    p.add_argument(\n        \"--label-token-ids\",\n        type=int,\n        nargs=\"+\",\n        default=None,\n        help=\"label_token_ids for the score call. Defaults to two valid mid-vocab ids.\",\n    )\n    p.add_argument(\n        \"--hidden-size\",\n        type=int,\n        default=None,\n        help=\"Override vector dim. Default: read from the model config.\",\n    )\n    p.add_argument(\n        \"--num-samples\", type=int, default=32, help=\"Number of (query, items) samples.\"\n    )\n    p.add_argument(\"--items-per-query\", type=int, default=8, help=\"Items per query.\")\n    p.add_argument(\"--query-len\", type=int, default=32, help=\"Query token length.\")\n    p.add_argument(\"--item-len\", type=int, default=24, help=\"Item token length.\")\n    p.add_argument(\n        \"--query-placeholders\",\n        type=int,\n        default=2,\n        help=\"# override positions per query.\",\n    )\n    p.add_argument(\n        \"--item-placeholders\",\n        type=int,\n        default=1,\n        help=\"# override positions per item.\",\n    )\n    p.add_argument(\n        \"--iters\",\n        type=int,\n        default=20,\n        help=\"Timed iterations over the dataset per path.\",\n    )\n    p.add_argument(\n        \"--warmup\", type=int, default=5, help=\"Warmup iterations per path (not timed).\"\n    )\n    p.add_argument(\n        \"--atol\",\n        type=float,\n        default=1e-4,\n        help=\"Absolute tolerance for score equivalence.\",\n    )\n    p.add_argument(\n        \"--rtol\",\n        type=float,\n        default=1e-4,\n        help=\"Relative tolerance for score equivalence.\",\n    )\n    p.add_argument(\"--seed\", type=int, default=1234)\n    p.add_argument(\"--tp-size\", type=int, default=1)\n    p.add_argument(\"--mem-fraction-static\", type=float, default=0.6)\n    p.add_argument(\n        \"--skip-perf\", action=\"store_true\", help=\"Only run the equivalence check.\"\n    )\n    return p.parse_args()\n\n\ndef resolve_hidden_size(\n    engine: \"sgl.Engine\", model_path: str, override: Optional[int]\n) -> int:\n    if override is not None:\n        return override\n    for getter in (\n        lambda: engine.tokenizer_manager.model_config.hf_config.hidden_size,\n        lambda: engine.tokenizer_manager.model_config.hidden_size,\n    ):\n        try:\n            return int(getter())\n        except Exception:\n            pass\n    from transformers import AutoConfig\n\n    return int(AutoConfig.from_pretrained(model_path).hidden_size)\n\n\ndef resolve_vocab_size(engine: \"sgl.Engine\") -> int:\n    try:\n        return int(engine.tokenizer_manager.tokenizer.vocab_size)\n    except Exception:\n        return int(engine.tokenizer_manager.model_config.vocab_size)\n\n\ndef synth_dataset(args: argparse.Namespace, vocab_size: int) -> List[dict]:\n    g = torch.Generator().manual_seed(args.seed)\n    ph = args.placeholder_token_id\n\n    def rand_tokens(n: int) -> List[int]:\n        toks = torch.randint(0, vocab_size, (n,), generator=g).tolist()\n        return [t if t != ph else (t + 1) % vocab_size for t in toks]\n\n    samples = []\n    for _ in range(args.num_samples):\n        q = rand_tokens(args.query_len)\n        for pos in range(min(args.query_placeholders, len(q))):\n            q[pos] = ph\n        items = []\n        for _ in range(args.items_per_query):\n            it = rand_tokens(args.item_len)\n            for pos in range(min(args.item_placeholders, len(it))):\n                it[pos] = ph\n            items.append(it)\n        samples.append({\"query\": q, \"items\": items})\n    return samples\n\n\ndef count_placeholders(seq: List[int], ph: int) -> int:\n    return sum(1 for t in seq if t == ph)\n\n\nclass OverrideVectors:\n    def __init__(self, hidden: int, seed: int):\n        self.hidden = hidden\n        self.g = torch.Generator().manual_seed(seed)\n\n    def make(self, n: int) -> torch.Tensor:\n        return torch.randn(n, self.hidden, generator=self.g, dtype=torch.float32)\n\n\ndef build_byvalue_inputs(sample: dict, ph: int, ov: OverrideVectors):\n    q_ph = count_placeholders(sample[\"query\"], ph)\n    q_master = ov.make(q_ph) if q_ph else torch.empty(0, ov.hidden)\n    query_embed_overrides = [q_master[i].clone() for i in range(q_ph)] if q_ph else None\n\n    item_embed_overrides: List[Optional[List[torch.Tensor]]] = []\n    item_masters = []\n    for it in sample[\"items\"]:\n        m = count_placeholders(it, ph)\n        if m == 0:\n            item_embed_overrides.append(None)\n            item_masters.append(torch.empty(0, ov.hidden))\n            continue\n        im = ov.make(m)\n        item_masters.append(im)\n        item_embed_overrides.append([im[i].clone() for i in range(m)])\n    if all(x is None for x in item_embed_overrides):\n        item_embed_overrides = [None] * len(sample[\"items\"])\n    return query_embed_overrides, item_embed_overrides, (q_master, item_masters)\n\n\ndef build_stacked_inputs(masters) -> List[Optional[torch.Tensor]]:\n    q_master, item_masters = masters\n    stacked: List[Optional[torch.Tensor]] = []\n    for im in item_masters:\n        rows = torch.cat([q_master, im])\n        stacked.append(rows.cuda() if rows.shape[0] else None)\n    return stacked\n\n\ndef scores_close(a, b, atol: float, rtol: float) -> Tuple[bool, float]:\n    ta = torch.tensor(a, dtype=torch.float64)\n    tb = torch.tensor(b, dtype=torch.float64)\n    if ta.shape != tb.shape:\n        return False, float(\"inf\")\n    max_abs = (ta - tb).abs().max().item() if ta.numel() else 0.0\n    return torch.allclose(ta, tb, atol=atol, rtol=rtol), max_abs\n\n\ndef main() -> int:\n    args = parse_args()\n    torch.manual_seed(args.seed)\n\n    print(f\"[init] launching Engine: {args.model_path} (tp_size={args.tp_size})\")\n    engine = sgl.Engine(\n        model_path=args.model_path,\n        tp_size=args.tp_size,\n        mem_fraction_static=args.mem_fraction_static,\n        disable_cuda_graph=True,\n        disable_radix_cache=True,\n    )\n\n    try:\n        hidden = resolve_hidden_size(engine, args.model_path, args.hidden_size)\n        vocab = resolve_vocab_size(engine)\n        ph = args.placeholder_token_id\n        label_ids = args.label_token_ids or [vocab // 3, vocab // 2]\n        assert all(t < vocab for t in label_ids), \"label_token_ids out of vocab\"\n        print(\n            f\"[init] hidden={hidden} vocab={vocab} placeholder={ph} labels={label_ids}\"\n        )\n\n        samples = synth_dataset(args, vocab)\n        print(\n            f\"[data] synthesized {len(samples)} samples ({args.items_per_query} items/query)\"\n        )\n\n        ov = OverrideVectors(hidden, args.seed)\n\n        prepared = []\n        for s in samples:\n            qbv, ibv, masters = build_byvalue_inputs(s, ph, ov)\n            prepared.append((s, qbv, ibv, build_stacked_inputs(masters)))\n\n        def run_byvalue(s, qbv, ibv):\n            return engine.score(\n                query=s[\"query\"],\n                items=s[\"items\"],\n                label_token_ids=label_ids,\n                embed_override_token_id=ph,\n                query_embed_overrides=qbv,\n                item_embed_overrides=ibv,\n                apply_softmax=False,\n            )\n\n        def run_stacked(s, stacked):\n            return engine.score(\n                query=s[\"query\"],\n                items=s[\"items\"],\n                label_token_ids=label_ids,\n                embed_override_token_id=ph,\n                stacked_query_item_embed_overrides=stacked,\n                apply_softmax=False,\n            )\n\n        print(\"\\n[equivalence] comparing by-value vs stacked scores ...\")\n        n_ok, worst = 0, 0.0\n        for idx, (s, qbv, ibv, stacked) in enumerate(prepared):\n            r_bv = run_byvalue(s, qbv, ibv)\n            r_stacked = run_stacked(s, stacked)\n            ok, max_abs = scores_close(\n                r_bv.scores, r_stacked.scores, args.atol, args.rtol\n            )\n            worst = max(worst, max_abs)\n            n_ok += int(ok)\n            if not ok:\n                print(f\"  sample {idx}: MISMATCH max_abs_diff={max_abs:.3e}\")\n        all_ok = n_ok == len(prepared)\n        print(\n            f\"[equivalence] {n_ok}/{len(prepared)} matched \"\n            f\"(max abs diff {worst:.3e}) -> {'PASS' if all_ok else 'FAIL'}\"\n        )\n\n        if not args.skip_perf:\n\n            def bench(fn) -> List[float]:\n                for _ in range(args.warmup):\n                    for s, qbv, ibv, stacked in prepared:\n                        fn(s, qbv, ibv, stacked)\n                torch.cuda.synchronize()\n                out = []\n                for _ in range(args.iters):\n                    t0 = time.perf_counter()\n                    for s, qbv, ibv, stacked in prepared:\n                        fn(s, qbv, ibv, stacked)\n                    torch.cuda.synchronize()\n                    out.append((time.perf_counter() - t0) * 1e3)\n                return out\n\n            print(\n                f\"\\n[perf] warmup={args.warmup} iters={args.iters} \"\n                f\"({len(prepared)} score calls / iter)\"\n            )\n            bv_ms = bench(lambda s, qbv, ibv, stacked: run_byvalue(s, qbv, ibv))\n            stacked_ms = bench(lambda s, qbv, ibv, stacked: run_stacked(s, stacked))\n\n            def summarize(name, ms):\n                srt = sorted(ms)\n                p50 = statistics.median(srt)\n                p90 = srt[min(len(srt) - 1, int(0.9 * len(srt)))]\n                calls = len(prepared) * len(ms)\n                print(\n                    f\"  {name:<12} mean={statistics.mean(ms):7.2f}ms  \"\n                    f\"p50={p50:7.2f}ms  p90={p90:7.2f}ms  \"\n                    f\"throughput={calls / (sum(ms) / 1e3):8.1f} calls/s\"\n                )\n                return statistics.mean(ms)\n\n            print(\"[perf] per-iteration wall time over the dataset:\")\n            m_bv = summarize(\"by-value\", bv_ms)\n            m_stacked = summarize(\"stacked\", stacked_ms)\n            if m_stacked > 0:\n                print(f\"[perf] stacked speedup vs by-value: {m_bv / m_stacked:.2f}x\")\n\n        print(\"\\n[result] EQUIVALENCE \" + (\"PASS\" if all_ok else \"FAIL\"))\n        return 0 if all_ok else 1\n    finally:\n        engine.shutdown()\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n```\n\n</details>\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:hourglass_flowing_sand: [Run #38474281000](https://github.com/sgl-project/sglang/actions/runs/38474281000)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:hourglass_flowing_sand: [Run #38474280773](https://github.com/sgl-project/sglang/actions/runs/38474280773)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:hourglass_flowing_sand: [Run #38474280963](https://github.com/sgl-project/sglang/actions/runs/38474280963)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 11,
+    "head": {
+      "repo": {
+        "full_name": "chuanrui/sglang"
+      },
+      "sha": "d4dbb1400aa26afad2efbfcea7b1605e4f189b3f"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/39730",
+    "merge_commit_sha": "baa632b04970742e7622afe308f270c86720de84",
+    "merged": true,
+    "merged_at": "2026-10-13T22:46:51Z",
+    "number": 39730,
+    "state": "closed",
+    "title": "[Score] Send stacked GPU embedding overrides through a CUDA IPC pool",
+    "updated_at": "2026-10-14T01:06:33Z"
+  },
+  "files": [
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fentrypoints%2Fengine_score_mixin.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fentrypoints%2Fengine_score_mixin.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 0,
+      "filename": "python/sglang/srt/entrypoints/engine_score_mixin.py",
+      "patch": "@@ -40,6 +40,7 @@ def score(\n         score_extraction_token_id: Optional[int] = None,\n         temperature: float = 1.0,\n         return_token_logprobs: bool = False,\n+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,\n     ) -> ScoreResult:\n         \"\"\"\n         Score items against a query using the loaded model.\n@@ -84,6 +85,9 @@ def score(\n                 softmax. Requires apply_softmax=True when different from 1.\n             return_token_logprobs: Include uncalibrated full-vocabulary logprobs for\n                 each item's candidates. Only supported for CausalLM, not raw logits.\n+            stacked_query_item_embed_overrides: Alternative to query_/item_embed_overrides:\n+                one already-stacked [N, hidden] tensor per output sequence, used without\n+                a restack. See score_request.\n \n         Returns:\n             ScoreResult with scores (flat ``[num_items x num_labels]`` for pointwise\n@@ -102,6 +106,7 @@ def score(\n                 query_embed_overrides=query_embed_overrides,\n                 item_embed_overrides=item_embed_overrides,\n                 score_extraction_token_id=score_extraction_token_id,\n+                stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,\n                 request=None,\n                 return_pooled_hidden_states=return_pooled_hidden_states,\n                 temperature=temperature,\n@@ -123,6 +128,7 @@ async def async_score(\n         score_extraction_token_id: Optional[int] = None,\n         temperature: float = 1.0,\n         return_token_logprobs: bool = False,\n+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,\n     ) -> ScoreResult:\n         \"\"\"Asynchronous version of score(). See score() for full documentation.\"\"\"\n         return await self.tokenizer_manager.score_request(\n@@ -135,6 +141,7 @@ async def async_score(\n             query_embed_overrides=query_embed_overrides,\n             item_embed_overrides=item_embed_overrides,\n             score_extraction_token_id=score_extraction_token_id,\n+            stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,\n             request=None,\n             return_pooled_hidden_states=return_pooled_hidden_states,\n             temperature=temperature,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fentrypoints%2Fengine_score_mixin.py",
+      "sha": "75a4125d074b1a465007d5dec322bf7c1a567e79",
+      "status": "modified"
+    },
+    {
+      "additions": 12,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fembed_types.py",
+      "changes": 14,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fembed_types.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 2,
+      "filename": "python/sglang/srt/managers/embed_types.py",
+      "patch": "@@ -23,6 +23,8 @@\n import msgspec\n import torch\n \n+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy\n+\n \n class PositionalEmbeds(msgspec.Struct, array_like=True):\n     \"\"\"Embeddings to place at specific token positions.\n@@ -36,7 +38,8 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):\n         positions: List of positions where embeddings should be injected.\n     \"\"\"\n \n-    embeds: torch.Tensor\n+    # torch.Tensor or CudaIpcTensorTransportProxy; msgspec cannot type that union.\n+    embeds: object\n     positions: List[int]\n \n     def __post_init__(self):\n@@ -51,8 +54,15 @@ def __post_init__(self):\n             else:\n                 # [1, hidden_dim] (already has the leading dim) → plain concat.\n                 self.embeds = torch.cat(self.embeds, dim=0)\n-        if self.embeds.shape[0] != len(self.positions):\n+        if isinstance(self.embeds, torch.Tensor) and self.embeds.shape[0] != len(\n+            self.positions\n+        ):\n             raise ValueError(\n                 f\"embeds length ({self.embeds.shape[0]}) != \"\n                 f\"positions length ({len(self.positions)})\"\n             )\n+\n+    def reconstruct(self, target_device: int) -> None:\n+        \"\"\"Copy embeds out of the CUDA IPC pool onto target_device and release the slot.\"\"\"\n+        if isinstance(self.embeds, CudaIpcTensorTransportProxy):\n+            self.embeds = self.embeds.reconstruct_on_target_device(target_device)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fembed_types.py",
+      "sha": "8d8974dbac1c44aa12114d946ea03a1a090d88ef",
+      "status": "modified"
+    },
+    {
+      "additions": 94,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fpositional_embeds_transport.py",
+      "changes": 94,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fpositional_embeds_transport.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 0,
+      "filename": "python/sglang/srt/managers/positional_embeds_transport.py",
+      "patch": "@@ -0,0 +1,94 @@\n+\"\"\"Send CUDA override embeds to the scheduler through a CUDA IPC pool, not by value.\"\"\"\n+\n+import logging\n+from typing import Iterable, List, Optional\n+\n+import torch\n+\n+from sglang.srt.environ import envs\n+from sglang.srt.managers.embed_types import PositionalEmbeds\n+from sglang.srt.multimodal.transport.cuda_ipc import (\n+    MM_FEATURE_CACHE_SIZE,\n+    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,\n+    CudaIpcTensorTransportProxy,\n+    MmItemMemoryPool,\n+    get_mm_feature_pool_size_per_worker,\n+)\n+from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count\n+from sglang.srt.runtime_context import get_parallel, get_serving\n+from sglang.srt.utils import is_cuda\n+\n+logger = logging.getLogger(__name__)\n+\n+\n+class PositionalEmbedsTransport:\n+    def __init__(self, base_gpu_id: int, mm_processor) -> None:\n+        parallel = get_parallel()\n+        # By value otherwise: IPC needs one node, every pipeline stage would ack the\n+        # slot, and the msgpack IPC encoder cannot encode the proxy.\n+        self.enabled = (\n+            is_cuda()\n+            and parallel.nnodes == 1\n+            and parallel.pp_size == 1\n+            and envs.SGLANG_USE_PICKLE_IPC.get()\n+        )\n+        self._base_gpu_id = base_gpu_id\n+        # A multimodal model with --mm-feature-transport=cuda_ipc already has a pool.\n+        self._pool: Optional[MmItemMemoryPool] = getattr(\n+            mm_processor, \"cudaipc_mmfeature_pool\", None\n+        )\n+        self._use_pool_handle_cache = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()\n+\n+    def _get_pool(self) -> MmItemMemoryPool:\n+        if self._pool is None:\n+            pool_size = get_mm_feature_pool_size_per_worker(\n+                MM_FEATURE_CACHE_SIZE, get_serving().tokenizer_worker_num\n+            )\n+            logger.info(\n+                \"Creating a %.0f MiB CUDA IPC pool on GPU %d for GPU-resident \"\n+                \"embedding overrides (SGLANG_MM_FEATURE_CACHE_MB).\",\n+                pool_size / (1024 * 1024),\n+                self._base_gpu_id,\n+            )\n+            self._pool = MmItemMemoryPool(\n+                pool_size,\n+                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,\n+                self._base_gpu_id,\n+                get_mm_feature_consumer_count(),\n+            )\n+        return self._pool\n+\n+    def prepare_for_dispatch(\n+        self, tokenized_objs: Iterable\n+    ) -> List[CudaIpcTensorTransportProxy]:\n+        \"\"\"Returns the proxies to cancel if dispatch fails; a full pool means by value.\"\"\"\n+        if not self.enabled:\n+            return []\n+        proxies = []\n+        try:\n+            for tokenized_obj in tokenized_objs:\n+                overrides = tokenized_obj.positional_embed_overrides\n+                if overrides is None or not (\n+                    isinstance(overrides.embeds, torch.Tensor)\n+                    and overrides.embeds.is_cuda\n+                    and overrides.embeds.numel() > 0\n+                ):\n+                    continue\n+                proxy = self._get_pool().wrap_tensor(\n+                    overrides.embeds, use_pool_handle_cache=self._use_pool_handle_cache\n+                )\n+                if proxy is None:\n+                    continue\n+                proxies.append(proxy)\n+                # A new object: requests may share the caller's PositionalEmbeds.\n+                tokenized_obj.positional_embed_overrides = PositionalEmbeds(\n+                    embeds=proxy, positions=overrides.positions\n+                )\n+        except BaseException:\n+            self.cancel_for_dispatch(proxies)\n+            raise\n+        return proxies\n+\n+    def cancel_for_dispatch(self, proxies: List[CudaIpcTensorTransportProxy]) -> None:\n+        for proxy in proxies:\n+            self._pool.cancel_proxy(proxy)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fpositional_embeds_transport.py",
+      "sha": "2f41bb6b7af2acbb7d97586fa61f32dcea5d7aff",
+      "status": "added"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 1,
+      "filename": "python/sglang/srt/managers/schedule_batch.py",
+      "patch": "@@ -1367,7 +1367,11 @@ def __init__(\n         # retracted request is rebootstrapped. Set in pause_generation(retract)\n         # and consumed in the decode transfer commit; never plumbed to prefill.\n         self.pd_rebootstrap_forced_output_id: Optional[int] = None\n-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST\n+        # Override embeds give KV that the token ids alone do not determine.\n+        self.skip_radix_cache_insert = (\n+            bootstrap_host == FAKE_BOOTSTRAP_HOST\n+            or positional_embed_overrides is not None\n+        )\n         # Set when the request's in-flight forward ran on KV that never landed:\n         # that forward's output is dropped and the request finishes with it.\n         self.discard_output_reason: Optional[FINISH_ABORT] = None",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fschedule_batch.py",
+      "sha": "fe7ac1bfd1911080f2427ea427836b2094824d12",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 0,
+      "filename": "python/sglang/srt/managers/scheduler.py",
+      "patch": "@@ -2140,6 +2140,13 @@ def process_input_requests(self, recv_reqs: List):\n         self.session_controller.maybe_reap(now)\n \n         for recv_req in recv_reqs:\n+            # Before any early exit, so every request releases its CUDA IPC pool slot.\n+            for tokenized_req in self._tokenized_requests(recv_req):\n+                if tokenized_req.positional_embed_overrides is not None:\n+                    tokenized_req.positional_embed_overrides.reconstruct(\n+                        get_device().gpu_id\n+                    )\n+\n             vmm_errors = None\n             if get_mm().mm_feature_transport == \"cuda_vmm\":\n                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py",
+      "sha": "814a10324d657a27c38c7877dd866fe7e9037959",
+      "status": "modified"
+    },
+    {
+      "additions": 19,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Ftokenizer_manager.py",
+      "changes": 19,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Ftokenizer_manager.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 0,
+      "filename": "python/sglang/srt/managers/tokenizer_manager.py",
+      "patch": "@@ -110,6 +110,7 @@\n from sglang.srt.managers.load_snapshot import create_load_snapshot_reader\n from sglang.srt.managers.mm_utils import wrap_shm_features\n from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors\n+from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport\n from sglang.srt.managers.schedule_batch import (\n     MultimodalDataItem,\n     get_request_return_hidden_states_mode,\n@@ -539,6 +540,9 @@ def __init__(\n         # Init request dispatcher\n         self.init_request_dispatcher()\n \n+        # Init the CUDA IPC transport for GPU-resident embedding overrides\n+        self.init_positional_embeds_transport()\n+\n         # Construct this last so later initialization failures cannot orphan\n         # the transport's recycler thread.\n         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(\n@@ -837,6 +841,11 @@ def set_startup_time(self, startup_time: Dict[str, Any]) -> None:\n         if self.enable_metrics:\n             self.metrics_collector.emit_startup_time(startup_time)\n \n+    def init_positional_embeds_transport(self):\n+        self.positional_embeds_transport = PositionalEmbedsTransport(\n+            self.server_args.base_gpu_id, self.mm_processor\n+        )\n+\n     def init_request_dispatcher(self):\n         self._result_dispatcher = TypeBasedDispatcher(\n             [\n@@ -1730,13 +1739,17 @@ async def _send_one_request(\n         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],\n     ):\n         prepared_mm_items = []\n+        prepared_embeds = []\n         dispatched = False\n         try:\n             prepared_mm_items = (\n                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(\n                     (tokenized_obj.mm_inputs,)\n                 )\n             )\n+            prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(\n+                (tokenized_obj,)\n+            )\n             tokenized_obj.time_stats.set_api_server_dispatch_time()\n             tokenized_obj = wrap_shm_features(tokenized_obj)\n             time_stats = tokenized_obj.time_stats\n@@ -1752,6 +1765,7 @@ async def _send_one_request(\n         finally:\n             if not dispatched:\n                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)\n+                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)\n \n     def _mark_state_dispatched(self, rid: str):\n         \"\"\"Record that *rid* reached the scheduler.\n@@ -1771,13 +1785,17 @@ async def _send_batch_request(\n     ):\n         \"\"\"Send a batch of tokenized requests as a single batched request to the scheduler.\"\"\"\n         prepared_mm_items = []\n+        prepared_embeds = []\n         dispatched = False\n         try:\n             prepared_mm_items = (\n                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(\n                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs\n                 )\n             )\n+            prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(\n+                tokenized_objs\n+            )\n \n             set_time_batch(tokenized_objs, \"set_api_server_dispatch_time\")\n             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]\n@@ -1799,6 +1817,7 @@ async def _send_batch_request(\n         finally:\n             if not dispatched:\n                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)\n+                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)\n \n     def _coalesce_streaming_chunks(\n         self,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Ftokenizer_manager.py",
+      "sha": "49962437260d994e83bc63f5baca1c32ac9f2e60",
+      "status": "modified"
+    },
+    {
+      "additions": 115,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Ftokenizer_manager_score_mixin.py",
+      "changes": 118,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Ftokenizer_manager_score_mixin.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 3,
+      "filename": "python/sglang/srt/managers/tokenizer_manager_score_mixin.py",
+      "patch": "@@ -479,6 +479,18 @@ def _resolve_overrides_for_sequence(\n             )\n         return embeds, positions\n \n+    def _placeholder_positions(\n+        self,\n+        token_ids: List[int],\n+        embed_override_token_id: int,\n+        position_offset: int = 0,\n+    ) -> List[int]:\n+        return [\n+            idx + position_offset\n+            for idx, tok in enumerate(token_ids)\n+            if tok == embed_override_token_id\n+        ]\n+\n     def _resolve_embed_overrides_for_request(\n         self,\n         query: List[int],\n@@ -523,12 +535,24 @@ def _build_token_id_inputs(\n         embed_override_token_id: Optional[int],\n         query_embed_overrides: Optional[List[torch.Tensor]],\n         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]],\n+        stacked_query_item_embed_overrides: Optional[\n+            List[Optional[torch.Tensor]]\n+        ] = None,\n     ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:\n         \"\"\"Build input_ids and resolve embed overrides for token-ID inputs.\n \n         Multi-item-scoring and single-item modes differ only in how input_ids\n         are assembled and what position offset each item gets.\n         \"\"\"\n+        if stacked_query_item_embed_overrides is not None:\n+            return self._build_token_id_inputs_stacked(\n+                query,\n+                items,\n+                use_multi_item_scoring,\n+                embed_override_token_id,\n+                stacked_query_item_embed_overrides,\n+            )\n+\n         # Both query and items are token IDs\n         has_embeds = (\n             query_embed_overrides is not None or item_embed_overrides is not None\n@@ -623,6 +647,63 @@ def _build_token_id_inputs(\n                 None,\n             )\n \n+    def _build_token_id_inputs_stacked(\n+        self,\n+        query: List[int],\n+        items: List[List[int]],\n+        use_multi_item_scoring: bool,\n+        embed_override_token_id: int,\n+        stacked_query_item_embed_overrides: List[Optional[torch.Tensor]],\n+    ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:\n+        \"\"\"On the single-item path each item's tensor holds the query rows, then its own.\"\"\"\n+        if use_multi_item_scoring:\n+            delimiter_token_id = MIS_DELIMITER_TOKEN_ID\n+            combined_input_ids, delimiter_indices = (\n+                self._build_multi_item_token_sequence(query, items, delimiter_token_id)\n+            )\n+            input_ids = [combined_input_ids]\n+\n+            embeds = stacked_query_item_embed_overrides[0]\n+            if embeds is None:\n+                return None, input_ids, None, delimiter_indices\n+\n+            positions = self._placeholder_positions(query, embed_override_token_id)\n+            current_offset = len(query) + 1  # +1 for first delimiter\n+            for item in items:\n+                positions.extend(\n+                    self._placeholder_positions(\n+                        item, embed_override_token_id, current_offset\n+                    )\n+                )\n+                current_offset += len(item) + 1  # +1 for delimiter\n+\n+            pe = [PositionalEmbeds(embeds=embeds, positions=positions)]\n+            return None, input_ids, pe, delimiter_indices\n+\n+        input_ids = [query + item for item in items]\n+        q_positions = self._placeholder_positions(query, embed_override_token_id)\n+\n+        positional_embed_overrides: List[Optional[PositionalEmbeds]] = []\n+        any_overrides = False\n+        for item, embeds in zip(items, stacked_query_item_embed_overrides):\n+            if embeds is None:\n+                positional_embed_overrides.append(None)\n+                continue\n+            i_positions = self._placeholder_positions(\n+                item, embed_override_token_id, len(query)\n+            )\n+            positional_embed_overrides.append(\n+                PositionalEmbeds(embeds=embeds, positions=q_positions + i_positions)\n+            )\n+            any_overrides = True\n+\n+        return (\n+            None,\n+            input_ids,\n+            positional_embed_overrides if any_overrides else None,\n+            None,\n+        )\n+\n     # ------------------------------------------------------------------\n     # Multi-position pooling readout (setwise scoring)\n     # ------------------------------------------------------------------\n@@ -818,6 +899,9 @@ async def score_request(\n         embed_override_token_id: Optional[int] = None,\n         query_embed_overrides: Optional[List[torch.Tensor]] = None,\n         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,\n+        stacked_query_item_embed_overrides: Optional[\n+            List[Optional[torch.Tensor]]\n+        ] = None,\n         request: Optional[Any] = None,\n         return_pooled_hidden_states: bool = False,\n         score_extraction_token_id: Optional[int] = None,\n@@ -852,6 +936,9 @@ async def score_request(\n \n         return_pooled_hidden_states is only supported for non-generation models\n         (SequenceClassification, RewardModel); raises ValueError for CausalLM.\n+\n+        stacked_query_item_embed_overrides replaces query_/item_embed_overrides with one\n+        [N, hidden] tensor per sequence (per item, or one under --enable-mis), query rows first.\n         \"\"\"\n         is_generation = self.is_generation\n \n@@ -910,20 +997,43 @@ async def score_request(\n             query = [] if items_are_token_ids else \"\"\n \n         has_embeds = (\n-            query_embed_overrides is not None or item_embed_overrides is not None\n+            query_embed_overrides is not None\n+            or item_embed_overrides is not None\n+            or stacked_query_item_embed_overrides is not None\n         )\n         if has_embeds and embed_override_token_id is None:\n             raise ValueError(\n-                \"embed_override_token_id is required when query_embed_overrides \"\n-                \"or item_embed_overrides are supplied.\"\n+                \"embed_override_token_id is required when query_embed_overrides, \"\n+                \"item_embed_overrides, or stacked_query_item_embed_overrides are supplied.\"\n             )\n         if item_first and has_embeds:\n             raise ValueError(\"item_first is not supported when embeddings are supplied\")\n+        if stacked_query_item_embed_overrides is not None and (\n+            query_embed_overrides is not None or item_embed_overrides is not None\n+        ):\n+            raise ValueError(\n+                \"stacked_query_item_embed_overrides is mutually exclusive with \"\n+                \"query_embed_overrides / item_embed_overrides.\"\n+            )\n         if item_embed_overrides is not None and len(item_embed_overrides) != len(items):\n             raise ValueError(\n                 f\"item_embed_overrides length ({len(item_embed_overrides)}) \"\n                 f\"must match items length ({len(items)}).\"\n             )\n+        if stacked_query_item_embed_overrides is not None:\n+            if isinstance(query, str) or isinstance(items, str):\n+                raise ValueError(\n+                    \"stacked_query_item_embed_overrides requires token-id query/items, \"\n+                    \"not str.\"\n+                )\n+            expected = 1 if get_exec().features.enable_mis else len(items)\n+            if len(stacked_query_item_embed_overrides) != expected:\n+                raise ValueError(\n+                    f\"stacked_query_item_embed_overrides length \"\n+                    f\"({len(stacked_query_item_embed_overrides)}) must be {expected} \"\n+                    f\"(1 for multi-item scoring, else len(items)).\"\n+                )\n+\n         # Check if multi-item scoring is enabled\n         use_multi_item_scoring = get_exec().features.enable_mis\n \n@@ -995,6 +1105,7 @@ async def score_request(\n                     embed_override_token_id,\n                     query_embed_overrides,\n                     item_embed_overrides,\n+                    stacked_query_item_embed_overrides,\n                 )\n             )\n         elif (\n@@ -1025,6 +1136,7 @@ async def score_request(\n                     embed_override_token_id,\n                     query_embed_overrides,\n                     item_embed_overrides,\n+                    stacked_query_item_embed_overrides,\n                 )\n             )\n         else:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/python%2Fsglang%2Fsrt%2Fmanagers%2Ftokenizer_manager_score_mixin.py",
+      "sha": "095e6f2005045e49bc07227840af9240e57b69e3",
+      "status": "modified"
+    },
+    {
+      "additions": 34,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Fprefill_only%2Ftest_score_engine.py",
+      "changes": 34,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fprefill_only%2Ftest_score_engine.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 0,
+      "filename": "test/registered/prefill_only/test_score_engine.py",
+      "patch": "@@ -30,6 +30,7 @@\n \n _CAUSAL_LM_MODEL = os.environ.get(\"TEST_MODEL_NAME\", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)\n _SEQCLS_MODEL = os.environ.get(\"TEST_CLASSIFICATION_BASE_MODEL\", \"Qwen/Qwen3-0.6B\")\n+_PLACEHOLDER = 50\n \n \n # ---------------------------------------------------------------------------\n@@ -279,6 +280,39 @@ def test_decision_scoring(self):\n                 torch.tensor(cold), torch.tensor(warm), atol=1e-3, rtol=1e-2\n             )\n \n+    def test_stacked_embed_overrides_match_by_value(self):\n+        hidden = self.engine.tokenizer_manager.model_config.hidden_size\n+        gen = torch.Generator().manual_seed(0)\n+        query = [_PLACEHOLDER, 1000, _PLACEHOLDER, 1001]\n+        items = [[2000 + i, _PLACEHOLDER, 3000 + i] for i in range(3)]\n+        query_vecs = 0.02 * torch.randn(2, hidden, generator=gen)\n+        item_vecs = [0.02 * torch.randn(1, hidden, generator=gen) for _ in items]\n+        kwargs = dict(query=query, items=items, label_token_ids=[33, 32])\n+\n+        without = self.engine.score(**kwargs).scores\n+        by_value = self.engine.score(\n+            embed_override_token_id=_PLACEHOLDER,\n+            query_embed_overrides=list(query_vecs),\n+            item_embed_overrides=[list(v) for v in item_vecs],\n+            **kwargs,\n+        ).scores\n+        stacked = self.engine.score(\n+            embed_override_token_id=_PLACEHOLDER,\n+            stacked_query_item_embed_overrides=[\n+                torch.cat([query_vecs, v]).cuda() for v in item_vecs\n+            ],\n+            **kwargs,\n+        ).scores\n+        after = self.engine.score(**kwargs).scores\n+\n+        torch.testing.assert_close(torch.tensor(stacked), torch.tensor(by_value))\n+        self.assertFalse(torch.allclose(torch.tensor(stacked), torch.tensor(without)))\n+        # Override KV must stay out of the radix cache.\n+        torch.testing.assert_close(torch.tensor(after), torch.tensor(without))\n+        self.assertIsNotNone(\n+            self.engine.tokenizer_manager.positional_embeds_transport._pool\n+        )\n+\n \n # ---------------------------------------------------------------------------\n # SequenceClassification — single-item mode",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Fprefill_only%2Ftest_score_engine.py",
+      "sha": "a81c03bbd6fa7e9d6d42faecd6f7619548e82b65",
+      "status": "modified"
+    },
+    {
+      "additions": 53,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Funit%2Fmanagers%2Ftest_embed_overrides.py",
+      "changes": 53,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmanagers%2Ftest_embed_overrides.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 0,
+      "filename": "test/registered/unit/managers/test_embed_overrides.py",
+      "patch": "@@ -537,6 +537,59 @@ def test_multi_item_with_query_and_item_embeds(self):\n         self.assertEqual(pe.embeds.shape[0], 2)\n \n \n+# ========================================================================\n+# Score mixin: _build_token_id_inputs stacked path\n+# ========================================================================\n+\n+\n+def _stacked(n_rows: int, val: float = 1.0) -> torch.Tensor:\n+    return torch.full((n_rows, HIDDEN_DIM), val, dtype=torch.float32)\n+\n+\n+class TestBuildTokenIdInputsStacked(CustomTestCase):\n+    def setUp(self):\n+        self.mixin = _FakeMixin()\n+\n+    def test_single_item_stacked_none_slot(self):\n+        stacked = _stacked(2, 5.0)\n+        _, input_ids, pe_overrides, _ = self.mixin._build_token_id_inputs(\n+            query=[50, 10],\n+            items=[[20, 50], [30, 40]],\n+            item_first=False,\n+            use_multi_item_scoring=False,\n+            embed_override_token_id=50,\n+            query_embed_overrides=None,\n+            item_embed_overrides=None,\n+            stacked_query_item_embed_overrides=[stacked, None],\n+        )\n+        self.assertEqual(input_ids, [[50, 10, 20, 50], [50, 10, 30, 40]])\n+        self.assertEqual(len(pe_overrides), 2)\n+        self.assertIs(pe_overrides[0].embeds, stacked)\n+        self.assertEqual(pe_overrides[0].positions, [0, 3])\n+        self.assertIsNone(pe_overrides[1])\n+\n+    def test_multi_item_stacked_used_as_is(self):\n+        # One fused sequence; placeholders: query pos 0, item[0] pos 4\n+        # (query_len 2 + delim 1 + idx 1). item[1] has no placeholder.\n+        stacked = _stacked(2, 9.0)\n+        _, input_ids, pe_overrides, delim = self.mixin._build_token_id_inputs(\n+            query=[50, 10],\n+            items=[[20, 50], [30, 40]],\n+            item_first=False,\n+            use_multi_item_scoring=True,\n+            embed_override_token_id=50,\n+            query_embed_overrides=None,\n+            item_embed_overrides=None,\n+            stacked_query_item_embed_overrides=[stacked],\n+        )\n+        self.assertEqual(\n+            input_ids, [[50, 10, DELIM_TOKEN, 20, 50, DELIM_TOKEN, 30, 40, DELIM_TOKEN]]\n+        )\n+        self.assertEqual(len(pe_overrides), 1)\n+        self.assertEqual(pe_overrides[0].positions, [0, 4])\n+        self.assertIs(pe_overrides[0].embeds, stacked)\n+\n+\n # ========================================================================\n # Score mixin: score_request validation\n # ========================================================================",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Funit%2Fmanagers%2Ftest_embed_overrides.py",
+      "sha": "b46e92708934a547e6beff94f817efd34313e907",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Funit%2Fmanagers%2Ftest_tokenizer_manager_rid_cleanup.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmanagers%2Ftest_tokenizer_manager_rid_cleanup.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 0,
+      "filename": "test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py",
+      "patch": "@@ -1190,6 +1190,7 @@ def test_cancel_after_dispatch_sends_abort_and_keeps_state(self, _wrap_shm):\n         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(\n             return_value=[]\n         )\n+        tm.positional_embeds_transport = Mock()\n         tm._dispatch_to_scheduler = Mock()\n         rid = \"disconnect_zombie\"\n         obj = _make_generate_obj(rid, is_single=True)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Funit%2Fmanagers%2Ftest_tokenizer_manager_rid_cleanup.py",
+      "sha": "fccde10b8f315b2eaea92f3a58c28010c383d231",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Funit%2Fmultimodal%2Ftest_gpu_feature_transport.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmultimodal%2Ftest_gpu_feature_transport.py?ref=d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "deletions": 2,
+      "filename": "test/registered/unit/multimodal/test_gpu_feature_transport.py",
+      "patch": "@@ -363,6 +363,7 @@ def test_failed_dispatch_cancels_published_items(self):\n         )\n         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)\n         manager.cuda_vmm_feature_transport = transport\n+        manager.positional_embeds_transport = MagicMock()\n \n         with (\n             patch.object(tokenizer_manager, \"wrap_shm_features\", lambda obj: obj),\n@@ -401,6 +402,7 @@ def test_post_dispatch_failure_does_not_cancel_published_items(self):\n         )\n         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)\n         manager.cuda_vmm_feature_transport = transport\n+        manager.positional_embeds_transport = MagicMock()\n \n         with (\n             patch.object(tokenizer_manager, \"wrap_shm_features\", lambda obj: obj),\n@@ -739,6 +741,7 @@ def _materialize_with_rank_errors(local_exception=None, remote_error=None):\n         class TokenizedRequest:\n             def __init__(self):\n                 self.mm_inputs = object()\n+                self.positional_embed_overrides = None\n \n         scheduler = object.__new__(scheduler_module.Scheduler)\n         scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)\n@@ -798,7 +801,7 @@ def test_materializes_inputs_directly_before_base_dispatch(self):\n         self._prepare_scheduler(scheduler)\n         raw_inputs = object()\n         materialized = object()\n-        request = SimpleNamespace(mm_inputs=raw_inputs)\n+        request = SimpleNamespace(mm_inputs=raw_inputs, positional_embed_overrides=None)\n \n         with (\n             patch.object(\n@@ -831,6 +834,7 @@ def test_materializes_batched_inputs_before_dispatch(self):\n         class TokenizedRequest:\n             def __init__(self, mm_inputs):\n                 self.mm_inputs = mm_inputs\n+                self.positional_embed_overrides = None\n \n         class BatchRequest:\n             def __init__(self, batch):\n@@ -1030,7 +1034,7 @@ def test_vmm_batch_dispatches_good_and_failed_requests_individually(self):\n         from sglang.srt.managers import scheduler as scheduler_module\n \n         class TokenizedRequest:\n-            pass\n+            positional_embed_overrides = None\n \n         class EmbeddingRequest:\n             pass",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/d4dbb1400aa26afad2efbfcea7b1605e4f189b3f/test%2Fregistered%2Funit%2Fmultimodal%2Ftest_gpu_feature_transport.py",
+      "sha": "f67d717a7dcd867ec3950201f6488fbbab9241d6",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-16T19:17:02Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5703169071",
+      "id": 5703169071,
+      "updated_at": "2026-09-16T19:17:02Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-16T23:30:34Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5706059741",
+      "id": 5706059741,
+      "updated_at": "2026-09-16T23:30:34Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-17T19:12:24Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5719835766",
+      "id": 5719835766,
+      "updated_at": "2026-09-17T19:12:24Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-21T20:01:14Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5766700819",
+      "id": 5766700819,
+      "updated_at": "2026-09-21T20:01:14Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-22T04:34:50Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5771259676",
+      "id": 5771259676,
+      "updated_at": "2026-09-22T04:34:50Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-22T17:11:01Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5780741481",
+      "id": 5780741481,
+      "updated_at": "2026-09-22T17:11:01Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-28T18:27:00Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5876047043",
+      "id": 5876047043,
+      "updated_at": "2026-09-28T18:27:00Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-09-28T23:05:53Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-5880325451",
+      "id": 5880325451,
+      "updated_at": "2026-09-28T23:05:53Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    },
+    {
+      "body": "/rerun-test registered/prefill_only/test_score_engine.py registered/unit/multimodal/test_cuda_ipc_transport.py",
+      "created_at": "2026-10-13T22:03:34Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6156145106",
+      "id": 6156145106,
+      "updated_at": "2026-10-13T22:03:34Z",
+      "user": {
+        "login": "hnyls2002"
+      }
+    },
+    {
+      "body": "🚀 `1-gpu-5090` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/38475175583) <!--rrt:0:done-->\n```\ncd test/ && python3 registered/prefill_only/test_score_engine.py\n```\n\n🚀 `1-gpu-h100` (1 test): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/38475193735) <!--rrt:1:done-->\n```\ncd test/ && python3 registered/unit/multimodal/test_cuda_ipc_transport.py\n```",
+      "created_at": "2026-10-13T22:03:59Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6156151475",
+      "id": 6156151475,
+      "updated_at": "2026-10-13T22:34:02Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "@Qiaolin-Yu Switched to them in 5dca0ba: CUDA override embeds are now copied into the tokenizer's `MmItemMemoryPool` and rebuilt on each scheduler rank from `CudaIpcTensorTransportProxy`, so the caller-supplied IPC handle and the `TransportProxyTensor` changes are gone, and TP > 1 works.\n",
+      "created_at": "2026-10-13T22:07:48Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6156209829",
+      "id": 6156209829,
+      "updated_at": "2026-10-13T22:07:48Z",
+      "user": {
+        "login": "hnyls2002"
+      }
+    },
+    {
+      "body": "> Why not use the existing `CudaIpcTensorTransportProxy` and `MmItemMemoryPool`?\r\n\r\nThanks for the update! The original one was designed to support true zero-copy for tp=1 case with raw per-request IPC handle on `TransportProxyTensor`. Agree your update is more robust to support general use case. \r\n\r\nI do want to point out that there is a small trade-off in this change due to an extra D2D copy from input tensor pool to MmItemMemoryPool, which is unavoidable since ipc handle is removed.",
+      "created_at": "2026-10-14T01:06:33Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#issuecomment-6158571763",
+      "id": 6158571763,
+      "updated_at": "2026-10-14T01:06:33Z",
+      "user": {
+        "login": "chuanrui"
+      }
+    }
+  ],
+  "number": 39730,
+  "refs": {
+    "base": {
+      "commit": "c0584cf9afefdb4a3004a57af8b1aec501d44a4a",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "d4dbb1400aa26afad2efbfcea7b1605e4f189b3f",
+      "repository": "chuanrui/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#pullrequestreview-5499193241",
+      "id": 5499193241,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-13T05:30:43Z",
+      "user": {
+        "login": "sundar24295s"
+      }
+    },
+    {
+      "body": "Why not use the existing `CudaIpcTensorTransportProxy` and `MmItemMemoryPool`?",
+      "html_url": "https://github.com/sgl-project/sglang/pull/39730#pullrequestreview-5510053201",
+      "id": 5510053201,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-13T21:16:09Z",
+      "user": {
+        "login": "Qiaolin-Yu"
+      }
+    }
+  ]
+}

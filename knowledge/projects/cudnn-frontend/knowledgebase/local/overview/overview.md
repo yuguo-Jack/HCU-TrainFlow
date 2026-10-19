@@ -9,39 +9,39 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-cudnn-frontend
   path: README.md
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: 4cabe0bbf2a76d4b5bbb1b06eae8d1de73aaf8cddb756e38903b6f62689b9279
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: f4e2131aeab9f5f6697805b9546aef78544370a6950a5c046ff3637b066ed4fa
 - source: nvidia-cudnn-frontend
   path: LICENSING.md
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
   sha256: e418507f66706a64e50b52a90888537162462f71b0baa5a2d994618ef3bd541e
 - source: nvidia-cudnn-frontend
   path: include/cudnn_frontend/graph_interface.h
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: f83702970e63af8fdee1648d4d5609b1d61c8338278764ba5829b365a49a7f79
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: fe55a7781cf88836bc3e7905b32cf7f18230ec6147c9c3b752c7447efc10d661
 - source: nvidia-cudnn-frontend
   path: python/cudnn/_pygraph.py
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: 0a143dba0a0aed7eac3227547bfd6e6d362ff6ec6ca60772c440e92c62c556e5
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: 7b033ce20a300a3a933d0ea67970a123dff21ed7c551fd5e9dfd5728d703587f
 - source: nvidia-cudnn-frontend
   path: docs/fe-oss-apis/overview.md
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: f73c6109c01248eab4257db24eb2f8074f8d4f0a61c7c934c18d15a5870cd012
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: 6c347c2a2eee41824bb24e5461ac8248d54b0787ff23f5556a41796267c09d55
 - source: nvidia-cudnn-frontend-docs
   path: index
-  commit: e231f1ecf1c04ca05f5c5f66898be6f84da14a37fddd16491d733ebb95e321c1
-  sha256: a47a30e4a032bce71b2e657c67f5176603afafec2051b51f2dafc7704a674928
-  url: https://docs.nvidia.com/deeplearning/cudnn/latest/index.html
+  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
+  sha256: 2ebf746b83ef6a0c55e90b194684d6d7e879c798cc53f4f69d1040a279c55643
+  url: https://docs.nvidia.com/cudnn/overview
   revision_kind: web-content-fingerprint
 - source: nvidia-cudnn-frontend-docs
   path: open-kernels
-  commit: e231f1ecf1c04ca05f5c5f66898be6f84da14a37fddd16491d733ebb95e321c1
-  sha256: 93d501a4efe8ce95bbc7abc0ee9e5e410323006364f42dbb77e6bbea189c2de6
-  url: https://docs.nvidia.com/deeplearning/cudnn/latest/fe-oss-apis/overview.html
+  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
+  sha256: e14115ad3751858b10e51100c0ab5f8983a683899cae5bfca3bf1d18e8119a27
+  url: https://docs.nvidia.com/cudnn/fe-oss-apis/overview
   revision_kind: web-content-fingerprint
 ---
 # cuDNN Frontend 官方工程：Graph、开放 Kernel 与训练调用链
@@ -74,18 +74,20 @@ cuDNN Frontend（常被写成 cudnn-fronted）提供 C++/Python 图接口，也�
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/README.md)
-- [nvidia-cudnn-frontend: LICENSING.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/LICENSING.md)
-- [nvidia-cudnn-frontend: include/cudnn_frontend/graph_interface.h](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/include/cudnn_frontend/graph_interface.h)
-- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/python/cudnn/_pygraph.py)
-- [nvidia-cudnn-frontend: docs/fe-oss-apis/overview.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/fe-oss-apis/overview.md)
-- [nvidia-cudnn-frontend-docs: index](https://docs.nvidia.com/deeplearning/cudnn/latest/index.html)
-- [nvidia-cudnn-frontend-docs: open-kernels](https://docs.nvidia.com/deeplearning/cudnn/latest/fe-oss-apis/overview.html)
+- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/README.md)
+- [nvidia-cudnn-frontend: LICENSING.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/LICENSING.md)
+- [nvidia-cudnn-frontend: include/cudnn_frontend/graph_interface.h](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/include/cudnn_frontend/graph_interface.h)
+- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/_pygraph.py)
+- [nvidia-cudnn-frontend: docs/fe-oss-apis/overview.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/overview.md)
+- [nvidia-cudnn-frontend-docs: index](https://docs.nvidia.com/cudnn/overview)
+- [nvidia-cudnn-frontend-docs: open-kernels](https://docs.nvidia.com/cudnn/fe-oss-apis/overview)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
 
 ## 版本线与当前能力入口
 
-源码专题跟踪官方 `develop` 的固定提交，已发布包、`main` 和官网 `latest` 分开确认。本次核对时 main 仍为 1.31.0 RC，而 develop 继续 1.32.0 开发；不能按分支名字认定 main 包含所有最新机制。运行配方必须固定实际 Frontend、cuDNN backend、CUDA、GPU 和可选 DSL 版本。
+源码专题跟踪官方 `develop@a7269d7607db343fb099dabf6d8fef47f4a2498c`，CMake 项目版本为1.32.0；已发布包、`main` 和官网滚动版本另行确认，不能按分支名字认定它们包含相同机制。运行配方必须固定实际 Frontend、cuDNN backend、CUDA、GPU 和可选 DSL 版本。
 
 [FlexAttention plan 与 autograd](../topics/flex-attention-plans.md) 补足可编译稀疏 mask 的执行生命周期；[开放 Kernel](../topics/open-kernel-fusions.md) 包含 grouped GEMM、BSA/DSA 的缓冲与精度约束。这些源码结论是候选方法，不构成 HCU 库的支持清单。
+
+当前更新的重点是 nanobind 构建、SDPA 地址/stride 校验、plan/metadata 一起排序、FlashInfer 对外能力查询和 DSA 确定性/预编译生命周期。官方文档已迁到 `docs.nvidia.com/cudnn/`；新高层 `with cudnn.Graph` 与旧显式入口按版本说明，某些网页比本固定源码保留更旧的 JAX 别名，不将官网与源码拼成一套调用。

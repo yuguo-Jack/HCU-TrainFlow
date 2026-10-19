@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed
-commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
 path: docs/en/features/virtual-pipeline-parallel.md
-raw_sha256: 1aa9a60ee90b4751379fb6671f88c9090b43812447104b2096e0984091a9190d
+raw_sha256: c4e6dde4db1a1026e223b2ee9cc86fd557635ca70cc14db961640004a3cd7df4
 sources: []
-generated_body_sha256: 7058c7e81ce341f63b637eed93cc1bf2a1ff714130970a8135819c0fc87710a2
+generated_body_sha256: c427d9e92e97e1fb1b776916ebad39ed697273dd8c10534a33f83bf69c6843a4
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed / docs/en/features/virtual-pipeline-parallel.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/en/features/virtual-pipeline-parallel.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/features/virtual-pipeline-parallel.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -42,7 +42,7 @@ Figure 1 Virtual pipeline parallelism
 
 ![VPP diagram](../figures/virtual-pipeline.PNG)
 
-For more details, see the paper [Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM](https://people.eecs.berkeley.edu/~matei/papers/2021/sc_megatron_lm.pdf).
+For more details, see the paper [Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM](https://dl.acm.org/doi/10.1145/3458817.3476209).
 
 For example, assuming the model has a total of 16 layers, tensor parallelism size is 1, pipeline parallelism size is 4, and virtual pipeline parallelism size is 2, the model will be divided into 4 * 2 = 8 stages, with each stage containing 16/8 = 2 layers, as shown below:
 

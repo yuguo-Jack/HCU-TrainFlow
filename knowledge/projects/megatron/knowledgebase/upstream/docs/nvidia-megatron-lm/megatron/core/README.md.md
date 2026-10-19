@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: ab1a28486b92adb3702f1289ff3a332cdb74294f
+commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
 path: megatron/core/README.md
-raw_sha256: 229c12d19ab7f970e787877a511cd9dbbc5a31d22508191c5c1cf0a5f3e96212
+raw_sha256: 3813da50b4bd59cf3c70046ed2f1c83f6bf73025535c8e2f85e6b246ed6f9533
 sources: []
-generated_body_sha256: 6ca57455fab0d3b8b7e8903d87754e94e7bfa49f76d9a98d4da75468869f42b2
+generated_body_sha256: 76903698591ef944e53815ddc8125093cb0f8c02849f7052ae91c731ce782538
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / megatron/core/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/ab1a28486b92adb3702f1289ff3a332cdb74294f/megatron/core/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -52,6 +52,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ### GPU-Optimized Building Blocks
 - **Transformer Components**: Attention mechanisms, MLP layers, embeddings
+- **Operations** (`megatron/core/ops`): SSM mixers, sparse attention and other fused operations with their kernels and backend adapters — see the [operations guide](ops/README.md) for adding an operation or a backend kernel
 - **Memory Management**: Activation recomputation
 - **FP8 Precision**: Optimized for NVIDIA Hopper, Ada, and Blackwell GPUs
 

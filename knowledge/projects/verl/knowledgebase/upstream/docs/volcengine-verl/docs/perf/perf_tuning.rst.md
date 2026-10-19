@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: verl-project/verl
-commit: 5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d
+commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
 path: docs/perf/perf_tuning.rst
-raw_sha256: ef61c873077ca83d096eead93515b7221d92addbbed67b988d1e5385d093fc49
+raw_sha256: 4c64e886e6acff66fd48c82e68d7289f572ebc5dedad9bb8da44ab9cef21c7b3
 sources: []
-generated_body_sha256: f079aef863f20238aec1d54691b999c1c8180289d5c05cff03c880b2ff01df2c
+generated_body_sha256: 08ad481ef887a1ecf0bd909248196e42f6c6c6649c5ccb444e3f3698d127dbcf
 source_state: current-scan
 ---
 
 # verl-project/verl / docs/perf/perf_tuning.rst
 
-[Original at fixed commit](https://github.com/verl-project/verl/blob/5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d/docs/perf/perf_tuning.rst)
+[Original at fixed commit](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/perf/perf_tuning.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -29,7 +29,7 @@ Upstream source document; original commands, claims and links require their stat
 Performance Tuning Guide
 ==============================
 
-Last updated: 07/17/2025.
+Last updated: 10/01/2026.
 
 Author: `Guangming Sheng <https://github.com/PeterSH6>`_, `Jiali Zheng <https://github.com/CurryRice233>`_
 
@@ -214,7 +214,7 @@ LigerKernel for training performance
 
 LigerKernel provides fused Triton kernels (RMSNorm, SwiGLU, RoPE) that can improve training throughput. It works with both SFT and RL (PPO/GRPO) training, including vision-language models.
 
-1. Install Liger Kernel 0.8.2 or newer via ``pip3 install "liger-kernel>=0.8.2"``. Set ``use_liger`` in your configuration:
+1. Install Liger Kernel 0.8.4 via ``uv pip install "liger-kernel==0.8.4"``. Set ``use_liger`` in your configuration:
 
    .. code-block:: yaml
 
@@ -224,6 +224,90 @@ LigerKernel provides fused Triton kernels (RMSNorm, SwiGLU, RoPE) that can impro
 2. The default value is ``False``. When enabled, verl applies Liger's fused RMSNorm, SwiGLU, and RoPE kernels to the model. The model-level ``fused_linear_cross_entropy`` patch remains disabled because verl computes log-probabilities through its output-head path.
 
 3. ``use_liger`` is compatible with ``use_fused_kernels``. The former controls model-internal kernels, while the latter controls the output head. Set ``fused_kernel_options.impl_backend`` to ``liger`` to use Liger's fused scaled cross entropy, or keep the default ``torch`` backend to use verl's native chunked ``FusedLinearForPPOFunction``. The ``liger`` backend falls back to the native implementation when Liger is not installed.
+
+   For Megatron, enable both ``use_fused_kernels`` and ``use_liger`` to select
+   Liger's public tensor-parallel output-head operator instead of Verl's Triton
+   implementation. Verl passes the full token tensor to the public API without
+   exposing chunking or padding controls. Verl delegates native setup to
+   ``liger_kernel.ops.configure.configure`` using the existing actor/reference
+   maximum-token limits. Every pipeline stage participates, including stages
+   without output weights. The runtime bootstraps on WORLD and registers the
+   tensor-parallel partition separately; Verl does not initialize NVSHMEM or
+   own native workspace/context caches.
+
+   Before the reference engine initializes, colocated Megatron actor/reference
+   workers reserve the maximum across the actor training, actor log-probability,
+   and reference limits, accounting for each engine's context parallelism.
+   They also reserve the local vocabulary required by the smallest configured
+   TP size. This does not change either engine's batching settings or add a
+   user-facing capacity knob. Standalone engines reserve
+   ``max(max_token_len_per_gpu, infer_max_token_len_per_gpu) * context_parallel_size``
+   tokens. Capacity cannot grow after initialization. Repeated setup and additional TP
+   partitions within the original capacity are managed by Liger. Execution
+   across native contexts must remain serialized per process.
+   With fixed-size microbatches these
+   token settings do not limit the batch itself: choose them to cover the
+   largest packed output-head input, including Megatron's alignment padding.
+   Verl does not resize the workspace from observed microbatch shapes.
+
+   .. code-block:: bash
+
+      uv sync --extra megatron --extra vllm  # replace vllm with the selected rollout backend
+      uv pip install /path/to/liger_kernel-0.8.4-py3-none-any.whl
+      uv pip install /path/to/liger_cute_kernels-<version>-<platform>.whl
+
+   .. code-block:: yaml
+
+      actor_rollout_ref:
+        model:
+          use_fused_kernels: true
+          use_liger: true
+
+   The optional ``liger-cute-kernels`` wheel enables Liger's native
+   CUTLASS/CuTe tensor-parallel implementation when the installed wheel
+   supports the current GPU and CUDA runtime. Backend selection remains inside
+   Liger; Verl calls the same public API whether Liger selects the native
+   implementation or its fallback.
+
+   The Megatron integration requires the public configuration API merged in
+   Liger mainline commit ``0043f43309144bb3054518d28efed25fc314edaf``,
+   plus the configuration fallback change in
+   `Liger-Kernel PR #1502 <https://github.com/linkedin/Liger-Kernel/pull/1502>`_
+   (merged mainline commit ``8866e4ee7945bc3cac0e40062e7bde26ecc09f65``).
+   Liger Kernel is pinned to the published ``0.8.4`` release containing both
+   changes. For native execution, install matching ``liger-kernel==0.8.4``
+   and ``liger-cute-kernels==0.8.4`` wheels, or build those sources locally.
+   Missing optional LCK or
+   unsupported native hardware causes Liger
+   to warn and skip native setup; genuine native configuration errors are
+   not suppressed.
+
+   Requirements, legacy GPU dependencies, and FSDP/Megatron extras use the
+   same ``liger-kernel==0.8.4`` pin.
+   VeRL does not inspect GPU capabilities or select a hardware fallback.
+   Liger owns both native eligibility and operator dispatch.
+   LCK remains CUDA-only and raises ``UnsupportedDeviceError`` on unsupported
+   devices. Liger-Kernel's public ``configure`` catches that specific error,
+   warns, and returns ``False`` without native setup.
+
+   **DeepEP and memory lifetime:** Native Liger must not share a process with
+   DeepEP V1 RDMA (cross-node EP). Liger rejects an external NVSHMEM runtime
+   initialized first. VeRL also checks the legacy DeepEP dispatch/combine RDMA
+   buffer-size hints before its lazy buffer can initialize after Liger, and
+   rejects that combination. Use ``alltoall``, a Megatron-supported DeepEP V2
+   dispatcher without NVSHMEM, or disable the Liger fused output head.
+   Intra-node DeepEP V1 buffers with zero RDMA allocation are not rejected.
+   The safety gate has unit coverage; cross-node DeepEP training is unsupported
+   and is not part of the dense training smoke.
+
+   NVSHMEM environment settings must be established before initialization.
+   Its symmetric heap and native workspaces remain resident through parameter
+   and optimizer offload and colocated inference-engine sleep/wake; budget
+   this memory separately from model weights and KV cache. Do not initialize
+   or finalize another NVSHMEM owner while Liger is active. Finalization is
+   only safe after every native operation, backward pass and captured graph
+   has finished, and the loaded NVSHMEM host runtime must be compatible with
+   the device library used to build the native wheel.
 
 Forward prefetch in FSDP training backend
 ----------------------

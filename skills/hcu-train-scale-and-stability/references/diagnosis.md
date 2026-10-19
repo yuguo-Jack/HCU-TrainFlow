@@ -75,6 +75,8 @@
 
 还要区分 host API 返回、通信设备工作完成、消费 stream 的依赖建立、watchdog 观察到完成四个时刻。异步 `Work.wait` 可能只插入设备依赖，不能据返回或单个 event 推断全组成功。graph 的监控 event 与消费 join event 可能用途不同；先查现场 TorchComms/PyTorch 后端，不删除依赖来“修复”卡住，也不假定所有超时从 Python 调用时开始计时。HCU 查 `torchcomms-async-functional-watchdog` 与 `pytorch-memory-stream-graph-lifecycle`。
 
+先核对观察动作本身是否允许。当前 Galaxy 的 event query/synchronize 会检查 capture 状态，对仍在活跃 capture 中记录的 event 可使 capture 失效并返回错误；不能为轮询完成临时加入 host 查询或同步，再把新增错误归咎于通信。复用框架已有的安全观察点，必要时在有界、明确改变 Graph 模式的复现中定位，原正式时序仍需复验。DeepEP/MoonEP/UltraEP 等异步路线还要追 plan/generation、视图所有权、消费 join 和迭代收尾，不能把接口返回 event 理解为任意并发或 Graph 资格。
+
 诊断复现可在确认版本支持后使用 `NCCL_DEBUG=INFO`、`NCCL_DEBUG_SUBSYS=INIT,COLL`、按 host/PID 区分的 `NCCL_DEBUG_FILE`；还需按 attempt 分目录。HCU RCCL 使用 NCCL 风格变量，不代表 NV 工具都可用。PyTorch 的 `TORCH_DISTRIBUTED_DEBUG`、flight recorder 等先核对当前 HCU 构建；`monitored_barrier` 的官方支持范围是 Gloo，若用它需在可修改的复现程序中由相同成员按相同顺序创建并使用诊断组，不能对挂住进程临时“插入 barrier”。这些都是诊断开销，不用于报性能收益。
 
 ### 3.3 复现与隔离
@@ -116,6 +118,8 @@ Linux 下先由目标 PID 的 `/proc/<pid>/cgroup` 与实际挂载确定路径�
 
 按当前 HCU PyTorch 支持情况使用 memory summary/snapshot/history，限制记录窗口和数据量；私有 API 先核对签名。必要时查 DTK `hipprof --memory-usage`（趋势）或 `--leak-check`（栈与分配信息）。先读现场帮助，选一个进程或最小复现，并考虑 hook/LD_PRELOAD、正常退出生成报告、未拦截接口和采集自身开销；没有报告不算没有泄漏。与 XProf/XCompute 性能采集分开，不混合命令或输出格式。
 
+VMM/expandable segments 另分虚拟地址预留与物理 create/map/释放；VA 耗尽、物理 OOM 和碎片不是同一指标。按实际 PyTorch、HIP/DTK、IPC/mempool/stream 组合查能力，不把某份调研的版本通过记录或一次地址复用当作全面支持，也不因名称存在就默认打开。Graph 失败后的池/BLAS workspace 清理要在异常路径检查；`allocated` 降低不能单独证明保留段已释放。
+
 `empty_cache`、缩 batch 或强制周期重启只能作为诊断/缓解手段，不能自动称根因修复。修复后关闭诊断，覆盖原增长窗口、保存/恢复周期和最坏 shape，观察峰值与斜率；短跑尚不足就保留长稳待验证项。
 
 ## 6. 数值异常与训练质量
@@ -136,6 +140,8 @@ RL 另对齐 policy/权重版本、rollout 样本及数据年龄、logprob/rewar
 
 共卡或 offload 模式下分别核对训练状态、推理 weights、KV cache 的驻留与 sleep/wake 顺序；同步峰值 OOM 不等于稳态 batch 放不下。发送调用返回、backend 完成、replica 已加载新版本和下一批使用新权重是不同证据。step 标签一致也不能单独证明参数一致；LoRA 还查 base/adapter 同步关系。
 
+沿消费者检查 HTTP/进程状态、业务结果字段、后台队列/后处理完成、每副本参数与发布版本。HTTP 200、仅 warning 的 post-hook 或 shutdown 返回都可能遗漏实际失败；不能据此恢复生成或递增 policy version。更新门禁还可能来自模型派生缓存、共享权重或量化打包，清 KV 不一定足够。失败时核对 begin/update/end 的实际 selector、锁范围、已改变的路径/存储和各 tag 副作用；日志写 rollback 不证明旧参数已恢复。由原恢复负责人确认可信完整版本与所有参与者状态，再按该 backend 的协议收尾或重建。
+
 权重传输不是持久化 checkpoint。恢复时查 actor/可选 critic、优化器、driver/global step、dataloader/队列状态，以及异步保存完成标记；缺少数据游标要说明可能重复/跳过样本。结合 HCU 大库 `verl-ppo-grpo-worker-chain`、`verl-weight-sync-checkpoint-lifecycle` 和相应 slime/AReaL 官方 Wiki，按现场子模块与传输 backend 追代码。固定小窗口验证恢复后首批 rollout 和更新链，不把该验证扩称完整 RL 收敛。
 
 ## 7. 性能持续退化与扩展效率
@@ -149,7 +155,7 @@ RL 另对齐 policy/权重版本、rollout 样本及数据年龄、logprob/rewar
 ## 8. 保存恢复、容错失效与节点重入
 
 1. **存储：** 先查容量、inode、quota、挂载/权限及读写错误，区分磁盘满、元数据/网络阻塞和写入进程退出。大型写盘探测本身可能扰动训练，不自动压满共享存储。
-2. **checkpoint：** 确认 writer/finalization 完成、manifest/分片/metadata 一致、完整性与加载版本匹配；未结束写入的目录不能当恢复点。检查模型 keys、优化器、RNG、scheduler 与数据位置，按项目 `docs/training-state-validation.md` 做恢复对照，不能仅以 load exit0 判断完整。
+2. **checkpoint：** 确认 writer/finalization 完成、manifest/分片/metadata 一致、完整性与加载版本匹配；未结束写入的目录不能当恢复点。异步保存保留并检查实际 save future/结果，close 无异常不一定传播写盘错误。检查模型 keys、优化器、RNG、scheduler、数据位置及实际低精度 recipe 的持久状态，按项目 `docs/training-state-validation.md` 做恢复对照，不能仅以 load exit0 判断完整。TE 旧状态兼容应先核对格式与可信来源，不通过丢弃 scale/amax 历史或全局开启 unsafe 加载绕过恢复失败。
 3. **控制链：** 逐项核对异常被检测 → 事件被消费 → 原作业停止 → 必需成员实际退出 → 节点处置 → 新资源就绪 → 新 attempt 启动 → 加载恢复点 → 真正继续 step。每一段保存身份、回执和截止；失败落在哪段就调查哪段，不能只看“restart sent”。
 4. **责任与边界：** Cluster Manager 的裸机/Slurm/MPI、Docker launcher 和 K8s operator 是不同入口，阅读已部署分支/PR，不照搬另一部署的命令。Docker 恢复核对替补节点容器准备、实际首节点启动和全部成员退出；停止脚本若按容器内进程名匹配，必须使用任务专属容器。空 hostfile 的幂等成功不能证明失联旧节点已经停止；故障归属用真实 rank/slot 映射，不能把控制节点名当故障节点。确认重试预算、退避和重复失败的人工介入点；无效恢复不能无限循环。
 5. **节点重入：** 保留故障证据，在授权隔离池中复核设备、网络及任务相关负载，必要时与已确认健康节点交叉测试。K8s Ready、单次 check 返回0、已发送告警均不够；核对结构化结果/缺项。解除黑名单/taint 由当前恢复协议决定，不能删除其他管理者状态。

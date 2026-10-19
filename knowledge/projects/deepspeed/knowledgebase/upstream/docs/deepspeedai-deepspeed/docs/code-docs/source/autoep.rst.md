@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: 1c862f7df93f0345b977c67f5408d967b94bf4ae
+commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
 path: docs/code-docs/source/autoep.rst
-raw_sha256: 1a6a0183fbfa2b41ccc79c7b06fdd88357c77f9e9d0667faca7d0f7a99f638e0
+raw_sha256: 93788bb8117b48587b9f5b97fa06cca3f4585ec9dbdd18da9243e51bd384b1cf
 sources: []
-generated_body_sha256: d1bfca549744cedc53466382d8d5d80c09ce68fa1a6f3d93a6e3b0613b9eb493
+generated_body_sha256: c859d4ae88190129f8d89e76bc2f4cf063fb98aa4bfa863a571f0c8f2b363f24
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/code-docs/source/autoep.rst
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/1c862f7df93f0345b977c67f5408d967b94bf4ae/docs/code-docs/source/autoep.rst)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/docs/code-docs/source/autoep.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -226,6 +226,12 @@ communicator is initialized once before each layer's first DeepEP buffer is
 constructed, including when the caller supplied a lazily initialized process
 group. This initialization does not run on subsequent forwards. The standard
 ``comm`` and ``autoep_size=1`` paths are unchanged.
+
+Received rows and routing weights are passed through without a prefix slice
+when their buffers already contain exactly the arrived rows. Overallocated
+buffers are still trimmed independently to the handle's row count. This avoids
+redundant slice-gradient zero-fills and copies during checkpoint recomputation;
+it changes neither row weighting nor DeepEP's communication volume.
 
 Both reentrant and non-reentrant activation checkpointing are supported with
 DeepEP. The order in which DeepEP delivers rows depends on arrival timing, and a

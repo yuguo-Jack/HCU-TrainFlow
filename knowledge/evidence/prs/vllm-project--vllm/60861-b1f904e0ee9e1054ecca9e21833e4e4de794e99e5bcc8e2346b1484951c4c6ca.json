@@ -1,0 +1,862 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "c9ed04e846282f05615f9a45ae2600067f25273d8a46f0e1231f90162fa91ec9",
+      "isPrivate": false,
+      "numbers": [
+        60870,
+        60869,
+        60868,
+        60867,
+        60864,
+        60863,
+        60861,
+        60858
+      ],
+      "observed_at": "2026-10-19T18:36:15.108879+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4566,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "371745ebd6c12f314402c6c319de2e7ef82c2981",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nFix the PLE (per-layer n-gram embedding) short-conv state handling of `qwen4_exp` (Qwen3.8-Flash-Next) in `mamba_cache_mode=\"align\"`, so that a request resumed from a prefix hit delivered by a KV connector (OffloadingConnector loads, PD) reads a valid conv state, and so that the blocks the prefix cache and the offloading tiers store for the PLE group are actually written.\n\nPart of the Qwen3.8-Flash-Next tracking issue #55922 (KV offload section). Same component as #59642 (PD side of the PLE state). Possibly related symptoms: #55357 (episodic 0% MTP acceptance with prefix caching on), #53912.\n\n## Root cause\n\nIn align mode the PLE metadata builder (`short_conv_attn.py`) takes `block_table[:, 0]` of the align-gathered block table, i.e. the block of the last *scheduled* token, and uses it both to read the initial conv state and to write the final one. The Mamba/GDN backends instead receive `block_idx_last_computed_token` and read the resumed state from the block of the last *computed* token inside their kernels; the PLE conv kernel has no align support at all.\n\nTwo consequences:\n\n1. A request resumed at, say, 6400 computed tokens with 3714 new tokens has its loaded state in block 1 but the PLE reads block 3, which was just allocated and never written. When that memory contains NaN the NaN appears in the PLE output of layer 1 with clean inputs and poisons the whole model; when it contains finite garbage the state is silently wrong.\n2. Blocks that end at a 3200-token boundary crossed by a prefill chunk are never written, so the prefix cache and the offloading tiers store uninitialized memory for the PLE group. Inspecting the stored blocks showed NaN in the PLE slot of every block of that group.\n\nGPU-local flows (chunked prefill, local prefix hits) were not affected because the KV cache manager copies the state forward for them; connector loads do not go through that path.\n\n## Changes\n\n- `short_conv_attn.py`: in align mode compute per row the carry source (block holding the state after the computed tokens) and destination (block the kernels address). Decode and spec rows go into persistent builder buffers padded with `NULL_BLOCK_ID`, like `spec_state_indices_tensor`, so full CUDA graph replay reads valid indices. Prefill rows also carry the block-table rows, `seq_lens` and `num_computed_tokens` needed to write boundary checkpoints.\n- `ple_layer.py`: copy the conv state from source to destination before each conv (decode, spec and prefill paths); after a prefill, write the exact state at every block boundary the chunk crossed into the block ending there, and zero the speculative scratch columns so stored blocks never carry garbage.\n\nNo behavior change when `mamba_cache_mode != \"align\"`: the new metadata fields stay `None` and the layer code paths are skipped.\n\n## Test Plan\n\nQwen3.8-Flash-Next-NVFP4 on DGX Spark (GB10, 119 GiB unified memory), `OffloadingConnector` with `TieringOffloadingSpec` (CPU tier + fs secondary tier), `mamba_cache_mode=align`, MTP k=3, prefix caching on, 8 GiB GPU KV cache. Load: 48 conversations of ~10.1k tokens (3200 shared system prompt + 6600 per-conversation context), 256 requests at concurrency 4, so most prefix hits come from the offloading tiers (6400-token external hits, ~49% of prompt tokens overall). A per-layer NaN probe was injected for the diagnostic runs.\n\n## Test Result\n\nValidated at TP=1 on two single-GPU hosts (GB10 and GB300). Not applicable to multi-node TP, for a reason unrelated to this fix (see below).\n\n| run (GB10) | fix | external hits | NaN in model | MTP acceptance | stored PLE blocks |\n|---|---|---|---|---|---|\n| TP=2 baseline | no | 31% | yes, born in PLE layer 1 on resumed prefills | 2.2 -> 1.0 as hits start | NaN in PLE slot |\n| TP=1 | no | 49% | none (uninitialized memory happened to be finite) | 2.13 | NaN in PLE slot |\n| TP=1 | yes | 49% | none, 17,751 probe records | 2.19 | fully initialized, scratch zeroed |\n| TP=1, tier on local NVMe | yes | 49% | none | 2.18 | fully initialized |\n| GB300 Station, TP=1, CPU tier 32 GiB + NVMe tier | yes | 49% | none | 2.12 | fully initialized |\n| GB300 Station, TP=1, CPU tier 4 GiB so hits are promoted from NVMe (1134 chunk hits from the fs tier) | yes | 49% | none | 2.08 | fully initialized |\n\nThe stored-block inspection is the direct evidence for the write side of the fix: before, the PLE slot of every stored block of that KV group contained uninitialized memory; after, it holds the boundary state with the three speculative columns zeroed. The TP=1-without-fix row shows why the bug can hide: the engine reads the wrong block either way, and only shows symptoms when that memory happens to hold NaN.\n\nOn a GB300 Station (256 GB HBM, 494 GB DRAM, local NVMe) the same load shows the expected gain with the fix in place: median TTFT 0.81 s for first occurrences vs 0.31 s for repeated conversations with hits served from the CPU tier, and 0.97 s vs 0.36 s when the CPU tier is shrunk to 4 GiB so that hits are promoted from the NVMe tier; MTP acceptance stays at 2.1 throughout. Before the fix the same hits made it collapse to 1.0.\n\nRevalidated after rebasing on `main` (371745ebd6, after #58114 and #58997) with an image built from this branch, no file injection: GB300 Station, TP=1, MTP k=3, CPU tier 4 GiB + NVMe tier, 256 requests. No errors (the all-speculative decode path that the earlier rebase broke runs on every steady-state step), 1134 chunk hits served from the NVMe tier, 49% external prefix hits, MTP acceptance 2.12 on average (2.02-2.20 per window, flat from 0% to 49% hits), median TTFT 0.90 s first occurrence vs 0.40 s repeated. Note that on current `main` `--mamba-cache-mode` is deprecated and align mode follows `--enable-prefix-caching`, so this path is active by default whenever prefix caching is on.\n\nTTFT on GB10 at TP=1 does not improve with offloading (10.5 s first occurrence vs 11.1 s repeat, both on NFS and on local NVMe) because the 99 GiB model leaves the node memory-starved (host<->GPU copies at 200 MB/s versus 56 GB/s on an idle node, prefill at ~750 tok/s); that is a platform limit of this model on a single GB10, not a property of the fix.\n\nTP=2 on GB10 means multi-node TP (one GPU per node), and there the tiering manager runs in the scheduler process on rank 0's node and only sees that node's mmap region: only `_r0` files are ever written, rank 1 never creates the secondary tier, and on a load rank 1 copies a stale slot from its own `/dev/shm`. The result is wrong but finite KV on rank 1 (0 NaN in the layer probe, MTP acceptance collapses to 1.0 as soon as external hits start), with or without this fix and with or without #58413. That is the single-host assumption of #54415 (addressed by #46556); details posted there. A TP=2 validation of this fix needs a single host with two GPUs.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "SebastianGode"
+            },
+            "body": "I just experienced the same thing and found that PR :D\r\nI just got pretty rarely garbage Output with LMCache and MTP, seems to match here",
+            "createdAt": "2026-10-09T16:03:20Z",
+            "databaseId": 6084556630,
+            "updatedAt": "2026-10-09T16:03:51Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6084556630"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aijanai"
+            },
+            "body": "Does recompiling vllm on your side with this patch overcome the issue? :)",
+            "createdAt": "2026-10-09T16:37:31Z",
+            "databaseId": 6085114313,
+            "updatedAt": "2026-10-09T16:37:31Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6085114313"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "SebastianGode"
+            },
+            "body": "I need to recompile, it will take a bit as I also need to account for LMCache :)\r\nJust in case you are curious, that's my config:\r\n\r\n```\r\n    command:\r\n      - --host\r\n      - \"0.0.0.0\"\r\n\r\n      - --port\r\n      - \"8888\"\r\n\r\n      - --model\r\n      - /models/Jon-Nielsen/Qwen3.8-Flash-Next-AWQ-INT4-FP8PLE\r\n\r\n      - --served-model-name\r\n      - qwen3.8-flash-next\r\n\r\n      - --tensor-parallel-size\r\n      - \"2\"\r\n\r\n      - --enable-expert-parallel\r\n\r\n      - --max-model-len\r\n      - \"262144\"\r\n\r\n      - --max-num-seqs\r\n      - \"40\"\r\n\r\n      - --max-num-batched-tokens\r\n      - \"3199\"\r\n\r\n      - --gpu-memory-utilization\r\n      - \"0.93\"\r\n\r\n      - --disable-custom-all-reduce\r\n\r\n      # MTP speculative decoding\r\n      - --speculative-config\r\n      - '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'\r\n\r\n      # Compilation / CUDA graphs\r\n      - --compilation-config\r\n      - '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}'\r\n\r\n      # Tool calling / reasoning\r\n      - --enable-auto-tool-choice\r\n      - --tool-call-parser\r\n      - qwen3_xml\r\n\r\n      - --reasoning-parser\r\n      - qwen3\r\n\r\n      - --enable-prompt-tokens-details\r\n\r\n      # Prefix caching\r\n      - --enable-prefix-caching\r\n\r\n      # Qwen3.8 / Mamba\r\n      - --mamba-cache-mode\r\n      - align\r\n\r\n      - --prefix-match-unit\r\n      - \"16\"\r\n\r\n      - --override-generation-config\r\n      - '{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}'\r\n\r\n      # LMCache\r\n      - --kv-transfer-config\r\n      - '{\"kv_connector\":\"LMCacheMPConnector\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"lmcache\",\"lmcache.mp.port\":5556}}'\r\n\r\n      # PLE\r\n      - --engram-config\r\n      - '{\"cpu_offload\":true}'\r\n\r\n      - --moe-backend\r\n      - marlin\r\n\r\n\r\n  lmcache:\r\n    image: lmcache/standalone:nightly-37280743050-amd64\r\n    container_name: lmcache\r\n    restart: unless-stopped\r\n\r\n    command:\r\n      - /opt/venv/bin/lmcache\r\n      - server\r\n      - --host=0.0.0.0\r\n      - --port=5556\r\n      - --http-port=18556\r\n\r\n      - --chunk-size=1600\r\n      - --separate-object-groups\r\n      - --l1-size-gb=42\r\n      - --eviction-policy=LRU\r\n      - --max-workers=16\r\n\r\n      - --worker-registration-grace-seconds=86400\r\n      - --l2-adapter\r\n      - '{\"type\":\"fs_native\",\"base_path\":\"/lmcache_store\",\"num_workers\":16,\"max_capacity_gb\":600,\"eviction\":{\"eviction_policy\":\"LRU\",\"trigger_watermark\":0.8,\"eviction_ratio\":0.2},\"serde\":{\"type\":\"aesgcm\",\"key_provider\":\"hkdf\",\"master_key_path\":\"/etc/lmcache/keys/master\",\"aes_bits\":128,\"max_workers\":4}}'\r\n\r\n    environment:\r\n      - NVIDIA_VISIBLE_DEVICES=all\r\n      - NVIDIA_DRIVER_CAPABILITIES=compute,utility\r\n\r\n    volumes:\r\n      - lmcache_store:/lmcache_store\r\n      - ./secrets/lmcache-master.key:/etc/lmcache/keys/master:ro\r\n\r\n    ipc: host\r\n\r\n    deploy:\r\n      resources:\r\n        reservations:\r\n          devices:\r\n            - driver: nvidia\r\n              count: 2\r\n              capabilities: [gpu]\r\n\r\n```\r\n\r\nAnd during lots of traffic some streams eventually get garbage output, other streams stay fine:\r\n```\r\n┌─ Reasoning ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\r\n!ductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\n└───────────────────────────────────────────────────────────────────────────────────────\r\n```\r\n\r\nIf I just patch both files into the existing image it didn't fix the problem, but generally this could be because of not recompiling it. But I somehow have my doubts too. I'm not sure what really goes wrong here tbh",
+            "createdAt": "2026-10-09T17:53:08Z",
+            "databaseId": 6086313408,
+            "updatedAt": "2026-10-09T18:10:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6086313408"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "SebastianGode"
+            },
+            "body": "@aijanai \r\nSadly I still have the same issue even after the patch.\r\nSomething breaks it and I can't find any other issue mentioning it. Also happens with no MTP sadly. I'm unstable to fix it for now with just flags.\r\n\r\n```\r\nvllm                | (APIServer pid=1) INFO 10-11 08:34:15 [loggers.py:329] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 41.6 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 3.6%, Prefix cache hit rate: 97.6%, External prefix cache hit rate: 32.8%\r\nvllm                | (APIServer pid=1) INFO 10-11 08:34:15 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.00, Accepted throughput: 0.00 tokens/s, Drafted throughput: 124.79 tokens/s, Accepted: 0 tokens, Drafted: 1248 tokens, Per-position acceptance rate: 0.000, 0.000, 0.000, Avg Draft acceptance rate: 0.0%\r\n\r\n```",
+            "createdAt": "2026-10-10T13:58:39Z",
+            "databaseId": 6098247789,
+            "updatedAt": "2026-10-11T11:47:45Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6098247789"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "clee"
+            },
+            "body": "I'd just like to report that I applied this PR to my vllm-sm80 fork and have not yet seen a recurrence of the glitchy/hallucinatory reasoning after tool-calls that I was seeing before with qwen3.8-flash-next. My setup is using 3xCMP170HX in PP=3 (sometimes PP=2) mode, with all speculative decoding currently disabled.",
+            "createdAt": "2026-10-17T11:15:43Z",
+            "databaseId": 6233243646,
+            "updatedAt": "2026-10-17T11:15:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6233243646"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXOHv_4=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "headRefOid": "78ba9ceba0b6a441f33eca88ca17e7155b6d4c19",
+      "headRepository": {
+        "nameWithOwner": "aijanai/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 60861,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5519487166,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-14T14:24:38Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#pullrequestreview-5519487166"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "EagleClaw89"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "EagleClaw89"
+                  },
+                  "body": "`spec_req_idx_cpu` is unbound in the all-speculative branch of `build()`.\n\nAfter #58114 (\"Reduce PLE metadata construction overhead\", merged 2026-09-28), `spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]` is assigned only in the mixed-batch `else:` branch of `short_conv_attn.py`. This PR's new call\n\n```python\nalign_fields = self._ple_align_fields(\n    m,\n    decode_req_idx_cpu if num_decodes > 0 else None,\n    prefill_req_idx_cpu if num_prefills > 0 else None,\n    spec_req_idx_cpu if num_spec_decodes > 0 else None, ...\n```\n\nruns for every batch. In a pure speculative batch (`num_decodes == 0 and num_prefills == 0`, `num_spec_decodes > 0`, the normal steady state with MTP) the `else:` branch is skipped, so the conditional expression reads an unbound local and raises `UnboundLocalError` before `_ple_align_fields` can check the cache mode. It fires in every cache mode, not only align.\n\nReproduced on 2x DGX Spark (GB10), TP=2, nightly 77154ca6 + #59958 + this PR, Qwen3.8-Flash-Next NVFP4 with MTP: engine dies on the first all-spec decode step with\n\n```\nshort_conv_attn.py\", line 571, in build\nUnboundLocalError: cannot access local variable 'spec_req_idx_cpu'\n```\n\nFix (with it the engine boots and served our full eval runs): hoist the assignment above `if num_decodes == 0 and num_prefills == 0:`; see the diff below. The PR base is also 453 commits behind main, so a rebase will be needed anyway; the line was hoisted on the base this PR was written against and #58114 moved it.\n\n```diff\n@@ -424,6 +424,8 @@\n         non_spec_req_idx: torch.Tensor | None = None\n \n+        spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]\n         if num_decodes == 0 and num_prefills == 0:\n@@ -440,7 +442,6 @@\n             query_lens = torch.diff(query_start_loc)\n-            spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]\n             decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]\n```\n\n(The PR's `test_ple.py` spec-padding case is a pure-spec batch and should hit the same path.) Not yet checked: whether the full engine then decodes correctly with the PR; our confidence is on the boot path only.\n\n_Drafted with AI assistance (Claude); reviewed and approved by the author._",
+                  "createdAt": "2026-10-16T18:57:04Z",
+                  "databaseId": 4298241222,
+                  "diffHunk": "@@ -449,7 +564,16 @@ def build(  # type: ignore[override]\n             num_accepted_tokens = self.num_accepted_tokens[:batch_size]\n             num_accepted_tokens[num_spec_decodes:].fill_(1)\n \n+        align_fields = self._ple_align_fields(\n+            m,\n+            decode_req_idx_cpu if num_decodes > 0 else None,\n+            prefill_req_idx_cpu if num_prefills > 0 else None,\n+            spec_req_idx_cpu if num_spec_decodes > 0 else None,",
+                  "line": 578,
+                  "originalLine": 571,
+                  "path": "vllm/v1/attention/backends/short_conv_attn.py",
+                  "updatedAt": "2026-10-16T18:57:09Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60861#discussion_r4298241222"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNlQxODo1NzowNFrPAAAAAQAx9MY=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5552381515,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-16T18:57:04Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#pullrequestreview-5552381515"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aijanai"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "aijanai"
+                  },
+                  "body": "Thanks, confirmed: my base predated #58114 moving that assignment into the mixed-batch branch, and the rebase would have carried the unbound name into the pure-spec path. Rebased on current `main` (371745ebd6) and fixed in 78ba9ceba0. In the all-speculative branch the spec rows are by construction the first `num_spec_decodes` requests (the same slice `spec_state_indices_tensor` uses), so I bind `spec_req_idx_cpu = torch.arange(num_spec_decodes)` there instead of re-running `nonzero`, and leave the mixed branch as #58114 has it. While at it the carry-index uploads now go through `async_tensor_h2d` like the rest of the builder, so the align path adds no synchronous H2D copy per step.\n",
+                  "createdAt": "2026-10-18T13:50:36Z",
+                  "databaseId": 4307273221,
+                  "diffHunk": "@@ -449,7 +564,16 @@ def build(  # type: ignore[override]\n             num_accepted_tokens = self.num_accepted_tokens[:batch_size]\n             num_accepted_tokens[num_spec_decodes:].fill_(1)\n \n+        align_fields = self._ple_align_fields(\n+            m,\n+            decode_req_idx_cpu if num_decodes > 0 else None,\n+            prefill_req_idx_cpu if num_prefills > 0 else None,\n+            spec_req_idx_cpu if num_spec_decodes > 0 else None,",
+                  "line": 578,
+                  "originalLine": 571,
+                  "path": "vllm/v1/attention/backends/short_conv_attn.py",
+                  "updatedAt": "2026-10-18T13:50:36Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/60861#discussion_r4307273221"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xOFQxMzo1MDozNlrPAAAAAQC7xgU=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5563253460,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-18T13:50:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/60861#pullrequestreview-5563253460"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xOFQxMzo1MDozNlq0MjAyNi0xMC0xOFQxMzo1MDozNlrPAAAAAUuYgtQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "OPEN",
+      "title": "[Bugfix][Qwen4Exp] Carry and checkpoint the PLE short-conv state in align mode",
+      "updatedAt": "2026-10-18T19:24:18Z",
+      "url": "https://github.com/vllm-project/vllm/pull/60861"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/60861/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/60861/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/60861"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/60861"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/60861/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/60861"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/78ba9ceba0b6a441f33eca88ca17e7155b6d4c19"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 256,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 23600,
+        "forks_count": 23600,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9091,
+        "open_issues_count": 9091,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-10-19T17:00:21Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 323941,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 94145,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-10-19T18:24:55Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 94145,
+        "watchers_count": 94145,
+        "web_commit_signoff_required": true
+      },
+      "sha": "371745ebd6c12f314402c6c319de2e7ef82c2981",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Purpose\n\nFix the PLE (per-layer n-gram embedding) short-conv state handling of `qwen4_exp` (Qwen3.8-Flash-Next) in `mamba_cache_mode=\"align\"`, so that a request resumed from a prefix hit delivered by a KV connector (OffloadingConnector loads, PD) reads a valid conv state, and so that the blocks the prefix cache and the offloading tiers store for the PLE group are actually written.\n\nPart of the Qwen3.8-Flash-Next tracking issue #55922 (KV offload section). Same component as #59642 (PD side of the PLE state). Possibly related symptoms: #55357 (episodic 0% MTP acceptance with prefix caching on), #53912.\n\n## Root cause\n\nIn align mode the PLE metadata builder (`short_conv_attn.py`) takes `block_table[:, 0]` of the align-gathered block table, i.e. the block of the last *scheduled* token, and uses it both to read the initial conv state and to write the final one. The Mamba/GDN backends instead receive `block_idx_last_computed_token` and read the resumed state from the block of the last *computed* token inside their kernels; the PLE conv kernel has no align support at all.\n\nTwo consequences:\n\n1. A request resumed at, say, 6400 computed tokens with 3714 new tokens has its loaded state in block 1 but the PLE reads block 3, which was just allocated and never written. When that memory contains NaN the NaN appears in the PLE output of layer 1 with clean inputs and poisons the whole model; when it contains finite garbage the state is silently wrong.\n2. Blocks that end at a 3200-token boundary crossed by a prefill chunk are never written, so the prefix cache and the offloading tiers store uninitialized memory for the PLE group. Inspecting the stored blocks showed NaN in the PLE slot of every block of that group.\n\nGPU-local flows (chunked prefill, local prefix hits) were not affected because the KV cache manager copies the state forward for them; connector loads do not go through that path.\n\n## Changes\n\n- `short_conv_attn.py`: in align mode compute per row the carry source (block holding the state after the computed tokens) and destination (block the kernels address). Decode and spec rows go into persistent builder buffers padded with `NULL_BLOCK_ID`, like `spec_state_indices_tensor`, so full CUDA graph replay reads valid indices. Prefill rows also carry the block-table rows, `seq_lens` and `num_computed_tokens` needed to write boundary checkpoints.\n- `ple_layer.py`: copy the conv state from source to destination before each conv (decode, spec and prefill paths); after a prefill, write the exact state at every block boundary the chunk crossed into the block ending there, and zero the speculative scratch columns so stored blocks never carry garbage.\n\nNo behavior change when `mamba_cache_mode != \"align\"`: the new metadata fields stay `None` and the layer code paths are skipped.\n\n## Test Plan\n\nQwen3.8-Flash-Next-NVFP4 on DGX Spark (GB10, 119 GiB unified memory), `OffloadingConnector` with `TieringOffloadingSpec` (CPU tier + fs secondary tier), `mamba_cache_mode=align`, MTP k=3, prefix caching on, 8 GiB GPU KV cache. Load: 48 conversations of ~10.1k tokens (3200 shared system prompt + 6600 per-conversation context), 256 requests at concurrency 4, so most prefix hits come from the offloading tiers (6400-token external hits, ~49% of prompt tokens overall). A per-layer NaN probe was injected for the diagnostic runs.\n\n## Test Result\n\nValidated at TP=1 on two single-GPU hosts (GB10 and GB300). Not applicable to multi-node TP, for a reason unrelated to this fix (see below).\n\n| run (GB10) | fix | external hits | NaN in model | MTP acceptance | stored PLE blocks |\n|---|---|---|---|---|---|\n| TP=2 baseline | no | 31% | yes, born in PLE layer 1 on resumed prefills | 2.2 -> 1.0 as hits start | NaN in PLE slot |\n| TP=1 | no | 49% | none (uninitialized memory happened to be finite) | 2.13 | NaN in PLE slot |\n| TP=1 | yes | 49% | none, 17,751 probe records | 2.19 | fully initialized, scratch zeroed |\n| TP=1, tier on local NVMe | yes | 49% | none | 2.18 | fully initialized |\n| GB300 Station, TP=1, CPU tier 32 GiB + NVMe tier | yes | 49% | none | 2.12 | fully initialized |\n| GB300 Station, TP=1, CPU tier 4 GiB so hits are promoted from NVMe (1134 chunk hits from the fs tier) | yes | 49% | none | 2.08 | fully initialized |\n\nThe stored-block inspection is the direct evidence for the write side of the fix: before, the PLE slot of every stored block of that KV group contained uninitialized memory; after, it holds the boundary state with the three speculative columns zeroed. The TP=1-without-fix row shows why the bug can hide: the engine reads the wrong block either way, and only shows symptoms when that memory happens to hold NaN.\n\nOn a GB300 Station (256 GB HBM, 494 GB DRAM, local NVMe) the same load shows the expected gain with the fix in place: median TTFT 0.81 s for first occurrences vs 0.31 s for repeated conversations with hits served from the CPU tier, and 0.97 s vs 0.36 s when the CPU tier is shrunk to 4 GiB so that hits are promoted from the NVMe tier; MTP acceptance stays at 2.1 throughout. Before the fix the same hits made it collapse to 1.0.\n\nRevalidated after rebasing on `main` (371745ebd6, after #58114 and #58997) with an image built from this branch, no file injection: GB300 Station, TP=1, MTP k=3, CPU tier 4 GiB + NVMe tier, 256 requests. No errors (the all-speculative decode path that the earlier rebase broke runs on every steady-state step), 1134 chunk hits served from the NVMe tier, 49% external prefix hits, MTP acceptance 2.12 on average (2.02-2.20 per window, flat from 0% to 49% hits), median TTFT 0.90 s first occurrence vs 0.40 s repeated. Note that on current `main` `--mamba-cache-mode` is deprecated and align mode follows `--enable-prefix-caching`, so this path is active by default whenever prefix caching is on.\n\nTTFT on GB10 at TP=1 does not improve with offloading (10.5 s first occurrence vs 11.1 s repeat, both on NFS and on local NVMe) because the 99 GiB model leaves the node memory-starved (host<->GPU copies at 200 MB/s versus 56 GB/s on an idle node, prefill at ~750 tok/s); that is a platform limit of this model on a single GB10, not a property of the fix.\n\nTP=2 on GB10 means multi-node TP (one GPU per node), and there the tiering manager runs in the scheduler process on rank 0's node and only sees that node's mmap region: only `_r0` files are ever written, rank 1 never creates the secondary tier, and on a load rank 1 copies a stale slot from its own `/dev/shm`. The result is wrong but finite KV on rank 1 (0 NaN in the layer probe, MTP acceptance collapses to 1.0 as soon as external hits start), with or without this fix and with or without #58413. That is the single-host assumption of #54415 (addressed by #46556); details posted there. A TP=2 validation of this fix needs a single host with two GPUs.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 5,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/60861/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/60861/commits",
+    "created_at": "2026-10-09T14:17:05Z",
+    "deletions": 0,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/60861.diff",
+    "draft": false,
+    "head": {
+      "label": "aijanai:amassidda/ple-align-state-fix",
+      "ref": "amassidda/ple-align-state-fix",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/aijanai/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/aijanai/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/aijanai/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/aijanai/vllm/branches{/branch}",
+        "clone_url": "https://github.com/aijanai/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/aijanai/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/aijanai/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/aijanai/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/aijanai/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/aijanai/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/aijanai/vllm/contributors",
+        "created_at": "2026-08-10T08:09:12Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/aijanai/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/aijanai/vllm/downloads",
+        "events_url": "https://api.github.com/repos/aijanai/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/aijanai/vllm/forks",
+        "full_name": "aijanai/vllm",
+        "git_commits_url": "https://api.github.com/repos/aijanai/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/aijanai/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/aijanai/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/aijanai/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/aijanai/vllm/hooks",
+        "html_url": "https://github.com/aijanai/vllm",
+        "id": 1329580599,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/aijanai/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/aijanai/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/aijanai/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/aijanai/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/aijanai/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/aijanai/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/aijanai/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/aijanai/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOTz_KNw",
+        "notifications_url": "https://api.github.com/repos/aijanai/vllm/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/7932716?v=4",
+          "events_url": "https://api.github.com/users/aijanai/events{/privacy}",
+          "followers_url": "https://api.github.com/users/aijanai/followers",
+          "following_url": "https://api.github.com/users/aijanai/following{/other_user}",
+          "gists_url": "https://api.github.com/users/aijanai/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/aijanai",
+          "id": 7932716,
+          "login": "aijanai",
+          "node_id": "MDQ6VXNlcjc5MzI3MTY=",
+          "organizations_url": "https://api.github.com/users/aijanai/orgs",
+          "received_events_url": "https://api.github.com/users/aijanai/received_events",
+          "repos_url": "https://api.github.com/users/aijanai/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/aijanai/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/aijanai/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/aijanai",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/aijanai/vllm/pulls{/number}",
+        "pushed_at": "2026-10-18T19:35:30Z",
+        "releases_url": "https://api.github.com/repos/aijanai/vllm/releases{/id}",
+        "size": 307201,
+        "ssh_url": "git@github.com:aijanai/vllm.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/aijanai/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/aijanai/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/aijanai/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/aijanai/vllm/subscription",
+        "svn_url": "https://github.com/aijanai/vllm",
+        "tags_url": "https://api.github.com/repos/aijanai/vllm/tags",
+        "teams_url": "https://api.github.com/repos/aijanai/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/aijanai/vllm/git/trees{/sha}",
+        "updated_at": "2026-10-02T15:38:11Z",
+        "url": "https://api.github.com/repos/aijanai/vllm",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": true
+      },
+      "sha": "78ba9ceba0b6a441f33eca88ca17e7155b6d4c19",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/7932716?v=4",
+        "events_url": "https://api.github.com/users/aijanai/events{/privacy}",
+        "followers_url": "https://api.github.com/users/aijanai/followers",
+        "following_url": "https://api.github.com/users/aijanai/following{/other_user}",
+        "gists_url": "https://api.github.com/users/aijanai/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/aijanai",
+        "id": 7932716,
+        "login": "aijanai",
+        "node_id": "MDQ6VXNlcjc5MzI3MTY=",
+        "organizations_url": "https://api.github.com/users/aijanai/orgs",
+        "received_events_url": "https://api.github.com/users/aijanai/received_events",
+        "repos_url": "https://api.github.com/users/aijanai/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/aijanai/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/aijanai/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/aijanai",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/60861",
+    "id": 4801660121,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/60861",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d73a4a",
+        "default": true,
+        "description": "Something isn't working",
+        "id": 5135047172,
+        "name": "bug",
+        "node_id": "LA_kwDOI7xefs8AAAABMhKaBA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/bug"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "DBB0FE",
+        "default": false,
+        "description": "Related to Qwen models",
+        "id": 8745996664,
+        "name": "qwen",
+        "node_id": "LA_kwDOI7xefs8AAAACCU1ReA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/qwen"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "8c05801d2e22b1821385b49692e6593e304e5f0f",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABHjOE2Q",
+    "number": 60861,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/60861.patch",
+    "rebaseable": false,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/8854186?v=4",
+        "events_url": "https://api.github.com/users/LucasWilkinson/events{/privacy}",
+        "followers_url": "https://api.github.com/users/LucasWilkinson/followers",
+        "following_url": "https://api.github.com/users/LucasWilkinson/following{/other_user}",
+        "gists_url": "https://api.github.com/users/LucasWilkinson/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/LucasWilkinson",
+        "id": 8854186,
+        "login": "LucasWilkinson",
+        "node_id": "MDQ6VXNlcjg4NTQxODY=",
+        "organizations_url": "https://api.github.com/users/LucasWilkinson/orgs",
+        "received_events_url": "https://api.github.com/users/LucasWilkinson/received_events",
+        "repos_url": "https://api.github.com/users/LucasWilkinson/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/LucasWilkinson/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/LucasWilkinson/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/LucasWilkinson",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/22648877?v=4",
+        "events_url": "https://api.github.com/users/MatthewBonanni/events{/privacy}",
+        "followers_url": "https://api.github.com/users/MatthewBonanni/followers",
+        "following_url": "https://api.github.com/users/MatthewBonanni/following{/other_user}",
+        "gists_url": "https://api.github.com/users/MatthewBonanni/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/MatthewBonanni",
+        "id": 22648877,
+        "login": "MatthewBonanni",
+        "node_id": "MDQ6VXNlcjIyNjQ4ODc3",
+        "organizations_url": "https://api.github.com/users/MatthewBonanni/orgs",
+        "received_events_url": "https://api.github.com/users/MatthewBonanni/received_events",
+        "repos_url": "https://api.github.com/users/MatthewBonanni/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/MatthewBonanni/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/MatthewBonanni/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/MatthewBonanni",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/26946864?v=4",
+        "events_url": "https://api.github.com/users/gau-nernst/events{/privacy}",
+        "followers_url": "https://api.github.com/users/gau-nernst/followers",
+        "following_url": "https://api.github.com/users/gau-nernst/following{/other_user}",
+        "gists_url": "https://api.github.com/users/gau-nernst/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/gau-nernst",
+        "id": 26946864,
+        "login": "gau-nernst",
+        "node_id": "MDQ6VXNlcjI2OTQ2ODY0",
+        "organizations_url": "https://api.github.com/users/gau-nernst/orgs",
+        "received_events_url": "https://api.github.com/users/gau-nernst/received_events",
+        "repos_url": "https://api.github.com/users/gau-nernst/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/gau-nernst/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/gau-nernst/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/gau-nernst",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 2,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/60861/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/78ba9ceba0b6a441f33eca88ca17e7155b6d4c19",
+    "title": "[Bugfix][Qwen4Exp] Carry and checkpoint the PLE short-conv state in align mode",
+    "updated_at": "2026-10-18T19:24:18Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/60861",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/7932716?v=4",
+      "events_url": "https://api.github.com/users/aijanai/events{/privacy}",
+      "followers_url": "https://api.github.com/users/aijanai/followers",
+      "following_url": "https://api.github.com/users/aijanai/following{/other_user}",
+      "gists_url": "https://api.github.com/users/aijanai/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/aijanai",
+      "id": 7932716,
+      "login": "aijanai",
+      "node_id": "MDQ6VXNlcjc5MzI3MTY=",
+      "organizations_url": "https://api.github.com/users/aijanai/orgs",
+      "received_events_url": "https://api.github.com/users/aijanai/received_events",
+      "repos_url": "https://api.github.com/users/aijanai/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/aijanai/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/aijanai/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/aijanai",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 125,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/78ba9ceba0b6a441f33eca88ca17e7155b6d4c19/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fple_layer.py",
+      "changes": 125,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fple_layer.py?ref=78ba9ceba0b6a441f33eca88ca17e7155b6d4c19",
+      "deletions": 0,
+      "filename": "vllm/models/qwen4_exp/nvidia/ple_layer.py",
+      "patch": "@@ -186,6 +186,76 @@ def get_state_shape(self) -> Sequence[tuple[int, ...]]:\n             num_spec=self.num_spec_tokens,\n         )\n \n+    def _ple_carry_state(\n+        self,\n+        conv_state: torch.Tensor,\n+        src: torch.Tensor | None,\n+        dst: torch.Tensor | None,\n+        ncols: int,\n+    ) -> torch.Tensor | None:\n+        \"\"\"Copy the state from the last computed token's block (src) into the\n+        block the kernels address (dst). Rows with src == dst are no-ops.\"\"\"\n+        if src is None or dst is None or dst.numel() == 0:\n+            return None\n+        sub = conv_state[..., :ncols]\n+        sub.index_copy_(0, dst.long(), sub.index_select(0, src.long()))\n+        return dst\n+\n+    def _ple_write_checkpoints(\n+        self,\n+        conv_state: torch.Tensor,\n+        inputs_p: torch.Tensor,\n+        token_indices_p: torch.Tensor | None,\n+        query_start_loc_p: torch.Tensor,\n+        bt_p: torch.Tensor,\n+        seq_lens_p: torch.Tensor,\n+        num_computed_p: torch.Tensor,\n+        bs: int,\n+        kmax: int,\n+        init_state: torch.Tensor,\n+    ) -> None:\n+        \"\"\"Materialize the exact state at every block boundary a prefill\n+        chunk crosses, into the block ending there, and zero its scratch.\"\"\"\n+        sl = self.conv_state_len\n+        dev = conv_state.device\n+        r = seq_lens_p.numel()\n+        k = torch.arange(kmax, device=dev)\n+        c0 = num_computed_p[:, None] // bs\n+        p = (c0 + 1 + k[None, :]) * bs  # [R, K] boundaries > c\n+        valid = p <= seq_lens_p[:, None]\n+        off = p - num_computed_p[:, None]  # offset into the chunk, >= 1\n+        cols = ((p // bs) - 1).clamp(min=0, max=bt_p.shape[1] - 1)\n+        blocks = bt_p.gather(1, cols.long())  # [R, K]\n+        j = torch.arange(sl, device=dev)\n+        pos = off[..., None] - sl + j  # [R, K, SL], < 0 -> from the initial state\n+        qsl = query_start_loc_p[:r].to(dev)\n+        # In mixed batches inputs_p is the full tensor and token_indices_p\n+        # maps prefill-relative positions into it: clamp on the index space.\n+        n_tok = (\n+            token_indices_p.numel()\n+            if token_indices_p is not None\n+            else inputs_p.shape[0]\n+        )\n+        tok = (qsl[:, None, None] + pos.clamp(min=0)).clamp(max=n_tok - 1)\n+        if token_indices_p is not None:\n+            tok = token_indices_p[tok]\n+        win_in = inputs_p[tok.long()].transpose(2, 3)  # [R, K, C, SL]\n+        init_col = (sl + pos).clamp(0, sl - 1)  # [R, K, SL]\n+        c = init_state.shape[1]\n+        win_init = (\n+            init_state[:, None]\n+            .expand(r, kmax, c, sl)\n+            .gather(3, init_col[:, :, None, :].expand(r, kmax, c, sl).long())\n+        )\n+        win = torch.where((pos >= 0)[:, :, None, :], win_in, win_init)\n+        sel = valid.reshape(-1)\n+        blocks_f = blocks.reshape(-1)[sel].long()\n+        if blocks_f.numel() == 0:\n+            return\n+        win_f = win.reshape(r * kmax, c, sl)[sel].to(conv_state.dtype)\n+        conv_state[..., :sl].index_copy_(0, blocks_f, win_f)\n+        conv_state[..., sl:].index_fill_(0, blocks_f, 0)\n+\n     def _short_conv_dilated_dispatch(\n         self,\n         inputs: torch.Tensor,\n@@ -225,6 +295,13 @@ def _short_conv_dilated_dispatch(\n             spec_state_indices = metadata.spec_state_indices_tensor[\n                 : metadata.num_spec_decodes\n             ]\n+            if metadata.ple_block_size > 0:\n+                self._ple_carry_state(\n+                    conv_state,\n+                    metadata.ple_src_spec,\n+                    metadata.ple_dst_spec,\n+                    conv_state.shape[-1],\n+                )\n             # Mixed batches stay in their original row order; the kernels map\n             # logical spec/non-spec rows instead of materializing both groups.\n             ple_conv(\n@@ -279,6 +356,13 @@ def _short_conv_dilated_dispatch(\n                 )\n \n             if has_decode:\n+                if metadata.ple_block_size > 0:\n+                    self._ple_carry_state(\n+                        conv_state,\n+                        metadata.ple_src_d,\n+                        metadata.ple_dst_d,\n+                        conv_state.shape[-1],\n+                    )\n                 ple_conv(\n                     inputs=inputs_d,\n                     residual=residual_d,\n@@ -300,6 +384,21 @@ def _short_conv_dilated_dispatch(\n                 raise ValueError(\n                     \"has_initial_states_p is required for prefill short-conv\"\n                 )\n+            dst_p = None\n+            init_state = None\n+            if metadata.ple_block_size > 0 and metadata.ple_bt_p is not None:\n+                dst_p = self._ple_carry_state(\n+                    conv_state,\n+                    metadata.ple_src_p,\n+                    metadata.ple_dst_p,\n+                    self.conv_state_len,\n+                )\n+                assert dst_p is not None\n+                init_state = (\n+                    conv_state[..., : self.conv_state_len]\n+                    .index_select(0, dst_p.long())\n+                    .clone()\n+                )\n             ple_conv(\n                 inputs=inputs_p,\n                 residual=residual_p,\n@@ -313,12 +412,38 @@ def _short_conv_dilated_dispatch(\n                 has_initial_states=has_initial_states,\n                 token_indices=token_indices_p,\n             )\n+            if dst_p is not None and init_state is not None:\n+                assert metadata.ple_bt_p is not None\n+                assert metadata.ple_seq_lens_p is not None\n+                assert metadata.ple_num_computed_p is not None\n+                self._ple_write_checkpoints(\n+                    conv_state,\n+                    inputs_p,\n+                    token_indices_p,\n+                    query_start_loc,\n+                    metadata.ple_bt_p,\n+                    metadata.ple_seq_lens_p,\n+                    metadata.ple_num_computed_p,\n+                    metadata.ple_block_size,\n+                    metadata.ple_kmax,\n+                    init_state,\n+                )\n+                # No speculative rows survive a prefill: keep the scratch clean\n+                # so stored/offloaded blocks never carry uninitialized memory.\n+                conv_state[..., self.conv_state_len :].index_fill_(0, dst_p.long(), 0)\n         else:\n             num_decode_rows = (\n                 non_spec_token_indices.numel()\n                 if non_spec_token_indices is not None\n                 else inputs.size(0)\n             )\n+            if metadata.ple_block_size > 0:\n+                self._ple_carry_state(\n+                    conv_state,\n+                    metadata.ple_src_d,\n+                    metadata.ple_dst_d,\n+                    conv_state.shape[-1],\n+                )\n             ple_conv(\n                 inputs=inputs,\n                 residual=residual,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/78ba9ceba0b6a441f33eca88ca17e7155b6d4c19/vllm%2Fmodels%2Fqwen4_exp%2Fnvidia%2Fple_layer.py",
+      "sha": "6ed89ad6a36223e45be0c46653b1102d7163699f",
+      "status": "modified"
+    },
+    {
+      "additions": 131,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/78ba9ceba0b6a441f33eca88ca17e7155b6d4c19/vllm%2Fv1%2Fattention%2Fbackends%2Fshort_conv_attn.py",
+      "changes": 131,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fattention%2Fbackends%2Fshort_conv_attn.py?ref=78ba9ceba0b6a441f33eca88ca17e7155b6d4c19",
+      "deletions": 0,
+      "filename": "vllm/v1/attention/backends/short_conv_attn.py",
+      "patch": "@@ -89,6 +89,22 @@ class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):\n     non_spec_token_indx: torch.Tensor | None = None\n     num_decode_draft_tokens_cpu: torch.Tensor | None = None\n \n+    # Align-mode state carry / boundary checkpoints for the PLE short conv.\n+    # Rows follow the kernels' order: decodes, prefills, spec requests.\n+    ple_block_size: int = 0\n+    ple_kmax: int = 0\n+    # Carry: block of the last computed token (src) -> block of the last\n+    # scheduled token (dst). Decode/spec rows live in persistent buffers.\n+    ple_src_d: torch.Tensor | None = None\n+    ple_dst_d: torch.Tensor | None = None\n+    ple_src_spec: torch.Tensor | None = None\n+    ple_dst_spec: torch.Tensor | None = None\n+    ple_src_p: torch.Tensor | None = None\n+    ple_dst_p: torch.Tensor | None = None\n+    ple_bt_p: torch.Tensor | None = None\n+    ple_seq_lens_p: torch.Tensor | None = None\n+    ple_num_computed_p: torch.Tensor | None = None\n+\n \n class PleShortConvAttentionBackend(ShortConvAttentionBackend):\n     @staticmethod\n@@ -150,6 +166,95 @@ def __init__(\n         self.has_initial_states_d = torch.empty(\n             (self.decode_cudagraph_max_bs,), dtype=torch.bool, device=device\n         )\n+        # PLE align-mode carry blocks, padded for full CUDA graph replay.\n+        self.ple_src_d = torch.empty(\n+            (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device\n+        )\n+        self.ple_dst_d = torch.empty(\n+            (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device\n+        )\n+        self.ple_src_spec = torch.empty(\n+            (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device\n+        )\n+        self.ple_dst_spec = torch.empty(\n+            (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device\n+        )\n+\n+    def _ple_carry_blocks(\n+        self, m: CommonAttentionMetadata, idx: torch.Tensor\n+    ) -> tuple[torch.Tensor, torch.Tensor]:\n+        \"\"\"(src, dst) block ids per row: src holds the state after the\n+        computed tokens, dst is the block the kernels address.\"\"\"\n+        bs = self.kv_cache_spec.block_size\n+        bt = m.block_table_tensor\n+        if idx.device != bt.device:\n+            idx = async_tensor_h2d(idx, device=bt.device)\n+        idx = idx.to(torch.long)\n+        bt_rows = bt.index_select(0, idx)\n+        seq_lens = m.seq_lens.index_select(0, idx)\n+        num_computed = m.compute_num_computed_tokens().index_select(0, idx)\n+        last_col = bt.shape[1] - 1\n+        dst_col = ((seq_lens - 1) // bs).clamp(min=0, max=last_col)\n+        src_col = ((num_computed - 1) // bs).clamp(min=0, max=last_col)\n+        dst = bt_rows.gather(1, dst_col.unsqueeze(1).long()).squeeze(1)\n+        src = bt_rows.gather(1, src_col.unsqueeze(1).long()).squeeze(1)\n+        src = torch.where(num_computed > 0, src, dst)\n+        return src.to(torch.int32), dst.to(torch.int32)\n+\n+    def _ple_align_fields(\n+        self,\n+        m: CommonAttentionMetadata,\n+        decode_idx: torch.Tensor | None,\n+        prefill_idx: torch.Tensor | None,\n+        spec_idx: torch.Tensor | None,\n+        max_prefill_query_len: int,\n+        pad_d: int | None = None,\n+        pad_spec: int | None = None,\n+    ) -> dict[str, Any]:\n+        \"\"\"Per-row carry blocks (align mode only), plus the prefill rows\n+        needed to write exact boundary checkpoints.\n+\n+        In align mode the kernels address the block of the last scheduled\n+        token, while a resumed request's state lives in the block of the last\n+        computed token. ``pad_*`` copies the decode/spec rows into the\n+        persistent buffers (padded with NULL_BLOCK_ID) for CUDA graph replay.\n+        \"\"\"\n+        if self.vllm_config.cache_config.mamba_cache_mode != \"align\":\n+            return {}\n+        bs = self.kv_cache_spec.block_size\n+        out: dict[str, Any] = {\n+            \"ple_block_size\": bs,\n+            \"ple_kmax\": max_prefill_query_len // bs + 2,\n+        }\n+        groups = (\n+            (\"d\", decode_idx, pad_d, self.ple_src_d, self.ple_dst_d),\n+            (\"spec\", spec_idx, pad_spec, self.ple_src_spec, self.ple_dst_spec),\n+            (\"p\", prefill_idx, None, None, None),\n+        )\n+        for name, idx, pad, src_buf, dst_buf in groups:\n+            if idx is None or idx.numel() == 0:\n+                continue\n+            src, dst = self._ple_carry_blocks(m, idx)\n+            if pad is not None and src_buf is not None and dst_buf is not None:\n+                n = src.numel()\n+                src_buf[:n].copy_(src, non_blocking=True)\n+                dst_buf[:n].copy_(dst, non_blocking=True)\n+                src_buf[n:pad].fill_(NULL_BLOCK_ID)\n+                dst_buf[n:pad].fill_(NULL_BLOCK_ID)\n+                src, dst = src_buf[:pad], dst_buf[:pad]\n+            out[f\"ple_src_{name}\"] = src\n+            out[f\"ple_dst_{name}\"] = dst\n+            if name == \"p\":\n+                bt = m.block_table_tensor\n+                idx_l = idx\n+                if idx_l.device != bt.device:\n+                    idx_l = async_tensor_h2d(idx_l, device=bt.device)\n+                idx_l = idx_l.to(torch.long)\n+                num_computed = m.compute_num_computed_tokens()\n+                out[\"ple_bt_p\"] = bt.index_select(0, idx_l)\n+                out[\"ple_seq_lens_p\"] = m.seq_lens.index_select(0, idx_l)\n+                out[\"ple_num_computed_p\"] = num_computed.index_select(0, idx_l)\n+        return out\n \n     def _build_non_spec_metadata(\n         self,\n@@ -189,6 +294,7 @@ def _build_non_spec_metadata(\n             )\n \n         has_initial_states_d = None\n+        ple_pad_d: int | None = None\n         if metadata.num_decodes > 0:\n             num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()\n             has_initial_states_d = num_computed_tokens[: metadata.num_decodes] > 0\n@@ -208,6 +314,7 @@ def _build_non_spec_metadata(\n                     False\n                 )\n                 has_initial_states_d = self.has_initial_states_d[:num_decode_rows]\n+                ple_pad_d = num_decode_rows\n \n         max_prefill_query_len = 0\n         if metadata.num_prefills > 0:\n@@ -222,6 +329,16 @@ def _build_non_spec_metadata(\n                 .item()\n             )\n \n+        dev = common_attn_metadata.block_table_tensor.device\n+        nd, np_ = metadata.num_decodes, metadata.num_prefills\n+        align_fields = self._ple_align_fields(\n+            common_attn_metadata,\n+            torch.arange(nd, device=dev) if nd > 0 else None,\n+            torch.arange(nd, nd + np_, device=dev) if np_ > 0 else None,\n+            None,\n+            max_prefill_query_len,\n+            pad_d=ple_pad_d,\n+        )\n         return replace(\n             metadata,\n             num_actual_tokens=common_attn_metadata.num_actual_tokens,\n@@ -232,6 +349,7 @@ def _build_non_spec_metadata(\n             has_initial_states_d=has_initial_states_d,\n             non_spec_query_start_loc=common_attn_metadata.query_start_loc,\n             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,\n+            **align_fields,\n         )\n \n     def build(  # type: ignore[override]\n@@ -313,6 +431,8 @@ def build(  # type: ignore[override]\n \n         if num_decodes == 0 and num_prefills == 0:\n             # All real requests are speculative; zero-length padding is trailing.\n+            spec_req_idx_cpu = torch.arange(num_spec_decodes)\n+            decode_req_idx_cpu = prefill_req_idx_cpu = None\n             spec_token_indx = None\n             non_spec_token_indx = None\n             spec_state_indices_tensor = block_table_tensor[:num_spec_decodes, 0]\n@@ -414,6 +534,7 @@ def build(  # type: ignore[override]\n         # Request-level buffers use ``m.num_reqs`` while token-level buffers\n         # use their independently bounded token count.\n         batch_size = m.num_reqs\n+        ple_pad_spec: int | None = None\n         if (\n             self.use_full_cuda_graph\n             and num_prefills == 0\n@@ -422,6 +543,7 @@ def build(  # type: ignore[override]\n             and num_spec_decodes <= self.decode_cudagraph_max_bs\n             and num_spec_decode_tokens <= self.decode_cudagraph_max_tokens\n         ):\n+            ple_pad_spec = batch_size\n             assert spec_state_indices_tensor is not None\n             self.spec_state_indices_tensor[:num_spec_decodes].copy_(\n                 spec_state_indices_tensor, non_blocking=True\n@@ -449,7 +571,16 @@ def build(  # type: ignore[override]\n             num_accepted_tokens = self.num_accepted_tokens[:batch_size]\n             num_accepted_tokens[num_spec_decodes:].fill_(1)\n \n+        align_fields = self._ple_align_fields(\n+            m,\n+            decode_req_idx_cpu if num_decodes > 0 else None,\n+            prefill_req_idx_cpu if num_prefills > 0 else None,\n+            spec_req_idx_cpu if num_spec_decodes > 0 else None,\n+            max_prefill_query_len,\n+            pad_spec=ple_pad_spec,\n+        )\n         return PleShortConvAttentionMetadata(\n+            **align_fields,\n             num_prefills=num_prefills,\n             num_prefill_tokens=num_prefill_tokens,\n             num_decodes=num_decodes,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/78ba9ceba0b6a441f33eca88ca17e7155b6d4c19/vllm%2Fv1%2Fattention%2Fbackends%2Fshort_conv_attn.py",
+      "sha": "62aa5b230dc39be1857e2d68f8c78571b61462a2",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "`spec_req_idx_cpu` is unbound in the all-speculative branch of `build()`.\n\nAfter #58114 (\"Reduce PLE metadata construction overhead\", merged 2026-09-28), `spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]` is assigned only in the mixed-batch `else:` branch of `short_conv_attn.py`. This PR's new call\n\n```python\nalign_fields = self._ple_align_fields(\n    m,\n    decode_req_idx_cpu if num_decodes > 0 else None,\n    prefill_req_idx_cpu if num_prefills > 0 else None,\n    spec_req_idx_cpu if num_spec_decodes > 0 else None, ...\n```\n\nruns for every batch. In a pure speculative batch (`num_decodes == 0 and num_prefills == 0`, `num_spec_decodes > 0`, the normal steady state with MTP) the `else:` branch is skipped, so the conditional expression reads an unbound local and raises `UnboundLocalError` before `_ple_align_fields` can check the cache mode. It fires in every cache mode, not only align.\n\nReproduced on 2x DGX Spark (GB10), TP=2, nightly 77154ca6 + #59958 + this PR, Qwen3.8-Flash-Next NVFP4 with MTP: engine dies on the first all-spec decode step with\n\n```\nshort_conv_attn.py\", line 571, in build\nUnboundLocalError: cannot access local variable 'spec_req_idx_cpu'\n```\n\nFix (with it the engine boots and served our full eval runs): hoist the assignment above `if num_decodes == 0 and num_prefills == 0:`; see the diff below. The PR base is also 453 commits behind main, so a rebase will be needed anyway; the line was hoisted on the base this PR was written against and #58114 moved it.\n\n```diff\n@@ -424,6 +424,8 @@\n         non_spec_req_idx: torch.Tensor | None = None\n \n+        spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]\n         if num_decodes == 0 and num_prefills == 0:\n@@ -440,7 +442,6 @@\n             query_lens = torch.diff(query_start_loc)\n-            spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]\n             decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]\n```\n\n(The PR's `test_ple.py` spec-padding case is a pure-spec batch and should hit the same path.) Not yet checked: whether the full engine then decodes correctly with the PR; our confidence is on the boot path only.\n\n_Drafted with AI assistance (Claude); reviewed and approved by the author._",
+      "created_at": "2026-10-16T18:57:04Z",
+      "diff_hunk": "@@ -449,7 +564,16 @@ def build(  # type: ignore[override]\n             num_accepted_tokens = self.num_accepted_tokens[:batch_size]\n             num_accepted_tokens[num_spec_decodes:].fill_(1)\n \n+        align_fields = self._ple_align_fields(\n+            m,\n+            decode_req_idx_cpu if num_decodes > 0 else None,\n+            prefill_req_idx_cpu if num_prefills > 0 else None,\n+            spec_req_idx_cpu if num_spec_decodes > 0 else None,",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#discussion_r4298241222",
+      "id": 4298241222,
+      "line": 578,
+      "original_line": 571,
+      "path": "vllm/v1/attention/backends/short_conv_attn.py",
+      "updated_at": "2026-10-16T18:57:09Z",
+      "user": {
+        "login": "EagleClaw89"
+      }
+    },
+    {
+      "body": "Thanks, confirmed: my base predated #58114 moving that assignment into the mixed-batch branch, and the rebase would have carried the unbound name into the pure-spec path. Rebased on current `main` (371745ebd6) and fixed in 78ba9ceba0. In the all-speculative branch the spec rows are by construction the first `num_spec_decodes` requests (the same slice `spec_state_indices_tensor` uses), so I bind `spec_req_idx_cpu = torch.arange(num_spec_decodes)` there instead of re-running `nonzero`, and leave the mixed branch as #58114 has it. While at it the carry-index uploads now go through `async_tensor_h2d` like the rest of the builder, so the align path adds no synchronous H2D copy per step.\n",
+      "created_at": "2026-10-18T13:50:36Z",
+      "diff_hunk": "@@ -449,7 +564,16 @@ def build(  # type: ignore[override]\n             num_accepted_tokens = self.num_accepted_tokens[:batch_size]\n             num_accepted_tokens[num_spec_decodes:].fill_(1)\n \n+        align_fields = self._ple_align_fields(\n+            m,\n+            decode_req_idx_cpu if num_decodes > 0 else None,\n+            prefill_req_idx_cpu if num_prefills > 0 else None,\n+            spec_req_idx_cpu if num_spec_decodes > 0 else None,",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#discussion_r4307273221",
+      "id": 4307273221,
+      "line": 578,
+      "original_line": 571,
+      "path": "vllm/v1/attention/backends/short_conv_attn.py",
+      "updated_at": "2026-10-18T13:50:36Z",
+      "user": {
+        "login": "aijanai"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "I just experienced the same thing and found that PR :D\r\nI just got pretty rarely garbage Output with LMCache and MTP, seems to match here",
+      "created_at": "2026-10-09T16:03:20Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6084556630",
+      "id": 6084556630,
+      "updated_at": "2026-10-09T16:03:51Z",
+      "user": {
+        "login": "SebastianGode"
+      }
+    },
+    {
+      "body": "Does recompiling vllm on your side with this patch overcome the issue? :)",
+      "created_at": "2026-10-09T16:37:31Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6085114313",
+      "id": 6085114313,
+      "updated_at": "2026-10-09T16:37:31Z",
+      "user": {
+        "login": "aijanai"
+      }
+    },
+    {
+      "body": "I need to recompile, it will take a bit as I also need to account for LMCache :)\r\nJust in case you are curious, that's my config:\r\n\r\n```\r\n    command:\r\n      - --host\r\n      - \"0.0.0.0\"\r\n\r\n      - --port\r\n      - \"8888\"\r\n\r\n      - --model\r\n      - /models/Jon-Nielsen/Qwen3.8-Flash-Next-AWQ-INT4-FP8PLE\r\n\r\n      - --served-model-name\r\n      - qwen3.8-flash-next\r\n\r\n      - --tensor-parallel-size\r\n      - \"2\"\r\n\r\n      - --enable-expert-parallel\r\n\r\n      - --max-model-len\r\n      - \"262144\"\r\n\r\n      - --max-num-seqs\r\n      - \"40\"\r\n\r\n      - --max-num-batched-tokens\r\n      - \"3199\"\r\n\r\n      - --gpu-memory-utilization\r\n      - \"0.93\"\r\n\r\n      - --disable-custom-all-reduce\r\n\r\n      # MTP speculative decoding\r\n      - --speculative-config\r\n      - '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'\r\n\r\n      # Compilation / CUDA graphs\r\n      - --compilation-config\r\n      - '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}'\r\n\r\n      # Tool calling / reasoning\r\n      - --enable-auto-tool-choice\r\n      - --tool-call-parser\r\n      - qwen3_xml\r\n\r\n      - --reasoning-parser\r\n      - qwen3\r\n\r\n      - --enable-prompt-tokens-details\r\n\r\n      # Prefix caching\r\n      - --enable-prefix-caching\r\n\r\n      # Qwen3.8 / Mamba\r\n      - --mamba-cache-mode\r\n      - align\r\n\r\n      - --prefix-match-unit\r\n      - \"16\"\r\n\r\n      - --override-generation-config\r\n      - '{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}'\r\n\r\n      # LMCache\r\n      - --kv-transfer-config\r\n      - '{\"kv_connector\":\"LMCacheMPConnector\",\"kv_connector_module_path\":\"lmcache.integration.vllm.lmcache_mp_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.host\":\"lmcache\",\"lmcache.mp.port\":5556}}'\r\n\r\n      # PLE\r\n      - --engram-config\r\n      - '{\"cpu_offload\":true}'\r\n\r\n      - --moe-backend\r\n      - marlin\r\n\r\n\r\n  lmcache:\r\n    image: lmcache/standalone:nightly-37280743050-amd64\r\n    container_name: lmcache\r\n    restart: unless-stopped\r\n\r\n    command:\r\n      - /opt/venv/bin/lmcache\r\n      - server\r\n      - --host=0.0.0.0\r\n      - --port=5556\r\n      - --http-port=18556\r\n\r\n      - --chunk-size=1600\r\n      - --separate-object-groups\r\n      - --l1-size-gb=42\r\n      - --eviction-policy=LRU\r\n      - --max-workers=16\r\n\r\n      - --worker-registration-grace-seconds=86400\r\n      - --l2-adapter\r\n      - '{\"type\":\"fs_native\",\"base_path\":\"/lmcache_store\",\"num_workers\":16,\"max_capacity_gb\":600,\"eviction\":{\"eviction_policy\":\"LRU\",\"trigger_watermark\":0.8,\"eviction_ratio\":0.2},\"serde\":{\"type\":\"aesgcm\",\"key_provider\":\"hkdf\",\"master_key_path\":\"/etc/lmcache/keys/master\",\"aes_bits\":128,\"max_workers\":4}}'\r\n\r\n    environment:\r\n      - NVIDIA_VISIBLE_DEVICES=all\r\n      - NVIDIA_DRIVER_CAPABILITIES=compute,utility\r\n\r\n    volumes:\r\n      - lmcache_store:/lmcache_store\r\n      - ./secrets/lmcache-master.key:/etc/lmcache/keys/master:ro\r\n\r\n    ipc: host\r\n\r\n    deploy:\r\n      resources:\r\n        reservations:\r\n          devices:\r\n            - driver: nvidia\r\n              count: 2\r\n              capabilities: [gpu]\r\n\r\n```\r\n\r\nAnd during lots of traffic some streams eventually get garbage output, other streams stay fine:\r\n```\r\n┌─ Reasoning ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\r\n!ductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\nductductductductductductductductductductductductductductductductductductductductduct\r\n└───────────────────────────────────────────────────────────────────────────────────────\r\n```\r\n\r\nIf I just patch both files into the existing image it didn't fix the problem, but generally this could be because of not recompiling it. But I somehow have my doubts too. I'm not sure what really goes wrong here tbh",
+      "created_at": "2026-10-09T17:53:08Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6086313408",
+      "id": 6086313408,
+      "updated_at": "2026-10-09T18:10:42Z",
+      "user": {
+        "login": "SebastianGode"
+      }
+    },
+    {
+      "body": "@aijanai \r\nSadly I still have the same issue even after the patch.\r\nSomething breaks it and I can't find any other issue mentioning it. Also happens with no MTP sadly. I'm unstable to fix it for now with just flags.\r\n\r\n```\r\nvllm                | (APIServer pid=1) INFO 10-11 08:34:15 [loggers.py:329] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 41.6 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 3.6%, Prefix cache hit rate: 97.6%, External prefix cache hit rate: 32.8%\r\nvllm                | (APIServer pid=1) INFO 10-11 08:34:15 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.00, Accepted throughput: 0.00 tokens/s, Drafted throughput: 124.79 tokens/s, Accepted: 0 tokens, Drafted: 1248 tokens, Per-position acceptance rate: 0.000, 0.000, 0.000, Avg Draft acceptance rate: 0.0%\r\n\r\n```",
+      "created_at": "2026-10-10T13:58:39Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6098247789",
+      "id": 6098247789,
+      "updated_at": "2026-10-11T11:47:45Z",
+      "user": {
+        "login": "SebastianGode"
+      }
+    },
+    {
+      "body": "I'd just like to report that I applied this PR to my vllm-sm80 fork and have not yet seen a recurrence of the glitchy/hallucinatory reasoning after tool-calls that I was seeing before with qwen3.8-flash-next. My setup is using 3xCMP170HX in PP=3 (sometimes PP=2) mode, with all speculative decoding currently disabled.",
+      "created_at": "2026-10-17T11:15:43Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#issuecomment-6233243646",
+      "id": 6233243646,
+      "updated_at": "2026-10-17T11:15:43Z",
+      "user": {
+        "login": "clee"
+      }
+    }
+  ],
+  "number": 60861,
+  "refs": {
+    "base": {
+      "commit": "371745ebd6c12f314402c6c319de2e7ef82c2981",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "78ba9ceba0b6a441f33eca88ca17e7155b6d4c19",
+      "repository": "aijanai/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#pullrequestreview-5519487166",
+      "id": 5519487166,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-14T14:24:38Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#pullrequestreview-5552381515",
+      "id": 5552381515,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-16T18:57:04Z",
+      "user": {
+        "login": "EagleClaw89"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/60861#pullrequestreview-5563253460",
+      "id": 5563253460,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-18T13:50:36Z",
+      "user": {
+        "login": "aijanai"
+      }
+    }
+  ]
+}

@@ -52,6 +52,29 @@ def test_skill_root_paths_form_real_reading_routes(tmp_path):
     assert checker.check_documentation(tmp_path)['status'] == 'current'
 
 
+def test_bracketed_pr_titles_do_not_hide_broken_links(tmp_path):
+    fixture(tmp_path)
+    write(tmp_path, 'README.md', '[PR: [dev] overlap](gone.md)\n'
+          '[PR: [PyTorch] linear](docs/guide.md#missing)\n')
+    issues = checker.check_documentation(tmp_path)['issues']
+    assert any('missing link target: gone.md' in issue for issue in issues)
+    assert any('missing heading anchor: docs/guide.md#missing' in issue for issue in issues)
+
+
+def test_clickable_images_keep_image_destination_checks(tmp_path):
+    fixture(tmp_path)
+    write(tmp_path, 'target.bin', 'data')
+    write(tmp_path, 'README.md', '[Guide](docs/guide.md)\n[![diagram](missing.svg)](target.bin)\n')
+    issues = checker.check_documentation(tmp_path)['issues']
+    assert any('missing link target: missing.svg' in issue for issue in issues)
+
+
+def test_invalid_outer_nested_link_is_not_a_destination(tmp_path):
+    fixture(tmp_path)
+    write(tmp_path, 'README.md', '[outer [inner](docs/guide.md)](literal-text.md)\n')
+    assert checker.check_documentation(tmp_path)['status'] == 'current'
+
+
 def test_escaped_and_case_sensitive_paths_and_main_self_links(tmp_path):
     fixture(tmp_path)
     write(tmp_path, 'README.md', '[Guide](docs/Guide.md)\n[Escape](../outside.md)\n'

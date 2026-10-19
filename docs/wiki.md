@@ -112,9 +112,13 @@ decision 为 knowledge-added（必须链接知识页）、not-relevant 或 defer
 
 `wiki-sync-prs` 初次默认发现最近 30 天更新的 PR；后续使用游标并回看一天，`--since` 可扩大窗口。已收录旧 PR 即使不在窗口，也周期复核讨论（默认七天）。`--max-prs` 只是批次，pending 未清零不推进发现游标，失败保留旧页，重复命令续采。默认窗口不是全历史覆盖；问题检索可找到任意旧 PR。
 
+发现阶段每次最多扫描20页；尚未结束时返回 `discovery_pending=true`、`next_page` 和 partial，按原命令继续即可。私有状态逐页保留原 since/started、累计队列及下一页；失败页不会作为空结果提交。发现结束前不采集队列中的 PR，也不推进公共发现游标；即使 `pending=0` 也先看 discovery_pending。不要为了消除分页上限缩窄原窗口。GitHub 按更新时间排序的跨页观察不是原子快照，后续增量仍保留一天回看。
+
 源码/文档/PR 独立失败，更新记录汇总阶段状态；partial 返回非零退出码。采集成功是 collected-not-reviewed，不是完成作者结论或训练验证。
 
 PR 原文/review/diff 变化还会产生 `wiki/pr-review/` 待复核项，关联该 PR 或同源码来源的作者页。即使主干文件未变，也不能忽略讨论对解释的影响。逐页确认后用 `wiki-review-pr PROJECT PR_ID decisions.json` 留回执；decisions 包含当前 `artifact_sha256`、总体 `note` 与 `pages`（逐页 decision/note/page_sha256）。同一 PR 未变化的重复采集不清除待办。
+
+关联扫描按知识归属检查当前作者页、环境/模型经验和外部路由；规范的 `knowledgebase/upstream/` 生成来源子树不属于作者回执范围。每个批次重新发现当前页面和内容哈希，新增页面、正文改动或移除旧引用仍会使相关复核失效；原文的采集、完整性检查和搜索索引继续独立覆盖来源子树。
 
 `wiki-update` 最后重建公共来源导航，也可单独 `wiki-catalog PROJECT`。正式补入 PR 或改注册范围后刷新目录，检索前再 wiki-index。
 
@@ -140,3 +144,5 @@ decisions 结构为 `{"pages":{PATH:DECISION},"workflows":{PATH:DECISION}}`。ap
 工作流在线时 Agent 自主批量更新与复核，CLI 不自动启动后台模型。无需每次检索全量刷新。作者页、来源页和锁随公共仓；私有任务数据库、objects 和 experience 随整个任务工作区备份，不能当普通下载缓存清理。
 
 官网抓取目前限登记的 docs.nvidia.com HTML；Git 文档限登记模式中的文本类型。原始图表和其他格式通过固定链接按需查看。网页最新、主干、PR head、正式发布、HCU 分支和任务版本分别标记，不用页数宣称全模型/全 backend 已精读。Wiki 功能不依赖 GPU，现场命令和真实训练验证另行完成。
+
+官网迁站或重定向时，先查证同一官方站点的实际 canonical 页面与正文，再更新 `documents`、来源入口、第三方声明和受影响作者链接，重新采集 HTML/文本及内容指纹。不要关闭重定向保护、把 URL 变化当作正文未变，或仅修总入口而继续以旧站快照代表新教程；旧固定证据保留其历史身份。

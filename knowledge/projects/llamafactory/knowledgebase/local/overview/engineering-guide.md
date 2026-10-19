@@ -10,9 +10,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime
-  execution
+reviewed_on: '2026-10-20'
+coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: hiyouga-llama-factory
   path: README.md

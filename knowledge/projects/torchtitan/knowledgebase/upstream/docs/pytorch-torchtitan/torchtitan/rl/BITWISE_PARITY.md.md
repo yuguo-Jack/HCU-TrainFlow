@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: torchtitan/rl/BITWISE_PARITY.md
-raw_sha256: e2d8599828473b3abd1f7beb8db39606d27870602bbcc21279c072175dac0144
+raw_sha256: 00e77fab6806fa0986f1f4b16ca3769ceee98f7959ea76680fd8ba81d064fce0
 sources: []
-generated_body_sha256: 53aee147c1516e1ad78a9bf866d164b2faa029a5fbfd4418be54b8ef7bc3bdef
+generated_body_sha256: 5efa58e6c8f20eb9a3260354b8d842415f595347faaa6a3254ea88ff968874a0
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/BITWISE_PARITY.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/BITWISE_PARITY.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/BITWISE_PARITY.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -51,8 +51,8 @@ deterministic=True)` on both the trainer and generator configs. The shared
 toggle is `set_batch_invariance()` in `torchtitan/distributed/batch_invariant.py`, called
 from:
 
-- `torchtitan/rl/trainer.py` (trainer)
-- `torchtitan/rl/generator.py` (generator)
+- `torchtitan/rl/trainer/trainer.py` (trainer)
+- `torchtitan/rl/generator/generator.py` (generator)
 - `torchtitan/rl/generate.py` (standalone generation)
 
 ## Sources of non-batch-invariance
@@ -83,7 +83,7 @@ same accumulation order. Three groups of fixes make that hold.
   `torch.backends.cuda.matmul.allow_tf32 = False`,
   `torch.backends.cudnn.allow_tf32 = False`).
 
-**Generator-only patches** (`torchtitan/rl/model/batch_invariance.py`) --
+**Generator-only patches** (`torchtitan/rl/generator/vllm/batch_invariance.py`) --
 the generator runs the same model inside vLLM, whose fused kernels must be routed
 back to the trainer's ops:
 

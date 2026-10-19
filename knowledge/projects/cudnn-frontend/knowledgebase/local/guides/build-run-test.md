@@ -9,41 +9,41 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-cudnn-frontend
   path: README.md
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: 4cabe0bbf2a76d4b5bbb1b06eae8d1de73aaf8cddb756e38903b6f62689b9279
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: f4e2131aeab9f5f6697805b9546aef78544370a6950a5c046ff3637b066ed4fa
 - source: nvidia-cudnn-frontend
   path: setup.py
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: 1751eb8280739e6b7be513a36eaaaec357ce406c2a4d0f76290efafe1e615cdd
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: 2f928bd4305e6dda4cda1f74dba910a1706eb65028dfaf855d04c74fd7c0ab55
 - source: nvidia-cudnn-frontend
   path: pyproject.toml
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: 27fb5d86264af4263cb8faec5597b6c412a499c0b69d04bb803eac73e868c865
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: e2493ad4ae041a32c698d9b6a870ed3cd2f06d9c641fcc8fb1658ec22fc57eb4
 - source: nvidia-cudnn-frontend
   path: CMakeLists.txt
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: 2b29c9721c9a03fe90378f323a5bdd2c11c2381fce8f43cfd3c9cfe6e8df9ce6
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: b52e3feb56f99ef81cfb24b78f4b8d58bebdae96a9ff422f5e1586a3d9d9f9c4
 - source: nvidia-cudnn-frontend
   path: samples/cpp/CMakeLists.txt
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
   sha256: 082d97b1796be55f09fa144c9a510be9ccd3db25725b7eee483492bcbf838ed9
 - source: nvidia-cudnn-frontend
   path: samples/cpp/sdpa/fp16_bwd.cpp
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
   sha256: 62f47b922848b39b6ec9ee07f2dbac8e65b2f46cfffb1e327e9b050a4d9f6bc2
 - source: nvidia-cudnn-frontend
   path: docs/quickstart.mdx
-  commit: 941078f2ce6aa0a45ac5813b81760a19c616732a
-  sha256: 93ed00e9f0f26ad5a4f31971b226ffaef47477e435e61cc66e4f9f9b47c456ea
+  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  sha256: b2d16117ddd1956a6b5fe4e231b5a9260dce41f6130b47627e77d2b77e8a378a
 - source: nvidia-cudnn-frontend-docs
   path: quickstart
-  commit: e231f1ecf1c04ca05f5c5f66898be6f84da14a37fddd16491d733ebb95e321c1
-  sha256: efb405e71ec606566ab443881a1101611dbc8a64b45cb487a6c421efd2c1a1c4
-  url: https://docs.nvidia.com/deeplearning/cudnn/latest/quickstart.html
+  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
+  sha256: a360753931c52ab40d573da739ed74d9d730d7c0063c3634116f89b7075f6c7c
+  url: https://docs.nvidia.com/cudnn/quickstart/
   revision_kind: web-content-fingerprint
 ---
 # cuDNN Frontend 编译安装、运行示例与测试路线
@@ -63,6 +63,10 @@ C++ Frontend 主要通过头文件接入；编译应用和样例仍需匹配 CUD
 
 构建步骤应记录 source SHA、CUDA/cuDNN/框架/DSL 版本、编译配置、链接库和加载位置。源码已向新的 Python 图封装发展，`cudnn.Graph` 和较显式的 `cudnn.pygraph` 教程可能并存；不能将不同版本片段拼成一段未经验证的命令。
 
+当前 `a7269d7607db` 已把 Python binding 从 pybind11 改为 nanobind 3.0.1以上且小于4，CMake 最低3.26；源码安装须按本版 build-system 准备，旧构建依赖不是当前合同。可选 `CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON` 仅接受 CPython≥3.12 且 GIL 开启，默认 OFF；它不把整个 Python 支持下界提高到3.12，也不证明所有可选 GPU runtime/平台都有对应 wheel。
+
+新官网 Quick Start 使用 `with cudnn.Graph(...) as graph` 构图，退出 context 时 validate/build，之后 `graph(...)` 执行；inputs/outputs 名字列表确定调用次序。构图时只用 tensor 元数据，执行时才读值。这个高级入口与显式 pygraph 的计划/工作区生命周期可以对照，不能把教程的矩阵尺寸、宽松误差和性能当训练验收；主控不因此安装 NV 包。
+
 ## 正确性与性能验收
 
 单测至少覆盖 forward、backward、非连续布局、变长/边界、RNG、不同 head/专家规模及实际需要的精度。运行数为零、unsupported、skip 与 fallback 分开报告。性能分构图/编译、首次调用、稳态 execute 和模型墙钟；同步位置与 workspace 分配边界保持一致。
@@ -71,13 +75,13 @@ C++ Frontend 主要通过头文件接入；编译应用和样例仍需匹配 CUD
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/README.md)
-- [nvidia-cudnn-frontend: setup.py](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/setup.py)
-- [nvidia-cudnn-frontend: pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/pyproject.toml)
-- [nvidia-cudnn-frontend: CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/CMakeLists.txt)
-- [nvidia-cudnn-frontend: samples/cpp/CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/cpp/CMakeLists.txt)
-- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/samples/cpp/sdpa/fp16_bwd.cpp)
-- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/docs/quickstart.mdx)
-- [nvidia-cudnn-frontend-docs: quickstart](https://docs.nvidia.com/deeplearning/cudnn/latest/quickstart.html)
+- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/README.md)
+- [nvidia-cudnn-frontend: setup.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/setup.py)
+- [nvidia-cudnn-frontend: pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/pyproject.toml)
+- [nvidia-cudnn-frontend: CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/CMakeLists.txt)
+- [nvidia-cudnn-frontend: samples/cpp/CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/cpp/CMakeLists.txt)
+- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/cpp/sdpa/fp16_bwd.cpp)
+- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/quickstart.mdx)
+- [nvidia-cudnn-frontend-docs: quickstart](https://docs.nvidia.com/cudnn/quickstart/)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。

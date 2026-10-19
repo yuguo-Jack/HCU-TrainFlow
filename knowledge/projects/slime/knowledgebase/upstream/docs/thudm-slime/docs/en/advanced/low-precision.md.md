@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 05e3b017fed9e02de418c2fbac9d75602a534be5
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/advanced/low-precision.md
-raw_sha256: dfa5b830983f2425e95cc1cc03cccb8f743e2c2311841a2233d74fde64aa56aa
+raw_sha256: 2bb781c2df429eddfca6d81acd052a9d6bb37599ae6fcd4cef151f0496f848da
 sources: []
-generated_body_sha256: 101ccea183549c29ac1c396dff0e86c0df3415ad434474687cebfbccca654828
+generated_body_sha256: 918e184cb4ae473c11d0ef50567c7bf7de2043b28c1351cce2f1ba32e190ea44
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/low-precision.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/05e3b017fed9e02de418c2fbac9d75602a534be5/docs/en/advanced/low-precision.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/low-precision.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -156,10 +156,9 @@ RUNTIME_ENV_JSON="{
 
 3. Launch an example:
 
-```bash
-# Moonlight-16B-A3B INT4 training
-bash scripts/low_precision/run-moonlight-16B-A3B-int4.sh
+The Qwen3 launchers use Instruct-2507 checkpoints (256K context) with a 128K response limit and CP. Quantize and convert that same checkpoint; older Qwen3 weights use different RoPE settings.
 
+```bash
 # Qwen3-30B-A3B INT4 training
 bash scripts/low_precision/run-qwen3-30B-A3B-int4.sh
 

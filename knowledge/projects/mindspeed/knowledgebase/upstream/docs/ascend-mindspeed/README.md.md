@@ -10,23 +10,27 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed
-commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
 path: README.md
-raw_sha256: 10c6731705c141a7f72921b1ec77fbb498adb617d4a2639c7831209b26bbea34
+raw_sha256: f2f0148d8dfbbfae0babf11fb869674846a2f9ad04be763b5718835ed5388378
 sources: []
-generated_body_sha256: 9aaa446a113ed461cb6a6cc7144ef50c9eb951dcafae7a531832377ed3259a38
+generated_body_sha256: b6e89bd74d23d1fbacfea9ce799d2207fc66e21e81d24bbc23b59df631908edd
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed / README.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/README.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
 ---
 
 # <p align="center"> <img src="docs/LOGO.png" height="172px" width="598px"> </p>
+
+<p align="center">
+   <a href="./README_en.md"> English </a> | 简体中文
+</p>
 
 <p align="center">
     <a> <img src="https://img.shields.io/badge/python-3.8%7C3.9%7C3.10-green"> </a>
@@ -301,16 +305,7 @@ MindSpeed docs目录下的文档适用CC-BY 4.0许可证，具体请参见[LICEN
 
 ---
 
-🔎 MindSpeed-Core 由华为公司的下列部门联合贡献 ：
-
-华为公司：
-
-- 昇腾计算产品部
-- 计算算法部
-- 计算软件平台部
-- 计算技术开发部
-- 公共开发部：NAIE
-- 网络技术实验室
+🔎 MindSpeed-Core 由华为技术有限公司与开发者联合贡献，
 
 此外，MindSpeed-Core 感谢以下团队对项目的贡献：
 

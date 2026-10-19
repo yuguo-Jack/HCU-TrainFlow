@@ -9,32 +9,48 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/parallel_state.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 414ecaf3b1891e8d621e5ec86a80af9d2d313d4393ac11e83832ff4bf7257dd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 57ab2c1765c4a20a92379bf50a6485bcd50859de86a59af5332e6b2bb8bcfd2a
 - source: nvidia-megatron-lm
   path: docs/user-guide/parallelism-guide.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 8fe555b69e65abd543acc633c23f1b33491d6b0266a7b6c9848dd997222e674d
 - source: nvidia-megatron-lm
   path: megatron/core/pipeline_parallel/schedules.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 3719d850b8822e221f30472881b8802b8f88ce02167856130fae97849d1d91ee
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 4d1c5904df165b8917029602466ebb0f5409db591b912e6969f4561ecc385171
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
 - source: nvidia-megatron-lm
   path: docs/user-guide/features/pipeline_parallel_layout.md
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: a8f23d24f026a955abe527e45bd83fde707e967110a9ad868cc72c4a1e265c5f
+- source: nvidia-megatron-lm
+  path: megatron/core/tensor_parallel/gtp_parallel_layout.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ce5dd0d608afdf0f0af8dc472679bbdf7b0f6f9c20670a2feaf7a3ca4d7126d5
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/test_gtp_parallel_layout.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: c993d3330ac50624e0d86338ab4133c5767eea1a853edb4f8ed5202af7683c21
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/pipeline_parallel/test_pp_mhc_compatibility.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 0690ffc6afde9c3df97f4392c9d384821c37a4de145ad8079c6a9c4b6109a0aa
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/pipeline_parallel/test_pp_mhc_dsv4_shapes.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 21fa62f7559076e91aca7876c7852b1cf4f996e8946f8d54907df51a70b49389
 kind: authored
 ---
 
@@ -71,14 +87,22 @@ PP 不只按层数均分：embedding、attention/MLP/MoE、MTP 和末端 loss �
 
 先将能装下的布局与 worst-rank 峰值列出，再比较 profiler-off 有效吞吐和同域等待。`overlap_p2p_comm` 与批量 P2P 等组合有配置约束；改布局后回到 [overlap](overlap.md) 检查互斥项与 [loss](training-and-loss.md) 检查缩放。这里只解释固定官方机制，HCU 组合支持需独立验收。
 
+## GTP 的 token 布局与权重布局
+
+`GTPParallelLayout` 将权重分片/复制与序列/batch 分配分开。CLI 的配置 CP 在初始化时乘入 GTP sequence shards，成为 runtime CP；直接 Python 调用 `initialize_model_parallel` 则应传已解析的 runtime CP。重复乘一次会错算 rank、seq 整除与通信组。
+
+batch 计数采用 `batch_parallel_size`，权重/optimizer 分片采用 `num_weight_replicas`。GTP 的一部分 rank 可共享同一序列，不能继续一律将 DP 乘全部 GTP degree 当作独立样本数。当前 sequence shards 必须整除 weight-remat degree，TP>1 时需要 SP，并受 torch_dist、非 FSDP 等约束；`tests/unit_tests/test_gtp_parallel_layout.py` 给出纯布局边界。
+
+mHC 的普通 PP/VPP schedule 现按 `hidden_size × mhc_num_residual_streams` 传递残差，包括末物理 rank 回到首 rank 的下一虚拟 chunk。GPT 的 mHC+PP+MTP 仍受入口限制，HybridModel 的 MTP 另有对照测试；PP 与 EP-overlap 的组合检查也仍保留。比较新布局时同时检查 P2P shape、batch/loss 分母与 checkpoint，不能只看初始化成功。
+
 ## 验证
 
 改变拓扑后重新构造 context；旧 trace/环境检查/质量报告仍保留，但不能为新配置放行。DP/TP/EP collective 单测的数据量与 dtype 应来自真实模型，机内与机间测试不能互相替代。
 
 ## 固定源码与更新范围
 
-- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/parallel_state.py)
-- [docs/user-guide/parallelism-guide.md](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/docs/user-guide/parallelism-guide.md)
-- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/pipeline_parallel/schedules.py)
+- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/parallel_state.py)
+- [docs/user-guide/parallelism-guide.md](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/parallelism-guide.md)
+- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/pipeline_parallel/schedules.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。

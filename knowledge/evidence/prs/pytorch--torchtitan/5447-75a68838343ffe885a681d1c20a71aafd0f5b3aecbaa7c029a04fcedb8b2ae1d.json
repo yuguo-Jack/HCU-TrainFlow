@@ -1,0 +1,624 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "17691567c83954e5ae05b0a46a5ab194bf372e4779c3fe14e6c53dba5bca0122",
+      "isPrivate": false,
+      "numbers": [
+        5454,
+        5453,
+        5451,
+        5450,
+        5448,
+        5447,
+        5445,
+        5444
+      ],
+      "observed_at": "2026-10-19T18:02:07.221490+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4961,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "95788b0536a5e10c6e17f2ebf73cdd00ec88c931",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** The RL trainer binds itself to one NUMA node but keeps torch's thread count for the whole host, so the weight push's CPU copies oversubscribe the node. This PR gives each trainer rank its share of the node's cores. The push drops from 1.05 s to 0.08 s at Qwen3-0.6B; in a 35B microbench the put drops from 13.4 s to 0.76 s per rank.\n\n**Problem**\n1. **Binding.** `Trainer.__init__` calls `maybe_apply_numa_binding`, which limits the trainer process to the CPUs of its GPU's NUMA node: 96 of the host's 192 cores on our 2-socket H100 hosts.\n2. **Threads.** torch keeps its default thread count, one per physical core of the whole host: 192.\n3. **The push.** After each optimizer step, the trainer's TorchStore put copies every tensor of its CPU snapshot into shared memory. Each copy starts 192 threads on the node's 96 cores.\n4. **Cost.** The push takes 1.05 s at Qwen3-0.6B, and only 0.03 s of it is the GPU -> CPU copy. At 35B with 3 trainer ranks on a node, the put takes 13.4 s per rank.\n\n**Solution**\n1. Right after binding, `Trainer.__init__` calls `torch.set_num_threads(_num_cpu_threads_per_rank(device_index=...))`.\n2. `_num_cpu_threads_per_rank` divides the physical cores the process is bound to by the trainer ranks on its NUMA node (one rank per visible GPU, as `train.py` launches them).\n\n```text\n2 sockets x 96 cores x 2 threads; GPUs 0-3 on node 0, GPUs 4-7 on node 1\ntrainer on GPU 0       192 logical CPUs / 2 per core / 1 rank on node 0   = 96 threads\ntrainer on GPUs 0-3    192 logical CPUs / 2 per core / 4 ranks on node 0  = 24 threads\ntrainer on GPUs 0-7    192 logical CPUs / 2 per core / 4 ranks per node   = 24 threads\n```\n\n3. **Why in `__init__`.** Each thread applies torch's thread count on its first parallel CPU op (ATen's `lazy_init_num_threads` is thread-local). The put runs in an `asyncio.to_thread` worker. Once that worker has run a copy, a later `set_num_threads` doesn't reach it.\n4. **Unchanged:** trainers on other devices (binding is a no-op there), the generator, and the other trainers.\n\n**Results**\n\nNumerics: unchanged. Training math runs on the GPU; this PR changes only how many CPU threads the copies use.\n\n```text\nQwen3-0.6B RL run: multi-turn debug env (12 turns), 4 prompts x 16 samples, trainer and generator on 1 H100 each,\nTorchStore over TCP fallback, 6 steps, same upstream main for both arms. Trainer spans from the structured log.\n\n                                                         main              this PR\nTorchStore put (its own log line), warm pushes           0.91-1.13 s       0.036-0.063 s\npush_model_state_dict span, pushes that ran alone        0.95-1.18 s (6)   0.077-0.087 s (3)\nfirst push (allocates the shared memory)                 1.97 s            0.82 s\ntiming/step/forward_backward, median of steps 2-6        2.967 s           2.974 s\n```\n\n```text\nTorchStore put microbench: real routing put from CPU-only Monarch actors, NUMA-bound like the trainer,\nwarm medians. Qwen3-0.6B: 1 rank on node 0. 35B: Qwen3.5-35B-A3B shapes (69 GB bf16), 4 ranks with dim-0\nshards (17.3 GB each) pushing at once, 3 on node 0 and 1 on node 1; max over ranks.\n\n                          default threads   this PR's count\n0.6B put                  1.60 s            0.046 s   (96 threads)\n35B put per rank          13.4 s            0.76 s    (32 threads on node 0)\n```\n\n- In 3 of the 5 measured steps of the RL run with this PR, the next batch was ready before the push ended. `forward_backward` then started during the push, and the push could reply only after it (2.98-3.22 s). A follow-up PR awaits the push before `forward_backward`; that is only cheap with this fix.\n- The first `forward_backward` of the PR run spent 16.6 s in its first `preprocess_inputs` (main: 0.04 s). Two more runs with this change took 0.036 and 0.047 s, and no compile cache was written during it. I think it was a host stall, not this PR.\n\nYou may ask:\n- Why not a fixed count, like 16? The right count depends on the host. At 35B, 16 threads put in 0.85 s against 0.76 s for 32.\n- Why not count `torch.cuda.device_count()` instead of the GPUs on the node? A trainer on all 8 GPUs would get 12 threads instead of 24.\n- Why not bind with `AffinityMode.EXCLUSIVE`? It narrows each rank's CPUs further but leaves torch at 192 threads.\n- Why only the RL trainer? The other callers of `maybe_apply_numa_binding` are the RL generator, where vLLM already sets torch to 1 thread, and `experiments/graph_trainer`. The core trainer doesn't bind.\n\nNOTE:\n- Measured on H100 hosts (AMD EPYC, 2 x 96 cores, 2 threads per core). Needs retesting on Blackwell hosts (Grace CPUs, no SMT, 2 GPUs per NUMA node), where the formula gives 72 / 2 = 36 threads.\n- `_num_cpu_threads_per_rank` reads the GPU's NUMA node from sysfs, like the binding does. The binding falls back silently when that fails; this helper raises.\n\n**Follow up**\n- [ ] `experiments/graph_trainer` binds the same way and likely has the same oversubscription for its CPU work.\n- [ ] The generator has the opposite problem: vLLM runs torch on 1 thread, so its TorchStore get copies on one thread (estimated ~4 s at 35B).\n\n**Test plan**\n- GPU: the Results RL run, main vs this PR (`timing/weight_sync/trainer_push_model_state_dict`, trainer spans).\n- The helper on this host: `CUDA_VISIBLE_DEVICES=0` -> 96, `0,1,2,3` -> 24, `0-7` -> 24, `4,5` -> 48.\n- `pytest tests/rl/unit_tests/cpu`: same results as main (7 failures and 2 collection errors in verifiers/search-r1 tests that also fail on main in my env).\n",
+      "changedFiles": 1,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "f1b20b9b7c80458678de297e4951a5b465734703",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 5447,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "can we put all these into `maybe_apply_numa_binding` function one line above",
+                  "createdAt": "2026-10-17T04:38:22Z",
+                  "databaseId": 4301407165,
+                  "diffHunk": "@@ -118,6 +119,13 @@ def __init__(\n         engine = self.engine\n         self._controller_state = MirroredState()\n         maybe_apply_numa_binding(engine.device.index, engine.device.type)\n+        if engine.device.type == \"cuda\":",
+                  "line": 122,
+                  "originalLine": 122,
+                  "path": "torchtitan/rl/trainer/trainer.py",
+                  "updatedAt": "2026-10-17T04:38:39Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5447#discussion_r4301407165"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xN1QwNDozODoyMlrPAAAAAQBiQ70=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5556234352,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-17T04:38:39Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5447#pullrequestreview-5556234352"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xN1QwNDozODozOVq0MjAyNi0xMC0xN1QwNDozODoyMlrPAAAAAUstaHA=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[rl] Set the trainer's CPU thread count after NUMA binding",
+      "updatedAt": "2026-10-17T04:38:39Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5447"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5447/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5447/commits"
+      },
+      "html": {
+        "href": "https://github.com/pytorch/torchtitan/pull/5447"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5447"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5447/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5447"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/statuses/f1b20b9b7c80458678de297e4951a5b465734703"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 33,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "pytorch:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "95788b0536a5e10c6e17f2ebf73cdd00ec88c931",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "body": "**TLDR:** The RL trainer binds itself to one NUMA node but keeps torch's thread count for the whole host, so the weight push's CPU copies oversubscribe the node. This PR gives each trainer rank its share of the node's cores. The push drops from 1.05 s to 0.08 s at Qwen3-0.6B; in a 35B microbench the put drops from 13.4 s to 0.76 s per rank.\n\n**Problem**\n1. **Binding.** `Trainer.__init__` calls `maybe_apply_numa_binding`, which limits the trainer process to the CPUs of its GPU's NUMA node: 96 of the host's 192 cores on our 2-socket H100 hosts.\n2. **Threads.** torch keeps its default thread count, one per physical core of the whole host: 192.\n3. **The push.** After each optimizer step, the trainer's TorchStore put copies every tensor of its CPU snapshot into shared memory. Each copy starts 192 threads on the node's 96 cores.\n4. **Cost.** The push takes 1.05 s at Qwen3-0.6B, and only 0.03 s of it is the GPU -> CPU copy. At 35B with 3 trainer ranks on a node, the put takes 13.4 s per rank.\n\n**Solution**\n1. Right after binding, `Trainer.__init__` calls `torch.set_num_threads(_num_cpu_threads_per_rank(device_index=...))`.\n2. `_num_cpu_threads_per_rank` divides the physical cores the process is bound to by the trainer ranks on its NUMA node (one rank per visible GPU, as `train.py` launches them).\n\n```text\n2 sockets x 96 cores x 2 threads; GPUs 0-3 on node 0, GPUs 4-7 on node 1\ntrainer on GPU 0       192 logical CPUs / 2 per core / 1 rank on node 0   = 96 threads\ntrainer on GPUs 0-3    192 logical CPUs / 2 per core / 4 ranks on node 0  = 24 threads\ntrainer on GPUs 0-7    192 logical CPUs / 2 per core / 4 ranks per node   = 24 threads\n```\n\n3. **Why in `__init__`.** Each thread applies torch's thread count on its first parallel CPU op (ATen's `lazy_init_num_threads` is thread-local). The put runs in an `asyncio.to_thread` worker. Once that worker has run a copy, a later `set_num_threads` doesn't reach it.\n4. **Unchanged:** trainers on other devices (binding is a no-op there), the generator, and the other trainers.\n\n**Results**\n\nNumerics: unchanged. Training math runs on the GPU; this PR changes only how many CPU threads the copies use.\n\n```text\nQwen3-0.6B RL run: multi-turn debug env (12 turns), 4 prompts x 16 samples, trainer and generator on 1 H100 each,\nTorchStore over TCP fallback, 6 steps, same upstream main for both arms. Trainer spans from the structured log.\n\n                                                         main              this PR\nTorchStore put (its own log line), warm pushes           0.91-1.13 s       0.036-0.063 s\npush_model_state_dict span, pushes that ran alone        0.95-1.18 s (6)   0.077-0.087 s (3)\nfirst push (allocates the shared memory)                 1.97 s            0.82 s\ntiming/step/forward_backward, median of steps 2-6        2.967 s           2.974 s\n```\n\n```text\nTorchStore put microbench: real routing put from CPU-only Monarch actors, NUMA-bound like the trainer,\nwarm medians. Qwen3-0.6B: 1 rank on node 0. 35B: Qwen3.5-35B-A3B shapes (69 GB bf16), 4 ranks with dim-0\nshards (17.3 GB each) pushing at once, 3 on node 0 and 1 on node 1; max over ranks.\n\n                          default threads   this PR's count\n0.6B put                  1.60 s            0.046 s   (96 threads)\n35B put per rank          13.4 s            0.76 s    (32 threads on node 0)\n```\n\n- In 3 of the 5 measured steps of the RL run with this PR, the next batch was ready before the push ended. `forward_backward` then started during the push, and the push could reply only after it (2.98-3.22 s). A follow-up PR awaits the push before `forward_backward`; that is only cheap with this fix.\n- The first `forward_backward` of the PR run spent 16.6 s in its first `preprocess_inputs` (main: 0.04 s). Two more runs with this change took 0.036 and 0.047 s, and no compile cache was written during it. I think it was a host stall, not this PR.\n\nYou may ask:\n- Why not a fixed count, like 16? The right count depends on the host. At 35B, 16 threads put in 0.85 s against 0.76 s for 32.\n- Why not count `torch.cuda.device_count()` instead of the GPUs on the node? A trainer on all 8 GPUs would get 12 threads instead of 24.\n- Why not bind with `AffinityMode.EXCLUSIVE`? It narrows each rank's CPUs further but leaves torch at 192 threads.\n- Why only the RL trainer? The other callers of `maybe_apply_numa_binding` are the RL generator, where vLLM already sets torch to 1 thread, and `experiments/graph_trainer`. The core trainer doesn't bind.\n\nNOTE:\n- Measured on H100 hosts (AMD EPYC, 2 x 96 cores, 2 threads per core). Needs retesting on Blackwell hosts (Grace CPUs, no SMT, 2 GPUs per NUMA node), where the formula gives 72 / 2 = 36 threads.\n- `_num_cpu_threads_per_rank` reads the GPU's NUMA node from sysfs, like the binding does. The binding falls back silently when that fails; this helper raises.\n\n**Follow up**\n- [ ] `experiments/graph_trainer` binds the same way and likely has the same oversubscription for its CPU work.\n- [ ] The generator has the opposite problem: vLLM runs torch on 1 thread, so its TorchStore get copies on one thread (estimated ~4 s at 35B).\n\n**Test plan**\n- GPU: the Results RL run, main vs this PR (`timing/weight_sync/trainer_push_model_state_dict`, trainer spans).\n- The helper on this host: `CUDA_VISIBLE_DEVICES=0` -> 96, `0,1,2,3` -> 24, `0-7` -> 24, `4,5` -> 48.\n- `pytest tests/rl/unit_tests/cpu`: same results as main (7 failures and 2 collection errors in verifiers/search-r1 tests that also fail on main in my env).\n",
+    "changed_files": 1,
+    "closed_at": null,
+    "comments": 0,
+    "comments_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5447/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5447/commits",
+    "created_at": "2026-10-16T14:33:32Z",
+    "deletions": 0,
+    "diff_url": "https://github.com/pytorch/torchtitan/pull/5447.diff",
+    "draft": false,
+    "head": {
+      "label": "pytorch:felipemello1/weight-push/0-trainer-num-threads",
+      "ref": "felipemello1/weight-push/0-trainer-num-threads",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "f1b20b9b7c80458678de297e4951a5b465734703",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5447",
+    "id": 4889869739,
+    "issue_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5447",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "009900",
+        "default": false,
+        "description": "This label is managed by the Meta Open Source bot.",
+        "id": 6319105129,
+        "name": "CLA Signed",
+        "node_id": "LA_kwDOK5EkJM8AAAABeKXkaQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/CLA%20Signed"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10889347594,
+        "name": "ciflow/rl",
+        "node_id": "LA_kwDOK5EkJM8AAAACiQ5CCg",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/rl"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "89F2C0",
+        "default": false,
+        "description": "Run 1-GPU Fake PG integration tests",
+        "id": 12159706465,
+        "name": "ciflow/fake-pg",
+        "node_id": "LA_kwDOK5EkJM8AAAAC1MZlYQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/fake-pg"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": "d9538436045e3647b8944d09e6e39a99642fadbf",
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOK5EkJM8AAAABI3V9qw",
+    "number": 5447,
+    "patch_url": "https://github.com/pytorch/torchtitan/pull/5447.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/40016222?v=4",
+        "events_url": "https://api.github.com/users/wwwjn/events{/privacy}",
+        "followers_url": "https://api.github.com/users/wwwjn/followers",
+        "following_url": "https://api.github.com/users/wwwjn/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wwwjn/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/wwwjn",
+        "id": 40016222,
+        "login": "wwwjn",
+        "node_id": "MDQ6VXNlcjQwMDE2MjIy",
+        "organizations_url": "https://api.github.com/users/wwwjn/orgs",
+        "received_events_url": "https://api.github.com/users/wwwjn/received_events",
+        "repos_url": "https://api.github.com/users/wwwjn/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/wwwjn/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wwwjn/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/wwwjn",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/62389750?v=4",
+        "events_url": "https://api.github.com/users/pzhan9/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pzhan9/followers",
+        "following_url": "https://api.github.com/users/pzhan9/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pzhan9/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pzhan9",
+        "id": 62389750,
+        "login": "pzhan9",
+        "node_id": "MDQ6VXNlcjYyMzg5NzUw",
+        "organizations_url": "https://api.github.com/users/pzhan9/orgs",
+        "received_events_url": "https://api.github.com/users/pzhan9/received_events",
+        "repos_url": "https://api.github.com/users/pzhan9/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pzhan9/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pzhan9/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/pzhan9",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}",
+    "review_comments": 1,
+    "review_comments_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5447/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/f1b20b9b7c80458678de297e4951a5b465734703",
+    "title": "[rl] Set the trainer's CPU thread count after NUMA binding",
+    "updated_at": "2026-10-17T04:38:39Z",
+    "url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5447",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+      "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+      "followers_url": "https://api.github.com/users/felipemello1/followers",
+      "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+      "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/felipemello1",
+      "id": 23004953,
+      "login": "felipemello1",
+      "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+      "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+      "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+      "repos_url": "https://api.github.com/users/felipemello1/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/felipemello1",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 33,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/f1b20b9b7c80458678de297e4951a5b465734703/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "changes": 33,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Ftrainer%2Ftrainer.py?ref=f1b20b9b7c80458678de297e4951a5b465734703",
+      "deletions": 0,
+      "filename": "torchtitan/rl/trainer/trainer.py",
+      "patch": "@@ -15,6 +15,7 @@\n import torch\n import torchstore as ts\n from torch.distributed.tensor import DTensor\n+from torch.numa import binding as numa_binding\n from torchstore import RankRole\n \n from torchtitan.components.checkpointer.utils import canonical_fqn\n@@ -118,6 +119,13 @@ def __init__(\n         engine = self.engine\n         self._controller_state = MirroredState()\n         maybe_apply_numa_binding(engine.device.index, engine.device.type)\n+        if engine.device.type == \"cuda\":\n+            # torch defaults to one thread per physical core of the host, which oversubscribes the\n+            # bound node: the weight push takes 1.0 s instead of 0.08 s at Qwen3-0.6B. Set it before\n+            # the push's worker thread starts: a thread reads the count on its first parallel op.\n+            torch.set_num_threads(\n+                _num_cpu_threads_per_rank(device_index=engine.device.index)\n+            )\n \n         # Only cast when the generator and training dtypes differ. A CPU\n         # staging snapshot is still required when no cast is needed.\n@@ -500,3 +508,28 @@ def _setup_staging_model_state_dict(self) -> dict[str, torch.Tensor]:\n     async def initialize_torchstore_client(self) -> None:\n         \"\"\"Initialize this process as a TorchStore routing publisher.\"\"\"\n         await ts.client(role=RankRole.PUBLISHER)\n+\n+\n+def _num_cpu_threads_per_rank(device_index: int) -> int:\n+    \"\"\"Return this rank's share of its NUMA node's physical cores.\n+\n+    Assumes one trainer rank per visible GPU, as `train.py` launches them.\n+\n+    Example (2 sockets x 96 cores x 2 threads; GPUs 0-3 on NUMA node 0, GPUs 4-7 on node 1):\n+        trainer on GPU 0     -> 192 logical CPUs / 2 per core / 1 rank on node 0  = 96 threads\n+        trainer on GPUs 0-3  -> 192 logical CPUs / 2 per core / 4 ranks on node 0 = 24 threads\n+        trainer on GPUs 0-7  -> 192 logical CPUs / 2 per core / 4 ranks per node  = 24 threads\n+    \"\"\"\n+    cpus = os.sched_getaffinity(0)\n+    threads_per_core = len(\n+        numa_binding._get_logical_cpu_indices_sharing_same_physical_core_as(\n+            logical_cpu_index=min(cpus)\n+        )\n+    )\n+    numa_node_index = numa_binding._get_numa_node_index_for_device_index(\n+        device_index=device_index\n+    )\n+    num_ranks_on_node = len(\n+        numa_binding._get_device_indices_for_numa_node(numa_node_index=numa_node_index)\n+    )\n+    return max(1, len(cpus) // threads_per_core // num_ranks_on_node)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/f1b20b9b7c80458678de297e4951a5b465734703/torchtitan%2Frl%2Ftrainer%2Ftrainer.py",
+      "sha": "90662d66aa0fc79d99e2513f2a909da5165a4a7f",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "can we put all these into `maybe_apply_numa_binding` function one line above",
+      "created_at": "2026-10-17T04:38:22Z",
+      "diff_hunk": "@@ -118,6 +119,13 @@ def __init__(\n         engine = self.engine\n         self._controller_state = MirroredState()\n         maybe_apply_numa_binding(engine.device.index, engine.device.type)\n+        if engine.device.type == \"cuda\":",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5447#discussion_r4301407165",
+      "id": 4301407165,
+      "line": 122,
+      "original_line": 122,
+      "path": "torchtitan/rl/trainer/trainer.py",
+      "updated_at": "2026-10-17T04:38:39Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ],
+  "issue_comments": [],
+  "number": 5447,
+  "refs": {
+    "base": {
+      "commit": "95788b0536a5e10c6e17f2ebf73cdd00ec88c931",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "f1b20b9b7c80458678de297e4951a5b465734703",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5447#pullrequestreview-5556234352",
+      "id": 5556234352,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-17T04:38:39Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ]
+}

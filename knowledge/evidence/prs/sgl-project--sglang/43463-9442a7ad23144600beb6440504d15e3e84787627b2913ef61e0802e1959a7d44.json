@@ -1,0 +1,297 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "43462bbf6423f77475d92b90ac42e81134d1247b66da7a57bbf1b057075e60b2",
+      "isPrivate": false,
+      "numbers": [
+        43467,
+        43466,
+        43465,
+        43464,
+        43463,
+        43462,
+        43461,
+        43460
+      ],
+      "observed_at": "2026-10-19T18:36:58.653219+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4556,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "bd7c7971ba74851375807f93f7f09d6896bc6ac0",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nFor Qwen3.8-Flash-Next B200 BF16 (TP4, NEXTN MTP 3/1/4) the QSA decode indexer takes about 3 ms of a 28.75 ms bs64 decode step. It costs that much even at short contexts, where QSA selects every block anyway. Three pieces of it scale with the max context instead of the live one:\n\n- `tilelang_qsa_mqa_decode` launches a `(rows, max_pages / 4)` grid. The CUDA-graph page table is sized for the max context: 262144 tokens are 65536 compressed tokens, which is 4096 pages of 16, or 1024 CTAs per row. At bs64 verify (256 rows) this launches 262K CTAs per layer, almost all of which exit immediately. Each call takes 137 us, 1.78 ms per step.\n- For a row whose compressed length fits the k = 512 top-k, `fast_topk` writes `0..len-1` without reading its scores. So the scoring work on that row is thrown away, and so is the `-inf` pre-fill of the whole `rows x max_model_len` logits matrix, since `fast_topk` never reads past a row's length.\n- `_qsa_fused_kv_prepare` writes every row's full packed width: 2112 tokens of K and V at 256 dims, zero-filling the part past the valid count. `trtllm_decode` reads each row only up to `valid_counts`. At 256 rows this writes 537 MB per call, 76 us per call and 1.06 ms per step.\n\n## Modifications\n\n- `qsa/mqa.py`:\n  - The decode kernel now takes `ctas_per_row`, chosen as 1, 16 or 256 by row count so the grid covers about four waves; the three levels bound the number of TileLang specializations. Each row's CTAs stride over its 64-token groups up to `context_len` in a dynamic loop.\n  - `min_scored_len` skips rows at or below that length.\n  - `tilelang_qsa_mqa_decode(..., min_scored_len=)` leaves those rows, and the columns past each row's length, unset (`torch.empty`). The default of 0 keeps the previous fully `-inf`-filled output.\n- `qsa/qsa_indexer.py`: `select_decode_tokens` passes `min_scored_len=block_topk` only on the `fast_topk` (k = 512) path. That path writes `0..len-1` for rows that fit k without reading their scores, and never reads past a length. Every other top-k path keeps the full `-inf` fill.\n- `qsa/fused_kv.py`: `fused_kv_prepare(..., visible_page_size=)` applies on the block-index path (`compress_ratio > 1`). A packed tile at or past the row's valid count, rounded up to the page, returns before loading or storing. The count uses the same formula as the `COUNTS` tile.\n- `qwen_sparse_attn_backend.py`:\n  - The trtllm sparse decode passes `visible_page_size=64`, the trtllm page.\n  - The packed scratch is allocated with `torch.zeros`, so bytes that are never written cannot be NaN. The allocation happens once, at full graph capacity during the eager warmup before capture.\n- Tests:\n  - `test_qsa_indexer.py`: the decode grid scores every group at 256, 16 and 1 CTAs per row, checked against the torch reference. With `min_scored_len`, `fast_topk` returns the same selection; the unset logits are NaN-poisoned through the caching allocator.\n  - `test_qsa_fused_kv_prepare.py`: with `visible_page_size`, the visible pages are bitwise equal to the full write and nothing past them is written (NaN sentinel), for counts at and around page edges and widths 1 and 4.\n\n## Accuracy Tests\n\n- `test_qsa_indexer.py` and `test_qsa_fused_kv_prepare.py`: 187 passed. `test_qsa.py`: 49 passed, 1 skipped. All run on B200.\n- GSM8K through `sglang.test.run_eval` (chat, 5-shot, 200 questions, greedy, max 4096 tokens), Qwen3.8-Flash-Next BF16, TP4, MTP: 0.985 with this PR, 0.98 on main.\n- Needle in a haystack: a 4-digit code planted at 10/50/90% depth in natural text of 1.1K, 4K, 16.6K, 35K and 70K tokens, chat API, greedy. 15/15 pass. Above 2048 tokens QSA's sparse selection is active, so these runs exercise the restructured scoring path.\n\n## Speed Tests and Profiling\n\nSetup:\n- 8x B200, two servers built from the same commit: main `5cbf949839` on GPUs 4-7 and this PR on GPUs 0-3.\n- Both use the cookbook B200 BF16 low-latency flags.\n- Load: closed bursts of chat requests with `ignore_eos`, 1536 output tokens each.\n- Step time = running × accept_len / gen_throughput, taken as the median over the steady-state `Decode batch` log lines.\n\n| Concurrency | main | this PR |\n|---|---:|---:|\n| 1 | 6.29 ms | 6.22 ms |\n| 16 | 16.55 ms | 15.77 ms (-4.7%) |\n| 64 | 28.75 ms | 26.54 ms (-7.7%) |\n\nTorch profile, bs64 decode, TP0, 10 steps. The main-side profile is from `fba3ad4b1f`, whose QSA files are identical to `5cbf949839`.\n\n| Kernel, per step | main | this PR |\n|---|---:|---:|\n| TileLang decode scoring | 1.778 ms (137 us/call) | 0.041 ms (3.2 us/call) |\n| `_qsa_fused_kv_prepare` | 1.060 ms (76 us/call) | 0.317 ms (22.6 us/call) |\n| logits fill | 0.165 ms | 0.036 ms |\n| Total | 3.03 ms | 0.42 ms |\n\nLong contexts do not regress. Scoring plus `fast_topk` for 256 rows over a 64K-token context takes 365 us on main and 333 us with this PR. This is an eager measurement including launch overhead, and its 287 MB compressed cache is larger than L2.\n\nTrade-off: up to three TileLang decode-scoring specializations are compiled per head configuration, where main compiled one.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (No user-facing change.)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #38011429774](https://github.com/sgl-project/sglang/actions/runs/38011429774)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38011429321](https://github.com/sgl-project/sglang/actions/runs/38011429321)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38011429772](https://github.com/sgl-project/sglang/actions/runs/38011429772)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "/rerun-failed-ci extra",
+            "createdAt": "2026-10-11T04:57:23Z",
+            "databaseId": 6105626153,
+            "updatedAt": "2026-10-11T04:57:23Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43463#issuecomment-6105626153"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-10-11T04:57:43Z",
+            "databaseId": 6105628406,
+            "updatedAt": "2026-10-11T04:57:43Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43463#issuecomment-6105628406"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWvsfvY=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "002abb989d9261e5c149957a71ad73204500e1b3",
+      "headRepository": {
+        "nameWithOwner": "yuan-luo/sglang"
+      },
+      "mergeCommit": {
+        "oid": "23a1f53fc3a0e7f5fc94c4a4abd4eb9bcf9c6042"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-12T14:47:46Z",
+      "number": 43463,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "kaixih"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5477646384,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-10T04:48:26Z",
+            "url": "https://github.com/sgl-project/sglang/pull/43463#pullrequestreview-5477646384"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMFQwNDo0ODoyNlq0MjAyNi0xMC0xMFQwNDo0ODoyNlrPAAAAAUZ-QDA=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "MERGED",
+      "title": "[QSA] Bound the decode indexer's work by the context length",
+      "updatedAt": "2026-10-16T02:25:57Z",
+      "url": "https://github.com/sgl-project/sglang/pull/43463"
+    },
+    "reused_files": {
+      "artifact_path": "knowledge/evidence/prs/sgl-project--sglang/43463-a2cac22fa3fef28fb0bcf91ca81b485088fc83183fad5d36a6733c0595498898.json",
+      "artifact_sha256": "a2cac22fa3fef28fb0bcf91ca81b485088fc83183fad5d36a6733c0595498898",
+      "reason": "Same immutable head/base repository+commit pair and changed_files; original fully paginated files response reused. Discussions are freshly queried.",
+      "refs": {
+        "base": {
+          "commit": "bd7c7971ba74851375807f93f7f09d6896bc6ac0",
+          "repository": "sgl-project/sglang"
+        },
+        "head": {
+          "commit": "002abb989d9261e5c149957a71ad73204500e1b3",
+          "repository": "yuan-luo/sglang"
+        }
+      }
+    },
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "bd7c7971ba74851375807f93f7f09d6896bc6ac0"
+    },
+    "body": "## Motivation\n\nFor Qwen3.8-Flash-Next B200 BF16 (TP4, NEXTN MTP 3/1/4) the QSA decode indexer takes about 3 ms of a 28.75 ms bs64 decode step. It costs that much even at short contexts, where QSA selects every block anyway. Three pieces of it scale with the max context instead of the live one:\n\n- `tilelang_qsa_mqa_decode` launches a `(rows, max_pages / 4)` grid. The CUDA-graph page table is sized for the max context: 262144 tokens are 65536 compressed tokens, which is 4096 pages of 16, or 1024 CTAs per row. At bs64 verify (256 rows) this launches 262K CTAs per layer, almost all of which exit immediately. Each call takes 137 us, 1.78 ms per step.\n- For a row whose compressed length fits the k = 512 top-k, `fast_topk` writes `0..len-1` without reading its scores. So the scoring work on that row is thrown away, and so is the `-inf` pre-fill of the whole `rows x max_model_len` logits matrix, since `fast_topk` never reads past a row's length.\n- `_qsa_fused_kv_prepare` writes every row's full packed width: 2112 tokens of K and V at 256 dims, zero-filling the part past the valid count. `trtllm_decode` reads each row only up to `valid_counts`. At 256 rows this writes 537 MB per call, 76 us per call and 1.06 ms per step.\n\n## Modifications\n\n- `qsa/mqa.py`:\n  - The decode kernel now takes `ctas_per_row`, chosen as 1, 16 or 256 by row count so the grid covers about four waves; the three levels bound the number of TileLang specializations. Each row's CTAs stride over its 64-token groups up to `context_len` in a dynamic loop.\n  - `min_scored_len` skips rows at or below that length.\n  - `tilelang_qsa_mqa_decode(..., min_scored_len=)` leaves those rows, and the columns past each row's length, unset (`torch.empty`). The default of 0 keeps the previous fully `-inf`-filled output.\n- `qsa/qsa_indexer.py`: `select_decode_tokens` passes `min_scored_len=block_topk` only on the `fast_topk` (k = 512) path. That path writes `0..len-1` for rows that fit k without reading their scores, and never reads past a length. Every other top-k path keeps the full `-inf` fill.\n- `qsa/fused_kv.py`: `fused_kv_prepare(..., visible_page_size=)` applies on the block-index path (`compress_ratio > 1`). A packed tile at or past the row's valid count, rounded up to the page, returns before loading or storing. The count uses the same formula as the `COUNTS` tile.\n- `qwen_sparse_attn_backend.py`:\n  - The trtllm sparse decode passes `visible_page_size=64`, the trtllm page.\n  - The packed scratch is allocated with `torch.zeros`, so bytes that are never written cannot be NaN. The allocation happens once, at full graph capacity during the eager warmup before capture.\n- Tests:\n  - `test_qsa_indexer.py`: the decode grid scores every group at 256, 16 and 1 CTAs per row, checked against the torch reference. With `min_scored_len`, `fast_topk` returns the same selection; the unset logits are NaN-poisoned through the caching allocator.\n  - `test_qsa_fused_kv_prepare.py`: with `visible_page_size`, the visible pages are bitwise equal to the full write and nothing past them is written (NaN sentinel), for counts at and around page edges and widths 1 and 4.\n\n## Accuracy Tests\n\n- `test_qsa_indexer.py` and `test_qsa_fused_kv_prepare.py`: 187 passed. `test_qsa.py`: 49 passed, 1 skipped. All run on B200.\n- GSM8K through `sglang.test.run_eval` (chat, 5-shot, 200 questions, greedy, max 4096 tokens), Qwen3.8-Flash-Next BF16, TP4, MTP: 0.985 with this PR, 0.98 on main.\n- Needle in a haystack: a 4-digit code planted at 10/50/90% depth in natural text of 1.1K, 4K, 16.6K, 35K and 70K tokens, chat API, greedy. 15/15 pass. Above 2048 tokens QSA's sparse selection is active, so these runs exercise the restructured scoring path.\n\n## Speed Tests and Profiling\n\nSetup:\n- 8x B200, two servers built from the same commit: main `5cbf949839` on GPUs 4-7 and this PR on GPUs 0-3.\n- Both use the cookbook B200 BF16 low-latency flags.\n- Load: closed bursts of chat requests with `ignore_eos`, 1536 output tokens each.\n- Step time = running × accept_len / gen_throughput, taken as the median over the steady-state `Decode batch` log lines.\n\n| Concurrency | main | this PR |\n|---|---:|---:|\n| 1 | 6.29 ms | 6.22 ms |\n| 16 | 16.55 ms | 15.77 ms (-4.7%) |\n| 64 | 28.75 ms | 26.54 ms (-7.7%) |\n\nTorch profile, bs64 decode, TP0, 10 steps. The main-side profile is from `fba3ad4b1f`, whose QSA files are identical to `5cbf949839`.\n\n| Kernel, per step | main | this PR |\n|---|---:|---:|\n| TileLang decode scoring | 1.778 ms (137 us/call) | 0.041 ms (3.2 us/call) |\n| `_qsa_fused_kv_prepare` | 1.060 ms (76 us/call) | 0.317 ms (22.6 us/call) |\n| logits fill | 0.165 ms | 0.036 ms |\n| Total | 3.03 ms | 0.42 ms |\n\nLong contexts do not regress. Scoring plus `fast_topk` for 256 rows over a 64K-token context takes 365 us on main and 333 us with this PR. This is an eager measurement including launch overhead, and its 287 MB compressed cache is larger than L2.\n\nTrade-off: up to three TileLang decode-scoring specializations are compiled per head configuration, where main compiled one.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). (No user-facing change.)\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #38011429774](https://github.com/sgl-project/sglang/actions/runs/38011429774)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38011429321](https://github.com/sgl-project/sglang/actions/runs/38011429321)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #38011429772](https://github.com/sgl-project/sglang/actions/runs/38011429772)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "yuan-luo/sglang"
+      },
+      "sha": "002abb989d9261e5c149957a71ad73204500e1b3"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/43463",
+    "merge_commit_sha": "23a1f53fc3a0e7f5fc94c4a4abd4eb9bcf9c6042",
+    "merged": true,
+    "merged_at": "2026-10-12T14:47:46Z",
+    "number": 43463,
+    "state": "closed",
+    "title": "[QSA] Bound the decode indexer's work by the context length",
+    "updated_at": "2026-10-16T02:25:57Z"
+  },
+  "files": [
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Ffused_kv.py",
+      "changes": 19,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Ffused_kv.py?ref=002abb989d9261e5c149957a71ad73204500e1b3",
+      "deletions": 2,
+      "filename": "python/sglang/srt/layers/attention/qsa/fused_kv.py",
+      "patch": "@@ -33,6 +33,7 @@ def _qsa_fused_kv_prepare(\n     RATIO: tl.constexpr,\n     IB: tl.constexpr,\n     CHAIN: tl.constexpr,\n+    PAGE: tl.constexpr,\n ):\n     tiles = tl.cdiv(S, B) + 2\n     pid = tl.program_id(0)\n@@ -48,10 +49,18 @@ def _qsa_fused_kv_prepare(\n         c = tile * B + tl.arange(0, B)\n         if EXPAND:\n             n = tl.minimum((tl.load(LENGTH + row) // RATIO), IB) * RATIO\n-            blocks = tl.load(IDX + row * IB + c // RATIO, c < IB * RATIO, -1)\n-            expanded = blocks * RATIO + c % RATIO\n             qpos = tl.load(QPOS + row)\n             tail_start = (qpos + 1) // RATIO * RATIO\n+            if PAGE > 0:\n+                # Same count as the COUNTS tile below; the paged consumer never\n+                # reads past the page that holds it.\n+                tail_count = tl.maximum(\n+                    0, tl.minimum(qpos + 1, tl.load(LENGTH + row)) - tail_start\n+                )\n+                if tile * B >= (n + tail_count + PAGE - 1) // PAGE * PAGE:\n+                    return\n+            blocks = tl.load(IDX + row * IB + c // RATIO, c < IB * RATIO, -1)\n+            expanded = blocks * RATIO + c % RATIO\n             tail_off = c - n\n             tail = tail_start + tail_off\n             pos = tl.where(\n@@ -136,7 +145,12 @@ def fused_kv_prepare(\n     compress_ratio=1,\n     query_positions=None,\n     chain_positions=False,\n+    visible_page_size=0,\n ):\n+    \"\"\"With block indices (compress_ratio > 1) and ``visible_page_size`` set, a\n+    row's packed K/V is written only up to its valid count rounded up to that\n+    page: a paged consumer bounded by ``counts`` never reads further, and the\n+    rest of the row keeps whatever the buffer held.\"\"\"\n     rows, input_topk = indices.shape\n     topk = input_topk * compress_ratio + compress_ratio - 1\n     if rows == 0:\n@@ -174,5 +188,6 @@ def fused_kv_prepare(\n         compress_ratio,\n         input_topk,\n         chain_positions,\n+        visible_page_size if compress_ratio > 1 else 0,\n         num_warps=4,\n     )",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Ffused_kv.py",
+      "sha": "8da03a2d64104ec98ab5844299daab63232097b4",
+      "status": "modified"
+    },
+    {
+      "additions": 94,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Fmqa.py",
+      "changes": 142,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Fmqa.py?ref=002abb989d9261e5c149957a71ad73204500e1b3",
+      "deletions": 48,
+      "filename": "python/sglang/srt/layers/attention/qsa/mqa.py",
+      "patch": "@@ -1,6 +1,7 @@\n \"\"\"Weight-free TileLang MQA operators for the simple QSA indexer;\n the torch implementations are the fallback and the reference.\"\"\"\n \n+import functools\n import math\n from typing import Optional\n \n@@ -225,8 +226,8 @@ def _tilelang_qsa_mqa_decode_kernel(\n         heads: int,\n         head_dim: int,\n         page_size: int = 64,\n-        groups_per_cta: int = 1,\n-        num_stages: int = 3,\n+        ctas_per_row: int = 1,\n+        min_scored_len: int = 0,\n         threads: int = 128,\n         dtype: str = \"bfloat16\",\n     ):\n@@ -249,49 +250,54 @@ def kernel(\n             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore\n             Scale: T.float32,\n         ):\n-            with T.Kernel(\n-                batch,\n-                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),\n-                threads=threads,\n-            ) as (bx, group_block):\n+            # A fixed number of CTAs per row strides over that row's groups, so the\n+            # grid no longer scales with the page-table width (the max context).\n+            with T.Kernel(batch, ctas_per_row, threads=threads) as (bx, cta):\n                 q_shared = T.alloc_shared([heads, head_dim], dtype)\n                 k_shared = T.alloc_shared([GROUP, head_dim], dtype)\n                 scores = T.alloc_fragment([GROUP, heads], T.float32)\n                 reduced = T.alloc_fragment([GROUP], T.float32)\n-                T.copy(Q[bx, 0, :, :], q_shared)\n+                context_len = T.alloc_var(T.int32)\n                 context_len = ContextLens[bx]\n-\n-                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):\n-                    group = group_block * groups_per_cta + gi\n-                    if group * GROUP < context_len:\n-                        # TileLang's pipeliner rejects dynamic loops around smem copies;\n-                        # unroll at the Python level instead.\n-                        for sp in range(sub_pages):\n-                            if (group * sub_pages + sp) * page_size < context_len:\n-                                T.copy(\n-                                    KCache[\n-                                        PageTable[bx, group * sub_pages + sp],\n-                                        :,\n-                                        0,\n-                                        :,\n-                                    ],\n-                                    k_shared[sp * page_size : (sp + 1) * page_size, :],\n-                                )\n-                        T.gemm(\n-                            k_shared,\n-                            q_shared,\n-                            scores,\n-                            transpose_B=True,\n-                            clear_accum=True,\n-                            policy=T.GemmWarpPolicy.FullCol,\n-                        )\n-                        for token, head in T.Parallel(GROUP, heads):\n-                            scores[token, head] = T.max(scores[token, head], 0.0)\n-                        T.reduce_sum(scores, reduced, dim=1, clear=True)\n-                        for token in T.Parallel(GROUP):\n-                            position = group * GROUP + token\n-                            if position < context_len:\n-                                Logits[bx, position] = reduced[token] / Scale\n+                num_groups = T.ceildiv(context_len, GROUP)\n+\n+                # Rows at or below min_scored_len select every block, so their\n+                # scores are never read.\n+                if context_len > min_scored_len:\n+                    T.copy(Q[bx, 0, :, :], q_shared)\n+                    for step in T.serial(T.ceildiv(num_groups, ctas_per_row)):\n+                        group = step * ctas_per_row + cta\n+                        if group < num_groups:\n+                            # TileLang's pipeliner rejects dynamic loops around smem\n+                            # copies; unroll the sub-pages at the Python level.\n+                            for sp in range(sub_pages):\n+                                if (group * sub_pages + sp) * page_size < context_len:\n+                                    T.copy(\n+                                        KCache[\n+                                            PageTable[bx, group * sub_pages + sp],\n+                                            :,\n+                                            0,\n+                                            :,\n+                                        ],\n+                                        k_shared[\n+                                            sp * page_size : (sp + 1) * page_size, :\n+                                        ],\n+                                    )\n+                            T.gemm(\n+                                k_shared,\n+                                q_shared,\n+                                scores,\n+                                transpose_B=True,\n+                                clear_accum=True,\n+                                policy=T.GemmWarpPolicy.FullCol,\n+                            )\n+                            for token, head in T.Parallel(GROUP, heads):\n+                                scores[token, head] = T.max(scores[token, head], 0.0)\n+                            T.reduce_sum(scores, reduced, dim=1, clear=True)\n+                            for token in T.Parallel(GROUP):\n+                                position = group * GROUP + token\n+                                if position < context_len:\n+                                    Logits[bx, position] = reduced[token] / Scale\n \n         return kernel\n \n@@ -351,15 +357,40 @@ def tilelang_qsa_mqa_prefill(\n     return logits\n \n \n+# CTAs per decode row: few enough levels to bound the TileLang specializations, and\n+# a grid of about four waves (at least one CTA per row).\n+_DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)\n+\n+\n+@functools.lru_cache(maxsize=None)\n+def _num_sms(device_index: int) -> int:\n+    return torch.cuda.get_device_properties(device_index).multi_processor_count\n+\n+\n+def _decode_ctas_per_row(rows: int, device: torch.device) -> int:\n+    wanted = -(-4 * _num_sms(device.index or 0) // max(rows, 1))\n+    for level in _DECODE_CTAS_PER_ROW_LEVELS:\n+        if level >= wanted:\n+            return level\n+    return _DECODE_CTAS_PER_ROW_LEVELS[-1]\n+\n+\n def tilelang_qsa_mqa_decode(\n     q: torch.Tensor,\n     k_cache: torch.Tensor,\n     page_table: torch.Tensor,\n     context_lens: torch.Tensor,\n     max_model_len: int,\n     score_scale: Optional[float] = None,\n+    *,\n+    min_scored_len: int = 0,\n ) -> torch.Tensor:\n-    \"\"\"Validated TileLang paged decode kernel with weights removed.\"\"\"\n+    \"\"\"Validated TileLang paged decode kernel with weights removed.\n+\n+    With ``min_scored_len`` > 0, rows whose context length is at most that are not\n+    scored and the logits past each row's context length are left unset: only for\n+    a top-k that selects every block of a row that fits k and reads nothing past\n+    the length.\"\"\"\n \n     if not HAS_TILELANG:\n         raise RuntimeError(\"TileLang is unavailable\")\n@@ -370,12 +401,17 @@ def tilelang_qsa_mqa_decode(\n             \"TileLang QSA decode requires a compressed page size of \"\n             f\"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}\"\n         )\n-    logits = torch.full(\n-        (q.shape[0], max_model_len),\n-        -float(\"inf\"),\n-        dtype=torch.float32,\n-        device=q.device,\n-    )\n+    if min_scored_len > 0:\n+        logits = torch.empty(\n+            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device\n+        )\n+    else:\n+        logits = torch.full(\n+            (q.shape[0], max_model_len),\n+            -float(\"inf\"),\n+            dtype=torch.float32,\n+            device=q.device,\n+        )\n     if not q.shape[0] or not max_model_len:\n         return logits\n     # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires\n@@ -400,6 +436,8 @@ def tilelang_qsa_mqa_decode(\n         heads=kernel_heads,\n         head_dim=head_dim,\n         page_size=page_size,\n+        ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),\n+        min_scored_len=min_scored_len,\n         dtype=_TILELANG_DTYPES[scoring_dtype],\n     )(\n         q_kernel.unsqueeze(1).contiguous(),\n@@ -431,10 +469,18 @@ def qsa_mqa_decode(\n     context_lens: torch.Tensor,\n     max_model_len: int,\n     score_scale: Optional[float] = None,\n+    *,\n+    min_scored_len: int = 0,\n ) -> torch.Tensor:\n     if q.is_cuda and HAS_TILELANG:\n         return tilelang_qsa_mqa_decode(\n-            q, k_cache, page_table, context_lens, max_model_len, score_scale\n+            q,\n+            k_cache,\n+            page_table,\n+            context_lens,\n+            max_model_len,\n+            score_scale,\n+            min_scored_len=min_scored_len,\n         )\n     return torch_qsa_mqa_decode(\n         q, k_cache, page_table, context_lens, max_model_len, score_scale",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Fmqa.py",
+      "sha": "7949506945d13078362e8e21fa1155d34f21dd91",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Fqsa_indexer.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Fqsa_indexer.py?ref=002abb989d9261e5c149957a71ad73204500e1b3",
+      "deletions": 1,
+      "filename": "python/sglang/srt/layers/attention/qsa/qsa_indexer.py",
+      "patch": "@@ -499,14 +499,18 @@ def select_decode_tokens(\n         sequence_lengths: torch.Tensor,\n         defer_expansion: bool = False,\n     ) -> torch.Tensor:\n+        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading\n+        # their scores, and never reads past a row's length.\n+        use_fast_topk = q.is_cuda and self.block_topk == 512\n         logits = qsa_mqa_decode(\n             q,\n             compressed_cache,\n             compressed_page_table,\n             compressed_lengths,\n             max_model_len,\n+            min_scored_len=self.block_topk if use_fast_topk else 0,\n         )\n-        if logits.is_cuda and self.block_topk == 512:\n+        if use_fast_topk:\n             # Decode rows start at zero, so compressed lengths double as row lengths;\n             # skip the generic zero-fill + subtract.\n             from sglang.kernels.ops.attention.fast_topk import fast_topk",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqsa%2Fqsa_indexer.py",
+      "sha": "883671944cfcc76edddc88ffa8c1a94b80eea210",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqwen_sparse_attn_backend.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqwen_sparse_attn_backend.py?ref=002abb989d9261e5c149957a71ad73204500e1b3",
+      "deletions": 2,
+      "filename": "python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py",
+      "patch": "@@ -1669,9 +1669,11 @@ def _get_fa2_scratch(\n         buffers = self._fa2_scratch.get(key)\n         if buffers is None or buffers[0].shape[0] < capacity:\n             shape = (capacity, num_kv_heads, head_dim)\n+            # Zeroed once: a row is packed only up to its last visible page, so\n+            # bytes past it are never written and must not be NaN garbage.\n             buffers = (\n-                torch.empty(shape, dtype=dtype, device=device),\n-                torch.empty(shape, dtype=dtype, device=device),\n+                torch.zeros(shape, dtype=dtype, device=device),\n+                torch.zeros(shape, dtype=dtype, device=device),\n             )\n             self._fa2_scratch[key] = buffers\n         return buffers[0][:capacity], buffers[1][:capacity]\n@@ -1760,6 +1762,8 @@ def _forward_trtllm_sparse(\n                     if compress_ratio > 1\n                     else None\n                 ),\n+                # trtllm_decode reads each row only up to valid_counts.\n+                visible_page_size=page,\n             )\n         else:\n             qwen_sparse_valid_counts_triton(",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/002abb989d9261e5c149957a71ad73204500e1b3/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fqwen_sparse_attn_backend.py",
+      "sha": "f96cbd7523f153dee82bd51ec138a59582c9b543",
+      "status": "modified"
+    },
+    {
+      "additions": 71,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/002abb989d9261e5c149957a71ad73204500e1b3/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Fqsa%2Ftest_qsa_fused_kv_prepare.py",
+      "changes": 71,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Fqsa%2Ftest_qsa_fused_kv_prepare.py?ref=002abb989d9261e5c149957a71ad73204500e1b3",
+      "deletions": 0,
+      "filename": "test/registered/kernels/ops/attention/qsa/test_qsa_fused_kv_prepare.py",
+      "patch": "@@ -236,6 +236,77 @@ def candidate():\n         torch.testing.assert_close(actual.float(), ref.float(), rtol=0, atol=0)\n \n \n+@pytest.mark.parametrize(\"width\", [1, 4])\n+def test_fused_block_expansion_writes_only_visible_pages(width):\n+    \"\"\"With visible_page_size, a row's packed K/V matches the full write up to its\n+    valid count rounded up to the page (counts at, below and past page edges),\n+    and nothing after that page is written.\"\"\"\n+    torch.manual_seed(7)\n+    page, stride = 64, 2112\n+    bases = [1, 2, 3, 4, 5, 63, 64, 65, 127, 128, 129, 2047, 2048, 2049, 2052, 8192]\n+    requests = len(bases)\n+    rows, length = requests * width, 9216\n+    mapping = (torch.randperm(requests * length, device=\"cuda\") + 1).view(\n+        requests, length\n+    )\n+    req = torch.arange(requests, device=\"cuda\").repeat_interleave(width).int()\n+    lens = torch.tensor(\n+        [bases[r // width] + r % width for r in range(rows)],\n+        device=\"cuda\",\n+        dtype=torch.int32,\n+    )\n+    positions = lens - 1\n+    loc = mapping[req.long(), positions.long()].contiguous()\n+    blocks = torch.full((rows, 512), -1, device=\"cuda\", dtype=torch.int32)\n+    for row in range(rows):\n+        n = int(lens[row]) // 4\n+        chosen = torch.randperm(n, device=\"cuda\")[:512]\n+        blocks[row, : chosen.numel()] = chosen.int()\n+    k = torch.randn(requests * length + 1, 1, 256, device=\"cuda\", dtype=torch.bfloat16)\n+    v = torch.randn_like(k)\n+    nk = torch.randn(rows, 1, 256, device=\"cuda\", dtype=torch.bfloat16)\n+    nv = torch.randn_like(nk)\n+\n+    def run(visible_page_size, fill):\n+        kc, vc = k.clone(), v.clone()\n+        counts = torch.empty(rows, device=\"cuda\", dtype=torch.int32)\n+        ok = torch.full(\n+            (rows * stride, 1, 256), fill, device=\"cuda\", dtype=torch.bfloat16\n+        )\n+        ov = torch.full_like(ok, fill)\n+        fused_kv_prepare(\n+            kc,\n+            vc,\n+            nk,\n+            nv,\n+            loc,\n+            mapping,\n+            req,\n+            blocks,\n+            lens,\n+            counts,\n+            ok,\n+            ov,\n+            width,\n+            compress_ratio=4,\n+            query_positions=positions,\n+            chain_positions=True,\n+            visible_page_size=visible_page_size,\n+        )\n+        return kc, vc, counts, ok.view(rows, stride, -1), ov.view(rows, stride, -1)\n+\n+    full = run(0, 0.0)\n+    paged = run(page, float(\"nan\"))\n+    for actual, ref in zip(paged[:3], full[:3]):\n+        assert torch.equal(actual, ref)\n+    counts = full[2]\n+    for row in range(rows):\n+        visible = -(-int(counts[row]) // page) * page\n+        for actual, ref in zip(paged[3:], full[3:]):\n+            assert torch.equal(actual[row, :visible], ref[row, :visible])\n+            assert torch.isnan(actual[row, visible:]).all()\n+\n+\n def test_block_indices_expand_on_attention_fallback(monkeypatch):\n     from types import SimpleNamespace\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/002abb989d9261e5c149957a71ad73204500e1b3/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Fqsa%2Ftest_qsa_fused_kv_prepare.py",
+      "sha": "bc08dc759577b6a98cea5df1b1c1f6dd98eb22ab",
+      "status": "modified"
+    },
+    {
+      "additions": 84,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/002abb989d9261e5c149957a71ad73204500e1b3/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Fqsa%2Ftest_qsa_indexer.py",
+      "changes": 84,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Fqsa%2Ftest_qsa_indexer.py?ref=002abb989d9261e5c149957a71ad73204500e1b3",
+      "deletions": 0,
+      "filename": "test/registered/kernels/ops/attention/qsa/test_qsa_indexer.py",
+      "patch": "@@ -319,6 +319,90 @@ def test_tilelang_mqa_rejects_mixed_operand_dtypes():\n         tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, 64)\n \n \n+def _decode_operands(rows, max_pages, page_size, context_lens, device):\n+    q = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device).to(torch.bfloat16)\n+    cache = torch.randn(1024, page_size, 1, HEAD_DIM, device=device).to(torch.bfloat16)\n+    page_table = torch.randint(\n+        0, 1024, (rows, max_pages), device=device, dtype=torch.int32\n+    )\n+    return q, cache, page_table, context_lens.to(device=device, dtype=torch.int32)\n+\n+\n+@pytest.mark.parametrize(\"rows\", [6, 100, 700])\n+def test_tilelang_mqa_decode_grid_covers_every_group(rows):\n+    \"\"\"The decode kernel strides 256, 16 or 1 CTAs per row (by row count) over the\n+    row's 64-token groups. Every group of every row must be scored, and nothing\n+    is written past a row's context length.\"\"\"\n+    from sglang.srt.layers.attention.qsa.mqa import (\n+        HAS_TILELANG,\n+        tilelang_qsa_mqa_decode,\n+        torch_qsa_mqa_decode,\n+    )\n+\n+    if not HAS_TILELANG:\n+        pytest.skip(\"tilelang unavailable\")\n+    device = torch.device(\"cuda\")\n+    torch.manual_seed(rows)\n+    max_pages, page_size = 128, 16\n+    max_model_len = max_pages * page_size\n+    lens = torch.randint(1, max_model_len + 1, (rows,))\n+    lens[0] = max_model_len\n+    q, cache, page_table, lens = _decode_operands(\n+        rows, max_pages, page_size, lens, device\n+    )\n+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)\n+    out = tilelang_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)\n+    finite = torch.isfinite(ref)\n+    assert torch.equal(finite, torch.isfinite(out))\n+    torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)\n+\n+\n+def test_tilelang_mqa_decode_skips_rows_that_fit_topk():\n+    \"\"\"With min_scored_len = k the kernel leaves rows that fit k unscored and\n+    nothing past a row's length is set; fast_topk(k) must still select exactly\n+    what it selects on fully scored logits (every block of a row that fits k).\"\"\"\n+    from sglang.kernels.ops.attention.fast_topk import fast_topk\n+    from sglang.srt.layers.attention.qsa.mqa import (\n+        HAS_TILELANG,\n+        tilelang_qsa_mqa_decode,\n+        torch_qsa_mqa_decode,\n+    )\n+\n+    if not HAS_TILELANG:\n+        pytest.skip(\"tilelang unavailable\")\n+    device = torch.device(\"cuda\")\n+    torch.manual_seed(5)\n+    max_pages, page_size, block_topk = 128, 16, 512\n+    max_model_len = max_pages * page_size\n+    lens = torch.tensor([1, 300, 511, 512, 513, 1000, 2047, 2048] * 4)\n+    rows = lens.numel()\n+    q, cache, page_table, lens = _decode_operands(\n+        rows, max_pages, page_size, lens, device\n+    )\n+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)\n+    # The caching allocator hands the NaN block to the unset logits, so a top-k\n+    # that read an unscored row or a column past a length would show it.\n+    poison = torch.full((rows, max_model_len), float(\"nan\"), device=device)\n+    del poison\n+    out = tilelang_qsa_mqa_decode(\n+        q, cache, page_table, lens, max_model_len, min_scored_len=block_topk\n+    )\n+    sel_ref = fast_topk(ref, lens, topk=block_topk)\n+    sel_out = fast_topk(out, lens, topk=block_topk)\n+    for row in range(rows):\n+        length = int(lens[row])\n+        if length <= block_topk:\n+            assert torch.equal(sel_out[row], sel_ref[row])\n+            continue\n+        torch.testing.assert_close(\n+            out[row, :length], ref[row, :length], rtol=2e-3, atol=2e-3\n+        )\n+    for a, b in zip(\n+        _selected_score_multisets(ref, sel_ref), _selected_score_multisets(ref, sel_out)\n+    ):\n+        torch.testing.assert_close(a, b, rtol=2e-3, atol=2e-3)\n+\n+\n @pytest.mark.parametrize(\"dtype\", [torch.int32, torch.int64])\n def test_expand_block_indices_int_inputs(dtype):\n     device = torch.device(\"cuda\")",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/002abb989d9261e5c149957a71ad73204500e1b3/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Fqsa%2Ftest_qsa_indexer.py",
+      "sha": "8733d001467c6ee24a688922b8dee0d5595bf120",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "/rerun-failed-ci extra",
+      "created_at": "2026-10-11T04:57:23Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43463#issuecomment-6105626153",
+      "id": 6105626153,
+      "updated_at": "2026-10-11T04:57:23Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-10-11T04:57:43Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43463#issuecomment-6105628406",
+      "id": 6105628406,
+      "updated_at": "2026-10-11T04:57:43Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    }
+  ],
+  "number": 43463,
+  "refs": {
+    "base": {
+      "commit": "bd7c7971ba74851375807f93f7f09d6896bc6ac0",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "002abb989d9261e5c149957a71ad73204500e1b3",
+      "repository": "yuan-luo/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/43463#pullrequestreview-5477646384",
+      "id": 5477646384,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-10T04:48:26Z",
+      "user": {
+        "login": "kaixih"
+      }
+    }
+  ]
+}

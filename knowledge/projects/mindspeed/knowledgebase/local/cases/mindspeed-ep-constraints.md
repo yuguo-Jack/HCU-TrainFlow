@@ -8,17 +8,16 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source, official documentation and related PR reading; no HCU runtime validation
 sources:
 - source: ascend-mindspeed
   path: mindspeed/features_manager/moe/moe_alltoall_overlap.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: 98f147c94abd5db221b522a34a396d8a046f571e0d2075d3f6eb574aa322f6ec
 - source: ascend-mindspeed
   path: mindspeed/features_manager/moe/moe_zero_memory.py
-  commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
   sha256: ef0f3874ed9f81d07aa70d701f2b2a62e78bf8c913832c4ab078bda371658248
 ---
 
@@ -42,7 +41,7 @@ sources:
 
 ## 固定证据与复核范围
 
-- [mindspeed/features_manager/moe/moe_alltoall_overlap.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/features_manager/moe/moe_alltoall_overlap.py)
-- [mindspeed/features_manager/moe/moe_zero_memory.py](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/mindspeed/features_manager/moe/moe_zero_memory.py)
+- [mindspeed/features_manager/moe/moe_alltoall_overlap.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/features_manager/moe/moe_alltoall_overlap.py)
+- [mindspeed/features_manager/moe/moe_zero_memory.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/features_manager/moe/moe_zero_memory.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

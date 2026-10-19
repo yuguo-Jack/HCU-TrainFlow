@@ -10,85 +10,84 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime
-  execution
+reviewed_on: '2026-10-20'
+coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: volcengine-verl
   path: README.md
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: ddf49da56b709047d7641c6885c00bb43a68944aa458f03965008978d75a019d
 - source: volcengine-verl
   path: pyproject.toml
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: 0be004554c671c42b612f050788366027e8e7197e0705b1b87d4f436cbc6af79
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: 41b9ee003cf1eb4478101ceefc7e6345e4c22b93554927b0438c24eb455bb388
 - source: volcengine-verl
   path: setup.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: 87bbccbcffac8bf9f203443bf9fba9f62ddf84c0333401d834624d86b3c175d4
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: f1e4766854206b20afab7cf9c3b6fc3949dbe900cc1a2314e1a04e5d289e94bb
 - source: volcengine-verl
   path: verl/trainer/main_ppo.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: 270ffe0d0f5ddbc4e9af8d0f6eece5d11b1a6d6d76166603b5ebac81345dd5cc
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: 8f5166336c11fc84f0144d93cc9412d446854820c0b4135ab902be6173e40a08
 - source: volcengine-verl
   path: verl/trainer/ppo/ray_trainer.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: eb41f99ccc66976eab14ebe35aa1aa5b7318e02469240ef1569ac4c884c94312
 - source: volcengine-verl
   path: verl/trainer/ppo/core_algos.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: 369b614f239f237a04a38a40b1877cd6fd14aa7bd5f9ff4fe4d7758b682a6948
 - source: volcengine-verl
   path: verl/workers/engine_workers.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: 781e4384762cc26c264e0baefddc6e9126472cac690d184660a37ba1200ef2c2
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: 301323b0a8665d236189c3438b835ee4b2ba8bc8cfced1890684070d403ef7a8
 - source: volcengine-verl
   path: verl/workers/config/actor.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: d7631944b186f162b897022c9fac8b2f0ede7f8bb6cba4276d98e5d5033fd60b
 - source: volcengine-verl
   path: verl/workers/config/rollout.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: a1fde638501c9cd69c1711cd1b4aa75241daaa171133f070ad89a5833c20f05d
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: f62e366c906a152a2fc61328afb33c711125f036e05d82b82189333c4ffc47b4
 - source: volcengine-verl
   path: verl/workers/engine/base.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: c3d0f88e32f8fe044bf7c4d249dfc4cfcee66ccc89b9850d971798b1b20f6a92
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: 58057882c03110cdcf846fd833085e01e3f517a17dd9400f3c0d0e4bdba6500a
 - source: volcengine-verl
   path: verl/workers/engine/megatron/transformer_impl.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: b43b266774c25924d0326ff0693b1a0db7614032b1061ae108926366b3de570e
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: a7c2de9049ebbb20d6da480dd078be0ecc6e7fcf2eb91d9e270c7c0367e9dc09
 - source: volcengine-verl
   path: verl/workers/engine/fsdp/transformer_impl.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: 717b595c729469bde375234710b967e5b4a8d39ba93419f7b2a380f080483842
 - source: volcengine-verl
   path: verl/utils/seqlen_balancing.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: f0536d757a8c8eb1a15d63e7174a8995ebbf180481845576f1817ee6020b4902
 - source: volcengine-verl
   path: docs/start/install.rst
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: 0892c67e9d35372a6c1ecd477463851b992f13fb673c75916fbd9ca2c99130ad
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: 9c02bd24568ebf1c285bdcac45a472f60d7641c7cc658e5d40686457aa5a8eec
 - source: volcengine-verl
   path: docs/perf/best_practices.rst
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: 37ede8da2d9efbc564bc9cb9f37e9d2f5a273e8eadb360b90e85166ebc1473cd
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: ce40babc9a9c45b9a80926509ffacc0697b753aae393e4c8bd00aa5e3f781af3
 - source: volcengine-verl
   path: docs/perf/perf_tuning.rst
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
-  sha256: ef61c873077ca83d096eead93515b7221d92addbbed67b988d1e5385d093fc49
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  sha256: 4c64e886e6acff66fd48c82e68d7289f572ebc5dedad9bb8da44ab9cef21c7b3
 - source: volcengine-verl
   path: docs/perf/torch_profiling.md
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: c1925e1edfba630c25a048f219365d6aed183eab4eb9befc84baab86a857263f
 - source: volcengine-verl
   path: tests/utils/test_seqlen_balancing.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: 658fb094f2edb2fe6914ded167e4b18aba3543d5b5410a93a2816622a7b9c48d
 - source: volcengine-verl
   path: tests/trainer/ppo/test_rollout_corr_integration.py
-  commit: 2035f58dcb06d8cad4caee107b30f4045d724367
+  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
   sha256: 3d8c1a1471043a5cbe03cf010c0b2e3dff293370c79b2273aa70a02261bdd759
 ---
 
@@ -104,7 +103,7 @@ verl 将 rollout、reward、reference/value、advantage 与 actor 更新表达�
 
 | 入口 | 职责、下一层 |
 | --- | --- |
-| [`verl/trainer/main_ppo.py`](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/verl/trainer/main_ppo.py) | Hydra 配置、Ray driver、TaskRunner、资源/角色选择 |
+| [`verl/trainer/main_ppo.py`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/trainer/main_ppo.py) | Hydra 配置、Ray driver、TaskRunner、资源/角色选择 |
 | `trainer/ppo/ray_trainer.py` | `RayPPOTrainer.fit`、rollout/训练编排、负载平衡、save/load |
 | `trainer/ppo/core_algos.py` | advantage/policy loss 注册、GRPO、聚合分母；从算法名继续到函数 |
 | `trainer/config/`、`workers/config/` | YAML 组合与 dataclass 校验；实际解析值比脚本覆盖项更可靠 |
@@ -119,11 +118,13 @@ verl 将 rollout、reward、reference/value、advantage 与 actor 更新表达�
 
 ## 3. 安装和依赖
 
-[官方安装](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/docs/start/install.rst)和当前 [`pyproject.toml`](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/pyproject.toml)一起读。Python 范围为 `>=3.10,<3.13`，构建使用 setuptools；GPU 后端 extras 对 Torch、推理引擎、TE/Apex、FlashAttention 等有各自组合约束。当前 main 的统一依赖方案包含 CUDA 导向的软件包/轮子，不应直接安装来覆盖 HCU 镜像已有栈。
+[官方安装](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/start/install.rst)和当前 [`pyproject.toml`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/pyproject.toml)一起读。Python 范围为 `>=3.10,<3.13`，构建使用 setuptools；GPU 后端 extras 对 Torch、推理引擎、TE/Apex、FlashAttention 等有各自组合约束。当前 main 的统一依赖方案包含 CUDA 导向的软件包/轮子，不应直接安装来覆盖 HCU 镜像已有栈。
 
 在官方匹配环境中可按所选 backend 安装源码及所需 extra；HCU 中先确认 HCU 仓是否完整 Python 包、是否通过子模块和 patch 注入、镜像里已有的包，以及实际 import 路径。记录 model checkpoint、tokenizer、Torch/DTK、Megatron/Bridge、rollout 引擎、通信库和 gitlink。`requirements` 中的浮动 Git main 仍需记录解析 SHA。
 
 README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `git submodule update --init --recursive recipe`；不是自动把所有 recipe 安装到 Python 环境。TaskRunner 的 Ray runtime_env 与本地 shell 不必相同，核对 worker 内的最终变量、依赖路径和可见卡。
+
+当前依赖层把 VeOmni 单独列为训练 backend，CI 的 veomni-sft 附加项不是完整的用户环境；Megatron/FSDP 等 Liger pin 也固定到0.8.4。这里是官方 CUDA/Torch 配对和安装元数据，不能自动装入活动 HCU 镜像。顶层脚本、模型 backend、extras 与实际 worker import 继续成组核对。
 
 ## 4. 启动、配置和测试
 
@@ -150,9 +151,11 @@ README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `g
 - [动态 micro batch、负载平衡与 loss 分母](../topics/dynamic-batch-and-loss.md)：硬 token budget、DP/VPP 调度、GRPO grouping、统计/梯度一致性。
 - [训练到 rollout 的权重、缓存与恢复](../topics/weight-cache-and-checkpoint.md)：naive/分离 backend、LoRA、权重/KV 内存峰值和持久化 checkpoint。
 
-先按[性能教程](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/docs/perf/perf_tuning.rst)分开测 actor、old/ref logprob、critic、rollout prefill/decode、reward、权重传输和保存。动态批次/去 padding、并行重切、重算/offload、融合实现、推理缓存分别有约束；教程中的 NVIDIA 测量或建议不是 HCU 标称。
+先按[性能教程](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/perf/perf_tuning.rst)分开测 actor、old/ref logprob、critic、rollout prefill/decode、reward、权重传输和保存。动态批次/去 padding、并行重切、重算/offload、融合实现、推理缓存分别有约束；教程中的 NVIDIA 测量或建议不是 HCU 标称。
 
-[`MegatronEngine`](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/verl/workers/engine/megatron/transformer_impl.py)的 dynamic CP 目前要求 DP×CP 为至少2的偶数、remove-padding；不支持 pad_to_length、多模态/value model、VPP、FP8/蒸馏等所列组合。fused linear-CE 要 uniform finite temperature。不能为减少显存把这些支持门控跳过。当前 actor schema 也包含 TorchTitan/VeOmni 等后端，不表示本页已读完每个 backend。
+[`MegatronEngine`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/workers/engine/megatron/transformer_impl.py)的 dynamic CP 目前要求 DP×CP 为至少2的偶数、remove-padding；不支持 pad_to_length、多模态/value model、VPP、FP8/蒸馏等所列组合。fused linear-CE 要 uniform finite temperature。不能为减少显存把这些支持门控跳过。当前 actor schema 也包含 TorchTitan/VeOmni 等后端，不表示本页已读完每个 backend。
+
+本轮新增两项跨阶段契约：rollout 量化采用结构化配置，并把真实 weight/scale 导出统一移到 trainer 端；Megatron Liger output-head 则在最早 consumer 初始化前预留 actor/ref 共用容量，由 Liger 管 native runtime 和 dispatch。[传权专题](../topics/weight-cache-and-checkpoint.md)与[loss 专题](../topics/dynamic-batch-and-loss.md)分别说明精度、容量和资源所有权。它们不是 HCU 已支持的证明，也不允许绕过不兼容 backend 的明确拒绝。
 
 ## 8. 精度、排障与恢复
 
@@ -165,7 +168,7 @@ README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `g
 | HCU patch 未生效 | 父仓/子提交、注入文件、目标对象 identity、worker真实导入模块 |
 | 保存目录存在但恢复找不到 | async_save完成协议、latest tracker、actor/critic分片与data.pt |
 
-[Torch profiling](https://github.com/verl-project/verl/blob/2035f58dcb06d8cad4caee107b30f4045d724367/docs/perf/torch_profiling.md)应记录 rank/role/step；当前 TrainingWorker 在 mini batch 内推进 profiler schedule，不能把调度单位无条件当成整个 RL outer iteration。各并行域选择代表 rank，联查真实后端代码和 TraceLens。
+[Torch profiling](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/perf/torch_profiling.md)应记录 rank/role/step；当前 TrainingWorker 在 mini batch 内推进 profiler schedule，不能把调度单位无条件当成整个 RL outer iteration。各并行域选择代表 rank，联查真实后端代码和 TraceLens。
 
 ## 9. 官方教程、PR 和维护范围
 

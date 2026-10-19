@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed
-commit: 241431d43e02a89556d2d2b3eacc7e24448adee5
+commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
 path: docs/zh/SECURITYNOTE.md
-raw_sha256: d861d465eeb1e4a03148001485327addc6a6cc03fd4ed7a6a2f32dc608bb8f22
+raw_sha256: e5d268ee3b37d5fd1f2eee68361ff346997f8ec5b5fd0185ccb01f7639d005e4
 sources: []
-generated_body_sha256: 49aa7cf4e57e4dcde2e44fbd8aa7b60e30db3dfc5ce64940e76f2e2aa1ad9307
+generated_body_sha256: 227fe93358d6ef5fc1e5faa8f1f3f13fd6366a5625d233fad2154982dc6fe82a
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed / docs/zh/SECURITYNOTE.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/241431d43e02a89556d2d2b3eacc7e24448adee5/docs/zh/SECURITYNOTE.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/zh/SECURITYNOTE.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -101,7 +101,7 @@ Upstream source document; original commands, claims and links require their stat
 |  开源引入  |      <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/moe/sharded_moe.py>       |                   mindspeed/moe/utils.py                   |    <https://arxiv.org/pdf/2006.16668.pdf>    |                einsum论文地址                 |
 |  开源引入  |        <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/moe/experts.py>         |                  mindspeed/moe/experts.py                  |     <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/moe/experts.py>   |             deepspeed moe源码地址             |
 |  开源引入  |                               <https://github.com/HazyResearch/flash-attention>                               |              docs/zh/features/flash-attention.md              |                               <https://arxiv.org/pdf/2205.14135>                               |            flash-attention说明文档            |
-|  开源引入  |                                    <https://github.com/nvidia/megatron-lm>                                    |         docs/zh/features/virtual-pipeline-parallel.md         |               <https://people.eecs.berkeley.edu/~matei/papers/2021/sc_megatron_lm.pdf>       |       virtual-pipeline-parallel说明文档       |
+|  开源引入  |                                    <https://github.com/nvidia/megatron-lm>                                    |         docs/zh/features/virtual-pipeline-parallel.md         |               <https://dl.acm.org/doi/10.1145/3458817.3476209>       |       virtual-pipeline-parallel说明文档       |
 |  开源引入  |                            <https://github.com/feifeibear/long-context-attention>                             |          docs/zh/features/hybrid-context-parallel.md          |                               <https://arxiv.org/abs/2405.07719>                               |        hybrid-context-parallel说明文档        |
 |  开源引入  |                            <https://github.com/feifeibear/long-context-attention>                             |      docs/zh/features/ring-attention-context-parallel.md      |                           <https://arxiv.org/pdf/2310.01889>                                  |    ring-attention-context-parallel说明文档    |
 |  开源引入  |                          <https://github.com/ofirpress/attention_with_linear_biases>                          |                   docs/zh/features/alibi.md                   |           <https://arxiv.org/pdf/2108.12409>                                           |                 alibi说明文档                 |

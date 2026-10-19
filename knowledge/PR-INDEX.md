@@ -33,17 +33,17 @@ sources: []
 - [#302：迭代器 finalize 的后续讨论](projects/energon/knowledgebase/upstream/prs/NVIDIA--Megatron-Energon/PR-302.md)；[当前恢复与吞吐机制](projects/energon/knowledgebase/local/topics/energon-recovery-throughput.md)，未合入提议不当作已实现能力。
 ## llamafactory
 
-- [hiyouga/LlamaFactory #10762：[v1] Support multimodal Ulysses CP and memory-efficient chunk loss for SFT](prs/hiyouga--LlamaFactory/PR-10762.md)
+- [hiyouga/LlamaFactory #10762：[v1] Support multimodal Ulysses CP and memory-efficient chunk loss for SFT](projects/llamafactory/knowledgebase/upstream/prs/hiyouga--LlamaFactory/PR-10762.md)
 ## megatron
 
 - [NVIDIA/Megatron-LM #6878：Mxfp8 refit bounded memory](projects/megatron/knowledgebase/upstream/prs/NVIDIA--Megatron-LM/PR-6878.md)
-- [NVIDIA/Megatron-LM #7534：[dev] docs: add combined 1F1B MoE A2A overlap guide](prs/NVIDIA--Megatron-LM/PR-7534.md)
+- [NVIDIA/Megatron-LM #7534：[dev] docs: add combined 1F1B MoE A2A overlap guide](projects/megatron/knowledgebase/upstream/prs/NVIDIA--Megatron-LM/PR-7534.md)
 - [NVIDIA/Megatron-LM #7897：Widen paged-stash copy/pop kernel launches](projects/megatron/knowledgebase/upstream/prs/NVIDIA--Megatron-LM/PR-7897.md)
 - [NVIDIA/Megatron-LM #7942：Declare the residual on the pre-MLP norm of the fused MLA spec](projects/megatron/knowledgebase/upstream/prs/NVIDIA--Megatron-LM/PR-7942.md)
 ## sglang
 
 - [#43758：权重装载成功后 flush 失败的状态](projects/sglang/knowledgebase/upstream/prs/sgl-project--sglang/PR-43758.md)、[#42561：部分 runner 更新提议](projects/sglang/knowledgebase/upstream/prs/sgl-project--sglang/PR-42561.md)；[权重与 KV 生命周期](projects/sglang/knowledgebase/local/topics/weight-update.md)。
-- [sgl-project/sglang #39265：[sglang-miles] Allocate packed weight receive buffers directly from metadata](prs/sgl-project--sglang/PR-39265.md)
+- [sgl-project/sglang #39265：[sglang-miles] Allocate packed weight receive buffers directly from metadata](projects/sglang/knowledgebase/upstream/prs/sgl-project--sglang/PR-39265.md)
 ## slime
 
 - [THUDM/slime #2442：fix(weight-sync): honor checkpoint shard indexes in disk delta sync](projects/slime/knowledgebase/upstream/prs/THUDM--slime/PR-2442.md)
@@ -51,7 +51,7 @@ sources: []
 ## swift
 
 - [modelscope/ms-swift #10188：docs: clarify configuration for fractional loss weights](projects/swift/knowledgebase/upstream/prs/modelscope--ms-swift/PR-10188.md)
-- [modelscope/ms-swift #10242：[bugfix] drop dp_cp_group from content_metadata when saving mcore checkpoint](prs/modelscope--ms-swift/PR-10242.md)
+- [modelscope/ms-swift #10242：[bugfix] drop dp_cp_group from content_metadata when saving mcore checkpoint](projects/swift/knowledgebase/upstream/prs/modelscope--ms-swift/PR-10242.md)
 ## torchtitan
 
 - [#5033：Kimi Attention Residual 的局部编译与 Triton 融合](projects/torchtitan/knowledgebase/upstream/prs/pytorch--torchtitan/PR-5033.md)；[案例：独立算子收益与模型吞吐](projects/torchtitan/knowledgebase/local/cases/kimi-attnres-fusion.md)。
@@ -64,15 +64,15 @@ sources: []
 
 - [#3657：RMSNorm 与 MXFP8 量化融合](projects/transformer-engine/knowledgebase/upstream/prs/NVIDIA--TransformerEngine/PR-3657.md)；[调用、布局与数值案例](projects/transformer-engine/knowledgebase/local/cases/rmsnorm-mxfp8-fusion.md)。
 - [#3662：单 group NVFP4 MLP 权重视图](projects/transformer-engine/knowledgebase/upstream/prs/NVIDIA--TransformerEngine/PR-3662.md)；[前后向格式案例](projects/transformer-engine/knowledgebase/local/cases/grouped-mlp-weight-layout.md)。
-- [NVIDIA/TransformerEngine #3517：[PyTorch] Support distributed weights in GroupedLinear's grouped-tensor path](prs/NVIDIA--TransformerEngine/PR-3517.md)
-- [NVIDIA/TransformerEngine #3546：[PyTorch] Enable LayerNormLinear UB AG overlap under no_grad](prs/NVIDIA--TransformerEngine/PR-3546.md)
+- [NVIDIA/TransformerEngine #3517：[PyTorch] Support distributed weights in GroupedLinear's grouped-tensor path](projects/transformer-engine/knowledgebase/upstream/prs/NVIDIA--TransformerEngine/PR-3517.md)
+- [NVIDIA/TransformerEngine #3546：[PyTorch] Enable LayerNormLinear UB AG overlap under no_grad](projects/transformer-engine/knowledgebase/upstream/prs/NVIDIA--TransformerEngine/PR-3546.md)
 ## verl
 
-- [verl-project/verl #7926：[trainer, rollout] fix: honor V1 standalone rollout memory budget](prs/verl-project--verl/PR-7926.md)
-- [verl-project/verl #8064：[rollout, vllm] fix: drop tied-embedding alias in fp8 weight sync](prs/verl-project--verl/PR-8064.md)
+- [verl-project/verl #7926：[trainer, rollout] fix: honor V1 standalone rollout memory budget](projects/verl/knowledgebase/upstream/prs/verl-project--verl/PR-7926.md)
+- [verl-project/verl #8064：[rollout, vllm] fix: drop tied-embedding alias in fp8 weight sync](projects/verl/knowledgebase/upstream/prs/verl-project--verl/PR-8064.md)
 ## vllm
 
-- [vllm-project/vllm #59772：[CI] Fix ModelExpress handling in weight transfer tests](prs/vllm-project--vllm/PR-59772.md)
+- [vllm-project/vllm #59772：[CI] Fix ModelExpress handling in weight transfer tests](projects/vllm/knowledgebase/upstream/prs/vllm-project--vllm/PR-59772.md)
 
 ## 从问题到实现
 

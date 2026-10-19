@@ -8,26 +8,25 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
-coverage: selected source, official documentation and related PR reading; no HCU runtime
-  validation
+reviewed_on: '2026-10-20'
+coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
 sources:
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/communication-overlap.md
-  commit: 53681c1aa264b54a1afa320830738382ee2a44f4
+  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
   sha256: 859943b891cd2eefe537fe433c40e7a7ba0fcca702f6ecf44ccf1f9075e4ddde
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/comm_overlap.py
-  commit: 53681c1aa264b54a1afa320830738382ee2a44f4
+  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
   sha256: efabb5d0084f4c5c29b96c6bf6a22307c7a2fb89a72453e22f6d91c4f5afd8dc
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/config.py
-  commit: 53681c1aa264b54a1afa320830738382ee2a44f4
-  sha256: f0ddd9f5450e353dad5cdf067ba8b01088e3e29ff35e521fa622141e03fe080d
+  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  sha256: e6402cd67d776fa9937915fa926c16cb3daac7b18a93b6710e2c631fd9d8c39d
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/train.py
-  commit: 53681c1aa264b54a1afa320830738382ee2a44f4
-  sha256: 413a9f26ed5d92a2cc419481897a174c6d11af4d9623a2cc2610b6478c70b561
+  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  sha256: fc9f3755a844b2c8b93a93dbdb200fcc77d52c8a6035d7ced8e07e994bd1abe9
 ---
 
 # Bridge：DP/TP/PP/CP/EP 重叠、Graph 与显存取舍
@@ -44,6 +43,8 @@ EP的`overlap_moe_expert_parallel_comm`当前早期检查EP>1、experts>1、allt
 
 `delay_wgrad_compute`依EP overlap，不是通用GEMM加速；graph、gradient reduction/accumulation、bias/shared expert和TE版本又有额外条件。正式开启前读当前`comm_overlap.py`全部validate/setup分支，而非凭参数名推断支持。MindSpeed共享专家策略不同，不能交叉套用。
 
+当前 Bridge 保留自己的 `dist.use_megatron_fsdp` 兼容字段，并与所选 Megatron-FSDP 版本的 DDP/optimizer 设置联动；不能因新 Core 不再声明同字段就删掉 Bridge 配方，也不能与 Torch FSDP2 混称。确定性模式改为把 cross-entropy、TP overlap、router fusion 等选项交给固定 Core 的 `apply_determinism_to_args` 校验；旧 Bridge 内嵌的环境断言不是当前完整规则，更不直接成为 HCU 环境模板。
+
 ## 内存与调度收益
 
 更早发起通信/推迟wgrad可能增buffer、活动microbatch或state寿命，争用HBM/SM/网络。kernel稍慢可换来更快step，也可能本来通信已隐藏而只多付开销。重算/offload减少HBM又可能减少overlap窗口，要联看MB、VPP、rank负载和最坏rank的显存余量。
@@ -56,15 +57,17 @@ EP的`overlap_moe_expert_parallel_comm`当前早期检查EP>1、experts>1、allt
 
 graph/capture/fallback分别检查；enable但自动禁用、共享buffer不匹配或库接口fallback必须报告。阶段loss放在局部数值可信且形成优化阶段成果后，不用频繁长训替代机制验证。
 
+退出/重启还要核对 graph 所有者。当前 `_delete_cuda_graphs` 除 full/optimizer graph 和实际创建的 TE graph，还调用 Core 的 local CudaGraphManager 清理；只清 TE helper 会遗漏另一组持有通信 buffer 的图。验证捕获与未创建图、local/TE 模式及进程组销毁顺序，不能把代码清理入口存在当成实际多 rank 退出无残留。
+
 ## 排障、回退与维护
 
 卡住查所有rank最后共同事件、组和collective顺序、资源不足/异常；内存风险查活动微批/新增buffer，数值偏差查梯度延迟/累加依赖。退回已验证的分域配置，再决定调参、框架调度、通算融合或底层库优化。修改Core/TE、dispatcher、overlap/graph约束时同步[总览](../overview/bridge.md)、provider和checkpoint专题，不以文档刷新替代实际版本检查。
 
 ## 固定证据与复核范围
 
-- [docs/training/communication-overlap.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/docs/training/communication-overlap.md)
-- [src/megatron/bridge/training/comm_overlap.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/src/megatron/bridge/training/comm_overlap.py)
-- [src/megatron/bridge/training/config.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/src/megatron/bridge/training/config.py)
-- [src/megatron/bridge/training/train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/src/megatron/bridge/training/train.py)
+- [docs/training/communication-overlap.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/training/communication-overlap.md)
+- [src/megatron/bridge/training/comm_overlap.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/comm_overlap.py)
+- [src/megatron/bridge/training/config.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/config.py)
+- [src/megatron/bridge/training/train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/train.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

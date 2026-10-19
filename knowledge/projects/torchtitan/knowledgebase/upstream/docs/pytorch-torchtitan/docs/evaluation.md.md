@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: a242475253433725f10f39c18f5ccbfdf188e097
 path: docs/evaluation.md
-raw_sha256: c31b772e3ec4b8c46ef086fa3cc08a75d0eaa6b26343686dc57d6cbb0a5e5f96
+raw_sha256: 01c96cc92985701cc7f3e64bdcff5180d454b5fb1c972d7e2684ae57017b4510
 sources: []
-generated_body_sha256: eb559005d9511ce65b693daa2cf7b1598fc1b2c3b83255ac7298dd082b8ebc0f
+generated_body_sha256: 6f325b86396a44cc527d9fd4ac9e24a897445a5f1d7848330ec6a57c25691e0d
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / docs/evaluation.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/docs/evaluation.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/docs/evaluation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -56,6 +56,9 @@ validator=Validator.Config(
 ```
 
 Omitting `dataloader` uses this configuration by default.
+
+Validation follows `training.disable_cuda_graphs` and shares the training graph pool.
+See [CUDA graphs](../torchtitan/distributed/CUDA_GRAPH.md) for capture order and tensor lifetimes.
 
 ## Third-Party Evaluation
 With `./scripts/checkpoint_conversion/convert_to_hf.py`, `torchtitan` offers support for converting checkpoints from DCP to safetensors format. Using this script, users can perform efficient evaluation separate from their training using external libraries that support HuggingFace e.g. `lm_eval` with `vllm` backend.

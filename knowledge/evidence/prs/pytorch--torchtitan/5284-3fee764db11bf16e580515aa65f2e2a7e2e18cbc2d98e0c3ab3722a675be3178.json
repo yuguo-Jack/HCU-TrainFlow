@@ -1,0 +1,569 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "fd1a72593ded8db31f281282a5c0d696589bdc6ad2f5b61d7cb189c994d8a711",
+      "isPrivate": false,
+      "numbers": [
+        5292,
+        5291,
+        5290,
+        5289,
+        5286,
+        5285,
+        5284,
+        5283
+      ],
+      "observed_at": "2026-10-19T18:04:18.715522+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4913,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "432b95dcf55b3840d7f63ca24a0c585701e70c36",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** On a busy controller, the batcher waits on the GIL: one batch takes 3.6-4.1 s instead of 0.2 s (CPU benchmark). This PR moves the builder and the batcher into their own process (`BatcherActor`): 1.6-1.8 s under the same load.\n\n**Problem**\n1. **One GIL.** `_batcher_loop` builds training samples and packs microbatches inside the controller process.\n2. **Busy loop.** On large runs, the controller's event loop holds that GIL most of the time, serving rollouts.\n3. **Build blocks.** `build_from_group` runs on the event loop, so every rollout waits for it.\n4. **Pack waits.** `add_training_samples` runs in `asyncio.to_thread` and, after each torch op, waits up to 5 ms (`sys.getswitchinterval()`) to get the GIL back.\n5. **How much.** A batch is thousands of small torch ops: 0.2 s alone, 3.6-4.1 s next to a busy loop.\n6. **At scale.** On a 10-node agentic run, the trainer idled 54% of each step: the batcher took 100-180 s per batch vs 80 s of forward/backward.\n\n```text\nbefore (controller process, one GIL)\n  event loop thread:  serve rollouts, ..., build_from_group        <- holds the GIL most of the time\n  to_thread worker:   add_training_samples                         <- every torch op: release, wait up to 5 ms\n\nafter\n  controller:         await batcher.add_group.call_one(rollout_group=group)   <- pickle a group, unpickle a batch\n  batcher process:    BatcherActor: build_from_group + add_training_samples   (its own GIL)\n```\n\n**Solution**\n1. **Own GIL.** Build and pack in a separate process, as the router already does (\"so routing does not contend with the training loop for the controller's GIL\").\n2. **`BatcherActor`** (`torchtitan/rl/distributed/actors/batcher.py`) owns the builder and the batcher; `add_group(rollout_group=...)` returns what `add_training_samples` returns.\n3. **Wiring.** `setup_async` spawns it on a one-process mesh on the controller host; `_batcher_loop` awaits `add_group`.\n4. **Step sync.** The trainer loop sends the step with `broadcast`, so it never waits behind a running `add_group`.\n5. **Unchanged:** `Batcher`, `TrainingSampleBuilder`, `TrainerStepBatch`, the batch order and the one-batch queue.\n\n**Results**\n\nCPU benchmark, devserver CPU, torch 2.15 nightly: 8 groups x 8 rollouts x 8 turns -> 1 batch of 32 microbatches. A task on the asyncio loop burns CPU for <load> of every 10 ms. Wall time per batch, main -> this PR:\n\n```text\nloop idle        0.22 s    -> 0.35 s\nloop 50% busy    0.40 s    -> 0.38 s\nloop 90% busy    0.79 s    -> 0.46 s\nloop 100% busy   3.6-4.1 s -> 1.6-1.8 s\n```\n\n- At 100%, ~1.3 s of what's left is the controller unpickling the returned batch (0.03 s on an idle loop). A TODO in `add_group` covers it.\n- On an idle loop the actor costs 0.13 s more per batch, for pickling the groups and the batch.\n- Same batch: the unit test checks that the actor's `TrainerStepBatch` equals the in-process one, every tensor exact.\n\nYou may ask:\n- Why not a `ProcessPoolExecutor`? Its pipe moves the batch in 64 KB reads, each one a GIL handoff: 26 s at 100% load.\n- Why not `sys.setswitchinterval(0.0005)`? It cuts the busy-loop time 4x (3.2 s -> 0.75 s), but it's process-wide: the event loop gets preempted 10x more often.\n- Why not fewer torch ops in the packer? The cost is still ops x 5 ms, and it grows with the microbatch count.\n- Why not move rollout serving out of the controller? It removes the load at its source, but it's a larger change; the batcher should stay off the controller's GIL either way.\n\nNOTE:\n- The 10-node run was on a branch whose `TrainingSample`s hold tensors, which packs with many more torch ops: 0.1 s -> 18 s under the same benchmark, vs main's 0.2 s -> 3.6-4.1 s. This PR has not run at scale.\n- Sending a group pickles it on the event loop: 0.02 s for 8 rollouts x 8 turns, 0.04-0.07 s for 8 rollouts x 40 turns (each turn stores its full prompt). Main's on-loop build took 0.003 s and 0.02 s for those groups.\n- The `training_sample_builder` and `batcher_pack` spans move to a new `rl_batcher` structured log; the controller logs `batcher_add_group` around the call.\n- A bad batcher config (e.g. `num_tokens_per_microbatch_per_dp_rank` not a multiple of `max_context_length`) now fails at actor spawn: the run stops as \"Interrupted\", and the `ValueError` is in the batcher process's traceback.\n\n**Follow up**\n- [ ] Return refs the trainer pulls microbatches from, so batch bytes skip the controller (needs trainer ranks to pull their own microbatches).\n- [ ] Send only the fields the builder reads, if group pickling shows up in `batcher_add_group`.\n- [ ] Move rollout serving out of the controller process.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu/test_batcher_actor.py`: spawns `BatcherActor` in its own process; for 3 groups (one untrainable) its batch equals the in-process builder + batcher, and a builder error surfaces at `call_one` as `ActorError`.\n- `pytest tests/rl/unit_tests/cpu`: all pass.\n- 2 GPUs, Qwen3-0.6B alphabet sort (1 trainer GPU, 1 generator GPU), 5 steps, main vs this PR: both exit 0, reward main 0.52 -> 0.42, this PR 0.51 -> 0.38 (async runs, so rollouts differ). `rl_batcher` has 64 `training_sample_builder` and 64 `batcher_pack` spans, stamped with steps 1-5.\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Replaced by the third PR of the trainer-pull stack, same title (branch felipemello1/trainer-pull/3-batcher-process): the batcher process now registers each batch as RDMA refs and returns refs instead of the batch, so the batch's bytes never pass through the controller.",
+            "createdAt": "2026-10-11T19:40:30Z",
+            "databaseId": 6112946116,
+            "updatedAt": "2026-10-11T19:40:30Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5284#issuecomment-6112946116"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWxcJ8Q=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+      "headRepository": {
+        "nameWithOwner": "felipemello1/torchtitan"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 5284,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "CLOSED",
+      "title": "[rl] Build and pack training batches in their own process",
+      "updatedAt": "2026-10-11T19:40:30Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5284"
+    },
+    "reused_files": {
+      "artifact_path": "knowledge/evidence/prs/pytorch--torchtitan/5284-4cdd71f254ab5bf03ddb34df54b89537c94175ff5e48673ca4ced736f5d81f22.json",
+      "artifact_sha256": "4cdd71f254ab5bf03ddb34df54b89537c94175ff5e48673ca4ced736f5d81f22",
+      "reason": "Same immutable head/base repository+commit pair and changed_files; original fully paginated files response reused. Discussions are freshly queried.",
+      "refs": {
+        "base": {
+          "commit": "432b95dcf55b3840d7f63ca24a0c585701e70c36",
+          "repository": "pytorch/torchtitan"
+        },
+        "head": {
+          "commit": "ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+          "repository": "felipemello1/torchtitan"
+        }
+      }
+    },
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5284/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5284/commits"
+      },
+      "html": {
+        "href": "https://github.com/pytorch/torchtitan/pull/5284"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5284"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5284/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5284"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/statuses/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 251,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "pytorch:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1041,
+        "forks_count": 1041,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 350,
+        "open_issues_count": 350,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T17:45:56Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 209455,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5820,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-19T17:45:58Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5820,
+        "watchers_count": 5820,
+        "web_commit_signoff_required": false
+      },
+      "sha": "432b95dcf55b3840d7f63ca24a0c585701e70c36",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "body": "**TLDR:** On a busy controller, the batcher waits on the GIL: one batch takes 3.6-4.1 s instead of 0.2 s (CPU benchmark). This PR moves the builder and the batcher into their own process (`BatcherActor`): 1.6-1.8 s under the same load.\n\n**Problem**\n1. **One GIL.** `_batcher_loop` builds training samples and packs microbatches inside the controller process.\n2. **Busy loop.** On large runs, the controller's event loop holds that GIL most of the time, serving rollouts.\n3. **Build blocks.** `build_from_group` runs on the event loop, so every rollout waits for it.\n4. **Pack waits.** `add_training_samples` runs in `asyncio.to_thread` and, after each torch op, waits up to 5 ms (`sys.getswitchinterval()`) to get the GIL back.\n5. **How much.** A batch is thousands of small torch ops: 0.2 s alone, 3.6-4.1 s next to a busy loop.\n6. **At scale.** On a 10-node agentic run, the trainer idled 54% of each step: the batcher took 100-180 s per batch vs 80 s of forward/backward.\n\n```text\nbefore (controller process, one GIL)\n  event loop thread:  serve rollouts, ..., build_from_group        <- holds the GIL most of the time\n  to_thread worker:   add_training_samples                         <- every torch op: release, wait up to 5 ms\n\nafter\n  controller:         await batcher.add_group.call_one(rollout_group=group)   <- pickle a group, unpickle a batch\n  batcher process:    BatcherActor: build_from_group + add_training_samples   (its own GIL)\n```\n\n**Solution**\n1. **Own GIL.** Build and pack in a separate process, as the router already does (\"so routing does not contend with the training loop for the controller's GIL\").\n2. **`BatcherActor`** (`torchtitan/rl/distributed/actors/batcher.py`) owns the builder and the batcher; `add_group(rollout_group=...)` returns what `add_training_samples` returns.\n3. **Wiring.** `setup_async` spawns it on a one-process mesh on the controller host; `_batcher_loop` awaits `add_group`.\n4. **Step sync.** The trainer loop sends the step with `broadcast`, so it never waits behind a running `add_group`.\n5. **Unchanged:** `Batcher`, `TrainingSampleBuilder`, `TrainerStepBatch`, the batch order and the one-batch queue.\n\n**Results**\n\nCPU benchmark, devserver CPU, torch 2.15 nightly: 8 groups x 8 rollouts x 8 turns -> 1 batch of 32 microbatches. A task on the asyncio loop burns CPU for <load> of every 10 ms. Wall time per batch, main -> this PR:\n\n```text\nloop idle        0.22 s    -> 0.35 s\nloop 50% busy    0.40 s    -> 0.38 s\nloop 90% busy    0.79 s    -> 0.46 s\nloop 100% busy   3.6-4.1 s -> 1.6-1.8 s\n```\n\n- At 100%, ~1.3 s of what's left is the controller unpickling the returned batch (0.03 s on an idle loop). A TODO in `add_group` covers it.\n- On an idle loop the actor costs 0.13 s more per batch, for pickling the groups and the batch.\n- Same batch: the unit test checks that the actor's `TrainerStepBatch` equals the in-process one, every tensor exact.\n\nYou may ask:\n- Why not a `ProcessPoolExecutor`? Its pipe moves the batch in 64 KB reads, each one a GIL handoff: 26 s at 100% load.\n- Why not `sys.setswitchinterval(0.0005)`? It cuts the busy-loop time 4x (3.2 s -> 0.75 s), but it's process-wide: the event loop gets preempted 10x more often.\n- Why not fewer torch ops in the packer? The cost is still ops x 5 ms, and it grows with the microbatch count.\n- Why not move rollout serving out of the controller? It removes the load at its source, but it's a larger change; the batcher should stay off the controller's GIL either way.\n\nNOTE:\n- The 10-node run was on a branch whose `TrainingSample`s hold tensors, which packs with many more torch ops: 0.1 s -> 18 s under the same benchmark, vs main's 0.2 s -> 3.6-4.1 s. This PR has not run at scale.\n- Sending a group pickles it on the event loop: 0.02 s for 8 rollouts x 8 turns, 0.04-0.07 s for 8 rollouts x 40 turns (each turn stores its full prompt). Main's on-loop build took 0.003 s and 0.02 s for those groups.\n- The `training_sample_builder` and `batcher_pack` spans move to a new `rl_batcher` structured log; the controller logs `batcher_add_group` around the call.\n- A bad batcher config (e.g. `num_tokens_per_microbatch_per_dp_rank` not a multiple of `max_context_length`) now fails at actor spawn: the run stops as \"Interrupted\", and the `ValueError` is in the batcher process's traceback.\n\n**Follow up**\n- [ ] Return refs the trainer pulls microbatches from, so batch bytes skip the controller (needs trainer ranks to pull their own microbatches).\n- [ ] Send only the fields the builder reads, if group pickling shows up in `batcher_add_group`.\n- [ ] Move rollout serving out of the controller process.\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu/test_batcher_actor.py`: spawns `BatcherActor` in its own process; for 3 groups (one untrainable) its batch equals the in-process builder + batcher, and a builder error surfaces at `call_one` as `ActorError`.\n- `pytest tests/rl/unit_tests/cpu`: all pass.\n- 2 GPUs, Qwen3-0.6B alphabet sort (1 trainer GPU, 1 generator GPU), 5 steps, main vs this PR: both exit 0, reward main 0.52 -> 0.42, this PR 0.51 -> 0.38 (async runs, so rollouts differ). `rl_batcher` has 64 `training_sample_builder` and 64 `batcher_pack` spans, stamped with steps 1-5.\n",
+    "changed_files": 3,
+    "closed_at": "2026-10-11T19:40:30Z",
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5284/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5284/commits",
+    "created_at": "2026-10-11T17:56:30Z",
+    "deletions": 35,
+    "diff_url": "https://github.com/pytorch/torchtitan/pull/5284.diff",
+    "draft": true,
+    "head": {
+      "label": "felipemello1:rl/batcher-process",
+      "ref": "rl/batcher-process",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/felipemello1/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/felipemello1/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/felipemello1/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/felipemello1/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/felipemello1/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/felipemello1/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/felipemello1/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/felipemello1/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/felipemello1/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/felipemello1/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/felipemello1/torchtitan/contributors",
+        "created_at": "2026-02-28T02:26:15Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/felipemello1/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/felipemello1/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/felipemello1/torchtitan/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/felipemello1/torchtitan/forks",
+        "full_name": "felipemello1/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/felipemello1/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/felipemello1/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/felipemello1/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/felipemello1/torchtitan.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/felipemello1/torchtitan/hooks",
+        "html_url": "https://github.com/felipemello1/torchtitan",
+        "id": 1168972994,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/felipemello1/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/felipemello1/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/felipemello1/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/felipemello1/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/felipemello1/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/felipemello1/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/felipemello1/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/felipemello1/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDORa0cwg",
+        "notifications_url": "https://api.github.com/repos/felipemello1/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 183,
+        "open_issues_count": 183,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+          "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+          "followers_url": "https://api.github.com/users/felipemello1/followers",
+          "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+          "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/felipemello1",
+          "id": 23004953,
+          "login": "felipemello1",
+          "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+          "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+          "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+          "repos_url": "https://api.github.com/users/felipemello1/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/felipemello1",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/felipemello1/torchtitan/pulls{/number}",
+        "pushed_at": "2026-10-19T06:06:32Z",
+        "releases_url": "https://api.github.com/repos/felipemello1/torchtitan/releases{/id}",
+        "size": 49065,
+        "ssh_url": "git@github.com:felipemello1/torchtitan.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/felipemello1/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/felipemello1/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/felipemello1/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/felipemello1/torchtitan/subscription",
+        "svn_url": "https://github.com/felipemello1/torchtitan",
+        "tags_url": "https://api.github.com/repos/felipemello1/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/felipemello1/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/felipemello1/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-10-15T01:24:10Z",
+        "url": "https://api.github.com/repos/felipemello1/torchtitan",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+        "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+        "followers_url": "https://api.github.com/users/felipemello1/followers",
+        "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+        "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/felipemello1",
+        "id": 23004953,
+        "login": "felipemello1",
+        "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+        "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+        "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+        "repos_url": "https://api.github.com/users/felipemello1/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/felipemello1",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5284",
+    "id": 4821117352,
+    "issue_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5284",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "009900",
+        "default": false,
+        "description": "This label is managed by the Meta Open Source bot.",
+        "id": 6319105129,
+        "name": "CLA Signed",
+        "node_id": "LA_kwDOK5EkJM8AAAABeKXkaQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/CLA%20Signed"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10889347594,
+        "name": "ciflow/rl",
+        "node_id": "LA_kwDOK5EkJM8AAAACiQ5CCg",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/rl"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": null,
+    "mergeable": false,
+    "mergeable_state": "dirty",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOK5EkJM8AAAABH1xpqA",
+    "number": 5284,
+    "patch_url": "https://github.com/pytorch/torchtitan/pull/5284.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5284/comments",
+    "state": "closed",
+    "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+    "title": "[rl] Build and pack training batches in their own process",
+    "updated_at": "2026-10-11T19:40:30Z",
+    "url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5284",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+      "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+      "followers_url": "https://api.github.com/users/felipemello1/followers",
+      "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+      "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/felipemello1",
+      "id": 23004953,
+      "login": "felipemello1",
+      "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+      "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+      "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+      "repos_url": "https://api.github.com/users/felipemello1/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/felipemello1",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 115,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py",
+      "changes": 115,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py?ref=ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+      "deletions": 0,
+      "filename": "tests/rl/unit_tests/cpu/test_batcher_actor.py",
+      "patch": "@@ -0,0 +1,115 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"BatcherActor, spawned in its own process, returns what the in-process builder + batcher return.\"\"\"\n+\n+import asyncio\n+import dataclasses\n+\n+import pytest\n+import torch\n+from monarch.actor import ActorError, this_host\n+\n+from torchtitan.rl.components.batcher import Batcher\n+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder\n+from torchtitan.rl.distributed.actors.batcher import BatcherActor\n+from torchtitan.rl.rollout.types import (\n+    Rollout,\n+    RolloutGroup,\n+    RolloutStatus,\n+    RolloutTurn,\n+)\n+from torchtitan.rl.types import RolloutTurnID\n+\n+_BATCHER_KWARGS = dict(\n+    num_tokens_per_microbatch_per_dp_rank=32,\n+    max_context_length=16,\n+    num_prompts_per_train_step=2,\n+    dp_degree=2,\n+    pad_id=0,\n+    temperature=1.0,\n+)\n+\n+\n+def _group(group_id: int, rewards: list[float]) -> RolloutGroup:\n+    rollouts = [\n+        Rollout(\n+            group_id=group_id,\n+            rollout_id=rollout_id,\n+            turns=[\n+                RolloutTurn(\n+                    rollout_id=RolloutTurnID(\n+                        group_id=group_id, rollout_id=rollout_id, turn_id=0\n+                    ),\n+                    prompt_token_ids=[1, 2, 3],\n+                    completion_token_ids=[4 + rollout_id, 5],\n+                    completion_logprobs=[-0.5, -0.25],\n+                    min_policy_version=0,\n+                    max_policy_version=0,\n+                )\n+            ],\n+            status=RolloutStatus.COMPLETED,\n+            reward=reward,\n+            advantage=reward - sum(rewards) / len(rewards),\n+        )\n+        for rollout_id, reward in enumerate(rewards)\n+    ]\n+    return RolloutGroup(group_id=group_id, rollouts=rollouts)\n+\n+\n+def test_batcher_actor_returns_the_in_process_batch(tmp_path) -> None:\n+    # Group 1 has zero reward spread, so the builder drops it: it rides along but isn't trainable.\n+    groups = [_group(0, [0.0, 1.0]), _group(1, [1.0, 1.0]), _group(2, [1.0, 0.0])]\n+\n+    builder = TrainingSampleBuilder.Config().build()\n+    batcher = Batcher.Config().build(**_BATCHER_KWARGS)\n+    expected = [\n+        batcher.add_training_samples(\n+            training_sample_group=builder.build_from_group(rollout_group=group)\n+        )\n+        for group in groups\n+    ]\n+\n+    async def run() -> list:\n+        mesh = this_host().spawn_procs(per_host={\"cpus\": 1})\n+        try:\n+            actor = mesh.spawn(\n+                \"batcher\",\n+                BatcherActor,\n+                training_sample_builder_config=TrainingSampleBuilder.Config(),\n+                batcher_config=Batcher.Config(),\n+                batcher_kwargs=_BATCHER_KWARGS,\n+                output_dir=str(tmp_path),\n+                enable_structured_logging=False,\n+            )\n+            results = [\n+                await actor.add_group.call_one(rollout_group=group) for group in groups\n+            ]\n+            # A builder error surfaces at call_one.\n+            no_advantage = _group(3, [0.0, 1.0])\n+            no_advantage.rollouts[0].advantage = None\n+            with pytest.raises(ActorError, match=\"has no advantage\"):\n+                await actor.add_group.call_one(rollout_group=no_advantage)\n+            return results\n+        finally:\n+            await mesh.stop()\n+\n+    results = asyncio.run(run())\n+\n+    assert [(batch is None, trainable) for batch, trainable in results] == [\n+        (True, True),\n+        (True, False),\n+        (False, True),\n+    ]\n+    batch, expected_batch = results[-1][0], expected[-1][0]\n+    assert batch.group_ids == [0, 1, 2]\n+    # assert_close can't compare metric objects; every other field must match exactly.\n+    torch.testing.assert_close(\n+        dataclasses.asdict(dataclasses.replace(batch, metrics=[])),\n+        dataclasses.asdict(dataclasses.replace(expected_batch, metrics=[])),\n+        rtol=0,\n+        atol=0,\n+    )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_batcher_actor.py",
+      "sha": "064a4de662cbc8f9c7f6de793b2b25b5a5b51371",
+      "status": "added"
+    },
+    {
+      "additions": 41,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924/torchtitan%2Frl%2Fcontroller.py",
+      "changes": 76,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fcontroller.py?ref=ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+      "deletions": 35,
+      "filename": "torchtitan/rl/controller.py",
+      "patch": "@@ -40,17 +40,16 @@\n                                                   v\n _batcher_loop\n +----------------------------------------------------------------------------------------+\n-| training_sample_group = training_sample_builder.build_from_group(rollout_group=group)  |\n+| batch, trainable = batcher.add_group.call_one(group)                                   |\n | if no trainable samples: group_buffer.release_active_groups(1, \"untrainable_group\")    |\n-| batch, trainable = batcher.add_training_samples(training_sample_group)                  |\n | training_batch_queue.put(TrainerStepBatch)                                             |\n +-----------------------+------------------------------+---------------------------------+\n                         |  ^                           |\n           add group     |  | maybe_training_batch      | put batch\n                         v  |                           v\n-Batcher                                              training_batch_queue\n+BatcherActor (own process)                           training_batch_queue\n +-------------------------------------------------+   +----------------------------------------------+\n-| accumulated TrainingSampleGroups                |   | size 1; holds TrainerStepBatch | None        |\n+| build_from_group -> add_training_samples        |   | size 1; holds TrainerStepBatch | None        |\n | pack at num_prompts_per_train_step               |   +---------------------+------------------------+\n +-------------------------------------------------+                         |\n                                                                          | packed = training_batch_queue.get()\n@@ -115,6 +114,7 @@\n     RolloutGroupWork,\n     RolloutGroupWorkBuffer,\n )\n+from torchtitan.rl.distributed.actors.batcher import BatcherActor\n from torchtitan.rl.distributed.actors.generator import VLLMGeneratorActor\n from torchtitan.rl.distributed.actors.trainer import TrainerActor\n from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter\n@@ -400,6 +400,7 @@ def __init__(self, config: Config):\n         config.maybe_log()\n         self.trainer: Trainer | None = None\n         self.generator_router: InterGeneratorRouter | None = None\n+        self.batcher: BatcherActor | None = None\n         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.\n         self.start_step = 0\n         self._proc_meshes = []\n@@ -577,8 +578,15 @@ async def setup_async(\n             # controller's process so routing does not contend with the training\n             # loop for the controller's GIL.\n             router_mesh = this_host().spawn_procs(per_host={\"cpus\": 1})\n+            # Same for the batcher: build + pack would contend for the controller's GIL.\n+            batcher_mesh = this_host().spawn_procs(per_host={\"cpus\": 1})\n             # Store proc meshes for cleanup\n-            self._proc_meshes = [router_mesh, trainer_mesh, *generator_meshes]\n+            self._proc_meshes = [\n+                router_mesh,\n+                batcher_mesh,\n+                trainer_mesh,\n+                *generator_meshes,\n+            ]\n \n             await setup_torch_elastic_env(trainer_mesh)\n             for generator_mesh in generator_meshes:\n@@ -618,6 +626,24 @@ async def setup_async(\n                 config.generator_router,\n                 generators=generators,\n             )\n+            self.batcher = batcher_mesh.spawn(\n+                \"batcher\",\n+                BatcherActor,\n+                training_sample_builder_config=async_loop.training_sample_builder,\n+                batcher_config=async_loop.batcher,\n+                batcher_kwargs=dict(\n+                    num_tokens_per_microbatch_per_dp_rank=(\n+                        config.trainer.training.num_tokens_per_microbatch_per_dp_rank\n+                    ),\n+                    max_context_length=config.trainer.training.max_context_length,\n+                    num_prompts_per_train_step=async_loop.num_prompts_per_train_step,\n+                    dp_degree=self.trainer_dp_degree,\n+                    pad_id=self.tokenizer.eos_id,\n+                    temperature=self._sampling.temperature,\n+                ),\n+                output_dir=config.dump_folder,\n+                enable_structured_logging=config.trainer.debug.enable_structured_logging,\n+            )\n \n             await self._rollouter.setup_async(\n                 tokenizer_config=config.tokenizer,\n@@ -812,21 +838,6 @@ async def run(self) -> None:\n             num_prompts_per_train_step=async_loop.num_prompts_per_train_step,\n         )\n \n-        # training_sample_builder\n-        training_sample_builder = async_loop.training_sample_builder.build()\n-\n-        # batcher\n-        batcher = async_loop.batcher.build(\n-            num_tokens_per_microbatch_per_dp_rank=(\n-                self.config.trainer.training.num_tokens_per_microbatch_per_dp_rank\n-            ),\n-            max_context_length=self.config.trainer.training.max_context_length,\n-            num_prompts_per_train_step=async_loop.num_prompts_per_train_step,\n-            dp_degree=self.trainer_dp_degree,\n-            pad_id=self.tokenizer.eos_id,\n-            temperature=self._sampling.temperature,\n-        )\n-\n         # training_batch_queue\n         training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(\n             maxsize=1\n@@ -858,8 +869,7 @@ async def run(self) -> None:\n         batcher_task = asyncio.create_task(\n             self._batcher_loop(\n                 group_buffer=self._group_buffer,\n-                training_sample_builder=training_sample_builder,\n-                batcher=batcher,\n+                batcher=self.batcher,\n                 training_batch_queue=training_batch_queue,\n             ),\n             name=\"batcher\",\n@@ -1014,11 +1024,10 @@ async def _batcher_loop(\n         self,\n         *,\n         group_buffer: RolloutGroupWorkBuffer,\n-        training_sample_builder: TrainingSampleBuilder,\n-        batcher: Batcher,\n+        batcher: BatcherActor,\n         training_batch_queue: \"asyncio.Queue[TrainerStepBatch | None]\",\n     ) -> None:\n-        \"\"\"Take finalized groups, build training_samples, accumulate them, and queue each ready training batch.\n+        \"\"\"Send finalized groups to the batcher actor (it builds and accumulates them), and queue each ready training batch.\n \n         On a clean close/shutdown the group_buffer drains and returns None; we forward a `None` sentinel\n         so the trainer stops.\n@@ -1035,18 +1044,13 @@ async def _batcher_loop(\n             if rollout_group is None:  # closed and drained\n                 logger.info(\"Buffer drained; batcher loop stopping\")\n                 break\n-            with sl.log_trace_span(\"training_sample_builder\"):\n-                training_sample_group = training_sample_builder.build_from_group(\n-                    rollout_group=rollout_group\n-                )\n-\n             # We put a group in. We may get a batch back\n             # if there are enough accumulated trainable groups to return one.\n-            with sl.log_trace_span(\"batcher_pack\"):\n-                maybe_training_batch, group_is_trainable = await asyncio.to_thread(\n-                    batcher.add_training_samples,\n-                    training_sample_group=training_sample_group,\n-                )\n+            with sl.log_trace_span(\"batcher_add_group\"):\n+                (\n+                    maybe_training_batch,\n+                    group_is_trainable,\n+                ) = await batcher.add_group.call_one(rollout_group=rollout_group)\n             if not group_is_trainable:\n                 await group_buffer.release_active_groups(1, reason=\"untrainable_group\")\n             if maybe_training_batch is not None:\n@@ -1083,6 +1087,8 @@ async def _trainer_loop(\n             with sl.log_trace_span(\"sync_log_step\"):\n                 await self.trainer.sync_log_step.call(step)\n                 await self.generator_router.sync_log_step.call_one(step)\n+                # Not awaited: it would wait behind an in-flight add_group.\n+                self.batcher.sync_log_step.broadcast(step)\n                 await self._rollouter.sync_log_step(step)\n             step_timer = MetricsTimer()\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924/torchtitan%2Frl%2Fcontroller.py",
+      "sha": "f4752007ea0df8b2fd900669f8bef85bd2423020",
+      "status": "modified"
+    },
+    {
+      "additions": 95,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924/torchtitan%2Frl%2Fdistributed%2Factors%2Fbatcher.py",
+      "changes": 95,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fdistributed%2Factors%2Fbatcher.py?ref=ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+      "deletions": 0,
+      "filename": "torchtitan/rl/distributed/actors/batcher.py",
+      "patch": "@@ -0,0 +1,95 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"Monarch actor that turns finished rollout groups into training batches.\"\"\"\n+\n+from __future__ import annotations\n+\n+from typing import Any\n+\n+from monarch.actor import Actor, endpoint\n+\n+from torchtitan.observability import structured_logger as sl\n+from torchtitan.observability.logging import init_logger\n+from torchtitan.rl.components.batcher import Batcher\n+from torchtitan.rl.components.training_sample_builder import TrainingSampleBuilder\n+from torchtitan.rl.rollout.types import RolloutGroup\n+from torchtitan.rl.types import TrainerStepBatch\n+\n+\n+class BatcherActor(Actor):\n+    \"\"\"Turns finished rollout groups into training batches, in its own process.\n+\n+    Why not in the controller, whose busy event loop holds the GIL:\n+        build on the loop thread:     blocks every rollout while it runs\n+        pack in `asyncio.to_thread`:  each torch op waits up to 5 ms (the GIL switch interval)\n+\n+    Args:\n+        training_sample_builder_config: Built in this process.\n+        batcher_config: Built in this process with `batcher_kwargs`.\n+        batcher_kwargs: Runtime kwargs for `batcher_config.build`, e.g. `dp_degree` and `pad_id`.\n+        output_dir: Where the structured logger writes this process's spans.\n+        enable_structured_logging: Whether to write those spans.\n+\n+    Example:\n+        batcher = this_host().spawn_procs(per_host={\"cpus\": 1}).spawn(\n+            \"batcher\",\n+            BatcherActor,\n+            training_sample_builder_config=TrainingSampleBuilder.Config(),\n+            batcher_config=Batcher.Config(),\n+            batcher_kwargs=dict(num_prompts_per_train_step=2, dp_degree=1, ...),\n+            output_dir=\"outputs\",\n+            enable_structured_logging=False,\n+        )\n+        await batcher.add_group.call_one(rollout_group=group0)  # -> (None, True)\n+        await batcher.add_group.call_one(rollout_group=group1)  # -> (TrainerStepBatch, True)\n+    \"\"\"\n+\n+    def __init__(\n+        self,\n+        *,\n+        training_sample_builder_config: TrainingSampleBuilder.Config,\n+        batcher_config: Batcher.Config,\n+        batcher_kwargs: dict[str, Any],\n+        output_dir: str,\n+        enable_structured_logging: bool,\n+    ) -> None:\n+        init_logger()\n+        sl.init_structured_logger(\n+            source=\"rl_batcher\",\n+            output_dir=output_dir,\n+            rank=0,\n+            enable=enable_structured_logging,\n+        )\n+        self._training_sample_builder = training_sample_builder_config.build()\n+        self._batcher = batcher_config.build(**batcher_kwargs)\n+\n+    @endpoint\n+    def add_group(\n+        self, *, rollout_group: RolloutGroup\n+    ) -> tuple[TrainerStepBatch | None, bool]:\n+        \"\"\"Build this group's training samples and add them; returns `(batch | None, group_is_trainable)`.\n+\n+        Sync `@endpoint`, not `@concurrent_endpoint` like the other actors: each call finishes\n+        before the next starts, so groups reach the stateful batcher in arrival order.\n+        \"\"\"\n+        # TODO(perf): return refs the trainer pulls microbatches from, not the batch: unpickling\n+        # the batch in a busy controller costs ~1-2 s per batch (CPU benchmark). Needs trainer\n+        # ranks to pull their own microbatches (pytorch/torchtitan#5272).\n+        with sl.log_trace_span(\"training_sample_builder\"):\n+            training_sample_group = self._training_sample_builder.build_from_group(\n+                rollout_group=rollout_group\n+            )\n+        with sl.log_trace_span(\"batcher_pack\"):\n+            return self._batcher.add_training_samples(\n+                training_sample_group=training_sample_group\n+            )\n+\n+    @endpoint\n+    def sync_log_step(self, step: int) -> None:\n+        \"\"\"Plain `@endpoint` like `add_group`, so messages stay in order: the step is set before\n+        the next group's spans.\"\"\"\n+        sl.set_step(step)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924/torchtitan%2Frl%2Fdistributed%2Factors%2Fbatcher.py",
+      "sha": "c05cfe997186f344aa6ab8b816d5117dce249ae0",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Replaced by the third PR of the trainer-pull stack, same title (branch felipemello1/trainer-pull/3-batcher-process): the batcher process now registers each batch as RDMA refs and returns refs instead of the batch, so the batch's bytes never pass through the controller.",
+      "created_at": "2026-10-11T19:40:30Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5284#issuecomment-6112946116",
+      "id": 6112946116,
+      "updated_at": "2026-10-11T19:40:30Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5284,
+  "refs": {
+    "base": {
+      "commit": "432b95dcf55b3840d7f63ca24a0c585701e70c36",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "ba9baba9c6d6b04bc6cd9bef6f9b3765774ff924",
+      "repository": "felipemello1/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": []
+}

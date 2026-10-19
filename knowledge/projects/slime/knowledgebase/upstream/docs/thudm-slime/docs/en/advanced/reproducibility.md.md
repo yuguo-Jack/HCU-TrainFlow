@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/advanced/reproducibility.md
-raw_sha256: 7c141c940cc4390e5a024f7966e8c5b62019cf261aab84742571ba25dd23cf4c
+raw_sha256: eec3fb54c371a6ee024461c513670189db2b3812bb65c4a84b8263fca6285c5a
 sources: []
-generated_body_sha256: 1a87ba431b852a1ffe6e573d401f050706574caf4218d55d2328883488bf340b
+generated_body_sha256: de80736586d8a4076c60d82d3cb576a81711c72ec0804f08afcc6dfb4114143f
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/reproducibility.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/reproducibility.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/reproducibility.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -52,32 +52,32 @@ Also set the following environment variables:
      }
 ```
 
-We provide a fully deterministic GSM8K training script for Qwen2.5-0.5B.
+The GSM8K example enables deterministic training for Qwen3-4B-Instruct-2507, with CP=4 and a 128K response limit.
 
 Use the following commands to initialize the training data and checkpoint:
 
 ```bash
 # download
 hf download --repo-type dataset zhuzilin/gsm8k --local-dir /root/gsm8k
-hf download Qwen/Qwen2.5-0.5B-Instruct --local-dir /root/Qwen2.5-0.5B-Instruct
+hf download Qwen/Qwen3-4B-Instruct-2507 --local-dir /root/Qwen3-4B-Instruct-2507
 
 # convert ckpt
 cd slime/
-source scripts/models/qwen2.5-0.5B.sh
+source scripts/models/qwen3-4B-Instruct-2507.sh
 PYTHONPATH=/root/Megatron-LM/ python \
    tools/convert_hf_to_torch_dist.py \
    ${MODEL_ARGS[@]} \
-   --hf-checkpoint /root/Qwen2.5-0.5B-Instruct \
-   --save /root/Qwen2.5-0.5B-Instruct_torch_dist/
+   --hf-checkpoint /root/Qwen3-4B-Instruct-2507 \
+   --save /root/Qwen3-4B-Instruct-2507_torch_dist/
 ```
 
 Run training with:
 
 ```bash
-bash scripts/run-qwen2.5-0.5B-reproducibility.sh
+bash scripts/run-qwen3-4B-reproducibility.sh
 ```
 
-The wandb screenshots are recorded in [pull#370](https://github.com/THUDM/slime/pull/370).
+Historical Qwen2.5-0.5B wandb screenshots are recorded in [pull#370](https://github.com/THUDM/slime/pull/370).
 
 ## Train/rollout log-prob alignment (GLM-5)
 

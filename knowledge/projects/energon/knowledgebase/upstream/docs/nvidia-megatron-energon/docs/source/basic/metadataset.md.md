@@ -15,7 +15,7 @@ path: docs/source/basic/metadataset.md
 raw_sha256: a1b4e464a5244d050d35bd567fec3aeef146e5cf3d96484fcc4fcc66afe0c974
 sources: []
 generated_body_sha256: 04a430e39d40b7c0186076d26fe2c6a3fe95fc82849489176e307f56a834c3a4
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/basic/metadataset.md

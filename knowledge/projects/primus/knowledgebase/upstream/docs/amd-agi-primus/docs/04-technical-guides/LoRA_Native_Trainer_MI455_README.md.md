@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
 path: docs/04-technical-guides/LoRA_Native_Trainer_MI455_README.md
-raw_sha256: e9d6d168abf92e174f800152d9e6d359851532470d9a29efc724f550293c437d
+raw_sha256: d51eb4d079a6250761e84a2a1fd9e95aaedf3f6c091782310d1223b76b1df5b5
 sources: []
-generated_body_sha256: af808a4cbbd8f69f92dd6cee50ecee85743b6bc1472b6a8d5b8fc5e7fbcb5ff5
+generated_body_sha256: 104a121bd2e9780400751c78166a121f0cf06dceee2a5a5d66f2a02cbdcb9662
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/04-technical-guides/LoRA_Native_Trainer_MI455_README.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/04-technical-guides/LoRA_Native_Trainer_MI455_README.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/04-technical-guides/LoRA_Native_Trainer_MI455_README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -45,8 +45,11 @@ Image: `YOUR_DOCKER_IMAGE`.
 |---|---|---|
 | `llama3.2_1B-BF16-lora-sft.yaml` | Full Llama-3.2-1B LoRA SFT | Converts HF weights (`meta-llama/Llama-3.2-1B`, gated) |
 | `llama2_70B-BF16-lora-sft-1gpu-proxy.yaml` | Llama-2-70B shape, **4 of 80 layers** | Random init, no 70B download |
+| `llama2_70B-FP8-lora-sft-1gpu-proxy.yaml` | Same proxy, TE FP8 hybrid GEMMs | Random init, no 70B download |
 | `qwen2.5_72B-BF16-lora-sft-1gpu-proxy.yaml` | Qwen2.5-72B shape, **4 of 80 layers** | Random init, no 72B download |
+| `qwen2.5_72B-FP8-lora-sft-1gpu-proxy.yaml` | Same proxy, TE FP8 hybrid GEMMs | Random init, no 72B download |
 | `qwen3_235B_A22B-BF16-lora-sft-1gpu-proxy.yaml` | Qwen3-235B-A22B MoE shape, **4 of 94 layers** | Random init, no 235B download |
+| `qwen3_235B_A22B-FP8-lora-sft-1gpu-proxy.yaml` | Same proxy, TE FP8 hybrid GEMMs | Random init, no 235B download |
 
 Primus has **Qwen3-235B-A22B**, not a 253B variant. The MoE smoke uses that
 in-tree model. LoRA on that recipe is attention-only (`linear_qkv` /
@@ -168,6 +171,11 @@ mkdir -p /tmp/primus-proxy-no-ckpt
   --env PRIMUS_TURBO_ATTN_BACKEND=triton \
   -- train posttrain \
   --config examples/megatron/configs/MI455X/qwen3_235B_A22B-BF16-lora-sft-1gpu-proxy.yaml
+
+# FP8 hybrid siblings: same command, swap BF16 for FP8 in the config name.
+#   llama2_70B-FP8-lora-sft-1gpu-proxy.yaml
+#   qwen2.5_72B-FP8-lora-sft-1gpu-proxy.yaml
+#   qwen3_235B_A22B-FP8-lora-sft-1gpu-proxy.yaml
 ```
 
 ---
@@ -271,6 +279,11 @@ mkdir -p /tmp/primus-proxy-no-ckpt
 # Qwen3-235B-A22B MoE 4-layer proxy (random init)
 ./primus-cli direct -- train posttrain \
   --config examples/megatron/configs/MI455X/qwen3_235B_A22B-BF16-lora-sft-1gpu-proxy.yaml
+
+# FP8 hybrid siblings: same command, swap BF16 for FP8 in the config name.
+#   llama2_70B-FP8-lora-sft-1gpu-proxy.yaml
+#   qwen2.5_72B-FP8-lora-sft-1gpu-proxy.yaml
+#   qwen3_235B_A22B-FP8-lora-sft-1gpu-proxy.yaml
 ```
 
 ---

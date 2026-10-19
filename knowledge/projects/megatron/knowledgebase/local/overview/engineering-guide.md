@@ -10,60 +10,60 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: selected implementation chain, not all models or backends
 sources:
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: ead299ef4e42cd444a931fe61d5778b274acae572d9fca3025de5549dd2c02f5
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: b9166c3df5fe4dd90d5f3479871eeecabae61b9d9eb7722e2b72010d3327ccd8
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e436206da1fe3ec5b8b5da8a06e1c8d6a7e08f149a0079107d83f1d68284e469
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 560336b88b52060544ca76ceb8c9e0b9274472cdea043b76e2a87db467532883
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
 - source: nvidia-megatron-lm
   path: megatron/core/distributed/distributed_data_parallel.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: a19f8e1300dd8c7b294d1d52defe22ecb6e9c79fbcbae61a41dc5bf0de460f67
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 26a06023687b3ab6a9d89fc2d1776997e619dc9d34649d38b90c2b85cb3f7b07
 - source: nvidia-megatron-lm
   path: megatron/core/optimizer/distrib_optimizer.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 892589f868b77a8f209bbcc8861521e7e71ddd46665b3dee38871aa580523389
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 5e0edba9f82b504a1785959824f03b8ea5c13799049c29a579ce0cc3b9a26e7b
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/token_dispatcher.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 518636f7fdd774247796ad5dc4ddcfd85be4e20b755e85ac763bf1a53d898a31
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 7f3e33027136df240426614ee65a3c149d7a2c4361eda3b62cc6123af1bd9c6e
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/paged_stash.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 950b8c72253b90e8b6936a5aa8532120bd8e056f6cc88807efa4c818d88d4efc
 - source: nvidia-megatron-lm
   path: megatron/core/extensions/transformer_engine.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 6ee4807baa38389691e5ecf19472ee933f2ac5b6fe51b3e3cf26539388b77bf4
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 402dd8cf540b17fac15f0f77fba603acaa5fb4f6d9493536ff6550719f0bda47
 - source: nvidia-megatron-lm
   path: megatron/core/pipeline_parallel/schedules.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 3719d850b8822e221f30472881b8802b8f88ce02167856130fae97849d1d91ee
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 4d1c5904df165b8917029602466ebb0f5409db591b912e6969f4561ecc385171
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
 - source: nvidia-megatron-lm
   path: megatron/training/argument_utils.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 977593174e884b7ab344335c32d12f8a233290cccbca779fbfde9a205856f79c
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 9d43af562fba192aab67c469978ba2ab7a79cb37c40f23720aa31a10f8211d0e
 - source: nvidia-megatron-lm
   path: megatron/training/config/container.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: d789fb75d3422ff66e3ea4ed448ccb06fffd55ae93c7eb1c031d30c441f9599c
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 22076a5fc2b1d61486d47cace2f23e378b0929191c7a5ffe6091508fb3f7aa82
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/moe/ops/paged_stash.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: dba859b82cd90179fc8e45bf3c55ecef10a7432a6d968df4b30c66768efd6de4
 ---
 
@@ -83,7 +83,7 @@ Megatron-LM 仓同时包含训练入口/应用层和 `megatron/core`。`pretrain
 
 本地保存官方 README、core quickstart、GPT3/RL examples、user-guide/features 和部分测试指南。安装时区分 Core 包和 LM 完整训练工程，确认 PyTorch、TE、编译扩展与实际 HCU patch 的版本组合。执行采用当前 HCU 主仓适用脚本；官方配方用于核对模型和训练语义，平台变量以 HCU 实现与现场为准。
 
-最小任务先检查模型 shape、数据/分词/seed、精度、并行拓扑和 optimizer。模型过大时只减少层数，其余模型参数保留，记录该缩模边界。运行前选对应 unit/functional tests，运行后检查 optimizer step、保存恢复和原始 loss 基线。低精度、MoE 与 fused kernels 需要局部误差及确定性/容差契约。
+最小任务先检查模型 shape、数据/分词/seed、精度、并行拓扑和 optimizer。先评估完整模型的可行并行布局与容量；确需代理时优先只减少层数，保留其余模型参数并记录边界。运行前选对应 unit/functional tests，运行后检查 optimizer step、保存恢复和原始 loss 基线。低精度、MoE 与 fused kernels 需要局部误差及确定性/容差契约。
 
 ## 系统性能分析次序
 
@@ -109,6 +109,12 @@ token_dispatcher 与 EP routing 决定各 rank workload、传输和 grouped GEMM
 
 官方 dev、main、release 和 HCU patch 分支可能差异很大；PR merged 还要核对目标 branch 和运行依赖。参考 AMD Primus、华为 MindSpeed/MindSpeed-LLM、百度 LoongForge 时记录依赖、算法前提和采用/退役条件；官方合入等价改进后再经验证退役本地补丁。路线图只是候选方向，不能自动视为已提供能力。
 
+## 当前主干的三类状态边界
+
+配置容器定稿、`TrainState` 运行进度与 checkpoint 持久化是三层状态。当前循环从 `get_train_state()` 读取 iteration、consumed/skipped samples、验证进度与累计 FLOPs；旧 `args` 上同名字段不再是可靠消费点。恢复后的吞吐使用独立的 resume 基准，见[训练/loss](../topics/training-and-loss.md)与[保存恢复](../topics/checkpoint.md)。
+
+新 GTP 布局将权重分片/复制和独立序列分配分开；mHC 的部分 PP/VPP 支持已落到 P2P 残差宽度，不能继续把 PP>1 一概判为不支持，也不能推成所有 mHC/MTP/EP-overlap 组合可用。MoonEP 虚拟专家、梯度池卸载与低精度缓存各有所有权和互斥条件，详见[并行](../topics/parallelism.md)、[MoE](../topics/moe.md)与[显存](../topics/memory.md)。
+
 ## 本轮接口复核与阅读路线
 
 当前 main 将训练配置组织为 `ConfigContainerBase`/`PretrainConfigContainer` 等 typed 容器，`argument_utils.py` 连接 CLI、dataclass 和配置转换，`training.py` 从 `cfg` 消费参数。检查部署版本的解析、校验、转换与实际构造，不能只在旧 `args` 或某篇教程找到同名参数。这里是官方 main 行为，不要求 HCU 较旧 release 改成同一接口。
@@ -128,23 +134,23 @@ HCU 适配仓还可能通过独立补丁包、submodule 或插件连接上游：
 
 | 文件 | 本轮源码中可追查的入口（非全部符号） |
 | --- | --- |
-| [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/pretrain_gpt.py) | `get_batch`, `loss_func`, `forward_step`, `is_dataset_built_on_rank`, `core_gpt_dataset_config_from_args`, `train_valid_test_datasets_provider`, `get_embedding_ranks` |
-| [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/training.py) | `set_startup_timestamps`, `destroy_global_state`, `print_datetime`, `update_seqlen_stats_from_cu_seqlens`, `set_seqlen_stats_in_iteration`, `consume_seqlen_stats_in_iteration`, `num_floating_point_operations`, `get_start_time_from_progress_log` |
-| [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/arguments.py) | `add_megatron_arguments`, `parse_and_validate_args`, `parse_args`, `validate_model_config_args_from_heterogeneous_config`, `no_rope_freq_type`, `compress_ratios_type`, `moe_freq_type`, `la_freq_type` |
-| [megatron/core/distributed/distributed_data_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/distributed/distributed_data_parallel.py) | `DistributedDataParallel`, `enable_forward_pre_hook`, `disable_forward_pre_hook`, `no_sync`, `start_param_sync`, `reset_param_sync_dispatch_state`, `start_grad_sync`, `finish_grad_sync` |
-| [megatron/core/optimizer/distrib_optimizer.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/optimizer/distrib_optimizer.py) | `get_legacy_grad_dtypes`, `Range`, `DistributedOptimizer`, `normalize`, `compute_full_param_layout`, `get_grad_stats_parallel_group`, `optimizer_state_keys`, `state_dict` |
-| [megatron/core/transformer/moe/token_dispatcher.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/token_dispatcher.py) | `MoETokenDispatcher`, `MoEAllGatherTokenDispatcher`, `MoEAlltoAllTokenDispatcher`, `nccl_ep_release_context`, `MoEFlexTokenDispatcher`, `dispatch_preprocess`, `token_dispatch`, `dispatch_postprocess` |
-| [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/moe/paged_stash.py) | `PagedStashBuffer`, `PagedTensor`, `PipelinePreScheduleFunction`, `PipelinePostScheduleFunction`, `PagedStashManager`, `PagedStashContext`, `paged_stash_group_start`, `get_paged_stash_context` |
-| [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/extensions/transformer_engine.py) | `TransformerEngineConfigType`, `TEQuantizationRecipe`, `TEQuantizationParams`, `condition_init_method`, `split_te_layernorm_column_parallel_linear`, `TENorm`, `TELinear`, `TELayerNormColumnParallelLinear` |
-| [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/pipeline_parallel/schedules.py) | `get_forward_backward_func`, `deallocate_output_tensor`, `custom_backward`, `get_tensor_device`, `forward_step_calc_loss`, `forward_step`, `backward_step`, `backward_step_multimodule` |
-| [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/transformer_config.py) | `TransformerConfig`, `MLATransformerConfig`, `from_config` |
+| [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/pretrain_gpt.py) | `get_batch`, `loss_func`, `forward_step`, `is_dataset_built_on_rank`, `core_gpt_dataset_config_from_args`, `train_valid_test_datasets_provider`, `get_embedding_ranks` |
+| [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/training.py) | `set_startup_timestamps`, `destroy_global_state`, `print_datetime`, `update_seqlen_stats_from_cu_seqlens`, `set_seqlen_stats_in_iteration`, `consume_seqlen_stats_in_iteration`, `num_floating_point_operations`, `get_start_time_from_progress_log` |
+| [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/arguments.py) | `add_megatron_arguments`, `parse_and_validate_args`, `parse_args`, `validate_model_config_args_from_heterogeneous_config`, `no_rope_freq_type`, `compress_ratios_type`, `moe_freq_type`, `la_freq_type` |
+| [megatron/core/distributed/distributed_data_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/distributed/distributed_data_parallel.py) | `DistributedDataParallel`, `enable_forward_pre_hook`, `disable_forward_pre_hook`, `no_sync`, `start_param_sync`, `reset_param_sync_dispatch_state`, `start_grad_sync`, `finish_grad_sync` |
+| [megatron/core/optimizer/distrib_optimizer.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/optimizer/distrib_optimizer.py) | `get_legacy_grad_dtypes`, `Range`, `DistributedOptimizer`, `normalize`, `compute_full_param_layout`, `get_grad_stats_parallel_group`, `optimizer_state_keys`, `state_dict` |
+| [megatron/core/transformer/moe/token_dispatcher.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/token_dispatcher.py) | `MoETokenDispatcher`, `MoEAllGatherTokenDispatcher`, `MoEAlltoAllTokenDispatcher`, `nccl_ep_release_context`, `MoEFlexTokenDispatcher`, `dispatch_preprocess`, `token_dispatch`, `dispatch_postprocess` |
+| [megatron/core/transformer/moe/paged_stash.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/moe/paged_stash.py) | `PagedStashBuffer`, `PagedTensor`, `PipelinePreScheduleFunction`, `PipelinePostScheduleFunction`, `PagedStashManager`, `PagedStashContext`, `paged_stash_group_start`, `get_paged_stash_context` |
+| [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/extensions/transformer_engine.py) | `TransformerEngineConfigType`, `TEQuantizationRecipe`, `TEQuantizationParams`, `condition_init_method`, `split_te_layernorm_column_parallel_linear`, `TENorm`, `TELinear`, `TELayerNormColumnParallelLinear` |
+| [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/pipeline_parallel/schedules.py) | `get_forward_backward_func`, `deallocate_output_tensor`, `custom_backward`, `get_tensor_device`, `forward_step_calc_loss`, `forward_step`, `backward_step`, `backward_step_multimodule` |
+| [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/transformer_config.py) | `TransformerConfig`, `MLATransformerConfig`, `from_config` |
 
 ## 教程、PR 与继续搜索
 
 - [全仓目录和固定文件入口](../../upstream/source-map/nvidia-megatron-lm.md)：没有本地专题时按模块继续读源码。
 - [上游教程原文目录](../../upstream/docs/nvidia-megatron-lm)：保留来源内容，链接相对位置以原站为准。
 - [PR #6878：Mxfp8 refit bounded memory](../../upstream/prs/NVIDIA--Megatron-LM/PR-6878.md)：正文、review、diff 与 head/base 源码。
-- [PR #7534：[dev] docs: add combined 1F1B MoE A2A overlap guide](../prs/NVIDIA--Megatron-LM/PR-7534.md)：正文、review、diff 与 head/base 源码。
+- [PR #7534：[dev] docs: add combined 1F1B MoE A2A overlap guide](../../upstream/prs/NVIDIA--Megatron-LM/PR-7534.md)：正文、review、diff 与 head/base 源码。
 - [PR #7897：Widen paged-stash copy/pop kernel launches](../../upstream/prs/NVIDIA--Megatron-LM/PR-7897.md)：正文、review、diff 与 head/base 源码。
 - [PR #7942：Declare the residual on the pre-MLP norm of the fused MLA spec](../../upstream/prs/NVIDIA--Megatron-LM/PR-7942.md)：正文、review、diff 与 head/base 源码。
 

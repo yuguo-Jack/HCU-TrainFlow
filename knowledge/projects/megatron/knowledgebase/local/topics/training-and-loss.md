@@ -10,30 +10,38 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: ead299ef4e42cd444a931fe61d5778b274acae572d9fca3025de5549dd2c02f5
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: b9166c3df5fe4dd90d5f3479871eeecabae61b9d9eb7722e2b72010d3327ccd8
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e436206da1fe3ec5b8b5da8a06e1c8d6a7e08f149a0079107d83f1d68284e469
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 560336b88b52060544ca76ceb8c9e0b9274472cdea043b76e2a87db467532883
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
 - source: nvidia-megatron-lm
   path: megatron/core/pipeline_parallel/schedules.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 3719d850b8822e221f30472881b8802b8f88ce02167856130fae97849d1d91ee
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 4d1c5904df165b8917029602466ebb0f5409db591b912e6969f4561ecc385171
 - source: nvidia-megatron-lm
   path: megatron/core/rerun_state_machine.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 628f9550686505275eddfda7f444ebee51c573f0790d6927027444660f51a5ea
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 0098ceed9a9cedfc0fba53aab75aefad8fe8ea8d10711da70965f55500401c03
+- source: nvidia-megatron-lm
+  path: megatron/core/full_cuda_graph.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 0fb16794b9755891671ecc46c843b87eee521236978f0cc3221d0bf3d7f32776
+- source: nvidia-megatron-lm
+  path: tests/unit_tests/transformer/test_full_cuda_graph_validation.py
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: b76d1cca894d212d29cd4c2791398f8a49a6e060ce0fac881b8c1251a6f4d5e6
 ---
 
 # Megatron 训练步：数据、loss 归一化、optimizer与数值诊断
@@ -60,6 +68,14 @@ sources:
 
 clip/QK统计、动态loss scale、梯度累积、low-precision master与cached weights要与更新完成状态对应。仅优化fused Adam不能外推Muon；优化某分支首先从实际profile与调用者确认。
 
+## 配置、进度和 Graph 验证的当前所有者
+
+`validate()` 保持纯校验，初始化时的 `finalize()` 一次性落实运行派生值；迭代/consumed/skipped samples、验证计数和累计 FLOPs 由 `TrainState` 负责。旧 args 字段可能仍供兼容入口解析，但不能用它们代替当前循环的运行状态。初次恢复的 resume_iteration/resume FLOPs 与随后累积值分开，重启后的吞吐分子须扣除本次 resume 基准。
+
+GTP sequence sharding 下的样本数使用实际独立序列域，不能继续乘全部 weight-remat ranks；reporting、scheduler、eval 微批和 data 游标需同步采用同一计数语义。权重复制域和 token 域不能互换。
+
+full_iteration Graph 现保留 loss/gradient 检查：在原验证点 clone tensor，replay 后在主机执行 deferred validations，之后才决定 rerun 或 optimizer 更新。旧教程中强制关闭 NaN 检查的要求已移除。复制必须发生在后续 in-place 修改之前，重放后再次保存验证值避免被下次 replay 覆盖；reset/异常还需清理对应 graph 的验证记录。不能把 CUDA capture 中无法同步解释为应永久关闭质量检查。
+
 ## 阶段数值验证
 
 初始可信checkpoint/样本和loss基线冻结。保存tokenizer/data指纹、seed/RNG、mask/position、optimizer/LR、precision recipe、全局batch/tokens、拓扑与报告定义。小迭代做局部输出/梯度/dispatch和短性能，阶段候选稳定后做较长loss；无需每次微调长训，但不能省去阶段质量验收。
@@ -74,10 +90,10 @@ NV环境可从同state/tokens/拓扑可比配置找第一处分歧，再定位em
 
 ## 固定源码与维护边界
 
-- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/pretrain_gpt.py)
-- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/training.py)
-- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/arguments.py)
-- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/pipeline_parallel/schedules.py)
-- [megatron/core/rerun_state_machine.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/rerun_state_machine.py)
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/pretrain_gpt.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/training.py)
+- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/arguments.py)
+- [megatron/core/pipeline_parallel/schedules.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/pipeline_parallel/schedules.py)
+- [megatron/core/rerun_state_machine.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/rerun_state_machine.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

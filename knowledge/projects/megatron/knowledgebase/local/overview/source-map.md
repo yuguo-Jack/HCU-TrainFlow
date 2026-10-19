@@ -10,42 +10,42 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-12'
+reviewed_on: '2026-10-20'
 coverage: reviewed training, parallel, state and backend implementation chains; not
   all models or runtime combinations
 sources:
 - source: nvidia-megatron-lm
   path: pretrain_gpt.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: ead299ef4e42cd444a931fe61d5778b274acae572d9fca3025de5549dd2c02f5
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: b9166c3df5fe4dd90d5f3479871eeecabae61b9d9eb7722e2b72010d3327ccd8
 - source: nvidia-megatron-lm
   path: gpt_builders.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 6cbcee1cfeb9cd6d7d0f89938c59e84380c713c9faf3436c5ff6c0b1a521ba18
 - source: nvidia-megatron-lm
   path: model_provider.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
   sha256: 9e4fde24c6615e43ab242c1c9d69b4785554de3afd39a159488264e61c3ac653
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: eca958faeab77e1df81073998ea07aa3cc8a5884f96f6182782d620942139bd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
 - source: nvidia-megatron-lm
   path: megatron/training/initialize.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e093f7728b47ae4ef7b3310fd13ecc243805cd309976d7a846fb23b338cb7fda
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 8689f06f35f490d39a50a64b8110ce2e8123acfcdab110558ed80c3f22a5d584
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: e436206da1fe3ec5b8b5da8a06e1c8d6a7e08f149a0079107d83f1d68284e469
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 560336b88b52060544ca76ceb8c9e0b9274472cdea043b76e2a87db467532883
 - source: nvidia-megatron-lm
   path: megatron/core/parallel_state.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 414ecaf3b1891e8d621e5ec86a80af9d2d313d4393ac11e83832ff4bf7257dd2
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: 57ab2c1765c4a20a92379bf50a6485bcd50859de86a59af5332e6b2bb8bcfd2a
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e30d863a6d82a3c45f2d71355dc73fbf5610967b
-  sha256: 36ebc84d850af5653d6f17aa2147f61b79f82b7a05422b8d0eba8943bafb0f87
+  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
 ---
 
 # Megatron 代码目录：从配置、训练步到计算和恢复
@@ -78,6 +78,13 @@ sources:
 
 模型配置、运行/记录配置、并行组、optimizer/precision配置分别表达。选定一项优化时记录定义、消费、约束和接口测试四个位置；编译成功或flag被接受不能代替实际dispatch证据。
 
+## 新布局与状态的精确入口
+
+- `core/tensor_parallel/gtp_parallel_layout.py`：同一组 rank 的 token 与 weight 两种视图、独立 batch 数和权重复制数；继续到 `parallel_state.py` 的真实 group。
+- `core/transformer/moe/virtual_expert_load_balancer.py`：路由规划、权重推送、虚拟梯度回并和对称内存释放；不是只有 dispatcher 改名。
+- `core/full_cuda_graph.py` 与 `core/rerun_state_machine.py`：图内保存验证点的值、每次 replay 后的主机检查；不能通过关闭检查掩盖 capture 限制。
+- `training/ckpt/glu_checkpointing.py`：模型 FC1 的规范行布局与 optimizer 的运行布局；与 `training/checkpointing.py` 的完整恢复入口一起核对。
+
 ## 从症状进入源码
 
 loss变化先查`pretrain_gpt.loss_func`和`schedules.forward_step_calc_loss`，再查训练report reduction及optimizer step；不是先改融合kernel。空泡先查data/host/PP/通信等待后再追driver。OOM沿param/grad/activation/gather/graph/checkpoint所有者查。恢复失败沿training tracker/config/RNG→Core strict/sharded metadata→backend和loader状态查。
@@ -92,13 +99,13 @@ Core→TE/cuDNN/编译器及通信库问题可以继续读实际底层依赖分�
 
 ## 固定源码与维护边界
 
-- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/pretrain_gpt.py)
-- [gpt_builders.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/gpt_builders.py)
-- [model_provider.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/model_provider.py)
-- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/arguments.py)
-- [megatron/training/initialize.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/initialize.py)
-- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/training/training.py)
-- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/parallel_state.py)
-- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/megatron/core/transformer/transformer_config.py)
+- [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/pretrain_gpt.py)
+- [gpt_builders.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/gpt_builders.py)
+- [model_provider.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/model_provider.py)
+- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/arguments.py)
+- [megatron/training/initialize.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/initialize.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/training.py)
+- [megatron/core/parallel_state.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/parallel_state.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/transformer_config.py)
 
-2026-10-12按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

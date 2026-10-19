@@ -39,6 +39,10 @@
 
 训练 Graph 按完整优化器步及累积边界核对；一次 graph launch 可能只覆盖 fwd、bwd、重算或更新的一部分。capture 的源码映射与正式 replay 的时间分开，逐图保留准确 shape/stride/phase 特化和调用序列；不能用推理请求的 batch bucket 或相邻 launch 替代训练步语义。参数更新、共享 buffer 地址/存活期、grad 清零/累积、随机操作及动态 MoE 调度必须与原训练契约一致；编译图或 capture 成功后仍验证完整步数值、显存和 profiler-off 收益。
 
+`torch.compile` 可用与 Graph replay 安全分别验收。当前 HCU Primus Turbo 在特定 DTK 的 attention backward 注册中保留编译，却显式标记 `cudagraph_unsafe`；不要为追求整图删除这类门禁。先检查实际 op 注册、fake/meta、mutation/alias、生成代码和 capture 限制，再决定切分边界与回退。自定义流水或 Cython launcher 升级后也要核对当前 device/stream 与参数绑定，不能用旧缓存或一次 eager 通过替代变化输入 replay。
+
+编译期常量和缓存的失效属于正确性检查。TE UB、后端、量化 recipe、布局或工具链变化后，核对当前版本如何 reset/recompile，验证冷/热缓存都命中正确实现。对会写 out、累加梯度或更新状态的编译/autotune 路线，先检查准备阶段是否真的执行 kernel；在独立输出上准备或按实现保证只更新一次，不能把第一次执行当纯编译而遗漏副作用。具体梯度与状态检查见[底层库接入](hcu-library-integration.md#融合梯度与低精度状态的接入检查)。
+
 **AOTInductor/export 不作为默认训练加速方案。** 仅当项目确实使用导出路径，或冻结编码器/评估/rollout 等子模块有明确需求时评估；分别核查 autograd、参数更新与部署支持。AOTAutograd 的训练图处理不能和 AOTI 推理打包混为一谈。需要可训练自定义算子时补正确 backward，以及当前编译路径需要的注册/形状/别名描述，再交给已有 Hygon kernel Skill。
 
 ## 4. 收益排序与交付
@@ -48,6 +52,8 @@
 系统/编译问题与算子优化可按独立范围并行。累计 ≥90% 端到端热点集合中的非通信 op 仍须按真实 shape 建模；框架优化不能代替该评估。优先复用 HCU TE/Flash-Train 和当前库能力；需要实现再调用 HIP/Triton Skills。
 
 每轮比较初始正确基线的输出、loss 分量、梯度和参数更新，覆盖多 shape/mask、train/eval、累积边界、随机操作和保存恢复。稳定候选再验阶段 loss；视频/动作等任务使用匹配目标的质量与验证集指标，不能只套语言模型 loss。保留最近已验收最佳候选，退化方案记录原因并回退；交付实际采用的代码/配置、编译策略、缓存重建、收益和限制。
+
+PyTorch 版本、RCCL 兼容宏、DTK/HIP 和库版本分别记录，原生接口列表不等于本 HCU 构建全部支持。日志类别、allocator/snapshot 私有签名与 DDP bucket 生命周期沿当前源码核对；VMM 的虚拟地址预留与物理显存、Graph 池与普通缓存分别计量。异步 checkpoint 以实际 save future/结果确认写盘和错误，不能仅以 close 无异常或后台进程退出判定可恢复。
 
 ## 5. 版本查证入口
 

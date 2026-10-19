@@ -1,0 +1,387 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "5bfd416de3a93fa9da61f8273e3cba2492b15c70839901ced06ddd6752b1a5ab",
+      "isPrivate": false,
+      "numbers": [
+        44270,
+        44269,
+        44268,
+        44267,
+        44266,
+        44265,
+        44264,
+        44263
+      ],
+      "observed_at": "2026-10-19T18:28:55.368955+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4698,
+        "resetAt": "2026-10-19T18:47:39Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "fa66e7d816d77bdff44fec3fa2aa333a2934d703",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nOn ROCm with `SGLANG_USE_AITER=1` (the default in the ROCm images), dense Qwen3-VL decode goes through `Qwen3Attention.forward_prepare_aiter_fused_mrope`, which calls aiter's `fused_qk_norm_mrope_3d_cache_pts_quant_shuffle` to run QK-norm + 3D mRoPE + the KV cache write in one kernel. That path currently produces garbage:\n\n| `Qwen3-VL-8B-Instruct`, default server args | `main` | This PR |\n|---|---|---|\n| GSM8K (1319 questions, chat API, greedy) | **0.005** | **0.942** |\n| \"What is the capital of France? Answer in one sentence.\" | `The capital of France's capital of France is Paris of France is Paris is Paris is …` | `The capital of France is Paris.` |\n| Image with the text \"MI355X 2026\", a red circle and a blue square | `BasedThe text: The text: The text: The text: …` | `… The text written at the top of the image is: M1355X 2026 … Left Shape: A solid red circle. Right Shape: A solid blue square.` |\n\n**Root cause.** Since ROCm/aiter#4531 (in the AITER pin since #37784), the kernel reads `k_cache` / `v_cache` strides as `(block, token, head, head_dim)`: dim 1 is the per-token stride and dim 2 the per-head stride. `Qwen3Attention` passes the NHD pool buffers `(slots, num_kv_heads, head_dim)`, whose dim-1 / dim-2 strides are `head_dim` / `1`, so the K/V of slot `s`, head `h` is written at element offset `s * head_dim + h` instead of `(s * num_kv_heads + h) * head_dim`. The decode token's own slot is not written by it, and other slots — including the prompt KV of running requests — are overwritten. Nothing faults and throughput is unchanged, so performance runs do not notice. Prefill uses the unfused path, which is why the first token is still sensible.\n\nAffected: dense Qwen3-VL (`Qwen3VLForConditionalGeneration`) on ROCm with the default aiter attention backend. Qwen3-VL-MoE uses `Qwen3MoeAttention` and does not take this path; the AMD VLM accuracy test runs `Qwen3-VL-30B-A3B-Instruct`, which is why CI did not catch it.\n\nThe same path also cast `cos_sin_cache` to the activation dtype on every layer of every decode step. On HIP that cache is kept in fp32, and for Qwen3-VL-8B (`max_position_embeddings = 262144`) it is 128 MiB, so each step moved about 6.75 GiB (36 layers × 128 MiB read + 64 MiB write) just to recreate the same bf16 table.\n\n## Modifications\n\n- `aiter_fused_qk_norm_rope_set_kv` (new, `models/qwen3.py`) holds the kernel call and passes the NHD buffers as one-slot blocks, `k_cache.unsqueeze(1)` → `(slots, 1, num_kv_heads, head_dim)` with `block_size = 0`, which gives the kernel the token stride `num_kv_heads * head_dim` and the head stride `head_dim`.\n- `Qwen3Attention.forward` takes the fused path only when the pool buffer is that 3D NHD layout in the activation dtype. The kernel's quantized write uses a fixed per-tensor scale of 1.0 rather than the layer's `k_scale` / `v_scale`, and the HND and `vectorized_5d` layouts are not NHD; those configurations use the unfused path.\n- `RotaryEmbedding.cos_sin_cache_as(dtype)` returns `cos_sin_cache` in `dtype` and reuses the cast copy until `cos_sin_cache` is replaced (`_ensure_cos_sin_cache_length`, device moves). The first call happens in the eager warmup before CUDA graph capture, so the captured graphs contain no cast.\n- `test/registered/amd/test_qwen3_aiter_fused_qk_norm_rope.py` calls the helper with NHD buffers and checks q and the K/V written at `out_cache_loc` against `RMSNorm.forward_native` + `MRotaryEmbedding.forward_native`, that no other slot is written, and the `cos_sin_cache_as` reuse/invalidation. With the 3D buffers passed as before, 98% of the written K elements mismatch; with this PR it passes.\n\n## Accuracy Tests\n\nMI355X (gfx950), ROCm 7.2.0, torch 2.9.1, Triton 3.7.0, transformers 5.19.0, `SGLANG_USE_AITER=1`, default server args (attention backend resolves to `aiter`, decode CUDA graphs on). The pinned AITER `e7d2453f` has the same stride handling in both fused kernels.\n\n**Unit test.** `test/registered/amd/test_qwen3_aiter_fused_qk_norm_rope.py`: 2 passed, 8 subtests passed.\n\n**`Qwen3-VL-8B-Instruct`, end to end:** see the table above. GSM8K via `python -m sglang.test.run_eval --eval-name gsm8k --num-examples 1319 --max-tokens 2048`; the text and image prompts are single chat requests at temperature 0.\n\nDense Qwen3 (plain RoPE) does not take this path and is unchanged.\n\n## Speed Tests and Profiling\n\n`Qwen3-VL-8B-Instruct`, `python -m sglang.bench_serving --backend sglang --dataset-name random-ids --random-input-len 1024 --random-output-len 512 --random-range-ratio 1.0`, `--num-prompts = max(16, 4 × concurrency)`, prefix cache flushed before each run, one benchmark at a time. Both servers generate the same number of tokens per request, so the comparison holds even though the `main` output is wrong.\n\n| Concurrency | Median TPOT `main` (ms) | Median TPOT this PR (ms) | Delta | Output throughput |\n|---|---|---|---|---|\n| 1 | 5.960 | 4.818 | **−19.2%** | +14.5% |\n| 8 | 6.782 | 5.462 | **−19.5%** | +22.5% |\n| 32 | 8.797 | 7.490 | **−14.9%** | +15.9% |\n| 64 | 12.359 | 11.190 | −9.5% | +9.2% |\n\nThe saving is a roughly constant 1.1–1.3 ms per step across concurrencies, the order expected for the ~6.75 GiB per-step `cos_sin_cache` cast that is no longer launched.\n\n## Reproduce\n\n```bash\nMODEL=Qwen/Qwen3-VL-8B-Instruct\nSGLANG_USE_AITER=1 python -m sglang.launch_server --model-path $MODEL --port 30000\npython -m sglang.test.run_eval --port 30000 --eval-name gsm8k --num-examples 1319 --max-tokens 2048\npython -m pytest test/registered/amd/test_qwen3_aiter_fused_qk_norm_rope.py\n```\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). — no user-facing behaviour change, nothing to document.\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:no_entry_sign: [Run #38696450223](https://github.com/sgl-project/sglang/actions/runs/38696450223)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38696450166](https://github.com/sgl-project/sglang/actions/runs/38696450166)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:hourglass_flowing_sand: [Run #38696450168](https://github.com/sgl-project/sglang/actions/runs/38696450168)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jiaqiang-dot-liu"
+            },
+            "body": "@BBuf @HaiShaw could you please review on this PR？thanks！",
+            "createdAt": "2026-10-14T13:16:16Z",
+            "databaseId": 6169247265,
+            "updatedAt": "2026-10-14T13:16:16Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44266#issuecomment-6169247265"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jiaqiang-dot-liu"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-10-14T13:19:40Z",
+            "databaseId": 6169312916,
+            "updatedAt": "2026-10-14T13:19:40Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44266#issuecomment-6169312916"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jiaqiang-dot-liu"
+            },
+            "body": "@ch-wan could you please review on this PR？ thx!",
+            "createdAt": "2026-10-15T02:00:40Z",
+            "databaseId": 6182670830,
+            "updatedAt": "2026-10-15T02:00:40Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44266#issuecomment-6182670830"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXCEEe4=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "85183672f32130d035f93835fe59ea8735791d40",
+      "headRepository": {
+        "nameWithOwner": "jiaqiang-dot-liu/sglang"
+      },
+      "mergeCommit": {
+        "oid": "2f5407da286bebd645440b5fe2293bd6e4fbfcc5"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-15T13:22:47Z",
+      "number": 44266,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "1am9trash"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "1am9trash"
+                  },
+                  "body": "Hi, @jiaqiang-dot-liu \n\nReassigning `use_aiter_fused` after the cache lookup makes the same flag mean two different things. It might read more clearly to use a cheap `can_try_aiter_fused` check to decide whether to fetch the cache, and set `use_aiter_fused` once from the layout and dtype.\n\nJust for ref,\n```py\ncan_try_aiter_fused = (\n    self.use_fused_qk_norm_mrope\n    and forward_batch.forward_mode.is_decode()\n    and get_exec().deterministic.rl_on_policy_target is None\n)\nif can_try_aiter_fused:\n    k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)\n    # NHD in the activation dtype. This path passes scale 1 and does not\n    # quantize, so a quantized or other-layout store stays on the normal write.\n    use_aiter_fused = (\n        k_cache.dim() == 3\n        and k_cache.dtype == hidden_states.dtype\n    )\n```\n",
+                  "createdAt": "2026-10-14T11:22:46Z",
+                  "databaseId": 4270113223,
+                  "diffHunk": "@@ -280,10 +300,17 @@ def forward(\n             and forward_batch.forward_mode.is_decode()\n             and get_exec().deterministic.rl_on_policy_target is None\n         )\n+        if use_aiter_fused:\n+            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)\n+            # The fused write targets the NHD layout in the activation dtype and\n+            # does not apply per-layer KV scales.\n+            use_aiter_fused = (\n+                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype\n+            )\n \n         if use_aiter_fused:",
+                  "line": 312,
+                  "originalLine": 311,
+                  "path": "python/sglang/srt/models/qwen3.py",
+                  "updatedAt": "2026-10-14T11:22:46Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/44266#discussion_r4270113223"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNFQxMToyMjo0NlrO_oTBxw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5517109994,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-14T11:22:46Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44266#pullrequestreview-5517109994"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jiaqiang-dot-liu"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "jiaqiang-dot-liu"
+                  },
+                  "body": "Thanks, agreed. Split it into `can_try_aiter_fused`, a cheap gate that decides whether to fetch the cache, and `use_aiter_fused`, set once from the layout and dtype. `use_aiter_fused` starts as False so the non-decode path stays defined. I kept the existing comment wording: with an FP8 cache the kernel does quantize, but with a fixed scale of 1.0 instead of the layer's k_scale/v_scale. Pushed in ab0ef07ab8.",
+                  "createdAt": "2026-10-14T11:38:04Z",
+                  "databaseId": 4270249275,
+                  "diffHunk": "@@ -280,10 +300,17 @@ def forward(\n             and forward_batch.forward_mode.is_decode()\n             and get_exec().deterministic.rl_on_policy_target is None\n         )\n+        if use_aiter_fused:\n+            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)\n+            # The fused write targets the NHD layout in the activation dtype and\n+            # does not apply per-layer KV scales.\n+            use_aiter_fused = (\n+                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype\n+            )\n \n         if use_aiter_fused:",
+                  "line": 312,
+                  "originalLine": 311,
+                  "path": "python/sglang/srt/models/qwen3.py",
+                  "updatedAt": "2026-10-14T11:38:04Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/44266#discussion_r4270249275"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xNFQxMTozODowNFrO_obVOw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5517269458,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-14T11:38:04Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44266#pullrequestreview-5517269458"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "1am9trash"
+            },
+            "body": "LGTM. The comments resolved.\r\nAll changes are under aiter guard.\r\n",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5517374496,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-14T11:47:17Z",
+            "url": "https://github.com/sgl-project/sglang/pull/44266#pullrequestreview-5517374496"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xNFQxMTo0NzoxN1q0MjAyNi0xMC0xNFQxMTo0NzoxN1rPAAAAAUjcdCA=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "MERGED",
+      "title": "[Fix] [AMD] qwen3: Fix KV cache write in the fused QK-norm + mRoPE decode path",
+      "updatedAt": "2026-10-15T13:22:48Z",
+      "url": "https://github.com/sgl-project/sglang/pull/44266"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "fa66e7d816d77bdff44fec3fa2aa333a2934d703"
+    },
+    "body": "## Motivation\n\nOn ROCm with `SGLANG_USE_AITER=1` (the default in the ROCm images), dense Qwen3-VL decode goes through `Qwen3Attention.forward_prepare_aiter_fused_mrope`, which calls aiter's `fused_qk_norm_mrope_3d_cache_pts_quant_shuffle` to run QK-norm + 3D mRoPE + the KV cache write in one kernel. That path currently produces garbage:\n\n| `Qwen3-VL-8B-Instruct`, default server args | `main` | This PR |\n|---|---|---|\n| GSM8K (1319 questions, chat API, greedy) | **0.005** | **0.942** |\n| \"What is the capital of France? Answer in one sentence.\" | `The capital of France's capital of France is Paris of France is Paris is Paris is …` | `The capital of France is Paris.` |\n| Image with the text \"MI355X 2026\", a red circle and a blue square | `BasedThe text: The text: The text: The text: …` | `… The text written at the top of the image is: M1355X 2026 … Left Shape: A solid red circle. Right Shape: A solid blue square.` |\n\n**Root cause.** Since ROCm/aiter#4531 (in the AITER pin since #37784), the kernel reads `k_cache` / `v_cache` strides as `(block, token, head, head_dim)`: dim 1 is the per-token stride and dim 2 the per-head stride. `Qwen3Attention` passes the NHD pool buffers `(slots, num_kv_heads, head_dim)`, whose dim-1 / dim-2 strides are `head_dim` / `1`, so the K/V of slot `s`, head `h` is written at element offset `s * head_dim + h` instead of `(s * num_kv_heads + h) * head_dim`. The decode token's own slot is not written by it, and other slots — including the prompt KV of running requests — are overwritten. Nothing faults and throughput is unchanged, so performance runs do not notice. Prefill uses the unfused path, which is why the first token is still sensible.\n\nAffected: dense Qwen3-VL (`Qwen3VLForConditionalGeneration`) on ROCm with the default aiter attention backend. Qwen3-VL-MoE uses `Qwen3MoeAttention` and does not take this path; the AMD VLM accuracy test runs `Qwen3-VL-30B-A3B-Instruct`, which is why CI did not catch it.\n\nThe same path also cast `cos_sin_cache` to the activation dtype on every layer of every decode step. On HIP that cache is kept in fp32, and for Qwen3-VL-8B (`max_position_embeddings = 262144`) it is 128 MiB, so each step moved about 6.75 GiB (36 layers × 128 MiB read + 64 MiB write) just to recreate the same bf16 table.\n\n## Modifications\n\n- `aiter_fused_qk_norm_rope_set_kv` (new, `models/qwen3.py`) holds the kernel call and passes the NHD buffers as one-slot blocks, `k_cache.unsqueeze(1)` → `(slots, 1, num_kv_heads, head_dim)` with `block_size = 0`, which gives the kernel the token stride `num_kv_heads * head_dim` and the head stride `head_dim`.\n- `Qwen3Attention.forward` takes the fused path only when the pool buffer is that 3D NHD layout in the activation dtype. The kernel's quantized write uses a fixed per-tensor scale of 1.0 rather than the layer's `k_scale` / `v_scale`, and the HND and `vectorized_5d` layouts are not NHD; those configurations use the unfused path.\n- `RotaryEmbedding.cos_sin_cache_as(dtype)` returns `cos_sin_cache` in `dtype` and reuses the cast copy until `cos_sin_cache` is replaced (`_ensure_cos_sin_cache_length`, device moves). The first call happens in the eager warmup before CUDA graph capture, so the captured graphs contain no cast.\n- `test/registered/amd/test_qwen3_aiter_fused_qk_norm_rope.py` calls the helper with NHD buffers and checks q and the K/V written at `out_cache_loc` against `RMSNorm.forward_native` + `MRotaryEmbedding.forward_native`, that no other slot is written, and the `cos_sin_cache_as` reuse/invalidation. With the 3D buffers passed as before, 98% of the written K elements mismatch; with this PR it passes.\n\n## Accuracy Tests\n\nMI355X (gfx950), ROCm 7.2.0, torch 2.9.1, Triton 3.7.0, transformers 5.19.0, `SGLANG_USE_AITER=1`, default server args (attention backend resolves to `aiter`, decode CUDA graphs on). The pinned AITER `e7d2453f` has the same stride handling in both fused kernels.\n\n**Unit test.** `test/registered/amd/test_qwen3_aiter_fused_qk_norm_rope.py`: 2 passed, 8 subtests passed.\n\n**`Qwen3-VL-8B-Instruct`, end to end:** see the table above. GSM8K via `python -m sglang.test.run_eval --eval-name gsm8k --num-examples 1319 --max-tokens 2048`; the text and image prompts are single chat requests at temperature 0.\n\nDense Qwen3 (plain RoPE) does not take this path and is unchanged.\n\n## Speed Tests and Profiling\n\n`Qwen3-VL-8B-Instruct`, `python -m sglang.bench_serving --backend sglang --dataset-name random-ids --random-input-len 1024 --random-output-len 512 --random-range-ratio 1.0`, `--num-prompts = max(16, 4 × concurrency)`, prefix cache flushed before each run, one benchmark at a time. Both servers generate the same number of tokens per request, so the comparison holds even though the `main` output is wrong.\n\n| Concurrency | Median TPOT `main` (ms) | Median TPOT this PR (ms) | Delta | Output throughput |\n|---|---|---|---|---|\n| 1 | 5.960 | 4.818 | **−19.2%** | +14.5% |\n| 8 | 6.782 | 5.462 | **−19.5%** | +22.5% |\n| 32 | 8.797 | 7.490 | **−14.9%** | +15.9% |\n| 64 | 12.359 | 11.190 | −9.5% | +9.2% |\n\nThe saving is a roughly constant 1.1–1.3 ms per step across concurrencies, the order expected for the ~6.75 GiB per-step `cos_sin_cache` cast that is no longer launched.\n\n## Reproduce\n\n```bash\nMODEL=Qwen/Qwen3-VL-8B-Instruct\nSGLANG_USE_AITER=1 python -m sglang.launch_server --model-path $MODEL --port 30000\npython -m sglang.test.run_eval --port 30000 --eval-name gsm8k --num-examples 1319 --max-tokens 2048\npython -m pytest test/registered/amd/test_qwen3_aiter_fused_qk_norm_rope.py\n```\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations). — no user-facing behaviour change, nothing to document.\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:no_entry_sign: [Run #38696450223](https://github.com/sgl-project/sglang/actions/runs/38696450223)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #38696450166](https://github.com/sgl-project/sglang/actions/runs/38696450166)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:hourglass_flowing_sand: [Run #38696450168](https://github.com/sgl-project/sglang/actions/runs/38696450168)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->",
+    "changed_files": 3,
+    "head": {
+      "repo": {
+        "full_name": "jiaqiang-dot-liu/sglang"
+      },
+      "sha": "85183672f32130d035f93835fe59ea8735791d40"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/44266",
+    "merge_commit_sha": "2f5407da286bebd645440b5fe2293bd6e4fbfcc5",
+    "merged": true,
+    "merged_at": "2026-10-15T13:22:47Z",
+    "number": 44266,
+    "state": "closed",
+    "title": "[Fix] [AMD] qwen3: Fix KV cache write in the fused QK-norm + mRoPE decode path",
+    "updated_at": "2026-10-15T13:22:48Z"
+  },
+  "files": [
+    {
+      "additions": 16,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/85183672f32130d035f93835fe59ea8735791d40/python%2Fsglang%2Fsrt%2Flayers%2Frotary_embedding%2Fbase.py",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Frotary_embedding%2Fbase.py?ref=85183672f32130d035f93835fe59ea8735791d40",
+      "deletions": 0,
+      "filename": "python/sglang/srt/layers/rotary_embedding/base.py",
+      "patch": "@@ -86,6 +86,9 @@\n class RotaryEmbedding(BaseFusedOp):\n     \"\"\"Original rotary positional embedding.\"\"\"\n \n+    # (source cos_sin_cache, cast copy) memo for cos_sin_cache_as().\n+    _cos_sin_cache_cast: Optional[Tuple[torch.Tensor, torch.Tensor]] = None\n+\n     def __init__(\n         self,\n         head_size: int,\n@@ -170,6 +173,19 @@ def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:\n                     query.device, dtype=query.dtype\n                 )\n \n+    def cos_sin_cache_as(self, dtype: torch.dtype) -> torch.Tensor:\n+        \"\"\"cos_sin_cache in ``dtype``, for kernels that read it in the activation\n+        dtype. The cast copy is reused until cos_sin_cache is replaced (growth or\n+        device move), so steady-state calls launch no cast kernel.\"\"\"\n+        cache = self.cos_sin_cache\n+        if cache.dtype == dtype:\n+            return cache\n+        memo = self._cos_sin_cache_cast\n+        if memo is None or memo[0] is not cache or memo[1].dtype != dtype:\n+            memo = (cache, cache.to(dtype))\n+            self._cos_sin_cache_cast = memo\n+        return memo[1]\n+\n     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:\n         \"\"\"Compute the inverse frequency.\"\"\"\n         # NOTE(woosuk): To exactly match the HF implementation, we need to",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/85183672f32130d035f93835fe59ea8735791d40/python%2Fsglang%2Fsrt%2Flayers%2Frotary_embedding%2Fbase.py",
+      "sha": "b6f9d71501b9c82ff14fa4d72df2c6e05bbab04b",
+      "status": "modified"
+    },
+    {
+      "additions": 80,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/85183672f32130d035f93835fe59ea8735791d40/python%2Fsglang%2Fsrt%2Fmodels%2Fqwen3.py",
+      "changes": 132,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodels%2Fqwen3.py?ref=85183672f32130d035f93835fe59ea8735791d40",
+      "deletions": 52,
+      "filename": "python/sglang/srt/models/qwen3.py",
+      "patch": "@@ -65,6 +65,65 @@\n     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream\n \n \n+def aiter_fused_qk_norm_rope_set_kv(\n+    qkv: torch.Tensor,\n+    q_norm: RMSNorm,\n+    k_norm: RMSNorm,\n+    rotary_emb: MRotaryEmbedding,\n+    positions: torch.Tensor,\n+    k_cache: torch.Tensor,\n+    v_cache: torch.Tensor,\n+    out_cache_loc: torch.Tensor,\n+    num_heads: int,\n+    num_kv_heads: int,\n+    head_dim: int,\n+    k_scale: torch.Tensor,\n+    v_scale: torch.Tensor,\n+) -> torch.Tensor:\n+    \"\"\"QK-norm + 3D mRoPE + KV cache write in one aiter HIP kernel.\n+\n+    ``qkv`` is the (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim) QKV\n+    projection; ``k_cache`` / ``v_cache`` are the NHD (slots, num_kv_heads,\n+    head_dim) pool buffers. ``k_scale`` / ``v_scale`` must be CPU tensors: the\n+    kernel reads them on the host. Returns q as (num_tokens, num_heads * head_dim).\n+    \"\"\"\n+    num_tokens = qkv.shape[0]\n+    q_out = torch.empty(\n+        num_tokens, num_heads, head_dim, dtype=qkv.dtype, device=qkv.device\n+    )\n+    # The kernel reads cache strides as (block, token, head); an NHD buffer is\n+    # one-slot blocks addressed with block_size=0.\n+    fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(\n+        qkv.view(num_tokens, -1, head_dim),\n+        q_norm.weight,\n+        k_norm.weight,\n+        rotary_emb.cos_sin_cache_as(qkv.dtype),\n+        positions,\n+        num_tokens,\n+        num_heads,\n+        num_kv_heads,\n+        num_kv_heads,\n+        head_dim,\n+        rotary_emb.is_neox_style,\n+        rotary_emb.mrope_section,\n+        rotary_emb.mrope_interleaved,\n+        q_norm.variance_epsilon,\n+        q_out,\n+        k_cache.unsqueeze(1),\n+        v_cache.unsqueeze(1),\n+        out_cache_loc,\n+        k_scale,\n+        v_scale,\n+        None,\n+        None,\n+        False,\n+        False,\n+        0,\n+        0,\n+    )\n+    return q_out.view(num_tokens, -1)\n+\n+\n class Qwen3Attention(nn.Module):\n     def __init__(\n         self,\n@@ -204,65 +263,26 @@ def forward_prepare_npu(self, positions, hidden_states, forward_batch):\n         return q, k, v\n \n     def forward_prepare_aiter_fused_mrope(\n-        self, positions, hidden_states, forward_batch\n+        self, positions, hidden_states, forward_batch, k_cache, v_cache\n     ):\n-        \"\"\"Fused QK-norm + 3D mRoPE + KV cache write for decode (ROCm/aiter).\n-\n-        The fused HIP kernel replaces split → QK norm → mRoPE → cache write,\n-        so KV is already in the paged cache when this returns.\n-        Returns (q, None, None); caller must pass save_kv_cache=False to attn.\n-        \"\"\"\n+        \"\"\"Decode-only fused path; KV is already in the paged cache when this\n+        returns, so the caller must pass save_kv_cache=False to attn.\"\"\"\n         qkv, _ = self.qkv_proj(hidden_states)\n-        num_tokens = qkv.shape[0]\n-\n-        qkv_3d = qkv.view(num_tokens, -1, self.head_dim)\n-\n-        token_to_kv_pool = get_token_to_kv_pool()\n-        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(self.attn.layer_id)\n-        slot_mapping = forward_batch.out_cache_loc\n-\n-        cos_sin = self.rotary_emb.cos_sin_cache\n-        if cos_sin.dtype != qkv.dtype:\n-            cos_sin = cos_sin.to(dtype=qkv.dtype)\n-\n-        q_out = torch.empty(\n-            num_tokens,\n-            self.num_heads,\n-            self.head_dim,\n-            dtype=qkv.dtype,\n-            device=qkv.device,\n-        )\n-\n-        fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(\n-            qkv_3d,\n-            self.q_norm.weight,\n-            self.k_norm.weight,\n-            cos_sin,\n+        q = aiter_fused_qk_norm_rope_set_kv(\n+            qkv,\n+            self.q_norm,\n+            self.k_norm,\n+            self.rotary_emb,\n             positions,\n-            num_tokens,\n+            k_cache,\n+            v_cache,\n+            forward_batch.out_cache_loc,\n             self.num_heads,\n             self.num_kv_heads,\n-            self.num_kv_heads,\n             self.head_dim,\n-            self.rotary_emb.is_neox_style,\n-            self.rotary_emb.mrope_section,\n-            self.rotary_emb.mrope_interleaved,\n-            self.q_norm.variance_epsilon,\n-            q_out,\n-            k_cache,\n-            v_cache,\n-            slot_mapping,\n             self._fused_k_scale,\n             self._fused_v_scale,\n-            None,\n-            None,\n-            False,\n-            False,\n-            0,\n-            0,\n         )\n-\n-        q = q_out.reshape(num_tokens, -1)\n         return q, None, None\n \n     def forward(\n@@ -275,15 +295,23 @@ def forward(\n             hidden_states = hidden_states.bfloat16()\n \n         save_kv_cache = True\n-        use_aiter_fused = (\n+        use_aiter_fused = False\n+        can_try_aiter_fused = (\n             self.use_fused_qk_norm_mrope\n             and forward_batch.forward_mode.is_decode()\n             and get_exec().deterministic.rl_on_policy_target is None\n         )\n+        if can_try_aiter_fused:\n+            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)\n+            # The fused write targets the NHD layout in the activation dtype and\n+            # does not apply per-layer KV scales.\n+            use_aiter_fused = (\n+                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype\n+            )\n \n         if use_aiter_fused:\n             q, k, v = self.forward_prepare_aiter_fused_mrope(\n-                positions, hidden_states, forward_batch\n+                positions, hidden_states, forward_batch, k_cache, v_cache\n             )\n             save_kv_cache = False\n         elif not _is_npu:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/85183672f32130d035f93835fe59ea8735791d40/python%2Fsglang%2Fsrt%2Fmodels%2Fqwen3.py",
+      "sha": "2b3b1a8dab8fb205262d5a3f902b59a7a73e093e",
+      "status": "modified"
+    },
+    {
+      "additions": 146,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/85183672f32130d035f93835fe59ea8735791d40/test%2Fregistered%2Famd%2Ftest_qwen3_aiter_fused_qk_norm_rope.py",
+      "changes": 146,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Famd%2Ftest_qwen3_aiter_fused_qk_norm_rope.py?ref=85183672f32130d035f93835fe59ea8735791d40",
+      "deletions": 0,
+      "filename": "test/registered/amd/test_qwen3_aiter_fused_qk_norm_rope.py",
+      "patch": "@@ -0,0 +1,146 @@\n+\"\"\"aiter fused QK-norm + RoPE + KV-cache write used by Qwen3 decode on ROCm.\n+\n+``aiter_fused_qk_norm_rope_set_kv`` hands the kernel sglang's NHD\n+(slots, num_kv_heads, head_dim) pool buffers. Guards: q and the K/V written at\n+``out_cache_loc`` match QK-norm + RoPE computed with the reference modules, and\n+no other cache slot is written.\n+\"\"\"\n+\n+import os\n+import unittest\n+\n+import torch\n+\n+from sglang.test.ci.ci_register import register_amd_ci\n+from sglang.test.test_utils import CustomTestCase\n+\n+register_amd_ci(est_time=30, suite=\"stage-a-test-1-gpu-small-amd\")\n+\n+HEAD_DIM = 128\n+EPS = 1e-6\n+MAX_POS = 8192\n+NUM_SLOTS = 4096\n+# Qwen3-VL text config: interleaved 3D mRoPE over a 128-dim head.\n+MROPE_SCALING = {\n+    \"rope_type\": \"default\",\n+    \"mrope_section\": [24, 20, 20],\n+    \"mrope_interleaved\": True,\n+}\n+# bf16 carries ~8 mantissa bits; q/k go through a norm and a rotation.\n+TOL = 2e-2\n+\n+\n+@unittest.skipUnless(\n+    torch.cuda.is_available() and torch.version.hip, \"ROCm aiter kernel\"\n+)\n+class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):\n+    @classmethod\n+    def setUpClass(cls):\n+        os.environ.setdefault(\"SGLANG_USE_AITER\", \"1\")\n+        from sglang.srt.models import qwen3\n+\n+        if not qwen3._has_fused_qk_norm_mrope:\n+            raise unittest.SkipTest(\"aiter fused_qk_norm_mrope kernel unavailable\")\n+        cls.qwen3 = qwen3\n+        cls.device = torch.device(\"cuda\", 0)\n+\n+    def _norm(self):\n+        from sglang.srt.layers.layernorm import RMSNorm\n+\n+        norm = RMSNorm(HEAD_DIM, eps=EPS).to(self.device, torch.bfloat16)\n+        norm.weight.data.copy_(1.0 + 0.1 * torch.randn(HEAD_DIM, device=self.device))\n+        return norm\n+\n+    def _mrope(self):\n+        from sglang.srt.layers.rotary_embedding import get_rope\n+\n+        return get_rope(\n+            HEAD_DIM, HEAD_DIM, MAX_POS, 5000000, rope_scaling=MROPE_SCALING\n+        ).to(self.device)\n+\n+    def _check(self, rotary_emb, positions, num_heads, num_kv_heads):\n+        num_tokens = positions.shape[-1]\n+        q_norm, k_norm = self._norm(), self._norm()\n+        qkv = torch.randn(\n+            num_tokens,\n+            (num_heads + 2 * num_kv_heads) * HEAD_DIM,\n+            dtype=torch.bfloat16,\n+            device=self.device,\n+        )\n+        k_cache = torch.zeros(\n+            NUM_SLOTS, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device\n+        )\n+        v_cache = torch.zeros_like(k_cache)\n+        slots = torch.randperm(NUM_SLOTS - 1, device=self.device)[:num_tokens] + 1\n+        scale = torch.tensor(1.0, dtype=torch.float32, device=\"cpu\")\n+\n+        q = self.qwen3.aiter_fused_qk_norm_rope_set_kv(\n+            qkv,\n+            q_norm,\n+            k_norm,\n+            rotary_emb,\n+            positions,\n+            k_cache,\n+            v_cache,\n+            slots,\n+            num_heads,\n+            num_kv_heads,\n+            HEAD_DIM,\n+            scale,\n+            scale,\n+        )\n+\n+        q_ref, k_ref, v_ref = qkv.split(\n+            [num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM, num_kv_heads * HEAD_DIM],\n+            dim=-1,\n+        )\n+        q_ref = q_norm.forward_native(q_ref.reshape(-1, HEAD_DIM)).view(num_tokens, -1)\n+        k_ref = k_norm.forward_native(k_ref.reshape(-1, HEAD_DIM)).view(num_tokens, -1)\n+        q_ref, k_ref = rotary_emb.forward_native(positions, q_ref, k_ref)\n+\n+        torch.testing.assert_close(q, q_ref, atol=TOL, rtol=TOL)\n+        torch.testing.assert_close(\n+            k_cache[slots],\n+            k_ref.view(num_tokens, num_kv_heads, HEAD_DIM),\n+            atol=TOL,\n+            rtol=TOL,\n+        )\n+        torch.testing.assert_close(\n+            v_cache[slots],\n+            v_ref.reshape(num_tokens, num_kv_heads, HEAD_DIM),\n+            atol=0,\n+            rtol=0,\n+        )\n+        untouched = torch.ones(NUM_SLOTS, dtype=torch.bool, device=self.device)\n+        untouched[slots] = False\n+        self.assertFalse(k_cache[untouched].any().item(), \"K written to other slots\")\n+        self.assertFalse(v_cache[untouched].any().item(), \"V written to other slots\")\n+\n+    def test_mrope_nhd_cache(self):\n+        torch.manual_seed(0)\n+        rotary_emb = self._mrope()\n+        # (32, 8): Qwen3-VL-8B at TP1; (16, 2): Qwen3-VL-32B at TP4.\n+        for num_heads, num_kv_heads in ((32, 8), (16, 2)):\n+            for num_tokens in (1, 7, 64, 256):\n+                with self.subTest(heads=(num_heads, num_kv_heads), tokens=num_tokens):\n+                    positions = torch.randint(\n+                        0, MAX_POS, (3, num_tokens), device=self.device\n+                    )\n+                    self._check(rotary_emb, positions, num_heads, num_kv_heads)\n+\n+    def test_cos_sin_cache_cast_is_reused(self):\n+        rotary_emb = self._mrope()\n+        self.assertEqual(rotary_emb.cos_sin_cache.dtype, torch.float32)\n+        first = rotary_emb.cos_sin_cache_as(torch.bfloat16)\n+        self.assertIs(rotary_emb.cos_sin_cache_as(torch.bfloat16), first)\n+        torch.testing.assert_close(\n+            first, rotary_emb.cos_sin_cache.to(torch.bfloat16), atol=0, rtol=0\n+        )\n+        rotary_emb._ensure_cos_sin_cache_length(2 * MAX_POS)\n+        grown = rotary_emb.cos_sin_cache_as(torch.bfloat16)\n+        self.assertIsNot(grown, first)\n+        self.assertEqual(grown.shape, rotary_emb.cos_sin_cache.shape)\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/85183672f32130d035f93835fe59ea8735791d40/test%2Fregistered%2Famd%2Ftest_qwen3_aiter_fused_qk_norm_rope.py",
+      "sha": "8f9a0cdc6827932170034007d46fa4c233c356c6",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "Hi, @jiaqiang-dot-liu \n\nReassigning `use_aiter_fused` after the cache lookup makes the same flag mean two different things. It might read more clearly to use a cheap `can_try_aiter_fused` check to decide whether to fetch the cache, and set `use_aiter_fused` once from the layout and dtype.\n\nJust for ref,\n```py\ncan_try_aiter_fused = (\n    self.use_fused_qk_norm_mrope\n    and forward_batch.forward_mode.is_decode()\n    and get_exec().deterministic.rl_on_policy_target is None\n)\nif can_try_aiter_fused:\n    k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)\n    # NHD in the activation dtype. This path passes scale 1 and does not\n    # quantize, so a quantized or other-layout store stays on the normal write.\n    use_aiter_fused = (\n        k_cache.dim() == 3\n        and k_cache.dtype == hidden_states.dtype\n    )\n```\n",
+      "created_at": "2026-10-14T11:22:46Z",
+      "diff_hunk": "@@ -280,10 +300,17 @@ def forward(\n             and forward_batch.forward_mode.is_decode()\n             and get_exec().deterministic.rl_on_policy_target is None\n         )\n+        if use_aiter_fused:\n+            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)\n+            # The fused write targets the NHD layout in the activation dtype and\n+            # does not apply per-layer KV scales.\n+            use_aiter_fused = (\n+                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype\n+            )\n \n         if use_aiter_fused:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#discussion_r4270113223",
+      "id": 4270113223,
+      "line": 312,
+      "original_line": 311,
+      "path": "python/sglang/srt/models/qwen3.py",
+      "updated_at": "2026-10-14T11:22:46Z",
+      "user": {
+        "login": "1am9trash"
+      }
+    },
+    {
+      "body": "Thanks, agreed. Split it into `can_try_aiter_fused`, a cheap gate that decides whether to fetch the cache, and `use_aiter_fused`, set once from the layout and dtype. `use_aiter_fused` starts as False so the non-decode path stays defined. I kept the existing comment wording: with an FP8 cache the kernel does quantize, but with a fixed scale of 1.0 instead of the layer's k_scale/v_scale. Pushed in ab0ef07ab8.",
+      "created_at": "2026-10-14T11:38:04Z",
+      "diff_hunk": "@@ -280,10 +300,17 @@ def forward(\n             and forward_batch.forward_mode.is_decode()\n             and get_exec().deterministic.rl_on_policy_target is None\n         )\n+        if use_aiter_fused:\n+            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)\n+            # The fused write targets the NHD layout in the activation dtype and\n+            # does not apply per-layer KV scales.\n+            use_aiter_fused = (\n+                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype\n+            )\n \n         if use_aiter_fused:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#discussion_r4270249275",
+      "id": 4270249275,
+      "line": 312,
+      "original_line": 311,
+      "path": "python/sglang/srt/models/qwen3.py",
+      "updated_at": "2026-10-14T11:38:04Z",
+      "user": {
+        "login": "jiaqiang-dot-liu"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "@BBuf @HaiShaw could you please review on this PR？thanks！",
+      "created_at": "2026-10-14T13:16:16Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#issuecomment-6169247265",
+      "id": 6169247265,
+      "updated_at": "2026-10-14T13:16:16Z",
+      "user": {
+        "login": "jiaqiang-dot-liu"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-10-14T13:19:40Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#issuecomment-6169312916",
+      "id": 6169312916,
+      "updated_at": "2026-10-14T13:19:40Z",
+      "user": {
+        "login": "jiaqiang-dot-liu"
+      }
+    },
+    {
+      "body": "@ch-wan could you please review on this PR？ thx!",
+      "created_at": "2026-10-15T02:00:40Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#issuecomment-6182670830",
+      "id": 6182670830,
+      "updated_at": "2026-10-15T02:00:40Z",
+      "user": {
+        "login": "jiaqiang-dot-liu"
+      }
+    }
+  ],
+  "number": 44266,
+  "refs": {
+    "base": {
+      "commit": "fa66e7d816d77bdff44fec3fa2aa333a2934d703",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "85183672f32130d035f93835fe59ea8735791d40",
+      "repository": "jiaqiang-dot-liu/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#pullrequestreview-5517109994",
+      "id": 5517109994,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-14T11:22:46Z",
+      "user": {
+        "login": "1am9trash"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#pullrequestreview-5517269458",
+      "id": 5517269458,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-14T11:38:04Z",
+      "user": {
+        "login": "jiaqiang-dot-liu"
+      }
+    },
+    {
+      "body": "LGTM. The comments resolved.\r\nAll changes are under aiter guard.\r\n",
+      "html_url": "https://github.com/sgl-project/sglang/pull/44266#pullrequestreview-5517374496",
+      "id": 5517374496,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-14T11:47:17Z",
+      "user": {
+        "login": "1am9trash"
+      }
+    }
+  ]
+}

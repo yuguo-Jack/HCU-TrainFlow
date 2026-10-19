@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: THUDM/slime
-commit: 0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e
+commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
 path: docs/en/advanced/sglang-config.md
-raw_sha256: f30b036edbc2b4ca1bb1e8e2bebea7f203978d00a41c0814926af436ccd84b44
+raw_sha256: 5901576ff30663dbbb5f2cc7176bb0beb459947d225fb73b6d5c2fce91e1b5c1
 sources: []
-generated_body_sha256: 3292de0561589f94faa1d69008fcd114a1b15e6b36aad1e9d4340e5f12ab6785
+generated_body_sha256: e703ef5fb61adeb118afd0bbeb9930d47c6f974d31489d7ccdc64532361275e0
 source_state: current-scan
 ---
 
 # THUDM/slime / docs/en/advanced/sglang-config.md
 
-[Original at fixed commit](https://github.com/THUDM/slime/blob/0b0c277d5b4cc66efc3b6db269e2e5184e8f3b1e/docs/en/advanced/sglang-config.md)
+[Original at fixed commit](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/sglang-config.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -49,6 +49,43 @@ With `--sglang-config`, the SGLang deployment expands into a multi-model, multi-
 - **Weight sync is per-model.** Only models with `update_weights: true` receive weight updates from training. Frozen models (reference, reward, etc.) are served as-is.
 
 ---
+
+## Independent SGLang Python Environment
+
+Set `--sglang-python-executable` to launch slime-managed SGLang servers with a different Python environment from Megatron:
+
+```bash
+python train.py \
+  --sglang-python-executable /path/to/sglang-env/bin/python \
+  ...
+```
+
+Ray control actors and the router continue to use the training environment. Only the SGLang server and its workers use the selected executable, with server arguments passed as JSON. This works with the default deployment and `--sglang-config`, including PD and multi-node engines. Omitting the option keeps the existing multiprocessing launch path.
+
+Both environments must be able to import the same slime checkout, through an installation or the job's `PYTHONPATH`. The training environment still needs SGLang's Python helpers and the router package; keep the SGLang version consistent so argument schemas and weight-update protocols match. The serving environment needs its own SGLang dependencies, but does not need Megatron. Each environment can retain its own PyTorch, Triton, CUDA libraries, and compiled extensions. Avoid adding another environment's entire `site-packages` directory to `PYTHONPATH`.
+
+For a conda environment, create your own wrapper, such as `serve-python.sh`, replacing the placeholders with your conda installation and environment:
+
+```bash
+#!/usr/bin/env bash
+set -e
+source /path/to/miniconda/etc/profile.d/conda.sh
+conda activate your-serving-env
+exec python "$@"
+```
+
+Make it executable and pass its path to slime:
+
+```bash
+chmod +x /path/to/serve-python.sh
+python train.py \
+  --sglang-python-executable /path/to/serve-python.sh \
+  ...
+```
+
+Use `exec python "$@"` to forward Python arguments and preserve process ownership. The wrapper, conda installation, and serving environment must be available at the configured paths on every rollout node.
+
+Environment selection does not change weight synchronization: CUDA IPC and NCCL still require compatible libraries and hardware. Use disk transport when those requirements cannot be met; see [External Rollout Engines](external-rollout-engines.md#environment-and-hardware-decoupling).
 
 ## Config Format
 
