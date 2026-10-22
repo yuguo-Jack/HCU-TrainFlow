@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-10-22
+
+- Complete the HCU training, SFT, RL and inference integration inventory with repository links and ownership for Megatron-LM/Bridge, DeepSpeed, verl, slime, AReaL, SGLang, the vLLM HCU plugin, DiffSynth-Studio and TurboPhysAI.
+- Distinguish public and internal maintenance lines, engine/plugin dependencies and cross-repository delivery; connect the optimization reference map and library integration guide to the shared inventory. HCU repository knowledge remains owned by HCU-Knowledge.
+- Align the README, Python package and CLI version for this release and synchronize the selected local installation. Existing hardware qualification boundaries remain unchanged.
+
 ## 0.6.10 — 2026-10-20
 
 - Align adaptation, capacity, numerical diagnosis, optimization and recovery guidance with the independently published HCU-Knowledge snapshot. Keep consumer-selected dependencies, in-place outputs, low-precision state and asynchronous completion contracts explicit.
