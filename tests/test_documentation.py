@@ -111,6 +111,18 @@ def test_json_examples_are_syntax_checked(tmp_path):
     assert any('invalid JSON example' in e for e in result['issues'])
 
 
+def test_example_guides_are_checked_without_running_commands(tmp_path):
+    fixture(tmp_path)
+    write(tmp_path, 'examples/README.md', '# Examples\n[Input](missing.json)\n'
+          '```bash\nhcu-trainflow no-such-command\n```\n')
+    result = checker.check_documentation(tmp_path)
+    assert any('examples/README.md: missing link target' in e for e in result['issues'])
+    assert any('examples/README.md: invalid CLI example' in e for e in result['issues'])
+    write(tmp_path, 'examples/input.json', '{}\n')
+    write(tmp_path, 'examples/README.md', '# Examples\n[Input](input.json)\n')
+    assert checker.check_documentation(tmp_path)['status'] == 'current'
+
+
 def test_history_upstream_versions_and_stable_ids_are_not_rewritten(tmp_path):
     fixture(tmp_path)
     write(tmp_path, 'CHANGELOG.md', 'HCU-TrainFlow v0.1.0 $hcu-train-prepare\n[Old](gone.md)\n')

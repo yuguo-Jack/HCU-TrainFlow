@@ -6,6 +6,8 @@
 
 跨 rank 判断到达先后或因果链时，保存共同参考时基、校时方法、offset/drift 与误差界，再按实际 group、调用序列及 producer → consumer → join 对应。待解释的时间差不大于误差时保持未知；单 rank 的区间时长仍可独立报告。GPU 空白还可能来自输入/提交、依赖/peer 等待、流水线空泡或缺事件，不能仅凭空白定性 CPU 或链路瓶颈。
 
+以下命令使用[合成示例](../examples/README.md)演示输入与输出；其中的时间、shape 和峰值不是 HCU 实测参数。
+
 ```bash
 hcu-trainflow profile-plan examples/groups.json
 hcu-trainflow profile-analyze examples/trace.json examples/window.json --models examples/models.json --groups examples/process-groups.json --output .work/analysis.json

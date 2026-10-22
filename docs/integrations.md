@@ -124,6 +124,8 @@ python -m pip install -e thirdparty/TraceLens
 
 ## TraceLens 的实际集成
 
+第一条命令使用[合成 trace](../examples/README.md)检查报告接口；后两条需换成当前任务的真实 trace 和请求配置，示例报告不构成训练性能证据。
+
 ```bash
 hcu-trainflow --workspace .work/analysis tracelens-report examples/tracelens-trace.json --project . --rank 0
 hcu-trainflow --workspace .work/analysis tracelens-collective '/private/traces/rank*.json' --project . --world-size 8

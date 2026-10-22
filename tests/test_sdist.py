@@ -16,6 +16,7 @@ def test_sdist_retains_declared_evidence_assets_and_excludes_local_checkouts(tmp
     module=project/'src/hcu_trainflow/__init__.py';module.parent.mkdir(parents=True)
     module.write_text('"""Source distribution fixture."""\n')
     files={
+        'examples/README.md':b'Configuration templates and synthetic inputs; not real measurements.\n',
         'docs/assets/workflow-overview.png':b'fixture image',
         'thirdparty/KNOWLEDGE-NOTICES.md':b'Upstream knowledge attribution\n',
         'thirdparty/licenses/upstream/LICENSE':b'Original upstream license\n',

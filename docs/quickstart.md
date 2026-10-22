@@ -38,7 +38,7 @@ hcu-trainflow collaboration-demo .work/collaboration-001
 
 写入前确认[工作空间及远端/容器映射](workspace-boundaries.md)，将源码、构建、日志、checkpoint 和工具缓存安排在任务范围内。已有范围与授权可复用；外部依赖安装、指定工程修改或 Wiki 维护采用明确的必要例外，不把项目安装目录当任务输出目录。
 
-推荐通过 `$hcu-trainflow` 提供环境、模型和目标，由 Agent 建立内部任务与协作循环。也可从 `examples/task.json` 复制到私有目录并修改，用 CLI 手动操作。先明确只分析、只诊断还是完整推进。
+推荐通过 `$hcu-trainflow` 提供环境、模型和目标，由 Agent 建立内部任务与协作循环。也可从 [task.json](../examples/task.json) 复制到私有目录并修改，用 CLI 手动操作；模板与合成输入的区别见[示例目录说明](../examples/README.md)。先明确只分析、只诊断还是完整推进。
 
 仅审查/交付已有改动时，直接由主控读取[交付规范](change-delivery.md)，不执行下面的 `task-create` 或创建训练协作循环；按实际差异完成相关验证与 PR 审查即可。
 

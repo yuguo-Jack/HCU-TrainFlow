@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Explain configuration templates, synthetic analysis inputs and real-task evidence ownership in the examples guide; include that guide in source distributions and documentation checks.
+- Separate retained official licenses, website notices, HCU integration/history and dated verification in knowledge attribution; connect source-version updates to the notice review rules.
+
 ## 0.7.0 — 2026-10-22
 
 - Complete the HCU training, SFT, RL and inference integration inventory with repository links and ownership for Megatron-LM/Bridge, DeepSpeed, verl, slime, AReaL, SGLang, the vLLM HCU plugin, DiffSynth-Studio and TurboPhysAI.

@@ -56,6 +56,8 @@ TraceLens 接口更新同时核对报告/collective、Graph、Roofline、Agent�
 
 ## 组织标准
 
+来源新增、版本推进或收录范围改变时，按项目 `thirdparty/KNOWLEDGE-NOTICES.md` 的维护规则复核材料归属与许可；官网正文、仓库文档/PR、工具依赖和历史归属分别处理，保留固定原件与核对依据。只登记链接的 HCU 联动仓不重复采集其 Wiki 或整套许可。
+
 流程文档同时遵守项目 `CONTRIBUTING.md` 的文档同步规则：对照当前代码和 CLI 核对根目录说明、docs、Skill/reference、Wiki 导航及图文入口；更新仍在使用的旧说明，清理前核查引用和维护关联。不要改写固定上游原文或删除兼容页面 ID 来消除旧字符串。收尾运行 `python scripts/check_documentation.py` 与原有知识/阅读路线检查；结构检查不能替代内容复核。
 
 维护所有来源时先读项目 `docs/wiki-authoring-standard.md` 和 `knowledge/coverage.json`；按相同内容维度检查各工程，包括用于优化借鉴的 DeepSpeed、Primus、MindSpeed 系列和 LoongForge。新增来源补角色/入口/维度；补齐薄弱正文并关联实际源码，不用页数或原文采集量冒充深度。更新相关 README、参考选择表、HCU 库归属与受影响阶段，运行 `python scripts/check_wiki_coverage.py`；它只检查组织完整性，结论仍需源码复核。

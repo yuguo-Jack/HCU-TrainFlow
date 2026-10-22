@@ -202,7 +202,7 @@ python scripts/check_documentation.py
 | `src/hcu_trainflow/` | 持久任务、复核循环、执行与证据、分析和监测 |
 | `knowledge/` | 官方训练引擎与生态 Wiki、通用站点经验、最终模型总结，以及固定来源与维护关联 |
 | `docs/` | 协作约定、安装、契约、部署及验证说明 |
-| `examples/`、`tests/` | 合成示例与本地回归 |
+| [`examples/`](examples/README.md)、`tests/` | 配置模板、合成演示数据与本地回归；真实任务记录留在任务工作空间 |
 | `thirdparty/` | 依赖清单和忽略提交的工具 checkout |
 
 安装后，Skill/reference 位于 Agent 系统目录，共享 docs 和 Wiki 通过 `workspace.json` 读取工程中的同一份内容，需保留 checkout。[阅读导航](docs/skill-reading-map.md) 列出每个模式的开始与条件入口；[性能方法来源](docs/practices/performance-methods.md) 说明 Hyperloom、GEAK、BBuf 的采用位置与调整依据。

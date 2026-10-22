@@ -30,7 +30,7 @@ def prose(text):
 def pages(project):
     """Only controlled documentation roots; never traverse third-party checkouts."""
     result = [p for p in project.glob('*.md') if p.name not in HISTORY]
-    for folder in ('docs', 'skills'):
+    for folder in ('docs', 'skills', 'examples'):
         result.extend((project / folder).rglob('*.md'))
     result.extend((project / 'thirdparty').glob('*.md'))
     result.extend(p for p in (project / 'knowledge').rglob('*.md')

@@ -42,7 +42,7 @@
 
 `knowledge/coverage.json` 登记各工程的来源、入口、内容维度与机制专题；[覆盖导航](../knowledge/COVERAGE.md)便于横向浏览。维护时先检查薄弱维度，再按当前变化修订相关总览、专题、案例和工作流。新增来源必须登记角色和阅读入口，不能只注册下载。
 
-新增来源或改变材料保留方式时，同步[第三方工程与来源说明](../THIRD_PARTY_NOTICES.md)；保留的上游文档、PR 等材料继续记录原始归属，并核对[知识材料声明与许可副本](../thirdparty/KNOWLEDGE-NOTICES.md)，不能把来源层原文表述为 TrainFlow 原创内容。
+新增来源或改变材料保留方式时，同步[第三方工程与来源说明](../THIRD_PARTY_NOTICES.md)；保留的上游文档、PR 等材料继续记录原始归属，并核对[知识材料声明与许可副本](../thirdparty/KNOWLEDGE-NOTICES.md)，不能把来源层原文表述为 TrainFlow 原创内容。已有来源推进版本时，也按该页维护规则核对 LICENSE/NOTICE、文档目录或文件专用许可及官网声明；分别记录副本来源、核对基线和未确认项，不能用仓库许可替代网页材料的适用声明。
 
 `python scripts/check_wiki_coverage.py` 检查登记来源、页面与维度引用是否齐全，`validate_knowledge.py` 核对固定证据。它们不判断文字是否准确：Agent 仍须阅读正文与代码、运行代表性查询，并明确未覆盖模型、backend、历史 PR 或现场验证范围。统一标准不是“所有实现均已精读”的声明。
 
