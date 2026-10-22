@@ -19,6 +19,8 @@
 
 ## HCU 修改并不限于算子
 
+实际 HCU 训练、SFT、RL 与推理后端的仓库入口统一见[HCU 引擎联动清单](../THIRD_PARTY_NOTICES.md#41-训练强化学习与推理引擎)，包含 Megatron-LM/Bridge、DeepSpeed、verl/slime/AReaL、SGLang/vLLM 及 Torch 原生模型适配工程。上表是官方机制参考；部署和交付先确认 HCU 维护仓与实际依赖，RL 任务同时追训练、生成后端和权重同步链路。
+
 根因在哪层，就在对应 HCU 工程修复：训练引擎负责配方、调度和接入；TE / Flash-Train / Primus Turbo 负责各自算子；RCCL、rocSHMEM、DeepEP 等负责通信实现；必要时还可涉及数学库、PyTorch、编译器和 Runtime。具体仓、分支选择和验证要求见 [HCU 库联动与修改归属](../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。
 
 例如 **HCU RCCL** 的已登记源码在 [DTK GitLab / dcutoolkit/deeplearing/rccl](http://42.228.13.241:20080/dcutoolkit/deeplearing/rccl)，使用前通过 HCU-Knowledge 核对当前适用分支；[rccl-test](http://42.228.13.241:20080/dcutoolkit/driverruntime/rccl-test) 是测试工程，AMD/ROCm RCCL 是外部参考，三者不能混用。内部链接需要对应账号权限，不将内部源码复制进公共 Wiki。

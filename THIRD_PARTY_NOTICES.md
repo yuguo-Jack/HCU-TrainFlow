@@ -59,12 +59,33 @@ Wiki 的 `knowledge/projects/*/knowledgebase/upstream/` 保留所选上游文档
 
 这些工程按具体环境和问题调用，不是安装 TrainFlow 时统一部署或替换的依赖；其项目 Wiki 由 HCU-Knowledge 维护。内部仓需要本人读取权限。
 
+### 4.1 训练、强化学习与推理引擎
+
+以下仓库身份依据 HCU-Knowledge `3829ef06e7c7` 的来源清单、仓库选择记录及工程报告核对。表中是联查与交付入口，具体分支、模型支持和依赖以任务使用时的知识记录、现场配方与实际源码为准；公开仓与内部仓不能默认视为同一版本。
+
+| 场景 | HCU 仓库入口 | 在工作流中的联动职责 |
+| --- | --- | --- |
+| Megatron 预训练与模型并行 | [Megatron-LM-das](https://github.com/HYGON-AI/Megatron-LM-das)（`hcu-megatron`） | HCU 适配、并行调度、通信重叠及显存优化；核对它固定的 Megatron Core/LM 子模块与模型脚本，训练引擎改动向此仓交付 |
+| 模型接入、配方与 SFT | [Megatron-bridge-das](https://github.com/HYGON-AI/Megatron-bridge-das) | 模型转换/provider、训练配方、数据处理及 HCU 启动入口；独立 Bridge 的依赖锁与 Megatron-LM-das 内嵌 Bridge 分别核对 |
+| DeepSpeed 训练、ZeRO 与 offload | [内部 DeepSpeed](http://42.228.13.241:10068/dcutoolkit/deeplearing/deepspeed) / [公开 Deepspeed-das](https://github.com/HYGON-AI/Deepspeed-das) | accelerator、算子构建、ZeRO/优化器及训练后端接入；当前知识记录以内部分支为主，公开发版有差异，按实际版本选择 |
+| 强化学习训练与 rollout 编排 | [verl-das](https://github.com/HYGON-AI/verl-das) | HCU patch、模型脚本和训练/生成后端组合；训练主体与依赖子模块单独锁定，核对策略权重、样本和恢复状态 |
+| Megatron 与 SGLang 协同 RL | [内部 dcu_slime](http://42.228.13.241:10068/dcutoolkit/deeplearing/dcu_slime) / [公开 slime-das](https://github.com/HYGON-AI/slime-das) | 训练与 rollout 调度、权重同步、同步/异步执行；当前知识记录以内部适配线为主，公开实现作为独立来源对照 |
+| 异步强化学习 | [AReal-das](https://github.com/HYGON-AI/AReal-das) | HCU 启动、rollout/训练衔接、策略版本和资源调度；按模型确认实际训练与推理后端 |
+| 推理与 RL rollout 后端 | [sglang-das](https://github.com/HYGON-AI/sglang-das) | 模型/算子分派、调度、KV cache、权重加载及推理侧通信；与 RL 引擎联合验证权重更新、显存切换和生成结果 |
+| vLLM 的 HCU 平台接入 | [vllm-plugin-das](https://github.com/HYGON-AI/vllm-plugin-das) | HCU 插件、模型与后端适配；基础 vLLM、插件、算子制品分别匹配，训推切换不能只验插件导入 |
+| 视频生成与 Torch 原生训练 | [DiffSynth-Studio-das](https://github.com/HYGON-AI/DiffSynth-Studio-das) | HCU 模型/pipeline、训练与 LoRA 示例、attention 及张量算子接入；按具体模型和前后向契约验证 |
+| 物理 AI 模型适配与优化 | [TurboPhysAI](https://github.com/HYGON-AI/TurboPhysAI) | 原训练脚本前的优化配置、函数替换、算子联动及测试；原模型训练语义与外部算子实现分别核对 |
+
+RL 任务同时联查其 HCU 训练后端、推理后端与通信依赖，不能仅查看 RL 编排仓。TorchTitan、MS-SWIFT、LLaMA-Factory、Primus 等的官方参考见第 3 节；需要 HCU 适配时再通过大知识库和现场配方确认维护仓，未确认的独立 HCU fork 不凭名称补写地址。实际 PR 按引擎、插件、算子或通信实现归属提交，跨仓改动关联依赖与集成验证。
+
+### 4.2 环境、算子、通信与底层配套
+
 | 工程范围 | 作用与现有入口 |
 | --- | --- |
 | [Cluster Manager](https://github.com/HYGON-AI/cluster-manager-das)，含 hcu-envcheck 等子工程 | 环境检查、筛机、故障诊断与既有容错；见[外部知识入口](knowledge/catalog/external/cluster-manager.md) |
 | [HCU Train Simulator](https://github.com/HYGON-AI/hcu-train-simulator) | 模型容量、并行配置与资源预算；见[外部知识入口](knowledge/catalog/external/train-simulator.md) |
 | HCU Probe、Primus Safe | 分别用于数值诊断和适用部署下的容错；见[精度诊断](docs/practices/model-accuracy-diagnosis.md)与[故障证据来源](skills/hcu-train-scale-and-stability/references/evidence-sources.md) |
-| HCU 训练/推理引擎，Transformer Engine、Flash-Train、Primus Turbo 等算子库 | 现场适配、既有实现复用与修改交付；仓库、分支和归属见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md) |
+| Transformer Engine、Flash-Train、Primus Turbo、AITER 等 HCU 算子库 | 训练/推理融合、低精度与既有实现复用；仓库、分支和归属见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md) |
 | HCU RCCL、rccl-test、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP、MORI、Flux | 集合通信测试、MoE 通信及通算融合；具体入口同见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)，不能用 AMD 上游替代 HCU 实际仓 |
 | HCU rocBLAS、hipBLASLt、CK、PyTorch、AICC/DCC 与 Galaxy Runtime | 数学库调优及必要的底层定位/隔离构建；通过 HCU-Knowledge 确认实际源码、版本和权限 |
 
@@ -72,4 +93,5 @@ Wiki 的 `knowledge/projects/*/knowledgebase/upstream/` 保留所选上游文档
 
 - 保留的第三方材料及许可副本统一列于 [KNOWLEDGE-NOTICES.md](thirdparty/KNOWLEDGE-NOTICES.md)，包括文档专用许可和历史归属。下载、参考、集成和再分发分别核对所用版本的条件。
 - 新增依赖、方法参考或 Wiki 来源时，同步本页相应条目与原有清单；保留第三方材料时同步来源链接及许可/NOTICE。具体命令和分支只在对应集成文档维护，本页不再复制一份。
+- HCU 联动来源变化时，分别核对训练/SFT、强化学习、推理后端和底层配套，更新仓库入口及公开/内部来源角色；不能用“训练引擎与算子库”一行代替实际引擎清单。HCU 项目知识继续由 HCU-Knowledge 维护。
 - HCU 及其他产品名称属于各自所有者；本项目不表示上述组织背书。
