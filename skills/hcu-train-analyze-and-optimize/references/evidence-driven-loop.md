@@ -27,6 +27,8 @@
 
 映射 trace 与正式 trace 通过 source/dispatch、shape/dtype/layout、phase、graph 特化和调用序列对应。签名重复、融合改变或关联不唯一时标为候选映射，继续读源码/做定向标注；不能按 kernel 名或相邻顺序强行一对一。TrainFlow 的归因导入只接受同一原 trace/窗口的映射；跨运行映射是人工查证线索，不能伪造 event/hash 导入。
 
+先按[原生能力调优](native-engine-tuning.md)核对实际引擎选项和后端路径：下面的融合、重叠或调度机会可能已有原生实现，只是未启用或未命中。候选配置、特性 PR 与依赖缺口归入同一优化计划；补齐能力后回到选项/组合验证，配置改变结构时按上面的规则刷新证据。
+
 ## 3. 用三张互相关联的表形成优化计划
 
 不要求复制三份原始大表：在现有报告/BOARD 维护关键行，链接 TraceLens 原件和 operator key。

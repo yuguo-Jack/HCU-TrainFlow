@@ -1,7 +1,7 @@
 # 工作流总览图生成说明
 
 - 内容基准：HCU-TrainFlow 当前主线；所有流程图均不写工程版本号。
-- 输出：[workflow-overview.png](workflow-overview.png)。首页使用摘要图，精确分支与验收门槛以[可编辑流程图](../workflow-map.md)和[能力边界](../capabilities.md)为准。
+- 输出：[workflow-overview-native-tuning.png](workflow-overview-native-tuning.png)。首页使用摘要图，精确分支与验收门槛以[可编辑流程图](../workflow-map.md)和[能力边界](../capabilities.md)为准。
 - 生成方式：内置 `imagegen`，以此前的总览图为编辑输入，采用白底、低饱和蓝灰 / 青灰 / 淡紫灰、细线边框与箭头，保留分阶段科技信息图结构及文字对比度。
 - 维护：图面不印版本号；流程、状态或边界变更时一起复核 README、工程介绍和细图。重新生成后检查文字、箭头及验证声明。
 
@@ -39,8 +39,9 @@ card 4 跑通与初始数值基线
 bottom note: 环境差距先排查 · 代理结果限定范围
 
 CENTER 02 title 性能分析与优化
-card 1 并行切分与显存权衡
-TP / PP / DP / CP / EP · 微批 / 重算
+card 1 引擎原生能力与配置调优
+官方 / 候选 PR / HCU 优化项
+并行 · 显存 · 融合 · 编译 · 通信
 card 2 稳态 profile + TraceLens
 时间线 / Graph · 多 rank · 真实 shape
 指标 → Agent 查证 → 瓶颈排序
@@ -60,7 +61,7 @@ card 5 复用与实现迭代
 Orange outlined stage gate below center cards:
 稳定阶段验收：同初态 A/B
 loss · 整步净收益 · 显存 · 原始证据
-Orange feedback arrow from this gate back to center analysis labeled 修正 / 重采
+Orange feedback arrow from this gate back to the first configuration card labeled 补齐依赖 / 回调配置
 Blue pass arrow labeled 通过 from gate to RIGHT FIRST CARD (not directly long training).
 
 RIGHT 03 title 规模扩展与长稳运行
@@ -107,3 +108,5 @@ Footer:
 
 Aim for elegant clear readable technical documentation quality. Keep arrows sparse and precise. Do not insert logos, additional statistics, fabricated screenshots, checkmarks implying all capabilities passed, or any platform-wide validation claim.
 ```
+
+本次使用内置 imagegen 精确编辑原概览图：仅扩展中间阶段首卡的上述三行，并将左侧反馈标注改为“补齐依赖 / 回调配置”，其余信息和风格保持。原生调优包括并行与显存，完整分支与失败回退以可编辑流程图为准。

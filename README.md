@@ -6,7 +6,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 给出模型、环境和目标，由本地主控 Agent 协调适配、分析与优化、扩容验证及长训容错。候选与阶段结果以实际证据推进，经过独立复核和修正；有界初筛、局部试参和未变化的证据按需复用，不逐条命令审核。人在看板中补充意见，Agent 读取、回复并调整后续工作。适用于预训练、SFT、RL，以及 Torch 原生的视频生成、VLA、世界模型等训练，也支持只检查环境、只分析性能或只诊断故障。
 
-**当前版本：`0.7.0`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
+**当前版本：`0.7.1`。** 已结合真实 SSH + Docker HCU 环境验证固定快照执行、代理模型训练、多 rank 性能分析、代表性算子迭代和有界跨节点恢复；主控接手、阶段交接及工具逻辑有本地回归。新站点、完整模型收敛、长期告警/Agent 自动唤醒仍须分别验收。见 [能力与验证边界](docs/capabilities.md)及[变更记录](CHANGELOG.md)。
 
 **首次了解工程，建议阅读 [HCU-TrainFlow 工程介绍](docs/project-overview.md)**：从接到一个新模型和环境开始，讲清三个阶段如何推进、如何选择优化对象、怎样保护训练质量，以及多 Agent、知识检索和持续守护如何配合。
 
@@ -64,7 +64,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ## 工作流总览
 
-[![HCU-TrainFlow 工作流总览：环境检查与模型适配、性能分析与优化、规模扩展与长稳运行；支持独立任务，多 Agent、证据复核和精选知识贯穿全程](docs/assets/workflow-overview.png)](docs/assets/workflow-overview.png)
+[![HCU-TrainFlow 工作流总览：环境检查与模型适配、性能分析与优化、规模扩展与长稳运行；支持独立任务，多 Agent、证据复核和精选知识贯穿全程](docs/assets/workflow-overview-native-tuning.png)](docs/assets/workflow-overview-native-tuning.png)
 
 [工程介绍](docs/project-overview.md) · [详细流程图与验收规则](docs/workflow-map.md)
 
@@ -77,7 +77,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 
 ### 2. 性能分析、优化与质量验证
 
-- **并行切分与显存取舍**：先评估 TP/PP/DP/CP/EP、微批、累积、重算、状态切分及 overlap，在显存峰值、必要余量、通信和实际吞吐之间选择配置。调参保持训练语义可比，GPU_MAX_HW_QUEUES 等按当前 runtime 与实测核验。
+- **先用好引擎原生优化能力**：系统检查官方已合入、候选 PR 和 HCU 特有的优化项，按实际瓶颈调优后端/融合、编译/图执行、通信调度、缓存及训推协同，与并行切分、微批、重算和显存权衡同等对待。先验证适用的已有机制；高价值选项缺底层能力时衔接实现，补齐后回到配置和组合验证，保持训练语义与质量可比。详见[原生能力调优与实现迭代](skills/hcu-train-analyze-and-optimize/references/native-engine-tuning.md)。
 - **按主要瓶颈推进**：采集稳态端到端 profile，每个实际非单例并行组至少覆盖两个代表 rank，结合 TraceLens 分析空泡、通信、负载不均、计算和显存。谁占主要时间就先处理谁；通信达到单测预期仍大量暴露时，再考虑 overlap、调度或通算融合。
 - **重点算子持续迭代**：对累计 ≥90% 端到端热点中的非通信算子，按实际贡献排序，评估瓶颈、可达上限、当前效率和剩余空间。同 shape 独立实测与上限建模可以并行，用于区分实现差距和模型内资源竞争；保留空泡、重叠和未归因时间的正确口径。
 - **复用与实现迭代**：结合真实热点，参考 NVIDIA 对应源码与实际调用链挖掘算子融合机会，对齐前后向语义与数值精度。优先复用现有 HCU 算子库、通信库的能力；能力或性能不足时，基于对应库补充实现并借助算子 Skill 持续优化。对齐接口与数值契约，以实际性能分析、局部回归和整步收益验证结果；具体工程分工见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。

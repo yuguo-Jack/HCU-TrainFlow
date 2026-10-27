@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.7.1 — 2026-10-27
+
+- Treat native training/inference engine optimization options as a first-class tuning surface alongside parallelism and memory. Distinguish merged, candidate-PR and HCU-specific mechanisms, verify effective dispatch, and prioritize bounded experiments by end-to-end bottlenecks.
+- Connect feature dependency gaps to reuse/implementation work and return to configuration, combination and affected-profile validation; retain numerical baselines, analysis-only boundaries and stage-level loss checks.
+- Align coordinator/stage/update Skills, reading routes, workflow diagrams and source-maintenance associations; synchronize the selected local installation. This methodology update does not imply new hardware qualification.
+
 - Explain configuration templates, synthetic analysis inputs and real-task evidence ownership in the examples guide; include that guide in source distributions and documentation checks.
 - Separate retained official licenses, website notices, HCU integration/history and dated verification in knowledge attribution; connect source-version updates to the notice review rules.
 

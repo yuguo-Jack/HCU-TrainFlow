@@ -20,7 +20,7 @@ flowchart TD
     A --> AG{"环境与初始数值基线通过？"}
     AG -->|缺失或失败| AR["补证据 / 修环境 / 修适配"]
     AR --> A
-    AG -->|通过| O["② 性能分析与优化<br/>先并行切分和显存预算 · 详见图 3"]
+    AG -->|通过| O["② 性能分析与优化<br/>原生能力调优 / 并行显存 / 实现迭代 · 详见图 3"]
     O --> Q["稳定候选：阶段 loss 与性能验收<br/>每轮仍做局部正确性及性能回归"]
     Q --> QG{"达到约定目标且数值通过？"}
     QG -->|未达到| OR["定位问题、修正或回退<br/>无新证据 / 达到预算边界时请专家介入"]
@@ -108,38 +108,43 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    B["固定比较条件与初始数值基线<br/>模型 / 数据 / 精度 / 有效 batch-token / 版本"] --> P["优先评估并行切分与显存预算<br/>TP / PP / DP / CP / EP / SP<br/>微批、累积、重算、状态分片与 offload"]
-    P --> M["核对已有布局证据与可行候选<br/>最吃紧 rank 峰值 + 必要余量<br/>只分析时未获准实验保留为建议"]
+    B["固定比较条件与初始数值基线<br/>模型 / 数据 / 精度 / 有效 batch-token / 版本"] --> P["梳理当前训练与推理引擎的原生能力<br/>官方已合入 / 候选 PR / HCU 特有优化<br/>核对有效配置、实际命中与依赖条件"]
+    P --> M["与并行切分和显存联合评估<br/>后端 / 融合 / 编译与图 / 通信调度 / 缓存与状态<br/>容量、最重 rank 余量与必要组合；不穷举参数"]
     M --> RES{"允许优化且有隔离资源<br/>和独立优化假设？"}
     RES -->|是| INST["多个完整模型可行实例并行优化<br/>公共基线、分工/资源独立、及时交换结果<br/>主控在共同实例复验组合"]
     RES -->|否| T
     INST --> T
-    T["读取已有或获准采集的稳态 torchprof<br/>覆盖各实际非单例并行组至少 2 个代表 rank<br/>证据缺口保留，不代替执行授权"]
+    T["复用有效 profile 或获准短时采样<br/>覆盖各实际非单例并行组至少 2 个代表 rank<br/>证据缺口保留，不代替执行授权"]
     T --> TL["TraceLens + TrainFlow 窗口分析<br/>shape / dtype / layout / phase + Graph 调用关联<br/>Roofline / 回放 / Agent 证据链见图 3.6"]
-    TL --> A["按证据并行分析<br/>CPU / 数据 / launch 空泡"]
-    TL --> C["通信依赖、暴露时间与 overlap<br/>bucket / chunk / 预取 / 通算融合<br/>慢 rank、拓扑及计算竞争 · 详见图 3.5"]
+    TL --> A["CPU / 数据 / launch 空泡"]
+    TL --> C["通信依赖、暴露尾部与 overlap<br/>bucket / chunk / 预取 / 通算融合<br/>慢 rank、拓扑及计算竞争 · 详见图 3.5"]
     TL --> V["显存生命周期与峰值<br/>激活 / 状态 / workspace / 通信 / graph"]
     TL --> O["真实算子调用与热点表<br/>前后向、融合粒度与时间归因"]
     TL --> TORCH["Torch 原生 / 引擎局部模块<br/>输入、断图、重编译、前后向、DDP/FSDP<br/>详见图 3.4"]
-    A --> H["主控合并证据和瓶颈优先级<br/>区分系统问题与实现差距"]
+    A --> H["主控合并证据与瓶颈优先级<br/>区分系统问题和实现差距"]
     C --> H
     V --> H
     O --> H
     TORCH --> H
-    H --> RANK["先处理端到端主要占比<br/>空泡 / 通信 / 负载不均 / 计算<br/>计算按实际 op 占比逐项分析；跳过要有依据"]
+    H --> RANK["按端到端贡献和可兑现收益排序<br/>先验证适用的已有机制，保留依赖缺口<br/>计算热点逐项评估；跳过有依据"]
     RANK --> MODE{"是否仅性能分析？"}
-    MODE -->|是| REPORT["交付瓶颈、上限评估、证据缺口与实验建议<br/>不擅自修改配置或启动优化实验"]
-    MODE -->|否| SYS["系统调参候选<br/>并行布局 / overlap / GPU_MAX_HW_QUEUES<br/>必要位置 compile / 显存与重算权衡"]
-    MODE -->|否| K["融合对齐与热点实现优化<br/>进入图 3.2，可与独立系统分析并行"]
-    SYS --> VERIFY["局部正确性 + profiler-off 对照测量<br/>依赖变化同步更新 ranks 和 shapes"]
-    VERIFY -->|重采验证与重新归因| T
-    K -->|集成候选后重评系统效果| VERIFY
-    H -.-> REF["按问题联查官方教程、源码与 PR<br/>Megatron / TorchTitan / DeepSpeed / SFT / RL<br/>Primus、MindSpeed、LoongForge 与 HCU 对应分支"]
+    MODE -->|是| REPORT["交付瓶颈、上限、配置建议与依赖缺口<br/>不擅自修改配置或启动优化实验"]
+    MODE -->|否| CHOICE{"当前最高价值方向"}
+    CHOICE -->|已有可用机制| SYS["有界试验原生选项及必要组合<br/>并行 / 显存 / backend / compile / graph<br/>overlap / 队列 / 输入流水 / 训推协同"]
+    CHOICE -->|选项缺依赖或已有实现仍不足| K["追消费者与条件检查，先复用再实现<br/>融合对齐 / 通信 / 高贡献算子 / 底层库<br/>进入图 3.2，不等所有参数试完"]
+    SYS --> VERIFY["核对实际命中、局部数值与显存<br/>profiler-off 整步对照，保留最佳或回退"]
+    K --> RETURN["补齐能力后返回选项与组合验证<br/>重评受影响配置和资源竞争"]
+    RETURN --> SYS
+    VERIFY -->|调用 / shape / 调度变化后刷新证据| T
+    VERIFY -->|稳定候选| G["按当前模式完成热点处置与阶段质量验收<br/>达到目标可停止，无需强制新写 kernel"]
+    P -.-> REF["按问题联查当前版本教程、PR 与源码<br/>Megatron / TorchTitan / DeepSpeed / SFT / RL<br/>Primus、MindSpeed、LoongForge 与 HCU 对应分支"]
 ```
+
+能力类别、候选状态和依赖反馈的详细方法见[原生能力调优与实现迭代](../skills/hcu-train-analyze-and-optimize/references/native-engine-tuning.md)。清单覆盖相关机制，实验按主要瓶颈排序；原生调优与后续实现可以交替推进，不是必须扫完全部参数的单向阶段。主页概览图的“引擎原生能力与配置调优”包含并行与显存取舍。
 
 并行布局须在显存、通信、流水空泡和吞吐之间权衡，不以“占满显存”为目标。改变微批、累积或并行度时保持训练语义可比；布局变化会改变热点与 shape，需要重新分析。具体指南见 [并行切分与显存调参](../knowledge/projects/megatron/knowledgebase/local/topics/parallelism.md)。
 
-只分析模式仍检查布局、显存、热点和上限，但不为了走完图而改配置或启动优化候选；补充采集按已有授权，缺少执行条件时交付具体实验建议。优化模式才执行候选布局的短跑校准与迭代。
+只分析模式仍检查原生能力、布局、显存、热点和上限，但不为了走完图而改配置或启动优化候选；补充采集按已有授权，缺少执行条件时交付具体实验建议。优化模式才执行候选短跑校准与迭代。
 
 TraceLens 的逐 rank 分析可用代表样本；其完整 collective 报告要求全部 `0..N-1` rank 文件及实际通信上下文。时间对齐、RCCL 识别和统计口径要在现场核对。TrainFlow 的重叠时间归因是初步排序方法，不是自动关键路径证明。
 
@@ -547,7 +552,7 @@ flowchart TD
 | `training` | `environment`、`stage-quality`、`scale` | 当前候选满足训练准入 |
 | `completed` | `completion` | 达到约定范围的完成条件 |
 
-独立任务另按模式的交付契约判断，不能照搬全流程门槛。图中“先并行切分和显存预算”属于 Skill 的分析顺序，不是新增状态；图中“原生 Agent 派发”和“现场告警”也不意味着 CLI 自带模型服务或飞书机器人。
+独立任务另按模式的交付契约判断，不能照搬全流程门槛。图中原生能力调优、并行/显存取舍及实现反馈属于既有优化循环，不是新增状态；图中“原生 Agent 派发”和“现场告警”也不意味着 CLI 自带模型服务或飞书机器人。
 
 `stage-quality` 的通过报告须引用已注册的 `quality_inputs`，程序在登记和晋级时重新计算同初态、同配方、当前候选的对照。旧报告仅有 pass、旧质量契约缺少初态/配方指纹，或原件属于其他 context/候选，都不能放行新阶段。详见 [质量契约](contracts.md#qualitycontract-与记录)。
 

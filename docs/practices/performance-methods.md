@@ -2,6 +2,8 @@
 
 本页说明 TrainFlow 采用哪些参考方法、如何核对、为何保留差异。执行方法见优化 Skill 的 [证据驱动闭环](../../skills/hcu-train-analyze-and-optimize/references/evidence-driven-loop.md) 和 [算子上限迭代](../../skills/hcu-train-analyze-and-optimize/references/operator-ceiling-iteration.md)。这些是工作流方法，不是新 Agent 编排系统或额外必装运行时。
 
+引擎原生优化项的发现、实际生效检查，以及调参与依赖补齐的双向衔接，统一见[原生能力调优](../../skills/hcu-train-analyze-and-optimize/references/native-engine-tuning.md)。这项方法同时覆盖官方已合入、候选 PR 和 HCU 特有配置，与并行/显存取舍共同进入现有证据闭环；不新增参数搜索器或宣称全部选项已实测。
+
 ## 固定参考与采用范围
 
 2026-10-10 读取以下公开版本的文档和相关源码。这里只复核列出的性能/诊断方法，未运行它们的 AMD/NV 工作负载，未宣称整个参考仓已更新到本仓 Wiki；Wiki 原有锁定快照继续有效。
