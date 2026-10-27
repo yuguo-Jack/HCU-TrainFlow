@@ -71,7 +71,7 @@ An agentic workflow for end-to-end large-model training adaptation, optimization
 ### 1. 环境检查与模型适配
 
 - **发现并验收现场**：确认节点与卡的授权、占用、拓扑、镜像、DTK 和关键库版本，复用当前 Cluster Manager、run_nhc、检查脚本及 DTK 工具。检查健康、GEMM、HBM、机内互联和机间通信，逐项对照有来源的预期；缺项、性能差距和排查结果明确记录，需要时请专家介入。
-- **选择稳定或快速路线**：已支持模型优先匹配官方 release 的 HCU 稳定插件与发布配方；新模型或指定源码版本走快速适配，锁定官方/客户 commit，对齐 HCU 库与融合路径，在模型 example 交付可重放 patch。稳定线满足替代条件后更新 Cookbook、退役临时补丁；详见[双线方法](docs/practices/engine-delivery-tracks.md)。
+- **选择稳定或快速路线**：已支持模型优先匹配官方 release 的 HCU 稳定插件与发布配方；新模型或指定源码版本走快速适配，锁定官方/客户 commit，对齐 HCU 库与融合路径，在模型 example 交付可重放 patch。两条线都按任务范围完成性能分析、调参、系统/通信/算子优化及精度验证；快速不意味着跑通即结束。稳定线满足替代条件后更新 Cookbook、退役临时补丁；详见[双线方法](docs/practices/engine-delivery-tracks.md)。
 - **准确适配模型**：保持选定源码基点，核对适用 HCU 实现、启动脚本、环境变量和现场激活链；结合官方实现确认模型结构、数据、精度、优化器与训练语义，保留用户 patch 和执行基线。预训练、SFT、RL 与 Torch 原生训练分别补查其数据和执行语义。
 - **先评估完整模型容量**：参考 HCU Train Sim、当前模型源码、实际可用卡数和硬件参数，预算最重 rank 的显存与余量并短跑校准。能放下就直接全参适配；资源不足才优先缩 layer，其他维度变化须明确授权并记录代理范围。
 - **建立可信基线**：验证前向、反向、参数更新和 checkpoint，冻结源码、配置、初始数值及比较条件。有 NVIDIA 环境时补充跨平台对照；未覆盖范围保留到后续验收。

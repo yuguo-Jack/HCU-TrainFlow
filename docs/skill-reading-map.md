@@ -40,7 +40,7 @@ Markdown 链接不会自动将所有文档注入 Agent 上下文。主控在任�
 | [HCU-TrainFlow-Wiki 搜索](../skills/hcu-trainflow-wiki-search/SKILL.md) | [查询方法](../skills/hcu-trainflow-wiki-search/references/workflow.md) 与 [Wiki 命令](wiki.md) 对应部分 | 先跨官方资料、通用环境经验和最终总结查询，再按适用条件筛选；本地证据不足时在线查 PR，再追最终源码；涉及 HCU 的事实按需联查大知识库，不更新它 |
 | [HCU-TrainFlow-Wiki 与 Skill 更新](../skills/hcu-trainflow-wiki-skill-update/SKILL.md) | [更新方法](../skills/hcu-trainflow-wiki-skill-update/references/workflow.md)、[Wiki 更新契约](wiki.md)、[知识归属与维护时机](knowledge-architecture.md)、[维护关联](../knowledge/maintenance.json) | 按 [统一 Wiki 标准](wiki-authoring-standard.md)检查各工程内容维度，修订受影响的 overview/topic/case/Skill/解析器；收尾按 [本机同步](integrations.md#skills账号与升级)。依赖锁变化需另做对应依赖验证 |
 
-每个阶段都有自身交付与复核责任；只有用户要求完整流程时才串起全部阶段。命令以当前 CLI 帮助、实际部署分支和授权为准。
+稳定/快速路线与执行模式分开；按[共用阶段契约](practices/engine-delivery-tracks.md#共用阶段与交接)交接，不能因快速线把 `full` 改成 `adapt` 或仅交付。每个阶段都有自身交付与复核责任；只有用户要求完整流程时才串起全部阶段。命令以当前 CLI 帮助、实际部署分支和授权为准。
 
 分析涉及 Graph、效率/上限、EventReplay、原生 Agent 或 HCU profiler 格式时，性能阶段及成员须补读 [TraceLens HCU 分析契约](tracelens-analysis.md)。环境阶段检查采集依赖、更新阶段复核解析器时也使用该页的能力与权限边界。
 

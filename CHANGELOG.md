@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Clarify that stable and rapid delivery tracks share full-task profiling, tuning, operator optimization and accuracy gates. Separate optional external-feature ports from required optimization work, and carry validated candidates through scale/stability before final patch delivery.
+
 ## 0.7.2 — 2026-10-27
 
 - Separate stable HCU plugin/release delivery from rapid adaptation against a pinned official or customer commit. Share HCU backend, fusion, numerical and performance validation requirements without forcing rapid recipes onto the stable engine branch.

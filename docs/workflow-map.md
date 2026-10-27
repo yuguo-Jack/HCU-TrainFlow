@@ -72,7 +72,7 @@ flowchart TD
     W["官方引擎 Wiki + 对应依赖源码<br/>核对模型、精度及训练语义"] -.-> R
     R --> TRACK{"选定交付路线"}
     TRACK -->|稳定插件| STABLE["匹配官方 release + HCU 发布组合<br/>仅承诺已验模型 example 与支持范围"]
-    TRACK -->|快速适配| FAST["指定官方 / 客户 commit<br/>对应模型 example + 可重放 patch<br/>不强制迁移至稳定主仓"]
+    TRACK -->|快速适配| FAST["指定官方 / 客户 commit<br/>example + patch 仅为交付形式<br/>沿同一完整流程，不强制迁移稳定主仓"]
     STABLE --> L["本地独立开发 checkout，不用知识库缓存<br/>锁官方 / HCU / 依赖 / submodule 提交"]
     FAST --> L
     L --> SEM["核对实际模型与训练语义<br/>构造参数、辅助模块、优化器与参数分组<br/>tokenizer / mask / 精度 / 有效 batch"]
@@ -98,7 +98,7 @@ flowchart TD
     B --> BG{"基线可用且验证通过？"}
     BG -->|否| BF["追到当前引擎和底层库源码<br/>修正适配，重跑受影响验证"]
     BF --> R
-    BG -->|是| OUT["进入性能分析或按适配任务范围交付"]
+    BG -->|是| OUT["full：两条线均继续分析、调参、优化与精度验证<br/>仅独立 adapt：按适配范围交付；跑通不结束完整任务"]
 ```
 
 先按[稳定发布与快速适配](practices/engine-delivery-tracks.md)确认模型和版本范围；两条线可同仓维护，不改变原有数值与阶段验收。快速线 example/patch 重放、Cookbook 更新与稳定接管退役也由该方法统一规定。

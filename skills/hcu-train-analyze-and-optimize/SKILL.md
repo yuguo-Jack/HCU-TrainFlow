@@ -13,6 +13,8 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 
 支持 `analyze` 只交付性能分析，也支持 `optimize/full` 迭代。分析任务不自动改实现或长时验 loss。
 
+快速线与稳定线共用下面的完整优化闭环，区别仅在源码/依赖基线与交付形式。不能以“已跑通、已对齐初步融合或 patch 已导出”跳过端到端分析、原生调参、热点上限/同 shape 对照、必要的系统/通信/算子迭代及阶段精度验收。额外移植 HCU 独有机制或未合入 PR 可以按需求选择，原有优化验收不因此变为可选；确无优化必要需给出证据。
+
 涉及 Graph、Roofline/算子效率、EventReplay、TraceLens 原生 Agent 或 hipprof/XProf/XCompute 时，读取工程 `docs/tracelens-analysis.md`，使用锁定 fork 的统一入口和实际资格边界。自动模型未知项仍须纳入热点任务；计数器、回放与 profiler-off 时间不可混用；原生 Agent metrics 完成后继续查证、撰写及复核，不把自动表格当成最终结论。
 
 先识别实际训练执行路径：大型引擎按既有并行与融合路线；Torch 原生训练（包括视频生成、VLA、世界模型）按 [Torch 训练专项](references/torch-native-training.md) 补查输入流水、eager/compile、断图/重编译、autograd、DDP/FSDP 和实际 backend。引擎内部模块也可采用该专项，不另建一套流程。环境适配和扩 DP/容错继续复用另外两个阶段。

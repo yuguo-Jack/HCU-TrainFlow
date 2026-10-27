@@ -55,7 +55,7 @@ TraceLens 接口更新同时核对报告/collective、Graph、Roofline、Agent�
 
 精度方法维护还需复核项目 `docs/practices/model-accuracy-diagnosis.md` 与三个阶段的入口。按 HCU-Knowledge 的 dcu_probe 项目或当前源码核对 hcu-probe/hcuprobe 包与 CLI、配置、hook/异步快照/flush、compare 映射和跨 rank 首差、训推接入；同时核对 PyTorch/TE 的精度与随机性接口。来源变更不代表所有后端已实测，保留登记/离线/现场的验证范围，不自动刷新 HCU 大库。
 
-维护发布/开发线和模型 example/Cookbook 时，读取项目 `docs/practices/engine-delivery-tracks.md`：区分稳定插件的官方 release/HCU 发布锁与快速方案的指定官方/客户 commit，核对实际 HCU 算子/通信路径、TE 兼容、必要/可选补丁及验证状态。按任务开始/交付、相关发布和例行维护时机修订推荐入口、适用版本与替代说明；稳定线接管须验证所需功能、质量、性能/显存及恢复条件，再退役已替代的临时 patch，未替代优化或客户固定基点仍保留。不得把上游 release 已发布当成 HCU 已稳定支持，不自动切换运行任务、不更新外部仓或大知识库；只有明确授权范围内才修改对应 Cookbook/example。方法/引用更新后同步安装，不把本规约宣称为后台定时服务。
+维护发布/开发线和模型 example/Cookbook 时，读取项目 `docs/practices/engine-delivery-tracks.md`：区分稳定插件的官方 release/HCU 发布锁与快速方案的指定官方/客户 commit，核对实际 HCU 算子/通信路径、TE 兼容、必要/可选补丁及验证状态。按任务开始/交付、相关发布和例行维护时机修订推荐入口、适用版本与替代说明；稳定线接管须验证所需功能、质量、性能/显存及恢复条件，再退役已替代的临时 patch，未替代优化或客户固定基点仍保留。不得把上游 release 已发布当成 HCU 已稳定支持，不自动切换运行任务、不更新外部仓或大知识库；只有明确授权范围内才修改对应 Cookbook/example。复核主控、三个阶段、交付及 Cookbook 时保持“路线与模式分开”：快速线不省略完整任务的分析、调参、热点优化、精度和约定规模/长稳验证；不能将 patch 重放或额外移植可选误写为优化可选。方法/引用更新后同步安装，不把本规约宣称为后台定时服务。
 
 ## 组织标准
 

@@ -16,7 +16,7 @@ description: 统一编排 HCU 大模型训练适配、性能优化、大规模�
 ## 定位与任务契约
 
 1. 定位 HCU-TrainFlow checkout：用户明确指定路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录 `workspace.json` 的 `project_root`；验证其项目标识、docs/skills 和版本。失效时重装绑定，不猜目录。私有 `TRAINFLOW_WORKSPACE` 按当前任务另行确定。新任务、换 Agent 或中断恢复先读项目 `docs/agent-playbook.md`，按其接手清单核对任务、现场和证据，再读当前阶段 Skill；具体契约按需读 `docs/collaboration.md`、`docs/multi-agent.md`、`docs/workflows.md` 与当前 CLI 帮助。
-2. 从会话和现场推导模型、预训练/SFT/RL、资源范围、部署方式、数据/权重、用户 patch、目标及已有授权。关键访问、数据或资源缺失才向用户询问；并行继续可做的阅读/分析。全流程用 `full`；只检查、适配、分析、优化、诊断、运行分别用现有独立模式，不扩大任务。
+2. 从会话和现场推导模型、预训练/SFT/RL、资源范围、部署方式、数据/权重、用户 patch、目标及已有授权。关键访问、数据或资源缺失才向用户询问；并行继续可做的阅读/分析。全流程用 `full`；只检查、适配、分析、优化、诊断、运行分别用现有独立模式，不扩大任务。稳定/快速是源码与交付路线，不是执行模式；不能因用户选择快速线就改成 `adapt` 或仅交付，也不能在跑通或生成 patch 后关闭完整任务。
 3. 创建或恢复 TaskSpec；冻结初始数值基线、比较上下文、预算、执行权限、唯一容错负责人。按项目 `docs/practices/engine-delivery-tracks.md` 区分稳定插件线与快速适配线：前者锁官方 release 与已验 HCU 发布组合，后者锁指定官方/客户 commit，交付模型 example 和可重放 patch。`full` 任务在固定执行基线上完成约定优化、阶段 loss、扩 DP、容错和持续监测后按路线交付；主仓整合仅在约定目标包含时进行。独立阶段按自身目标验收，不强加扩容/长训。不得把最终目标当作中途换基线的理由。按 adapt 的基线规则记录例外/受影响回归。参考适用 HCU 脚本与现场方式，不机械照搬 NV 配方。读取原始证据的权限不等于允许发布数据或重启任意任务。
 4. 写出可验收的目标和阶段计划，`flow-start` 挂接持久循环。用 `flow-board` 向用户提供中文 BOARD.md、要求与指导 GUIDANCE.md、提问与回答 QUESTIONS.md 的路径；技术判断需要的细节直接在 BOARD，完整团队和历史在 DETAILS.md。预算是停止盲目试错的边界；实际调整理由用 `flow-replan` 留痕，不能偷偷降低目标或延长循环。
 5. 每个模型私有工作区保留 `task_plan.md`、`findings.md`、`progress.md`：分别记录当前计划、可追溯发现和实验/决策经过。它们补充看板与结构化 evidence，不代替程序门槛；跨环境/版本结论标明适用范围，仅经筛选的通用环境经验和模型最终优化总结进入工程 Wiki，完整过程留任务档案，见 `docs/knowledge-architecture.md`。
