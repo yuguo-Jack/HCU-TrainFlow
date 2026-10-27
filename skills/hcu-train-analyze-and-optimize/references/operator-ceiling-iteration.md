@@ -135,4 +135,4 @@ HCU 查证入口：`xprof-xcompute-workflow`、`hipprof-2610-metrics`、`infra-r
 
 主控在推进前检查高优先级算子的处置、未覆盖项、最佳候选和阶段数值结果。独立的容错验证可并行推进；它不代表优化阶段已验收。用户明确收束某条工作线时记录范围调整，不把该决定写成技术上的近峰结论。
 
-新通用训练 HIP 算子在 HCU 现有库均无适用实现时，默认交付 **HCU Flash-Train**；扩展 TE 已有算子/优化器交 HCU TE，Primus Turbo 自有能力交其 HCU 仓。训练引擎保留必要调用、配置与集成测试。按任务约定完成整个工作流后再整合主仓/提交 PR；参见 [工程联动](hcu-library-integration.md)。
+新通用训练 HIP 算子在 HCU 现有库均无适用实现时，默认交付 **HCU Flash-Train**；扩展 TE 已有算子/优化器交 HCU TE，Primus Turbo 自有能力交其 HCU 仓。训练引擎保留必要调用、配置与集成测试。按任务范围验收后，底层实现向归属库提交 PR；训练引擎按[双线方法](../../../docs/practices/engine-delivery-tracks.md)交付发布配方或模型 example/patch，不要求所有快速方案整合主仓；参见 [工程联动](hcu-library-integration.md)。

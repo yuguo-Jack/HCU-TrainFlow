@@ -5,7 +5,8 @@
 - [全参容量预估与多实例并行优化](capacity-and-parallel-experiments.md)：HCU Train Sim 的适用边界、全参优先、缩模依据、独立 DP 实例和 Agent 交流。
 - [通信现场配方、RoCE 与 RCCL 差距排查](communication-recipe.md)：发现完整启动链、核对变量/库与实际路径、复现实测、区分多变量收益与单变量因果。
 - [HCU 算子、通信与底层依赖联动](hcu-library-routing.md)：Primus Turbo、UCCL、UltraEP、MoonEP 等的选择边界，重编制品、集成与PR。
-- [执行基线、候选验证与主仓交付顺序](execution-baseline.md)：保持实验连续性、复用已有资格、差异回归。
+- [稳定插件发布与快速适配](engine-delivery-tracks.md)：固定版本、模型 example/patch、Cookbook 指路与补丁退役。
+- [执行基线、候选验证与分路线交付](execution-baseline.md)：保持实验连续性、复用已有资格、差异回归。
 - [性能方法与参考来源](performance-methods.md)：证据刷新、热点/重叠/融合分析、条件上限、组合验证，以及 Hyperloom、GEAK、BBuf 方法的采用边界。
 - [模型精度诊断](model-accuracy-diagnosis.md)：有 NV 时分层对照、无 NV 时可信基线自查，结合 HCU Probe 定位首处分歧及恢复后的状态问题。
 

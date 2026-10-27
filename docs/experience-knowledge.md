@@ -67,7 +67,7 @@ loss 独立于性能结论：not-run/pass/fail/incomplete。非 not-run 需要�
 
 ## Cookbook 关联
 
-由成果所属阶段 Skill 负责最佳实践。先保存 baseline、候选、验证和边界，再写 kind=cookbook 的记录；delivery 字段示例：
+由成果所属阶段 Skill 负责最佳实践。按[双线方法](practices/engine-delivery-tracks.md)在正文写清稳定/快速路线、精确基点与 HCU 依赖、example/补丁顺序和已验证范围；发布版本支持变化时复核推荐入口与临时补丁替代关系，不能把快速方案成绩标为稳定 release 支持。沿项目维护周期及任务开始/交付、相关 release 发布时检查，不自动部署定时任务。先保存 baseline、候选、验证和边界，再写 kind=cookbook 的记录；delivery 字段示例：
 
 ```json
 {

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.7.2 — 2026-10-27
+
+- Separate stable HCU plugin/release delivery from rapid adaptation against a pinned official or customer commit. Share HCU backend, fusion, numerical and performance validation requirements without forcing rapid recipes onto the stable engine branch.
+- Define reproducible model-example patch bundles, dependency/source locks, optional optimization layers and Cookbook routing. Retire temporary patches only after verified stable coverage, retaining provenance and unmet requirements.
+- Align adaptation, optimization, scale/recovery, delivery and Wiki/Skill maintenance guidance; synchronize local Skills. This workflow-method update does not implement or qualify new engine plugins or hardware combinations.
+
 ## 0.7.1 — 2026-10-27
 
 - Treat native training/inference engine optimization options as a first-class tuning surface alongside parallelism and memory. Distinguish merged, candidate-PR and HCU-specific mechanisms, verify effective dispatch, and prioritize bounded experiments by end-to-end bottlenecks.
