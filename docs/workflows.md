@@ -26,7 +26,7 @@
 
 ## 性能分析与优化
 
-**按端到端主要占比推进。** 空泡大先解决空泡原因；通信大先判定是否达到匹配单测预期，异常先排查，符合预期的固有开销重点考虑 overlap/通算融合；负载不均则调整并行、调度或借鉴引擎实现；计算大就按真实算子占比逐项分析瓶颈、上限并优化，无需优化的说明依据。数学库 GEMM 确有性能缺口时，提取 rocBLAS/hipBLASLt 原生日志中的完整 bench 命令及条件证据用于 tune；attention 等按适用性复用已有库或重写。每轮重新检查主导因素，不围绕预先选定的候选机械迭代。
+**按端到端主要占比推进。** 空泡大先解决空泡原因；通信大先判定是否达到匹配单测预期，异常先排查，符合预期的固有开销重点考虑 overlap/通算融合；负载不均则调整并行、调度或借鉴引擎实现；计算大就按真实算子占比逐项分析瓶颈、上限并优化，无需优化的说明依据。数学库 GEMM 确有性能缺口时，按[数学库调优指南](../skills/hcu-train-analyze-and-optimize/references/math-library-tuning.md)提取原生 bench，rocBLAS 可自行有界选优并隔离回归，hipBLASLt 交用户协调；MIOpen conv/其他热点核对布局与 Find/缓存，提取 Driver 或最小复现交数学库。attention 等按适用性复用已有库或重写。每轮重新检查主导因素，不围绕预先选定的候选机械迭代。
 
 优化阶段按实际调用选择大型引擎或 [Torch 原生训练专项](../skills/hcu-train-analyze-and-optimize/references/torch-native-training.md)，可以混用，不新增阶段。视频生成/VLA/世界模型侧重输入与时空 shape、autograd、compile/断图/重编译、DDP/FSDP 及编译后的实际后端；共同保留初始数值基线、累计覆盖端到端 ≥90% 热点集合中各非通信算子的建模和阶段 loss。AOTI 不默认用于训练。
 

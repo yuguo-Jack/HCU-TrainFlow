@@ -16,6 +16,7 @@
 | 专家负载偏斜、复制与权重/梯度流转 | HCU UltraEP 与引擎专家计算/dispatcher；联查实际rocSHMEM provider | 副本placement/reroute、权重版本、梯度归并与更新归属、异步顺序、拓扑域和额外显存；不能把它当简单dispatch替换后就认为训练语义正确 |
 | 设备侧通信、通算融合与推进瓶颈 | HCU rocSHMEM、MORI、Flux及上述库现有路径 | provider/SHCA、symmetric heap、fence/可见性、progress、资源预留与消费者；遵守[通信专项](communication-optimization.md) |
 | GEMM或编译/runtime本身成为限制 | HCU rocBLAS/hipBLASLt、CK、AICC/DCC、Galaxy及真实依赖 | 当前分支、编译/链接参数、ABI、实际加载路径、architecture和数值；按证据选择调参、调优请求或局部修复 |
+| 卷积或其他 MIOpen 算子性能异常 | HCU MIOpen 与实际框架调用者 | 先核对 NHWC/NCHW、Find/缓存、workspace 和前反向，按[数学库调优](math-library-tuning.md)提取原生 Driver 复现；有性能差距交用户协调数学库 |
 
 先选择与热点直接相关的一两条候选路径，说明收益假设与排除理由。可以复用实现，也可以移植局部机制；不为“联动”重装全栈。不把某后端 `import` 成功、接口同名、README 上的速度或某个 gfx code object 存在视作目标训练通过。
 
@@ -46,10 +47,11 @@ Triton/TileLang 的前端选项、流水 pass 和后端工具链须作为同一�
 | [MoonEP](http://42.228.13.241:10068/dcutoolkit/deeplearing/MoonEP) | `develop`，`master` 仅历史初始化；按实际版本检查 dispatch/combine、G1、同步和单/多节点支持 |
 | [MORI](http://42.228.13.241:10068/dcutoolkit/deeplearing/mori) | `dcu-mori-ep-internodev1ll`；MORI EP、MORI-SHMEM 和独立 morishmem 源不能互相代替 |
 | [rocBLAS](http://42.228.13.241:20080/dcutoolkit/mathlibs/rocblas) / [hipBLASLt](http://42.228.13.241:20080/dcutoolkit/mathlibs/hipblaslt) | 前者 `dtk-26.10.1`，后者 `chitu-develop-bw-nmz` 与对应发版线；先分析真实 bench 命令和 tune 需求，再决定算法/dispatch 修复 |
+| [MIOpen](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen) | `develop` 综合线；2026-10-29 补核大库固定源码 `66f318c40eeb`。卷积及其他算子的 solver/选优/融合归此仓；Find 模式按当前 HCU 版本核对，不照搬 AMD 默认值 |
 | [DCC](http://42.228.13.241:20080/dcutoolkit/driverruntime/llvm-project) / [AICC](http://42.228.13.241:10068/dcutoolkit/deeplearing/aicc/llvm-project) | DCC `develop-6.0.0` 是 DTK HIP 编译器体系；AICC `dtk-llvm-6.3.3` / `dtk-llvm-7.2.1` 是独立 AI 编译器，不因同名 llvm-project 混用 |
 | [Galaxy](http://42.228.13.241:20080/dcutoolkit/driverruntime/galaxy) | `develop-merge-rock714` 为已选集成线；runtime、stream/event、调度/内存问题先做最小复现，再查对应运行版本 |
 
-CK、Flux、MIOpen、PyTorch/Inductor 等未在表中逐一列出的真实依赖也可按根因修改：从大知识库的对应项目取仓库身份，再沿引擎 build/lock/gitlink 和已加载制品确定目标，不能凭包名拼仓库 URL。权限不足保留缺口，不拿 NVIDIA/AMD 同名源码当作 HCU 实现。
+CK、Flux、PyTorch/Inductor 等未在表中逐一列出的真实依赖也可按根因修改：从大知识库的对应项目取仓库身份，再沿引擎 build/lock/gitlink 和已加载制品确定目标，不能凭包名拼仓库 URL。权限不足保留缺口，不拿 NVIDIA/AMD 同名源码当作 HCU 实现。
 
 分别记录父仓 gitlink、构建脚本显式 checkout、最终加载的依赖制品；三者可能不同。当前 DeepEP 构建脚本会选择特定 rocSHMEM 子提交与 SHCA/provider，独立 rocSHMEM develop 的新策略不自动进入该消费者。AITER 锁定的 CK/MoE 也不能由独立子仓 HEAD 替换；新增 selector、模板参数或量化布局要追到父仓实际采用的版本。显式环境开关仍需检查实际读取与分派，保留兼容名字但已 ignored 的变量不能证明命中，master 关闭也可能改选另一 provider。
 

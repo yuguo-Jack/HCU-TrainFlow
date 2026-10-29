@@ -28,6 +28,7 @@
 | 动态时空尺寸导致频繁编译 | 评估动态 shape、有限 bucket、编译边界；保存 shape 分布和各变体成本 | padding/mask/样本权重等价，缓存与显存受控；不偷偷缩短视频或序列 |
 | 小 kernel 很多但图较稳定 | 评估 graph capture/replay 或减少 host 调度 | 目标 HCU/PyTorch 支持、地址与生命周期、随机数、动态控制流、图池占用、反向和 optimizer；不盲开 NV 开关 |
 | layout 转换/拷贝密集 | 查 permute/contiguous、视图、卷积/attention/GEMM 输入输出；按子图评估 layout | fwd/bwd、alias/in-place 契约与全链路转换成本；不全局强制 channels-last |
+| MIOpen conv/其他库算子低效或 Find 反复耗时 | 按[数学库调优](math-library-tuning.md)提取真实 Driver 复现；优先比较适用的 NHWC，核对 Find 模式与缓存复用 | 冷启动与稳态分开，前反向、转换/显存和确定性不变；存在可靠差距再交数学库需求 |
 | backward/optimizer/重算显著 | 查 saved tensors、checkpoint、RNG、副作用、融合/foreach optimizer 和 state/offload 路径 | 梯度、参数更新、optimizer state、EMA 和恢复一致性；重算并非无条件省内存且不损吞吐 |
 | 编译后通信暴露变多 | 联合检查 DDP bucket/通信触发与编译图边界，FSDP gather/prefetch 的存活区间 | 按通信指引测整步；“更大完整图”不必然更快 |
 

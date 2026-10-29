@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.7.3 — 2026-10-29
 
+- Add HCU MIOpen reproduction capture, layout comparison and version-qualified Find/cache reuse to the math-library workflow; distinguish HCU mode numbering from AMD upstream and preserve numerical/whole-step validation.
+- Document bounded rocBLAS automatic selection, private tool/configuration handling, effective-result loading and independent regression. Keep hipBLASLt tuning as a team handoff.
+- Link analysis, replay, native tuning, dependency ownership and Wiki/Skill maintenance; synchronize local installation. These source/document-reviewed methods add no hardware qualification.
 - Clarify that stable and rapid delivery tracks share full-task profiling, tuning, operator optimization and accuracy gates. Separate optional external-feature ports from required optimization work, and carry validated candidates through scale/stability before final patch delivery.
 
 ## 0.7.2 — 2026-10-27

@@ -87,7 +87,7 @@ RL 任务同时联查其 HCU 训练后端、推理后端与通信依赖，不能
 | HCU Probe、Primus Safe | 分别用于数值诊断和适用部署下的容错；见[精度诊断](docs/practices/model-accuracy-diagnosis.md)与[故障证据来源](skills/hcu-train-scale-and-stability/references/evidence-sources.md) |
 | Transformer Engine、Flash-Train、Primus Turbo、AITER 等 HCU 算子库 | 训练/推理融合、低精度与既有实现复用；仓库、分支和归属见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md) |
 | HCU RCCL、rccl-test、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP、MORI、Flux | 集合通信测试、MoE 通信及通算融合；具体入口同见[库联动指南](skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)，不能用 AMD 上游替代 HCU 实际仓 |
-| HCU rocBLAS、hipBLASLt、CK、PyTorch、AICC/DCC 与 Galaxy Runtime | 数学库调优及必要的底层定位/隔离构建；通过 HCU-Knowledge 确认实际源码、版本和权限 |
+| HCU rocBLAS、hipBLASLt、MIOpen、CK、PyTorch、AICC/DCC 与 Galaxy Runtime | 数学库调优及必要的底层定位/隔离构建；通过 HCU-Knowledge 确认实际源码、版本和权限 |
 
 ## 5. 声明与维护
 

@@ -10,6 +10,7 @@
 | 专家复制、负载重路由、权重与梯度归并 | HCU UltraEP 与实际 rocSHMEM provider | 不等同于单纯 dispatch 库；额外显存与训练状态一致性都要验证 |
 | 通算融合、设备侧通信与推进 | HCU rocSHMEM、MORI、Flux 及上列库 | 需要实际 provider、可见性/同步、资源争用和消费者调用链证据 |
 | GEMM、编译器或 runtime 本身限制 | HCU rocBLAS/hipBLASLt、CK、AICC/DCC、Galaxy | 同 shape 重现、当前实际分支与加载制品；必要时修改重编，隔离候选依赖 |
+| 卷积或其他 MIOpen 热点低效 | HCU MIOpen、实际框架消费者 | 按[数学库调优](../../skills/hcu-train-analyze-and-optimize/references/math-library-tuning.md)比较布局、选优/缓存，提原生 Driver/最小复现；方法与 BLAS bench、rocBLAS 自动选优区分 |
 
 遇到 HCU 问题先用大知识库按报错/符号/shape/gfx/DTK/机制检索，再看实际部署源码。既有证据适用时直接复用；普通查阅不更新大库。没有访问权限、版本未知、接口缺失应形成明确缺口，不用 AMD/NVIDIA 同名工程替代 HCU 支持结论。
 

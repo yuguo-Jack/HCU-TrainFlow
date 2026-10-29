@@ -7,6 +7,7 @@
 | 类型 | 必须核对的条件 |
 | --- | --- |
 | GEMM / grouped GEMM | 每个矩阵的 shape、stride、dtype、转置；fwd/dgrad/wgrad；输出及累积 dtype；alpha/beta、accumulate、bias/激活融合；group splits、空组和实际数学库/算法 |
+| MIOpen conv / 其他库算子 | 原生 Driver 命令或最小 API 复现；真实 tensor 描述符/layout、dtype、卷积 groups/pad/stride/dilation、fwd/bwd-data/bwd-weights 或对应算子参数；融合、workspace、确定性、Find 配置、实际 solver 和冷/热缓存状态。详见[数学库调优](math-library-tuning.md) |
 | Attention / 递归注意力 | Q/K/V 或状态 shape、布局、head/group关系；mask/causal、序列长度及变长边界、scale、gate、归一化；前后向和保存/重算；实际 backend、数值路径及中间 kernel |
 | 通信 | 实际 process group 有序 rank、物理拓扑、每 rank 输入/输出及每 peer split、dtype、in-place、async/wait、stream；dispatcher 通信前后布局；不能只根据 hidden size 推算消息量 |
 | Copy / cast / contiguous | 源与目标设备、dtype、shape、stride、offset、字节量、pinned/pageable、non_blocking、alias；区分 D2D/H2D/D2H、类型转换、布局转换与无实际拷贝的 `to()` |
