@@ -15,8 +15,10 @@ def page(root, name, identity, body, **meta):
     import yaml
     path = root / 'knowledge' / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('---\n' + yaml.safe_dump({'id': identity, 'title': identity, **meta}, allow_unicode=True)
-                    + '---\n\n' + body + '\n', encoding='utf-8')
+    # Production generated_page/atomic_write writes exact UTF-8 bytes. Avoid
+    # platform text-newline conversion before Git's independent clean filter.
+    path.write_bytes(('---\n' + yaml.safe_dump({'id': identity, 'title': identity, **meta}, allow_unicode=True)
+                      + '---\n\n' + body + '\n').encode('utf-8'))
     return path
 
 
@@ -91,7 +93,7 @@ def test_retired_original_and_legacy_generation_restore_exact_git_bytes(tmp_path
     p = page(root, relative.removeprefix('knowledge/'), 'pr-org--repo-7', 'original PR body', kind='source-pr')
     raw = p.read_bytes()
     write_json(root / 'knowledge/sources.json', [{'id': 'repo', 'repository': 'Org/Repo', 'knowledge_project': 'repo'}])
-    for args in [['init'], ['add', '.'], ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline']]:
+    for args in [['init'], ['-c', 'core.autocrlf=true', 'add', '.'], ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'baseline']]:
         subprocess.run(['git', *args], cwd=root, check=True, capture_output=True)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
     legacy = wiki.index_wiki(store, root)
