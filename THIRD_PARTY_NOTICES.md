@@ -4,6 +4,8 @@ TrainFlow 原创代码和原创说明使用 [MIT](LICENSE)。本页列出直接�
 
 Wiki 的 `knowledge/projects/*/knowledgebase/upstream/` 保留所选上游文档、PR 描述与讨论，`knowledge/evidence/prs/` 保留 PR 原件；`local/` 是 TrainFlow 整理的阅读说明。第三方内容保留原作者、来源和适用许可，不随本项目改授 MIT。详见 [知识材料声明与许可副本](thirdparty/KNOWLEDGE-NOTICES.md)；代码或文档中的文件级声明仍须保留。
 
+lite 当前树只直接保留重要/引用 PR 的固定原件，普通 PR 通过官方入口发现并按需阅读。旧材料仍在已有固定 Git 历史中，按需恢复不改变原作者、来源或许可；不会因此新建全量评论和 review 镜像。
+
 ## 1. 安装与运行依赖
 
 完整第三方 checkout 在本机忽略目录或已绑定的独立目录中，不随 TrainFlow 主仓重复分发。固定提交及安装方式见 [依赖清单](thirdparty/manifest.json)和[安装说明](thirdparty/README.md)；Python 包依赖另见 [pyproject.toml](pyproject.toml)。

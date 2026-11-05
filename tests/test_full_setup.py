@@ -434,21 +434,89 @@ def sync_fixture(tmp_path):
     return module, project, target
 
 
+def sync_runner(commands, *, package_current=False, skills_current=False, failed_stage=None):
+    package_installed, skills_installed = False, False
+    def run(argv, **kwargs):
+        nonlocal package_installed, skills_installed
+        commands.append(argv)
+        if '-c' in argv:
+            current = package_current or package_installed and failed_stage != 'package-check'
+            return SimpleNamespace(returncode=0 if current else 1,
+                stdout=json.dumps({'status': 'current' if current else 'incomplete',
+                                   'foreign': False, 'repairable': True}))
+        if 'pip' in argv:
+            package_installed = True
+            return SimpleNamespace(returncode=1 if failed_stage == 'package-install' else 0)
+        if '--replace' in argv:
+            skills_installed = True
+            return SimpleNamespace(returncode=1 if failed_stage == 'skills-install' else 0)
+        assert '--check' in argv
+        current = skills_current or skills_installed and failed_stage != 'skills-check'
+        return SimpleNamespace(returncode=0 if current else 1)
+    return run
+
+
 def test_local_sync_is_bounded_and_checks_package_before_replacing_skills(tmp_path):
+    module, project, target = sync_fixture(tmp_path)
+    commands = []
+    result = module.sync(project, target, run=sync_runner(commands))
+    assert result['status'] == 'current'
+    assert result['completed_stages'] == ['preflight', 'package-install', 'package-check', 'skills-install', 'skills-check']
+    assert '-I' in commands[0] and '-I' in commands[2]
+    assert all(option in commands[1] for option in ['--no-index', '--no-deps', '--no-build-isolation'])
+    assert '--replace' in commands[4] and '--workflow-only' in commands[4]
+    assert '--check' in commands[3] and '--check' in commands[5]
+    assert not any('setup_trainflow.py' in str(c) or 'git' in c for c in commands)
+    assert json.loads((project/'.work/setup/local-sync.json').read_text())['status'] == 'current'
+
+
+@pytest.mark.parametrize('package_current,skills_current', [(True, True), (True, False), (False, True)])
+def test_local_sync_reuses_current_package_and_only_copies_changed_skills(tmp_path, package_current, skills_current):
+    module, project, target = sync_fixture(tmp_path)
+    commands = []
+    result = module.sync(project, target, run=sync_runner(commands, package_current=package_current,
+                                                       skills_current=skills_current))
+    assert result['status'] == 'current'
+    assert result['package_action'] == ('reused' if package_current else 'refreshed')
+    assert result['skills_action'] == ('reused' if skills_current else 'refreshed')
+    assert any('pip' in command for command in commands) is not package_current
+    assert any('--replace' in command for command in commands) is not skills_current
+    assert '-I' in commands[0]
+    if package_current and skills_current:
+        assert len(commands) == 2
+        assert result['completed_stages'] == ['preflight', 'package-check', 'skills-check']
+
+
+def test_local_sync_rejects_foreign_package_before_install_or_skill_replacement(tmp_path):
     module, project, target = sync_fixture(tmp_path)
     commands = []
     def run(argv, **kwargs):
         commands.append(argv)
-        return SimpleNamespace(returncode=0)
+        assert '-I' in argv
+        return SimpleNamespace(returncode=1, stdout=json.dumps({'status': 'incomplete', 'foreign': True, 'repairable': False}))
+    with pytest.raises(FlowError, match='foreign/unknown package binding'):
+        module.sync(project, target, run=run)
+    assert len(commands) == 1
+    state = json.loads((project/'.work/setup/local-sync.json').read_text())
+    assert state['failed_stage'] == 'package-check' and state['status'] == 'incomplete'
+
+
+def test_local_sync_refreshes_changed_packaging_even_when_installed_version_matches(tmp_path):
+    module, project, target = sync_fixture(tmp_path)
+    (project/'setup.cfg').write_text('[options.entry_points]\nconsole_scripts=\n old=example:main\n')
+    commands = []
+    run = sync_runner(commands, package_current=True, skills_current=True)
+    module.sync(project, target, run=run)
+    (project/'setup.cfg').write_text('[options.entry_points]\nconsole_scripts=\n old=example:main\n new=example:main\n')
+    with pytest.raises(FlowError, match='package-check failed'):
+        module.sync(project, target, check_only=True, run=run)
+    commands.clear()
     result = module.sync(project, target, run=run)
-    assert result['status'] == 'current'
-    assert result['completed_stages'] == ['preflight', 'package-install', 'package-check', 'skills-install', 'skills-check']
-    assert '--no-deps' in commands[0] and '--no-build-isolation' in commands[0]
-    assert '-I' in commands[1]
-    assert '--replace' in commands[2] and '--workflow-only' in commands[2]
-    assert '--check' in commands[3]
-    assert not any('setup_trainflow.py' in str(c) or 'git' in c for c in commands)
-    assert json.loads((project/'.work/setup/local-sync.json').read_text())['status'] == 'current'
+    assert result['package_action'] == 'refreshed' and result['skills_action'] == 'reused'
+    assert any('pip' in command for command in commands)
+    commands.clear()
+    assert module.sync(project, target, run=run)['package_action'] == 'reused'
+    assert not any('pip' in command for command in commands)
 
 
 def test_local_sync_rejects_stale_root_documentation_before_pip(tmp_path):
@@ -464,11 +532,8 @@ def test_local_sync_rejects_stale_root_documentation_before_pip(tmp_path):
 def test_failed_local_sync_never_leaves_old_success(tmp_path, failed_stage):
     module, project, target = sync_fixture(tmp_path)
     write_json(project/'.work/setup/local-sync.json', {'status': 'current'})
-    stages = iter(['package-install', 'package-check', 'skills-install', 'skills-check'])
-    def run(argv, **kwargs):
-        return SimpleNamespace(returncode=1 if next(stages) == failed_stage else 0)
     with pytest.raises(FlowError, match=failed_stage):
-        module.sync(project, target, run=run)
+        module.sync(project, target, run=sync_runner([], failed_stage=failed_stage))
     state = json.loads((project/'.work/setup/local-sync.json').read_text())
     assert state['status'] == 'incomplete' and state['failed_stage'] == failed_stage
 
@@ -476,10 +541,8 @@ def test_failed_local_sync_never_leaves_old_success(tmp_path, failed_stage):
 def test_local_check_is_readonly_and_never_runs_pip(tmp_path):
     module, project, target = sync_fixture(tmp_path)
     commands = []
-    def run(argv, **kwargs):
-        commands.append(argv)
-        return SimpleNamespace(returncode=0)
-    module.sync(project, target, check_only=True, run=run)
+    module.sync(project, target, check_only=True,
+                run=sync_runner(commands, package_current=True, skills_current=True))
     assert len(commands) == 2 and '-I' in commands[0] and '--check' in commands[1]
     assert not (project/'.work').exists()
 

@@ -60,6 +60,10 @@ def search_prs(store, query, repos, token=None, limit=10, state='all', branch=No
         raise FlowError('Use concise terms, limit 1..100 and page 1..10')
     if state not in {'all','open','closed','merged'}:
         raise FlowError('Invalid PR state')
+    from .capture_policy import public_query_risk
+    if public_query_risk(query):
+        return {'status':'public-query-required','results':[],'coverage':[],
+                'instruction':'Extract public mechanism or symbol terms; pasted private context was kept local.'}
     terms = re.findall(r'[\w./+-]+', query, re.UNICODE)[:20]
     if not terms:
         raise FlowError('No search terms')
@@ -99,7 +103,8 @@ def annotate_prs(project, result):
         row['locally_retained']=bool(meta)
         row['local_page_id']=meta.get('id')
         row['upstream_changed']=meta.get('updated_at')!=row['updated_at'] if meta else None
-        row['discussion_recheck_required']=True
+        row['discussion_recheck_required']=False
+        row['discussion_reading']='on-demand'
     return result
 
 
@@ -130,16 +135,25 @@ def read_code(store, repo, commit, path, token=None, max_chars=24000):
     return {**retained,'content':text[:max_chars],'truncated':len(text)>max_chars,'lines':len(text.splitlines())}
 
 
-def read_pr(store, repo, number, token=None, max_pages=20):
+def read_pr(store, repo, number, token=None, max_pages=20, *, discussions=None, files=None):
     repo=repo_name(repo)
     if number <= 0 or not 1 <= max_pages <= 100:
         raise FlowError('Positive PR number and max-pages 1..100 required')
     base=f'https://api.github.com/repos/{repo}/pulls/{number}'
     detail,_=wiki._get_json(base,token)
+    # None preserves old internal callers. The user-facing CLI explicitly
+    # requests body/pins only unless deeper reading is selected.
+    discussions = True if discussions is None else discussions
+    files = True if files is None else files
     data={'repository':repo,'number':number,'detail':detail,'coverage':{},'observed_at':utc()}
     urls={'issue_comments':f'https://api.github.com/repos/{repo}/issues/{number}/comments',
           'inline_comments':base+'/comments','reviews':base+'/reviews','files':base+'/files'}
     for key,url in urls.items():
+        if not (files if key == 'files' else discussions):
+            data[key]=[]
+            data['coverage'][key]={'complete':False,'requested':False,'pages':0,
+                                   'next_url':None,'error':None,'reason':'on demand'}
+            continue
         rows=[]; pages=0; error=None; seen=set(); url+='?per_page=100'
         while url and pages<max_pages:
             try:
@@ -154,15 +168,17 @@ def read_pr(store, repo, number, token=None, max_pages=20):
                 error=str(exc)[:240];break
         data[key]=rows
         data['coverage'][key]={'complete':not url,'pages':pages,'next_url':url,'error':error}
-    data['coverage']['diff_complete']=len(data['files'])==detail.get('changed_files') and all(f.get('patch') for f in data['files'])
+    data['coverage']['diff_complete']=bool(files and len(data['files'])==detail.get('changed_files') and all(f.get('patch') for f in data['files']))
+    data['scope']={'body':True,'discussions':discussions,'files':files}
     data['refs']={side:{'repository':(detail.get(side,{}).get('repo') or {}).get('full_name'),
                         'commit':detail.get(side,{}).get('sha')} for side in ('head','base')}
     sha=store.put(json.dumps(data,ensure_ascii=False).encode())
     return {'artifact':sha,'repository':repo,'number':number,'title':detail.get('title'),'body':detail.get('body'),
             'refs':data['refs'],'coverage':data['coverage'],
+            'scope':data['scope'],'url':detail.get('html_url',f'https://github.com/{repo}/pull/{number}'),
             'files':[{'path':f['filename'],'old_path':f.get('previous_filename',f['filename']),'status':f.get('status')} for f in data['files']],
-            'status':'collected-not-reviewed' if all(v['complete'] for v in data['coverage'].values() if isinstance(v,dict)) else 'partial',
-            'instruction':'Read retained artifact for all reviews; inspect exact head/base file, callers and tests. No runtime validation implied.'}
+            'status':'collected-not-reviewed' if all(v['complete'] for v in data['coverage'].values() if isinstance(v,dict) and v.get('requested',True)) else 'partial',
+            'instruction':'Open the original PR page as needed. Discussions and files are optional; use exact head/base code, callers and tests for implementation claims. No runtime validation implied.'}
 
 
 def markdown(meta, body):
@@ -207,11 +223,22 @@ def retain_pr(store, project, result, engine, token=None):
     info,_=api(repo,'',token)
     if info.get('private') is not False:
         raise FlowError('Public Wiki accepts verified public repositories only')
-    if any(not v['complete'] for v in data['coverage'].values() if isinstance(v,dict)):
+    if any(not v['complete'] for v in data['coverage'].values() if isinstance(v,dict) and v.get('requested',True)):
         raise FlowError('Incomplete discussion pagination; keep prior published page and retry')
     slug=repo.replace('/','--'); pid=f'pr-{slug.lower()}-{number}'
     path=layout.pr_root(project,repo)/f'PR-{number}.md'
-    old_meta,_=wiki.parse_page(path) if path.exists() else ({},'')
+    old_meta,old_body=wiki.parse_page(path) if path.exists() else ({},'')
+    from .capture_policy import discovery_project, semantic_pr_fingerprint
+    if discovery_project(project,repo) and old_meta.get('artifact_path'):
+        from . import source_evidence
+        original=source_evidence.read_json(project,old_meta['artifact_path'],expected_sha=old_meta['artifact_sha256'])
+        if semantic_pr_fingerprint(original,data['coverage'])==semantic_pr_fingerprint(data,data['coverage']):
+            if old_meta.get('generated_body_sha256')!=digest(old_body.encode()):
+                raise FlowError('Generated page has manual edits; preserve commentary in a separate topic: '+str(path))
+            _track_pr_review(store,project,pid,path,old_meta['artifact_sha256'],old_meta,repo)
+            return {'id':pid,'page':path.relative_to(project).as_posix(),'artifact':old_meta['artifact_sha256'],
+                    'updated_at':old_meta['updated_at'],'unchanged':True,
+                    'scope':'Existing richer fixed evidence retained; new observation did not change requested semantics'}
     retained={k:v for k,v in data.items() if k!='observed_at'}
     raw_bytes=json.dumps(retained,ensure_ascii=False,sort_keys=True,indent=2).encode()
     raw_sha=digest(raw_bytes)
@@ -223,12 +250,16 @@ def retain_pr(store, project, result, engine, token=None):
     body+='## Review and discussion\n\n'
     for key in ('reviews','issue_comments','inline_comments'):
         body+='### '+key+'\n\n'
+        if not data['coverage'].get(key,{}).get('requested',True):
+            body+='Not requested; open the original PR page if this discussion is needed.\n\n'
         for row in data[key]:
             author=(row.get('user') or {}).get('login','unknown')
             body+=f'- {author} · {row.get("state", "comment")} · {row.get("submitted_at",row.get("created_at",""))} · [source]({row.get("html_url",d["html_url"])})\n\n'
             if row.get('path'):body+=f'File: `{row["path"]}` · line {row.get("line",row.get("original_line"))}\n\n'
             body+=(row.get('body') or '(No body; status only.)')+'\n\n'
     body+='## Changed files and fixed code\n\n'
+    if not data['coverage'].get('files',{}).get('requested',True):
+        body+='File list and patches were not requested. Read the original PR or exact head/base code as needed.\n\n'
     for row in data['files']:
         body+=f'- `{row["filename"]}` · {row.get("status")} · additions {row.get("additions")} / deletions {row.get("deletions")}\n'
         for side,ref in data['refs'].items():
@@ -240,10 +271,16 @@ def retain_pr(store, project, result, engine, token=None):
     body+=f'[Original JSON, discussions and patches]({rel}) · SHA-256 `{raw_sha}`.\n\n'
     body+=f'Diff complete: {data["coverage"]["diff_complete"]}. Missing/binary/truncated patches require pinned source inspection. This is a source page, not an independently verified optimization case. Open, merged and released are different states; recheck the deployed dependency.\n'
     meta={'id':pid,'title':d['title'],'engine':engine,'stages':['adapt','optimize','fault-tolerance'],
-          'kind':'source-pr','coverage':'upstream-body-and-discussions','review_level':'source-reported','runtime_validated':False,
+          'kind':'source-pr','coverage':('upstream-body; discussions/files on demand' if any(not v.get('requested',True) for v in data['coverage'].values() if isinstance(v,dict)) else 'upstream-body-and-discussions'),'review_level':'source-reported','runtime_validated':False,
           'repository':repo,'pr_number':number,'updated_at':d['updated_at'],'artifact_sha256':raw_sha,
           'artifact_path':raw.relative_to(project).as_posix(),'sources':[]}
     generated_page(path,meta,body)
+    _track_pr_review(store,project,pid,path,raw_sha,old_meta,repo)
+    return {'id':pid,'page':path.relative_to(project).as_posix(),'artifact':raw_sha,'updated_at':d['updated_at']}
+
+
+def _track_pr_review(store,project,pid,path,raw_sha,old_meta,repo):
+    """Retaining identical source bytes still observes changed authored dependencies."""
     pointer=store.root/'wiki/pr-review'/f'{pid}.json'
     prior=read_json(pointer) if pointer.exists() else {}
     affected=pr_page_hashes(project,pid,repo,prior.get('affected_pages',[]))
@@ -253,7 +290,6 @@ def retain_pr(store, project, result, engine, token=None):
         write_json(pointer,{'id':pid,'artifact_sha256':raw_sha,'affected_pages':sorted(affected),
                     'page':path.relative_to(project).as_posix(),
                     'status':'pending-content-review','reason':'PR evidence or related authored pages changed'})
-    return {'id':pid,'page':path.relative_to(project).as_posix(),'artifact':raw_sha,'updated_at':d['updated_at']}
 
 
 def review_pr(store, project, identity, decisions):
@@ -363,6 +399,9 @@ def sync_prs(store, project, source_id, token=None, max_prs=10, since=None):
     if not 1<=max_prs<=100:raise FlowError('max-prs must be 1..100')
     source=source_for(project,source_id)
     if not source or source.get('kind')=='web':raise FlowError('Select registered Git source')
+    from .capture_policy import is_discovery
+    if is_discovery(source):
+        return discover_prs(store,source,token,max_prs,since)
     repo=repo_name(source['repository']); engine=source.get('engine',source_id)
     ledger_path=Path(project)/'knowledge/catalog/pr-ledgers'/f'{source_id}.json'
     ledger=read_json(ledger_path) if ledger_path.exists() else {'records':{},'scope':'registered PR sources plus recent updated discovery'}
@@ -453,6 +492,64 @@ def sync_prs(store, project, source_id, token=None, max_prs=10, since=None):
             'scope_since':state['since'],
             'instruction':('Discovery is incomplete; repeat the same command to resume its fixed window. No PRs were retained or public cursor advanced. GitHub pagination is not an atomic snapshot.'
                            if discovery else 'Review related topics/cases; collection is not synthesis. Repeat the same command to resume.')}
+
+
+def discover_prs(store, source, token=None, limit=10, since=None):
+    """Observe one recent PR listing; preserve old capture queues as history.
+
+    Search covers longer-tail questions when needed. A successful bounded list
+    is never presented as full-history/body/discussion coverage.
+    """
+    repo=repo_name(source['repository'])
+    safe_id(source['id'])
+    if type(limit) is not int or not 1<=limit<=100:raise FlowError('Discovery limit must be 1..100')
+    cutoff=None
+    if since:
+        cutoff=datetime.fromisoformat(since.replace('Z','+00:00'))
+        if cutoff.tzinfo is None:raise FlowError('since requires timezone')
+    state_path=store.root/'wiki/pr-discovery'/f'{source["id"]}.json'
+    previous=read_json(state_path) if state_path.exists() else {}
+    result={'source':source['id'],'repository':repo,'processed':[],'pending':0,'captured':0,
+            'review_pending':[],'history_complete':False,'discussion_audited':False,
+            'scope':'one recent listing page; no automatic PR body/comments/reviews/files retention',
+            'instruction':'Open a candidate URL or search the repository for the actual question; read body/code/discussion only as needed.'}
+    try:
+        rows,links=api(repo,f'/pulls?state=all&sort=updated&direction=desc&per_page={limit}&page=1',token)
+        if not isinstance(rows,list) or not isinstance(links,str):raise FlowError('Expected PR list and pagination links')
+        if len(rows)>limit:raise FlowError('PR response exceeds requested listing window')
+        candidates=[]
+        for row in rows:
+            if (not isinstance(row,dict) or type(row.get('number')) is not int or row['number']<=0
+                    or not isinstance(row.get('updated_at'),str)):
+                raise FlowError('Expected numbered PR rows with updated_at')
+            updated=datetime.fromisoformat(row['updated_at'].replace('Z','+00:00'))
+            if updated.tzinfo is None:raise FlowError('PR updated_at requires timezone')
+            if cutoff and updated<cutoff:continue
+            candidates.append({'number':row['number'],'title':row.get('title') or f'PR #{row["number"]}',
+                               'url':f'https://github.com/{repo}/pull/{row["number"]}',
+                               'updated_at':row['updated_at'],'state':row.get('state','unknown'),
+                               'status':'unreviewed','body_captured':False})
+        queue={str(row['number']):row for row in previous.get('candidates',[])}
+        queue.update((str(row['number']),row) for row in candidates)
+        queue=sorted(queue.values(),key=lambda row:datetime.fromisoformat(row['updated_at'].replace('Z','+00:00')),reverse=True)[:1000]
+        candidate_fp=fingerprint(queue)
+        state={'source':source['id'],'repository':repo,'observed_at':utc(),'candidates':queue,
+               'candidate_fingerprint':candidate_fp,'scope':result['scope'],'history_complete':False,
+               'listing_has_more':bool(re.search(r'rel="next"',links)),'max_candidates':1000,'listing_limit':limit}
+        write_json(state_path,state)
+        result.update(status='discovered',errors=[],results=candidates[:limit],listed=len(rows),
+                      candidate_count=len(queue),unchanged=previous.get('candidate_fingerprint')==candidate_fp,
+                      discovery_pending=False,next_page=2 if state['listing_has_more'] else None,
+                      observation_path=str(state_path))
+    except (FlowError,OSError,ValueError) as exc:
+        result.update(status='partial',errors=[{'phase':'discovery','error':str(exc)[:240]}],
+                      results=[],candidate_count=len(previous.get('candidates',[])),discovery_pending=True,next_page=1)
+    old_state=store.root/'wiki/pr-sync'/f'{source["id"]}.json'
+    if old_state.exists():
+        old=read_json(old_state)
+        result['historical_capture']={'state_path':str(old_state),'pending':len(old.get('pending',[])),
+                                      'status':'preserved; outside discovery scope'}
+    return result
 
 
 def apply_refresh(store, project, stage_id):
@@ -581,6 +678,9 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
 
 def catalog(project):
     project=Path(project).resolve()
+    from .capture_policy import discovery_project
+    if discovery_project(project):
+        return _discovery_catalog(project)
     root=Path(project)/'knowledge'
     body='# 官方来源覆盖目录\n\n此页由来源目录和已保留页面重建。完整路径、文档采集和内容精读是不同覆盖层；没有逐模型或硬件验证的隐含承诺。\n\n'
     for source in read_json(root/'sources.json'):
@@ -612,10 +712,42 @@ def catalog(project):
     return {'status':'catalogued','source_count':len(read_json(root/'sources.json'))}
 
 
+def _discovery_catalog(project):
+    """Rebuild links, not a second mirror of upstream PR/tree inventories."""
+    root=Path(project)/'knowledge'
+    registry=read_json(root/'sources.json')
+    body='# 官方来源与按需查阅\n\n此页只维护登记来源和阅读路由，不展开全部 PR、评论或完整源码路径。'
+    body+='先查已有解释，长尾问题在线联搜原页；重要结论按实际版本读取源码与必要证据。历史采集台账不代表本轮刷新。\n\n'
+    for source in registry:
+        sid=source['id']
+        url=source['repository'] if source.get('kind')=='web' else 'https://github.com/'+repo_name(source['repository'])
+        body+=f'## {sid}\n\n[官方入口]({url})'
+        if source.get('kind')!='web':
+            body+=f' · [PR 入口]({url}/pulls) · 登记分支 `{source["ref"]}`'
+        body+='\n\n'
+        if source.get('document_scope'):body+='文档选择范围：'+source['document_scope']+'\n\n'
+        mapping=layout.source_map(project,sid)
+        if mapping.is_file():
+            link=Path(os.path.relpath(mapping,root/'catalog')).as_posix()
+            body+=f'- [固定源码阅读入口]({link})；按固定 commit 查文件、调用者和测试。\n'
+        docs=layout.document_root(project,sid)
+        if docs.is_dir() and any(docs.rglob('*.md')):
+            link=Path(os.path.relpath(docs,root/'catalog')).as_posix()
+            body+=f'- [选定文档原文]({link}/)；保留原版本和适用范围。\n'
+        body+='\n'
+    generated_page(root/'catalog/README.md',{'id':'official-source-catalog','title':'官方来源与按需查阅入口',
+        'kind':'source-map','engine':'cross-engine','review_level':'navigation-only','runtime_validated':False,'sources':[]},body)
+    project_catalog(project)
+    return {'status':'catalogued','source_count':len(registry),'profile':'discovery-first',
+            'scope':'registered routes and selected authored knowledge; no full PR/tree expansion'}
+
+
 def project_catalog(project):
     """Rebuild navigation, keeping authored mechanisms separate from source copies."""
     project=Path(project).resolve()
     root=Path(project)/'knowledge'
+    from .capture_policy import discovery_project
+    lite=discovery_project(project)
     coverage=root/'coverage.json'
     groups={r['id']:r for r in read_json(coverage).get('projects',[])} if coverage.exists() else {}
     registry=read_json(root/'sources.json')
@@ -633,6 +765,7 @@ def project_catalog(project):
             link=Path(os.path.relpath(target,directory)).as_posix()
             body+=f'从[工程总览：{title}]({link})进入。\n\n'
         body+='## 整理后的知识\n\n'
+        listed=set()
         for section,label in [('overview','定位与代码地图'),('guides','安装、运行与测试'),('topics','机制专题'),('cases','优化案例'),('changes','版本与更新')]:
             pages=sorted((directory/'knowledgebase/local'/section).rglob('*.md'))
             if not pages:continue
@@ -640,6 +773,16 @@ def project_catalog(project):
             for page in pages:
                 title=wiki.parse_page(page)[0].get('title',page.stem)
                 body+=f'- [{title}]({page.relative_to(directory).as_posix()})\n'
+                listed.add(page.relative_to(project).as_posix())
+            body+='\n'
+        related=[name for name in group.get('related_pages',[]) if name not in listed]
+        if related:
+            body+='### 关联阅读\n\n'
+            for name in related:
+                page=child(project,name)
+                if page.is_file():
+                    title=wiki.parse_page(page)[0].get('title',page.stem)
+                    body+=f'- [{title}]({Path(os.path.relpath(page,directory)).as_posix()})\n'
             body+='\n'
         body+='## 上游资料\n\n'
         for source in registry:
@@ -647,10 +790,16 @@ def project_catalog(project):
             sid=source['id']
             url=source['repository'] if source.get('kind')=='web' else 'https://github.com/'+source['repository']
             body+=f'- [{sid}]({url})\n'
-        for kind,label in [('docs','官方文档原文'),('prs','PR 描述、review 与固定代码'),('source-map','完整源码路径')]:
+        sections=([('docs','选定官方文档原文'),('prs','已选定 PR 与固定证据'),('source-map','固定源码阅读入口')] if lite
+                  else [('docs','官方文档原文'),('prs','PR 描述、review 与固定代码'),('source-map','完整源码路径')])
+        for kind,label in sections:
             path=directory/'knowledgebase/upstream'/kind
-            if path.exists():body+=f'- [{label}]({path.relative_to(directory).as_posix()}/)\n'
-        body+='\n原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。\n'
+            if path.is_dir() and (not lite or any(path.rglob('*.md'))):body+=f'- [{label}]({path.relative_to(directory).as_posix()}/)\n'
+        if lite:
+            body+='\n普通 PR 通过官方原页联搜，正文、代码和讨论按需读取；已选定页面链接固定原件，历史材料由既有固定 Git 基线按需恢复。'
+        else:
+            body+='\n原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。'
+        body+='局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。\n'
         generated_page(directory/'README.md',{'id':'project-'+identity,'title':identity+' 官方工程 Wiki 导航',
             'kind':'source-map','review_level':'navigation-only','runtime_validated':False,'sources':[]},body)
         index+=f'- [{identity}]({identity}/README.md)\n'
@@ -661,6 +810,9 @@ def project_catalog(project):
 def update_source(store, project, source_id, token=None, max_prs=10, max_documents=40, since=None):
     source=source_for(project,source_id)
     if not source:raise FlowError('Unknown source')
+    from .capture_policy import is_discovery
+    if is_discovery(source) and source.get('kind')!='web':
+        return _update_discovery_source(store,project,source,token,max_prs,since)
     result={'source':source_id,'stages':{},'errors':[]}
     steps=([('inventory',lambda:inventory(store,project,source_id,token,True)),
             ('documents',lambda:sync_documents(store,project,source_id,token,max_documents)),
@@ -681,4 +833,54 @@ def update_source(store, project, source_id, token=None, max_prs=10, max_documen
     result['status']='partial' if result['errors'] or any(x.get('status')=='partial' for x in result['stages'].values()) else 'pending-content-review'
     result['instruction']='Review changed source paths and related overviews/topics/cases. Explicitly defer site workflow reviews if necessary; no automatic task dependency upgrade.'
     write_json(store.root/'wiki/update-runs'/f'{source_id}-{fingerprint(result)[:16]}.json',result)
+    return result
+
+
+def _locked_source_commit(project,source):
+    """Use the actual collected lock; a registry's original baseline may be old."""
+    path=Path(project)/'knowledge/source-lock.json'
+    rows=read_json(path).get('files',[]) if path.is_file() else []
+    rows=[row for row in rows if row.get('repo','').lower()==source['repository'].lower()
+          and row.get('ref')==source['ref'] and row.get('status')=='collected']
+    if rows:
+        commits={row['commit'] for row in rows}
+        covered={row['path'] for row in rows}
+        return next(iter(commits)) if len(commits)==1 and set(source.get('paths',[]))<=covered else None
+    if set(source.get('paths',[]))<=set(source.get('baseline_files',{})):
+        return source.get('baseline_commit')
+    return None
+
+
+def _update_discovery_source(store,project,source,token,max_prs,since):
+    """Check fixed monitored inputs; discover long-tail material when needed."""
+    result={'source':source['id'],'stages':{},'errors':[],
+            'scope':'branch check and registered paths only; PR URL discovery; no full-tree/document/discussion sweep'}
+    try:
+        repo=repo_name(source['repository'])
+        commit,_=api(repo,'/commits/'+quote(source['ref'],safe=''),token)
+        sha=commit.get('sha')
+        if not isinstance(sha,str) or not re.fullmatch(r'[0-9a-f]{40}',sha):raise FlowError('Unexpected commit SHA')
+        locked=_locked_source_commit(project,source)
+        result['stages']['check']={'commit':sha,'locked_commit':locked,'observed_at':utc(),
+                                   'status':'unchanged' if sha==locked else 'changed'}
+        if sha==locked:
+            result['stages']['content']={'status':'unchanged','commit':sha,'body_read':False,
+                                          'meaning':'Fixed inputs reused; authored facts and runtime behavior were not revalidated'}
+        else:
+            # The old full update verified this through inventory(). A light
+            # update must retain that public boundary before staging bytes.
+            info,_=api(repo,'',token)
+            if info.get('private') is not False:raise FlowError('Only verified public repository content may be retained')
+            result['stages']['content']=wiki.refresh_source(store,project,source['id'],token,fixed_commit=sha)
+    except (OSError,ValueError) as exc:
+        result['errors'].append({'stage':'content','error':str(exc)[:240]})
+    try:
+        result['stages']['prs']=sync_prs(store,project,source['id'],token,max_prs,since)
+    except (OSError,ValueError) as exc:
+        result['errors'].append({'stage':'prs','error':str(exc)[:240]})
+    partial=result['errors'] or any(stage.get('status')=='partial' for stage in result['stages'].values())
+    content=result['stages'].get('content',{})
+    result['status']='partial' if partial else ('unchanged' if content.get('status')=='unchanged' else 'pending-content-review')
+    result['instruction']='Review only actual changed inputs and affected knowledge; use online PR links and source code on demand. No automatic task dependency upgrade.'
+    write_json(store.root/'wiki/source-checks'/f'{source["id"]}.json',result)
     return result

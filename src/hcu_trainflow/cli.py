@@ -121,6 +121,8 @@ def parser():
     cmd('wiki-apply','project','stage')
     cmd("wiki-refresh", "project", "source")
     q = cmd("wiki-pr", "repository", "number"); q.add_argument("--output"); q.add_argument('--retain-project'); q.add_argument('--engine',default='unspecified'); q.add_argument('--max-pages',type=int,default=20)
+    q.add_argument('--discussions', action='store_true', help='Read comments/reviews only when needed')
+    q.add_argument('--files', action='store_true', help='Read changed files/diff only when needed')
     cmd('wiki-review-pr','project','id','decisions')
     q = cmd("wiki-review", "project", "stage", "decisions"); q.add_argument('--defer-workflows',metavar='REASON')
     cmd("demo", "destination")
@@ -296,7 +298,7 @@ def execute(a):
         return result
     if c == "wiki-refresh": return wiki.refresh_source(store, a.project, a.source, os.environ.get("GITHUB_TOKEN"))
     if c == "wiki-pr":
-        result = official.read_pr(store, a.repository, int(a.number), max_pages=a.max_pages)
+        result = official.read_pr(store, a.repository, int(a.number), max_pages=a.max_pages, discussions=a.discussions, files=a.files)
         if a.retain_project: result['retained']=official.retain_pr(store,a.retain_project,result,a.engine)
         if a.output: write_json(a.output, result)
         return result

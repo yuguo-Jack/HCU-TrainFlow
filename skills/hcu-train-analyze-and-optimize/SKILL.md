@@ -5,6 +5,8 @@ description: 分析 HCU 训练引擎及 Torch 原生训练瓶颈，推进系统�
 
 # hcu-train-analyze-and-optimize
 
+知识检索按问题推进：先复用已有解释，不足时联搜 PR 或官方页面，找到入口后按需读原页、固定源码和必要讨论。普通 PR 不要求离线镜像正文、评论、review 或 diff，也不要求每仓全量总结。只有形成结论所需的重要或引用证据才正式保留；HCU 内部仓继续通过 `$hcu-knowledge-search` 查证。当前入口和命令习惯保持，资料发现、内容复核与现场实测分别记录。
+
 ## 开始前定位与阅读
 
 先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。

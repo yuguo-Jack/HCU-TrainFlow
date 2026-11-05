@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: b2a92a46c9929d650e544004080dd6d0fc3e25f19a4baa65d6861b35fcd2f2a4
+generated_body_sha256: 0cdd36a5e7ee1bad7a84f03d937abcb8b4ee0fb50eabcb951da91fea4bd2b1ce
 ---
 
 # primus
@@ -31,8 +31,8 @@ generated_body_sha256: b2a92a46c9929d650e544004080dd6d0fc3e25f19a4baa65d6861b35f
 ## 上游资料
 
 - [amd-agi-primus](https://github.com/AMD-AGI/Primus)
-- [官方文档原文](knowledgebase/upstream/docs/)
-- [PR 描述、review 与固定代码](knowledgebase/upstream/prs/)
-- [完整源码路径](knowledgebase/upstream/source-map/)
+- [选定官方文档原文](knowledgebase/upstream/docs/)
+- [已选定 PR 与固定证据](knowledgebase/upstream/prs/)
+- [固定源码阅读入口](knowledgebase/upstream/source-map/)
 
-原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。
+普通 PR 通过官方原页联搜，正文、代码和讨论按需读取；已选定页面链接固定原件，历史材料由既有固定 Git 基线按需恢复。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。

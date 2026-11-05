@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: fccd1ead894b0e33eb1131ee4c3089fb65c2c3378812893ff1c5ebdb585d1ffd
+generated_body_sha256: 0cde832db1be66c1aba6b849cd6af5bf9dde4971e80a5367be5b772dbb626532
 ---
 
 # sglang
@@ -26,8 +26,8 @@ generated_body_sha256: fccd1ead894b0e33eb1131ee4c3089fb65c2c3378812893ff1c5ebdb5
 ## 上游资料
 
 - [sgl-project-sglang](https://github.com/sgl-project/sglang)
-- [官方文档原文](knowledgebase/upstream/docs/)
-- [PR 描述、review 与固定代码](knowledgebase/upstream/prs/)
-- [完整源码路径](knowledgebase/upstream/source-map/)
+- [选定官方文档原文](knowledgebase/upstream/docs/)
+- [已选定 PR 与固定证据](knowledgebase/upstream/prs/)
+- [固定源码阅读入口](knowledgebase/upstream/source-map/)
 
-原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。
+普通 PR 通过官方原页联搜，正文、代码和讨论按需读取；已选定页面链接固定原件，历史材料由既有固定 Git 基线按需恢复。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。

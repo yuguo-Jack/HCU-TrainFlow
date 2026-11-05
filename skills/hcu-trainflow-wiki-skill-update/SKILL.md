@@ -5,6 +5,8 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 # hcu-trainflow-wiki-skill-update
 
+知识检索按问题推进：先复用已有解释，不足时联搜 PR 或官方页面，找到入口后按需读原页、固定源码和必要讨论。普通 PR 不要求离线镜像正文、评论、review 或 diff，也不要求每仓全量总结。只有形成结论所需的重要或引用证据才正式保留；HCU 内部仓继续通过 `$hcu-knowledge-search` 查证。当前入口和命令习惯保持，资料发现、内容复核与现场实测分别记录。
+
 ## 开始前定位与阅读
 
 先定位 HCU-TrainFlow checkout：用户明确指定的路径优先，其次 `TRAINFLOW_PROJECT`，再读本 Skill 安装目录的 `workspace.json` 中 `project_root`；验证该目录的项目标识、docs/skills 与版本，失效时重新安装绑定，不猜路径。私有 `TRAINFLOW_WORKSPACE` 由当前任务另行确定，不从项目绑定推断。先读项目 `docs/skill-reading-map.md` 的当前模式行，再按其中的开始/条件入口读正文。首次使用或工程升级后核对安装副本；文件缺失或绑定过期先修复，不能直接跳过指南。
@@ -25,15 +27,15 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 ## 更新协议
 
-HCU 大知识库已更新或用户要求对齐时，先只读核对其当前提交与变更影响：覆盖三个阶段引用的工程、工具/命令、依赖与能力边界，再检查 TrainFlow 锁和本机已安装 Skill。确有过时用法才修订对应指南、适配器和测试；无变化的有效证据继续复用。将检查范围、结论与未验证项写入现有维护记录，随后推进局部 Wiki 深化，不以只更新官方 Wiki 代替此项。不得附带更新 HCU 大库或自动改变正在训练的依赖。
+HCU 大知识库已变更或用户要求对齐时，先只读核对其当前提交、变更清单与 TrainFlow 的真实消费点。若仅改变存储或发现策略，检查读者、命令、绑定和受影响 Skill 即可，不为此重新采集上游或逐项重验未变训练事实。只有工程、工具接口、依赖或能力边界确有变化时，才检查相关阶段用法并修订对应指南、适配器和测试；有效固定证据继续复用。范围、结论与未验证项写入现有记录，不附带更新 HCU 大库或改变正在训练的依赖。
 
 1. 检查公共 GitHub/文档权限、限流与实际访问，不把 404 当成已删除。读取 knowledge/sources.json 与已有 observed/reviewed 游标。
-2. 先读项目 `docs/wiki.md` 与 `docs/knowledge-architecture.md` 的“自动更新时的内容筛选”。按问题复核收录范围；已确定低相关资料在 sources.json 的 document_exclusions 登记路径模式和理由，不能只删页面让下次同步重建，也不能因目录通配符匹配就全收。`wiki-update PROJECT SOURCE` 依次检查完整树、document_globs 新文档（排除上述规则）、PR/讨论与登记源码；也可单独使用 wiki-inventory / wiki-sync-docs / wiki-sync-prs / wiki-refresh。重复运行续完 pending，检查所有阶段错误及 excluded_paths。未监测的新文件从完整树发现，按最新 commit 用 wiki-triage 记录 knowledge-added/not-relevant/deferred，不能只抓 README 宣称全仓无变化。web 来源生成内容指纹，不能当 Git SHA；TE/cuDNN 同时检查代码与官方教程。官网迁站按 `docs/wiki.md` 的 canonical 查证流程同步登记、声明与受影响链接，再重采正文，不放宽抓取保护。
-3. PR 来源页保存描述、普通评论、行内评论、独立 review 顶层状态/正文、文件列表及原始 JSON。首次增量发现默认最近 30 天，已保留历史 PR 每七天重新查讨论；需要扩大范围用 --since，不能称已覆盖全部历史。发现分页未结束时按 discovery_pending/next_page 续扫原窗口，不能只看 pending=0 或为绕过上限缩窄时间范围。主动按问题 wiki-search-pr 补重要未收录 PR，再 wiki-pr 和 wiki-code 追最终代码；可显式 --retain-project 纳入公共来源页。缺 patch/分页/权限时保留失败并补证据，不将标题或初始描述直接编成案例。
+2. 先读项目 `docs/wiki.md` 与 `docs/knowledge-architecture.md` 的“自动更新时的内容筛选”。检查 `knowledge/storage.json` 和来源策略：discovery-first 下 `wiki-update PROJECT SOURCE` 以固定版本/登记路径和轻量 PR 发现为范围；不附带全历史评论/review 补采或全仓目录深读。需要新文档时按实际问题检查官方入口，筛选后登记；低相关路径写入 document_exclusions，避免下轮重建。显式 wiki-inventory / wiki-sync-docs / wiki-refresh 仍可用于有需要的深入检查，不能把未执行范围宣称完整覆盖。网页指纹不当 Git SHA；迁站按 docs/wiki.md 核对 canonical 与受影响链接。
+3. 普通 PR 通过 `wiki-search-pr` 联搜，或 `wiki-sync-prs` 查看有界近期候选；只发现入口，不自动创建每条 PR 的正文/原始 JSON 副本。用 URL 或 `wiki-pr` 按需读取正文和固定版本，需要讨论/文件时显式加 --discussions / --files。只有重要变化或现有解释需要时，先核对公开归属与最少充分证据，再显式 --retain-project 正式保留。不运行每七天全历史讨论审计；旧不可用项、未读范围及固定历史保留，不因取消镜像虚报已补齐。
 4. 比较实际 active ref 与已锁版本，处理 submodule gitlink，不用子仓 HEAD 偷换。发布计划、open PR、merged main、released 和运行可用分开。
    官方发布与 roadmap 的查证入口见 `docs/wiki.md`“未收录的官方内容按需查证”；它们可能位于 Releases、官网、Issue/Discussion/Project，不能以 PR 采集代替。影响当前任务时按需阅读并追实现；持续策展按维护范围登记来源与覆盖缺口，未被现有采集器覆盖的页面不能宣称已自动全量同步。SFT/RL 模型专题可后续深化，当前问题仍须追官方模型配置、recipe 和 backend 源码。
-5. 对每个 affected overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
-   PR 描述、review 或 diff 更新即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
+5. 对确实受影响的 overview/topic/case 深读新实现、改原因、触发条件、测试、限制和回退，同仓交叉结论一起修正。必要时扩充关联的第三方优化采用/退役记录。
+   已保留且被知识引用的 PR 正文或必要证据变化时，即使没有主干源码变化，也检查 wiki/pr-review 待办；对关联页复核后 wiki-review-pr 留下对应原始 artifact 与页面哈希的回执。
 6. 按 knowledge/maintenance.json 检查官方变化影响；另读 knowledge/catalog/external-knowledge.json（或 `wiki-routes PROJECT`）核对 HCU 工具的维护关联。依托大库与实际部署/最新源码检查 Skill、环境命令、TraceLens 接口、日志字段、profile 参数和容错步骤；只修订本仓使用契约，不复制 HCU 仓库知识。任务所用 HCU 模型脚本、环境配置、launcher 或依赖变化时，复核适配/分析优化用法和配方。可复用站点经验按规范放 `knowledge/sites/`，临时排查留任务档案；检查依据、版本及未验证项记入本轮维护记录。
    新增或升级 HCU Primus Turbo、UCCL、UltraEP、MoonEP 等库时，复核 optimize 的 `references/hcu-library-integration.md`、通信专项及 adapt/规模长稳 Skill 调用；分别核对 HCU 主线/专项线、ABI/编译器、provider、同步/异步/精度边界与消费者。知识检索不足时读实际源码，不自动刷新大知识库。
    数学库或 HCU 教程更新时，复核 optimize 的 `references/math-library-tuning.md` 及关联入口：rocBLAS 以持续更新说明及当前推荐工具为准，MIOpen 核对实际版本的日志、布局与 Find/缓存语义。流程保留异常触发、处理方法和资料入口，不复制完整工具手册；hipBLASLt 不默认扩展为自行调优。
@@ -42,11 +44,11 @@ HCU 大知识库已更新或用户要求对齐时，先只读核对其当前提�
    PyTorch/编译器/DDP/FSDP 或通信库版本变化时，同步复核 optimize 的 `references/torch-native-training.md` 和 `references/communication-optimization.md`；核实日志接口、编译/通信触发、同步与 buffer 生命周期。未登记的依赖变化也要按任务版本主动查源码，不能因为不在维护清单就跳过。
    性能方法同步查项目 `docs/practices/performance-methods.md` 的固定来源与路径（Hyperloom/GEAK/BBuf）：核对新版本的证据刷新、dispatch/oracle、重叠归因、测量与停止规则，并复核 optimize 的 `references/evidence-driven-loop.md`、`references/operator-ceiling-iteration.md` 及实际分析/质量评估代码。参考仓不是必装运行时，不能把其推理门槛或 AMD/NV 工具默认搬到 HCU 训练；方法源暂未注册的按该页有界查证并记录，不能伪称 Wiki 已全量更新。
 
-   故障诊断与适配/优化异常指南也属于维护目标：同时复核规模长稳 Skill 的 `references/diagnosis.md`、`references/evidence-sources.md`、环境检查与模型适配的 `references/troubleshooting.md` 和 optimize 的 `references/validation-diagnostics.md`。检查 DTK hipgdb/hipprof 接口、runtime 信号/转储、RCCL/PyTorch 日志及内存 API、hcuprobe 与 Cluster Manager 的部署分支/恢复语义；按当前大库或源码查证，缺现场测试明确保留待验证，不能只换工具名字或年份。
-7. 修改后逐页/逐工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
+   故障诊断与适配/优化异常接口确有变化时，复核规模长稳 Skill 的 `references/diagnosis.md`、`references/evidence-sources.md`、环境检查与模型适配的 `references/troubleshooting.md` 和 optimize 的 `references/validation-diagnostics.md`。按实际变化检查 DTK hipgdb/hipprof、runtime 信号/转储、RCCL/PyTorch 日志及内存 API、hcuprobe 与 Cluster Manager 的部署分支/恢复语义；缺现场测试保留待验证，不因纯存储重构重做这些事实检查。
+7. 修改后对实际受影响的页面/工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
    复核后又改正文/工作流或新增同来源专题时，重新检查并留下新回执；即使上游没有新变化也不能沿用过期复核。PR 重采后同样处理由作者页变动引起的待办。
 8. wiki-catalog 刷新来源/文档/PR 导航（wiki-update 已在收尾调用），wiki-index 更新搜索。运行本工程测试和真实问题检索，保存本次缺口及下次入口。Wiki 提交与 push 沿用任务授权；站点知识按本仓归属规则提交，凭据不入仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
-9. **维护收尾包含本机同步。** 本仓 Wiki/docs、Skill/reference、脚本、CLI 或包配置有改动，复核和测试通过后，定位当前 Skill 安装所在的实际 Skills 目录，运行 `python scripts/sync_local_install.py --target <实际Skills目录>`，再以 `--check` 只读复核。它刷新本仓 editable Python 包和六个 Skill，检查内容哈希、绑定与阅读资源，成功后清理本次旧备份；失败不能报更新全部完成，按 `.work/setup/local-sync.json` 修复后重跑。源依赖约束、构建依赖或 thirdparty 锁有变化时先按 `docs/integrations.md` 完成对应安装/验证，局部同步不能代替依赖升级验收。仅文档/Wiki 内容通过 checkout 直接读取，但仍检查整个安装状态；同步完成后提醒新会话载入。其他安装目录只在明确选定时同步，不扫描所有 Agent；不自动更新 HCU-Knowledge。
+9. **维护收尾包含本机同步。** 本仓 Wiki/docs、Skill/reference、脚本、CLI 或包配置有改动，复核和测试通过后，定位当前 Skill 安装所在的实际 Skills 目录，运行 `python scripts/sync_local_install.py --target <实际Skills目录>`，再以 `--check` 只读复核。它先检查 editable 包的真实来源和版本，只有元数据漂移才离线刷新；Skill 按内容哈希只同步变化项，并核对绑定与阅读资源；失败不能报更新全部完成，按 `.work/setup/local-sync.json` 修复后重跑。源依赖约束、构建依赖或 thirdparty 锁有变化时先按 `docs/integrations.md` 完成对应安装/验证，局部同步不能代替依赖升级验收。仅文档/Wiki 内容通过 checkout 直接读取，但仍检查整个安装状态；同步完成后提醒新会话载入。其他安装目录只在明确选定时同步，不扫描所有 Agent；不自动更新 HCU-Knowledge。
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。
 
@@ -66,11 +68,11 @@ TraceLens 接口更新同时核对报告/collective、Graph、Roofline、Agent�
 
 流程文档同时遵守项目 `CONTRIBUTING.md` 的文档同步规则：对照当前代码和 CLI 核对根目录说明、docs、Skill/reference、Wiki 导航及图文入口；更新仍在使用的旧说明，清理前核查引用和维护关联。不要改写固定上游原文或删除兼容页面 ID 来消除旧字符串。收尾运行 `python scripts/check_documentation.py` 与原有知识/阅读路线检查；结构检查不能替代内容复核。
 
-维护所有来源时先读项目 `docs/wiki-authoring-standard.md` 和 `knowledge/coverage.json`；按相同内容维度检查各工程，包括用于优化借鉴的 DeepSpeed、Primus、MindSpeed 系列和 LoongForge。新增来源补角色/入口/维度；补齐薄弱正文并关联实际源码，不用页数或原文采集量冒充深度。更新相关 README、参考选择表、HCU 库归属与受影响阶段，运行 `python scripts/check_wiki_coverage.py`；它只检查组织完整性，结论仍需源码复核。
+维护来源时先读项目 `docs/wiki-authoring-standard.md` 和 `knowledge/coverage.json`。轻量注册核对用途、固定版本、官方/联搜入口、归属及真实消费者；取消九维、机制数、案例数和每仓新报告配额。已有深入解释保留，仅按真实影响修订。运行 `python scripts/check_wiki_coverage.py` 验证路由与引用；它不证明原文已精读或硬件已验证。
 
 流程与 Skill 只提炼跨模型、跨项目可迁移的方法。保留触发条件、输入契约、判断依据、验证和回退；命令用可发现的接口和参数化配置表示。单项目 shape/拓扑、地址、补丁、临时编译选项或实验顺序留在 workspace，不升级为通用默认或必做步骤。现有内容与新版本不同，先核对适用条件，不能把一次现场成功推广成所有环境适用。
 
-按工程定位→目录→编译安装→运行/测试→调用链→优化机制→问题诊断→版本/依赖→证据组织。案例按问题/瓶颈→为什么改→实现符号→适用条件→正确性/性能证据→失败条件/回退。尚未逐模型覆盖的入口页保持 coverage 标记，不以页数代替深度。
+需要新增深入解释时，按实际问题说明定位、调用链、触发条件、版本/依赖、验证及回退；已有教程和机制专题优先复用。案例说明瓶颈、为什么改、实现符号及正确性/性能证据。来源只作发现入口时明确标识，不为满足模板扩写全仓报告。
 
 全量、增量和任务中自主更新均按 `docs/wiki-authoring-standard.md` 筛选：发现重大或高价值优化项才需要整理详细案例，优先完善同机制已有案例。小修改按原规范更新相关章节、PR 摘要和证据，不为每个 PR 或每轮更新凑大案例；没有重大优化项可以不新增案例。按影响而非代码行数判断，重要精度/正确性/恢复变化仍须充分说明，受影响页面与 Skill 仍联动复核；缺证据记录待补入口，不虚构收益。统一内容粒度不要求案例数量相同。
 

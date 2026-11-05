@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 9bb16f05475440ad1a2489a3d14f8b5651feeb10e95570f71e220c80f9ea4e5d
+generated_body_sha256: f4f17e9d57ba73f4a151b67e16bad2f720f00cd060b2755e352e1f5f5f9f7ebc
 ---
 
 # vllm
@@ -26,8 +26,8 @@ generated_body_sha256: 9bb16f05475440ad1a2489a3d14f8b5651feeb10e95570f71e220c80f
 ## 上游资料
 
 - [vllm-project-vllm](https://github.com/vllm-project/vllm)
-- [官方文档原文](knowledgebase/upstream/docs/)
-- [PR 描述、review 与固定代码](knowledgebase/upstream/prs/)
-- [完整源码路径](knowledgebase/upstream/source-map/)
+- [选定官方文档原文](knowledgebase/upstream/docs/)
+- [已选定 PR 与固定证据](knowledgebase/upstream/prs/)
+- [固定源码阅读入口](knowledgebase/upstream/source-map/)
 
-原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。
+普通 PR 通过官方原页联搜，正文、代码和讨论按需读取；已选定页面链接固定原件，历史材料由既有固定 Git 基线按需恢复。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。

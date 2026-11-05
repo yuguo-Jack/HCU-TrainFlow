@@ -5,6 +5,7 @@ First installation and dependency changes use setup_trainflow.py instead.
 """
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -17,23 +18,37 @@ sys.path.insert(0, str(ROOT/'src'))
 from check_skill_resources import check_resources
 from check_documentation import check_documentation
 from install_skills import NAMES, RENAMED, checked_destination
-from hcu_trainflow.core import FlowError, write_json
+from hcu_trainflow.core import FlowError, read_json, write_json
 
 # -I prevents PYTHONPATH/current-directory source imports from hiding a stale install.
 PACKAGE_PROBE = '''import importlib.metadata as m, json, pathlib, sys
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
-import hcu_trainflow
 root=pathlib.Path(sys.argv[1]).resolve()
-dist=m.distribution('hcu-trainflow')
-direct=json.loads(dist.read_text('direct_url.json') or '{}')
+expected=root/'src/hcu_trainflow/__init__.py'
+try:
+    dist=m.distribution('hcu-trainflow')
+except m.PackageNotFoundError:
+    dist=None
+try:
+    import hcu_trainflow
+    actual=pathlib.Path(hcu_trainflow.__file__).resolve()
+    source_version=hcu_trainflow.__version__
+except ModuleNotFoundError as exc:
+    if exc.name != 'hcu_trainflow':
+        raise
+    actual=None
+    source_version=None
+direct=json.loads(dist.read_text('direct_url.json') or '{}') if dist else {}
 url=urlsplit(direct.get('url',''))
 editable=direct.get('dir_info',{}).get('editable') is True
 origin=pathlib.Path(url2pathname(url.path)).resolve() if url.scheme=='file' else None
-actual=pathlib.Path(hcu_trainflow.__file__).resolve()
-expected=root/'src/hcu_trainflow/__init__.py'
-ok=editable and origin==root and actual==expected and dist.version==hcu_trainflow.__version__
-print(json.dumps({'status':'current' if ok else 'incomplete','version':dist.version,'module':str(actual),'editable':editable}))
+foreign=(actual is not None and actual!=expected) or (origin is not None and origin!=root)
+repairable=not foreign and (dist is None or (actual==expected and origin==root))
+ok=bool(dist and editable and origin==root and actual==expected and dist.version==source_version)
+print(json.dumps({'status':'current' if ok else 'incomplete','version':dist.version if dist else None,
+                  'module':str(actual) if actual else None,'origin':str(origin) if origin else None,
+                  'editable':editable,'foreign':foreign,'repairable':repairable}))
 sys.exit(0 if ok else 1)
 '''
 
@@ -62,9 +77,19 @@ def check_existing_binding(project, target):
 
 def sync(project, target, *, check_only=False, run=subprocess.run):
     project, target = Path(project).resolve(), Path(target).expanduser().resolve()
+    state_path = project/'.work/setup/local-sync.json'
+    try:
+        prior = read_json(state_path)
+    except (OSError, ValueError):
+        prior = {}
+    if not isinstance(prior, dict):
+        prior = {}
+    interpreter = str(Path(sys.executable).resolve())
+    same_install = prior.get('project_root') == str(project) and prior.get('metadata_interpreter') == interpreter
     state = {'status': 'running', 'project_root': str(project), 'skills_dir': str(target),
              'started_at': datetime.now(timezone.utc).isoformat(), 'completed_stages': []}
-    state_path = project/'.work/setup/local-sync.json'
+    if same_install and prior.get('metadata_fingerprint'):
+        state.update(metadata_fingerprint=prior['metadata_fingerprint'], metadata_interpreter=interpreter)
     stage = 'preflight'
     def save():
         if not check_only:
@@ -75,6 +100,18 @@ def sync(project, target, *, check_only=False, run=subprocess.run):
             raise FlowError(f'{stage} failed (exit {result.returncode})')
         state['completed_stages'].append(stage)
         save()
+    def package_probe():
+        result = run([sys.executable, '-I', '-B', '-c', PACKAGE_PROBE, str(project)],
+                     cwd=project, check=False, capture_output=True, text=True,
+                     encoding='utf-8', errors='replace')
+        try:
+            details = json.loads(result.stdout)
+        except (AttributeError, TypeError, ValueError):
+            raise FlowError('package-check failed: isolated package probe did not return valid metadata')
+        if not isinstance(details, dict):
+            raise FlowError('package-check failed: invalid package metadata')
+        state['package'] = details
+        return result.returncode == 0 and details.get('status') == 'current', details
     save()
     try:
         check_existing_binding(project, target)
@@ -85,18 +122,45 @@ def sync(project, target, *, check_only=False, run=subprocess.run):
         if documentation['issues']:
             raise FlowError('Documentation inconsistent: '+'; '.join(documentation['issues']))
         state['completed_stages'].append(stage)
-        if not check_only:
-            stage = 'package-install'
-            command([sys.executable, '-m', 'pip', 'install', '--no-deps', '--no-build-isolation', '-e', str(project)])
         stage = 'package-check'
-        command([sys.executable, '-I', '-B', '-c', PACKAGE_PROBE, str(project)])
+        current, details = package_probe()
+        packaging = {name: hashlib.sha256((project/name).read_bytes()).hexdigest()
+                     for name in ['pyproject.toml', 'setup.cfg', 'setup.py'] if (project/name).is_file()}
+        metadata_fingerprint = hashlib.sha256(json.dumps(packaging, sort_keys=True).encode()).hexdigest()
+        if same_install and prior.get('metadata_fingerprint') and prior['metadata_fingerprint'] != metadata_fingerprint:
+            current = False
+        state['package_action'] = 'reused'
+        if not current:
+            if check_only:
+                raise FlowError('package-check failed: installed package metadata/source is not current')
+            if details.get('foreign') or not details.get('repairable'):
+                raise FlowError('package-check failed: foreign/unknown package binding; inspect and explicitly repair with setup_trainflow.py')
+            stage = 'package-install'
+            command([sys.executable, '-m', 'pip', 'install', '--no-index', '--no-deps',
+                     '--no-build-isolation', '--no-compile', '-e', str(project)])
+            stage = 'package-check'
+            current, _ = package_probe()
+            if not current:
+                raise FlowError('package-check failed: package still differs after metadata refresh')
+            state['package_action'] = 'refreshed'
+        state['completed_stages'].append(stage)
+        state.update(metadata_fingerprint=metadata_fingerprint, metadata_interpreter=interpreter)
+        save()
         installer = [sys.executable, '-B', '-X', 'utf8', str(project/'scripts/install_skills.py'),
                      '--target', str(target), '--workflow-only']
-        if not check_only:
+        stage = 'skills-check'
+        checked = run([*installer, '--check'], cwd=project, check=False)
+        state['skills_action'] = 'reused'
+        if checked.returncode:
+            if check_only:
+                raise FlowError(f'skills-check failed (exit {checked.returncode})')
             stage = 'skills-install'
             command([*installer, '--replace'])
-        stage = 'skills-check'
-        command([*installer, '--check'])
+            stage = 'skills-check'
+            command([*installer, '--check'])
+            state['skills_action'] = 'refreshed'
+        else:
+            state['completed_stages'].append(stage)
         state['status'] = 'current'
         state['scope'] = 'TrainFlow package, six Skills, bindings and reading resources; external dependencies not requalified'
         save()

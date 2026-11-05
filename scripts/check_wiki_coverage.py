@@ -1,7 +1,9 @@
 """Check authored Wiki reading routes, never infer factual or runtime coverage."""
 import json
 from pathlib import Path
+import re
 import sys
+from urllib.parse import urlsplit
 
 DIMENSIONS = {
     'scope', 'structure', 'installation', 'run_test', 'contracts',
@@ -17,8 +19,15 @@ def validate_coverage(root):
     if not manifest.is_file():
         return ['Missing knowledge/coverage.json']
     data = json.loads(manifest.read_text(encoding='utf-8'))
+    profile = data.get('profile', 'legacy')
+    lite = profile == 'discovery-first'
+    if profile not in {'legacy', 'discovery-first'}:
+        errors.append('Unknown coverage profile: ' + str(profile))
+    if lite and data.get('schema') != 2:
+        errors.append('discovery-first coverage requires schema 2')
     registry = json.loads((root / 'knowledge/sources.json').read_text(encoding='utf-8'))
     sources = {x['id'] for x in registry}
+    source_rows = {x['id']: x for x in registry}
     covered, identities = set(), set()
 
     for source in registry:
@@ -45,6 +54,19 @@ def validate_coverage(root):
         elif any(part in {'upstream', 'upstream-docs', 'source-maps', 'prs'} for part in path.relative_to(root / 'knowledge').parts):
             errors.append(f'{label}: generated sources do not replace authored explanations')
 
+    def source_route(source, label):
+        """A discovery source needs a real route, not a new authored report."""
+        route = source.get('repository', '')
+        if source.get('kind') == 'web':
+            parsed = urlsplit(route)
+            if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password:
+                errors.append(f'{label}: missing official HTTPS source route')
+        elif not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', route):
+            errors.append(f'{label}: missing repository source route')
+        baseline = source.get('baseline_commit')
+        if baseline and source.get('kind') != 'web' and not re.fullmatch(r'[0-9a-f]{40}', baseline):
+            errors.append(f'{label}: invalid fixed baseline commit')
+
     for row in data.get('projects', []):
         identity = row.get('id', '')
         if not identity or identity in identities:
@@ -58,9 +80,19 @@ def validate_coverage(root):
         if registered & covered:
             errors.append(f'{identity}: source assigned to multiple coverage groups')
         covered.update(registered)
-        page(row.get('entry'), identity)
+        if row.get('entry') or not lite:
+            page(row.get('entry'), identity)
+        if lite:
+            for source_id in registered & sources:
+                source_route(source_rows[source_id], identity + '/' + source_id)
+            related = row.get('related_pages', [])
+            if not isinstance(related, list):
+                errors.append(f'{identity}: related_pages must be a list')
+            else:
+                for value in related:
+                    page(value, identity + '/related')
         dimensions = row.get('dimensions', {})
-        if set(dimensions) != DIMENSIONS:
+        if not lite and set(dimensions) != DIMENSIONS:
             errors.append(f'{identity}: missing/unknown dimensions {sorted(DIMENSIONS ^ set(dimensions))}')
         for name, pages in dimensions.items():
             if not isinstance(pages, list) or not pages:
@@ -69,7 +101,7 @@ def validate_coverage(root):
             for value in pages:
                 page(value, identity + '/' + name)
         mechanisms = row.get('mechanisms', [])
-        if row.get('role') in {'engine', 'library', 'ecosystem'} and len(mechanisms) < 2:
+        if not lite and row.get('role') in {'engine', 'library', 'ecosystem'} and len(mechanisms) < 2:
             errors.append(f'{identity}: at least two explained mechanisms required')
         for mechanism in mechanisms:
             if not mechanism.get('topic'):
@@ -78,7 +110,7 @@ def validate_coverage(root):
         if not row.get('limits'):
             errors.append(f'{identity}: explicit reading/runtime limits required')
     if sources - covered:
-        errors.append('Registered sources without authored route: ' + ', '.join(sorted(sources - covered)))
+        errors.append('Registered sources without ' + ('discovery route: ' if lite else 'authored route: ') + ', '.join(sorted(sources - covered)))
     return errors
 
 

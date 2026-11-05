@@ -1,6 +1,6 @@
 ---
 id: pr-index
-title: PR 描述 review 和固定源码索引
+title: 重要 PR 与固定源码索引
 engine: cross-engine
 kind: authored
 sources: []
@@ -8,7 +8,7 @@ sources: []
 
 # PR 来源与机制入口
 
-这里保存问题驱动选取的 PR 原文、review、diff 与固定源码入口。不是完整 PR 历史，也不表示每篇均已形成案例。未收录的 PR 可在线按问题搜索；已收录的 PR 也要检查新讨论与目标版本。
+这里保留问题驱动选取的重要 PR 和固定源码入口。普通 PR 在线联搜找到原页即可，正文、代码与必要讨论按需读取；不再自动追踪全部评论或 review。已有原件保持固定版本，是否适用于目标环境仍需按实际问题核对。
 
 ## areal
 

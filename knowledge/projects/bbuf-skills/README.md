@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 164493acecededfb600cf87c9764d5cd294156c14ddd745621e6cdfdaa750fe3
+generated_body_sha256: a50963e97b21d9e1bface1d3c41c0ec7f068434bac968966169b1f9d984ce13c
 ---
 
 # bbuf-skills
@@ -21,8 +21,7 @@ generated_body_sha256: 164493acecededfb600cf87c9764d5cd294156c14ddd745621e6cdfda
 ## 上游资料
 
 - [bbuf-ai-infra-auto-driven-skills](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS)
-- [官方文档原文](knowledgebase/upstream/docs/)
-- [PR 描述、review 与固定代码](knowledgebase/upstream/prs/)
-- [完整源码路径](knowledgebase/upstream/source-map/)
+- [选定官方文档原文](knowledgebase/upstream/docs/)
+- [固定源码阅读入口](knowledgebase/upstream/source-map/)
 
-原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。
+普通 PR 通过官方原页联搜，正文、代码和讨论按需读取；已选定页面链接固定原件，历史材料由既有固定 Git 基线按需恢复。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。

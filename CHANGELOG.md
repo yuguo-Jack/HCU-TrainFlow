@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0 — 2026-11-05
+
+- Refactor maintenance around PR URL discovery and question-driven reading. Ordinary PRs no longer create full body/comment/review/diff mirrors; explicitly important or cited evidence remains traceable. No upstream facts are refreshed by this migration.
+- Retire ordinary flat PR copies after byte comparison with preserved fixed Git objects. Old IDs and original paths remain readable on demand; shallow clones fetch the fixed historical commit only when that uncited history is requested.
+- Share Wiki document versions and FTS across logical generations. Reuse parsing and indexing when content is unchanged, verify current bytes, preserve exact originals for new snapshots, and retain legacy generation readers.
+- Replace reporting quotas with source roles, version pins, routes and affected-consumer checks. Keep the six Skill entry points, existing installation bindings, and optional KernelWiki; avoid unchanged package reinstalls and run CI checks by change scope.
+
 ## 0.7.4 — 2026-11-05
 
 - Align adaptation, capacity, numerical diagnosis, optimization and recovery guidance with the independently published HCU-Knowledge snapshot. Verify actual consumers, provider branches, low-precision state and completion boundaries without changing active training environments.

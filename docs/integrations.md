@@ -82,9 +82,9 @@ python scripts/sync_local_install.py --target "$HOME/.codex/skills"
 python scripts/sync_local_install.py --target "$HOME/.codex/skills" --check
 ```
 
-`--target` 使用当前 Agent 的真实安装目录，不从任务 cwd 猜测。该命令检查既有六个绑定，拒绝静默替换其他 checkout；刷新包时用 `--no-deps --no-build-isolation`，不联网获取上游、不升级依赖、不重建 HCU-Knowledge。状态写入忽略提交的 `.work/setup/local-sync.json`，含失败阶段；`--check` 只读检查，不安装或覆盖状态。内容和绑定全部验收成功才报 current；这仅证明本仓本机同步完成，不重新证明外部依赖、账号或现场硬件可用。失败可能留下部分已更新内容，检查失败阶段与保留的备份再重跑，不能声称已自动回滚。
+`--target` 使用当前 Agent 的真实安装目录，不从任务 cwd 猜测。该命令检查既有六个绑定，拒绝静默替换其他 checkout；先隔离检查 editable 来源、真实导入路径与包版本，并比较上次成功探测的打包配置指纹；一致则复用，元数据漂移才用 `--no-index --no-deps --no-build-isolation --no-compile` 离线刷新。Skill 先检查内容哈希，仅变化项通过原安装器替换；不联网获取上游、不升级依赖、不重建 HCU-Knowledge。状态写入忽略提交的 `.work/setup/local-sync.json`，含失败阶段；`--check` 只读检查，不安装或覆盖状态。内容和绑定全部验收成功才报 current；这仅证明本仓本机同步完成，不重新证明外部依赖、账号或现场硬件可用。失败可能留下部分已更新内容，检查失败阶段与保留的备份再重跑，不能声称已自动回滚。
 
-首次安装、安装不完整、工程搬家或 Python/构建依赖、thirdparty 锁变化时，用 `setup_trainflow.py --replace`，核对包、依赖和全部 11 个入口。普通手动 pull 之后可执行上述局部同步；依赖清单变化则走完整安装和对应回归。算子或知识库 Skill 的源版本确有变化时按对应维护范围同步，不因本仓文档变化而升级其他项目。HCU-Knowledge 的内容更新仍需单独授权。
+首次安装、安装不完整、工程搬家或实际 Python/构建依赖改变时，用 `setup_trainflow.py --replace`，核对包、依赖和全部 11 个入口。普通手动 pull 之后可执行上述局部同步；实际运行依赖锁改变时定向执行对应安装和回归；仅对齐已独立交付的知识库版本/存储协议时，核对固定提交、doctor、读取契约与受影响 Skill，不重装无关依赖。算子或知识库 Skill 的源版本确有变化时按对应维护范围同步，不因本仓文档变化而升级其他项目。HCU-Knowledge 的内容更新仍需单独授权。
 
 这是 Agent 维护流程的收尾动作，不是后台文件监视器：只运行 Git pull、单独调用 wiki-update CLI 或修改文件不会触发安装。通过更新 Skill 或按本仓 AGENTS.md 维护时，Agent 应执行同步并报告结果。已运行会话不会因此自动重载指令；完成后新开会话，当前仍在工作的 Agent 应重新读取受影响的 Skill/指南。
 
@@ -123,6 +123,13 @@ python -m pip install -e thirdparty/TraceLens
 ```
 
 仅允许来源和基准提交均与清单匹配、工作树干净的迁移；保留 upstream remote。不同来源/提交或本地修改需先人工核对。TraceLens 可选 LLM/联网 extra 不会默认安装。
+
+
+### lite 知识读取契约
+
+HCU-Knowledge 锁定已独立交付的 lite 提交，直接复用其原 search/read/original/read-code/search-pr/read-pr 入口和实际安装绑定，不要直接拼接旧 derived、压缩包或源码缓存路径。普通 GitHub/GitLab PR 以联搜找到入口为目标；正文、讨论、diff 和固定代码按需读取，不因评论/review 无法被平台搜索而建立完整本地镜像。存储重构没有重新验证训练事实，原始事实版本和实测日期继续保留。私有知识原件不进入公开 TrainFlow 的 Wiki、索引或证据。
+
+本仓 `knowledge/storage.json` 声明 discovery-first / shared-v1。旧普通 PR 原件可以从固定 Git 历史按需恢复，新克隆若需这些历史原件应保留对应 main/旧标签的提交对象；浅检出缺少固定对象时，按读取器提示定向补取该版本或打开固定原页。当前精选证据保持直接可读。历史解析与查阅缓存属于可重建副本，不要求为普通搜索重新建立全部 PR 正文路径。来源原页不可访问时说明缺口，不把缺口补写为已验证结论。
 
 ## TraceLens 的实际集成
 
@@ -173,3 +180,7 @@ fork 保留原有模块、API 和 13 个上游 console 命令；HCU 扩展通过
 ## 训练环境中的 HCU 库
 
 TE、Flash-Train、HCU Primus Turbo、RCCL、rocSHMEM、DeepEP、UCCL、UltraEP、MoonEP等按实际模型和瓶颈选择；它们不是本地主控安装时统一替换的依赖。先查HCU大知识库，再核对活动分支与镜像ABI，必要时在任务隔离前缀/容器构建候选，保留旧制品。接口、验证与PR归属见[工程联动](../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)。
+
+## CI 的变更范围
+
+所有 push/PR 都运行范围分类、实际知识/文档/阅读资源检查和最终 CI result 汇总。软件、存储协议、测试、依赖锁或未知路径变化运行 Windows/Ubuntu 与 Python 3.10/3.12 完整矩阵；仅资料/Markdown/Skill 指引变化运行相关知识、路由、文档和安装契约回归。无法取得可靠 Git 差异时保守跑完整矩阵；不以整个 workflow 的 paths 过滤留下待定检查。CI 不访问私有 HCU 原件，也不替代现场硬件验证。

@@ -2,9 +2,11 @@
 
 TrainFlow 的共享 Wiki 保存在工程 `knowledge/`，随 Git 提交、克隆和更新。只收录官方资料、跨项目有借鉴意义的通用环境经验，以及模型最终优化里程碑的总结和关键数据。任务 Store 保存完整实验过程；有记录、有测量或一次局部测试通过，都不自动构成共享收录条件。
 
+lite 在 `storage.json` 使用 `discovery-first`：普通 PR/MR 通过在线联搜找到入口，原页、固定代码和必要讨论按需读取。当前保留作者知识、选定官方资料及实际引用原件；普通历史副本沿固定 Git 基线恢复。搜索广度按有用来源和可到达原件判断，不以评论、review 的离线覆盖率为目标。新增来源只需可靠路由、角色和限制，重要变化再形成可复用解释。
+
 | 内容 | 位置 | 保存范围 |
 | --- | --- | --- |
-| 官方引擎、依赖与参考工程 | `knowledge/projects/<project>/knowledgebase/` | 项目内区分上游原文与作者知识，包含教程、PR/review、调用链、优化机制及限制 |
+| 官方引擎、依赖与参考工程 | `knowledge/projects/<project>/knowledgebase/` | 项目内区分选定上游原文与作者知识，保留教程、实际引用的 PR、调用链、优化机制及限制 |
 | HCU 仓库知识 | HCU-Knowledge；本仓仅保存 `knowledge/catalog/external/` 联查入口 | 不复制 HCU 仓库 Wiki、源码文档、PR 或整套版本证据 |
 | 工作流方法说明 | `docs/practices/` | 环境发现、配方核对、调参、验证与交付的方法；属于使用文档，不混入知识检索 |
 | 跨项目环境经验 | `knowledge/sites/<site-id>/` | 经验证、有明确适用条件的硬件/软件/拓扑、环境配方、单测参考与通用排障经验；说明其他项目如何借鉴 |
@@ -39,8 +41,8 @@ knowledge/
     knowledgebase/
       upstream/
         docs/<source>/       # 官方文档原文，保持上游内容
-        prs/<owner--repo>/    # PR 描述、评论、review 与固定代码入口
-        source-map/          # 自动生成的完整源码路径
+        prs/<owner--repo>/    # 选定保留的 PR 及固定代码入口
+        source-map/          # 已有固定目录与阅读入口
       local/
         overview/            # 工程定位与解释性代码地图
         guides/              # 安装、运行与测试
@@ -60,7 +62,7 @@ knowledge/
 docs/practices/              # 工作流方法说明，不进入 wiki-search
 ```
 
-`sources.json` 的 `knowledge_project` 决定资料所属项目，多个关联来源可以共享一个项目（如 MindSpeed 与 MindSpeed-LLM、代码仓与网站教程）。Bridge、Energon 有独立入口，与 Megatron 互相链接。无内容的分类无需空建。`upstream` 是来源，`local` 是解释；`evidence` 是核验原件，不是另一份 Wiki。Release/roadmap 以官方入口和必要的版本解释保留，不单建全量发布页快照目录。
+`sources.json` 的 `knowledge_project` 决定资料所属项目，多个关联来源可以共享一个项目（如 MindSpeed 与 MindSpeed-LLM、代码仓与网站教程）。Bridge、Energon 有独立入口，与 Megatron 互相链接。发现来源无需先建空目录或报告；`coverage.json` 登记角色、官方路由、已有阅读入口和限制。`upstream` 是来源，`local` 是解释；`evidence` 是核验原件，不是另一份 Wiki。Release/roadmap 以官方入口和必要的版本解释保留，不单建全量发布页快照目录。
 
 目录迁移保留原页面 ID；旧 ID 中含历史目录名是稳定标识，不是文件路径。`catalog/path-migrations.json` 供维护程序解析旧记录，旧正文哈希不会因此被重新批准；内容变化仍须复核。重新 `wiki-index` 即可搜索新位置，不需要重新下载上游或模型。
 
@@ -72,6 +74,8 @@ TrainFlow 仍负责自身怎样使用这些工具：`catalog/external-knowledge.
 
 HCU TraceLens 是本仓实际集成的定制工具：官方 AMD Wiki 与 HCU 接口文档分开。其 fork 的锁与集成文档通过 `thirdparty/manifest.json` 的 `integration_contracts` 关联；依赖 commit 变化会要求复核契约，不再靠复制 fork 的整套来源/Wiki 做绑定。校验不代替接口回归，也不假设 HCU-Knowledge 已覆盖该 fork。
 
+外部路由保留真实 owner、固定依赖和实际消费者 targets。大库的存储或维护契约变化时，先沿这些消费者复核入口与用法；无事实变化的训练指南不重新宣称已验证，也不连带刷新大库。PR 链接可通过原服务按需发现，不维护另一套全评论或 review 档案。
+
 专题页必须有唯一 `id`、标题、阶段、知识类型、观测/复核日期与验证边界。原命令与最终执行命令、固定源码/镜像/库身份、关键参数、结果、正确性、因果边界、复用前检查和失效触发都应写清。标称值、历史值、本次实测分别表达；“脚本跑完”不能写成环境达标。某站点的 NIC/GID/TC/固定端口等不能成为所有 HCU 集群默认值。
 
 正文使用仓内相对链接；复制所引用的关键原件或注明为选摘及完整来源哈希。完整归档仍可保留在任务 workspace，但仓内页不能只有 `objects/<hash>` 或任务绝对路径，导致另一个用户无法理解或核验主要结论。`manifest.json` 校验已经声明的证据，并不证明文字推理正确。两个实证目录在 `.gitattributes` 中关闭换行归一化，避免 Windows/Linux checkout 改变原件哈希；提交前也应检查 Git 索引中的字节与清单一致。
@@ -82,9 +86,9 @@ HCU TraceLens 是本仓实际集成的定制工具：官方 AMD Wiki 与 HCU 接
 
 - **正文保留**：可复用结论、触发条件、适用版本、有效配置、关键数据、证据入口和限制。实际测量节点、镜像、库与命令参数属于复现条件，可继续保留。
 - **过程归档**：用户何时同意继续、等待答复或权限、当时谁占卡、临时端口/容器的创建回收、逐次尝试与下一步待办放任务档案。正文需要连接命令时参数化，不把某次任务的设施变成站点固定入口。支撑结论的原始回执保留真实身份，不为精简改写原件。
-- **文档范围**：`knowledge/sources.json` 用 `document_globs` 发现文档，用带理由的 `document_exclusions` 排除已审查的低相关内容；可用 `document_scope` 说明该源与训练的关系。保留完整源码目录，排除全文不妨碍之后按问题查 PR/源码，也不表示上游已删除。新用途成立时重新审查排除规则。
-- **收尾复核**：同时检查同站点/同工程总览、专题与案例。精简正文不改变观测日期、验证级别或证据哈希；仍有效的历史结论不因版本旧而自动删除。不要把“安排复核”写成已经存在的后台定时任务。
-- **案例筛选**：仅对重大或高价值优化项整理详细案例，优先完善已有案例；小修改更新原有章节、PR 摘要和证据即可，不凑案例。全量及自主更新都遵守 [案例选择规则](wiki-authoring-standard.md#更新时如何选择案例)，正常采集与受影响内容复核照常进行。
+- **文档范围**：`knowledge/sources.json` 用 `document_globs` 选择需要保留的文档，用带理由的 `document_exclusions` 排除低相关内容，`document_scope` 说明训练用途。只在相关版本或接口变化时刷新需要的正文；源码目录、PR 和原文可沿官方入口按需查证，范围收紧不表示上游已删除。
+- **收尾复核**：沿实际证据引用、接口和消费者检查受影响的总览、专题、案例与 Skill；未受影响内容复用原记录。精简正文不改变观测日期、验证级别或证据哈希；仍有效的历史结论不因版本旧而自动删除。不要把“安排复核”写成已经部署的定时任务。
+- **案例筛选**：仅对重大或高价值优化项整理详细案例，优先完善已有案例；小修改按实际影响修订章节和必要证据，普通无关 PR 保留在线入口。不逐条总结，不凑案例或逐仓维度；遵守 [案例选择规则](wiki-authoring-standard.md#更新时如何选择案例)。
 
 范围调整涉及已收录文档时，检查作者页链接与固定证据引用，再移除明确排除的生成页及文档 ledger 记录，刷新目录和索引。自动同步不会擅自删除既有页；发现排除规则与保留记录冲突会报出待整理项。程序校验能检查已登记排除规则和文件一致性，正文是否具有复用价值仍由更新 Agent 阅读判断。
 
@@ -95,7 +99,7 @@ hcu-trainflow --workspace NEW_TASK wiki-search "RCCL RoCE alltoall" --project TR
 hcu-trainflow --workspace NEW_TASK wiki-read sites/cfs-roce-bw1000/communication --project TRAINFLOW_PROJECT
 ```
 
-`wiki-search` 索引整个 `knowledge/**/*.md`，因此必须在写入前筛选内容，不能靠标题里的“实验”“待验证”降低噪声。官方页、可复用环境经验和最终模型里程碑可搜；中间试验不放在 knowledge 下。站点事实不一定属于某个引擎；先按问题跨引擎搜索，再定向过滤，避免 `--engine megatron` 把通信现场记录排除。JSON/日志/图像由命中文章链接打开，未把所有原件全文自动索引的内容冒充可搜。重点术语、别名、变量名和数值解释须出现在 Markdown。
+`wiki-search` 索引当前保留的公开 Markdown，普通历史 PR 由联搜和固定 Git 原件读取补充；不要求将所有原件或评论全文加入热索引。写入前仍需筛选：官方页、可复用环境经验和最终模型里程碑可搜，中间试验留任务档案。站点事实不一定属于某个引擎；先按问题跨引擎搜索，再定向过滤，避免 `--engine megatron` 把通信现场记录排除。JSON/日志/图像由命中文章链接打开，重点术语、别名、变量名和数值解释放在 Markdown 中。
 
 任务内细节仍用 `experience-search`、`experience-read`、`reference-query`。它们搜索所选 Store，不自动搜索所有 workspace。普通检索不改上游、不重新测量、不执行配方；知识命中也不是健康/性能门槛通过。
 

@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: f03d23951bf68489a01d76a00e2bc98075d8852e582f4382dffced2332ee79a7
+generated_body_sha256: 1ada02c006fda22b46826b509d1d718f3b94b834175a4deae171947c4317cd5f
 ---
 
 # energon
@@ -26,8 +26,8 @@ generated_body_sha256: f03d23951bf68489a01d76a00e2bc98075d8852e582f4382dffced233
 ## 上游资料
 
 - [nvidia-megatron-energon](https://github.com/NVIDIA/Megatron-Energon)
-- [官方文档原文](knowledgebase/upstream/docs/)
-- [PR 描述、review 与固定代码](knowledgebase/upstream/prs/)
-- [完整源码路径](knowledgebase/upstream/source-map/)
+- [选定官方文档原文](knowledgebase/upstream/docs/)
+- [已选定 PR 与固定证据](knowledgebase/upstream/prs/)
+- [固定源码阅读入口](knowledgebase/upstream/source-map/)
 
-原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。
+普通 PR 通过官方原页联搜，正文、代码和讨论按需读取；已选定页面链接固定原件，历史材料由既有固定 Git 基线按需恢复。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。

@@ -55,6 +55,9 @@ def terms(text):
 
 
 def index_wiki(store, project):
+    from . import wiki_index
+    if wiki_index.enabled(project):
+        return wiki_index.index(store, project)
     root = Path(project).resolve() / "knowledge"
     if not root.is_dir():
         raise FlowError("Project knowledge directory not found")
@@ -103,6 +106,9 @@ def search_wiki(store, query, limit=10, engine=None, stage=None, kind=None, inde
     if index is None and not active.exists():
         raise FlowError("Run wiki index first; no upstream refresh is needed for local indexing")
     state = index or read_json(active)
+    if state.get('index_layout') == 'shared-v1':
+        from . import wiki_index
+        return wiki_index.search(store, state, query, limit, engine, stage, kind)
     tokens = terms(query)
     if not tokens:
         return {"results": [], "generation": state["generation"]}
@@ -136,8 +142,14 @@ def read_page(store, identity, generation=None):
         if not re.fullmatch(r'[0-9a-f]{64}', generation):
             raise FlowError('Invalid Wiki generation')
         state={'generation':generation, 'path':str(store.root/'wiki'/f'{generation}.sqlite3')}
+        if not Path(state['path']).is_file() and (store.root/'wiki/shared.sqlite3').is_file():
+            from . import wiki_index
+            return wiki_index.read_page(store, identity, generation)
     else:
         state=read_json(store.root/'wiki/active.json')
+        if state.get('index_layout') == 'shared-v1':
+            from . import wiki_index
+            return wiki_index.read_page(store, identity, state=state)
     with contextlib.closing(sqlite3.connect(Path(state['path']).as_uri()+'?mode=ro',uri=True)) as db:
         db.row_factory=sqlite3.Row
         row=db.execute('SELECT * FROM pages WHERE id=?',(identity,)).fetchone()
@@ -146,6 +158,28 @@ def read_page(store, identity, generation=None):
     value['generation']=state['generation']
     path=Path(value['path'])
     value['review_state']='indexed-snapshot' if path.is_file() and digest(path.read_bytes())==value['sha256'] else 'local-page-changed; reindex'
+    if not path.is_file() and 'knowledge' in path.parts:
+        from . import source_evidence
+        position = path.parts.index('knowledge')
+        project = Path(*path.parts[:position])
+        relative = path.relative_to(project).as_posix()
+        if source_evidence.retired(project, relative):
+            value['original_path'] = str(path)
+            try:
+                value['path'] = str(source_evidence.materialize(project, relative, value['sha256']))
+                value['review_state'] = 'archived-fixed-source'
+            except (FlowError, FileNotFoundError, OSError) as exc:
+                # The old SQLite body remains valid even if its exact Markdown
+                # bytes were never committed or differ from the migration pin.
+                view = child(store.root, f'wiki/views/{value["sha256"]}/indexed-body.md')
+                if view.exists() and digest(view.read_bytes()) != digest(value['body'].encode()):
+                    import uuid
+                    view = view.with_name(uuid.uuid4().hex + '-indexed-body.md')
+                if not view.exists():
+                    atomic_write(view, value['body'])
+                value.update(path=None, original_available=False, original_error=str(exc),
+                             snapshot_view_path=str(view), view_sha256=digest(value['body'].encode()),
+                             review_state='indexed-history; original-unavailable')
     return value
 
 

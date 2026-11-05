@@ -8,7 +8,7 @@
 - `docs/workflows.md`：三个工作流与验证门槛。
 - `docs/profiling.md`：时间分母、热点建模和 TraceLens。
 - `docs/operations.md`：远程 watcher、事件重放与恢复边界。
-- `docs/wiki.md`：固定来源、更新复核和工作流维护。
+- `docs/wiki.md`：轻量来源、线上 PR/官方页面入口、固定版本及按需深读；普通查询不要求全量讨论镜像。
 - `knowledge/README.md`：HCU-TrainFlow-Wiki 总入口，含官方资料、通用环境经验和模型最终总结。
 
 不要从安装目录的父级猜仓库位置；先核对上述工程绑定。执行前检查 `hcu-trainflow --help` 和相关子命令帮助，不猜不存在的 flag。
