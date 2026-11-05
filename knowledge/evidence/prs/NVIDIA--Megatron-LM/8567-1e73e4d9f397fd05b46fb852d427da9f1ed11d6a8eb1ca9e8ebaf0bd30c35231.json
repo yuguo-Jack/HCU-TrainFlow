@@ -1,0 +1,558 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "a96eff5bee0bd235e76d55585237e5218484ea619435d56a9eb5591b905c2981",
+      "isPrivate": false,
+      "numbers": [
+        8570,
+        8569,
+        8568,
+        8567,
+        8566,
+        8565,
+        8564,
+        8563
+      ],
+      "observed_at": "2026-11-04T15:32:13.602910+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4904,
+        "resetAt": "2026-11-04T15:50:00Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "9dd63d992a5925dba7f9bfd1aec9dbfb1f54b837",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nFixes the FP8 inference padding wrapper so that a row-parallel TE linear under sequence parallelism reduces its output once instead of twice. The wrapper now pads each rank's chunk of the sequence and leaves all communication to the module.\n\n**Bug.** `prepare_model_for_fp8_inference` wraps every TE linear of a model served with `fp8` set (any `transformer_impl` except `inference_optimized`) with `_wrap_te_linear_for_padding`. With TP > 1 and `sequence_parallel=True`, each wrapped `TERowParallelLinear` (attention `linear_proj`, MLP `linear_fc2`) returns `TP x` the correct output on every FP8 forward, for padded and unpadded sequences alike.\n\n**Root cause.** With sequence parallelism, the wrapper:\n1. cleared `module.sequence_parallel`;\n2. padded the whole sequence and ran the TE forward;\n3. reduce-scattered the row-parallel output itself.\n\nTE's `Linear` reads `sequence_parallel` on every call. Its row-parallel branch is \"reduce-scatter if `sequence_parallel`, else all-reduce if `tp_size > 1`\" (`transformer_engine/pytorch/module/linear.py`). With the flag cleared, TE all-reduced the partial products, and the wrapper's reduce-scatter then summed the already reduced tensor across the ranks again. Column-parallel modules were not affected, because there the wrapper's own all-gather replaced TE's.\n\n**Fix** (`megatron/core/fp8_utils.py`). With sequence parallelism, a column-parallel module all-gathers its input and a row-parallel module reduce-scatters its output along the sequence, in one chunk per TP rank. The wrapper now pads and unpads each chunk separately (`Fp8Padding`/`Fp8Unpadding` with one split per chunk):\n\n| Module (TE `parallel_mode`) | Pads | Module communication | Unpads |\n|---|---|---|---|\n| `\"column\"` | the local chunk | all-gather of `TP` padded chunks | `TP` chunks |\n| `\"row\"` | `TP` chunks of the full sequence | reduce-scatter, one padded chunk per rank | the local chunk |\n\n- Padding per chunk keeps the chunk boundaries aligned with the ranks, so the module's own single all-gather or reduce-scatter gives each rank exactly its rows.\n- Each local chunk also meets TE's FP8 shape check, which TE applies to the local input before its all-gather.\n- The chunk layout follows the module's TE `parallel_mode`, since that is what selects TE's collective. This covers `TEColumnParallelLinear`, `TELayerNormColumnParallelLinear`, `TERowParallelLinear`, and any `TELinear` built with a row or column mode.\n- A row-parallel input whose sequence length is not divisible by TP now fails with a clear assertion.\n- The wrapper no longer toggles `module.sequence_parallel`, so an exception in the forward can no longer leave it cleared. It also no longer issues its own collectives.\n- Without sequence parallelism, the behavior is unchanged.\n\nHot path: the per-call cost is unchanged (Python list arithmetic and an integer check), with no host syncs and no new allocations beyond the existing padding buffer.\n\nPerformance trade-offs, not benchmarked:\n- Padding per chunk can add up to `TP x (alignment - 1)` zero rows to the GEMM, instead of `alignment - 1`. For example, with TP=8 and MXFP8, 8 tokens per rank are padded to 32 per rank, a 256-row GEMM instead of 64.\n- Under sequence parallelism, column-parallel modules now use TE's own sequence-parallel all-gather (of the quantized input) instead of the wrapper's bf16 all-gather. For current-scaling recipes, TE also all-reduces the input amax across the TP group, as it does for any sequence-parallel column-parallel linear.\n\n**Tests** (`tests/unit_tests/test_fp8_utils.py`):\n- `TestFP8PaddingSequenceParallel` (2 GPUs, FP8 tensorwise) covers `TERowParallelLinear`, `TEColumnParallelLinear` and `TELayerNormColumnParallelLinear`:\n  - `test_wrapped_output_matches_unwrapped`: for 32 tokens (already aligned) and 40 tokens, the wrapped FP8 output equals the unwrapped FP8 output (relative error < 0.05). The unwrapped output is within FP8 tolerance of an fp64 reference, and `sequence_parallel` is untouched. The test runs with the recipe's padding alignment and with the 32-row MXFP8 alignment. MXFP8 itself needs Blackwell, so the 32-row alignment is forced on the tensorwise recipe. When padding is expected, the test also checks that the wrapper actually padded.\n  - `test_wrapper_is_noop_outside_fp8`: outside an FP8 context, the wrapped output equals the unwrapped one and the reference.\n- CPU tests with a single emulated rank (the last of 4) and pure-torch padding:\n  - `test_fp8_padding_pads_each_sequence_parallel_chunk[row|column|None]`: the wrapper pads per chunk as the TE `parallel_mode` splits the sequence, and returns exactly that rank's rows.\n  - `test_fp8_padding_rejects_sequence_not_divisible_by_tp`: checks the divisibility assertion.\n\n**Results.** On H100 in the CI image (TE 2.20.2), at the first commit of this PR:\n- Of the original test's 6 GPU cases, the 2 row-parallel cases fail on main (relative error 1.0: the output is scaled by TP). All 6 pass with this PR.\n- The neighbor tests `TestFP8Padding` and `test_dynamic_engine.py::TestDynamicInferenceEngine::test_fp8_inference` pass.\n\nOn H100 in the CI image (rerun at this PR's head), the regression tests pass (4/4 on 1 GPU, 15/15 on 2 GPUs) and 7 fail on `main`. The neighbor tests pass, including the TP=4 sequence-parallel FP8 engine test. On CPU, the layout tests pass with this PR and fail with both main and the first commit of this PR, which chose the chunk layout from the module class.\n\n## Issue tracking\n\nLinked issue: none; this PR's regression tests reproduce the bug.\n\n## Code provenance\n\nNo code was copied from external sources.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [ ] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md)) (not applicable: no kernel or kernel-selection change. `fp8_utils.py` is registered for the FP8/FP4 master-weight casts, which this PR does not touch, so the PR needs the `determinism-exempt` label.)\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+            "createdAt": "2026-10-27T16:17:22Z",
+            "databaseId": 6447245881,
+            "updatedAt": "2026-10-27T16:17:22Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8567#issuecomment-6447245881"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYBJKjk=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "81def749367d4ec43b920f16fe7b4e16e541673d",
+      "headRepository": {
+        "nameWithOwner": "lmcafee-nvidia/Megatron-LM"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 8567,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[Inference][FP8] Reduce FP8-padded row-parallel outputs once under sequence parallelism",
+      "updatedAt": "2026-11-03T17:18:19Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/8567"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8567/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8567/commits"
+      },
+      "html": {
+        "href": "https://github.com/NVIDIA/Megatron-LM/pull/8567"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8567"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8567/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8567"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/81def749367d4ec43b920f16fe7b4e16e541673d"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 284,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "NVIDIA:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/NVIDIA/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contributors",
+        "created_at": "2019-03-21T16:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/events",
+        "fork": false,
+        "forks": 4700,
+        "forks_count": 4700,
+        "forks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/forks",
+        "full_name": "NVIDIA/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/NVIDIA/Megatron-LM.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/hooks",
+        "html_url": "https://github.com/NVIDIA/Megatron-LM",
+        "id": 176982014,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "MDEwOlJlcG9zaXRvcnkxNzY5ODIwMTQ=",
+        "notifications_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 1937,
+        "open_issues_count": 1937,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+          "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NVIDIA/followers",
+          "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NVIDIA",
+          "id": 1728152,
+          "login": "NVIDIA",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+          "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+          "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+          "repos_url": "https://api.github.com/users/NVIDIA/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/NVIDIA",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T15:22:16Z",
+        "releases_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/releases{/id}",
+        "size": 178037,
+        "ssh_url": "git@github.com:NVIDIA/Megatron-LM.git",
+        "stargazers_count": 18328,
+        "stargazers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscription",
+        "svn_url": "https://github.com/NVIDIA/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/teams",
+        "topics": [
+          "large-language-models",
+          "model-para",
+          "transformers"
+        ],
+        "trees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-11-04T13:28:01Z",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM",
+        "visibility": "public",
+        "watchers": 18328,
+        "watchers_count": 18328,
+        "web_commit_signoff_required": false
+      },
+      "sha": "9dd63d992a5925dba7f9bfd1aec9dbfb1f54b837",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+        "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NVIDIA/followers",
+        "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NVIDIA",
+        "id": 1728152,
+        "login": "NVIDIA",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+        "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+        "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+        "repos_url": "https://api.github.com/users/NVIDIA/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/NVIDIA",
+        "user_view_type": "public"
+      }
+    },
+    "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nFixes the FP8 inference padding wrapper so that a row-parallel TE linear under sequence parallelism reduces its output once instead of twice. The wrapper now pads each rank's chunk of the sequence and leaves all communication to the module.\n\n**Bug.** `prepare_model_for_fp8_inference` wraps every TE linear of a model served with `fp8` set (any `transformer_impl` except `inference_optimized`) with `_wrap_te_linear_for_padding`. With TP > 1 and `sequence_parallel=True`, each wrapped `TERowParallelLinear` (attention `linear_proj`, MLP `linear_fc2`) returns `TP x` the correct output on every FP8 forward, for padded and unpadded sequences alike.\n\n**Root cause.** With sequence parallelism, the wrapper:\n1. cleared `module.sequence_parallel`;\n2. padded the whole sequence and ran the TE forward;\n3. reduce-scattered the row-parallel output itself.\n\nTE's `Linear` reads `sequence_parallel` on every call. Its row-parallel branch is \"reduce-scatter if `sequence_parallel`, else all-reduce if `tp_size > 1`\" (`transformer_engine/pytorch/module/linear.py`). With the flag cleared, TE all-reduced the partial products, and the wrapper's reduce-scatter then summed the already reduced tensor across the ranks again. Column-parallel modules were not affected, because there the wrapper's own all-gather replaced TE's.\n\n**Fix** (`megatron/core/fp8_utils.py`). With sequence parallelism, a column-parallel module all-gathers its input and a row-parallel module reduce-scatters its output along the sequence, in one chunk per TP rank. The wrapper now pads and unpads each chunk separately (`Fp8Padding`/`Fp8Unpadding` with one split per chunk):\n\n| Module (TE `parallel_mode`) | Pads | Module communication | Unpads |\n|---|---|---|---|\n| `\"column\"` | the local chunk | all-gather of `TP` padded chunks | `TP` chunks |\n| `\"row\"` | `TP` chunks of the full sequence | reduce-scatter, one padded chunk per rank | the local chunk |\n\n- Padding per chunk keeps the chunk boundaries aligned with the ranks, so the module's own single all-gather or reduce-scatter gives each rank exactly its rows.\n- Each local chunk also meets TE's FP8 shape check, which TE applies to the local input before its all-gather.\n- The chunk layout follows the module's TE `parallel_mode`, since that is what selects TE's collective. This covers `TEColumnParallelLinear`, `TELayerNormColumnParallelLinear`, `TERowParallelLinear`, and any `TELinear` built with a row or column mode.\n- A row-parallel input whose sequence length is not divisible by TP now fails with a clear assertion.\n- The wrapper no longer toggles `module.sequence_parallel`, so an exception in the forward can no longer leave it cleared. It also no longer issues its own collectives.\n- Without sequence parallelism, the behavior is unchanged.\n\nHot path: the per-call cost is unchanged (Python list arithmetic and an integer check), with no host syncs and no new allocations beyond the existing padding buffer.\n\nPerformance trade-offs, not benchmarked:\n- Padding per chunk can add up to `TP x (alignment - 1)` zero rows to the GEMM, instead of `alignment - 1`. For example, with TP=8 and MXFP8, 8 tokens per rank are padded to 32 per rank, a 256-row GEMM instead of 64.\n- Under sequence parallelism, column-parallel modules now use TE's own sequence-parallel all-gather (of the quantized input) instead of the wrapper's bf16 all-gather. For current-scaling recipes, TE also all-reduces the input amax across the TP group, as it does for any sequence-parallel column-parallel linear.\n\n**Tests** (`tests/unit_tests/test_fp8_utils.py`):\n- `TestFP8PaddingSequenceParallel` (2 GPUs, FP8 tensorwise) covers `TERowParallelLinear`, `TEColumnParallelLinear` and `TELayerNormColumnParallelLinear`:\n  - `test_wrapped_output_matches_unwrapped`: for 32 tokens (already aligned) and 40 tokens, the wrapped FP8 output equals the unwrapped FP8 output (relative error < 0.05). The unwrapped output is within FP8 tolerance of an fp64 reference, and `sequence_parallel` is untouched. The test runs with the recipe's padding alignment and with the 32-row MXFP8 alignment. MXFP8 itself needs Blackwell, so the 32-row alignment is forced on the tensorwise recipe. When padding is expected, the test also checks that the wrapper actually padded.\n  - `test_wrapper_is_noop_outside_fp8`: outside an FP8 context, the wrapped output equals the unwrapped one and the reference.\n- CPU tests with a single emulated rank (the last of 4) and pure-torch padding:\n  - `test_fp8_padding_pads_each_sequence_parallel_chunk[row|column|None]`: the wrapper pads per chunk as the TE `parallel_mode` splits the sequence, and returns exactly that rank's rows.\n  - `test_fp8_padding_rejects_sequence_not_divisible_by_tp`: checks the divisibility assertion.\n\n**Results.** On H100 in the CI image (TE 2.20.2), at the first commit of this PR:\n- Of the original test's 6 GPU cases, the 2 row-parallel cases fail on main (relative error 1.0: the output is scaled by TP). All 6 pass with this PR.\n- The neighbor tests `TestFP8Padding` and `test_dynamic_engine.py::TestDynamicInferenceEngine::test_fp8_inference` pass.\n\nOn H100 in the CI image (rerun at this PR's head), the regression tests pass (4/4 on 1 GPU, 15/15 on 2 GPUs) and 7 fail on `main`. The neighbor tests pass, including the TP=4 sequence-parallel FP8 engine test. On CPU, the layout tests pass with this PR and fail with both main and the first commit of this PR, which chose the chunk layout from the module class.\n\n## Issue tracking\n\nLinked issue: none; this PR's regression tests reproduce the bug.\n\n## Code provenance\n\nNo code was copied from external sources.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [ ] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md)) (not applicable: no kernel or kernel-selection change. `fp8_utils.py` is registered for the FP8/FP4 master-weight casts, which this PR does not touch, so the PR needs the `determinism-exempt` label.)\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8567/comments",
+    "commits": 2,
+    "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8567/commits",
+    "created_at": "2026-10-27T16:17:18Z",
+    "deletions": 36,
+    "diff_url": "https://github.com/NVIDIA/Megatron-LM/pull/8567.diff",
+    "draft": true,
+    "head": {
+      "label": "lmcafee-nvidia:fix/s7-fp8-padding-double-reduce",
+      "ref": "fix/s7-fp8-padding-double-reduce",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contributors",
+        "created_at": "2025-10-27T15:58:06Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/forks",
+        "full_name": "lmcafee-nvidia/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/index.html#quick-start",
+        "hooks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/hooks",
+        "html_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "id": 1084385341,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "R_kgDOQKJoPQ",
+        "notifications_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 82,
+        "open_issues_count": 82,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+          "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+          "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+          "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+          "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/lmcafee-nvidia",
+          "id": 85179052,
+          "login": "lmcafee-nvidia",
+          "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+          "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+          "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+          "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/lmcafee-nvidia",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T14:49:01Z",
+        "releases_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/releases{/id}",
+        "size": 115739,
+        "ssh_url": "git@github.com:lmcafee-nvidia/Megatron-LM.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscription",
+        "svn_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-08-25T16:48:34Z",
+        "url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "81def749367d4ec43b920f16fe7b4e16e541673d",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+        "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+        "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+        "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+        "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/lmcafee-nvidia",
+        "id": 85179052,
+        "login": "lmcafee-nvidia",
+        "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+        "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+        "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+        "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/lmcafee-nvidia",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8567",
+    "id": 5037310080,
+    "issue_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8567",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "E2EB04",
+        "default": false,
+        "description": "",
+        "id": 12171687456,
+        "name": "determinism-exempt",
+        "node_id": "LA_kwDOCoyH_s8AAAAC1X02IA",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/determinism-exempt"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D93F0B",
+        "default": false,
+        "description": "High: major correctness, availability, or resource harm in shared or normal supported execution.",
+        "id": 12756649297,
+        "name": "P1",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsFUQ",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/P1"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D73A4A",
+        "default": false,
+        "description": "Production correction with focused regressions; includes historical aggregates containing fixes.",
+        "id": 12756651122,
+        "name": "Production Fix",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsMcg",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/Production%20Fix"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "c8417016e13fb8e6bf96b79e0f54d1aeee4015d2",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOCoyH_s8AAAABLD9AgA",
+    "number": 8567,
+    "patch_url": "https://github.com/NVIDIA/Megatron-LM/pull/8567.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8567/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/81def749367d4ec43b920f16fe7b4e16e541673d",
+    "title": "[Inference][FP8] Reduce FP8-padded row-parallel outputs once under sequence parallelism",
+    "updated_at": "2026-11-03T17:18:19Z",
+    "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8567",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+      "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+      "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+      "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+      "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/lmcafee-nvidia",
+      "id": 85179052,
+      "login": "lmcafee-nvidia",
+      "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+      "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+      "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+      "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/lmcafee-nvidia",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 35,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/81def749367d4ec43b920f16fe7b4e16e541673d/megatron%2Fcore%2Ffp8_utils.py",
+      "changes": 70,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ffp8_utils.py?ref=81def749367d4ec43b920f16fe7b4e16e541673d",
+      "deletions": 35,
+      "filename": "megatron/core/fp8_utils.py",
+      "patch": "@@ -11,12 +11,7 @@\n import torch\n \n from megatron.core.enums import Fp4Recipe, Fp8Recipe\n-from megatron.core.tensor_parallel import (\n-    ColumnParallelLinear,\n-    RowParallelLinear,\n-    gather_from_sequence_parallel_region,\n-    reduce_scatter_to_sequence_parallel_region,\n-)\n+from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear\n from megatron.core.transformer.transformer_config import TransformerConfig\n from megatron.core.utils import get_te_version, is_te_min_version\n \n@@ -967,13 +962,27 @@ def _wrap_te_linear_for_padding(module: torch.nn.Module):\n         2. Run the original forward pass\n         3. Unpad outputs to original sequence length\n \n+        With sequence parallelism, the module itself all-gathers its input (column-parallel)\n+        or reduce-scatters its output (row-parallel) along the sequence, one chunk per\n+        tensor-parallel rank. Each chunk is then padded separately, so that the chunk\n+        boundaries stay aligned with the ranks and the module's communication is unchanged.\n+\n         Args:\n             module: A Transformer Engine linear layer (TELinear, TEColumnParallelLinear, etc.)\n         \"\"\"\n         if module in _fp8_inference_wrapped_modules:\n             return\n-        _pad_func = Fp8Padding(1)\n-        _unpad_func = Fp8Unpadding(1)\n+\n+        # Number of per-rank sequence chunks in the input and the output with sequence\n+        # parallelism: a column-parallel module gathers its input chunks into TP output\n+        # chunks, and a row-parallel module scatters TP input chunks into one output chunk.\n+        # TE's parallel_mode is what selects the collective, so it decides the chunks.\n+        parallel_mode = getattr(module, \"parallel_mode\", None)\n+        tp_size = getattr(module, \"tp_size\", 1)\n+        sp_input_chunks = tp_size if parallel_mode == \"row\" else 1\n+        sp_output_chunks = tp_size if parallel_mode == \"column\" else 1\n+        _pad_funcs = {n: Fp8Padding(n) for n in {1, sp_input_chunks}}\n+        _unpad_funcs = {n: Fp8Unpadding(n) for n in {1, sp_output_chunks}}\n \n         original_forward = module.forward\n \n@@ -988,24 +997,23 @@ def padded_forward(input_tensor, *args, **kwargs):\n             if not module_uses_quant:\n                 return original_forward(input_tensor, *args, **kwargs)\n \n-            # With sequence parallelism we need to all-gather before padding\n-            # and reduce-scatter after unpadding\n-            if is_sequence_parallel := getattr(module, \"sequence_parallel\", False):\n-                if is_column_parallel_linear(module):\n-                    input_tensor = gather_from_sequence_parallel_region(\n-                        input_tensor, group=module.tp_group\n-                    )\n-\n-                # Disable sequence parallelism on the module because we are handling the\n-                # all-gather and reduce-scatter externally\n-                module.sequence_parallel = False\n+            if getattr(module, \"sequence_parallel\", False):\n+                input_chunks, output_chunks = sp_input_chunks, sp_output_chunks\n+            else:\n+                input_chunks, output_chunks = 1, 1\n \n             seq_len, batch_size, hidden_size = input_tensor.shape\n+            assert seq_len % input_chunks == 0, (\n+                f\"Sequence length {seq_len} is not divisible by the {input_chunks} \"\n+                f\"tensor-parallel ranks that {type(module).__name__} reduce-scatters it to\"\n+            )\n+            chunk_len = seq_len // input_chunks\n             # Reshape to (S, B*H) to pad sequence dimension\n             input_2d = input_tensor.reshape(seq_len, -1)\n-            # Pad the sequence dimension\n-            padded_input_2d, _ = _pad_func(input_2d, [seq_len])\n+            # Pad each chunk of the sequence dimension\n+            padded_input_2d, _ = _pad_funcs[input_chunks](input_2d, [chunk_len] * input_chunks)\n             padded_seq_len = padded_input_2d.shape[0]\n+            padded_chunk_len = padded_seq_len // input_chunks\n \n             # Reshape back to (padded_S, B, H)\n             padded_input_3d = padded_input_2d.view(padded_seq_len, batch_size, hidden_size)\n@@ -1019,21 +1027,13 @@ def padded_forward(input_tensor, *args, **kwargs):\n                 output_tensor = output\n                 other_outputs = ()\n \n-            # Unpad output - reshape to 2D, unpad, reshape back\n+            # Unpad output - reshape to 2D, unpad each chunk, reshape back\n             _, _, output_hidden_size = output_tensor.shape\n-            output_2d = output_tensor.reshape(padded_seq_len, -1)\n-            unpadded_output_2d = _unpad_func(output_2d, [seq_len])\n-            unpadded_output = unpadded_output_2d.reshape(seq_len, batch_size, output_hidden_size)\n-\n-            if is_sequence_parallel:\n-                # Reduce-scatter after unpadding\n-                if is_row_parallel_linear(module):\n-                    unpadded_output = reduce_scatter_to_sequence_parallel_region(\n-                        unpadded_output, group=module.tp_group\n-                    )\n-\n-                # Reset sequence parallelism flag on the module\n-                module.sequence_parallel = True\n+            output_2d = output_tensor.reshape(padded_chunk_len * output_chunks, -1)\n+            unpadded_output_2d = _unpad_funcs[output_chunks](output_2d, [chunk_len] * output_chunks)\n+            unpadded_output = unpadded_output_2d.reshape(\n+                chunk_len * output_chunks, batch_size, output_hidden_size\n+            )\n \n             if other_outputs:\n                 return (unpadded_output,) + other_outputs",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/81def749367d4ec43b920f16fe7b4e16e541673d/megatron%2Fcore%2Ffp8_utils.py",
+      "sha": "1d2d27876a71ed3150766135ff501fa82766cc9e",
+      "status": "modified"
+    },
+    {
+      "additions": 249,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/81def749367d4ec43b920f16fe7b4e16e541673d/tests%2Funit_tests%2Ftest_fp8_utils.py",
+      "changes": 250,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Ftest_fp8_utils.py?ref=81def749367d4ec43b920f16fe7b4e16e541673d",
+      "deletions": 1,
+      "filename": "tests/unit_tests/test_fp8_utils.py",
+      "patch": "@@ -1,12 +1,16 @@\n # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.\n \n+from contextlib import contextmanager, nullcontext\n+from functools import partial\n from unittest.mock import Mock, patch\n \n import pytest\n import torch\n import torch.nn as nn\n \n-from megatron.core import fp8_utils\n+from megatron.core import fp8_utils, parallel_state\n+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed\n+from megatron.core.transformer.transformer_config import TransformerConfig\n from megatron.training.utils import get_device_arch_version\n from tests.unit_tests.test_utilities import Utils\n \n@@ -18,6 +22,19 @@\n except ImportError:\n     HAVE_MXFP8_TENSOR = False\n \n+try:\n+    from transformer_engine.pytorch.fp8 import check_fp8_support\n+\n+    from megatron.core.extensions.transformer_engine import (\n+        TEColumnParallelLinear,\n+        TELayerNormColumnParallelLinear,\n+        TERowParallelLinear,\n+    )\n+\n+    fp8_available, reason_for_no_fp8 = check_fp8_support()\n+except ImportError:\n+    fp8_available, reason_for_no_fp8 = False, \"FP8 requires Transformer Engine\"\n+\n # MXFP8 needs Blackwell or newer.\n mxfp8_available = HAVE_MXFP8_TENSOR and get_device_arch_version() >= 10\n reason_for_no_mxfp8 = \"MXFP8 requires Transformer Engine and device arch >= 10\"\n@@ -170,6 +187,237 @@ def track_forward(x):\n             assert output.shape == (6, 2, 4096)  # Back to original seq_len\n \n \n+class _FakeSequenceParallelTELinear(nn.Module):\n+    \"\"\"One rank of a TE linear with sequence parallelism and an identity GEMM. The other ranks\n+    contribute zeros to the reduce-scatter and copies of this rank's chunk to the all-gather.\"\"\"\n+\n+    def __init__(self, parallel_mode, tp_size, rank):\n+        super().__init__()\n+        self.parallel_mode, self.tp_size, self.rank = parallel_mode, tp_size, rank\n+        self.sequence_parallel = True\n+\n+    def forward(self, x):\n+        if self.sequence_parallel and self.parallel_mode == \"row\":\n+            return x.chunk(self.tp_size)[self.rank], None\n+        if self.sequence_parallel and self.parallel_mode == \"column\":\n+            return torch.cat([x] * self.tp_size), None\n+        return x, None\n+\n+\n+@contextmanager\n+def _fake_fp8_padding(align):\n+    \"\"\"Pure-torch Fp8Padding / Fp8Unpadding with a fixed alignment, inside an FP8 context.\"\"\"\n+\n+    def padded(splits):\n+        return [-(-m // align) * align for m in splits]\n+\n+    class Padding:\n+        def __init__(self, num_gemms):\n+            self.num_gemms = num_gemms\n+\n+        def __call__(self, inp, splits):\n+            assert len(splits) == self.num_gemms\n+            pads = [(0, 0, 0, p - m) for m, p in zip(splits, padded(splits))]\n+            chunks = [nn.functional.pad(c, pad) for c, pad in zip(inp.split(splits), pads)]\n+            return torch.cat(chunks), padded(splits)\n+\n+    class Unpadding(Padding):\n+        def __call__(self, inp, splits):\n+            assert len(splits) == self.num_gemms\n+            return torch.cat([c[:m] for c, m in zip(inp.split(padded(splits)), splits)])\n+\n+    with (\n+        patch.object(fp8_utils, \"Fp8Padding\", Padding),\n+        patch.object(fp8_utils, \"Fp8Unpadding\", Unpadding),\n+        patch.object(fp8_utils.FP8GlobalStateManager, \"is_fp8_enabled\", return_value=True),\n+    ):\n+        yield\n+\n+\n+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason=\"Transformer Engine is not installed\")\n+@pytest.mark.parametrize(\"parallel_mode\", [\"row\", \"column\", None])\n+def test_fp8_padding_pads_each_sequence_parallel_chunk(parallel_mode):\n+    \"\"\"With sequence parallelism, each rank's chunk of the sequence is padded separately, as TE's\n+    parallel_mode splits it, so the last rank gets exactly its rows back.\"\"\"\n+    tp_size, chunk_len, align = 4, 3, 4\n+    module = _FakeSequenceParallelTELinear(parallel_mode, tp_size, rank=tp_size - 1)\n+    seq_len = chunk_len if parallel_mode == \"column\" else chunk_len * tp_size\n+    x = torch.randn(seq_len, 2, 8)\n+    if parallel_mode == \"row\":\n+        expected = x[-chunk_len:]\n+    elif parallel_mode == \"column\":\n+        expected = torch.cat([x] * tp_size)\n+    else:\n+        expected = x\n+\n+    with _fake_fp8_padding(align):\n+        fp8_utils._wrap_te_linear_for_padding(module)\n+        output, _ = module(x)\n+\n+    torch.testing.assert_close(output, expected, atol=0, rtol=0)\n+\n+\n+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason=\"Transformer Engine is not installed\")\n+def test_fp8_padding_rejects_sequence_not_divisible_by_tp():\n+    module = _FakeSequenceParallelTELinear(\"row\", tp_size=4, rank=0)\n+    with _fake_fp8_padding(align=4), pytest.raises(AssertionError, match=\"not divisible\"):\n+        fp8_utils._wrap_te_linear_for_padding(module)\n+        module(torch.randn(10, 2, 8))\n+\n+\n+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)\n+class TestFP8PaddingSequenceParallel:\n+    \"\"\"The padding wrapper on tensor-parallel TE linears with sequence parallelism.\n+\n+    The module's own all-gather (column-parallel) or reduce-scatter (row-parallel) must stay the\n+    only communication, so the wrapped FP8 output equals the unwrapped one.\n+    \"\"\"\n+\n+    TP = 2\n+    BATCH = 2\n+    PARALLEL_MODES = [\"row\", \"column\", \"layernorm_column\"]\n+    # With the tensorwise recipe's 16-row alignment, the wrapper pads 40 tokens (20 per rank) and\n+    # leaves 32 tokens (16 per rank) as they are.\n+    SEQ_LENS = [pytest.param(32, id=\"aligned\"), pytest.param(40, id=\"padded\")]\n+    RECIPE_ALIGNMENT = 16\n+    # Padding alignments: the recipe's, and the 32 rows of MXFP8 (which itself needs Blackwell).\n+    ALIGNMENTS = [pytest.param(None, id=\"recipe_alignment\"), pytest.param(32, id=\"mxfp8_alignment\")]\n+\n+    def setup_method(self, method):\n+        if Utils.world_size % self.TP != 0:\n+            pytest.skip(f\"requires a world size divisible by TP={self.TP}\")\n+        Utils.initialize_model_parallel(tensor_model_parallel_size=self.TP)\n+        model_parallel_cuda_manual_seed(123)\n+        fp8_utils._fp8_inference_wrapped_modules.clear()\n+\n+    def teardown_method(self, method):\n+        Utils.destroy_model_parallel()\n+        fp8_utils._fp8_inference_wrapped_modules.clear()\n+\n+    def _config(self):\n+        return TransformerConfig(\n+            num_layers=1,\n+            hidden_size=128,\n+            num_attention_heads=4,\n+            tensor_model_parallel_size=self.TP,\n+            sequence_parallel=True,\n+            params_dtype=torch.bfloat16,\n+            bf16=True,\n+            add_bias_linear=False,\n+            fp8=\"e4m3\",\n+            fp8_recipe=\"tensorwise\",\n+        )\n+\n+    def _setup(self, config, parallel_mode, seq_len):\n+        \"\"\"Build the TE linear from a full weight and return it with this rank's input and the\n+        expected output, computed in fp64 from the full operands.\"\"\"\n+        tp_group = parallel_state.get_tensor_model_parallel_group()\n+        rank = tp_group.rank()\n+        in_features, out_features = (256, 128) if parallel_mode == \"row\" else (128, 256)\n+        generator = torch.Generator().manual_seed(seq_len)\n+        x = torch.randn(seq_len, self.BATCH, in_features, generator=generator).bfloat16()\n+        weight = (torch.randn(out_features, in_features, generator=generator) * 0.05).bfloat16()\n+        gemm_input = x.double()\n+        if parallel_mode == \"layernorm_column\":\n+            # TE initializes the norm's weight to one and its bias to zero.\n+            gemm_input = torch.nn.functional.layer_norm(\n+                gemm_input, (in_features,), eps=config.layernorm_epsilon\n+            )\n+        expected = torch.einsum(\"sbk,nk->sbn\", gemm_input, weight.double())\n+\n+        kwargs = dict(\n+            config=config,\n+            init_method=config.init_method,\n+            bias=False,\n+            skip_bias_add=True,\n+            is_expert=False,\n+            tp_group=tp_group,\n+        )\n+        if parallel_mode == \"row\":\n+            module = TERowParallelLinear(\n+                in_features, out_features, input_is_parallel=True, **kwargs\n+            )\n+            weight_shard = weight.chunk(self.TP, dim=1)[rank]\n+            x_local = x.chunk(self.TP, dim=2)[rank]\n+            expected = expected.chunk(self.TP, dim=0)[rank]\n+        else:\n+            if parallel_mode == \"layernorm_column\":\n+                linear_class = TELayerNormColumnParallelLinear\n+            else:\n+                linear_class = TEColumnParallelLinear\n+            module = linear_class(in_features, out_features, gather_output=False, **kwargs)\n+            weight_shard = weight.chunk(self.TP, dim=0)[rank]\n+            x_local = x.chunk(self.TP, dim=0)[rank]\n+            expected = expected.chunk(self.TP, dim=2)[rank]\n+        assert module.sequence_parallel\n+        with torch.no_grad():\n+            module.weight.copy_(weight_shard)\n+        return module.eval(), x_local.contiguous().cuda(), expected.cuda()\n+\n+    @staticmethod\n+    def _forward(module, x, fp8_config=None):\n+        context = nullcontext() if fp8_config is None else fp8_utils.get_fp8_context(fp8_config)\n+        with torch.no_grad(), context:\n+            output, _ = module(x)\n+        return output\n+\n+    @staticmethod\n+    def _rel_err(actual, expected):\n+        \"\"\"Relative Frobenius error over the whole tensor-parallel group.\"\"\"\n+        sums = torch.stack(\n+            [((actual.double() - expected.double()) ** 2).sum(), (expected.double() ** 2).sum()]\n+        )\n+        torch.distributed.all_reduce(sums, group=parallel_state.get_tensor_model_parallel_group())\n+        return (sums[0] / sums[1]).sqrt().item()\n+\n+    @pytest.mark.parametrize(\"parallel_mode\", PARALLEL_MODES)\n+    def test_wrapper_is_noop_outside_fp8(self, parallel_mode):\n+        module, x, expected = self._setup(self._config(), parallel_mode, seq_len=40)\n+        unwrapped = self._forward(module, x)\n+        fp8_utils.prepare_model_for_fp8_inference(module)\n+        wrapped = self._forward(module, x)\n+\n+        torch.testing.assert_close(wrapped, unwrapped)\n+        torch.testing.assert_close(wrapped.double(), expected, atol=2e-2, rtol=2e-2)\n+\n+    @pytest.mark.parametrize(\"parallel_mode\", PARALLEL_MODES)\n+    @pytest.mark.parametrize(\"seq_len\", SEQ_LENS)\n+    @pytest.mark.parametrize(\"align_size\", ALIGNMENTS)\n+    def test_wrapped_output_matches_unwrapped(self, parallel_mode, seq_len, align_size):\n+        config = self._config()\n+        module, x, expected = self._setup(config, parallel_mode, seq_len)\n+        unwrapped = self._forward(module, x, config)\n+\n+        inner_seq_lens = []\n+        inner_forward = module.forward\n+\n+        def recording_forward(input_tensor, *args, **kwargs):\n+            inner_seq_lens.append(input_tensor.shape[0])\n+            return inner_forward(input_tensor, *args, **kwargs)\n+\n+        module.forward = recording_forward\n+        with (\n+            patch.object(\n+                fp8_utils, \"Fp8Padding\", partial(fp8_utils.Fp8Padding, align_size=align_size)\n+            ),\n+            patch.object(\n+                fp8_utils, \"Fp8Unpadding\", partial(fp8_utils.Fp8Unpadding, align_size=align_size)\n+            ),\n+        ):\n+            fp8_utils.prepare_model_for_fp8_inference(module)\n+        wrapped = self._forward(module, x, config)\n+\n+        if (seq_len // self.TP) % (align_size or self.RECIPE_ALIGNMENT) != 0:\n+            assert inner_seq_lens[0] > x.shape[0], \"the wrapper did not pad the FP8 input\"\n+        assert module.sequence_parallel\n+        assert wrapped.shape == unwrapped.shape == expected.shape\n+        # E4M3 quantization of both operands keeps the result within a few percent.\n+        assert self._rel_err(unwrapped, expected) < 0.15\n+        # Zero padding rows leave the FP8 scales unchanged, so only GEMM rounding differs. A second\n+        # reduction across the TP ranks would scale the output by TP (relative error TP - 1).\n+        assert self._rel_err(wrapped, unwrapped) < 0.05\n+\n+\n @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)\n class TestCopyTensorsToQuantizedParams:\n     \"\"\"Cover the batched MXFP8 param copy-back used by _post_param_sync.",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/81def749367d4ec43b920f16fe7b4e16e541673d/tests%2Funit_tests%2Ftest_fp8_utils.py",
+      "sha": "24a8217c6ce2f8f2d779892f01a8eec6cf395d7a",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+      "created_at": "2026-10-27T16:17:22Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8567#issuecomment-6447245881",
+      "id": 6447245881,
+      "updated_at": "2026-10-27T16:17:22Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    }
+  ],
+  "number": 8567,
+  "refs": {
+    "base": {
+      "commit": "9dd63d992a5925dba7f9bfd1aec9dbfb1f54b837",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "81def749367d4ec43b920f16fe7b4e16e541673d",
+      "repository": "lmcafee-nvidia/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": []
+}

@@ -1,0 +1,559 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "a0284bce64e949808754afe45ccaa65b5edda3c76051c840b96d3edbc90b075a",
+      "isPrivate": false,
+      "numbers": [
+        8872,
+        8871,
+        8870,
+        8869,
+        8868,
+        8867,
+        8866,
+        8865
+      ],
+      "observed_at": "2026-11-04T15:26:38.045790+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4931,
+        "resetAt": "2026-11-04T15:50:00Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nMakes the `deepgemm` batch-invariant backend run DeepGEMM's fixed-K-order GEMM kernel again, instead of the cuBLASLt heuristic it has silently run since #7725. It also hands DeepGEMM linear weights in place, instead of copying the whole weight on every GEMM and every CUDA-graph replay.\n\n**Bug 1: the backend runs cuBLASLt.** At the pinned DeepGEMM (`ea2b7805`), `bf16_gemm_nt` (and `bf16_gemm_nn`, which calls it) sends the GEMM to cuBLASLt unless `deep_gemm.use_deterministic_algorithms(True)` was called (`csrc/apis/gemm.hpp:498-500`). The cuBLASLt call takes the top-1 heuristic algorithm, allows split-K reductions and uses DeepGEMM's own 16 MiB workspace. Megatron never calls the switch. The switch and the cuBLASLt dispatch both arrived in DeepGEMM's 26/09 release (`66081d4`), and #7725 moved the pin past it. Before that, `bf16_gemm_nt` always ran DeepGEMM's kernel, which the backend was designed around. As a result:\n- every dense bf16 GEMM under `batch_invariant_backend=\"deepgemm\"` (training, TE-implementation inference and inference-optimized inference) runs cuBLASLt, which picks split-K per row count;\n- on H100, the profiled kernel for `F.linear([64, 4096] x [4096, 4096])` is `nvjet_sm90_tst_64x32_64x16_1x2_h_bz_NNT`, and row 0 of that GEMM changes bits between M=1 and M=16.\n\n**Bug 2: every linear copies its weight.** `F.linear` and `x @ w.t()` hand `aten::mm` the view `b = w.t()`, whose strides are `(1, K)`. `_mm_deepgemm` kept an operand only if `stride(0)` was 16-byte aligned. For `w.t()` that is the inner stride, which is 1, so every call allocated a padded row-major `[K, N]` buffer and copied the weight into it. Under CUDA graphs the copy kernel replays every step. `BatchInvariantTEGemmFn` also made the transposed weight contiguous under `deepgemm`. DeepGEMM needs neither copy: it reads an operand along its unit-stride dimension, so `w.t()` is read as the K-major `w`. On H100 at M=64, `F.linear` took 142 µs for a 4096 x 4096 weight (32 MiB copied per call) and 488 µs for 14336 x 4096. The GEMM in those calls took 11 µs and 46 µs, but that GEMM was cuBLASLt's `nvjet` kernel (Bug 1), not the DeepGEMM kernel this PR switches to, so these numbers show the cost of the copy, not the end-to-end speed-up. The DeepGEMM kernel's time at these shapes, against cuBLASLt, has not been measured.\n\n## Fix\n\n- Under the `deepgemm` backend, `enable_batch_invariant_mode` turns DeepGEMM's deterministic algorithms on (after its checks, right before the mode is marked on), and `disable_batch_invariant_mode` turns them back off. At `ea2b7805` only DeepGEMM's dense bf16 GEMMs, einsum and the fused mega kernels read the switch (`gemm.hpp:498`, `einsum.hpp:72,95`, `mega_mhc.hpp:16`, `heuristics/mega_gate.hpp:206`); the M- and K-grouped GEMMs that `triton` and the inference MoE experts use do not. So `te_native` and `triton` leave the switch alone, and only `deepgemm` changes it for other DeepGEMM users in the process. The switch is process-global and DeepGEMM binds only its setter, so the mode records that it set it, and disabling the mode turns it off even if other code had turned it on before; both docstrings say so. DeepGEMM releases without the switch never dispatch to cuBLASLt, so nothing changes for them.\n- `_mm_deepgemm` applies DeepGEMM's operand rules: one unit stride, and a 16-byte aligned outer stride and base pointer. It also requires the outer stride to cover the inner extent, so expanded (stride-0) and overlapping views are copied rather than handed to the TMA descriptor. An operand that meets them is passed as is, so a linear's weight is read K-major in place whenever K is a multiple of 8. Any other operand is copied into the same layout with a padded outer stride, so the copy stays K-major too. A column-major A, such as `grad_output.t()` in aten's weight gradient, therefore reaches DeepGEMM MN-major, which DeepGEMM supports for bf16 GEMMs on SM90 and SM100. The base-pointer check is new and also covers sliced activations, which DeepGEMM would otherwise reject.\n- `_mm_deepgemm` compiles only N into DeepGEMM's JIT kernel (`compiled_dims=\"n\"`; the binding default `\"nk\"` also compiles K). The token count is K in weight-gradient GEMMs (`grad.t() @ x`, TE's `NT` layout) and M in forward and data-gradient GEMMs, so with `\"nk\"` every new training token count would trigger a multi-second nvcc build on every rank. N is fixed for a given linear in all three. K is now a runtime loop bound in inference too; its effect on kernel time has not been measured.\n- `BatchInvariantTEGemmFn` passes the transposed weight view under `deepgemm`, as it already does under `triton`. TE GEMMs (training) and `F.linear`/`x @ w.t()` (inference) therefore give DeepGEMM the same K-major weight and run the same kernel variant.\n\nNo host syncs and no new allocations: the hot path loses a weight-sized allocation and copy per GEMM.\n\n## Tests\n\nNew cases in `tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py`, the dense DeepGEMM test registered for `batch_invariant_kernels.py` in the determinism manifest (whose entry now describes these checks). 1 GPU, Hopper or Blackwell, DeepGEMM with bf16 bindings:\n- `test_dense_deepgemm_runs_deepgemm_kernel`: profiles `F.linear` under the backend and requires DeepGEMM's `sm90_bf16_gemm_impl`/`sm100_bf16_gemm_impl` kernel. It also checks that the mode turns the switch on and back off. This fails on a future DeepGEMM bump that reroutes the call.\n- `test_dense_deepgemm_rows_are_invariant_across_batch_size`: row 0 of `F.linear` has the same bits at M = 1, 16, 256 and 4096, for (K, N) = (4096, 4096) and (16384, 64), and matches an fp64 reference.\n- `test_transposed_weight_reaches_deepgemm_uncopied`: `F.linear`, `torch.matmul(x, w.t())` and the TE `TN` GEMM hand DeepGEMM the weight's own storage, K-major, for (N, K) = (4096, 4096). For K = 60 they hand it a padded K-major copy. Outputs match an fp64 reference.\n- `test_weight_gradient_reads_column_major_grad`: aten's weight gradient `torch.mm(g.t(), x)` hands DeepGEMM `g` itself, MN-major (strides `(1, O)`), for (O, T, I) = (4096, 37, 1024), and a padded column-major copy (strides `(1, 64)`) for O = 60, T = 64. K is the token count, with a tail that is not a multiple of 64, and the output matches an fp64 reference. It also checks that K is not compiled into the kernel.\n- `test_other_backends_leave_deepgemm_switch_alone[te_native|triton]`: enabling and disabling those backends never calls DeepGEMM's switch.\n- `test_expanded_operand_is_copied`: `torch.mm(x, v.expand(128, 32))` hands DeepGEMM a copy with strides `(1, 128)`, not the stride-0 view, and matches an fp64 reference.\n\nOn H100 in the CI image (`mcore_ci_dev:main`, 2026-11-02), the regression tests pass (10 cases) and fail on `main` (7 of 10 cases). On `main`, the kernel test and the aliasing test fail, and the row test fails at 4096 x 4096 (row 0 differs at M=16) and passes at 16384 x 64. The weight-gradient and expanded-operand tests also fail on `main`, which copies both operands row-major and compiles K into the kernel; the switch-scope test passes on `main`, which never touches the switch. The neighbor tests pass (58 cases, 1 skipped): the existing stride-boundary test (its DeepGEMM witness now forwards keyword arguments; row-major weights are padded exactly as before), `test_te_layers_batch_invariant.py`, and `test_batch_invariant_pairwise.py::test_dense_dynamic_feature_batch_invariance`.\n\n## Merge order\n\nIndependent of the other open fixes; meant to land after #8865 (`fix/bi-te-gemm-accumulate`) and #8866 (`fix/te-grouped-bi-bypass`), alongside #8868 (`fix/bi-tp-reduce-scatter-order`) and before #8869 (`fix/bi-op-fuser-dense`). It merges cleanly with #8573 (`set_batch_invariant_mode` state restore), whose rollback on a failed enable calls `disable_batch_invariant_mode` and so also turns the DeepGEMM switch back off, and with #8708 (te_native aten cuBLASLt).\n\n## Issue tracking\n\nLinked issue: none. Found in code review; reproduced on H100.\n\n## Code provenance\n\nNo external code was copied or adapted.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+            "createdAt": "2026-11-03T04:21:07Z",
+            "databaseId": 6595370684,
+            "updatedAt": "2026-11-03T04:21:07Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8867#issuecomment-6595370684"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkdXrw=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "8e679cd9213924f2d09b40b2c895ce9b828fb9fa",
+      "headRepository": {
+        "nameWithOwner": "lmcafee-nvidia/Megatron-LM"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 8867,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[Core][BatchInvariant] Run DeepGEMM's own kernel for batch-invariant dense GEMMs and read weights in place",
+      "updatedAt": "2026-11-03T17:19:52Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/8867"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8867/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8867/commits"
+      },
+      "html": {
+        "href": "https://github.com/NVIDIA/Megatron-LM/pull/8867"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8867"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8867/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8867"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/8e679cd9213924f2d09b40b2c895ce9b828fb9fa"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 222,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "NVIDIA:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/NVIDIA/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contributors",
+        "created_at": "2019-03-21T16:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/events",
+        "fork": false,
+        "forks": 4700,
+        "forks_count": 4700,
+        "forks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/forks",
+        "full_name": "NVIDIA/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/NVIDIA/Megatron-LM.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/hooks",
+        "html_url": "https://github.com/NVIDIA/Megatron-LM",
+        "id": 176982014,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "MDEwOlJlcG9zaXRvcnkxNzY5ODIwMTQ=",
+        "notifications_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 1937,
+        "open_issues_count": 1937,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+          "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NVIDIA/followers",
+          "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NVIDIA",
+          "id": 1728152,
+          "login": "NVIDIA",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+          "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+          "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+          "repos_url": "https://api.github.com/users/NVIDIA/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/NVIDIA",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T15:22:16Z",
+        "releases_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/releases{/id}",
+        "size": 178037,
+        "ssh_url": "git@github.com:NVIDIA/Megatron-LM.git",
+        "stargazers_count": 18328,
+        "stargazers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscription",
+        "svn_url": "https://github.com/NVIDIA/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/teams",
+        "topics": [
+          "large-language-models",
+          "model-para",
+          "transformers"
+        ],
+        "trees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-11-04T13:28:01Z",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM",
+        "visibility": "public",
+        "watchers": 18328,
+        "watchers_count": 18328,
+        "web_commit_signoff_required": false
+      },
+      "sha": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+        "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NVIDIA/followers",
+        "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NVIDIA",
+        "id": 1728152,
+        "login": "NVIDIA",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+        "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+        "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+        "repos_url": "https://api.github.com/users/NVIDIA/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/NVIDIA",
+        "user_view_type": "public"
+      }
+    },
+    "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nMakes the `deepgemm` batch-invariant backend run DeepGEMM's fixed-K-order GEMM kernel again, instead of the cuBLASLt heuristic it has silently run since #7725. It also hands DeepGEMM linear weights in place, instead of copying the whole weight on every GEMM and every CUDA-graph replay.\n\n**Bug 1: the backend runs cuBLASLt.** At the pinned DeepGEMM (`ea2b7805`), `bf16_gemm_nt` (and `bf16_gemm_nn`, which calls it) sends the GEMM to cuBLASLt unless `deep_gemm.use_deterministic_algorithms(True)` was called (`csrc/apis/gemm.hpp:498-500`). The cuBLASLt call takes the top-1 heuristic algorithm, allows split-K reductions and uses DeepGEMM's own 16 MiB workspace. Megatron never calls the switch. The switch and the cuBLASLt dispatch both arrived in DeepGEMM's 26/09 release (`66081d4`), and #7725 moved the pin past it. Before that, `bf16_gemm_nt` always ran DeepGEMM's kernel, which the backend was designed around. As a result:\n- every dense bf16 GEMM under `batch_invariant_backend=\"deepgemm\"` (training, TE-implementation inference and inference-optimized inference) runs cuBLASLt, which picks split-K per row count;\n- on H100, the profiled kernel for `F.linear([64, 4096] x [4096, 4096])` is `nvjet_sm90_tst_64x32_64x16_1x2_h_bz_NNT`, and row 0 of that GEMM changes bits between M=1 and M=16.\n\n**Bug 2: every linear copies its weight.** `F.linear` and `x @ w.t()` hand `aten::mm` the view `b = w.t()`, whose strides are `(1, K)`. `_mm_deepgemm` kept an operand only if `stride(0)` was 16-byte aligned. For `w.t()` that is the inner stride, which is 1, so every call allocated a padded row-major `[K, N]` buffer and copied the weight into it. Under CUDA graphs the copy kernel replays every step. `BatchInvariantTEGemmFn` also made the transposed weight contiguous under `deepgemm`. DeepGEMM needs neither copy: it reads an operand along its unit-stride dimension, so `w.t()` is read as the K-major `w`. On H100 at M=64, `F.linear` took 142 µs for a 4096 x 4096 weight (32 MiB copied per call) and 488 µs for 14336 x 4096. The GEMM in those calls took 11 µs and 46 µs, but that GEMM was cuBLASLt's `nvjet` kernel (Bug 1), not the DeepGEMM kernel this PR switches to, so these numbers show the cost of the copy, not the end-to-end speed-up. The DeepGEMM kernel's time at these shapes, against cuBLASLt, has not been measured.\n\n## Fix\n\n- Under the `deepgemm` backend, `enable_batch_invariant_mode` turns DeepGEMM's deterministic algorithms on (after its checks, right before the mode is marked on), and `disable_batch_invariant_mode` turns them back off. At `ea2b7805` only DeepGEMM's dense bf16 GEMMs, einsum and the fused mega kernels read the switch (`gemm.hpp:498`, `einsum.hpp:72,95`, `mega_mhc.hpp:16`, `heuristics/mega_gate.hpp:206`); the M- and K-grouped GEMMs that `triton` and the inference MoE experts use do not. So `te_native` and `triton` leave the switch alone, and only `deepgemm` changes it for other DeepGEMM users in the process. The switch is process-global and DeepGEMM binds only its setter, so the mode records that it set it, and disabling the mode turns it off even if other code had turned it on before; both docstrings say so. DeepGEMM releases without the switch never dispatch to cuBLASLt, so nothing changes for them.\n- `_mm_deepgemm` applies DeepGEMM's operand rules: one unit stride, and a 16-byte aligned outer stride and base pointer. It also requires the outer stride to cover the inner extent, so expanded (stride-0) and overlapping views are copied rather than handed to the TMA descriptor. An operand that meets them is passed as is, so a linear's weight is read K-major in place whenever K is a multiple of 8. Any other operand is copied into the same layout with a padded outer stride, so the copy stays K-major too. A column-major A, such as `grad_output.t()` in aten's weight gradient, therefore reaches DeepGEMM MN-major, which DeepGEMM supports for bf16 GEMMs on SM90 and SM100. The base-pointer check is new and also covers sliced activations, which DeepGEMM would otherwise reject.\n- `_mm_deepgemm` compiles only N into DeepGEMM's JIT kernel (`compiled_dims=\"n\"`; the binding default `\"nk\"` also compiles K). The token count is K in weight-gradient GEMMs (`grad.t() @ x`, TE's `NT` layout) and M in forward and data-gradient GEMMs, so with `\"nk\"` every new training token count would trigger a multi-second nvcc build on every rank. N is fixed for a given linear in all three. K is now a runtime loop bound in inference too; its effect on kernel time has not been measured.\n- `BatchInvariantTEGemmFn` passes the transposed weight view under `deepgemm`, as it already does under `triton`. TE GEMMs (training) and `F.linear`/`x @ w.t()` (inference) therefore give DeepGEMM the same K-major weight and run the same kernel variant.\n\nNo host syncs and no new allocations: the hot path loses a weight-sized allocation and copy per GEMM.\n\n## Tests\n\nNew cases in `tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py`, the dense DeepGEMM test registered for `batch_invariant_kernels.py` in the determinism manifest (whose entry now describes these checks). 1 GPU, Hopper or Blackwell, DeepGEMM with bf16 bindings:\n- `test_dense_deepgemm_runs_deepgemm_kernel`: profiles `F.linear` under the backend and requires DeepGEMM's `sm90_bf16_gemm_impl`/`sm100_bf16_gemm_impl` kernel. It also checks that the mode turns the switch on and back off. This fails on a future DeepGEMM bump that reroutes the call.\n- `test_dense_deepgemm_rows_are_invariant_across_batch_size`: row 0 of `F.linear` has the same bits at M = 1, 16, 256 and 4096, for (K, N) = (4096, 4096) and (16384, 64), and matches an fp64 reference.\n- `test_transposed_weight_reaches_deepgemm_uncopied`: `F.linear`, `torch.matmul(x, w.t())` and the TE `TN` GEMM hand DeepGEMM the weight's own storage, K-major, for (N, K) = (4096, 4096). For K = 60 they hand it a padded K-major copy. Outputs match an fp64 reference.\n- `test_weight_gradient_reads_column_major_grad`: aten's weight gradient `torch.mm(g.t(), x)` hands DeepGEMM `g` itself, MN-major (strides `(1, O)`), for (O, T, I) = (4096, 37, 1024), and a padded column-major copy (strides `(1, 64)`) for O = 60, T = 64. K is the token count, with a tail that is not a multiple of 64, and the output matches an fp64 reference. It also checks that K is not compiled into the kernel.\n- `test_other_backends_leave_deepgemm_switch_alone[te_native|triton]`: enabling and disabling those backends never calls DeepGEMM's switch.\n- `test_expanded_operand_is_copied`: `torch.mm(x, v.expand(128, 32))` hands DeepGEMM a copy with strides `(1, 128)`, not the stride-0 view, and matches an fp64 reference.\n\nOn H100 in the CI image (`mcore_ci_dev:main`, 2026-11-02), the regression tests pass (10 cases) and fail on `main` (7 of 10 cases). On `main`, the kernel test and the aliasing test fail, and the row test fails at 4096 x 4096 (row 0 differs at M=16) and passes at 16384 x 64. The weight-gradient and expanded-operand tests also fail on `main`, which copies both operands row-major and compiles K into the kernel; the switch-scope test passes on `main`, which never touches the switch. The neighbor tests pass (58 cases, 1 skipped): the existing stride-boundary test (its DeepGEMM witness now forwards keyword arguments; row-major weights are padded exactly as before), `test_te_layers_batch_invariant.py`, and `test_batch_invariant_pairwise.py::test_dense_dynamic_feature_batch_invariance`.\n\n## Merge order\n\nIndependent of the other open fixes; meant to land after #8865 (`fix/bi-te-gemm-accumulate`) and #8866 (`fix/te-grouped-bi-bypass`), alongside #8868 (`fix/bi-tp-reduce-scatter-order`) and before #8869 (`fix/bi-op-fuser-dense`). It merges cleanly with #8573 (`set_batch_invariant_mode` state restore), whose rollback on a failed enable calls `disable_batch_invariant_mode` and so also turns the DeepGEMM switch back off, and with #8708 (te_native aten cuBLASLt).\n\n## Issue tracking\n\nLinked issue: none. Found in code review; reproduced on H100.\n\n## Code provenance\n\nNo external code was copied or adapted.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 3,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8867/comments",
+    "commits": 2,
+    "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8867/commits",
+    "created_at": "2026-11-03T04:21:03Z",
+    "deletions": 18,
+    "diff_url": "https://github.com/NVIDIA/Megatron-LM/pull/8867.diff",
+    "draft": true,
+    "head": {
+      "label": "lmcafee-nvidia:fix/deepgemm-bi-dense",
+      "ref": "fix/deepgemm-bi-dense",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contributors",
+        "created_at": "2025-10-27T15:58:06Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/forks",
+        "full_name": "lmcafee-nvidia/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/index.html#quick-start",
+        "hooks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/hooks",
+        "html_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "id": 1084385341,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "R_kgDOQKJoPQ",
+        "notifications_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 82,
+        "open_issues_count": 82,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+          "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+          "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+          "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+          "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/lmcafee-nvidia",
+          "id": 85179052,
+          "login": "lmcafee-nvidia",
+          "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+          "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+          "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+          "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/lmcafee-nvidia",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T14:49:01Z",
+        "releases_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/releases{/id}",
+        "size": 115739,
+        "ssh_url": "git@github.com:lmcafee-nvidia/Megatron-LM.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscription",
+        "svn_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-08-25T16:48:34Z",
+        "url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "8e679cd9213924f2d09b40b2c895ce9b828fb9fa",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+        "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+        "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+        "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+        "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/lmcafee-nvidia",
+        "id": 85179052,
+        "login": "lmcafee-nvidia",
+        "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+        "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+        "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+        "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/lmcafee-nvidia",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8867",
+    "id": 5131842155,
+    "issue_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8867",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D93F0B",
+        "default": false,
+        "description": "High: major correctness, availability, or resource harm in shared or normal supported execution.",
+        "id": 12756649297,
+        "name": "P1",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsFUQ",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/P1"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D73A4A",
+        "default": false,
+        "description": "Production correction with focused regressions; includes historical aggregates containing fixes.",
+        "id": 12756651122,
+        "name": "Production Fix",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsMcg",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/Production%20Fix"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "7e783069aff669963db58c5860ccd9565677fd77",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOCoyH_s8AAAABMeGyaw",
+    "number": 8867,
+    "patch_url": "https://github.com/NVIDIA/Megatron-LM/pull/8867.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8867/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/8e679cd9213924f2d09b40b2c895ce9b828fb9fa",
+    "title": "[Core][BatchInvariant] Run DeepGEMM's own kernel for batch-invariant dense GEMMs and read weights in place",
+    "updated_at": "2026-11-03T17:19:52Z",
+    "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8867",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+      "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+      "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+      "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+      "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/lmcafee-nvidia",
+      "id": 85179052,
+      "login": "lmcafee-nvidia",
+      "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+      "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+      "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+      "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/lmcafee-nvidia",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 68,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/8e679cd9213924f2d09b40b2c895ce9b828fb9fa/megatron%2Fcore%2Ftransformer%2Fcustom_layers%2Fbatch_invariant_kernels.py",
+      "changes": 84,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftransformer%2Fcustom_layers%2Fbatch_invariant_kernels.py?ref=8e679cd9213924f2d09b40b2c895ce9b828fb9fa",
+      "deletions": 16,
+      "filename": "megatron/core/transformer/custom_layers/batch_invariant_kernels.py",
+      "patch": "@@ -529,27 +529,63 @@ def mean_dim(\n # intentional higher-precision operations such as the fp32 MoE router.\n _BATCH_INVARIANT_BACKENDS = (\"deepgemm\", \"triton\", \"te_native\")\n _BATCH_INVARIANT_BACKEND: str = \"deepgemm\"\n+# Whether batch-invariant mode turned on DeepGEMM's deterministic algorithms. DeepGEMM\n+# has no getter for that switch, so this records what disabling the mode must undo.\n+_DEEPGEMM_DETERMINISTIC_SET = False\n+\n+\n+def _set_deepgemm_deterministic_algorithms(enabled: bool) -> None:\n+    \"\"\"Turn DeepGEMM's deterministic algorithms on for the deepgemm backend, or back off.\n+\n+    While they are off, DeepGEMM runs its dense bf16 GEMMs on cuBLASLt with the\n+    heuristic algorithm, which may split K differently for each M. The switch is\n+    process-global and only DeepGEMM's dense GEMMs, einsum and fused mega kernels\n+    read it (not the grouped GEMMs the other backends use). DeepGEMM releases\n+    without the switch always run their own kernels.\n+    \"\"\"\n+    global _DEEPGEMM_DETERMINISTIC_SET\n+    use_deterministic_algorithms = getattr(deep_gemm, \"use_deterministic_algorithms\", None)\n+    if use_deterministic_algorithms is None or enabled == _DEEPGEMM_DETERMINISTIC_SET:\n+        return\n+    use_deterministic_algorithms(enabled)\n+    _DEEPGEMM_DETERMINISTIC_SET = enabled\n \n \n def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:\n-    \"\"\"`a @ b` via DeepGEMM `bf16_gemm_nn`. Both inputs are row-major.\n+    \"\"\"`a @ b` via DeepGEMM `bf16_gemm_nn`.\n \n-    Bitwise-identical to `torch.mm` on Hopper/Blackwell, deterministic across\n-    runs, batch-invariant.\n+    Deterministic across runs and batch-invariant. Its bits generally differ from\n+    `torch.mm`'s, so the processes that must agree bitwise (for example RL\n+    training and rollout) must all use this backend.\n     \"\"\"\n     if a.dtype != torch.bfloat16:\n         raise RuntimeError(\n             f\"The DeepGEMM batch-invariant backend requires bf16 inputs \"\n             f\"(got {a.dtype}); use backend='triton' for fp16/fp32.\"\n         )\n-    # TMA descriptors require 16-byte outer strides, not padded logical shapes.\n+    # DeepGEMM reads an operand along its unit-stride dimension, so a column-major\n+    # view such as a linear's `weight.t()` is read K-major in place. Its TMA\n+    # descriptors need a 16-byte aligned base pointer and outer stride, and the\n+    # rows (or columns) must not overlap, which rules out expanded views.\n     stride_alignment = 16 // a.element_size()\n \n     def _align_outer_stride(t: torch.Tensor) -> torch.Tensor:\n-        if t.stride(0) % stride_alignment == 0:\n+        # Keep a column-major operand column-major; take anything else row-major.\n+        inner = 0 if t.stride(0) == 1 and t.stride(1) != 1 else 1\n+        outer = 1 - inner\n+        if (\n+            t.stride(inner) == 1\n+            and t.stride(outer) >= t.shape[inner]\n+            and t.stride(outer) % stride_alignment == 0\n+            and t.data_ptr() % 16 == 0\n+        ):\n             return t\n-        outer_stride = (t.shape[1] + stride_alignment - 1) // stride_alignment * stride_alignment\n-        aligned = t.new_empty_strided(t.shape, (outer_stride, 1))\n+        # Copy into that layout with the outer stride padded.\n+        strides = [1, 1]\n+        strides[outer] = (\n+            (t.shape[inner] + stride_alignment - 1) // stride_alignment * stride_alignment\n+        )\n+        aligned = t.new_empty_strided(t.shape, strides)\n         aligned.copy_(t)\n         return aligned\n \n@@ -559,7 +595,10 @@ def _align_outer_stride(t: torch.Tensor) -> torch.Tensor:\n     N = b.shape[1]\n     output_stride = (N + stride_alignment - 1) // stride_alignment * stride_alignment\n     d = a.new_empty_strided((M, N), (output_stride, 1))\n-    deep_gemm.bf16_gemm_nn(a, b, d)\n+    # Compile only N into the JIT kernel. The token count is K in weight-gradient\n+    # GEMMs (`grad.t() @ x`, TE's NT layout) and M in all others, so compiling\n+    # either would build a new kernel for every new token count.\n+    deep_gemm.bf16_gemm_nn(a, b, d, compiled_dims=\"n\")\n     return d.contiguous()\n \n \n@@ -1131,12 +1170,12 @@ def forward(\n         transb = layout[1].upper() == \"T\"\n \n         opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]\n-        # Triton's persistent GEMM consumes the operand strides directly. A\n-        # contiguous copy here materializes large TE projection weights on\n-        # every forward, including each CUDA-graph replay. DeepGEMM still\n-        # requires contiguous operands, and non-transposed layouts retain\n-        # their existing behavior.\n-        if not (transa and _BATCH_INVARIANT_BACKEND == \"triton\"):\n+        # Triton's persistent GEMM consumes the operand strides directly, and\n+        # DeepGEMM reads the transposed weight K-major in place. A contiguous\n+        # copy here materializes large TE projection weights on every forward,\n+        # including each CUDA-graph replay. Non-transposed layouts retain their\n+        # existing behavior.\n+        if not transa:\n             opA = opA.contiguous()\n         opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]\n \n@@ -1840,7 +1879,11 @@ def enable_batch_invariant_mode(backend: str = \"te_native\", collective: str = \"o\n         backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.\n             \"te_native\" (default) keeps the native cuBLASLt kernels and obtains\n             invariance via workspace starvation. \"deepgemm\" routes bf16 CUDA\n-            inputs through DeepGEMM `bf16_gemm_nn`. \"triton\" routes through the batch-invariant\n+            inputs through DeepGEMM `bf16_gemm_nn` and turns on DeepGEMM's\n+            process-global deterministic algorithms, which\n+            `disable_batch_invariant_mode` turns back off; DeepGEMM has no\n+            getter, so a value set before enabling is not restored.\n+            \"triton\" routes through the batch-invariant\n             Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and\n             on any CUDA device). \"te_native\" keeps the native cuBLASLt\n             kernels (aten and TE) and obtains invariance via workspace\n@@ -1865,6 +1908,10 @@ def enable_batch_invariant_mode(backend: str = \"te_native\", collective: str = \"o\n         )\n     _BATCH_INVARIANT_BACKEND = backend\n     dispatch_key = getattr(torch.accelerator.current_accelerator(), \"type\", \"cpu\").upper()\n+    if backend == \"deepgemm\":\n+        # DeepGEMM sends dense bf16 GEMMs to cuBLASLt's heuristic algorithms unless\n+        # its deterministic algorithms are on; the backend needs DeepGEMM's kernels.\n+        _set_deepgemm_deterministic_algorithms(True)\n     _batch_invariant_MODE = True\n     _batch_invariant_LIB = torch.library.Library(\"aten\", \"IMPL\")\n     if backend == \"te_native\":\n@@ -1900,7 +1947,11 @@ def enable_batch_invariant_mode(backend: str = \"te_native\", collective: str = \"o\n \n \n def disable_batch_invariant_mode():\n-    \"\"\"Disable global batch-invariant mode and restore original kernels.\"\"\"\n+    \"\"\"Disable global batch-invariant mode and restore original kernels.\n+\n+    If the mode turned on DeepGEMM's deterministic algorithms (deepgemm backend),\n+    they are turned off, also for other DeepGEMM users in the process.\n+    \"\"\"\n     global _batch_invariant_MODE, _batch_invariant_LIB\n     if _batch_invariant_LIB is not None:\n         _batch_invariant_LIB._destroy()\n@@ -1910,6 +1961,7 @@ def disable_batch_invariant_mode():\n     _te_unpatch_for_batch_invariant()\n     _disable_te_native_workspace_starvation()\n     _unpin_mamba_autotuners()\n+    _set_deepgemm_deterministic_algorithms(False)\n \n \n # (autotuner, original configs list) pairs saved by _pin_mamba_autotuners.",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/8e679cd9213924f2d09b40b2c895ce9b828fb9fa/megatron%2Fcore%2Ftransformer%2Fcustom_layers%2Fbatch_invariant_kernels.py",
+      "sha": "89f250999a2351c15d09623591842b2065075f90",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/8e679cd9213924f2d09b40b2c895ce9b828fb9fa/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py?ref=8e679cd9213924f2d09b40b2c895ce9b828fb9fa",
+      "deletions": 0,
+      "filename": "tests/unit_tests/determinism/kernels/manifest.py",
+      "patch": "@@ -687,6 +687,8 @@ class KernelEntry:\n             \"tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py\",\n         ),\n         kind=\"triton\",\n+        notes=\"The deepgemm backend's dense GEMM must profile as DeepGEMM's own kernel, not its \"\n+        \"cuBLASLt dispatch, and keep a row's bits across batch sizes.\",\n     ),\n     KernelEntry(\n         name=\"mtp_speculative_decoding_kernels\",",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/8e679cd9213924f2d09b40b2c895ce9b828fb9fa/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py",
+      "sha": "08efbd0fd59ad62e80ed559a5cca20835a2e1b76",
+      "status": "modified"
+    },
+    {
+      "additions": 152,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/8e679cd9213924f2d09b40b2c895ce9b828fb9fa/tests%2Funit_tests%2Finference%2Ftest_batch_invariant_deepgemm_stride.py",
+      "changes": 154,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Finference%2Ftest_batch_invariant_deepgemm_stride.py?ref=8e679cd9213924f2d09b40b2c895ce9b828fb9fa",
+      "deletions": 2,
+      "filename": "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
+      "patch": "@@ -1,13 +1,18 @@\n # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n import pytest\n import torch\n+import torch.nn.functional as F\n+from torch.profiler import ProfilerActivity, profile\n \n from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik\n \n _SUPPORTED = bik.HAVE_DEEPGEMM_BF16 and torch.cuda.is_available()\n _HOPPER = _SUPPORTED and torch.cuda.get_device_capability()[0] >= 9\n pytestmark = pytest.mark.skipif(not _HOPPER, reason=\"Requires BF16 DeepGEMM on Hopper or newer.\")\n \n+# DeepGEMM's own dense kernels are sm90_bf16_gemm_impl and sm100_bf16_gemm_impl.\n+_DEEPGEMM_DENSE_KERNEL = \"bf16_gemm_impl\"\n+\n \n @pytest.mark.parametrize(\"k, n\", [(128, 60), (60, 128), (128, 128)])\n def test_dense_deepgemm_stride_boundary_is_batch_invariant(monkeypatch, k, n):\n@@ -18,9 +23,9 @@ def test_dense_deepgemm_stride_boundary_is_batch_invariant(monkeypatch, k, n):\n     calls = []\n     native = bik.deep_gemm.bf16_gemm_nn\n \n-    def witness(a, b, d):\n+    def witness(a, b, d, **kwargs):\n         calls.append((a.stride(0), b.stride(0), d.stride(0), a.data_ptr(), b.data_ptr()))\n-        return native(a, b, d)\n+        return native(a, b, d, **kwargs)\n \n     monkeypatch.setattr(bik.deep_gemm, \"bf16_gemm_nn\", witness)\n     bik.enable_batch_invariant_mode(backend=\"deepgemm\", collective=\"ordered\")\n@@ -37,3 +42,148 @@ def witness(a, b, d):\n     for strides in (call[:3] for call in calls):\n         assert strides == ((k + 7) // 8 * 8, (n + 7) // 8 * 8, (n + 7) // 8 * 8)\n     assert k != n or calls[0][3:] == (small.data_ptr(), weight.data_ptr())\n+\n+\n+def test_dense_deepgemm_runs_deepgemm_kernel(monkeypatch):\n+    \"\"\"The backend runs DeepGEMM's fixed-K-order kernel, not DeepGEMM's cuBLASLt dispatch.\"\"\"\n+    switch = []\n+    native_switch = bik.deep_gemm.use_deterministic_algorithms\n+\n+    def record_switch(enabled):\n+        switch.append(enabled)\n+        return native_switch(enabled)\n+\n+    monkeypatch.setattr(bik.deep_gemm, \"use_deterministic_algorithms\", record_switch)\n+    x = torch.randn(64, 4096, device=\"cuda\", dtype=torch.bfloat16)\n+    weight = torch.randn(4096, 4096, device=\"cuda\", dtype=torch.bfloat16)\n+    bik.enable_batch_invariant_mode(backend=\"deepgemm\", collective=\"ordered\")\n+    try:\n+        F.linear(x, weight)  # JIT-compile outside the trace.\n+        torch.cuda.synchronize()\n+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:\n+            F.linear(x, weight)\n+            torch.cuda.synchronize()\n+    finally:\n+        bik.disable_batch_invariant_mode()\n+    names = sorted({event.name for event in prof.events()})\n+    assert any(_DEEPGEMM_DENSE_KERNEL in name for name in names), names\n+    assert switch == [True, False]\n+\n+\n+@pytest.mark.parametrize(\"backend\", [\"te_native\", \"triton\"])\n+def test_other_backends_leave_deepgemm_switch_alone(monkeypatch, backend):\n+    \"\"\"Only the deepgemm backend runs DeepGEMM's dense GEMMs, so only it sets DeepGEMM's switch.\"\"\"\n+    switch = []\n+    monkeypatch.setattr(bik.deep_gemm, \"use_deterministic_algorithms\", switch.append)\n+    bik.enable_batch_invariant_mode(backend=backend, collective=\"ordered\")\n+    bik.disable_batch_invariant_mode()\n+    assert switch == []\n+\n+\n+@pytest.mark.parametrize(\"k, n\", [(4096, 4096), (16384, 64)])\n+def test_dense_deepgemm_rows_are_invariant_across_batch_size(k, n):\n+    \"\"\"A token's output row has the same bits whatever the number of rows beside it.\"\"\"\n+    generator = torch.Generator(device=\"cuda\").manual_seed(0)\n+    weight = (torch.randn(n, k, device=\"cuda\", generator=generator) * 0.02).to(torch.bfloat16)\n+    target = torch.randn(k, device=\"cuda\", generator=generator).to(torch.bfloat16)\n+    rows = {}\n+    bik.enable_batch_invariant_mode(backend=\"deepgemm\", collective=\"ordered\")\n+    try:\n+        for m in (1, 16, 256, 4096):\n+            x = torch.randn(m, k, device=\"cuda\", generator=generator).to(torch.bfloat16)\n+            x[0] = target\n+            rows[m] = F.linear(x, weight)[0]\n+    finally:\n+        bik.disable_batch_invariant_mode()\n+    reference = target.double() @ weight.double().t()\n+    torch.testing.assert_close(rows[1].double(), reference, atol=0.05, rtol=0.02)\n+    for m, row in rows.items():\n+        assert torch.equal(row, rows[1]), f\"row 0 at M={m} differs from M=1\"\n+\n+\n+@pytest.mark.parametrize(\"n, k\", [(4096, 4096), (128, 60)])\n+def test_transposed_weight_reaches_deepgemm_uncopied(monkeypatch, n, k):\n+    \"\"\"Linear layers hand DeepGEMM their weight K-major, copied only for an unaligned K.\"\"\"\n+    weight = (torch.randn(n, k, device=\"cuda\") * 0.02).to(torch.bfloat16)\n+    x = torch.randn(64, k, device=\"cuda\").to(torch.bfloat16)\n+    reference = x.double() @ weight.double().t()\n+    operands = []\n+    native = bik.deep_gemm.bf16_gemm_nn\n+\n+    def witness(a, b, d, **kwargs):\n+        operands.append((b.untyped_storage().data_ptr(), b.stride()))\n+        return native(a, b, d, **kwargs)\n+\n+    monkeypatch.setattr(bik.deep_gemm, \"bf16_gemm_nn\", witness)\n+    linears = {\n+        \"F.linear\": lambda: F.linear(x, weight),\n+        \"matmul\": lambda: torch.matmul(x, weight.t()),\n+        \"TE TN GEMM\": lambda: bik.BatchInvariantTEGemmFn.apply(\n+            weight, x, None, torch.bfloat16, \"TN\"\n+        ),\n+    }\n+    # DeepGEMM reads b = weight.t() K-major; only an unaligned K needs a padded copy.\n+    expected_strides = (1, (k + 7) // 8 * 8)\n+    bik.enable_batch_invariant_mode(backend=\"deepgemm\", collective=\"ordered\")\n+    try:\n+        for name, linear in linears.items():\n+            operands.clear()\n+            output = linear()\n+            assert len(operands) == 1, name\n+            storage, strides = operands[0]\n+            assert strides == expected_strides, (name, strides)\n+            assert (storage == weight.untyped_storage().data_ptr()) == (k % 8 == 0), name\n+            torch.testing.assert_close(output.double(), reference, atol=0.05, rtol=0.02)\n+    finally:\n+        bik.disable_batch_invariant_mode()\n+\n+\n+@pytest.mark.parametrize(\"out_features, tokens, in_features\", [(4096, 37, 1024), (60, 64, 128)])\n+def test_weight_gradient_reads_column_major_grad(monkeypatch, out_features, tokens, in_features):\n+    \"\"\"aten's weight gradient `grad.t() @ x` reaches DeepGEMM MN-major, with K = token count.\"\"\"\n+    grad = torch.randn(tokens, out_features, device=\"cuda\").to(torch.bfloat16)\n+    x = torch.randn(tokens, in_features, device=\"cuda\").to(torch.bfloat16)\n+    reference = grad.double().t() @ x.double()\n+    calls = []\n+    native = bik.deep_gemm.bf16_gemm_nn\n+\n+    def witness(a, b, d, **kwargs):\n+        calls.append((a.untyped_storage().data_ptr(), a.stride(), kwargs.get(\"compiled_dims\")))\n+        return native(a, b, d, **kwargs)\n+\n+    monkeypatch.setattr(bik.deep_gemm, \"bf16_gemm_nn\", witness)\n+    bik.enable_batch_invariant_mode(backend=\"deepgemm\", collective=\"ordered\")\n+    try:\n+        wgrad = torch.mm(grad.t(), x)\n+    finally:\n+        bik.disable_batch_invariant_mode()\n+    assert len(calls) == 1\n+    storage, strides, compiled_dims = calls[0]\n+    # grad.t() stays column-major: in place, or a padded copy for an unaligned out_features.\n+    assert strides == (1, (out_features + 7) // 8 * 8)\n+    assert (storage == grad.untyped_storage().data_ptr()) == (out_features % 8 == 0)\n+    # The token count must not be compiled into the kernel (one JIT build per count).\n+    assert compiled_dims is not None and \"k\" not in compiled_dims\n+    torch.testing.assert_close(wgrad.double(), reference, atol=1e-2, rtol=1e-2)\n+\n+\n+def test_expanded_operand_is_copied(monkeypatch):\n+    \"\"\"A broadcast view (outer stride 0) is copied rather than handed to DeepGEMM's TMA.\"\"\"\n+    x = torch.randn(64, 128, device=\"cuda\").to(torch.bfloat16)\n+    column = torch.randn(128, 1, device=\"cuda\").to(torch.bfloat16)\n+    reference = x.double() @ column.double().expand(128, 32)\n+    strides = []\n+    native = bik.deep_gemm.bf16_gemm_nn\n+\n+    def witness(a, b, d, **kwargs):\n+        strides.append(b.stride())\n+        return native(a, b, d, **kwargs)\n+\n+    monkeypatch.setattr(bik.deep_gemm, \"bf16_gemm_nn\", witness)\n+    bik.enable_batch_invariant_mode(backend=\"deepgemm\", collective=\"ordered\")\n+    try:\n+        output = torch.mm(x, column.expand(128, 32))\n+    finally:\n+        bik.disable_batch_invariant_mode()\n+    assert strides == [(1, 128)]\n+    torch.testing.assert_close(output.double(), reference, atol=1e-2, rtol=1e-2)",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/8e679cd9213924f2d09b40b2c895ce9b828fb9fa/tests%2Funit_tests%2Finference%2Ftest_batch_invariant_deepgemm_stride.py",
+      "sha": "45153670b81ec377bc2449b358333f095d6f91b6",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+      "created_at": "2026-11-03T04:21:07Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8867#issuecomment-6595370684",
+      "id": 6595370684,
+      "updated_at": "2026-11-03T04:21:07Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    }
+  ],
+  "number": 8867,
+  "refs": {
+    "base": {
+      "commit": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "8e679cd9213924f2d09b40b2c895ce9b828fb9fa",
+      "repository": "lmcafee-nvidia/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": []
+}

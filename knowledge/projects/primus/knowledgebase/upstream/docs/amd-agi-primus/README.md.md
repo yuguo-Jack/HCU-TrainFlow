@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
 path: README.md
-raw_sha256: da7a135294ce239c33abefaeddf09aa2efc066cee6a8c887f66de5fbe0528e2d
+raw_sha256: 2d1bca053a8e10b7fdf55e859aac1c9058a2a7e439be1922ea65486f3c5c404f
 sources: []
-generated_body_sha256: 8c6558cd4088de5e2e5aa7f9624c8d7ec5193b1d2376945599e06f9562b324a9
+generated_body_sha256: 6e694512dd23fc4aae1200981bd0c84d655263a71471d333ff41182e2e5b2ab9
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / README.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/README.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -58,6 +58,7 @@ Upstream source document; original commands, claims and links require their stat
 - **MaxText (JAX)**: LLaMA2 / LLaMA3.x, DeepSeek-V2 16B, Mixtral-8x7B, Grok1, and Qwen3 14B / 30B-A3B (subset; see MaxText docs for details)
 - **Megatron-Bridge**: SFT and LoRA post-training for Qwen3 8B/32B, LLaMA3.1 70B, Zebra-LLaMA, and Mamba
 - **Diffusion**: Flux.1 (schnell / dev) text-to-image and Wan 2.1 / 2.2 text- and image-to-video
+- **AutoModel**: Flux.1, Wan 2.2 and Ideogram-4 diffusion training through AutoModel's diffusion recipe ([examples](./examples/automodel/README.md))
 
 For the full and up-to-date model matrix, see [Supported Models](./docs/06-developer-guide/model-support-matrix.md).
 

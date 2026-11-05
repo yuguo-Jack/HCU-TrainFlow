@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: modelscope/ms-swift
-commit: 22249748429ce7e8516640e35cbe997e572a233a
+commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
 path: docs/source_en/GetStarted/Quick-start.md
-raw_sha256: 7aae5e8e70ecafc28deb8900771da657a982e84fb510790b0e64b9eb4987ff2f
+raw_sha256: 81080e0f446e32f0f1f16b2c62d0cbdd8f48c0c16201009c582391ebf6a866c1
 sources: []
-generated_body_sha256: 76d9a96bce9e0dcd9c2484ba671161970598c6bd250691869652be87e5dc879b
+generated_body_sha256: 942019b87a66c832e626861ff0f52569d0ff9387383e09574a73afa2039fc9c0
 source_state: current-scan
 ---
 
 # modelscope/ms-swift / docs/source_en/GetStarted/Quick-start.md
 
-[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/docs/source_en/GetStarted/Quick-start.md)
+[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/docs/source_en/GetStarted/Quick-start.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -36,7 +36,7 @@ Upstream source document; original commands, claims and links require their stat
 
 - 🍎 **Model Types**: Supports **600+ text-only large models**, **400+ multimodal large models**, and All-to-All full modality models from training to deployment full pipeline, with Day-0 support for popular models.
 - **Dataset Types**: Built-in 150+ datasets for pre-training, fine-tuning, human alignment, multimodal and various other tasks, with support for custom datasets. Users only need to prepare datasets for one-click training.
-- **Hardware Support**: Supports NVIDIA GPUs (A100/H100/RTX series, etc., via CUDA), AMD GPUs (MI300 series, etc., via ROCm), domestic hardware such as Ascend NPU and MetaX GPU, as well as Apple MPS and CPU.
+- **Hardware Support**: Supports NVIDIA GPUs (A100/H100/RTX series, etc., via CUDA), AMD GPUs (MI300 series, etc., via ROCm), domestic hardware such as Huawei Ascend NPU and MetaX GPU, as well as Apple MPS and CPU.
 - **Lightweight Training**: Supports lightweight fine-tuning methods such as LoRA, QLoRA, DoRA, LoRA+, LLaMAPro, LongLoRA, LoRA-GA, ReFT, RS-LoRA, Adapter, LISA, etc.
 - **Quantized Training**: Supports training on BNB, AWQ, GPTQ, AQLM, HQQ, EETQ quantized models, requiring only 9GB training resources for 7B models.
 - **Memory Optimization**: GaLore, Q-Galore, UnSloth, Liger-Kernel, Flash-Attention 2/3, and **Ulysses and Ring-Attention sequence parallelism techniques** support, reducing memory consumption for long-text training.

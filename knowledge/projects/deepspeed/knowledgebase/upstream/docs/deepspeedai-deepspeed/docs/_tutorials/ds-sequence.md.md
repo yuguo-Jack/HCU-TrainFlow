@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/ds-sequence.md
-raw_sha256: aee1045e37a005ce68ba60c7f1eb25d7be3573ba108da9a2316deec35fd283f5
+raw_sha256: e4a0f06db8ea40116ae085766bfeaafe342b4526d83f5f8d0b66c1a2c9a35738
 sources: []
-generated_body_sha256: 15a0ea5e2a46e87beb28d05420c545713b2d23b750461a25deec0a5dc9ee3704
+generated_body_sha256: c2beee242b248fbbb867bbf20d7b915330916a8b23aedcc2ae3bf3106aaa09f1
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/ds-sequence.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/ds-sequence.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/ds-sequence.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,7 +38,7 @@ If you're interested in a newer version that works with HF Transformers, please 
 
 ## 1. Installation
 
-You will need to install DeepSpeed v0.10.2 or higher to use the DeepSpeed Sequence feature. Installing DeepSpeed is as simple as `pip install deepspeed`, [see more details](/tutorials/getting-started/).
+You will need to install DeepSpeed v0.10.2 or higher to use the DeepSpeed Sequence feature. Installing DeepSpeed is as simple as `pip install deepspeed`, [see more details](/getting-started/).
 
 
 ## 2. How to use DeepSpeed-Ulysses in your application?
@@ -107,7 +107,7 @@ def get_sequence_parallel_group():
 
 ```
 
-In the Megatron-DeepSpeed exampele, to enable sequence parallelism, set the degree of parallelism using the --ds-sequence-parallel-size argument. You also need to ensure that the number of attention heads is divisible by this value.
+In the Megatron-DeepSpeed example, to enable sequence parallelism, set the degree of parallelism using the --ds-sequence-parallel-size argument. You also need to ensure that the number of attention heads is divisible by this value.
 We have prepared scripts for you to quickly get some examples for training GPT-3 like models with very long sequences:
 
 ```shell

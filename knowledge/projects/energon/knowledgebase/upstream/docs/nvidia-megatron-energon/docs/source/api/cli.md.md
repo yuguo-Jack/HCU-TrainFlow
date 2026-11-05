@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/api/cli.md
-raw_sha256: eb565200496f70c6b7366541261438d207efcee272d1fde7b3a8bf51c814ed60
+raw_sha256: 8bc0e90114d94d710a2c4304c8979eef851fd9e1416b8d7b0d45da3dc565af11
 sources: []
-generated_body_sha256: 5804f723e8e90c599aa86ac48652210ccad52f21a2cee85b423fca08972e9a0f
+generated_body_sha256: 51e34691b7ad9cb98a584649606134517016cbe88e567ec20fed4c5f24c89a99
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/api/cli.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/api/cli.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/api/cli.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -42,7 +42,7 @@ energon prepare /mnt/data/my_captioning_webdataset
 
 The above command will scan your existing off-the-shelf [web dataset](https://webdataset.github.io/webdataset/)
 and add the [needed metadata](data-on-disk) to make it compatible with Energon.
-The same command can also prepare JSONL files.
+The same command can also prepare JSONL files and JSONL shard directories.
 
 Below, you can see the available sub-commands under `energon`.
 

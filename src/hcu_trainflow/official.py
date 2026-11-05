@@ -538,7 +538,10 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
     paths,excluded=select_document_paths(source,tree['entries'])
     def needs_copy(p):
         old=ledger['records'].get(p,{})
-        return old.get('blob')!=tree['entries'][p]['sha'] or not old.get('page') or not child(project,old['page']).is_file()
+        entry=tree['entries'][p]
+        # Contents API follows a symlink; its target can change without the link blob changing.
+        stale_target=entry.get('mode')=='120000' and old.get('commit')!=sha
+        return old.get('blob')!=entry['sha'] or stale_target or not old.get('page') or not child(project,old['page']).is_file()
     pending=[p for p in paths if needs_copy(p)]
     errors=[];processed=[]
     for path in pending[:max_documents]:
@@ -564,7 +567,7 @@ def sync_documents(store, project, source_id, token=None, max_documents=40):
         if not page.exists():continue
         meta,body=wiki.parse_page(page)
         state='current-scan' if name in paths else 'outside-current-scan' if name in tree['entries'] else 'removed-from-latest-tree'
-        if name in paths and row.get('blob')!=tree['entries'][name]['sha']:state='pending-newer-content'
+        if name in paths and needs_copy(name):state='pending-newer-content'
         if meta.get('source_state')!=state:
             meta['source_state']=state
             try:generated_page(page,meta,body)
@@ -600,7 +603,8 @@ def catalog(project):
         if source.get('kind')!='web':
             for page in sorted(layout.pr_root(project,source['repository']).glob('PR-*.md')):
                 meta,_=wiki.parse_page(page)
-                body+=f'- [PR #{meta["pr_number"]}：{meta["title"]}](../{page.relative_to(root).as_posix()})\n'
+                title=meta['title'].replace('[','&#91;').replace(']','&#93;')
+                body+=f'- [PR #{meta["pr_number"]}：{title}](../{page.relative_to(root).as_posix()})\n'
         body+='\n'
     generated_page(root/'catalog/README.md',{'id':'official-source-catalog','title':'官方源码 文档 PR 覆盖与更新索引',
         'kind':'source-map','engine':'cross-engine','review_level':'inventory-only','runtime_validated':False,'sources':[]},body)

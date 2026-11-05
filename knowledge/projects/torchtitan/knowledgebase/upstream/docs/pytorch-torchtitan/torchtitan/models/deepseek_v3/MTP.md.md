@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/models/deepseek_v3/MTP.md
-raw_sha256: 45781073a5f9fefa12b8a1cd4ea5f7b9b11c14d852d675875fd765480eaf1994
+raw_sha256: 34f1e5f5eedb4ccb56571720c42ee6fb3712e396b2fbabbfb2a46e906c29f8ca
 sources: []
-generated_body_sha256: 3025eb5b501fd27aaa83f51e3d32800d853cc6770c1f3b64dfb68605dfa66a4d
+generated_body_sha256: bb3072936f65bcfea261618cd2e129bede5a1cb6e9c2fba860d028f9db1d3292
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/deepseek_v3/MTP.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/deepseek_v3/MTP.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/deepseek_v3/MTP.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,7 +38,7 @@ DeepSeek-V3 MTP is currently enabled through the model config builder:
 
 - `build_model_config(..., num_mtp_layers=N)` controls whether MTP is enabled.
 - `_build_mtp_layers(...)` builds MTP layer configs from the last main decoder layer config.
-- `deepseek_v3_debugmodel_mtp()` is the current debug configuration example. It sets `num_mtp_layers=1` and uses `ChunkedLossWrapper` with `MTPLoss.Config(mtp_scale=0.3)` as its inner loss.
+- `deepseek_v3_debugmodel_mtp()` is the current debug configuration example. It sets `num_mtp_layers=1` and uses `ChunkedLossWrapper` with `MTPCrossEntropyLoss.Config(mtp_scale=0.3)` as its inner loss.
 
 Each MTP layer follows the normal decoder layer structure, with the following MTP-specific modules:
 
@@ -285,7 +285,7 @@ independent from MoE routing.
 
 ### 4.4 Loss Parallel
 
-When `global_vocab_size` is configured, `MTPLoss` uses the vocab size required by the loss-parallel cross entropy path. Main and auxiliary predictions share the same cross entropy helper so the loss semantics do not diverge across depths.
+When `global_vocab_size` is configured, `MTPCrossEntropyLoss` uses the vocab size required by the loss-parallel cross entropy path. Main and auxiliary predictions share the same cross entropy helper so the loss semantics do not diverge across depths.
 
 ### 4.5 Chunked Loss
 
@@ -293,7 +293,7 @@ When `global_vocab_size` is configured, `MTPLoss` uses the vocab size required b
 prediction and labels tuples. For each chunk it applies the shared LM head to
 every prediction, preserves the tensor-or-tuple structure when calling the
 inner loss, and routes one accumulated hidden-state gradient back to each model
-output. `MTPLoss` receives the aligned tuples and combines the main and weighted
+output. `MTPCrossEntropyLoss` receives the aligned tuples and combines the main and weighted
 auxiliary cross-entropy objectives.
 
 ## TODO

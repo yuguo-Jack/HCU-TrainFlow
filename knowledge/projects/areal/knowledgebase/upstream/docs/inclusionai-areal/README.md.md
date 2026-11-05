@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 3b93679888e9f4929f6f155f13c6a286a62dfd72
+commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
 path: README.md
-raw_sha256: ed1b3db840b6e56ede09fadb18f11894900cef42c76d4b5f1558786d6ffdd3b6
+raw_sha256: 7713e30d63e5dae416c1b870256996d4b5eccf18a4649f9b13d7e664d61228b4
 sources: []
-generated_body_sha256: a56f61967880c8d8033b6991890a4b18cd4fd95d4f77e57732c9d12ac19f4e12
+generated_body_sha256: c9951c986dc08a7c53e77893aca7470231e7c55decefdec05cf82e333279f608
 source_state: current-scan
 ---
 
 # areal-project/AReaL / README.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/3b93679888e9f4929f6f155f13c6a286a62dfd72/README.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -121,8 +121,8 @@ and the [announcement on X](https://x.com/guohao_li/status/2009678513574408636).
 
 **\[2026/01/01\]** Happy New Year! Thanks to the outstanding contribution from
 @HwVanICI, we are excited to officially announce stable support for AReaL training on
-**Ascend NPU devices**! The code is actively maintained and continuously updated in the
-[`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
+**Huawei Ascend NPU devices**! The code is actively maintained and continuously updated
+in the [`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
 [our documentation](https://areal-project.github.io/AReaL/en/tutorial/installation_npu.html)
 to get started, and feel free to report any issues!
 

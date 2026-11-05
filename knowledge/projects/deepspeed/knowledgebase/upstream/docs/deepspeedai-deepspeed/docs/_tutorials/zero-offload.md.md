@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/zero-offload.md
-raw_sha256: 7184e654521efa8a0c00d0d959ee79956b28c40620c78f29edfe821da8bd8b35
+raw_sha256: 02fe85c2863bbcddeabd266347aa1b2f98ceb67331f6b392916a11bd34fb0357
 sources: []
-generated_body_sha256: 10140443dda8a3ccd35d46c80e99286538d4ef5576be53a4779eb4ce550f2883
+generated_body_sha256: 873abffe966ff91ccc82d58c6099c35618d34ea9df1286044108ced15b224621
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/zero-offload.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/zero-offload.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/zero-offload.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -104,6 +104,7 @@ Finally, here is a screenshot of `htop` showing host CPU and memory activity dur
 
 ### CPU Adam perf tuning
 On AArch64 CPUs with SVE support, the FP32 `DeepSpeedCPUAdam` kernel uses SVE automatically; other data types use the scalar implementation there. AArch64 CPUs without SVE (including Apple Silicon) use NEON for FP32, FP16, and BF16.
+On RISC-V CPUs with the V extension, the FP32 `DeepSpeedCPUAdam` kernel uses RVV automatically; other data types, and CPUs without the V extension, use the scalar implementation.
 
 ZeRO offload already support multi-gpu training.  If the workload is using CPU optimizer, the workload can be further tuned by passing `--bind_cores_to_rank` to the deepspeed launch command. This switch will mainly do two things:
 1. Divide physical CPU cores evenly among ranks, make each rank to have a dedicated set of CPU cores to run CPU optimizer.

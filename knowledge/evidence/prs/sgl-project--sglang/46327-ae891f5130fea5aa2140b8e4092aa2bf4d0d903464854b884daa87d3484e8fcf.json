@@ -1,0 +1,772 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "49486ab3e2d0e168746b65c409fe89d1a301f140bf9e83c90cf975d0d678f142",
+      "isPrivate": false,
+      "numbers": [
+        46327,
+        46325,
+        46324,
+        46323,
+        46322,
+        46321,
+        46320,
+        46319
+      ],
+      "observed_at": "2026-11-04T17:05:37.149659+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4866,
+        "resetAt": "2026-11-04T17:50:07Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "f77064f635779601c7b20258ce45ded3fa00ac82",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\n\nDecode on gfx1151 (Strix Halo, LPDDR5X-8000, 256-bit bus, 256 GB/s theoretical) is memory-bound: over 98% of decode GPU time is in GEMMs. On HIP without AITER, unquantized linears run through `F.linear` (hipBLASLt). At M=1, hipBLASLt reaches only 132-193 GB/s on Llama-3.1-8B's shapes, 51-75% of the theoretical peak.\n\n## Root cause\n\nOn gfx1151 (and on gfx1100, see Results), a weight whose row stride is a multiple of 2 KiB puts the rows a skinny GEMM reads together onto the same L2/MALL channel. Most dense-model K dims qualify (bf16 K = 2048, 3072, 4096, 14336, ...).\n\nIf each row is offset by one 128 B cache line, they spread out again. The logical shape and values stay the same; only the stride changes.\n\nM=1 bf16, cold cache, best of 3, GB/s, plain row stride vs padded row stride, hipBLASLt default solutions, no TunableOp:\n\n| Llama-3.1-8B shape (K -> N) | plain | padded | change |\n|---|---|---|---|\n| QKV 4096 -> 6144 | 151.5 | 214.4 | +42% |\n| O 4096 -> 4096 | 131.6 | 213.3 | +62% |\n| gate/up 4096 -> 28672 | 182.6 | 223.0 | +22% |\n| down 14336 -> 4096 | 159.4 | 225.5 | +41% |\n| lm_head 4096 -> 128256 | 192.5 | 226.5 | +18% |\n| GEMM time per token | 89.0 ms | 67.6 ms | -24% |\n\nAll shapes reach 83-89% of peak after padding, and the output matches the unpadded output (relative error against fp32 is unchanged, 1.9-3.1e-3).\n\n## Fix\n\nWhen a qualifying unquantized weight finishes loading on gfx115x (RDNA3.5), give its rows a padded stride. This happens once per weight, at load time.\n\n- **Rule:** `(K * element_size) % 2048 == 0`. If it holds, the row stride grows by 128 B; it's the same rule as vLLM's `cache_aliasing_pad_elems`. Only bf16 and fp16 weights are padded, since those are what was measured. fp32 linears, such as the router gates in kimi_k3, longcat_flash and hunyuan_v3/v4, are left alone; vLLM pads them too, but that was never measured here. `K` is the weight tensor's own dim 1, so a tensor-parallel row shard is judged by its own K, not the full checkpoint K.\n- **Linear weights:** `UnquantizedLinearMethod.process_weights_after_loading` does the padding.\n- **lm_head:** `DefaultModelLoader.postprocess_weights` calls `finalize_gfx115_weight_padding(model)`, which pads every unquantized LM head:\n  - `ParallelLMHead`, untied.\n  - A tied head that is the input embedding module itself (`lm_head = model.embed_tokens`). 54 model files tie this way, and the embedding's quant method cannot tell it apart from an untied input embedding, so the model's module names decide.\n  - A tied head that shares a `Parameter` (`ParallelLMHead.tie_weights`). This is padded once.\n\n  An untied input embedding is never padded: it reads one row per token, so padding gains nothing.\n- **Gate:** `is_gfx115_supported()` is new in `srt/utils/common.py`: true on RDNA3.5 (`gcnArchName` starting with `gfx115`), with a `torch.cuda.is_available()` check. It's the gfx115x form of #47695's `is_gfx1151_supported()`.\n- **Opt-out:** setting `SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1` turns the padding off. It's on by default on gfx115x.\n- **Log:** the first load logs one INFO line listing the padded and skipped shapes. Later weight updates (for example, each RL weight sync) log the same line at DEBUG. That includes a speculative-decoding draft model, which is the second model loaded in the process, so its line is at DEBUG too. Example:\n  `gfx115x weight padding: padded {(6144, 4096): 32, (4096, 4096): 32, (28672, 4096): 32, (4096, 14336): 32, (128256, 4096): 1}; skipped {}`\n- **Memory:** the padded weights grow by 128 B per row, about 1.5% for K = 4096. Llama-3.1-8B: +0.24 GB on 16 GB. While one weight is being padded, `F.pad` briefly holds both copies, so peak extra memory during load is at most one LM head (about 1 GB for Llama-3.1-8B). That happens before KV-cache sizing, so it doesn't reduce the cache.\n\n## Results\n\nEach configuration was measured with padding on (default) and with `SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1`, on gfx1151.\n\nSettings:\n- Server: `--attention-backend triton --disable-overlap-schedule --mem-fraction-static 0.5 --context-length 8192`, plus `SGLANG_DISABLE_LEAN_ATTENTION=1`. Lean attention needs 66560 B of LDS, and RDNA has 65536.\n- Decode benchmark: `bench_serving` random, 1024 in / 256 out.\n- Prefill benchmark: 4000 in / 4 out.\n- Accuracy: sgl-eval 0.1.3 GSM8K, 200 questions, temperature 0, max-tokens 1024, 32 threads.\n\nThese numbers were measured without #45540 (RMSNorm via torch `rms_norm` on HIP), so both arms run the slower `forward_native` RMSNorm. The two PRs touch different files and don't depend on each other. With both merged, absolute tok/s will be higher; I haven't measured them together.\n\n**This branch, on main (638374c389):**\n\n| Model | 1-stream tok/s (TPOT) | 8-way tok/s | Prefill TTFT, 4000 tokens | 4-way prefill tok/s | GSM8K |\n|---|---|---|---|---|---|\n| Llama-3.1-8B-Instruct, off (2 runs) | 9.98 (98.4 ms) | 65.8 | 1786 ms | 3582 | 83.5, 81.5 |\n| Llama-3.1-8B-Instruct, **on** (2 runs) | **12.68 (76.9 ms), +27%** | **81.1, +23%** | 1785 ms | 3673 | 85.0, 84.5 |\n| Qwen2.5-3B-Instruct, off (3 runs) | 20.46 (48.1 ms) | 140.5 | 699 ms | 8818 | 85.0, 84.5, 85.5 |\n| Qwen2.5-3B-Instruct, **on** (4 runs) | **26.68 (36.8 ms), +30%** | **187.2, +33%** | 700 ms | 9110 | 84.0, 86.5, 85.0, 0.0 (see Known issues) |\n\nQwen2.5-3B covers the QKV bias, tied embeddings (`lm_head = model.embed_tokens`), and a skipped Down (K = 11008).\n\n**Same padding on an earlier experimental branch** (sglang at `pr31137`, padding behind a flag; that experiment also padded the untied input embedding):\n\n| Model | 1-stream tok/s | 8-way tok/s | Prefill TTFT | GSM8K |\n|---|---|---|---|---|\n| Phi-4-mini-instruct | 20.1 -> 23.4 (+16%) | 125.1 -> 140.0 (+12%) | 755 -> 756 ms | 91.0 -> 90.5% |\n| DeepSeek-V2-Lite-Chat (MoE) | 14.6 -> 16.4 (+12%) | 45.3 -> 47.7 (+5%) | 2783 -> 2820 ms | not usable (see Known issues) |\n\n**gfx1100 (Radeon PRO W7900D, 48 GB), measured independently by @LZ-QWQ** ([#30599 comment](https://github.com/sgl-project/sglang/issues/30599#issuecomment-6465927305)) at this PR's head `656e95c345`. Qwen3-8B bf16, TP1, decode CUDA graphs on, 3 runs per arm, without #45540:\n\n| Qwen3-8B on gfx1100 | Off | On |\n|---|---|---|\n| 1-stream tok/s (TPOT) | 19.40 (50.6 ms) | **22.79 (42.9 ms), +17.5%** |\n| 8-way tok/s (TPOT) | 135.6 (54.0 ms) | **156.5 (46.0 ms), +15.4%** |\n| Prefill TTFT, 4000 tokens | 1076 ms | 1095 ms (+1.7%) |\n| 4-way prefill tok/s | 3545 | 3515 (-0.8%) |\n| GSM8K (sgl-eval, 200 questions, 2 runs) | 95.5, 95.5 | 95.0, 95.5 |\n\nThe kernel-level table below gives +8% to +61% per shape on that card. All 12 tests in the new test file pass there, including the two device tests (run before the gate was narrowed to gfx115x; they're skipped on gfx1100 now). Their tree also carried the gfx1100 build and packaging enablement that `main` doesn't have yet (see #30599, #46900); both arms used that same tree.\n\n**Hidden size 5120: a small loss (Qwen3-14B, gfx1151).** K = 5120 rows are 10 KiB, 5 x 2 KiB, so the rule pads every linear here, but they alias much less than K = 4096. Qwen3-14B bf16 at `656e95c345` (this PR's commit, before the main merge), `--attention-backend triton --mem-fraction-static 0.8 --context-length 8192`, decode CUDA graphs on, same `bench_serving` settings as above, one server per arm, run off/on/off/on:\n\n| Qwen3-14B | Off (2 runs) | On (2 runs) |\n|---|---|---|\n| 1-stream tok/s (median TPOT) | 7.32 / 7.26 (133.4 / 134.0 ms) | 7.18 / 7.18 (135.7 / 135.7 ms), -1.5% |\n| 8-way tok/s (median TPOT) | 56.25 / 56.05 (141.5 / 142.0 ms) | 55.26 / 55.26 (144.0 / 144.0 ms), -1.6% |\n| GSM8K (200 questions, 5-shot, first pair) | 89.5 | 90.5 |\n\nPer shape at M=1 (`F.linear`, plain -> padded, GB/s), padding helps the small layers and slightly hurts the large ones: QKV 7168 x 5120 216 -> 224 (+4%), O 5120 x 5120 206 -> 220 (+7%), gate/up 34816 x 5120 235 -> 229 (-3%), down 5120 x 17408 225 -> 224 (-0.5%), lm_head 151936 x 5120 241 -> 231 (-4%). Weighted by bytes, that's about -0.8% of GEMM time, in line with the end-to-end result. Outputs are bitwise identical padded and unpadded.\n\n## What's not affected\n\n- **Prefill:** long-prompt GEMMs are compute-bound. TTFT and 4-way prefill throughput are within noise on every model (-3% to +4%).\n- **MoE experts:** fused-MoE expert weights are 3D and go through `UnquantizedFusedMoEMethod`, so they are not padded; vLLM doesn't pad them either. On DeepSeek-V2-Lite, the attention projections, shared experts and dense layer are padded, and `kv_b_proj` (K = 512) is skipped.\n- **Quantized layers:** only `UnquantizedLinearMethod` and unquantized LM heads are touched.\n- **fp32 weights**, for example MoE router gates, are left alone; only bf16/fp16 was measured.\n- **Outside gfx115x:** a no-op. `_is_gfx115` is computed once at import and is false on CUDA, CDNA, RDNA3 and CPU.\n- **Kernels reading raw weight pointers:** the CUDA-only bf16 GEMV/CuTe paths check `weight.is_contiguous()`. `apply_into` (`torch.mm(out=)`), `F.embedding` and the lm_head `torch.matmul` all honor strides. Model code that fuses weights after loading (`torch.cat(...).contiguous()` in qwen3_5, minimax_m3) simply produces a contiguous weight.\n\n## Related work\n\n- vLLM #55090 (`maybe_pad_weight_avoid_cache_aliasing`, `vllm/model_executor/layers/linear.py:230`): the same rule, measured on gfx1151 (its gate covers all of gfx11). It reports only -3% TPOT because vLLM decodes through `wvSplitK`, which is less sensitive to the aliasing. sglang's hipBLASLt path is hit much harder.\n- ROCm/hip-ep #1274: same cause (int4, gfx1151).\n- sglang's own XPU MoE padding (`xpu_moe_ld_padding_elems`): the same idea for Xe L3 set aliasing.\n\n## Kernel-level verification\n\n`F.linear` on Llama-3.1-8B's weight shapes, plain vs padded. Weights rotate through more than 512 MB so the cache can't help.\n\n**Gain per shape, BF16, M=1.** gfx1151 numbers are medians of 5 fresh processes; gfx1100 numbers are @LZ-QWQ's, from the same script:\n\n| Shape (K -> N) | gfx1151 plain -> padded (GB/s) | gfx1151 gain | gfx1100 plain -> padded (GB/s) | gfx1100 gain |\n|---|---|---|---|---|\n| QKV 4096 -> 6144 | 151.1 -> 212.2 | +40.4% | 351.6 -> 434.2 | +23.5% |\n| O 4096 -> 4096 | 131.5 -> 211.9 | +61.1% | 322.7 -> 397.4 | +23.1% |\n| gate/up 4096 -> 28672 | 182.4 -> 222.3 | +21.9% | 364.2 -> 587.1 | +61.2% |\n| down 14336 -> 4096 | 159.7 -> 224.7 | +40.7% | 424.3 -> 458.9 | +8.2% |\n| lm_head 4096 -> 128256 | 192.2 -> 225.8 | +17.5% | 649.9 -> 755.5 | +16.2% |\n\n**Order effects (gfx1151):** both layouts are allocated and warmed. Six rounds alternate plain-first and padded-first, 20 iterations each; each cell is the median of the per-round gains. Every round was positive.\n\n| Shape | bf16 M=1 | bf16 M=8 | fp16 M=1 | fp16 M=8 |\n|---|---|---|---|---|\n| QKV | +40.9% | +46.0% | +40.8% | +40.5% |\n| O | +61.5% | +57.0% | +57.3% | +56.6% |\n| gate/up | +22.1% | +27.9% | +20.6% | +21.7% |\n| down | +41.5% | +26.4% | +27.3% | +26.5% |\n| lm_head | +17.8% | +24.2% | +16.3% | +17.2% |\n\n**Numerics (gfx1151):** 30 cases (5 shapes x bf16/fp16 x M = 1, 8, 300, normalized random weights, with bias).\n- Padding keeps every logical weight exactly.\n- Padded and unpadded outputs are bitwise identical in all 30 cases.\n- Both match an fp32 reference: bf16 `rtol=1.6e-2, atol=1e-2`, fp16 `rtol=2e-3, atol=2e-3`.\n\nThese are standalone GEMM tests; the unit tests and end-to-end runs cover SGLang's load and reload hooks.\n\n## Testing\n\n`test/registered/unit/layers/quantization/test_unquant_gfx115_weight_padding.py`:\n\n- **CPU, registered in `base-a-test-cpu`:**\n  - The pad rule counts row bytes, not elements.\n  - The pad keeps shape and values and gives the same `F.linear` output, with bias.\n  - The gate leaves the weight untouched off gfx115x, when opted out, when already padded, when non-contiguous, and for fp32.\n  - An untied input embedding is not padded.\n  - Tied heads, both forms, are padded once and still embed correctly, including across a second postprocess pass (a reload).\n  - A quantized head is not padded.\n  - A reload writes into the padded storage, keeping the stride and the pointer. This holds for `ColumnParallelLinear`, and at TP=4 through the checkpoint loaders models actually use: `QKVParallelLinear` and `MergedColumnParallelLinear` (which slice rows) and `RowParallelLinear` (which slices K). After the reload, values match an unpadded layer loaded the same way.\n  - The log line is INFO on the first load and DEBUG on later passes.\n  - A TP=4 `RowParallelLinear` is judged by its 768-element shard, not K = 3072.\n- **gfx115x GPU** (skipped elsewhere, since most CI is NVIDIA or MI300). Run locally on gfx1151, and by @LZ-QWQ on gfx1100:\n  - hipBLASLt output matches unpadded on Llama shapes at M = 1, 8 and 300, with bias.\n  - A tied head embeds and projects correctly on device.\n- **Mutation checks:** 13 of 13 mutations caught (element-based rule, padding every embedding, dropping the tied-module case, dropping the loader call, no contiguity check, opt-out ignored, gate ignored, quantized head padded, linear hook removed, full-K instead of shard-K, wrong view slice, no dtype limit, logging at INFO on every pass).\n\nRepro:\n\n```bash\npython test/registered/unit/layers/quantization/test_unquant_gfx115_weight_padding.py -v\n\nSGLANG_DISABLE_LEAN_ATTENTION=1 [SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1] \\\npython -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \\\n  --attention-backend triton --disable-overlap-schedule --mem-fraction-static 0.5 --context-length 8192\npython -m sglang.bench_serving --backend sglang --dataset-name random --random-input-len 1024 \\\n  --random-output-len 256 --random-range-ratio 1 --num-prompts 8 --max-concurrency 1\nsgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1 --num-examples 200 --temperature 0 \\\n  --max-tokens 1024 --num-threads 32\n```\n\n## Scope and limits\n\n- **Hardware:** per review, the gate covers gfx115x (RDNA3.5: gfx1150 Strix Point, gfx1151 Strix Halo, gfx1152 Krackan Point), the same scope #47695 is moving to. Only gfx1151 was measured end to end (here and in vLLM #55090). gfx1150 and gfx1152 have a narrower memory system and are untested; owners, please report on #30599, and the opt-out exists for exactly that. RDNA3 (gfx110x) is outside the gate because `main` doesn't officially support it yet, even though @LZ-QWQ measured a gain on gfx1100; the gate can widen once it does.\n- **Hidden size 5120:** on Qwen3-14B (all linears K = 5120 or 17408) padding is 1.5% slower end to end; see Results. Other hidden-5120 models (for example Qwen2.5-14B, Phi-4) have the same K = 5120 rows but weren't measured. The rule is kept as is, the same as vLLM's. `SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1` turns it off for such models.\n- **Weight reload:**\n  - Reloads through `update_weights_*` keep the padding: the loaders copy into the padded storage (`narrow().copy_()`), and `postprocess_weights` re-runs. The second pass skips weights that are already padded, so storage pointers stay stable for CUDA graphs.\n  - If a loader rebinds a weight to a fresh contiguous tensor, the re-run pads it again.\n  - Loaders that bypass `DefaultModelLoader.postprocess_weights` (dummy, sharded-state, remote-instance) still pad linear weights but not the LM head. That affects only speed.\n- **Head detection:** an LM head is found by type (`ParallelLMHead`) or by the attribute name `lm_head`. A tied head stored under another name (for example `embed_out`) isn't padded, which costs only speed.\n\n## Known issues, unrelated or unresolved\n\n- **One collapsed Qwen2.5-3B GSM8K run with padding on (0.0%).** From the first token of every answer, the output was the same garbage regardless of the question, with speed normal. It didn't reproduce:\n  - 3 further padded runs, with the same script and server sequence, scored 84.0-86.5%.\n  - Single-prompt checks after each benchmark stage were correct.\n  - Concurrent 32-thread probes, with and without CUDA graphs, were correct.\n  - A launch-loop test then started 50 fresh Qwen2.5-3B servers, alternating 25 padded and 25 opted out. Each server got 5 fixed prompts and then a burst of 32 concurrent requests, all checked against the expected answers. All 50 launches answered every prompt correctly.\n  - Every launch was instrumented:\n    - A SHA-256 over every parameter after loading, computed on the logical values. All 50 launches had the same hash, padded or not.\n    - The tie (`lm_head` and `embed_tokens`): same module, same `Parameter`, same `data_ptr()` in every launch. The row stride was 2112 padded and 2048 opted out.\n    - No NaN or Inf in any weight, in the first 50 eager-mode logits, or in any returned logprob.\n\n  So I report it as a one-off that couldn't be reproduced. Before this test, padded runs had 1 collapse in 6 and opted-out runs 0 in 5. The launch loop doesn't replay the full benchmark sequence that came before the collapse, and the logits check doesn't cover decode steps replayed from CUDA graphs. @LZ-QWQ's two padded GSM8K runs on gfx1100 also showed no collapse. A similar intermittent breakdown happens with padding off on this stack: DeepSeek-V2-Lite's GSM8K answers degenerate into `!!!!` in 130 of 200 answers unpadded and 115 of 200 padded.\n- **DeepSeek-V2-Lite `!!!!` breakdown:** happens without this PR. Please don't attribute it to this change.\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:hourglass_flowing_sand: [Run #41597855958](https://github.com/sgl-project/sglang/actions/runs/41597855958)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #41597855980](https://github.com/sgl-project/sglang/actions/runs/41597855980)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:hourglass_flowing_sand: [Run #41597856070](https://github.com/sgl-project/sglang/actions/runs/41597856070)<!-- slot:pr-test-amd:end -->\n\n> [!TIP]\n> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:\n>\n> ```text\n> Find the registered tests this PR affects and run them with /rerun-test, following https://github.com/sgl-project/sglang/blob/main/.agents/skills/rerun-test/SKILL.md\n> ```\n<!-- pr-states:end -->\n\n",
+      "changedFiles": 5,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "twoask"
+            },
+            "body": "Hi maintainers, could someone add the run-ci label or trigger CI for this PR? The latest Extra and AMD ROCm 10 runs show as failed, but they look gated rather than related to the change (please correct me if I’m misreading the logs).\r\n\r\nSummary for context: on gfx11 this pads qualifying bf16/fp16 weight rows by 128 B at load to avoid cache-channel aliasing. On gfx1151 (Strix Halo): +27–30% single-stream and +23–33% batched decode on Llama-3.1-8B and Qwen2.5-3B, prefill and accuracy unchanged. It’s a no-op on non-gfx11 hardware and can be disabled with SGLANG_DISABLE_GFX11_WEIGHT_PADDING=1.\r\n\r\nIt complements #45540 (RMSNorm on RDNA without AITER), which also needs CI triggered. Thanks!",
+            "createdAt": "2026-10-24T20:10:24Z",
+            "databaseId": 6388977935,
+            "updatedAt": "2026-10-25T04:15:13Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6388977935"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "vivienfanghuagood"
+            },
+            "body": "I reproduced this on gfx1100 (RDNA3, W7900-class, 48 GB) independently, on the `amd_march` branch. The padding commit is applied on top of `amd_march` plus our open RDNA fixes (#46910, #46914, #46915, #46967). It cherry-picks with only trivial import and env-registry conflicts. Setup: ROCm 7.2, torch 2.13, hipBLASLt default solutions, no aiter, no TunableOp.\n\n**1. Kernel level, in-process A/B.**\n- Both arms run in the same process on the same GPU, interleaved round by round, 15 rounds, with the first arm alternating.\n- Each arm rotates over ≥1 GiB of distinct weight copies, so every call streams its weight from DRAM rather than the 96 MB last-level cache. Without this, single-copy loops overstate bandwidth on this card.\n- Shapes are Qwen3-8B's. bf16, M=1, `F.linear`.\n- Two independent passes; numbers are medians from pass 1, with pass 2 within 1%.\n\n| shape (K -> N) | plain | padded | speedup |\n|---|---|---|---|\n| QKV 4096 -> 6144 | 148.6 µs, 339 GB/s | 119.4 µs, 422 GB/s | 1.245x |\n| O 4096 -> 4096 | 104.7 µs, 321 GB/s | 85.7 µs, 392 GB/s | 1.22x |\n| gate_up 4096 -> 24576 | 516.4 µs, 390 GB/s | 347.9 µs, 579 GB/s | 1.48x |\n| down 12288 -> 4096 | 249.0 µs, 404 GB/s | 223.4 µs, 451 GB/s | 1.11x |\n| lm_head 4096 -> 151936 | 1930.8 µs, 645 GB/s | 1814.5 µs, 686 GB/s | 1.06x |\n\n- Spread within each arm is under 1% (e.g. QKV plain 147.9–149.7 µs, padded 118.4–121.5 µs).\n- Max relative error vs fp32 is identical between arms (2.5e-3 to 3.0e-3).\n\n**2. End to end.**\n- Qwen/Qwen3-8B bf16, TP1, default server flags: Triton attention, decode CUDA graphs on.\n- Arms switched with `SGLANG_DISABLE_GFX11_WEIGHT_PADDING=1/0`, three rounds alternating off/on (6 servers).\n- `bench_serving --dataset-name random-ids`, 1024 in / 256 out, range ratio 1.0, seed 1.\n- The startup log confirms the padding in every \"on\" server: `padded {(6144, 4096): 36, (4096, 4096): 36, (24576, 4096): 36, (4096, 12288): 36, (151936, 4096): 1}; skipped {}`. It's absent from every \"off\" server.\n\n| | off: output tok/s (median TPOT) | on: output tok/s (median TPOT) | gain |\n|---|---|---|---|\n| c=1, 16 prompts | 23.79 / 23.81 / 23.78 (41.0 ms) | 28.75 / 28.77 / 28.70 (33.8 ms) | **+20.9%** |\n| c=8, 32 prompts | 165.7 / 165.1 / 165.6 (44.4 ms) | 195.5 / 195.4 / 195.3 (37.0 ms) | **+18.0%** |\n| c=32, 128 prompts | 415.9 / 415.8 / 416.2 (59.3 ms) | 459.7 / 459.4 / 459.3 (51.7 ms) | **+10.4%** |\n\n- Rounds agree to within 0.4%.\n- TTFT: c=1 is 299.8 → 292.8 ms. At c=32, prefill-heavy, it is 2840 → 2916 ms (+2.7%).\n- GSM8K (`sgl-eval==0.1.2`, 200 questions, `enable_thinking=false`, temperature 0.7, top_p 0.8): off 0.96, on 0.95, which is within sampling noise. There was no output collapse in any request across the 6 servers.\n\n**One note for an `amd_march` port:** `test_unquant_gfx11_weight_padding.py` imports `sglang.test.parallel_groups`, which `amd_march` doesn't have yet. The test needs a small adjustment there.\n\n@twoask would you like to open the `amd_march` version yourself? The AMD maintainers have said RDNA changes land on `amd_march` first (#31805), and #46900 lists the other `amd_march` PRs. If you'd rather not, I'm happy to open a backport that keeps your authorship and links back here. Just let me know which you prefer.\n",
+            "createdAt": "2026-10-29T09:14:02Z",
+            "databaseId": 6492700413,
+            "updatedAt": "2026-10-29T09:14:02Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6492700413"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "twoask"
+            },
+            "body": "@vivienfanghuagood thanks, this is a really thorough repro! Good to see the gain hold at c=32, and the padding line showing up in every \"on\" server is a nice touch.\r\n\r\nI'll open the `amd_march` version myself. The PR is ready here #47299 : one commit on top of `amd_march`, conflicts were context only, and the test now builds its own TP group stubs since `sglang.test.parallel_groups` isn't there yet. All 12 tests pass on gfx1151 and the CPU-only ones pass without a GPU.",
+            "createdAt": "2026-10-29T17:16:48Z",
+            "databaseId": 6503484421,
+            "updatedAt": "2026-10-29T17:16:48Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6503484421"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hubertlu-tw"
+            },
+            "body": "cc: @nemanjaudovic",
+            "createdAt": "2026-11-01T00:46:31Z",
+            "databaseId": 6551350468,
+            "updatedAt": "2026-11-01T00:46:31Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6551350468"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hubertlu-tw"
+            },
+            "body": "@twoask could you please help resolve the merge conflict? Thanks.",
+            "createdAt": "2026-11-02T18:00:30Z",
+            "databaseId": 6584420091,
+            "updatedAt": "2026-11-02T18:00:30Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6584420091"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "twoask"
+            },
+            "body": "@hubertlu-tw Done, thanks for the ping! I merged main on top of your merge (c7b50d4781). The only conflict was in `unquant.py`: our `_is_gfx11` and main's new `_skip_aiter_unquant` landed on the same line, so I kept both. The PR diff against main is unchanged, the padding unit tests pass, and a quick Qwen3-0.6B server run on gfx1151 looks fine with padding on.\n",
+            "createdAt": "2026-11-02T18:26:44Z",
+            "databaseId": 6584970881,
+            "updatedAt": "2026-11-02T18:26:44Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6584970881"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hubertlu-tw"
+            },
+            "body": "Hi @twoask,\r\nDo you mind sending your contact info to [Hubert.Lu@amd.com](mailto:Hubert.Lu@amd.com) in case we would like to discuss some features or optimization offline? Thanks.",
+            "createdAt": "2026-11-02T19:18:05Z",
+            "databaseId": 6586184590,
+            "updatedAt": "2026-11-02T19:18:05Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6586184590"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=41592931476 -->\nRequired checks failed on 1b6ea3d; this PR cannot be merged until they pass.\n\n**Lint** ([run](https://github.com/sgl-project/sglang/actions/runs/41592931476))\nRun `pre-commit run --all-files` locally and push the result. The run log shows any other failing step.",
+            "createdAt": "2026-11-03T06:59:00Z",
+            "databaseId": 6597476577,
+            "updatedAt": "2026-11-03T07:44:15Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6597476577"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "HaiShaw"
+            },
+            "body": "PR test Base passed before updating from main.",
+            "createdAt": "2026-11-03T07:57:26Z",
+            "databaseId": 6598387017,
+            "updatedAt": "2026-11-03T07:57:47Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6598387017"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYlLZUk=",
+          "hasNextPage": false
+        },
+        "totalCount": 9
+      },
+      "headRefOid": "26cd738bcdb257640125b742b7f6609b6bfc86ec",
+      "headRepository": {
+        "nameWithOwner": "twoask/sglang"
+      },
+      "mergeCommit": {
+        "oid": "a470d74cdb2e92f851dd94269b8f82148be64de2"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-03T07:58:11Z",
+      "number": 46327,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hubertlu-tw"
+            },
+            "body": "LGTM",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5706826254,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-30T00:50:27Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5706826254"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "HaiShaw"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "HaiShaw"
+                  },
+                  "body": "pls add `and torch.cuda.is_available()` in `if`",
+                  "createdAt": "2026-11-03T05:56:00Z",
+                  "databaseId": 4451363622,
+                  "diffHunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():\n+    \"\"\"\n+    Returns whether the current platform is AMD RDNA3 / RDNA3.5 (gfx11xx, e.g. gfx1100, gfx1151).\n+    \"\"\"\n+    if torch.version.hip:",
+                  "line": null,
+                  "originalLine": 1268,
+                  "path": "python/sglang/srt/utils/common.py",
+                  "updatedAt": "2026-11-03T06:02:48Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451363622"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "HaiShaw"
+                  },
+                  "body": "Note - main has not officially supported RDNA3 and other chips than Halo, please use narrowed scope of `_gfx115_` as pr #47695 would do.",
+                  "createdAt": "2026-11-03T06:02:35Z",
+                  "databaseId": 4451402063,
+                  "diffHunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():",
+                  "line": null,
+                  "originalLine": 1264,
+                  "path": "python/sglang/srt/utils/common.py",
+                  "updatedAt": "2026-11-03T06:02:48Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451402063"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wM1QwNjowMjozNVrPAAAAAQlTAU8=",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5747801164,
+            "state": "CHANGES_REQUESTED",
+            "submittedAt": "2026-11-03T06:02:48Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5747801164"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "twoask"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "twoask"
+                  },
+                  "body": "acked.",
+                  "createdAt": "2026-11-03T06:37:52Z",
+                  "databaseId": 4451608750,
+                  "diffHunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():\n+    \"\"\"\n+    Returns whether the current platform is AMD RDNA3 / RDNA3.5 (gfx11xx, e.g. gfx1100, gfx1151).\n+    \"\"\"\n+    if torch.version.hip:",
+                  "line": null,
+                  "originalLine": 1268,
+                  "path": "python/sglang/srt/utils/common.py",
+                  "updatedAt": "2026-11-03T06:37:52Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451608750"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wM1QwNjozNzo1MlrPAAAAAQlWKK4=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5748100798,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T06:37:52Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748100798"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "twoask"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "twoask"
+                  },
+                  "body": "acked",
+                  "createdAt": "2026-11-03T06:38:00Z",
+                  "databaseId": 4451609660,
+                  "diffHunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():",
+                  "line": null,
+                  "originalLine": 1264,
+                  "path": "python/sglang/srt/utils/common.py",
+                  "updatedAt": "2026-11-03T06:38:00Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451609660"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wM1QwNjozODowMFrPAAAAAQlWLDw=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5748102057,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T06:38:00Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748102057"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "twoask"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "twoask"
+                  },
+                  "body": "Done in 1b6ea3d52d: the helper is now `if torch.version.hip and torch.cuda.is_available():`.",
+                  "createdAt": "2026-11-03T06:56:04Z",
+                  "databaseId": 4451721192,
+                  "diffHunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():\n+    \"\"\"\n+    Returns whether the current platform is AMD RDNA3 / RDNA3.5 (gfx11xx, e.g. gfx1100, gfx1151).\n+    \"\"\"\n+    if torch.version.hip:",
+                  "line": null,
+                  "originalLine": 1268,
+                  "path": "python/sglang/srt/utils/common.py",
+                  "updatedAt": "2026-11-03T06:56:05Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451721192"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wM1QwNjo1NjowNFrPAAAAAQlX3-g=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5748245530,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T06:56:04Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748245530"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "twoask"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "twoask"
+                  },
+                  "body": "Done in 1b6ea3d52d: the gate is now `is_gfx115_supported()` (`gcnArchName` starting with `gfx115`), matching what you asked for on #47695, so RDNA3 is out. I renamed the identifiers, the opt-out env var (now `SGLANG_DISABLE_GFX115_WEIGHT_PADDING`) and the test file to match, and updated the description. gfx1151 is the only chip I measured; gfx1150/1152 are covered but untested, and the opt-out is there for them.",
+                  "createdAt": "2026-11-03T06:56:07Z",
+                  "databaseId": 4451721489,
+                  "diffHunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():",
+                  "line": null,
+                  "originalLine": 1264,
+                  "path": "python/sglang/srt/utils/common.py",
+                  "updatedAt": "2026-11-03T06:56:07Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451721489"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wM1QwNjo1NjowN1rPAAAAAQlX4RE=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5748245882,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T06:56:07Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748245882"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "HaiShaw"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5748778704,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-03T07:56:33Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748778704"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wM1QwNzo1NjozM1q0MjAyNi0xMS0wM1QwNzo1NjozM1rPAAAAAVanZtA=",
+          "hasNextPage": false
+        },
+        "totalCount": 7
+      },
+      "state": "MERGED",
+      "title": "[Perf] [AMD] unquant: Pad gfx115x linear and lm_head weight rows to avoid cache aliasing",
+      "updatedAt": "2026-11-03T07:58:12Z",
+      "url": "https://github.com/sgl-project/sglang/pull/46327"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "f77064f635779601c7b20258ce45ded3fa00ac82"
+    },
+    "body": "## Motivation\n\nDecode on gfx1151 (Strix Halo, LPDDR5X-8000, 256-bit bus, 256 GB/s theoretical) is memory-bound: over 98% of decode GPU time is in GEMMs. On HIP without AITER, unquantized linears run through `F.linear` (hipBLASLt). At M=1, hipBLASLt reaches only 132-193 GB/s on Llama-3.1-8B's shapes, 51-75% of the theoretical peak.\n\n## Root cause\n\nOn gfx1151 (and on gfx1100, see Results), a weight whose row stride is a multiple of 2 KiB puts the rows a skinny GEMM reads together onto the same L2/MALL channel. Most dense-model K dims qualify (bf16 K = 2048, 3072, 4096, 14336, ...).\n\nIf each row is offset by one 128 B cache line, they spread out again. The logical shape and values stay the same; only the stride changes.\n\nM=1 bf16, cold cache, best of 3, GB/s, plain row stride vs padded row stride, hipBLASLt default solutions, no TunableOp:\n\n| Llama-3.1-8B shape (K -> N) | plain | padded | change |\n|---|---|---|---|\n| QKV 4096 -> 6144 | 151.5 | 214.4 | +42% |\n| O 4096 -> 4096 | 131.6 | 213.3 | +62% |\n| gate/up 4096 -> 28672 | 182.6 | 223.0 | +22% |\n| down 14336 -> 4096 | 159.4 | 225.5 | +41% |\n| lm_head 4096 -> 128256 | 192.5 | 226.5 | +18% |\n| GEMM time per token | 89.0 ms | 67.6 ms | -24% |\n\nAll shapes reach 83-89% of peak after padding, and the output matches the unpadded output (relative error against fp32 is unchanged, 1.9-3.1e-3).\n\n## Fix\n\nWhen a qualifying unquantized weight finishes loading on gfx115x (RDNA3.5), give its rows a padded stride. This happens once per weight, at load time.\n\n- **Rule:** `(K * element_size) % 2048 == 0`. If it holds, the row stride grows by 128 B; it's the same rule as vLLM's `cache_aliasing_pad_elems`. Only bf16 and fp16 weights are padded, since those are what was measured. fp32 linears, such as the router gates in kimi_k3, longcat_flash and hunyuan_v3/v4, are left alone; vLLM pads them too, but that was never measured here. `K` is the weight tensor's own dim 1, so a tensor-parallel row shard is judged by its own K, not the full checkpoint K.\n- **Linear weights:** `UnquantizedLinearMethod.process_weights_after_loading` does the padding.\n- **lm_head:** `DefaultModelLoader.postprocess_weights` calls `finalize_gfx115_weight_padding(model)`, which pads every unquantized LM head:\n  - `ParallelLMHead`, untied.\n  - A tied head that is the input embedding module itself (`lm_head = model.embed_tokens`). 54 model files tie this way, and the embedding's quant method cannot tell it apart from an untied input embedding, so the model's module names decide.\n  - A tied head that shares a `Parameter` (`ParallelLMHead.tie_weights`). This is padded once.\n\n  An untied input embedding is never padded: it reads one row per token, so padding gains nothing.\n- **Gate:** `is_gfx115_supported()` is new in `srt/utils/common.py`: true on RDNA3.5 (`gcnArchName` starting with `gfx115`), with a `torch.cuda.is_available()` check. It's the gfx115x form of #47695's `is_gfx1151_supported()`.\n- **Opt-out:** setting `SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1` turns the padding off. It's on by default on gfx115x.\n- **Log:** the first load logs one INFO line listing the padded and skipped shapes. Later weight updates (for example, each RL weight sync) log the same line at DEBUG. That includes a speculative-decoding draft model, which is the second model loaded in the process, so its line is at DEBUG too. Example:\n  `gfx115x weight padding: padded {(6144, 4096): 32, (4096, 4096): 32, (28672, 4096): 32, (4096, 14336): 32, (128256, 4096): 1}; skipped {}`\n- **Memory:** the padded weights grow by 128 B per row, about 1.5% for K = 4096. Llama-3.1-8B: +0.24 GB on 16 GB. While one weight is being padded, `F.pad` briefly holds both copies, so peak extra memory during load is at most one LM head (about 1 GB for Llama-3.1-8B). That happens before KV-cache sizing, so it doesn't reduce the cache.\n\n## Results\n\nEach configuration was measured with padding on (default) and with `SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1`, on gfx1151.\n\nSettings:\n- Server: `--attention-backend triton --disable-overlap-schedule --mem-fraction-static 0.5 --context-length 8192`, plus `SGLANG_DISABLE_LEAN_ATTENTION=1`. Lean attention needs 66560 B of LDS, and RDNA has 65536.\n- Decode benchmark: `bench_serving` random, 1024 in / 256 out.\n- Prefill benchmark: 4000 in / 4 out.\n- Accuracy: sgl-eval 0.1.3 GSM8K, 200 questions, temperature 0, max-tokens 1024, 32 threads.\n\nThese numbers were measured without #45540 (RMSNorm via torch `rms_norm` on HIP), so both arms run the slower `forward_native` RMSNorm. The two PRs touch different files and don't depend on each other. With both merged, absolute tok/s will be higher; I haven't measured them together.\n\n**This branch, on main (638374c389):**\n\n| Model | 1-stream tok/s (TPOT) | 8-way tok/s | Prefill TTFT, 4000 tokens | 4-way prefill tok/s | GSM8K |\n|---|---|---|---|---|---|\n| Llama-3.1-8B-Instruct, off (2 runs) | 9.98 (98.4 ms) | 65.8 | 1786 ms | 3582 | 83.5, 81.5 |\n| Llama-3.1-8B-Instruct, **on** (2 runs) | **12.68 (76.9 ms), +27%** | **81.1, +23%** | 1785 ms | 3673 | 85.0, 84.5 |\n| Qwen2.5-3B-Instruct, off (3 runs) | 20.46 (48.1 ms) | 140.5 | 699 ms | 8818 | 85.0, 84.5, 85.5 |\n| Qwen2.5-3B-Instruct, **on** (4 runs) | **26.68 (36.8 ms), +30%** | **187.2, +33%** | 700 ms | 9110 | 84.0, 86.5, 85.0, 0.0 (see Known issues) |\n\nQwen2.5-3B covers the QKV bias, tied embeddings (`lm_head = model.embed_tokens`), and a skipped Down (K = 11008).\n\n**Same padding on an earlier experimental branch** (sglang at `pr31137`, padding behind a flag; that experiment also padded the untied input embedding):\n\n| Model | 1-stream tok/s | 8-way tok/s | Prefill TTFT | GSM8K |\n|---|---|---|---|---|\n| Phi-4-mini-instruct | 20.1 -> 23.4 (+16%) | 125.1 -> 140.0 (+12%) | 755 -> 756 ms | 91.0 -> 90.5% |\n| DeepSeek-V2-Lite-Chat (MoE) | 14.6 -> 16.4 (+12%) | 45.3 -> 47.7 (+5%) | 2783 -> 2820 ms | not usable (see Known issues) |\n\n**gfx1100 (Radeon PRO W7900D, 48 GB), measured independently by @LZ-QWQ** ([#30599 comment](https://github.com/sgl-project/sglang/issues/30599#issuecomment-6465927305)) at this PR's head `656e95c345`. Qwen3-8B bf16, TP1, decode CUDA graphs on, 3 runs per arm, without #45540:\n\n| Qwen3-8B on gfx1100 | Off | On |\n|---|---|---|\n| 1-stream tok/s (TPOT) | 19.40 (50.6 ms) | **22.79 (42.9 ms), +17.5%** |\n| 8-way tok/s (TPOT) | 135.6 (54.0 ms) | **156.5 (46.0 ms), +15.4%** |\n| Prefill TTFT, 4000 tokens | 1076 ms | 1095 ms (+1.7%) |\n| 4-way prefill tok/s | 3545 | 3515 (-0.8%) |\n| GSM8K (sgl-eval, 200 questions, 2 runs) | 95.5, 95.5 | 95.0, 95.5 |\n\nThe kernel-level table below gives +8% to +61% per shape on that card. All 12 tests in the new test file pass there, including the two device tests (run before the gate was narrowed to gfx115x; they're skipped on gfx1100 now). Their tree also carried the gfx1100 build and packaging enablement that `main` doesn't have yet (see #30599, #46900); both arms used that same tree.\n\n**Hidden size 5120: a small loss (Qwen3-14B, gfx1151).** K = 5120 rows are 10 KiB, 5 x 2 KiB, so the rule pads every linear here, but they alias much less than K = 4096. Qwen3-14B bf16 at `656e95c345` (this PR's commit, before the main merge), `--attention-backend triton --mem-fraction-static 0.8 --context-length 8192`, decode CUDA graphs on, same `bench_serving` settings as above, one server per arm, run off/on/off/on:\n\n| Qwen3-14B | Off (2 runs) | On (2 runs) |\n|---|---|---|\n| 1-stream tok/s (median TPOT) | 7.32 / 7.26 (133.4 / 134.0 ms) | 7.18 / 7.18 (135.7 / 135.7 ms), -1.5% |\n| 8-way tok/s (median TPOT) | 56.25 / 56.05 (141.5 / 142.0 ms) | 55.26 / 55.26 (144.0 / 144.0 ms), -1.6% |\n| GSM8K (200 questions, 5-shot, first pair) | 89.5 | 90.5 |\n\nPer shape at M=1 (`F.linear`, plain -> padded, GB/s), padding helps the small layers and slightly hurts the large ones: QKV 7168 x 5120 216 -> 224 (+4%), O 5120 x 5120 206 -> 220 (+7%), gate/up 34816 x 5120 235 -> 229 (-3%), down 5120 x 17408 225 -> 224 (-0.5%), lm_head 151936 x 5120 241 -> 231 (-4%). Weighted by bytes, that's about -0.8% of GEMM time, in line with the end-to-end result. Outputs are bitwise identical padded and unpadded.\n\n## What's not affected\n\n- **Prefill:** long-prompt GEMMs are compute-bound. TTFT and 4-way prefill throughput are within noise on every model (-3% to +4%).\n- **MoE experts:** fused-MoE expert weights are 3D and go through `UnquantizedFusedMoEMethod`, so they are not padded; vLLM doesn't pad them either. On DeepSeek-V2-Lite, the attention projections, shared experts and dense layer are padded, and `kv_b_proj` (K = 512) is skipped.\n- **Quantized layers:** only `UnquantizedLinearMethod` and unquantized LM heads are touched.\n- **fp32 weights**, for example MoE router gates, are left alone; only bf16/fp16 was measured.\n- **Outside gfx115x:** a no-op. `_is_gfx115` is computed once at import and is false on CUDA, CDNA, RDNA3 and CPU.\n- **Kernels reading raw weight pointers:** the CUDA-only bf16 GEMV/CuTe paths check `weight.is_contiguous()`. `apply_into` (`torch.mm(out=)`), `F.embedding` and the lm_head `torch.matmul` all honor strides. Model code that fuses weights after loading (`torch.cat(...).contiguous()` in qwen3_5, minimax_m3) simply produces a contiguous weight.\n\n## Related work\n\n- vLLM #55090 (`maybe_pad_weight_avoid_cache_aliasing`, `vllm/model_executor/layers/linear.py:230`): the same rule, measured on gfx1151 (its gate covers all of gfx11). It reports only -3% TPOT because vLLM decodes through `wvSplitK`, which is less sensitive to the aliasing. sglang's hipBLASLt path is hit much harder.\n- ROCm/hip-ep #1274: same cause (int4, gfx1151).\n- sglang's own XPU MoE padding (`xpu_moe_ld_padding_elems`): the same idea for Xe L3 set aliasing.\n\n## Kernel-level verification\n\n`F.linear` on Llama-3.1-8B's weight shapes, plain vs padded. Weights rotate through more than 512 MB so the cache can't help.\n\n**Gain per shape, BF16, M=1.** gfx1151 numbers are medians of 5 fresh processes; gfx1100 numbers are @LZ-QWQ's, from the same script:\n\n| Shape (K -> N) | gfx1151 plain -> padded (GB/s) | gfx1151 gain | gfx1100 plain -> padded (GB/s) | gfx1100 gain |\n|---|---|---|---|---|\n| QKV 4096 -> 6144 | 151.1 -> 212.2 | +40.4% | 351.6 -> 434.2 | +23.5% |\n| O 4096 -> 4096 | 131.5 -> 211.9 | +61.1% | 322.7 -> 397.4 | +23.1% |\n| gate/up 4096 -> 28672 | 182.4 -> 222.3 | +21.9% | 364.2 -> 587.1 | +61.2% |\n| down 14336 -> 4096 | 159.7 -> 224.7 | +40.7% | 424.3 -> 458.9 | +8.2% |\n| lm_head 4096 -> 128256 | 192.2 -> 225.8 | +17.5% | 649.9 -> 755.5 | +16.2% |\n\n**Order effects (gfx1151):** both layouts are allocated and warmed. Six rounds alternate plain-first and padded-first, 20 iterations each; each cell is the median of the per-round gains. Every round was positive.\n\n| Shape | bf16 M=1 | bf16 M=8 | fp16 M=1 | fp16 M=8 |\n|---|---|---|---|---|\n| QKV | +40.9% | +46.0% | +40.8% | +40.5% |\n| O | +61.5% | +57.0% | +57.3% | +56.6% |\n| gate/up | +22.1% | +27.9% | +20.6% | +21.7% |\n| down | +41.5% | +26.4% | +27.3% | +26.5% |\n| lm_head | +17.8% | +24.2% | +16.3% | +17.2% |\n\n**Numerics (gfx1151):** 30 cases (5 shapes x bf16/fp16 x M = 1, 8, 300, normalized random weights, with bias).\n- Padding keeps every logical weight exactly.\n- Padded and unpadded outputs are bitwise identical in all 30 cases.\n- Both match an fp32 reference: bf16 `rtol=1.6e-2, atol=1e-2`, fp16 `rtol=2e-3, atol=2e-3`.\n\nThese are standalone GEMM tests; the unit tests and end-to-end runs cover SGLang's load and reload hooks.\n\n## Testing\n\n`test/registered/unit/layers/quantization/test_unquant_gfx115_weight_padding.py`:\n\n- **CPU, registered in `base-a-test-cpu`:**\n  - The pad rule counts row bytes, not elements.\n  - The pad keeps shape and values and gives the same `F.linear` output, with bias.\n  - The gate leaves the weight untouched off gfx115x, when opted out, when already padded, when non-contiguous, and for fp32.\n  - An untied input embedding is not padded.\n  - Tied heads, both forms, are padded once and still embed correctly, including across a second postprocess pass (a reload).\n  - A quantized head is not padded.\n  - A reload writes into the padded storage, keeping the stride and the pointer. This holds for `ColumnParallelLinear`, and at TP=4 through the checkpoint loaders models actually use: `QKVParallelLinear` and `MergedColumnParallelLinear` (which slice rows) and `RowParallelLinear` (which slices K). After the reload, values match an unpadded layer loaded the same way.\n  - The log line is INFO on the first load and DEBUG on later passes.\n  - A TP=4 `RowParallelLinear` is judged by its 768-element shard, not K = 3072.\n- **gfx115x GPU** (skipped elsewhere, since most CI is NVIDIA or MI300). Run locally on gfx1151, and by @LZ-QWQ on gfx1100:\n  - hipBLASLt output matches unpadded on Llama shapes at M = 1, 8 and 300, with bias.\n  - A tied head embeds and projects correctly on device.\n- **Mutation checks:** 13 of 13 mutations caught (element-based rule, padding every embedding, dropping the tied-module case, dropping the loader call, no contiguity check, opt-out ignored, gate ignored, quantized head padded, linear hook removed, full-K instead of shard-K, wrong view slice, no dtype limit, logging at INFO on every pass).\n\nRepro:\n\n```bash\npython test/registered/unit/layers/quantization/test_unquant_gfx115_weight_padding.py -v\n\nSGLANG_DISABLE_LEAN_ATTENTION=1 [SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1] \\\npython -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \\\n  --attention-backend triton --disable-overlap-schedule --mem-fraction-static 0.5 --context-length 8192\npython -m sglang.bench_serving --backend sglang --dataset-name random --random-input-len 1024 \\\n  --random-output-len 256 --random-range-ratio 1 --num-prompts 8 --max-concurrency 1\nsgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1 --num-examples 200 --temperature 0 \\\n  --max-tokens 1024 --num-threads 32\n```\n\n## Scope and limits\n\n- **Hardware:** per review, the gate covers gfx115x (RDNA3.5: gfx1150 Strix Point, gfx1151 Strix Halo, gfx1152 Krackan Point), the same scope #47695 is moving to. Only gfx1151 was measured end to end (here and in vLLM #55090). gfx1150 and gfx1152 have a narrower memory system and are untested; owners, please report on #30599, and the opt-out exists for exactly that. RDNA3 (gfx110x) is outside the gate because `main` doesn't officially support it yet, even though @LZ-QWQ measured a gain on gfx1100; the gate can widen once it does.\n- **Hidden size 5120:** on Qwen3-14B (all linears K = 5120 or 17408) padding is 1.5% slower end to end; see Results. Other hidden-5120 models (for example Qwen2.5-14B, Phi-4) have the same K = 5120 rows but weren't measured. The rule is kept as is, the same as vLLM's. `SGLANG_DISABLE_GFX115_WEIGHT_PADDING=1` turns it off for such models.\n- **Weight reload:**\n  - Reloads through `update_weights_*` keep the padding: the loaders copy into the padded storage (`narrow().copy_()`), and `postprocess_weights` re-runs. The second pass skips weights that are already padded, so storage pointers stay stable for CUDA graphs.\n  - If a loader rebinds a weight to a fresh contiguous tensor, the re-run pads it again.\n  - Loaders that bypass `DefaultModelLoader.postprocess_weights` (dummy, sharded-state, remote-instance) still pad linear weights but not the LM head. That affects only speed.\n- **Head detection:** an LM head is found by type (`ParallelLMHead`) or by the attribute name `lm_head`. A tied head stored under another name (for example `embed_out`) isn't padded, which costs only speed.\n\n## Known issues, unrelated or unresolved\n\n- **One collapsed Qwen2.5-3B GSM8K run with padding on (0.0%).** From the first token of every answer, the output was the same garbage regardless of the question, with speed normal. It didn't reproduce:\n  - 3 further padded runs, with the same script and server sequence, scored 84.0-86.5%.\n  - Single-prompt checks after each benchmark stage were correct.\n  - Concurrent 32-thread probes, with and without CUDA graphs, were correct.\n  - A launch-loop test then started 50 fresh Qwen2.5-3B servers, alternating 25 padded and 25 opted out. Each server got 5 fixed prompts and then a burst of 32 concurrent requests, all checked against the expected answers. All 50 launches answered every prompt correctly.\n  - Every launch was instrumented:\n    - A SHA-256 over every parameter after loading, computed on the logical values. All 50 launches had the same hash, padded or not.\n    - The tie (`lm_head` and `embed_tokens`): same module, same `Parameter`, same `data_ptr()` in every launch. The row stride was 2112 padded and 2048 opted out.\n    - No NaN or Inf in any weight, in the first 50 eager-mode logits, or in any returned logprob.\n\n  So I report it as a one-off that couldn't be reproduced. Before this test, padded runs had 1 collapse in 6 and opted-out runs 0 in 5. The launch loop doesn't replay the full benchmark sequence that came before the collapse, and the logits check doesn't cover decode steps replayed from CUDA graphs. @LZ-QWQ's two padded GSM8K runs on gfx1100 also showed no collapse. A similar intermittent breakdown happens with padding off on this stack: DeepSeek-V2-Lite's GSM8K answers degenerate into `!!!!` in 130 of 200 answers unpadded and 115 of 200 padded.\n- **DeepSeek-V2-Lite `!!!!` breakdown:** happens without this PR. Please don't attribute it to this change.\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:hourglass_flowing_sand: [Run #41597855958](https://github.com/sgl-project/sglang/actions/runs/41597855958)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #41597855980](https://github.com/sgl-project/sglang/actions/runs/41597855980)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:hourglass_flowing_sand: [Run #41597856070](https://github.com/sgl-project/sglang/actions/runs/41597856070)<!-- slot:pr-test-amd:end -->\n\n> [!TIP]\n> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:\n>\n> ```text\n> Find the registered tests this PR affects and run them with /rerun-test, following https://github.com/sgl-project/sglang/blob/main/.agents/skills/rerun-test/SKILL.md\n> ```\n<!-- pr-states:end -->\n\n",
+    "changed_files": 5,
+    "head": {
+      "repo": {
+        "full_name": "twoask/sglang"
+      },
+      "sha": "26cd738bcdb257640125b742b7f6609b6bfc86ec"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/46327",
+    "merge_commit_sha": "a470d74cdb2e92f851dd94269b8f82148be64de2",
+    "merged": true,
+    "merged_at": "2026-11-03T07:58:11Z",
+    "number": 46327,
+    "state": "closed",
+    "title": "[Perf] [AMD] unquant: Pad gfx115x linear and lm_head weight rows to avoid cache aliasing",
+    "updated_at": "2026-11-03T07:58:12Z"
+  },
+  "files": [
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Fenviron.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fenviron.py?ref=26cd738bcdb257640125b742b7f6609b6bfc86ec",
+      "deletions": 0,
+      "filename": "python/sglang/srt/environ.py",
+      "patch": "@@ -1010,6 +1010,9 @@ class Envs:\n     # is a diagnostic switch, not a supported off-ramp -- to actually stop\n     # serving FP8, drop --quantization fp8.\n     SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)\n+    # Kill-switch for the gfx115x row-stride pad on unquantized linear and lm_head\n+    # weights (see maybe_pad_weight_for_gfx115). Speed only; outputs do not depend on it.\n+    SGLANG_DISABLE_GFX115_WEIGHT_PADDING = EnvBool(False)\n     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the\n     # pinned aiter still ships the pre-PR config (see\n     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Fenviron.py",
+      "sha": "bd4646cb582c6756ebcc021033e6762d1939fe23",
+      "status": "modified"
+    },
+    {
+      "additions": 100,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Flayers%2Fquantization%2Funquant.py",
+      "changes": 100,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fquantization%2Funquant.py?ref=26cd738bcdb257640125b742b7f6609b6bfc86ec",
+      "deletions": 0,
+      "filename": "python/sglang/srt/layers/quantization/unquant.py",
+      "patch": "@@ -1,5 +1,6 @@\n from __future__ import annotations\n \n+import collections\n import logging\n from enum import Enum\n from typing import TYPE_CHECKING, Callable, List, Optional\n@@ -43,6 +44,7 @@\n     is_cpu,\n     is_cuda,\n     is_gfx95_supported,\n+    is_gfx115_supported,\n     is_hip,\n     is_npu,\n     is_xpu,\n@@ -69,6 +71,7 @@\n _is_npu = is_npu()\n _use_aiter = get_bool_env_var(\"SGLANG_USE_AITER\") and _is_hip\n _is_gfx95 = _is_hip and is_gfx95_supported()\n+_is_gfx115 = _is_hip and is_gfx115_supported()\n # AITER picks the GEMM kernel, tile and split-K by the number of tokens, so\n # initialize_bf16_gemm_config sets this on gfx95 in deterministic mode and\n # unquantized layers then skip AITER.\n@@ -538,6 +541,101 @@ def get_bf16_gemm_backend() -> Bf16GemmBackend:\n     return _BF16_GEMM_BACKEND\n \n \n+# On gfx115x a weight row stride that is a multiple of 2 KiB puts the rows a skinny GEMM\n+# reads together on the same L2/MALL channel; one 128 B cache line of pad spreads them.\n+# Same rule as vLLM's cache_aliasing_pad_elems; measured on gfx1151.\n+_GFX115_ALIASING_ROW_BYTES = 2048\n+_GFX115_ROW_PAD_BYTES = 128\n+# Only 16-bit weights were measured; fp32 (e.g. MoE router gates) is left alone.\n+_GFX115_PADDED_DTYPES = (torch.bfloat16, torch.float16)\n+# First load logs at INFO; weight updates (e.g. every RL sync) log at DEBUG.\n+_gfx115_padding_logged = False\n+\n+\n+def _gfx115_row_pad_elems(*, k: int, itemsize: int) -> int:\n+    if (k * itemsize) % _GFX115_ALIASING_ROW_BYTES != 0:\n+        return 0\n+    return _GFX115_ROW_PAD_BYTES // itemsize\n+\n+\n+def maybe_pad_weight_for_gfx115(weight: torch.Tensor) -> torch.Tensor:\n+    \"\"\"Return ``weight`` as a same-shape view with a non-aliasing row stride on gfx115x.\n+\n+    K is the tensor's own dim 1, so a tensor-parallel row shard is judged by its\n+    slice, not the full checkpoint K. Non-contiguous weights, including ones\n+    already padded, come back unchanged, which keeps a reload from padding twice.\n+    \"\"\"\n+    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():\n+        return weight\n+    if weight.dim() != 2 or not weight.is_contiguous():\n+        return weight\n+    if weight.dtype not in _GFX115_PADDED_DTYPES:\n+        return weight\n+    pad = _gfx115_row_pad_elems(k=weight.shape[1], itemsize=weight.element_size())\n+    if pad == 0:\n+        return weight\n+    return F.pad(weight, (0, pad))[:, :-pad]\n+\n+\n+def finalize_gfx115_weight_padding(model: torch.nn.Module) -> None:\n+    \"\"\"Pad unquantized lm_head weights and log which linear and head shapes were padded.\n+\n+    Runs on the whole model because a tied head is often the input embedding module\n+    itself (``lm_head = model.embed_tokens``), which its quant method cannot tell\n+    apart from an untied input embedding; only the model's module names show it.\n+    Also runs after every weight update; already-padded weights are skipped, so\n+    storage pointers stay stable for CUDA graphs.\n+    \"\"\"\n+    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():\n+        return\n+    for head in _unquantized_lm_heads(model):\n+        head.weight.data = maybe_pad_weight_for_gfx115(head.weight.data)\n+    _log_gfx115_padding(model)\n+\n+\n+def _unquantized_lm_heads(model: torch.nn.Module):\n+    # Imported here to avoid an import cycle; vocab_parallel_embedding imports this module.\n+    from sglang.srt.layers.vocab_parallel_embedding import (\n+        ParallelLMHead,\n+        VocabParallelEmbedding,\n+    )\n+\n+    seen = set()\n+    # Heads named otherwise (e.g. embed_out) are not found; that costs speed only.\n+    for name, module in model.named_modules(remove_duplicate=False):\n+        is_head = isinstance(module, ParallelLMHead) or (\n+            isinstance(module, VocabParallelEmbedding)\n+            and name.rsplit(\".\", 1)[-1] == \"lm_head\"\n+        )\n+        if (\n+            is_head\n+            and isinstance(module.quant_method, UnquantizedEmbeddingMethod)\n+            and id(module) not in seen\n+        ):\n+            seen.add(id(module))\n+            yield module\n+\n+\n+def _log_gfx115_padding(model: torch.nn.Module) -> None:\n+    # Imported here to avoid an import cycle through sglang.srt.layers.quantization.\n+    from sglang.srt.layers.linear import LinearBase\n+\n+    padded, skipped = collections.Counter(), collections.Counter()\n+    weights = [\n+        m.weight\n+        for m in model.modules()\n+        if isinstance(m, LinearBase)\n+        and isinstance(m.quant_method, UnquantizedLinearMethod)\n+    ] + [head.weight for head in _unquantized_lm_heads(model)]\n+    for weight in weights:\n+        is_padded = weight.dim() == 2 and weight.stride(0) > weight.shape[1]\n+        (padded if is_padded else skipped)[tuple(weight.shape)] += 1\n+    global _gfx115_padding_logged\n+    log = logger.debug if _gfx115_padding_logged else logger.info\n+    _gfx115_padding_logged = True\n+    log(\"gfx115x weight padding: padded %s; skipped %s\", dict(padded), dict(skipped))\n+\n+\n class UnquantizedEmbeddingMethod(QuantizeMethodBase):\n     \"\"\"Unquantized method for embeddings.\"\"\"\n \n@@ -604,6 +702,8 @@ def create_weights(\n     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:\n         if _is_cpu and _is_cpu_amx_available:\n             _amx_process_weight_after_loading(layer, [\"weight\"])\n+        else:\n+            layer.weight.data = maybe_pad_weight_for_gfx115(layer.weight.data)\n \n     def apply(\n         self,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Flayers%2Fquantization%2Funquant.py",
+      "sha": "25653e0c68c351c1d00525fd43fbec9b7d4c56ac",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Fmodel_loader%2Floader.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodel_loader%2Floader.py?ref=26cd738bcdb257640125b742b7f6609b6bfc86ec",
+      "deletions": 0,
+      "filename": "python/sglang/srt/model_loader/loader.py",
+      "patch": "@@ -95,6 +95,7 @@\n     QuantizationConfig,\n     QuantizeMethodBase,\n )\n+from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_padding\n from sglang.srt.layers.radix_linear_attention import RadixLinearAttention\n from sglang.srt.model_loader.remote_instance_weight_loader_utils import (\n     trigger_transferring_weights_request,\n@@ -1087,6 +1088,7 @@ def postprocess_weights(model, target_device):\n             # parameters onto device for processing and back off after.\n             with device_loading_context(module, target_device):\n                 quant_method.process_weights_after_loading(module)\n+        finalize_gfx115_weight_padding(model)\n \n     @staticmethod\n     def restore_weights_before_loading(model, target_device):",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Fmodel_loader%2Floader.py",
+      "sha": "6ba4437ccce8823046c53d31023f24bf9c4b07eb",
+      "status": "modified"
+    },
+    {
+      "additions": 12,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Futils%2Fcommon.py",
+      "changes": 12,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Futils%2Fcommon.py?ref=26cd738bcdb257640125b742b7f6609b6bfc86ec",
+      "deletions": 0,
+      "filename": "python/sglang/srt/utils/common.py",
+      "patch": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx115_supported():\n+    \"\"\"\n+    Returns whether the current platform is AMD RDNA3.5 (gfx115x, e.g. gfx1150, gfx1151).\n+    \"\"\"\n+    if torch.version.hip and torch.cuda.is_available():\n+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName\n+        return gcn_arch.startswith(\"gfx115\")\n+    else:\n+        return False\n+\n+\n @lru_cache(maxsize=1)\n def is_gfx1250_supported():\n     \"\"\"",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/26cd738bcdb257640125b742b7f6609b6bfc86ec/python%2Fsglang%2Fsrt%2Futils%2Fcommon.py",
+      "sha": "db546dbd9b7308776fc8c8469e455a9bc362cc6c",
+      "status": "modified"
+    },
+    {
+      "additions": 320,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/26cd738bcdb257640125b742b7f6609b6bfc86ec/test%2Fregistered%2Funit%2Flayers%2Fquantization%2Ftest_unquant_gfx115_weight_padding.py",
+      "changes": 320,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Flayers%2Fquantization%2Ftest_unquant_gfx115_weight_padding.py?ref=26cd738bcdb257640125b742b7f6609b6bfc86ec",
+      "deletions": 0,
+      "filename": "test/registered/unit/layers/quantization/test_unquant_gfx115_weight_padding.py",
+      "patch": "@@ -0,0 +1,320 @@\n+\"\"\"\n+Unit tests for the gfx115x row-stride pad on unquantized linear and lm_head weights.\n+\n+The pad must change only the row stride: same shape, same values, same outputs.\n+It applies to linear weights and the LM head (tied or not), never to an untied\n+input embedding, and is judged by each rank's own K shard.\n+\"\"\"\n+\n+from sglang.test.ci.ci_register import register_cpu_ci\n+\n+register_cpu_ci(est_time=10, suite=\"base-a-test-cpu\")\n+\n+import unittest\n+from unittest.mock import patch\n+\n+import torch\n+import torch.nn.functional as F\n+\n+import sglang.srt.layers.quantization.unquant as unquant\n+from sglang.srt.environ import envs\n+from sglang.srt.layers.linear import (\n+    ColumnParallelLinear,\n+    MergedColumnParallelLinear,\n+    QKVParallelLinear,\n+    ReplicatedLinear,\n+    RowParallelLinear,\n+)\n+from sglang.srt.layers.quantization.base_config import QuantizeMethodBase\n+from sglang.srt.layers.vocab_parallel_embedding import (\n+    ParallelLMHead,\n+    VocabParallelEmbedding,\n+)\n+from sglang.srt.model_loader.loader import DefaultModelLoader\n+from sglang.srt.runtime_context import SpawnRanks, reset_context\n+from sglang.srt.server_args import ServerArgs\n+from sglang.test.parallel_groups import publish\n+from sglang.test.test_utils import CustomTestCase\n+\n+# 1024 bf16 elements are 2 KiB per row, so these weights alias and get one 128 B line.\n+_VOCAB, _HIDDEN, _PADDED_STRIDE = 256, 1024, 1024 + 64\n+_BF16_RTOL, _BF16_ATOL = 1.6e-2, 1e-2\n+\n+\n+def _on_gfx115():\n+    # _is_cpu is cleared so a CPU runner with AMX does not take the AMX packing branch.\n+    return patch.multiple(unquant, _is_gfx115=True, _is_cpu=False)\n+\n+\n+def _publish(*, tp_size: int, device: str = \"cpu\") -> None:\n+    reset_context()\n+    publish(\n+        ServerArgs(model_path=\"dummy\", device=device, tp_size=tp_size),\n+        role=\"test\",\n+        ranks=SpawnRanks(world_rank=tp_size - 1),\n+    )\n+\n+\n+class _OpaqueHeadMethod(QuantizeMethodBase):\n+    def apply(self, layer, *args, **kwargs):\n+        raise NotImplementedError\n+\n+\n+class _CausalLM(torch.nn.Module):\n+    def __init__(self, *, tie: str):\n+        super().__init__()\n+        self.model = torch.nn.Module()\n+        self.model.embed_tokens = VocabParallelEmbedding(\n+            _VOCAB, _HIDDEN, params_dtype=torch.bfloat16\n+        )\n+        self.model.proj = ReplicatedLinear(\n+            _HIDDEN, 64, bias=False, params_dtype=torch.bfloat16\n+        )\n+        if tie == \"module\":\n+            self.lm_head = self.model.embed_tokens\n+        elif tie == \"parameter\":\n+            self.lm_head = ParallelLMHead(\n+                _VOCAB, _HIDDEN, params_dtype=torch.bfloat16\n+            ).tie_weights(self.model.embed_tokens)\n+        else:\n+            self.lm_head = ParallelLMHead(_VOCAB, _HIDDEN, params_dtype=torch.bfloat16)\n+        for param in self.parameters():\n+            param.data.copy_(torch.randn_like(param))\n+\n+\n+def _postprocess(model: torch.nn.Module) -> None:\n+    DefaultModelLoader.postprocess_weights(model, torch.device(\"cpu\"))\n+\n+\n+class TestGfx115WeightPadding(CustomTestCase):\n+    def setUp(self):\n+        torch.manual_seed(0)\n+        _publish(tp_size=1)\n+        self.addCleanup(reset_context)\n+\n+    def test_pad_rule_counts_row_bytes_not_elements(self):\n+        cases = {\n+            # (K, itemsize): pad in elements\n+            (4096, 2): 64,\n+            (14336, 2): 64,\n+            (11008, 2): 0,\n+            (512, 2): 0,\n+            (512, 4): 32,\n+            (3584, 2): 0,\n+        }\n+        for (k, itemsize), pad in cases.items():\n+            with self.subTest(k=k, itemsize=itemsize):\n+                self.assertEqual(\n+                    unquant._gfx115_row_pad_elems(k=k, itemsize=itemsize), pad\n+                )\n+\n+    def test_pad_changes_only_the_row_stride(self):\n+        weight = torch.randn(192, 4096, dtype=torch.bfloat16)\n+        bias = torch.randn(192, dtype=torch.bfloat16)\n+        x = torch.randn(3, 4096, dtype=torch.bfloat16)\n+        with _on_gfx115():\n+            padded = unquant.maybe_pad_weight_for_gfx115(weight)\n+\n+        self.assertEqual(padded.shape, weight.shape)\n+        self.assertEqual(padded.stride(), (4096 + 64, 1))\n+        self.assertTrue(torch.equal(padded, weight))\n+        torch.testing.assert_close(\n+            F.linear(x, padded, bias),\n+            F.linear(x, weight, bias),\n+            rtol=_BF16_RTOL,\n+            atol=_BF16_ATOL,\n+        )\n+\n+    def test_gate_leaves_weight_untouched(self):\n+        weight = torch.randn(64, 4096, dtype=torch.bfloat16)\n+        with patch.object(unquant, \"_is_gfx115\", False), self.subTest(\"not gfx115x\"):\n+            self.assertIs(unquant.maybe_pad_weight_for_gfx115(weight), weight)\n+        with _on_gfx115(), envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.override(True):\n+            with self.subTest(\"opted out\"):\n+                self.assertIs(unquant.maybe_pad_weight_for_gfx115(weight), weight)\n+        with _on_gfx115():\n+            padded = unquant.maybe_pad_weight_for_gfx115(weight)\n+            with self.subTest(\"already padded\"):\n+                self.assertIs(unquant.maybe_pad_weight_for_gfx115(padded), padded)\n+            fp32 = torch.randn(64, 512, dtype=torch.float32)\n+            with self.subTest(\"fp32, a 2 KiB row but unmeasured\"):\n+                self.assertIs(unquant.maybe_pad_weight_for_gfx115(fp32), fp32)\n+            transposed = torch.randn(4096, 64, dtype=torch.bfloat16).t()\n+            with self.subTest(\"non-contiguous\"):\n+                self.assertIs(\n+                    unquant.maybe_pad_weight_for_gfx115(transposed), transposed\n+                )\n+\n+    def test_untied_input_embedding_is_not_padded(self):\n+        model = _CausalLM(tie=\"none\")\n+        with _on_gfx115():\n+            _postprocess(model)\n+\n+        self.assertTrue(model.model.embed_tokens.weight.is_contiguous())\n+        self.assertEqual(model.lm_head.weight.stride(0), _PADDED_STRIDE)\n+        self.assertEqual(model.model.proj.weight.stride(0), _PADDED_STRIDE)\n+\n+    def test_tied_head_is_padded_once_and_still_embeds(self):\n+        ids = torch.tensor([0, 7, _VOCAB - 1])\n+        for tie in (\"module\", \"parameter\"):\n+            with self.subTest(tie=tie):\n+                model = _CausalLM(tie=tie)\n+                expected_rows = model.model.embed_tokens.weight[ids].clone()\n+                with _on_gfx115():\n+                    _postprocess(model)\n+                    storage = model.lm_head.weight.data_ptr()\n+                    # A weight update re-runs postprocessing on the same model.\n+                    _postprocess(model)\n+\n+                self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)\n+                self.assertEqual(model.lm_head.weight.stride(0), _PADDED_STRIDE)\n+                self.assertEqual(model.lm_head.weight.data_ptr(), storage)\n+                torch.testing.assert_close(\n+                    model.model.embed_tokens(ids), expected_rows, rtol=0, atol=0\n+                )\n+\n+    def test_quantized_head_is_not_padded(self):\n+        model = _CausalLM(tie=\"none\")\n+        model.lm_head.quant_method = _OpaqueHeadMethod()\n+        with _on_gfx115():\n+            _postprocess(model)\n+\n+        self.assertTrue(model.lm_head.weight.is_contiguous())\n+\n+    def test_padding_logs_at_info_only_on_the_first_load(self):\n+        model = _CausalLM(tie=\"module\")\n+        with _on_gfx115(), patch.object(unquant, \"_gfx115_padding_logged\", False):\n+            with self.assertLogs(unquant.logger, level=\"DEBUG\") as logs:\n+                for _ in range(3):\n+                    _postprocess(model)\n+\n+        levels = [r.levelname for r in logs.records if \"gfx115x\" in r.getMessage()]\n+        self.assertEqual(levels, [\"INFO\", \"DEBUG\", \"DEBUG\"])\n+\n+    def test_reload_writes_into_padded_storage(self):\n+        layer = ColumnParallelLinear(\n+            _HIDDEN, 64, bias=False, params_dtype=torch.bfloat16\n+        )\n+        with _on_gfx115():\n+            layer.quant_method.process_weights_after_loading(layer)\n+            storage = layer.weight.data_ptr()\n+            fresh = torch.randn(64, _HIDDEN, dtype=torch.bfloat16)\n+            layer.weight.weight_loader(layer.weight, fresh)\n+            layer.quant_method.process_weights_after_loading(layer)\n+\n+        self.assertEqual(layer.weight.stride(0), _PADDED_STRIDE)\n+        self.assertEqual(layer.weight.data_ptr(), storage)\n+        self.assertTrue(torch.equal(layer.weight, fresh))\n+\n+\n+class TestGfx115WeightPaddingShards(CustomTestCase):\n+    def setUp(self):\n+        _publish(tp_size=4)\n+        self.addCleanup(reset_context)\n+\n+    def test_row_parallel_pad_follows_the_shard_k(self):\n+        \"\"\"K = 3072 aliases (6 KiB rows), but a TP=4 row shard holds K = 768 (1.5 KiB).\"\"\"\n+        row = RowParallelLinear(3072, 64, bias=False, params_dtype=torch.bfloat16)\n+        column = ColumnParallelLinear(3072, 64, bias=False, params_dtype=torch.bfloat16)\n+        with _on_gfx115():\n+            for layer in (row, column):\n+                layer.quant_method.process_weights_after_loading(layer)\n+\n+        self.assertEqual(tuple(row.weight.shape), (64, 768))\n+        self.assertTrue(row.weight.is_contiguous())\n+        self.assertEqual(tuple(column.weight.shape), (16, 3072))\n+        self.assertEqual(column.weight.stride(0), 3072 + 64)\n+\n+    def test_checkpoint_loaders_reload_into_padded_storage(self):\n+        \"\"\"Fused loaders slice rows and RowParallelLinear slices K before copying.\"\"\"\n+        # Each shard ends up with K = 1024, a 2 KiB bf16 row.\n+        cases = {\n+            \"qkv\": (\n+                lambda: QKVParallelLinear(\n+                    _HIDDEN, 64, 16, 4, bias=False, params_dtype=torch.bfloat16\n+                ),\n+                {\"q\": (1024, _HIDDEN), \"k\": (256, _HIDDEN), \"v\": (256, _HIDDEN)},\n+            ),\n+            \"merged\": (\n+                lambda: MergedColumnParallelLinear(\n+                    _HIDDEN, [256, 256], bias=False, params_dtype=torch.bfloat16\n+                ),\n+                {0: (256, _HIDDEN), 1: (256, _HIDDEN)},\n+            ),\n+            \"row\": (\n+                lambda: RowParallelLinear(\n+                    4 * _HIDDEN, 64, bias=False, params_dtype=torch.bfloat16\n+                ),\n+                {None: (64, 4 * _HIDDEN)},\n+            ),\n+        }\n+        for kind, (make, shards) in cases.items():\n+            with self.subTest(kind=kind):\n+                padded, reference = make(), make()\n+                with _on_gfx115():\n+                    padded.quant_method.process_weights_after_loading(padded)\n+                    storage = padded.weight.data_ptr()\n+                    for shard_id, shape in shards.items():\n+                        full = torch.randn(shape, dtype=torch.bfloat16)\n+                        for layer in (padded, reference):\n+                            args = () if shard_id is None else (shard_id,)\n+                            layer.weight.weight_loader(layer.weight, full, *args)\n+                    padded.quant_method.process_weights_after_loading(padded)\n+\n+                self.assertEqual(padded.weight.stride(0), _PADDED_STRIDE)\n+                self.assertEqual(padded.weight.data_ptr(), storage)\n+                self.assertTrue(torch.equal(padded.weight, reference.weight))\n+\n+\n+@unittest.skipUnless(unquant._is_gfx115, \"needs an AMD gfx115x GPU\")\n+class TestGfx115WeightPaddingOnDevice(CustomTestCase):\n+    \"\"\"hipBLASLt and the embedding gather read the padded stride correctly.\"\"\"\n+\n+    def setUp(self):\n+        torch.manual_seed(0)\n+        _publish(tp_size=1, device=\"cuda\")\n+        self.addCleanup(reset_context)\n+\n+    @torch.inference_mode()\n+    def test_linear_outputs_match_unpadded(self):\n+        for k, n in ((4096, 6144), (4096, 4096), (14336, 4096)):\n+            layer = ReplicatedLinear(k, n, bias=True, params_dtype=torch.bfloat16)\n+            layer = layer.cuda()\n+            layer.weight.copy_(torch.randn_like(layer.weight) / k**0.5)\n+            layer.bias.copy_(torch.randn_like(layer.bias))\n+            reference_weight = layer.weight.clone()\n+            layer.quant_method.process_weights_after_loading(layer)\n+            self.assertEqual(layer.weight.stride(0), k + 64)\n+\n+            for m in (1, 8, 300):\n+                with self.subTest(k=k, n=n, m=m):\n+                    x = torch.randn(m, k, device=\"cuda\", dtype=torch.bfloat16)\n+                    torch.testing.assert_close(\n+                        layer(x)[0],\n+                        F.linear(x, reference_weight, layer.bias),\n+                        rtol=_BF16_RTOL,\n+                        atol=_BF16_ATOL,\n+                    )\n+\n+    @torch.inference_mode()\n+    def test_tied_head_embeds_and_projects(self):\n+        model = _CausalLM(tie=\"module\").cuda()\n+        reference = model.lm_head.weight.clone()\n+        DefaultModelLoader.postprocess_weights(model, torch.device(\"cuda\"))\n+        self.assertEqual(model.lm_head.weight.stride(0), _PADDED_STRIDE)\n+\n+        ids = torch.tensor([0, 7, _VOCAB - 1], device=\"cuda\")\n+        torch.testing.assert_close(\n+            model.model.embed_tokens(ids), reference[ids], rtol=0, atol=0\n+        )\n+        hidden = torch.randn(2, _HIDDEN, device=\"cuda\", dtype=torch.bfloat16)\n+        torch.testing.assert_close(\n+            hidden @ model.lm_head.weight.T,\n+            hidden @ reference.T,\n+            rtol=_BF16_RTOL,\n+            atol=_BF16_ATOL,\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/26cd738bcdb257640125b742b7f6609b6bfc86ec/test%2Fregistered%2Funit%2Flayers%2Fquantization%2Ftest_unquant_gfx115_weight_padding.py",
+      "sha": "5a7c7d4a60ee41494c68fc10c4c79e547b4c22ad",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "pls add `and torch.cuda.is_available()` in `if`",
+      "created_at": "2026-11-03T05:56:00Z",
+      "diff_hunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():\n+    \"\"\"\n+    Returns whether the current platform is AMD RDNA3 / RDNA3.5 (gfx11xx, e.g. gfx1100, gfx1151).\n+    \"\"\"\n+    if torch.version.hip:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451363622",
+      "id": 4451363622,
+      "line": null,
+      "original_line": 1268,
+      "path": "python/sglang/srt/utils/common.py",
+      "updated_at": "2026-11-03T06:02:48Z",
+      "user": {
+        "login": "HaiShaw"
+      }
+    },
+    {
+      "body": "Note - main has not officially supported RDNA3 and other chips than Halo, please use narrowed scope of `_gfx115_` as pr #47695 would do.",
+      "created_at": "2026-11-03T06:02:35Z",
+      "diff_hunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451402063",
+      "id": 4451402063,
+      "line": null,
+      "original_line": 1264,
+      "path": "python/sglang/srt/utils/common.py",
+      "updated_at": "2026-11-03T06:02:48Z",
+      "user": {
+        "login": "HaiShaw"
+      }
+    },
+    {
+      "body": "acked.",
+      "created_at": "2026-11-03T06:37:52Z",
+      "diff_hunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():\n+    \"\"\"\n+    Returns whether the current platform is AMD RDNA3 / RDNA3.5 (gfx11xx, e.g. gfx1100, gfx1151).\n+    \"\"\"\n+    if torch.version.hip:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451608750",
+      "id": 4451608750,
+      "line": null,
+      "original_line": 1268,
+      "path": "python/sglang/srt/utils/common.py",
+      "updated_at": "2026-11-03T06:37:52Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "acked",
+      "created_at": "2026-11-03T06:38:00Z",
+      "diff_hunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451609660",
+      "id": 4451609660,
+      "line": null,
+      "original_line": 1264,
+      "path": "python/sglang/srt/utils/common.py",
+      "updated_at": "2026-11-03T06:38:00Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "Done in 1b6ea3d52d: the helper is now `if torch.version.hip and torch.cuda.is_available():`.",
+      "created_at": "2026-11-03T06:56:04Z",
+      "diff_hunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():\n+    \"\"\"\n+    Returns whether the current platform is AMD RDNA3 / RDNA3.5 (gfx11xx, e.g. gfx1100, gfx1151).\n+    \"\"\"\n+    if torch.version.hip:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451721192",
+      "id": 4451721192,
+      "line": null,
+      "original_line": 1268,
+      "path": "python/sglang/srt/utils/common.py",
+      "updated_at": "2026-11-03T06:56:05Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "Done in 1b6ea3d52d: the gate is now `is_gfx115_supported()` (`gcnArchName` starting with `gfx115`), matching what you asked for on #47695, so RDNA3 is out. I renamed the identifiers, the opt-out env var (now `SGLANG_DISABLE_GFX115_WEIGHT_PADDING`) and the test file to match, and updated the description. gfx1151 is the only chip I measured; gfx1150/1152 are covered but untested, and the opt-out is there for them.",
+      "created_at": "2026-11-03T06:56:07Z",
+      "diff_hunk": "@@ -1260,6 +1260,18 @@ def is_gfx942_supported():\n         return False\n \n \n+@lru_cache(maxsize=1)\n+def is_gfx11_supported():",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#discussion_r4451721489",
+      "id": 4451721489,
+      "line": null,
+      "original_line": 1264,
+      "path": "python/sglang/srt/utils/common.py",
+      "updated_at": "2026-11-03T06:56:07Z",
+      "user": {
+        "login": "twoask"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Hi maintainers, could someone add the run-ci label or trigger CI for this PR? The latest Extra and AMD ROCm 10 runs show as failed, but they look gated rather than related to the change (please correct me if I’m misreading the logs).\r\n\r\nSummary for context: on gfx11 this pads qualifying bf16/fp16 weight rows by 128 B at load to avoid cache-channel aliasing. On gfx1151 (Strix Halo): +27–30% single-stream and +23–33% batched decode on Llama-3.1-8B and Qwen2.5-3B, prefill and accuracy unchanged. It’s a no-op on non-gfx11 hardware and can be disabled with SGLANG_DISABLE_GFX11_WEIGHT_PADDING=1.\r\n\r\nIt complements #45540 (RMSNorm on RDNA without AITER), which also needs CI triggered. Thanks!",
+      "created_at": "2026-10-24T20:10:24Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6388977935",
+      "id": 6388977935,
+      "updated_at": "2026-10-25T04:15:13Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "I reproduced this on gfx1100 (RDNA3, W7900-class, 48 GB) independently, on the `amd_march` branch. The padding commit is applied on top of `amd_march` plus our open RDNA fixes (#46910, #46914, #46915, #46967). It cherry-picks with only trivial import and env-registry conflicts. Setup: ROCm 7.2, torch 2.13, hipBLASLt default solutions, no aiter, no TunableOp.\n\n**1. Kernel level, in-process A/B.**\n- Both arms run in the same process on the same GPU, interleaved round by round, 15 rounds, with the first arm alternating.\n- Each arm rotates over ≥1 GiB of distinct weight copies, so every call streams its weight from DRAM rather than the 96 MB last-level cache. Without this, single-copy loops overstate bandwidth on this card.\n- Shapes are Qwen3-8B's. bf16, M=1, `F.linear`.\n- Two independent passes; numbers are medians from pass 1, with pass 2 within 1%.\n\n| shape (K -> N) | plain | padded | speedup |\n|---|---|---|---|\n| QKV 4096 -> 6144 | 148.6 µs, 339 GB/s | 119.4 µs, 422 GB/s | 1.245x |\n| O 4096 -> 4096 | 104.7 µs, 321 GB/s | 85.7 µs, 392 GB/s | 1.22x |\n| gate_up 4096 -> 24576 | 516.4 µs, 390 GB/s | 347.9 µs, 579 GB/s | 1.48x |\n| down 12288 -> 4096 | 249.0 µs, 404 GB/s | 223.4 µs, 451 GB/s | 1.11x |\n| lm_head 4096 -> 151936 | 1930.8 µs, 645 GB/s | 1814.5 µs, 686 GB/s | 1.06x |\n\n- Spread within each arm is under 1% (e.g. QKV plain 147.9–149.7 µs, padded 118.4–121.5 µs).\n- Max relative error vs fp32 is identical between arms (2.5e-3 to 3.0e-3).\n\n**2. End to end.**\n- Qwen/Qwen3-8B bf16, TP1, default server flags: Triton attention, decode CUDA graphs on.\n- Arms switched with `SGLANG_DISABLE_GFX11_WEIGHT_PADDING=1/0`, three rounds alternating off/on (6 servers).\n- `bench_serving --dataset-name random-ids`, 1024 in / 256 out, range ratio 1.0, seed 1.\n- The startup log confirms the padding in every \"on\" server: `padded {(6144, 4096): 36, (4096, 4096): 36, (24576, 4096): 36, (4096, 12288): 36, (151936, 4096): 1}; skipped {}`. It's absent from every \"off\" server.\n\n| | off: output tok/s (median TPOT) | on: output tok/s (median TPOT) | gain |\n|---|---|---|---|\n| c=1, 16 prompts | 23.79 / 23.81 / 23.78 (41.0 ms) | 28.75 / 28.77 / 28.70 (33.8 ms) | **+20.9%** |\n| c=8, 32 prompts | 165.7 / 165.1 / 165.6 (44.4 ms) | 195.5 / 195.4 / 195.3 (37.0 ms) | **+18.0%** |\n| c=32, 128 prompts | 415.9 / 415.8 / 416.2 (59.3 ms) | 459.7 / 459.4 / 459.3 (51.7 ms) | **+10.4%** |\n\n- Rounds agree to within 0.4%.\n- TTFT: c=1 is 299.8 → 292.8 ms. At c=32, prefill-heavy, it is 2840 → 2916 ms (+2.7%).\n- GSM8K (`sgl-eval==0.1.2`, 200 questions, `enable_thinking=false`, temperature 0.7, top_p 0.8): off 0.96, on 0.95, which is within sampling noise. There was no output collapse in any request across the 6 servers.\n\n**One note for an `amd_march` port:** `test_unquant_gfx11_weight_padding.py` imports `sglang.test.parallel_groups`, which `amd_march` doesn't have yet. The test needs a small adjustment there.\n\n@twoask would you like to open the `amd_march` version yourself? The AMD maintainers have said RDNA changes land on `amd_march` first (#31805), and #46900 lists the other `amd_march` PRs. If you'd rather not, I'm happy to open a backport that keeps your authorship and links back here. Just let me know which you prefer.\n",
+      "created_at": "2026-10-29T09:14:02Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6492700413",
+      "id": 6492700413,
+      "updated_at": "2026-10-29T09:14:02Z",
+      "user": {
+        "login": "vivienfanghuagood"
+      }
+    },
+    {
+      "body": "@vivienfanghuagood thanks, this is a really thorough repro! Good to see the gain hold at c=32, and the padding line showing up in every \"on\" server is a nice touch.\r\n\r\nI'll open the `amd_march` version myself. The PR is ready here #47299 : one commit on top of `amd_march`, conflicts were context only, and the test now builds its own TP group stubs since `sglang.test.parallel_groups` isn't there yet. All 12 tests pass on gfx1151 and the CPU-only ones pass without a GPU.",
+      "created_at": "2026-10-29T17:16:48Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6503484421",
+      "id": 6503484421,
+      "updated_at": "2026-10-29T17:16:48Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "cc: @nemanjaudovic",
+      "created_at": "2026-11-01T00:46:31Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6551350468",
+      "id": 6551350468,
+      "updated_at": "2026-11-01T00:46:31Z",
+      "user": {
+        "login": "hubertlu-tw"
+      }
+    },
+    {
+      "body": "@twoask could you please help resolve the merge conflict? Thanks.",
+      "created_at": "2026-11-02T18:00:30Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6584420091",
+      "id": 6584420091,
+      "updated_at": "2026-11-02T18:00:30Z",
+      "user": {
+        "login": "hubertlu-tw"
+      }
+    },
+    {
+      "body": "@hubertlu-tw Done, thanks for the ping! I merged main on top of your merge (c7b50d4781). The only conflict was in `unquant.py`: our `_is_gfx11` and main's new `_skip_aiter_unquant` landed on the same line, so I kept both. The PR diff against main is unchanged, the padding unit tests pass, and a quick Qwen3-0.6B server run on gfx1151 looks fine with padding on.\n",
+      "created_at": "2026-11-02T18:26:44Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6584970881",
+      "id": 6584970881,
+      "updated_at": "2026-11-02T18:26:44Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "Hi @twoask,\r\nDo you mind sending your contact info to [Hubert.Lu@amd.com](mailto:Hubert.Lu@amd.com) in case we would like to discuss some features or optimization offline? Thanks.",
+      "created_at": "2026-11-02T19:18:05Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6586184590",
+      "id": 6586184590,
+      "updated_at": "2026-11-02T19:18:05Z",
+      "user": {
+        "login": "hubertlu-tw"
+      }
+    },
+    {
+      "body": "<!-- pr-check-comment runs=41592931476 -->\nRequired checks failed on 1b6ea3d; this PR cannot be merged until they pass.\n\n**Lint** ([run](https://github.com/sgl-project/sglang/actions/runs/41592931476))\nRun `pre-commit run --all-files` locally and push the result. The run log shows any other failing step.",
+      "created_at": "2026-11-03T06:59:00Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6597476577",
+      "id": 6597476577,
+      "updated_at": "2026-11-03T07:44:15Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "PR test Base passed before updating from main.",
+      "created_at": "2026-11-03T07:57:26Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#issuecomment-6598387017",
+      "id": 6598387017,
+      "updated_at": "2026-11-03T07:57:47Z",
+      "user": {
+        "login": "HaiShaw"
+      }
+    }
+  ],
+  "number": 46327,
+  "refs": {
+    "base": {
+      "commit": "f77064f635779601c7b20258ce45ded3fa00ac82",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "26cd738bcdb257640125b742b7f6609b6bfc86ec",
+      "repository": "twoask/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "LGTM",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5706826254",
+      "id": 5706826254,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-30T00:50:27Z",
+      "user": {
+        "login": "hubertlu-tw"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5747801164",
+      "id": 5747801164,
+      "state": "CHANGES_REQUESTED",
+      "submitted_at": "2026-11-03T06:02:48Z",
+      "user": {
+        "login": "HaiShaw"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748100798",
+      "id": 5748100798,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T06:37:52Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748102057",
+      "id": 5748102057,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T06:38:00Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748245530",
+      "id": 5748245530,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T06:56:04Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748245882",
+      "id": 5748245882,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T06:56:07Z",
+      "user": {
+        "login": "twoask"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46327#pullrequestreview-5748778704",
+      "id": 5748778704,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-03T07:56:33Z",
+      "user": {
+        "login": "HaiShaw"
+      }
+    }
+  ]
+}

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan_recipes/README.md
-raw_sha256: a72fb9eab9eb7f376a50622327954f614694ed6aea5bb782aae51035e9c9157a
+raw_sha256: 80bf0cdce6473544775bf13189368107b72642a97efb075a9486e77a21ecbe1c
 sources: []
-generated_body_sha256: 1dfd32ae0fa342907049088ef5c37e938ca4a08330996459e93b0c5df4111ad7
+generated_body_sha256: 5c7a97db93ad37a3d9d9ca74d791ea57de8cf6f05f31f7defa490996239e4e05
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan_recipes/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan_recipes/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan_recipes/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -53,8 +53,15 @@ The package is organized by ownership:
 | `torchtitan_recipes.models.qwen3` | Qwen3 pretraining and SFT | `torchtitan/models/qwen3/README.md` |
 | `torchtitan_recipes.models.flux` | Flux pretraining | `torchtitan/models/flux/README.md` |
 | `torchtitan_recipes.models.muse_glimmer` | Muse Glimmer pretraining | `torchtitan/models/muse_glimmer/README.md` |
-| `torchtitan_recipes.graph_trainer` | GraphTrainer training | `torchtitan/experiments/graph_trainer/README.md` |
-| `torchtitan_recipes.rl` | RL examples | `torchtitan/rl/examples/` |
+| `torchtitan_recipes.graph_trainer.llama3` | GraphTrainer Llama 3 | `torchtitan/experiments/graph_trainer/README.md` |
+| `torchtitan_recipes.graph_trainer.qwen3` | GraphTrainer Qwen3 | `torchtitan/experiments/graph_trainer/README.md` |
+| `torchtitan_recipes.graph_trainer.deepseek_v3` | GraphTrainer DeepSeek V3 | `torchtitan/experiments/graph_trainer/README.md` |
+| `torchtitan_recipes.rl.alphabet_sort` | RL alphabet sort | `torchtitan/rl/examples/alphabet_sort/` |
+| `torchtitan_recipes.rl.dapo_math` | RL DAPO math | `torchtitan/rl/examples/dapo_math/` |
+| `torchtitan_recipes.rl.search_r1` | RL Search-R1 | `torchtitan/rl/examples/search_r1/` |
+| `torchtitan_recipes.rl.verifiers_dapo_math` | RL verifiers DAPO math | `torchtitan/rl/examples/verifiers/dapo_math/` |
+| `torchtitan_recipes.rl.verifiers_terminal_bench` | RL verifiers terminal bench | `torchtitan/rl/examples/verifiers/terminal_bench/` |
+| `torchtitan_recipes.decision.qwen3` | Typed-decision (Jev-style) fine-tuning | `torchtitan_recipes/decision/README.md` |
 | `torchtitan_recipes.torchft.llama3` | TorchFT replicated training | `torchtitan/experiments/torchft/README.md` |
 
 Select a recipe by its exact import path:

@@ -1,0 +1,654 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "88788e8782469e4aa2ce5f28f317436333ce02adebd7fd133c7380709ef37220",
+      "isPrivate": false,
+      "numbers": [
+        7481,
+        7480,
+        7478,
+        7472,
+        7469,
+        7468,
+        7467,
+        7466
+      ],
+      "observed_at": "2026-11-04T16:02:23.638377+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4981,
+        "resetAt": "2026-11-04T16:50:23Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "7de072aa9e72659445a908c0eeb04b030d1a6666",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "**Incremental review:** [Files changed](https://github.com/NVIDIA/Megatron-LM/pull/7481/files) against `main`.\n\n`get_tokens_per_expert_and_token_count(..., with_padding_mask=True)` returns a\n`local_num_tokens` that is not local.\n\n## Why the input alias causes a local/global mix-up\n\n```python\nlocal_tokens_per_expert = routing_map.sum(dim=0)          # contiguous\nglobal_tokens_per_expert = reduce_from_tensor_model_parallel_region(\n    local_tokens_per_expert, reduce_group\n)\nif with_padding_mask:\n    local_num_tokens = local_tokens_per_expert.sum() // topk   # reads the aliased buffer\n```\n\n`reduce_from_tensor_model_parallel_region` reaches `_reduce()` in\n`megatron/core/tensor_parallel/mappings.py`, which does\n\n```python\ninput_ = input_.contiguous()\ntorch.distributed.all_reduce(input_, group=group)\n```\n\nFor a contiguous input this mutates the caller's storage in place, so by the time the masked\nbranch reads `local_tokens_per_expert` that buffer already holds the group sum.\n\nThe value is consumed by `Router.attach_and_log_load_balancing_loss()` as the pre-multiplier\non the aux loss when `calculate_per_token_loss` is enabled, so on any run where ranks hold\ndifferent numbers of valid tokens the aux-loss gradient is scaled by a group-global factor.\n\n## Minimal reproduction (real NCCL, 2 ranks, EP=2, topk=2)\n\nRank 0 has 3 valid rows, rank 1 has 1:\n\n| | rank 0 local | rank 1 local | group global |\n|---|---|---|---|\n| before this fix | **4** | **4** | 4 |\n| after this fix | 3 | 1 | 4 |\n\nReproduced for topk = 1, 2 and 4. The group histogram and the `with_padding_mask=False` branch\nare correct in both cases. The same aliasing is visible directly: an `all_reduce` performed on\nthe buffer that `routing_map.sum(dim=0)` returned changes it in place.\n\n## The fix\n\nTake the rank-local scalar before the collective runs, into its own storage, and reuse it in\nthe non-masked branch. The divide operator is preserved exactly as found (`//` on current\nmain): this changes which tensor is read, not the division. The `// topk` floor that landed via\n#7183 (int64 for the fused aux loss) is a separate change and is deliberately left alone.\n\n* no new collective, and collective count/order/group/op are unchanged;\n* no `.item()` / `.cpu()` added to the training path and no host synchronization;\n* `_reduce()` is not modified globally, so unrelated callers are unaffected;\n* the histogram is not cloned; the local scalar owns its storage;\n* the `with_padding_mask=False` expressions are unchanged.\n\n## Evidence\n\nBase: `d564dd01de4549a4884be26b1d74e169798fd877` (the alias defect is present on this commit).\n\nReal-NCCL tests, 2 ranks, run with the file's own junit report per rank:\n\n| test file | base | with this PR |\n|---|---|---|\n| `test_token_count_preservation.py` + `test_local_count_router_gradient.py` | **5 failed**, 6 passed, 3 skipped | **11 passed**, 0 failed, 3 skipped |\n\nEvery base failure is the target assertion, not a missing dependency or an invalid config:\n\n```\nAssertionError: local token count is not rank-local on rank 0: got 4, expected 3 (group-global would be 4)\nAssertionError: rank 0: helper returned 10.0 for tp_cp_group, expected the rank-local valid count 7\nAssertionError: rank 0: router used valid_token_count=[10.0], none of which is this rank's valid count 7\n```\n\nThe skips are the zero-load-rank cases that a 2-rank plan does not contain; they are reported\nas skips, not passes.\n\n### What the added tests cover\n\n* helper contract on a real NCCL group: uneven per-rank counts, a zero-valid-row rank, the\n  unmasked branch, an all-padding input, and a storage-independence check so the local scalar\n  cannot silently alias the histogram;\n* the helper called the way the router calls it (`Router.tp_cp_group`) in a real TP domain;\n* `Router.forward` handing the rank-local count to `attach_and_log_load_balancing_loss`;\n* the aux gradient consequence, isolated: with the routing map, scores, aux formula and\n  process group held identical and only the reported count changed, the aux gradient scales\n  exactly linearly with it. Measured 1.428571x and 3.333333x for local/total of 7/10 and 3/10,\n  which is the `group_global/local` factor this bug introduces;\n* a real `MoELayer` forward + backward + optimizer step staying finite with the masked path\n  active.\n\nComparison is exact (integer counts), not tolerance-based.\n\nThe `conftest.py` change adds a session-scoped NCCL fixture. Both new modules need a real\ndistributed group, and per-module init/destroy pairs race when the modules share one `torchrun`\nsession, killing it with `ncclRemoteError: ... remote process exited prematurely`. Owning the\ngroup once at session scope removes that; the existing session-scoped `cleanup` fixture remains\nthe single owner of `destroy_process_group`.\n\n## Performance\n\nNo speedup is claimed. The change adds one reduction over a `[num_experts]` tensor per call and\nremoves nothing, so about 1.0 is the expected ratio, and peak allocated/reserved memory are\nunchanged. Measured as separate baseline/patch processes in balanced `A-P-P-A` / `P-A-A-P`\nblocks on L20, the effect is inside the run-to-run noise of the node used (an A/A control on\nidentical code showed a 3-6% mean, up to 15% per block), so it is reported as\ninconclusive-below-noise rather than as a result.\n\n## Not covered\n\nA single-process full-loss equivalence proof (which would need `finalize_model_grads`\nnormalization reproduced), a real CP>1 domain, and TP x CP combinations. Global/sequence\naux-loss normalization and the unmasked branch are not modified by this change.\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+            "createdAt": "2026-09-18T17:51:09Z",
+            "databaseId": 5733993647,
+            "updatedAt": "2026-09-18T17:51:09Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-5733993647"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "This PR has been automatically converted to **draft** because all PRs must start as drafts.\n\nWhen you are ready for review, click **Ready for Review** to begin the review process. This will:\n1. Add the oncall reviewer (optional reviewer)\n2. Add required review teams based on your changes\n\nSee the [contribution guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/submit.md) for more details.",
+            "createdAt": "2026-09-18T17:51:18Z",
+            "databaseId": 5733995401,
+            "updatedAt": "2026-09-18T17:51:18Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-5733995401"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Connor-XY"
+            },
+            "body": "@zhongbozhu, could you review the local token-count capture before the in-place reduction and its use in the router auxiliary loss? This is adjacent to your token-count dtype fix in #7183. Please also check that the new distributed regression fixtures fit the existing test lifecycle.\n",
+            "createdAt": "2026-09-21T18:55:26Z",
+            "databaseId": 5765826782,
+            "updatedAt": "2026-09-21T18:55:26Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-5765826782"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "0z5a"
+            },
+            "body": "Thanks for checking. Yes, #7046 fixes it: it reduces a clone of the histogram (`global_tokens_per_expert = local_tokens_per_expert.clone()`), so `local_tokens_per_expert` keeps this rank's counts and the masked `local_num_tokens` is rank-local again. That is the same fix as this PR. #7046 also covers it with `test_token_count_reduction_keeps_local_count_with_in_place_reduce` and the GPU tests with uneven per-rank counts, so nothing here is still needed. Closing this PR.\n",
+            "createdAt": "2026-10-29T10:10:55Z",
+            "databaseId": 6493867673,
+            "updatedAt": "2026-10-29T10:10:55Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-6493867673"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYMQjpk=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "80d403a17d188d6a137e7d8127b80826585602e9",
+      "headRepository": {
+        "nameWithOwner": "0z5a/Megatron-LM"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 7481,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "zhongbozhu"
+            },
+            "body": "Hi, thank you for your contribution! \r\n\r\nWith this PR merged https://github.com/NVIDIA/Megatron-LM/pull/7046, looks like the issue has been solved already? ",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5693143477,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-29T05:12:12Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#pullrequestreview-5693143477"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yOVQwNToxMjoxMlq0MjAyNi0xMC0yOVQwNToxMjoxMlrPAAAAAVNWebU=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "CLOSED",
+      "title": "Fix masked-routing local token count before the distributed reduction",
+      "updatedAt": "2026-10-29T10:11:10Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/7481"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7481/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7481/commits"
+      },
+      "html": {
+        "href": "https://github.com/NVIDIA/Megatron-LM/pull/7481"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7481"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7481/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7481"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/80d403a17d188d6a137e7d8127b80826585602e9"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 551,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "NONE",
+    "auto_merge": null,
+    "base": {
+      "label": "NVIDIA:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/NVIDIA/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contributors",
+        "created_at": "2019-03-21T16:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/events",
+        "fork": false,
+        "forks": 4700,
+        "forks_count": 4700,
+        "forks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/forks",
+        "full_name": "NVIDIA/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/NVIDIA/Megatron-LM.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/hooks",
+        "html_url": "https://github.com/NVIDIA/Megatron-LM",
+        "id": 176982014,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "MDEwOlJlcG9zaXRvcnkxNzY5ODIwMTQ=",
+        "notifications_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 1937,
+        "open_issues_count": 1937,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+          "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NVIDIA/followers",
+          "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NVIDIA",
+          "id": 1728152,
+          "login": "NVIDIA",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+          "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+          "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+          "repos_url": "https://api.github.com/users/NVIDIA/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/NVIDIA",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T15:52:06Z",
+        "releases_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/releases{/id}",
+        "size": 178037,
+        "ssh_url": "git@github.com:NVIDIA/Megatron-LM.git",
+        "stargazers_count": 18327,
+        "stargazers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscription",
+        "svn_url": "https://github.com/NVIDIA/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/teams",
+        "topics": [
+          "large-language-models",
+          "model-para",
+          "transformers"
+        ],
+        "trees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-11-04T15:48:34Z",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM",
+        "visibility": "public",
+        "watchers": 18327,
+        "watchers_count": 18327,
+        "web_commit_signoff_required": false
+      },
+      "sha": "7de072aa9e72659445a908c0eeb04b030d1a6666",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+        "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NVIDIA/followers",
+        "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NVIDIA",
+        "id": 1728152,
+        "login": "NVIDIA",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+        "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+        "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+        "repos_url": "https://api.github.com/users/NVIDIA/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/NVIDIA",
+        "user_view_type": "public"
+      }
+    },
+    "body": "**Incremental review:** [Files changed](https://github.com/NVIDIA/Megatron-LM/pull/7481/files) against `main`.\n\n`get_tokens_per_expert_and_token_count(..., with_padding_mask=True)` returns a\n`local_num_tokens` that is not local.\n\n## Why the input alias causes a local/global mix-up\n\n```python\nlocal_tokens_per_expert = routing_map.sum(dim=0)          # contiguous\nglobal_tokens_per_expert = reduce_from_tensor_model_parallel_region(\n    local_tokens_per_expert, reduce_group\n)\nif with_padding_mask:\n    local_num_tokens = local_tokens_per_expert.sum() // topk   # reads the aliased buffer\n```\n\n`reduce_from_tensor_model_parallel_region` reaches `_reduce()` in\n`megatron/core/tensor_parallel/mappings.py`, which does\n\n```python\ninput_ = input_.contiguous()\ntorch.distributed.all_reduce(input_, group=group)\n```\n\nFor a contiguous input this mutates the caller's storage in place, so by the time the masked\nbranch reads `local_tokens_per_expert` that buffer already holds the group sum.\n\nThe value is consumed by `Router.attach_and_log_load_balancing_loss()` as the pre-multiplier\non the aux loss when `calculate_per_token_loss` is enabled, so on any run where ranks hold\ndifferent numbers of valid tokens the aux-loss gradient is scaled by a group-global factor.\n\n## Minimal reproduction (real NCCL, 2 ranks, EP=2, topk=2)\n\nRank 0 has 3 valid rows, rank 1 has 1:\n\n| | rank 0 local | rank 1 local | group global |\n|---|---|---|---|\n| before this fix | **4** | **4** | 4 |\n| after this fix | 3 | 1 | 4 |\n\nReproduced for topk = 1, 2 and 4. The group histogram and the `with_padding_mask=False` branch\nare correct in both cases. The same aliasing is visible directly: an `all_reduce` performed on\nthe buffer that `routing_map.sum(dim=0)` returned changes it in place.\n\n## The fix\n\nTake the rank-local scalar before the collective runs, into its own storage, and reuse it in\nthe non-masked branch. The divide operator is preserved exactly as found (`//` on current\nmain): this changes which tensor is read, not the division. The `// topk` floor that landed via\n#7183 (int64 for the fused aux loss) is a separate change and is deliberately left alone.\n\n* no new collective, and collective count/order/group/op are unchanged;\n* no `.item()` / `.cpu()` added to the training path and no host synchronization;\n* `_reduce()` is not modified globally, so unrelated callers are unaffected;\n* the histogram is not cloned; the local scalar owns its storage;\n* the `with_padding_mask=False` expressions are unchanged.\n\n## Evidence\n\nBase: `d564dd01de4549a4884be26b1d74e169798fd877` (the alias defect is present on this commit).\n\nReal-NCCL tests, 2 ranks, run with the file's own junit report per rank:\n\n| test file | base | with this PR |\n|---|---|---|\n| `test_token_count_preservation.py` + `test_local_count_router_gradient.py` | **5 failed**, 6 passed, 3 skipped | **11 passed**, 0 failed, 3 skipped |\n\nEvery base failure is the target assertion, not a missing dependency or an invalid config:\n\n```\nAssertionError: local token count is not rank-local on rank 0: got 4, expected 3 (group-global would be 4)\nAssertionError: rank 0: helper returned 10.0 for tp_cp_group, expected the rank-local valid count 7\nAssertionError: rank 0: router used valid_token_count=[10.0], none of which is this rank's valid count 7\n```\n\nThe skips are the zero-load-rank cases that a 2-rank plan does not contain; they are reported\nas skips, not passes.\n\n### What the added tests cover\n\n* helper contract on a real NCCL group: uneven per-rank counts, a zero-valid-row rank, the\n  unmasked branch, an all-padding input, and a storage-independence check so the local scalar\n  cannot silently alias the histogram;\n* the helper called the way the router calls it (`Router.tp_cp_group`) in a real TP domain;\n* `Router.forward` handing the rank-local count to `attach_and_log_load_balancing_loss`;\n* the aux gradient consequence, isolated: with the routing map, scores, aux formula and\n  process group held identical and only the reported count changed, the aux gradient scales\n  exactly linearly with it. Measured 1.428571x and 3.333333x for local/total of 7/10 and 3/10,\n  which is the `group_global/local` factor this bug introduces;\n* a real `MoELayer` forward + backward + optimizer step staying finite with the masked path\n  active.\n\nComparison is exact (integer counts), not tolerance-based.\n\nThe `conftest.py` change adds a session-scoped NCCL fixture. Both new modules need a real\ndistributed group, and per-module init/destroy pairs race when the modules share one `torchrun`\nsession, killing it with `ncclRemoteError: ... remote process exited prematurely`. Owning the\ngroup once at session scope removes that; the existing session-scoped `cleanup` fixture remains\nthe single owner of `destroy_process_group`.\n\n## Performance\n\nNo speedup is claimed. The change adds one reduction over a `[num_experts]` tensor per call and\nremoves nothing, so about 1.0 is the expected ratio, and peak allocated/reserved memory are\nunchanged. Measured as separate baseline/patch processes in balanced `A-P-P-A` / `P-A-A-P`\nblocks on L20, the effect is inside the run-to-run noise of the node used (an A/A control on\nidentical code showed a 3-6% mean, up to 15% per block), so it is reported as\ninconclusive-below-noise rather than as a result.\n\n## Not covered\n\nA single-process full-loss equivalence proof (which would need `finalize_model_grads`\nnormalization reproduced), a real CP>1 domain, and TP x CP combinations. Global/sequence\naux-loss normalization and the unmasked branch are not modified by this change.\n",
+    "changed_files": 4,
+    "closed_at": "2026-10-29T10:11:03Z",
+    "comments": 4,
+    "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7481/comments",
+    "commits": 3,
+    "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7481/commits",
+    "created_at": "2026-09-18T17:51:04Z",
+    "deletions": 1,
+    "diff_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481.diff",
+    "draft": false,
+    "head": {
+      "label": "0z5a:fix/masked-routing-local-token-count",
+      "ref": "fix/masked-routing-local-token-count",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/0z5a/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/0z5a/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/0z5a/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/0z5a/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/0z5a/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/0z5a/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/0z5a/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/0z5a/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/0z5a/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/0z5a/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/0z5a/Megatron-LM/contributors",
+        "created_at": "2026-08-17T06:24:14Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/0z5a/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/0z5a/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/0z5a/Megatron-LM/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/0z5a/Megatron-LM/forks",
+        "full_name": "0z5a/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/0z5a/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/0z5a/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/0z5a/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/0z5a/Megatron-LM.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/0z5a/Megatron-LM/hooks",
+        "html_url": "https://github.com/0z5a/Megatron-LM",
+        "id": 1336761631,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/0z5a/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/0z5a/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/0z5a/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/0z5a/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/0z5a/Megatron-LM/labels{/name}",
+        "language": null,
+        "languages_url": "https://api.github.com/repos/0z5a/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/0z5a/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/0z5a/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "R_kgDOT61dHw",
+        "notifications_url": "https://api.github.com/repos/0z5a/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/192209249?v=4",
+          "events_url": "https://api.github.com/users/0z5a/events{/privacy}",
+          "followers_url": "https://api.github.com/users/0z5a/followers",
+          "following_url": "https://api.github.com/users/0z5a/following{/other_user}",
+          "gists_url": "https://api.github.com/users/0z5a/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/0z5a",
+          "id": 192209249,
+          "login": "0z5a",
+          "node_id": "U_kgDOC3ThYQ",
+          "organizations_url": "https://api.github.com/users/0z5a/orgs",
+          "received_events_url": "https://api.github.com/users/0z5a/received_events",
+          "repos_url": "https://api.github.com/users/0z5a/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/0z5a/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/0z5a/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/0z5a",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/0z5a/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-01T19:32:00Z",
+        "releases_url": "https://api.github.com/repos/0z5a/Megatron-LM/releases{/id}",
+        "size": 155929,
+        "ssh_url": "git@github.com:0z5a/Megatron-LM.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/0z5a/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/0z5a/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/0z5a/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/0z5a/Megatron-LM/subscription",
+        "svn_url": "https://github.com/0z5a/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/0z5a/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/0z5a/Megatron-LM/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/0z5a/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-08-17T06:24:14Z",
+        "url": "https://api.github.com/repos/0z5a/Megatron-LM",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "80d403a17d188d6a137e7d8127b80826585602e9",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/192209249?v=4",
+        "events_url": "https://api.github.com/users/0z5a/events{/privacy}",
+        "followers_url": "https://api.github.com/users/0z5a/followers",
+        "following_url": "https://api.github.com/users/0z5a/following{/other_user}",
+        "gists_url": "https://api.github.com/users/0z5a/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/0z5a",
+        "id": 192209249,
+        "login": "0z5a",
+        "node_id": "U_kgDOC3ThYQ",
+        "organizations_url": "https://api.github.com/users/0z5a/orgs",
+        "received_events_url": "https://api.github.com/users/0z5a/received_events",
+        "repos_url": "https://api.github.com/users/0z5a/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/0z5a/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/0z5a/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/0z5a",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481",
+    "id": 4571499737,
+    "issue_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/7481",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "aaaaaa",
+        "default": false,
+        "description": null,
+        "id": 8998491541,
+        "name": "community-request",
+        "node_id": "LA_kwDOCoyH_s8AAAACGFoVlQ",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/community-request"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": null,
+    "mergeable": false,
+    "mergeable_state": "dirty",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOCoyH_s8AAAABEHuM2Q",
+    "number": 7481,
+    "patch_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7481/comments",
+    "state": "closed",
+    "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/80d403a17d188d6a137e7d8127b80826585602e9",
+    "title": "Fix masked-routing local token count before the distributed reduction",
+    "updated_at": "2026-10-29T10:11:10Z",
+    "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/7481",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/192209249?v=4",
+      "events_url": "https://api.github.com/users/0z5a/events{/privacy}",
+      "followers_url": "https://api.github.com/users/0z5a/followers",
+      "following_url": "https://api.github.com/users/0z5a/following{/other_user}",
+      "gists_url": "https://api.github.com/users/0z5a/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/0z5a",
+      "id": 192209249,
+      "login": "0z5a",
+      "node_id": "U_kgDOC3ThYQ",
+      "organizations_url": "https://api.github.com/users/0z5a/orgs",
+      "received_events_url": "https://api.github.com/users/0z5a/received_events",
+      "repos_url": "https://api.github.com/users/0z5a/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/0z5a/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/0z5a/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/0z5a",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/80d403a17d188d6a137e7d8127b80826585602e9/megatron%2Fcore%2Ftransformer%2Fmoe%2Fmoe_utils.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftransformer%2Fmoe%2Fmoe_utils.py?ref=80d403a17d188d6a137e7d8127b80826585602e9",
+      "deletions": 1,
+      "filename": "megatron/core/transformer/moe/moe_utils.py",
+      "patch": "@@ -276,11 +276,17 @@ def get_tokens_per_expert_and_token_count(\n     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.\n     \"\"\"\n     local_tokens_per_expert = routing_map.sum(dim=0)\n+    # The rank-local valid token count must be computed BEFORE the reduction below.\n+    # `_reduce()` all-reduces a contiguous input in place, so `local_tokens_per_expert`\n+    # already holds the group-global histogram by the time the masked branch runs, and\n+    # reading it there returns a group-global count in place of the rank-local one.\n+    local_num_tokens = (\n+        local_tokens_per_expert.sum() // topk if with_padding_mask else None\n+    )\n     global_tokens_per_expert = reduce_from_tensor_model_parallel_region(\n         local_tokens_per_expert, reduce_group\n     )\n     if with_padding_mask:\n-        local_num_tokens = local_tokens_per_expert.sum() // topk\n         total_num_tokens = global_tokens_per_expert.sum() // topk\n     else:\n         local_num_tokens = routing_map.shape[0]",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/80d403a17d188d6a137e7d8127b80826585602e9/megatron%2Fcore%2Ftransformer%2Fmoe%2Fmoe_utils.py",
+      "sha": "57e839de9d1c47748f7a138f8f9a78770e1f465e",
+      "status": "modified"
+    },
+    {
+      "additions": 35,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/80d403a17d188d6a137e7d8127b80826585602e9/tests%2Funit_tests%2Ftransformer%2Fmoe%2Fconftest.py",
+      "changes": 35,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Ftransformer%2Fmoe%2Fconftest.py?ref=80d403a17d188d6a137e7d8127b80826585602e9",
+      "deletions": 0,
+      "filename": "tests/unit_tests/transformer/moe/conftest.py",
+      "patch": "@@ -56,3 +56,38 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:\n \n     else:\n         yield tmp_dir\n+# Appended to tests/unit_tests/transformer/moe/conftest.py\n+\n+import os as _os\n+\n+import pytest as _pytest\n+import torch as _torch\n+import torch.distributed as _dist\n+\n+\n+@_pytest.fixture(scope=\"session\")\n+def nccl_session():\n+    \"\"\"A session-scoped real NCCL process group for the A3 regression tests.\n+\n+    Skipped when torchrun did not provide RANK/WORLD_SIZE. Lifecycle is deliberately NOT torn\n+    down here: the session-scoped ``cleanup`` fixture above is the single owner of\n+    ``destroy_process_group``.\n+\n+    Why this exists: both A3 test modules need a real distributed group. Giving each module its\n+    own init/destroy pair breaks when they run in one torchrun session, because a module-scoped\n+    destroy races the next module's init and the session dies with\n+    ``ncclRemoteError: ... remote process exited prematurely`` while rank 0 is SIGTERM'd --\n+    which looks like a code failure but is a test-harness lifecycle bug.\n+    \"\"\"\n+    if not _torch.cuda.is_available():\n+        _pytest.skip(\"CUDA not available\")\n+    if \"RANK\" not in _os.environ or \"WORLD_SIZE\" not in _os.environ:\n+        _pytest.skip(\"requires torchrun with RANK/WORLD_SIZE\")\n+\n+    world = int(_os.environ[\"WORLD_SIZE\"])\n+    _torch.cuda.set_device(int(_os.environ.get(\"LOCAL_RANK\", 0)))\n+    if not _dist.is_initialized():\n+        _dist.init_process_group(\n+            \"nccl\", device_id=_torch.device(\"cuda\", _torch.cuda.current_device())\n+        )\n+    return world",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/80d403a17d188d6a137e7d8127b80826585602e9/tests%2Funit_tests%2Ftransformer%2Fmoe%2Fconftest.py",
+      "sha": "77de43498b9978a42cf5b21e9218160b9c573f0c",
+      "status": "modified"
+    },
+    {
+      "additions": 335,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/80d403a17d188d6a137e7d8127b80826585602e9/tests%2Funit_tests%2Ftransformer%2Fmoe%2Ftest_local_count_router_gradient.py",
+      "changes": 335,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Ftransformer%2Fmoe%2Ftest_local_count_router_gradient.py?ref=80d403a17d188d6a137e7d8127b80826585602e9",
+      "deletions": 0,
+      "filename": "tests/unit_tests/transformer/moe/test_local_count_router_gradient.py",
+      "patch": "@@ -0,0 +1,335 @@\n+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.\n+\"\"\"A3 part 2: the local token count in a REAL tensor-parallel domain, and its effect on the\n+auxiliary-loss scaling that reaches the router gradient.\n+\n+Part 1 (``test_token_count_preservation.py``) proves the helper's return contract on a raw\n+NCCL world group. This file closes the gap that matters for training:\n+\n+  * the helper is called with ``Router.tp_cp_group``, so the domain must be a real TP group;\n+  * its second return value pre-scales the aux loss in\n+    ``Router.attach_and_log_load_balancing_loss``, so a wrong value changes the gradient the\n+    router receives.\n+\n+Run with a real TP group:\n+\n+    torchrun --standalone --nproc_per_node=2 -m pytest -q \\\n+        tests/unit_tests/transformer/moe/test_local_count_router_gradient.py\n+\n+Scope note: this validates the SCALING TERM (``local_valid_tokens * tp_cp_size``) that the\n+router applies to the aux loss, and the ordering of the router gradient it produces. It is\n+not a full single-process loss-equivalence proof, which would require reproducing\n+``finalize_model_grads`` normalization; that is reported as NOT_RUN.\n+\"\"\"\n+from __future__ import annotations\n+\n+import os\n+\n+import pytest\n+import torch\n+import torch.nn.functional as F\n+\n+from megatron.core import parallel_state\n+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules\n+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules\n+from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler\n+from megatron.core.transformer.spec_utils import get_submodules\n+from megatron.core.transformer.transformer_config import TransformerConfig\n+\n+pytestmark = pytest.mark.internal\n+\n+H = 128\n+FFN = 256\n+NUM_EXPERTS = 8\n+TOPK = 2\n+PHYSICAL_ROWS = 8  # identical on every rank, so only the valid/padding split differs\n+\n+\n+def _plan(world: int) -> list[int]:\n+    \"\"\"Valid token count per rank, all different, all <= PHYSICAL_ROWS.\n+\n+    Identical physical rows on every rank is deliberate: if the ranks also agreed on the\n+    valid count, a global-for-local substitution would be invisible.\n+    \"\"\"\n+    plans = {2: [7, 3], 4: [7, 3, 5, 2], 8: [7, 3, 5, 2, 6, 1, 4, 8]}\n+    if world not in plans:\n+        pytest.skip(f\"no rank plan for world={world}\")\n+    return plans[world]\n+\n+\n+@pytest.fixture(scope=\"module\")\n+def tp_domain(nccl_session):\n+    \"\"\"A real TP group sized to the world, so Router.tp_cp_group has size > 1.\n+\n+    Reuses the session-wide process group when one is already up: re-initialising the model\n+    parallel state per module and tearing it down again races the previous destroy and kills\n+    the session (see ``_a3_pg.py``).\n+    \"\"\"\n+    world = nccl_session\n+    if world < 2:\n+        pytest.skip(\"needs >= 2 ranks for a non-trivial tp_cp_group\")\n+    from megatron.core import parallel_state\n+    from tests.unit_tests.test_utilities import Utils\n+\n+    if not parallel_state.model_parallel_is_initialized():\n+        Utils.initialize_model_parallel(\n+            tensor_model_parallel_size=world,\n+            pipeline_model_parallel_size=1,\n+            expert_model_parallel_size=1,\n+            context_parallel_size=1,\n+            expert_tensor_parallel_size=1,\n+        )\n+    # No teardown here on purpose: see the module docstring / _a3_pg rationale. The module\n+    # conftest's session-scoped cleanup destroys the process group once, at the end.\n+    yield world\n+\n+\n+def _build_layer(world: int, **over) -> MoELayer:\n+    cfg = TransformerConfig(\n+        tensor_model_parallel_size=world,\n+        expert_model_parallel_size=1,\n+        expert_tensor_parallel_size=1,\n+        pipeline_model_parallel_size=1,\n+        num_layers=1,\n+        hidden_size=H,\n+        ffn_hidden_size=FFN,\n+        num_attention_heads=8,\n+        num_moe_experts=NUM_EXPERTS,\n+        moe_router_topk=TOPK,\n+        moe_router_load_balancing_type=\"aux_loss\",\n+        moe_aux_loss_coeff=0.1,\n+        moe_token_dispatcher_type=\"alltoall\",\n+        moe_grouped_gemm=False,\n+        moe_router_dtype=\"fp32\",\n+        add_bias_linear=False,\n+        gated_linear_unit=True,\n+        activation_func=F.silu,\n+        use_cpu_initialization=True,\n+        bf16=True,\n+        # MoELayer rejects TP>1 without sequence parallelism during training\n+        sequence_parallel=world > 1,\n+        **over,\n+    )\n+    mlp_spec = get_gpt_layer_local_submodules(\n+        num_experts=NUM_EXPERTS, moe_grouped_gemm=False\n+    ).mlp\n+    submodules = get_submodules(mlp_spec)\n+    assert isinstance(submodules, MoESubmodules)\n+    layer = MoELayer(cfg, submodules).cuda().to(dtype=torch.bfloat16)\n+    layer.set_layer_number(0)\n+    layer.train()\n+    return layer\n+\n+\n+def _padding_mask(valid: int) -> torch.Tensor:\n+    \"\"\"[seq, 1] bool with True marking PADDING, on the device, per Router.forward's contract.\"\"\"\n+    m = torch.ones(PHYSICAL_ROWS, 1, dtype=torch.bool, device=\"cuda\")\n+    m[:valid] = False\n+    return m\n+\n+\n+def test_helper_local_count_uses_the_real_tp_cp_group(tp_domain):\n+    \"\"\"The helper, called the way the router calls it, returns rank-local counts.\"\"\"\n+    from megatron.core.transformer.moe.moe_utils import get_tokens_per_expert_and_token_count\n+\n+    world = tp_domain\n+    plan = _plan(world)\n+    rank = torch.distributed.get_rank()\n+    valid = plan[rank]\n+\n+    g = torch.Generator(device=\"cpu\").manual_seed(100 + rank)\n+    rmap = torch.zeros((PHYSICAL_ROWS, NUM_EXPERTS), dtype=torch.bool)\n+    for i in range(valid):\n+        rmap[i, torch.randperm(NUM_EXPERTS, generator=g)[:TOPK]] = True\n+    rmap = rmap.cuda()\n+\n+    tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()\n+    assert tp_cp_group.size() == world\n+\n+    _hist, local_num, total_num = get_tokens_per_expert_and_token_count(\n+        routing_map=rmap, reduce_group=tp_cp_group, topk=TOPK, with_padding_mask=True\n+    )\n+    assert float(local_num) == valid, (\n+        f\"rank {rank}: helper returned {float(local_num)} for tp_cp_group, expected the \"\n+        f\"rank-local valid count {valid}\"\n+    )\n+    assert float(total_num) == sum(plan), (\n+        f\"rank {rank}: group total {float(total_num)} != {sum(plan)}\"\n+    )\n+\n+\n+def _aux_grad_for_reported_count(router, scores, rmap, reported, monkeypatch):\n+    \"\"\"Run the real aux-loss chain and return (score-grad abs sum, aux value).\n+\n+    ``reported`` is what the helper claims the rank-local valid token count is. The routing\n+    map, scores, aux-loss formula and process group are identical between calls, so any\n+    difference in the returned gradient comes only from that reported count. That is what\n+    makes this able to detect the group-global substitution directly.\n+    \"\"\"\n+    import megatron.core.transformer.moe.router as router_mod\n+    from megatron.core.transformer.moe.moe_utils import (\n+        get_tokens_per_expert_and_token_count as real_helper,\n+        switch_load_balancing_loss_func,\n+    )\n+\n+    def fake_helper(routing_map, reduce_group, topk=None, with_padding_mask=False):\n+        hist, _local, total = real_helper(\n+            routing_map=routing_map, reduce_group=reduce_group, topk=topk,\n+            with_padding_mask=with_padding_mask,\n+        )\n+        return hist, reported, total\n+\n+    monkeypatch.setattr(router_mod, \"get_tokens_per_expert_and_token_count\", fake_helper)\n+\n+    s = scores.detach().clone().requires_grad_(True)\n+    ghist, local_num, total_num = fake_helper(\n+        routing_map=rmap, reduce_group=router.tp_cp_group, topk=TOPK, with_padding_mask=True\n+    )\n+    aux = switch_load_balancing_loss_func(\n+        probs=s,\n+        tokens_per_expert=ghist,\n+        total_num_tokens=total_num,\n+        topk=TOPK,\n+        num_experts=NUM_EXPERTS,\n+        moe_aux_loss_coeff=router.get_aux_loss_coeff(\"aux_loss\"),\n+    )\n+    acting = torch.randn(PHYSICAL_ROWS, 1, H, device=\"cuda\", dtype=torch.bfloat16)\n+    MoEAuxLossAutoScaler.main_loss_backward_scale = None\n+    attached = router.attach_and_log_load_balancing_loss(\n+        acting,\n+        router.get_aux_loss_coeff(\"aux_loss\"),\n+        aux,\n+        \"load_balancing_loss\",\n+        router.tp_cp_group,\n+        valid_token_count=local_num,\n+    )\n+    attached.float().sum().backward()\n+    assert s.grad is not None, \"aux loss produced no gradient for the router scores\"\n+    return float(s.grad.abs().sum()), float(aux.detach())\n+\n+\n+def test_reported_local_count_scales_the_aux_gradient(tp_domain, monkeypatch):\n+    \"\"\"The decisive regression: telling the router the group-global count instead of the\n+    rank-local count changes the aux-loss gradient, by exactly global/local.\n+\n+    With the A3 bug, ``local_num_tokens`` IS the group-global value, so the router scales its\n+    aux gradient by that factor on every rank whose local count differs from the group total.\n+    \"\"\"\n+    world = tp_domain\n+    plan = _plan(world)\n+    rank = torch.distributed.get_rank()\n+    layer = _build_layer(world, calculate_per_token_loss=True)\n+    router = layer.router\n+    assert router is not None\n+\n+    torch.manual_seed(4321)  # identical scores on every rank\n+    scores = torch.rand(PHYSICAL_ROWS, NUM_EXPERTS, device=\"cuda\", dtype=torch.float32)\n+    scores = scores / scores.sum(dim=-1, keepdim=True)\n+    rmap = _routing_map(plan[rank], seed=600 + rank)\n+\n+    valid_local = float(plan[rank])\n+    valid_total = float(sum(plan))\n+    assert valid_local != valid_total, \"rank plan must make local and global differ\"\n+\n+    g_local, aux_local = _aux_grad_for_reported_count(\n+        router, scores, rmap, valid_local, monkeypatch\n+    )\n+    g_total, aux_total = _aux_grad_for_reported_count(\n+        router, scores, rmap, valid_total, monkeypatch\n+    )\n+    MoEAuxLossAutoScaler.main_loss_backward_scale = None\n+\n+    # the aux loss value itself is unchanged: only the scaling term differs\n+    assert abs(aux_local - aux_total) < 1e-5, (\n+        f\"the aux loss value changed ({aux_local} vs {aux_total}); the comparison is not \"\n+        f\"isolating the scaling term\"\n+    )\n+    assert g_local > 0 and g_total > 0, (g_local, g_total)\n+\n+    ratio = g_total / g_local\n+    expected = valid_total / valid_local\n+    assert abs(ratio - expected) < 1e-4, (\n+        f\"rank {rank}: reporting the group-global count ({valid_total}) instead of the local \"\n+        f\"count ({valid_local}) scaled the aux gradient by {ratio:.6f}x, expected \"\n+        f\"{expected:.6f}x\"\n+    )\n+    assert abs(ratio - 1.0) > 1e-3, (\n+        f\"rank {rank}: local and global counts produced the same gradient; the fixture cannot \"\n+        f\"detect the substitution\"\n+    )\n+\n+\n+def test_router_uses_the_local_count_end_to_end(tp_domain, monkeypatch):\n+    \"\"\"End-to-end through Router.forward: the count the router actually uses in a real masked\n+    forward must be this rank's valid token count, never the group total.\"\"\"\n+    world = tp_domain\n+    plan = _plan(world)\n+    rank = torch.distributed.get_rank()\n+    layer = _build_layer(world, calculate_per_token_loss=True)\n+    router = layer.router\n+    assert router is not None\n+\n+    seen: list[float] = []\n+    real_attach = router.attach_and_log_load_balancing_loss\n+\n+    def spy(activation, coeff, aux_loss, name, reduce_group, *a, **kw):\n+        vt = kw.get(\"valid_token_count\")\n+        if vt is not None:\n+            seen.append(float(vt))\n+        return real_attach(activation, coeff, aux_loss, name, reduce_group, *a, **kw)\n+\n+    monkeypatch.setattr(router, \"attach_and_log_load_balancing_loss\", spy)\n+\n+    torch.manual_seed(4242)\n+    x = torch.randn(PHYSICAL_ROWS, 1, H, device=\"cuda\", dtype=torch.bfloat16)\n+    router(x, padding_mask=_padding_mask(plan[rank]))\n+    torch.cuda.synchronize()\n+    assert seen, \"attach_and_log_load_balancing_loss was never called during Router.forward\"\n+    assert any(abs(v - float(plan[rank])) < 1e-5 for v in seen), (\n+        f\"rank {rank}: router used valid_token_count={seen}, none of which is this rank's \"\n+        f\"valid count {plan[rank]} (group total is {sum(plan)})\"\n+    )\n+    assert not any(abs(v - float(sum(plan))) < 1e-5 for v in seen), (\n+        f\"rank {rank}: router used the group-global count {sum(plan)} (saw {seen})\"\n+    )\n+\n+\n+def _routing_map(valid_rows: int, seed: int) -> torch.Tensor:\n+    \"\"\"[PHYSICAL_ROWS, E] bool, exactly `valid_rows` rows carrying TOPK distinct experts.\"\"\"\n+    g = torch.Generator(device=\"cpu\").manual_seed(seed)\n+    rmap = torch.zeros((PHYSICAL_ROWS, NUM_EXPERTS), dtype=torch.bool)\n+    for i in range(valid_rows):\n+        rmap[i, torch.randperm(NUM_EXPERTS, generator=g)[:TOPK]] = True\n+    return rmap.cuda()\n+\n+\n+def test_moe_layer_training_step_is_finite(tp_domain):\n+    \"\"\"A real MoELayer forward+backward+optimizer step must stay finite with the masked\n+    routing path active. This is the model-level smoke the first pass was missing.\"\"\"\n+    world = tp_domain\n+    plan = _plan(world)\n+    rank = torch.distributed.get_rank()\n+    layer = _build_layer(world, calculate_per_token_loss=True)\n+    opt = torch.optim.SGD(layer.parameters(), lr=0.01)\n+\n+    torch.manual_seed(9001)\n+    x = torch.randn(PHYSICAL_ROWS, 1, H, device=\"cuda\", dtype=torch.bfloat16, requires_grad=True)\n+\n+    losses = []\n+    for _ in range(3):\n+        opt.zero_grad(set_to_none=True)\n+        MoEAuxLossAutoScaler.main_loss_backward_scale = None\n+        out = layer(x)\n+        hidden = out[0] if isinstance(out, tuple) else out\n+        loss = hidden.float().pow(2).mean()\n+        loss.backward()\n+        torch.nn.utils.clip_grad_norm_(layer.parameters(), 1.0)\n+        opt.step()\n+        losses.append(float(loss.detach()))\n+\n+    assert all(v == v and abs(v) < 1e6 for v in losses), f\"non-finite loss: {losses}\"\n+    gnorm = sum(\n+        float(p.grad.abs().sum()) for p in layer.parameters() if p.grad is not None\n+    )\n+    assert gnorm > 0, \"no gradients reached the layer parameters\"\n+    if rank == 0:\n+        print(f\"[a3] training smoke losses={losses} grad_abs_sum={gnorm:.4f}\")",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/80d403a17d188d6a137e7d8127b80826585602e9/tests%2Funit_tests%2Ftransformer%2Fmoe%2Ftest_local_count_router_gradient.py",
+      "sha": "cedf415ef71e5b084df73b71e09b6d6372208c0b",
+      "status": "added"
+    },
+    {
+      "additions": 174,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/80d403a17d188d6a137e7d8127b80826585602e9/tests%2Funit_tests%2Ftransformer%2Fmoe%2Ftest_token_count_preservation.py",
+      "changes": 174,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Ftransformer%2Fmoe%2Ftest_token_count_preservation.py?ref=80d403a17d188d6a137e7d8127b80826585602e9",
+      "deletions": 0,
+      "filename": "tests/unit_tests/transformer/moe/test_token_count_preservation.py",
+      "patch": "@@ -0,0 +1,174 @@\n+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.\n+\"\"\"Focused regression tests for the masked-routing local token count (A3).\n+\n+What is being protected\n+-----------------------\n+``get_tokens_per_expert_and_token_count(..., with_padding_mask=True)`` returns\n+\n+    (global_tokens_per_expert, local_num_tokens, total_num_tokens)\n+\n+where ``local_num_tokens`` must be THIS RANK's valid (non-padding) token count and\n+``total_num_tokens`` the group-global valid token count.\n+\n+``local_tokens_per_expert = routing_map.sum(dim=0)`` is contiguous, and\n+``reduce_from_tensor_model_parallel_region`` -> ``_reduce()`` all-reduces a contiguous\n+input IN PLACE (see megatron/core/tensor_parallel/mappings.py). Deriving\n+``local_num_tokens`` from that same buffer after the collective therefore yields the\n+group-global count, so the two return values silently collapse into one and the\n+per-token-loss scaling in ``Router.attach_and_log_load_balancing_loss``\n+(``aux_loss * num_local_tokens * tp_cp_group.size()``) is wrong by the group size.\n+\n+These tests use a real NCCL process group. Run them with torchrun, e.g.\n+\n+    torchrun --standalone --nproc_per_node=2 -m pytest -q \\\n+        tests/unit_tests/transformer/moe/test_token_count_preservation.py\n+\"\"\"\n+from __future__ import annotations\n+\n+import os\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+from megatron.core.transformer.moe.moe_utils import get_tokens_per_expert_and_token_count\n+\n+pytestmark = pytest.mark.internal\n+\n+NUM_EXPERTS = 8\n+PAD_ROWS = 2\n+\n+\n+def _build_routing_map(valid_rows: int, topk: int, seed: int) -> torch.Tensor:\n+    \"\"\"[valid_rows + PAD_ROWS, NUM_EXPERTS] bool with exactly `topk` distinct experts/row.\"\"\"\n+    g = torch.Generator(device=\"cpu\").manual_seed(seed)\n+    rows = []\n+    for _ in range(valid_rows):\n+        picked = torch.randperm(NUM_EXPERTS, generator=g)[:topk]\n+        row = torch.zeros(NUM_EXPERTS, dtype=torch.bool)\n+        row[picked] = True\n+        rows.append(row)\n+    valid = torch.stack(rows) if rows else torch.zeros((0, NUM_EXPERTS), dtype=torch.bool)\n+    return torch.cat([valid, torch.zeros((PAD_ROWS, NUM_EXPERTS), dtype=torch.bool)], dim=0)\n+\n+\n+@pytest.fixture(scope=\"module\")\n+def _nccl_group(nccl_session):\n+    \"\"\"Reuse the session-wide NCCL group.\n+\n+    This fixture must not destroy the group: the module conftest's session-scoped cleanup\n+    owns that, and a module-scoped destroy races the next module's init.\n+    \"\"\"\n+    if nccl_session < 2:\n+        pytest.skip(\"needs at least 2 ranks to observe the aliasing\")\n+    return nccl_session\n+\n+\n+def _valid_rows_per_rank(world: int) -> list[int]:\n+    \"\"\"A distribution where no two ranks share the same valid token count.\"\"\"\n+    plans = {\n+        2: [3, 1],\n+        3: [7, 2, 4],\n+        4: [6, 0, 3, 5],\n+        8: [6, 0, 3, 5, 9, 1, 4, 2],\n+    }\n+    if world not in plans:\n+        pytest.skip(f\"no rank plan for world_size={world}\")\n+    return plans[world]\n+\n+\n+def _check_case(topk: int, valid_rows: list[int], with_padding_mask: bool, seed: int) -> None:\n+    \"\"\"Compare the helper against an independent oracle on every rank.\"\"\"\n+    rank = dist.get_rank()\n+    world = dist.get_world_size()\n+    local_valid = valid_rows[rank]\n+    # rank-specific routing so no rank can pass by accident from a shared fixture\n+    seed = valid_rows[rank] * 1000 + topk + (0 if with_padding_mask else 7)\n+\n+    routing_map = _build_routing_map(local_valid, topk, seed).cuda()\n+\n+    global_hist, local_num, total_num = get_tokens_per_expert_and_token_count(\n+        routing_map=routing_map,\n+        reduce_group=dist.group.WORLD,\n+        topk=topk,\n+        with_padding_mask=with_padding_mask,\n+    )\n+\n+    # independent oracle: local histogram, then an explicit all-reduce of our own buffer\n+    expected_local_hist = routing_map.sum(dim=0).to(torch.int64)\n+    expected_global_hist = expected_local_hist.clone()\n+    dist.all_reduce(expected_global_hist)\n+\n+    assert torch.equal(global_hist.to(torch.int64), expected_global_hist), (\n+        f\"global histogram mismatch on rank {rank}: \"\n+        f\"{global_hist.tolist()} != {expected_global_hist.tolist()}\"\n+    )\n+\n+    # current main floors the masked division (`// topk`, #7183 int64 for the fused aux\n+    # loss), so the counts are compared as integers; the unmasked branch keeps its previous\n+    # definition exactly.\n+    if with_padding_mask:\n+        assert int(local_num) == local_valid, (\n+            f\"local token count is not rank-local on rank {rank}: \"\n+            f\"got {int(local_num)}, expected {local_valid} \"\n+            f\"(group-global would be {int(expected_global_hist.sum()) // topk})\"\n+        )\n+        assert int(total_num) == int(expected_global_hist.sum()) // topk\n+    else:\n+        physical_rows = routing_map.shape[0]\n+        assert float(local_num) == physical_rows, (\n+            f\"unmasked local count changed on rank {rank}: {float(local_num)} != {physical_rows}\"\n+        )\n+        assert float(total_num) == physical_rows * world\n+\n+\n+@pytest.mark.parametrize(\"topk\", [1, 2, 4])\n+def test_masked_local_count_uneven(_nccl_group, topk):\n+    \"\"\"Uneven valid rows per rank: local must stay rank-local, global must stay global.\"\"\"\n+    _check_case(topk, _valid_rows_per_rank(_nccl_group), with_padding_mask=True, seed=1)\n+\n+\n+@pytest.mark.parametrize(\"topk\", [1, 2, 4])\n+def test_masked_local_count_zero_rank(_nccl_group, topk):\n+    \"\"\"A rank with zero valid rows must report 0 locally, not the group total.\"\"\"\n+    world = _nccl_group\n+    rows = _valid_rows_per_rank(world)\n+    if 0 not in rows:\n+        pytest.skip(f\"rank plan for world_size={world} has no zero-load rank\")\n+    _check_case(topk, rows, with_padding_mask=True, seed=2)\n+\n+\n+@pytest.mark.parametrize(\"topk\", [1, 2])\n+def test_unmasked_count_unchanged(_nccl_group, topk):\n+    \"\"\"with_padding_mask=False keeps its original definition: physical rows.\"\"\"\n+    _check_case(topk, _valid_rows_per_rank(_nccl_group), with_padding_mask=False, seed=3)\n+\n+\n+@pytest.mark.parametrize(\"topk\", [2])\n+def test_helper_all_zero_counts(_nccl_group, topk):\n+    \"\"\"All ranks with only padding rows: helper returns zero counts, no NaN/fake epsilon.\"\"\"\n+    rank = dist.get_rank()\n+    routing_map = _build_routing_map(0, topk, seed=99 + rank).cuda()\n+    global_hist, local_num, total_num = get_tokens_per_expert_and_token_count(\n+        routing_map=routing_map,\n+        reduce_group=dist.group.WORLD,\n+        topk=topk,\n+        with_padding_mask=True,\n+    )\n+    assert float(local_num) == 0.0\n+    assert float(total_num) == 0.0\n+    assert int(global_hist.sum().item()) == 0\n+\n+\n+def test_local_count_storage_is_independent():\n+    \"\"\"The local scalar must not be a view of the histogram that the collective rewrites.\n+\n+    Pure bookkeeping check with no collective: reading the local count before the reduce\n+    is only meaningful if it materialises its own storage.\n+    \"\"\"\n+    routing_map = _build_routing_map(5, 2, seed=7)\n+    local_hist = routing_map.sum(dim=0)\n+    local_scalar = local_hist.sum() / 2\n+    expected = float(local_scalar)\n+    local_hist.add_(1000)  # simulate an in-place all-reduce\n+    assert float(local_scalar) == expected, \"local scalar aliases the histogram buffer\"",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/80d403a17d188d6a137e7d8127b80826585602e9/tests%2Funit_tests%2Ftransformer%2Fmoe%2Ftest_token_count_preservation.py",
+      "sha": "629f4f747969d2f6da8dfac684a85f77dc1a8e24",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+      "created_at": "2026-09-18T17:51:09Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-5733993647",
+      "id": 5733993647,
+      "updated_at": "2026-09-18T17:51:09Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    },
+    {
+      "body": "This PR has been automatically converted to **draft** because all PRs must start as drafts.\n\nWhen you are ready for review, click **Ready for Review** to begin the review process. This will:\n1. Add the oncall reviewer (optional reviewer)\n2. Add required review teams based on your changes\n\nSee the [contribution guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/submit.md) for more details.",
+      "created_at": "2026-09-18T17:51:18Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-5733995401",
+      "id": 5733995401,
+      "updated_at": "2026-09-18T17:51:18Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "@zhongbozhu, could you review the local token-count capture before the in-place reduction and its use in the router auxiliary loss? This is adjacent to your token-count dtype fix in #7183. Please also check that the new distributed regression fixtures fit the existing test lifecycle.\n",
+      "created_at": "2026-09-21T18:55:26Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-5765826782",
+      "id": 5765826782,
+      "updated_at": "2026-09-21T18:55:26Z",
+      "user": {
+        "login": "Connor-XY"
+      }
+    },
+    {
+      "body": "Thanks for checking. Yes, #7046 fixes it: it reduces a clone of the histogram (`global_tokens_per_expert = local_tokens_per_expert.clone()`), so `local_tokens_per_expert` keeps this rank's counts and the masked `local_num_tokens` is rank-local again. That is the same fix as this PR. #7046 also covers it with `test_token_count_reduction_keeps_local_count_with_in_place_reduce` and the GPU tests with uneven per-rank counts, so nothing here is still needed. Closing this PR.\n",
+      "created_at": "2026-10-29T10:10:55Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#issuecomment-6493867673",
+      "id": 6493867673,
+      "updated_at": "2026-10-29T10:10:55Z",
+      "user": {
+        "login": "0z5a"
+      }
+    }
+  ],
+  "number": 7481,
+  "refs": {
+    "base": {
+      "commit": "7de072aa9e72659445a908c0eeb04b030d1a6666",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "80d403a17d188d6a137e7d8127b80826585602e9",
+      "repository": "0z5a/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": [
+    {
+      "body": "Hi, thank you for your contribution! \r\n\r\nWith this PR merged https://github.com/NVIDIA/Megatron-LM/pull/7046, looks like the issue has been solved already? ",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/7481#pullrequestreview-5693143477",
+      "id": 5693143477,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-29T05:12:12Z",
+      "user": {
+        "login": "zhongbozhu"
+      }
+    }
+  ]
+}

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
 path: docs/03-configuration-reference/megatron-parameters.md
-raw_sha256: b4a2be097cab2ef6f9d7b4fcd60f28fedf7d8083a3d38ea9ffb49466eebfc9db
+raw_sha256: 41c1c8f96474eea400edd3f7d9108ae7444e8d019ae056f4f26598fd36c08f35
 sources: []
-generated_body_sha256: 91864b208459b1d3012323d8dd40bcc12c512e2f3b04527d1c19d29b0040e81e
+generated_body_sha256: 4beed747919ff9898da772cd980275a4dad0f9b12045a2b6c0a66d3ff82a0e24
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/03-configuration-reference/megatron-parameters.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/03-configuration-reference/megatron-parameters.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/03-configuration-reference/megatron-parameters.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -213,6 +213,7 @@ models:
 | `main_params_dtype` | `fp32` | Dtype for master params. |
 | `exp_avg_dtype` | `fp32` | Optimizer first moment dtype (`fp32`, `fp16`, `fp8`). |
 | `exp_avg_sq_dtype` | `fp32` | Optimizer second moment dtype. |
+| `use_triton_fused_adam` | `true` | Build Adam from `TritonFusedAdam` (Triton kernel with a device-sized grid) instead of TE `FusedAdam`. Matters for TE builds on the generic `multi_tensor_apply` launcher (capped at 320 workgroups per launch); ROCm TE builds with the custom Adam kernel are already uncapped. Precision-aware, capturable and FP8-param paths fall back to TE. Set `false` to keep TE `FusedAdam`. |
 
 ---
 

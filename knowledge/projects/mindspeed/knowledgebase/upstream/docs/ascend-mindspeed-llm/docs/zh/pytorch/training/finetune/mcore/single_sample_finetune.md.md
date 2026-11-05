@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/finetune/mcore/single_sample_finetune.md
-raw_sha256: d8fbb5ed4393baeeb0d239e6bc0fd1dcaabaa633bb47da5b53b6a20bddb859b4
+raw_sha256: d4ba2b2848647cfbbc52087cddfeb31358d2bdfee6b71dc03daed142119cc3f1
 sources: []
-generated_body_sha256: d2e0e9f1edc40251732150ebbab30336ba78c8a86e58afd38e567a4d4c9f2501
+generated_body_sha256: 5355bcff8f47cdece5bb680d86d42bb51e867df90ad0cec5d0bc0175fdd92194
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/finetune/mcore/single_sample_finetune.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/finetune/mcore/single_sample_finetune.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/finetune/mcore/single_sample_finetune.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -185,7 +185,7 @@ Upstream source document; original commands, claims and links require their stat
 
         ![variable-seq-lengths图示](../../../figures/instruction_finetune/variable_seq_lengths.png)
 
-    > [!NOTE]
+    > [!NOTE] 说明
     > - 提供的路径需要加双引号。
     > - 多机训练中请确保每台机器上的模型路径和数据集路径等无误。
     > - 微调脚本中使用的并行配置（包括TP/PP/EP/VPP等），应与权重转换时使用的配置保持一致，否则可能导致权重加载或转换异常。具体的并行配置请参考[权重转换指南](../../../tools/checkpoint_convert_hf_mcore_large_params.md#huggingface权重转换至megatron-mcore格式)。

@@ -10,25 +10,25 @@ stages:
 - optimize
 - fault-tolerance
 repository: modelscope/ms-swift
-commit: 22249748429ce7e8516640e35cbe997e572a233a
+commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
 path: docs/source_en/Megatron-SWIFT/Ascend.md
-raw_sha256: 78ef8260bf79895c687f8274ad73f8e8e4b97a423a32cdda69a0853f762bf557
+raw_sha256: a40810b505afd1ec70f202f0f348a92fc32fc5a7cabc33efb98e998db0f87946
 sources: []
-generated_body_sha256: f39a2912c08179f0a89a1b1b1f491523c24a695320ba066d78cbafea1c378da6
+generated_body_sha256: 91301bc67d4e0a24fbba97d911c0f342833c127339481c914a5cb8aa7b5c5ed7
 source_state: current-scan
 ---
 
 # modelscope/ms-swift / docs/source_en/Megatron-SWIFT/Ascend.md
 
-[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/docs/source_en/Megatron-SWIFT/Ascend.md)
+[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/docs/source_en/Megatron-SWIFT/Ascend.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
 ---
 
-# Ascend NPU
+# Huawei Ascend NPU
 
-For environment preparation of Megatron-SWIFT on Ascend NPU, please refer to [NPU Best Practices](../BestPractices/NPU-support.md).
+For environment preparation of Megatron-SWIFT on Huawei Ascend NPU, please refer to [NPU Best Practices](../BestPractices/NPU-support.md).
 
 ## NPU Performance Data Collection
 

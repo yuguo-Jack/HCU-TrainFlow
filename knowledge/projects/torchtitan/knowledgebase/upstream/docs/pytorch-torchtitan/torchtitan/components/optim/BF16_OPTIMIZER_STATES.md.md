@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/components/optim/BF16_OPTIMIZER_STATES.md
-raw_sha256: 4f0d88ff7b4b6149e86988f451b2698b6446ebf57b22fcb27f45d4ef671ac549
+raw_sha256: 70caaed9c8fe066019fa8404dc2d3827582e865ecc3fb7f6a7459b751d71e4cb
 sources: []
-generated_body_sha256: 03ba3776d1810256dc846ff902f908102cec9573e742997d386162534754382c
+generated_body_sha256: 13df5b6208e4033afbc0593737a677e6406d0b3f7148fa37754da70835c880a2
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/components/optim/BF16_OPTIMIZER_STATES.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/components/optim/BF16_OPTIMIZER_STATES.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/components/optim/BF16_OPTIMIZER_STATES.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -28,11 +28,11 @@ Upstream source document; original commands, claims and links require their stat
 
 ## BF16 Optimizer States
 
-In the default fp32 training configuration (`training.dtype="float32"`), Adam/AdamW keep momentum (`exp_avg`) and variance (`exp_avg_sq`) in float32, which roughly doubles optimizer-state memory versus storing those buffers in bfloat16.
+In the default fp32 training configuration (`precision.dtype="float32"`), Adam/AdamW keep momentum (`exp_avg`) and variance (`exp_avg_sq`) in float32, which roughly doubles optimizer-state memory versus storing those buffers in bfloat16.
 
 Set an Adam/AdamW optimizer config's `moment_dtype` to **`"bfloat16"`** to use the fused CUDA kernel with **bf16 optimizer moments** and **fp32 parameters**. This lowers optimizer-state memory while keeping parameter updates in fp32. FSDP may still reduce gradients in bf16. It casts the reduced gradient shards to fp32 before the optimizer step.
 
-If you use **`training.dtype="bfloat16"`** (params and grads in bf16), leave `moment_dtype="parameter"` (the default). PyTorch then aligns optimizer state dtypes with training.
+If you use **`precision.dtype="bfloat16"`** (params and grads in bf16), leave `moment_dtype="parameter"` (the default). PyTorch then aligns optimizer state dtypes with training.
 
 This is useful for memory-constrained training where slightly lower precision in moment estimates is acceptable.
 
@@ -45,15 +45,15 @@ This technique was notably used by [DeepSeek-V3](https://arxiv.org/abs/2412.1943
 To use BF16 optimizer states with FP32 persistent parameters, use:
 
 ```python
-config.training.dtype = "float32"
-config.training.mixed_precision_param = "bfloat16"
-config.training.mixed_precision_reduce = "float32"
-# config.training.mixed_precision_reduce = "bfloat16"  # Optional BF16 reduction.
+config.precision.dtype = "float32"
+config.precision.param_dtype = "bfloat16"
+config.precision.reduce_dtype = "float32"
+# config.precision.reduce_dtype = "bfloat16"  # Optional BF16 reduction.
 config.optim.optimizer.optimizers[0].moment_dtype = "bfloat16"
 ```
 
 The reduction dtype is independent of the optimizer-state dtype. Keep
-`mixed_precision_reduce="float32"` for FP32 gradient reduction. Set it to
+`reduce_dtype="float32"` for FP32 gradient reduction. Set it to
 `"bfloat16"` to reduce FSDP communication bandwidth. With BF16 reduction, FSDP
 casts each reduced gradient shard back to the FP32 parameter dtype before the
 optimizer step.
@@ -71,7 +71,7 @@ A step pre-hook is registered on each optimizer instance. Before Adam's lazy sta
 
 ### Interaction with other features
 
-- **`training.dtype`**: The primary use case is `float32` training with `moment_dtype="bfloat16"` for optimizer-state memory savings. With `bfloat16` training, the default `moment_dtype="parameter"` is usually enough; see the introduction above.
+- **`precision.dtype`**: The primary use case is `float32` training with `moment_dtype="bfloat16"` for optimizer-state memory savings. With `bfloat16` training, the default `moment_dtype="parameter"` is usually enough; see the introduction above.
 - **Checkpointing**: Optimizer moments are saved in bfloat16 when this option is enabled. On resume, use the same `moment_dtype`. A load post-hook restores `exp_avg`, `exp_avg_sq`, and optional AMSGrad `max_exp_avg_sq` to bfloat16 after PyTorch's native loader casts them to the parameter dtype. The `step` counter retains PyTorch's dtype and device policy. This preserves bf16 moments for subsequent updates, but the native loader can still temporarily allocate fp32 states during loading. Mixing moment dtypes across save/load remains unsupported.
 - **FSDP**: Compatible with FSDP2. The optimizer sees DTensor parameters; the bf16 state hook operates on the local shards.
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/features/mcore/checkpoint_resume.md
-raw_sha256: 4144d12b5fe396934d65d05f46250e2622ff64b7d1ced2160b73d6c4d72394c0
+raw_sha256: 235bd94e2190aaf7616b59fe9e5afada11262ef4c0714ec30616f8092c0baa81
 sources: []
-generated_body_sha256: 110355f0d82a8d01d542ae19aacb5df2ec071ca61a37e649440d8ab1159dc8a6
+generated_body_sha256: 134f7c65d1836e6ab806d9f7ac23efd39c6540c40b3fb665b0074fbc7d5a5b15
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/features/mcore/checkpoint_resume.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/mcore/checkpoint_resume.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/mcore/checkpoint_resume.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -49,7 +49,7 @@ Key parameters
 | `--no-load-optim` | ❌ Do not set this option. Otherwise, the system does not restore the optimizer state, such as the learning rate and momentum. |
 | `--no-load-rng` | ❌ Do not set this option. Otherwise, the system does not restore the random state. |
 
-> [!NOTE]
+> [!NOTE] Note
 > If you set `--finetune`, `--no-load-optim`, or `--no-load-rng`, the system does not restore the optimizer state or the random state. Therefore, it cannot truly resume training.
 
 ---
@@ -74,17 +74,17 @@ Each save produces the following structure:
 
 ```shell
 /your/checkpoint/path/
-|-- latest_checkpointed_iteration.txt
-|-- iter_0000001/
-|   |-- mp_rank_00_000/
-|   |   |-- distrib_optim.pt
-|   |   |-- model_optim_rng.pt
-|   |-- ...
-|-- iter_0000500/
-|   |-- mp_rank_00_000/
-|   |   |-- distrib_optim.pt
-|   |   |-- model_optim_rng.pt
-|   |-- ...
+├── latest_checkpointed_iteration.txt
+├── iter_0000001/
+│   ├── mp_rank_00_000/
+│   │   ├── distrib_optim.pt
+│   │   └── model_optim_rng.pt
+│   └── ...
+└── iter_0000500/
+    ├── mp_rank_00_000/
+    │   ├── distrib_optim.pt
+    │   └── model_optim_rng.pt
+    └── ...
 ```
 
 Key parameters:

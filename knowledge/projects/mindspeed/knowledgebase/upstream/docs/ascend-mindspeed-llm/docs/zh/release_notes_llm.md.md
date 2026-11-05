@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 5a8ea03b12066067f39b1771782d12db236267ef
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/release_notes_llm.md
-raw_sha256: 5fddf4cbf60b33ae874660f21b2de7c877cf21abe47ec17dbe6f22c665223fee
+raw_sha256: 23ee5b8f4b18b6564a4e096292f10b3eb836270c9911f2077f9f0e409d8c40f3
 sources: []
-generated_body_sha256: 65b730eb1c87d1e4bbfff5dc8b59ec4cf4e6c8cb9f84798ad83a1f222bfe9afc
+generated_body_sha256: bcb5f02ece0e4b6ede2f9ccf5db4dcc5d930a604bebdf4db85d3da677bcc1af9
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/release_notes_llm.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/zh/release_notes_llm.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/release_notes_llm.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -65,7 +65,7 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
   </tbody>
 </table>
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 有关MindSpeed LLM的版本维护，具体请参见[版本维护策略](https://gitcode.com/Ascend/MindSpeed-LLM/tree/master#%E7%89%88%E6%9C%AC%E7%BB%B4%E6%8A%A4%E7%AD%96%E7%95%A5)。
 
@@ -76,19 +76,19 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
 | MindSpeed LLM版本 | MindSpeed Core代码分支名称 | Megatron-LM版本 | PyTorch版本  | TorchNPU版本 | CANN版本 | Triton-Ascend版本 | FSDPTurbo版本 | Python版本 |
 | ---------------- | ------------------------- | ------------ | -----------  | ------------ | ------- | ----------------- | ------------ | ---------- |
 | master（在研版本）| master（在研版本）    | core_v0.12.1  | 2.10.0      | 在研版本      | 在研版本 | 在研版本   | 在研版本     | Python3.12 |
-| 26.2.0           | 26.2.0_core_r0.12.1  | core_v0.12.1  | 2.10.0      | 26.2.0       | 9.2.0   | 3.2.2     | 26.2.0       | Python3.12 |
-| 26.1.0           | 26.1.0_core_r0.12.1  | core_v0.12.1  | 2.7.1       | 26.1.0       | 9.1.0   | 3.2.2     | /            | Python3.10 |
+| 26.2.0           | 26.2.0_core_r0.12.1  | core_v0.12.1  | 2.10.0      | 26.2.0       | 9.2.0   | 3.6.0     | 26.2.0       | Python3.12 |
+| 26.1.0           | 26.1.0_core_r0.12.1  | core_v0.12.1  | 2.7.1       | 26.1.0       | 9.1.0   | 3.2.2     |   /          | Python3.10 |
 | 26.0.0           | 26.0.0_core_r0.12.1  | core_v0.12.1  | 2.7.1       | 26.0.0       | 9.0.0   | 3.2.1     |   /          | Python3.10 |
 
->[!NOTE]
+> [!NOTE] 说明
 >
 > - 用户可根据需要选择MindSpeed LLM代码分支下载源码并进行安装。
 > - Triton-Ascend版本与CANN版本强绑定，Triton-Ascend的使用应该与CANN版本一一对应，详见[Triton-Ascend兼容性](https://triton-ascend.readthedocs.io/zh-cn/latest/release_note.html#id13)。
-> - 26.1.0版本未使用FSDPTurbo组件，表中“/”表示不配套。
+> - 26.1.0及26.0.0版本未使用FSDPTurbo组件，表中“/”表示不配套。
 
 ## 版本兼容性说明
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 本节表格中“/”表示不可配套，“Y”表示可配套。
 
@@ -105,20 +105,20 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
   </colgroup>
   <thead>
     <tr>
-      <th rowspan="3">MindSpeed LLM</th>
+      <th rowspan="2">MindSpeed LLM</th>
       <th colspan="5">TorchNPU版本</th>
     </tr>
     <tr>
       <th>7.2.0</th>
       <th>7.3.0</th>
-      <th>26.0.0</th>
+      <th>26.0.X</th>
       <th>26.1.X</th>
       <th>26.2.X</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>26.0.0</td>
+      <td>26.0.X</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -126,7 +126,7 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
       <td>Y</td>
     </tr>
     <tr>
-      <td>26.1.0</td>
+      <td>26.1.X</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -134,7 +134,7 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
       <td>Y</td>
     </tr>
     <tr>
-      <td>26.2.0</td>
+      <td>26.2.X</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -157,12 +157,12 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
   </colgroup>
   <thead>
     <tr>
-      <th rowspan="3">MindSpeed LLM</th>
+      <th rowspan="2">MindSpeed LLM</th>
       <th colspan="5">CANN版本</th>
     </tr>
     <tr>
       <th>8.3.RCX</th>
-      <th>8.5.X</th>
+      <th>8.5.0</th>
       <th>9.0.X</th>
       <th>9.1.X</th>
       <th>9.2.X</th>
@@ -170,7 +170,7 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
   </thead>
   <tbody>
     <tr>
-      <td>26.0.0</td>
+      <td>26.0.X</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -178,7 +178,7 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
       <td>Y</td>
     </tr>
     <tr>
-      <td>26.1.0</td>
+      <td>26.1.X</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -186,7 +186,7 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
       <td>Y</td>
     </tr>
     <tr>
-      <td>26.2.0</td>
+      <td>26.2.X</td>
       <td>Y</td>
       <td>Y</td>
       <td>Y</td>
@@ -266,7 +266,7 @@ MindSpeed LLM新增支持GLM5.2模型训练和DeepSeekV4长序列，且权重/�
 无
 
 ## 修订记录
- 
+
 | 文档版本 | 发布日期 | 修改说明 |
 | --- | --- | --- |
 | 01 | 2026-10-15 | 第一次正式发布。 |

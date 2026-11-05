@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/models/flux/README.md
-raw_sha256: 63090efd1c71ea0b10f0b4ed318959ab7eaf37336276997f712b9aa662175ca6
+raw_sha256: 945d9a8a89c7726d786a526c20e141814300a33f6fed8736d697fcf69853c8a4
 sources: []
-generated_body_sha256: a443d81eb4fa587237431c08e0a49bfa50ff3a54d31246ee1b5350bf34dc7d5d
+generated_body_sha256: 0ccc0d1d7cce8e16693bcc50916db6ddec6a8336ab7e1a47cf97a9de751a642e
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/flux/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/flux/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/flux/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -79,7 +79,7 @@ MODULE=torchtitan_recipes.tests.models.flux CONFIG=flux_debugmodel_inference \
 The loss function can be compiled independently with:
 
 ```python
-config.model.local_compile_regions = ["loss"]
+config.model.local_compile.regions = ["loss"]
 ```
 
 The model itself is not compiled by the standard Trainer.

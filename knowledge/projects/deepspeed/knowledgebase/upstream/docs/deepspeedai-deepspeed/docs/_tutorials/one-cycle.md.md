@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/one-cycle.md
-raw_sha256: 267fde98c19e9bb519d2cf32d48eac1765280e1bcf75f94df95e9e212ebcc75e
+raw_sha256: 3475174aae44d2dc5ad9d46d4d8567b3056d92293d30d274ee493dbc7ea29381
 sources: []
-generated_body_sha256: 3c784b81615f002c8955426492fdf776033406798fe75eaa1fb41a61d6d74235
+generated_body_sha256: 2868fecf849f2a92160d8201d7d3e2ad7c8cf79209f9419af98cc3c262508416
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/one-cycle.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/one-cycle.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/one-cycle.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -118,7 +118,7 @@ and so should be added to the appropriate section of the model configuration.
 
 PyTorch versions 1.0.1 and newer provide a feature for implementing schedulers
 for hyper-parameters, called  [learning rate
-  schedulers](https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html).
+  schedulers](https://docs.pytorch.org/docs/stable/optim.html).
   We have implemented 1-Cycle schedule using this feature.  You will add a
   scheduler entry of type **"OneCycle"** as illustrated below.
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
 path: docs/01-getting-started/release-notes.md
-raw_sha256: 20edb8970b99c41b5e11b77cebfe297af4e8bce627dd53913fc6bfbf5dbec6c5
+raw_sha256: 9ec28e457b212b7ae4763ec8b4eb5c27e6c66779c2b9ec3c41e33675e6eacc97
 sources: []
-generated_body_sha256: b9be08d245a6986d339c56da19990fa8ccb011d5fb2444f3530ec8ebf93a5444
+generated_body_sha256: f53be9af50ccfdc43cee2af21cdf2f8950c7be64c9c2f2b47727da8724d6b80a
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/01-getting-started/release-notes.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/01-getting-started/release-notes.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/01-getting-started/release-notes.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -259,7 +259,7 @@ capability.
 
 ##### New features
 
-- **DeepSeek-V4 on gfx942 at long context.** V4 upstream targeted gfx950 and in practice only ran at `seq_length=4096`; it now trains on MI308X/CDNA3 with context parallelism at 128k, full model ([#1047](https://github.com/AMD-AGI/Primus/pull/1047)).
+- **DeepSeek-V4 on gfx942 at long context.** V4 upstream targeted gfx950 and in practice only ran at `seq_length=4096`; it now trains on CDNA3 with context parallelism at 128k, full model ([#1047](https://github.com/AMD-AGI/Primus/pull/1047)).
 - **Packed-sequence (THD) SFT for DeepSeek-V4** — many samples per window delimited by `cu_seqlens`, with attention isolated so no query sees another sample; full model at 4k and 128k across three nodes ([#1062](https://github.com/AMD-AGI/Primus/pull/1062)).
 - **DLRM-v4 (TorchRec/HSTU) projection workload** with first-principles MI350X calibration ([#1059](https://github.com/AMD-AGI/Primus/pull/1059)).
 - **MLPerf Llama 3.1 8B launcher** and refreshed MI355X benchmark configs ([#1012](https://github.com/AMD-AGI/Primus/pull/1012)).

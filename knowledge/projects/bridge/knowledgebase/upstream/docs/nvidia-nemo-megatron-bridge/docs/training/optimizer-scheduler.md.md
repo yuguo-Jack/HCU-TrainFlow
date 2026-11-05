@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA-NeMo/Megatron-Bridge
-commit: 34ddd53b0e023d93f107f29b7dc61f9c5dd76a57
+commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
 path: docs/training/optimizer-scheduler.md
-raw_sha256: 74711244a859386df7827fa6777741ca5b014ba59b3488d1e0ae6ee2257e5393
+raw_sha256: 068d4bcd561d9fe24a9c26f8a884aa394fc19234d3798f17a8545ff187fecfc5
 sources: []
-generated_body_sha256: df7f1d4eb69d68343e40ec18751fbb20dc836ee0a6ac0a7afcee4399d521f66b
+generated_body_sha256: 6f88115078068a61181d08cf18226d0d9d988243ed2f04f311d19eb9f040355d
 source_state: current-scan
 ---
 
 # NVIDIA-NeMo/Megatron-Bridge / docs/training/optimizer-scheduler.md
 
-[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/34ddd53b0e023d93f107f29b7dc61f9c5dd76a57/docs/training/optimizer-scheduler.md)
+[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/optimizer-scheduler.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -49,6 +49,70 @@ The `OptimizerConfig` contains all parameters for the optimization algorithm and
 | `overlap_param_gather` | `bool` | Overlap parameter gathering with computation |
 | `bf16` | `bool` | Use BF16 precision for training |
 | `fp16` | `bool` | Use FP16 precision for training |
+
+## Distributed Muon
+
+Use Bridge's `OptimizerConfig` to select Muon and distribute whole parameter tensors:
+
+```python
+from megatron.bridge.training.config import OptimizerConfig
+
+cfg.optimizer = OptimizerConfig(
+    optimizer="muon",
+    use_layer_wise_distributed_optimizer=True,
+    lr=1e-3,
+    bf16=True,
+)
+```
+
+When changing an existing distributed Adam recipe to Muon, Bridge also accepts
+`use_distributed_optimizer=True` on the optimizer or DDP configuration and
+resolves it to layer-wise optimizer distribution before constructing the model.
+The legacy `optimizer="dist_muon"` spelling resolves to the same mode. Adam and
+SGD continue to use their ordinary distributed optimizer. To run replicated
+Muon, disable both distributed optimizer flags and the DDP distributed flag.
+
+Parameter-gather overlap can be configured through `CommOverlapConfig` for
+layer-wise Muon. The current Core implementation requires one distributed
+optimizer instance and does not support `overlap_param_gather_with_optimizer_step`
+or either FSDP implementation with Muon.
+
+Runtime setup applies explicit communication-overlap overrides before validating
+the effective optimizer settings. For LayerWise optimizers, an unspecified
+`CommOverlapConfig.bucket_size` preserves `ddp.bucket_size`; when that is also
+unset, Core selects its DP-dependent bucket size. An explicit overlap bucket size
+still takes precedence. Likewise, an unspecified `overlap_grad_reduce` preserves
+the DDP setting, including at DP=1 where CP ranks may still reduce gradients.
+Explicit gradient-overlap overrides take precedence. Adam/SGD retain the ordinary
+distributed-optimizer presets.
+
+By default, `use_layer_wise_param_layout=False` retains compact DDP buffers and
+LayerWise's variable-size parameter synchronization path. This preserves the
+optimizer representation of existing Muon checkpoints while retaining the
+configured parameter-gather behavior. Set it to `True` to opt into shard-aligned
+buffers for a compatible model and optimizer.
+
+The current Core full-layout path does not support Lion/SOAP matrices marked
+`use_muon=False`, expert-parallel scalar fallback parameters (such as MoE expert
+biases), or optimizer domains whose trainable parameters all use the scalar
+fallback (such as bias-only tuning or a scalar-only MIMO component). Keep compact
+layout for these cases. Also retain the checkpoint's layout when resuming
+optimizer state: loading an older compact Muon checkpoint into the full-layout
+optimizer representation is not supported.
+
+Existing Kimi recipes keep the compact layout and parameter-gather overlap
+disabled until their MoE and pipeline-parallel configurations are validated
+with the shard-aligned layout; other recipes can opt in independently.
+They also retain Core-selected bucket sizes and gradient-reduce overlap, including
+DP=1 with CP>1 and the H100 Kimi K2 performance recipes.
+Explicit user overrides remain supported.
+
+Resuming Muon training restores Muon optimizer state. When changing optimization
+algorithms between runs, load model weights with fresh optimizer state using
+`checkpoint.load_optim=False` or the appropriate finetuning configuration;
+Bridge does not convert Adam moments into Muon optimizer state.
+Checkpoints created before distributed-optimizer metadata was recorded retain
+the historical model-space sharding fallback when that metadata key is absent.
 
 ## SchedulerConfig
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+commit: 25e7c5728d834335288d080e1c36810fa111d4da
 path: docs/training/rlhf.md
-raw_sha256: d5f1075d027de319baf6e7698cf21701d90a7026d3c1807b2439b38c6e2a4ec5
+raw_sha256: 56d2f446eb98232949176564869840ad8bcc9d182b8ce40959bd4f28f5d22bf8
 sources: []
-generated_body_sha256: 5c4eeea2d644e0ea987a7ffb6014c4f0399cb689748740273e7899019d3ab847
+generated_body_sha256: 63f51011be96cb2c63e7c2991d9b121752374083eb50d138d39d37bfefd680b6
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/rlhf.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/rlhf.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/training/rlhf.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -44,7 +44,7 @@ The following open-source RL libraries use vLLM for fast rollouts (sorted alphab
 - [Unsloth](https://github.com/unslothai/unsloth)
 - [verl](https://github.com/volcengine/verl)
 
-For weight synchronization between training and inference, see the [Weight Transfer](weight_transfer/README.md) documentation, which covers the pluggable backend system with [NCCL](weight_transfer/nccl.md) (multi-GPU) and [IPC](weight_transfer/ipc.md) (same-GPU) engines. To verify that an update landed on every rank, see the [Weight Checker](weight_checker.md).
+For weight synchronization between training and inference, see the [Weight Transfer](weight_transfer/README.md) documentation, which covers the pluggable backend system with [NCCL](weight_transfer/nccl.md) (multi-GPU) and [IPC](weight_transfer/ipc.md) (same-GPU) engines. To verify that an update landed on every rank, see the [Weight Checker](weight_checker.md). To check updates for a new model without a trainer, see [Verifying a New Model Without a Trainer](weight_transfer/README.md#verifying-a-new-model-without-a-trainer).
 
 For MoE policies, see [Routed Experts Return](routed_experts.md) (`--enable-return-routed-experts`) to get the per-token expert routing of each rollout for routing replay (R3) in the trainer.
 

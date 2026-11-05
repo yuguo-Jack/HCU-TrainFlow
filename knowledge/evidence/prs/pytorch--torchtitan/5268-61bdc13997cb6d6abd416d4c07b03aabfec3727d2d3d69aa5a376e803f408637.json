@@ -1,0 +1,569 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "72e656464aa081faefb663f3d685258ca002586193493b9bae8faf25b7be4c2b",
+      "isPrivate": false,
+      "numbers": [
+        5274,
+        5273,
+        5272,
+        5271,
+        5270,
+        5269,
+        5268,
+        5267
+      ],
+      "observed_at": "2026-11-04T18:29:25.408529+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4931,
+        "resetAt": "2026-11-04T19:00:29Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "2a00be295a20be5eccc5dddb5dd13fef2f2c6fbc",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "**TLDR:** On main, a weight sync holds two copies of the generator's weights, so the first sync OOMs unless the second copy fits in the ~6 GiB that vLLM leaves free on an H100. This PR syncs one FSDP module at a time: Qwen3.5-35B-A3B at TP1 needs 1.6 GiB extra instead of its 64.6 GiB state dict, and the KV cache keeps its size.\n\n**Problem**\n1. With FSDP, each weight has a sharded buffer, which `load_state_dict` writes, and an unsharded buffer, which forward and CUDA graphs read.\n2. Between syncs, only the unsharded buffers stay allocated.\n3. A sync re-allocates all sharded buffers (`prepare_for_state_dict_load`) before `load_state_dict`, so both sets are resident.\n4. With generator FSDP degree 1 (TP-only or 1-GPU generators), the sharded set is a whole second copy of the local model.\n5. vLLM fills GPU memory up to `gpu_memory_limit` (default 0.9) at startup, leaving a sync about 6 GiB on a 95 GiB H100.\n6. Qwen3.5-9B at TP1 needs 16.7 GiB and OOMs at the first sync.\n\n**Solution**\n1. `VLLMModelWrapper.load_state_dict` (overriding `nn.Module`'s, keyed like `self.model`) keeps one `load_state_dict` call. For each group of modules sharded together (e.g. `[norm, lm_head]`), it adds a temporary pre-hook on the first module, which calls `prepare_for_state_dict_load` for that group, and a post-hook on the last, which calls `prepare_for_forward`.\n2. `prepare_for_state_dict_load` no longer skips groups that already read as sharded: FSDP's own load pre-hook reshards a module that owns parameters (e.g. `tok_embeddings`) before ours runs.\n3. The generator's pull calls `model.load_state_dict(model_sd)`.\n4. Both prepare methods take one `FSDPModule` and act on its FSDP group; `__init__` loops over the FSDP modules for the initial unshard.\n\n```text\nbefore:  re-allocate ALL sharded -> load_state_dict -> unshard + free ALL           peak: 2x weights\nafter:   load_state_dict, per FSDP group: re-allocate -> copy -> unshard + free     peak: weights + ~1 group\n```\nWith tied embeddings, the `[tok_embeddings, norm, lm_head]` group stays allocated for the whole load.\n\n**Results**\n```text\nH100 (95 GiB), bf16, gpu_memory_limit 0.9: extra GPU memory during one sync\nmain = the state dict size; this PR = measured peak\nQwen3.5-35B-A3B, TP1     64.6 -> 1.6 GiB     (5.9 GiB free)    sync 1.3 s\nQwen3.5-9B, TP1          16.7 -> 1.9 GiB     (6.1 GiB free)    sync 0.37 s   main OOM observed\nQwen3.5-9B, TP2           8.3 -> 0.95 GiB    (5.7 GiB free)    sync 0.2-0.24 s\nQwen3.5-4B, TP1, tied     9.0 -> 1.4 GiB     (6.1 GiB free)    sync 0.2 s\n```\n- Greedy decode under FULL CUDA graphs is identical across syncs of the same weights. A perturbed `norm.weight` changes it, and undoing that restores it.\n- RL runs, H100:\n  - Qwen3.5-4B-Base, 2 GPUs, generator TP1, 8 steps: trainer-generator logprob diff mean 5.6e-5 at step 8.\n  - `rl_grpo_qwen3_moe_debug_varlen` (generator DP=2, so a real FSDP all-gather inside the load; CUDA graphs off), 5 steps: per-step max logprob diff 0.009-0.059, main 0.007-0.058; pull 0.60 s, main 0.62 s.\n  - `rl_dapo_qwen3_4b_math_8k`, 8 GPUs, 109 steps (then stopped by an unrelated host OOM kill): mean reward 0.17 over steps 1-10 and 0.35 over steps 91-109; 0.2 s per sync.\n\nYou may ask:\n- Why per FSDP group, not per module? `fully_shard([norm, lm_head])` gives both one FSDP state; unsharding after `norm` would all-gather `lm_head` before it loads.\n- Why hooks, not one `load_state_dict` per FSDP module? That call also loads the nested FSDP modules, whose sharded buffers are still freed.\n- Why not leave room for the second copy, by lowering `gpu_memory_limit` or reserving it during vLLM's memory profiling? It comes out of the KV cache. Reserving it at profiling, on one H100:\n  ```text\n  Qwen3.5-9B TP1          KV cache 67.81 -> 51.44 GiB (1.23M -> 0.93M tokens)\n  Qwen3.5-35B-A3B TP1     engine fails to start (OOM during memory profiling)\n  ```\n\nNOTE: results above are from an earlier main (`49c4cff1f`); the 9B and 35B probes were re-run on this branch (below).\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu/test_generator.py tests/rl/unit_tests/cpu/test_engine_loop.py tests/rl/unit_tests/cpu/test_inter_generator_router.py tests/rl/unit_tests/cpu/test_weight_sync.py`\n- `pytest tests/rl/unit_tests/cpu/test_vllm_wrapper.py::test_load_state_dict_allocates_one_fsdp_group_at_a_time` (new): real FSDP2 on CPU, a tied `[tok_embeddings, norm, lm_head]` group plus 3 blocks. Each group's sharded buffers are allocated before its copy, at most 2 groups at once, all are freed after, and every param equals the new weights. It fails if the `is_sharded` skip comes back.\n- `torchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen` (4 passed): its weight sync fills the generator's pinned CPU copy and calls `wrapper.load_state_dict`, as production does.\n- 1-GPU engine probe on this branch (vLLM engine with the TorchTitan generator model, FULL CUDA graphs, two syncs):\n  ```text\n  Qwen3.5-9B TP1          sync extra peak 1.89 GiB, 0.37 / 0.35 s\n  Qwen3.5-35B-A3B TP1     sync extra peak 1.57 GiB, 1.34 / 1.33 s\n  both: greedy identical after syncing the same weights, changed by a perturbed norm.weight, restored after undoing it\n  ```\n\n\n",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "reply by claude: All comments are addressed. Summary of the changes:\r\n\r\n- **`model.load_state_dict(model_sd)`:** `VLLMModelWrapper` now overrides `load_state_dict`. Keys are those of `self.model` (no `model.` prefix). `strict=True` is fixed: with `strict=False`, a missing param would end up with uninitialized memory.\r\n- **Why per FSDP group:** modules from one `fully_shard` call, e.g. `[norm, lm_head]`, share one FSDP state. Unsharding right after `norm` would all-gather `lm_head` before it loads. The docstring now draws when each group is allocated and freed.\r\n- **Why hooks:** calling `load_state_dict` per module would also load its nested modules while their buffers are still freed. The hooks run inside one call, right before and after each group. Added a comment.\r\n- **One module:** `prepare_for_state_dict_load` / `prepare_for_forward` take one `module: FSDPModule` (they call `_get_fsdp_state()` and `unshard()`). `__init__` loops over the FSDP modules.\r\n- **Tests:** CPU unit tests, a new CPU FSDP2 regression test, 2-GPU bitwise parity, and the 9B / 35B-A3B engine probes all pass.\r\n- **Red CI:** \"1 GPU Integration (Fake PG)\" fails on the SFT loss golden. That's main: the recent in-place WGRAD change updated `real_pg/a10g/sft.txt` but not `fake_pg/a10g/sft.txt`. Not from this PR.\r\n",
+            "createdAt": "2026-10-11T04:01:08Z",
+            "databaseId": 6105244701,
+            "updatedAt": "2026-10-11T04:07:45Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5268#issuecomment-6105244701"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWvmpB0=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "ca8a218249045608174b6fc300023701cee3e79e",
+      "headRepository": {
+        "nameWithOwner": "felipemello1/torchtitan"
+      },
+      "mergeCommit": {
+        "oid": "39513f1cb6a9035f14950e710ac01fef193c9cca"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-11T04:25:15Z",
+      "number": 5268,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "nice! Happy to stamp after you addressed comments",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "```suggestion\n        model.load_state_dict(model_sd)\n```",
+                  "createdAt": "2026-10-11T01:32:39Z",
+                  "databaseId": 4239868364,
+                  "diffHunk": "@@ -1566,10 +1566,8 @@ async def _pull_model_state_dict(self, version: int) -> None:\n         # live trainer GPU tensors while optimizer steps may be mutating them.\n         model = self._get_model()\n         model_sd = self._prefetched_model_state_dict\n-        model.prepare_for_state_dict_load()\n         # Perform the local CPU-to-GPU copy\n-        model.model.load_state_dict(model_sd, strict=True)\n-        model.prepare_for_forward()\n+        model.load_model_state_dict(model_sd)",
+                  "line": null,
+                  "originalLine": 1570,
+                  "path": "torchtitan/rl/generator.py",
+                  "updatedAt": "2026-10-11T02:05:50Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239868364"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "oh this looks a bit subtle -- IIUC the existence of the dict at all is because you want this per- FSDP group behavior\n> For each group of modules sharded together (e.g. [norm, lm_head]), it adds a temporary pre-hook on the first module, which calls prepare_for_state_dict_load for that group, and a post-hook on the last, which calls prepare_for_forward.\n\nbut curious why do we want the per-group behavior -- it seems because the code below has\n`for param_group in module._get_fsdp_state()._fsdp_param_groups` which covers one whole group at a time\n\nPlease add some documents, as the code is not very readable\n\ncc @weifengpy ",
+                  "createdAt": "2026-10-11T02:00:10Z",
+                  "databaseId": 4239925628,
+                  "diffHunk": "@@ -377,7 +379,44 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:\n+        \"\"\"\n+        Copy new weights into the model, one FSDP module at a time.\n+\n+        Why hooks, not one `load_state_dict` per FSDP module: that call also loads the\n+        nested FSDP modules, whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Same keys and shards as `self.model.state_dict()`, e.g. the\n+                generator's pinned CPU copy.\n+        \"\"\"\n+        # Modules sharded together share one FSDP state, e.g. [norm, lm_head]: re-allocate\n+        # before the first one loads and unshard after the last one. With tied embeddings\n+        # the group is [tok_embeddings, norm, lm_head], so its sharded buffers stay\n+        # allocated for the whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)",
+                  "line": 414,
+                  "originalLine": 400,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T02:05:50Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239925628"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "> Why hooks, not one load_state_dict per FSDP module? That call also loads the nested FSDP modules, whose sharded buffers are still freed.\n\nPlease add a comment on why doing this",
+                  "createdAt": "2026-10-11T02:00:59Z",
+                  "databaseId": 4239927439,
+                  "diffHunk": "@@ -377,7 +379,44 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:\n+        \"\"\"\n+        Copy new weights into the model, one FSDP module at a time.\n+\n+        Why hooks, not one `load_state_dict` per FSDP module: that call also loads the\n+        nested FSDP modules, whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Same keys and shards as `self.model.state_dict()`, e.g. the\n+                generator's pinned CPU copy.\n+        \"\"\"\n+        # Modules sharded together share one FSDP state, e.g. [norm, lm_head]: re-allocate\n+        # before the first one loads and unshard after the last one. With tied embeddings\n+        # the group is [tok_embeddings, norm, lm_head], so its sharded buffers stay\n+        # allocated for the whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(",
+                  "line": 420,
+                  "originalLine": 404,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T02:05:50Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239927439"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "from what I read we only need\n```suggestion\n        self, module: torch.nn.Module\n```\nand maybe even should be a torchtitan `Module`",
+                  "createdAt": "2026-10-11T02:03:53Z",
+                  "databaseId": 4239933604,
+                  "diffHunk": "@@ -377,7 +379,44 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:\n+        \"\"\"\n+        Copy new weights into the model, one FSDP module at a time.\n+\n+        Why hooks, not one `load_state_dict` per FSDP module: that call also loads the\n+        nested FSDP modules, whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Same keys and shards as `self.model.state_dict()`, e.g. the\n+                generator's pinned CPU copy.\n+        \"\"\"\n+        # Modules sharded together share one FSDP state, e.g. [norm, lm_head]: re-allocate\n+        # before the first one loads and unshard after the last one. With tied embeddings\n+        # the group is [tok_embeddings, norm, lm_head], so its sharded buffers stay\n+        # allocated for the whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(\n+                    lambda module, *args: self.prepare_for_state_dict_load([module])\n+                )\n+            )\n+            handles.append(\n+                modules[-1].register_load_state_dict_post_hook(\n+                    lambda module, *args: self.prepare_for_forward([module])\n+                )\n+            )\n+        self.model.load_state_dict(state_dict, strict=True)\n+        for handle in handles:\n+            handle.remove()\n+\n+    def prepare_for_state_dict_load(\n+        self, modules: Iterable[torch.nn.Module] | None = None",
+                  "line": null,
+                  "originalLine": 418,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T02:05:50Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239933604"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "similar",
+                  "createdAt": "2026-10-11T02:04:15Z",
+                  "databaseId": 4239934363,
+                  "diffHunk": "@@ -391,28 +430,30 @@ def prepare_for_state_dict_load(self) -> None:\n         memory. Sharded buffers are only re-allocated temporarily to receive\n         updated weights during weight sync, and are promptly freed afterwards.\n \n-        Note: This currently incurs a memory spike every weight sync (step 2),\n-        since FSDP maintains separate buffers for sharded and unsharded weights,\n-        and both must be resident during the weight sync. E.g. for bf16 generator\n-        and fsdp=1, weight sync currently maintains 2x model memory. This may be\n-        fine since this is not peak memory, but we should revisit in the future.\n+        `load_model_state_dict` runs this per FSDP module, so a sync adds about one\n+        module's weights instead of the whole model's: 1.6 GiB vs 64.6 GiB for bf16\n+        Qwen3.5-35B-A3B at TP1 on an H100.\n+\n+        Args:\n+            modules: Modules to prepare. Defaults to `self.model.modules()`.\n         \"\"\"\n         from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage\n \n-        for module in self.model.modules():\n+        for module in self.model.modules() if modules is None else modules:\n             if not isinstance(module, FSDPModule):\n                 continue\n             # TODO: replace this with FSDPModule._restore_sharded_params()\n             for param_group in module._get_fsdp_state()._fsdp_param_groups:\n-                if param_group.is_sharded:\n-                    continue\n+                # Don't skip is_sharded groups: FSDP's load pre-hook reshards e.g. tok_embeddings before ours.\n                 for param in param_group.fsdp_params:\n                     sharded_data = param._sharded_param_data\n                     if isinstance(sharded_data, _ShardedFSDPTensor):\n                         sharded_data = sharded_data._tensor\n                     alloc_storage(sharded_data)\n \n-    def prepare_for_forward(self) -> None:\n+    def prepare_for_forward(\n+        self, modules: Iterable[torch.nn.Module] | None = None",
+                  "line": null,
+                  "originalLine": 455,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T02:05:50Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239934363"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xMVQwMjowNDoxNVrO_LhDmw==",
+                "hasNextPage": false
+              },
+              "totalCount": 5
+            },
+            "databaseId": 5481493866,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-11T02:05:50Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5268#pullrequestreview-5481493866"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "Do we need `strict` and `assign`? If not let's remove",
+                  "createdAt": "2026-10-11T03:23:16Z",
+                  "databaseId": 4240098437,
+                  "diffHunk": "@@ -377,7 +379,58 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_state_dict(\n+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False",
+                  "line": null,
+                  "originalLine": 383,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T03:27:30Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240098437"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "```suggestion\n    def _prepare_for_state_dict_load(\n```\nbut I think we should embed this hook function inline",
+                  "createdAt": "2026-10-11T03:24:04Z",
+                  "databaseId": 4240100169,
+                  "diffHunk": "@@ -377,7 +379,58 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_state_dict(\n+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False\n+    ):\n+        \"\"\"\n+        Copy new weights into `self.model`, one FSDP group at a time.\n+\n+        Allocating every sharded buffer before the load would hold a second copy of the\n+        weights next to the unsharded buffers that forward reads (see\n+        `prepare_for_state_dict_load`). Instead, temporary hooks bracket each group: a\n+        pre-hook on its first module allocates the group's sharded buffers, and a post-hook\n+        on its last module unshards and frees them.\n+\n+        A group is the modules passed to one `fully_shard` call, e.g. [norm, lm_head]. They\n+        share one FSDP state, and both prepare methods act on the whole state, so unsharding\n+        after `norm` would all-gather `lm_head` before it is loaded.\n+\n+        Why hooks on one `load_state_dict`, not one call per FSDP module: that call\n+        recurses into children, so loading a module also loads the FSDP modules nested in it\n+        (e.g. the root holds every block), whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`, e.g.\n+                the generator's pinned CPU copy.\n+        \"\"\"\n+        # Each group's modules in load order. With tied embeddings the group is\n+        # [tok_embeddings, norm, lm_head], so its sharded buffers stay allocated for the\n+        # whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(\n+                    lambda module, *args: self.prepare_for_state_dict_load(module)\n+                )\n+            )\n+            handles.append(\n+                modules[-1].register_load_state_dict_post_hook(\n+                    lambda module, *args: self.prepare_for_forward(module)\n+                )\n+            )\n+        try:\n+            return self.model.load_state_dict(state_dict, strict, assign)\n+        finally:\n+            for handle in handles:\n+                handle.remove()\n+\n+    def prepare_for_state_dict_load(",
+                  "line": null,
+                  "originalLine": 431,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T03:27:30Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240100169"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "- would it ever be `None`? If not let's remove until it's needed later, also remove default value.\n- also I think this can be an inline embedded function in `load_state_dict()` and it doesn't need `self`, either",
+                  "createdAt": "2026-10-11T03:25:02Z",
+                  "databaseId": 4240102230,
+                  "diffHunk": "@@ -377,7 +379,58 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_state_dict(\n+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False\n+    ):\n+        \"\"\"\n+        Copy new weights into `self.model`, one FSDP group at a time.\n+\n+        Allocating every sharded buffer before the load would hold a second copy of the\n+        weights next to the unsharded buffers that forward reads (see\n+        `prepare_for_state_dict_load`). Instead, temporary hooks bracket each group: a\n+        pre-hook on its first module allocates the group's sharded buffers, and a post-hook\n+        on its last module unshards and frees them.\n+\n+        A group is the modules passed to one `fully_shard` call, e.g. [norm, lm_head]. They\n+        share one FSDP state, and both prepare methods act on the whole state, so unsharding\n+        after `norm` would all-gather `lm_head` before it is loaded.\n+\n+        Why hooks on one `load_state_dict`, not one call per FSDP module: that call\n+        recurses into children, so loading a module also loads the FSDP modules nested in it\n+        (e.g. the root holds every block), whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`, e.g.\n+                the generator's pinned CPU copy.\n+        \"\"\"\n+        # Each group's modules in load order. With tied embeddings the group is\n+        # [tok_embeddings, norm, lm_head], so its sharded buffers stay allocated for the\n+        # whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(\n+                    lambda module, *args: self.prepare_for_state_dict_load(module)\n+                )\n+            )\n+            handles.append(\n+                modules[-1].register_load_state_dict_post_hook(\n+                    lambda module, *args: self.prepare_for_forward(module)\n+                )\n+            )\n+        try:\n+            return self.model.load_state_dict(state_dict, strict, assign)\n+        finally:\n+            for handle in handles:\n+                handle.remove()\n+\n+    def prepare_for_state_dict_load(\n+        self, module: torch.nn.Module | None = None",
+                  "line": null,
+                  "originalLine": 432,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T03:27:30Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240102230"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "tianyu-l"
+                  },
+                  "body": "similar",
+                  "createdAt": "2026-10-11T03:27:19Z",
+                  "databaseId": 4240107381,
+                  "diffHunk": "@@ -391,28 +444,30 @@ def prepare_for_state_dict_load(self) -> None:\n         memory. Sharded buffers are only re-allocated temporarily to receive\n         updated weights during weight sync, and are promptly freed afterwards.\n \n-        Note: This currently incurs a memory spike every weight sync (step 2),\n-        since FSDP maintains separate buffers for sharded and unsharded weights,\n-        and both must be resident during the weight sync. E.g. for bf16 generator\n-        and fsdp=1, weight sync currently maintains 2x model memory. This may be\n-        fine since this is not peak memory, but we should revisit in the future.\n+        `load_state_dict` runs this per FSDP group, so a sync adds about one group's\n+        weights instead of the whole model's: 1.6 GiB vs 64.6 GiB for bf16\n+        Qwen3.5-35B-A3B at TP1 on an H100.\n+\n+        Args:\n+            module: Prepare this module's FSDP group. Defaults to every group in\n+                `self.model`.\n         \"\"\"\n         from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage\n \n-        for module in self.model.modules():\n+        modules = self.model.modules() if module is None else [module]\n+        for module in modules:\n             if not isinstance(module, FSDPModule):\n                 continue\n             # TODO: replace this with FSDPModule._restore_sharded_params()\n             for param_group in module._get_fsdp_state()._fsdp_param_groups:\n-                if param_group.is_sharded:\n-                    continue\n+                # Don't skip is_sharded groups: FSDP's load pre-hook reshards e.g. tok_embeddings before ours.\n                 for param in param_group.fsdp_params:\n                     sharded_data = param._sharded_param_data\n                     if isinstance(sharded_data, _ShardedFSDPTensor):\n                         sharded_data = sharded_data._tensor\n                     alloc_storage(sharded_data)\n \n-    def prepare_for_forward(self) -> None:\n+    def prepare_for_forward(self, module: torch.nn.Module | None = None) -> None:",
+                  "line": null,
+                  "originalLine": 470,
+                  "path": "torchtitan/rl/model/vllm_wrapper.py",
+                  "updatedAt": "2026-10-11T03:27:30Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240107381"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xMVQwMzoyNzoxOVrO_LrndQ==",
+                "hasNextPage": false
+              },
+              "totalCount": 4
+            },
+            "databaseId": 5481723328,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-11T03:27:30Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5268#pullrequestreview-5481723328"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xMVQwMzoyNzozMFq0MjAyNi0xMC0xMVQwMzoyMzoxNlrPAAAAAUa8dcA=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[rl] FSDP generator: sync weights one FSDP module at a time",
+      "updatedAt": "2026-10-11T04:25:15Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5268"
+    },
+    "reused_files": {
+      "artifact_path": "knowledge/evidence/prs/pytorch--torchtitan/5268-ce3d5c4004d14b39d52926ba11f75d0500b2fedfa89d959def83a897915f5183.json",
+      "artifact_sha256": "ce3d5c4004d14b39d52926ba11f75d0500b2fedfa89d959def83a897915f5183",
+      "reason": "Same immutable head/base repository+commit pair and changed_files; original fully paginated files response reused. Discussions are freshly queried.",
+      "refs": {
+        "base": {
+          "commit": "2a00be295a20be5eccc5dddb5dd13fef2f2c6fbc",
+          "repository": "pytorch/torchtitan"
+        },
+        "head": {
+          "commit": "ca8a218249045608174b6fc300023701cee3e79e",
+          "repository": "felipemello1/torchtitan"
+        }
+      }
+    },
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "2a00be295a20be5eccc5dddb5dd13fef2f2c6fbc"
+    },
+    "body": "**TLDR:** On main, a weight sync holds two copies of the generator's weights, so the first sync OOMs unless the second copy fits in the ~6 GiB that vLLM leaves free on an H100. This PR syncs one FSDP module at a time: Qwen3.5-35B-A3B at TP1 needs 1.6 GiB extra instead of its 64.6 GiB state dict, and the KV cache keeps its size.\n\n**Problem**\n1. With FSDP, each weight has a sharded buffer, which `load_state_dict` writes, and an unsharded buffer, which forward and CUDA graphs read.\n2. Between syncs, only the unsharded buffers stay allocated.\n3. A sync re-allocates all sharded buffers (`prepare_for_state_dict_load`) before `load_state_dict`, so both sets are resident.\n4. With generator FSDP degree 1 (TP-only or 1-GPU generators), the sharded set is a whole second copy of the local model.\n5. vLLM fills GPU memory up to `gpu_memory_limit` (default 0.9) at startup, leaving a sync about 6 GiB on a 95 GiB H100.\n6. Qwen3.5-9B at TP1 needs 16.7 GiB and OOMs at the first sync.\n\n**Solution**\n1. `VLLMModelWrapper.load_state_dict` (overriding `nn.Module`'s, keyed like `self.model`) keeps one `load_state_dict` call. For each group of modules sharded together (e.g. `[norm, lm_head]`), it adds a temporary pre-hook on the first module, which calls `prepare_for_state_dict_load` for that group, and a post-hook on the last, which calls `prepare_for_forward`.\n2. `prepare_for_state_dict_load` no longer skips groups that already read as sharded: FSDP's own load pre-hook reshards a module that owns parameters (e.g. `tok_embeddings`) before ours runs.\n3. The generator's pull calls `model.load_state_dict(model_sd)`.\n4. Both prepare methods take one `FSDPModule` and act on its FSDP group; `__init__` loops over the FSDP modules for the initial unshard.\n\n```text\nbefore:  re-allocate ALL sharded -> load_state_dict -> unshard + free ALL           peak: 2x weights\nafter:   load_state_dict, per FSDP group: re-allocate -> copy -> unshard + free     peak: weights + ~1 group\n```\nWith tied embeddings, the `[tok_embeddings, norm, lm_head]` group stays allocated for the whole load.\n\n**Results**\n```text\nH100 (95 GiB), bf16, gpu_memory_limit 0.9: extra GPU memory during one sync\nmain = the state dict size; this PR = measured peak\nQwen3.5-35B-A3B, TP1     64.6 -> 1.6 GiB     (5.9 GiB free)    sync 1.3 s\nQwen3.5-9B, TP1          16.7 -> 1.9 GiB     (6.1 GiB free)    sync 0.37 s   main OOM observed\nQwen3.5-9B, TP2           8.3 -> 0.95 GiB    (5.7 GiB free)    sync 0.2-0.24 s\nQwen3.5-4B, TP1, tied     9.0 -> 1.4 GiB     (6.1 GiB free)    sync 0.2 s\n```\n- Greedy decode under FULL CUDA graphs is identical across syncs of the same weights. A perturbed `norm.weight` changes it, and undoing that restores it.\n- RL runs, H100:\n  - Qwen3.5-4B-Base, 2 GPUs, generator TP1, 8 steps: trainer-generator logprob diff mean 5.6e-5 at step 8.\n  - `rl_grpo_qwen3_moe_debug_varlen` (generator DP=2, so a real FSDP all-gather inside the load; CUDA graphs off), 5 steps: per-step max logprob diff 0.009-0.059, main 0.007-0.058; pull 0.60 s, main 0.62 s.\n  - `rl_dapo_qwen3_4b_math_8k`, 8 GPUs, 109 steps (then stopped by an unrelated host OOM kill): mean reward 0.17 over steps 1-10 and 0.35 over steps 91-109; 0.2 s per sync.\n\nYou may ask:\n- Why per FSDP group, not per module? `fully_shard([norm, lm_head])` gives both one FSDP state; unsharding after `norm` would all-gather `lm_head` before it loads.\n- Why hooks, not one `load_state_dict` per FSDP module? That call also loads the nested FSDP modules, whose sharded buffers are still freed.\n- Why not leave room for the second copy, by lowering `gpu_memory_limit` or reserving it during vLLM's memory profiling? It comes out of the KV cache. Reserving it at profiling, on one H100:\n  ```text\n  Qwen3.5-9B TP1          KV cache 67.81 -> 51.44 GiB (1.23M -> 0.93M tokens)\n  Qwen3.5-35B-A3B TP1     engine fails to start (OOM during memory profiling)\n  ```\n\nNOTE: results above are from an earlier main (`49c4cff1f`); the 9B and 35B probes were re-run on this branch (below).\n\n**Test plan**\n- `pytest tests/rl/unit_tests/cpu/test_generator.py tests/rl/unit_tests/cpu/test_engine_loop.py tests/rl/unit_tests/cpu/test_inter_generator_router.py tests/rl/unit_tests/cpu/test_weight_sync.py`\n- `pytest tests/rl/unit_tests/cpu/test_vllm_wrapper.py::test_load_state_dict_allocates_one_fsdp_group_at_a_time` (new): real FSDP2 on CPU, a tied `[tok_embeddings, norm, lm_head]` group plus 3 blocks. Each group's sharded buffers are allocated before its copy, at most 2 groups at once, all are freed after, and every param equals the new weights. It fails if the `is_sharded` skip comes back.\n- `torchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen` (4 passed): its weight sync fills the generator's pinned CPU copy and calls `wrapper.load_state_dict`, as production does.\n- 1-GPU engine probe on this branch (vLLM engine with the TorchTitan generator model, FULL CUDA graphs, two syncs):\n  ```text\n  Qwen3.5-9B TP1          sync extra peak 1.89 GiB, 0.37 / 0.35 s\n  Qwen3.5-35B-A3B TP1     sync extra peak 1.57 GiB, 1.34 / 1.33 s\n  both: greedy identical after syncing the same weights, changed by a perturbed norm.weight, restored after undoing it\n  ```\n\n\n",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "felipemello1/torchtitan"
+      },
+      "sha": "ca8a218249045608174b6fc300023701cee3e79e"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5268",
+    "merge_commit_sha": "39513f1cb6a9035f14950e710ac01fef193c9cca",
+    "merged": true,
+    "merged_at": "2026-10-11T04:25:15Z",
+    "number": 5268,
+    "state": "closed",
+    "title": "[rl] FSDP generator: sync weights one FSDP module at a time",
+    "updated_at": "2026-10-11T04:25:15Z"
+  },
+  "files": [
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_engine_loop.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_engine_loop.py?ref=ca8a218249045608174b6fc300023701cee3e79e",
+      "deletions": 5,
+      "filename": "tests/rl/unit_tests/cpu/test_engine_loop.py",
+      "patch": "@@ -633,11 +633,7 @@ async def new_pull(self, version):\n         await original_pull(self, version)\n \n     monkeypatch.setattr(VLLMGenerator, \"_pull_model_state_dict\", new_pull)\n-    model = SimpleNamespace(\n-        model=SimpleNamespace(load_state_dict=lambda sd, strict: None),\n-        prepare_for_state_dict_load=lambda: None,\n-        prepare_for_forward=lambda: None,\n-    )\n+    model = SimpleNamespace(load_state_dict=lambda state_dict: None)\n     engine = _FakeEngine()\n     engine.model_executor = SimpleNamespace(\n         driver_worker=SimpleNamespace(get_model=lambda: model)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_engine_loop.py",
+      "sha": "9d7900faf10efc64b819b0634f8ecdc1aba5741a",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_generator.py",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_generator.py?ref=ca8a218249045608174b6fc300023701cee3e79e",
+      "deletions": 17,
+      "filename": "tests/rl/unit_tests/cpu/test_generator.py",
+      "patch": "@@ -169,14 +169,7 @@ def fill_state_dict(*args, **kwargs):\n             return {\"weight\": \"fetched\"}\n \n         load_state_dict = Mock()\n-        generator._get_model = lambda: SimpleNamespace(\n-            model=SimpleNamespace(\n-                state_dict=lambda: {\"weight\": \"old\"},\n-                load_state_dict=load_state_dict,\n-            ),\n-            prepare_for_state_dict_load=lambda: None,\n-            prepare_for_forward=lambda: None,\n-        )\n+        generator._get_model = lambda: SimpleNamespace(load_state_dict=load_state_dict)\n         generator._rank = 1\n         generator.config.reset_kv_cache_on_weight_sync = False\n \n@@ -192,7 +185,7 @@ def fill_state_dict(*args, **kwargs):\n             strict=False,\n             direct_rdma=False,\n         )\n-        load_state_dict.assert_called_once_with({\"weight\": \"fetched\"}, strict=True)\n+        load_state_dict.assert_called_once_with({\"weight\": \"fetched\"})\n \n     asyncio.run(main())\n \n@@ -420,14 +413,7 @@ async def run() -> None:\n         engine = cast(_FakeEngine, generator._engine)\n         generator.config.reset_kv_cache_on_weight_sync = reset_kv_cache\n         generator._prefetched_model_state_dict = {}\n-        model = SimpleNamespace(\n-            model=SimpleNamespace(\n-                state_dict=lambda: {},\n-                load_state_dict=lambda state_dict, strict: None,\n-            ),\n-            prepare_for_state_dict_load=lambda: None,\n-            prepare_for_forward=lambda: None,\n-        )\n+        model = SimpleNamespace(load_state_dict=lambda state_dict: None)\n         monkeypatch.setattr(generator, \"_get_model\", lambda: model)\n \n         await generator._pull_model_state_dict(version=8)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_generator.py",
+      "sha": "6796cfaf22933d7f9d1f3c1cc753e3f0803df65d",
+      "status": "modified"
+    },
+    {
+      "additions": 86,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_vllm_wrapper.py",
+      "changes": 87,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_vllm_wrapper.py?ref=ca8a218249045608174b6fc300023701cee3e79e",
+      "deletions": 1,
+      "filename": "tests/rl/unit_tests/cpu/test_vllm_wrapper.py",
+      "patch": "@@ -4,9 +4,16 @@\n # This source code is licensed under the BSD-style license found in the\n # LICENSE file in the root directory of this source tree.\n \n+import torch.distributed as dist\n+import torch.nn as nn\n+from torch.distributed.device_mesh import init_device_mesh\n+from torch.distributed.fsdp import FSDPModule, fully_shard\n from torchtitan.config.parallelism import ParallelismConfig\n from torchtitan.models.qwen3_5 import build_model_config\n-from torchtitan.rl.model.vllm_wrapper import _replace_vllm_layer_configs\n+from torchtitan.rl.model.vllm_wrapper import (\n+    _replace_vllm_layer_configs,\n+    VLLMModelWrapper,\n+)\n \n \n def test_vllm_replacement_preserves_attention_sharding() -> None:\n@@ -37,3 +44,81 @@ def test_vllm_replacement_preserves_attention_sharding() -> None:\n         assert vllm_sharding.local_spmd is model_sharding.local_spmd\n         for name, layout in model_sharding.state_shardings.items():\n             assert vllm_sharding.state_shardings[name] is layout\n+\n+\n+class _Wrapper:\n+    \"\"\"Stand-in `self` for VLLMModelWrapper's real weight-sync methods (no vLLM).\"\"\"\n+\n+    load_state_dict = VLLMModelWrapper.load_state_dict\n+    prepare_for_forward = VLLMModelWrapper.prepare_for_forward\n+\n+    def __init__(self, model: nn.Module):\n+        self.model = model\n+\n+\n+def test_load_state_dict_allocates_one_fsdp_group_at_a_time(tmp_path) -> None:\n+    \"\"\"Load new weights with at most two FSDP groups' sharded buffers allocated at once.\n+\n+    Guards that each group's sharded buffers are allocated before its copy, even when\n+    FSDP's own load pre-hook already resharded the group (tok_embeddings here).\n+    \"\"\"\n+    dist.init_process_group(\n+        \"gloo\", init_method=f\"file://{tmp_path / 'store'}\", rank=0, world_size=1\n+    )\n+    try:\n+        # The generator's layout: a tied [tok_embeddings, norm, lm_head] group, one per block.\n+        model = nn.Module()\n+        model.tok_embeddings = nn.Embedding(32, 16)\n+        model.layers = nn.ModuleList(\n+            nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16)) for _ in range(3)\n+        )\n+        model.norm = nn.LayerNorm(16)\n+        model.lm_head = nn.Linear(16, 32, bias=False)\n+        model.lm_head.weight = model.tok_embeddings.weight\n+        mesh = init_device_mesh(\"cpu\", (1,))\n+        fully_shard([model.tok_embeddings, model.norm, model.lm_head], mesh=mesh)\n+        for block in model.layers:\n+            fully_shard(block, mesh=mesh)\n+        fully_shard(model, mesh=mesh)\n+        model.set_keep_unsharded_storage(True)\n+        new_state_dict = {k: v.detach() + 1.0 for k, v in model.state_dict().items()}\n+        groups = [\n+            group\n+            for module in (model.tok_embeddings, *model.layers)\n+            for group in module._get_fsdp_state()._fsdp_param_groups\n+        ]\n+\n+        def is_allocated(group) -> bool:\n+            return all(\n+                p._sharded_param_data.untyped_storage().size() > 0\n+                for p in group.fsdp_params\n+            )\n+\n+        wrapper = _Wrapper(model)\n+        max_allocated_groups = 0\n+\n+        def prepare_for_state_dict_load(module) -> None:\n+            nonlocal max_allocated_groups\n+            VLLMModelWrapper.prepare_for_state_dict_load(wrapper, module)\n+            # The load copies into these buffers next, so freed ones would be overrun.\n+            assert all(map(is_allocated, module._get_fsdp_state()._fsdp_param_groups))\n+            max_allocated_groups = max(\n+                max_allocated_groups, sum(map(is_allocated, groups))\n+            )\n+\n+        wrapper.prepare_for_state_dict_load = prepare_for_state_dict_load\n+        for module in model.modules():  # as after the initial load\n+            if isinstance(module, FSDPModule):\n+                wrapper.prepare_for_forward(module)\n+        wrapper.load_state_dict(new_state_dict)\n+\n+        assert max_allocated_groups <= 2\n+        assert all(\n+            p._sharded_param_data.untyped_storage().size() == 0\n+            for group in groups\n+            for p in group.fsdp_params\n+        )\n+        for name, param in model.named_parameters(remove_duplicate=False):\n+            assert param.equal(new_state_dict[name].to_local()), name\n+    finally:\n+        dist.destroy_process_group()",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_vllm_wrapper.py",
+      "sha": "cde8d487ac43e14e2ff5ac3e17bc5240e915c09a",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_bitwise_parity.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_bitwise_parity.py?ref=ca8a218249045608174b6fc300023701cee3e79e",
+      "deletions": 5,
+      "filename": "tests/rl/unit_tests/gpu/test_bitwise_parity.py",
+      "patch": "@@ -277,10 +277,9 @@ def _sync_trainer_weights_to_vllm(trainer_model, engine) -> None:\n     \"\"\"Copy the trainer model's weights into the vLLM model in-process.\"\"\"\n \n     wrapper = engine.model_executor.driver_worker.get_model()\n-    vllm_model = wrapper.model\n     trainer_sd = trainer_model.state_dict()\n-    wrapper.prepare_for_state_dict_load()\n-    vllm_sd = vllm_model.state_dict()\n+    # As a weight sync: fill the pinned CPU copy, then load it with load_state_dict.\n+    vllm_sd = wrapper._prefetched_model_state_dict\n \n     missing = []\n     for name, vparam in vllm_sd.items():\n@@ -297,8 +296,7 @@ def _sync_trainer_weights_to_vllm(trainer_model, engine) -> None:\n             else:\n                 vparam.copy_(full)\n \n-    vllm_model.load_state_dict(vllm_sd, strict=False)\n-    wrapper.prepare_for_forward()\n+    wrapper.load_state_dict(vllm_sd)\n \n     if dist.get_rank() == 0 and missing:\n         logger.warning(\"vLLM params not present in trainer state_dict: %s\", missing)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ca8a218249045608174b6fc300023701cee3e79e/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_bitwise_parity.py",
+      "sha": "06aea738a1e6c8b19efd81dfd71eeebc96b9e302",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ca8a218249045608174b6fc300023701cee3e79e/torchtitan%2Frl%2Fgenerator.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fgenerator.py?ref=ca8a218249045608174b6fc300023701cee3e79e",
+      "deletions": 3,
+      "filename": "torchtitan/rl/generator.py",
+      "patch": "@@ -1566,10 +1566,8 @@ async def _pull_model_state_dict(self, version: int) -> None:\n         # live trainer GPU tensors while optimizer steps may be mutating them.\n         model = self._get_model()\n         model_sd = self._prefetched_model_state_dict\n-        model.prepare_for_state_dict_load()\n         # Perform the local CPU-to-GPU copy\n-        model.model.load_state_dict(model_sd, strict=True)\n-        model.prepare_for_forward()\n+        model.load_state_dict(model_sd)\n         self.policy_version = version\n         if self.config.reset_kv_cache_on_weight_sync:\n             # Always reset running requests too: the only reason to reset is a strict",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ca8a218249045608174b6fc300023701cee3e79e/torchtitan%2Frl%2Fgenerator.py",
+      "sha": "7287aed1eef841dc218f8f3380d9a04d95c14ebc",
+      "status": "modified"
+    },
+    {
+      "additions": 82,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ca8a218249045608174b6fc300023701cee3e79e/torchtitan%2Frl%2Fmodel%2Fvllm_wrapper.py",
+      "changes": 135,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fmodel%2Fvllm_wrapper.py?ref=ca8a218249045608174b6fc300023701cee3e79e",
+      "deletions": 53,
+      "filename": "torchtitan/rl/model/vllm_wrapper.py",
+      "patch": "@@ -13,7 +13,9 @@\n \n import copy\n import dataclasses\n-from typing import cast\n+from collections import defaultdict\n+from collections.abc import Mapping\n+from typing import Any, cast\n \n import spmd_types as spmd\n \n@@ -375,70 +377,97 @@ def __init__(\n \n         # Unshard the model here so vLLM performs its GPU memory profiling\n         # based on the model's actual representation used during forward\n-        self.prepare_for_forward()\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                self.prepare_for_forward(module)\n+\n+    def load_state_dict(self, state_dict: Mapping[str, Any]):\n+        \"\"\"Copy new weights into `self.model`, allocating about one FSDP group's sharded buffers at a time.\n+\n+        Each group is allocated right before its first module loads and freed right after its last:\n+\n+            load order:     tok_embeddings | layers.0 | ... | layers.N | norm     lm_head\n+            FSDP group:     [emb]          | [l0]     |     | [lN]     | [norm,   lm_head]\n+            allocate:       emb            | l0       |     | lN       | norm\n+            unshard, free:  emb            | l0       |     | lN       |          lm_head\n \n-    def prepare_for_state_dict_load(self) -> None:\n+        With tied embeddings the group is [tok_embeddings, norm, lm_head], so it stays\n+        allocated for the whole load.\n+\n+        Why this shape:\n+          - Memory: allocating every sharded buffer first adds a second copy of the weights at\n+            FSDP degree 1: 64.6 GiB extra for bf16 Qwen3.5-35B-A3B at TP1, vs 1.6 GiB here.\n+          - Per group: modules from one `fully_shard` call share one FSDP state, so unsharding\n+            after `norm` would all-gather `lm_head` before it loads.\n+          - Hooks: a `load_state_dict` per module would also load its nested FSDP modules\n+            (the root holds every block), whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`\n+                (no `model.` prefix), e.g. the generator's pinned CPU copy.\n         \"\"\"\n-        Re-allocate previously freed sharded buffers for receiving weights.\n-\n-        Weight sync lifecycle:\n-          1. prepare_for_state_dict_load: re-allocate sharded buffers\n-          2. model.state_dict() hook: reshard model + keep unsharded buffers\n-          3. ts.get_state_dict: fetch new weights into sharded buffers\n-          4. prepare_for_forward: unshard model + free sharded buffers\n-\n-        At the end of weight sync, only unsharded buffers are resident in\n-        memory. Sharded buffers are only re-allocated temporarily to receive\n-        updated weights during weight sync, and are promptly freed afterwards.\n-\n-        Note: This currently incurs a memory spike every weight sync (step 2),\n-        since FSDP maintains separate buffers for sharded and unsharded weights,\n-        and both must be resident during the weight sync. E.g. for bf16 generator\n-        and fsdp=1, weight sync currently maintains 2x model memory. This may be\n-        fine since this is not peak memory, but we should revisit in the future.\n+        # One entry per FSDP group: fully_shard([norm, lm_head]) gives both modules one\n+        # state, and its sharded buffers are allocated and freed together.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        # Hooks run inside the one load_state_dict call, just before and after each group\n+        # loads; a call per module would also load its nested modules while they are freed.\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(\n+                    lambda module, *args: self.prepare_for_state_dict_load(module)\n+                )\n+            )\n+            handles.append(\n+                modules[-1].register_load_state_dict_post_hook(\n+                    lambda module, *args: self.prepare_for_forward(module)\n+                )\n+            )\n+        incompatible_keys = self.model.load_state_dict(state_dict, strict=True)\n+        for handle in handles:\n+            handle.remove()\n+        return incompatible_keys\n+\n+    def prepare_for_state_dict_load(self, module: FSDPModule) -> None:\n+        \"\"\"Re-allocate the sharded buffers of `module`'s FSDP group so new weights can be copied in.\n+\n+        before:  sharded: freed                     unsharded: old weights (what CUDA graphs read)\n+        after:   sharded: allocated, uninitialized  unsharded: unchanged\n         \"\"\"\n         from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage\n \n-        for module in self.model.modules():\n-            if not isinstance(module, FSDPModule):\n-                continue\n-            # TODO: replace this with FSDPModule._restore_sharded_params()\n-            for param_group in module._get_fsdp_state()._fsdp_param_groups:\n-                if param_group.is_sharded:\n-                    continue\n-                for param in param_group.fsdp_params:\n-                    sharded_data = param._sharded_param_data\n-                    if isinstance(sharded_data, _ShardedFSDPTensor):\n-                        sharded_data = sharded_data._tensor\n-                    alloc_storage(sharded_data)\n+        # TODO: replace this with FSDPModule._restore_sharded_params()\n+        for param_group in module._get_fsdp_state()._fsdp_param_groups:\n+            # FSDP's own load pre-hook may have resharded this group already (e.g.\n+            # tok_embeddings), so is_sharded can be True while the storage is still freed.\n+            for param in param_group.fsdp_params:\n+                sharded_data = param._sharded_param_data\n+                if isinstance(sharded_data, _ShardedFSDPTensor):\n+                    sharded_data = sharded_data._tensor\n+                alloc_storage(sharded_data)\n \n-    def prepare_for_forward(self) -> None:\n-        \"\"\"\n-        After weight sync, prepare the model for prefill/decode by:\n-          1. Explicitly unsharding model to refill existing unsharded operands\n-          2. Freeing sharded buffers since they are not needed during forward\n+    def prepare_for_forward(self, module: FSDPModule) -> None:\n+        \"\"\"Unshard `module`'s FSDP group into its unsharded buffers, then free its sharded ones.\n \n-        For (1), unshard must be an explicit call here, since CUDA graph replays\n-        are not guaranteed to execute the forward pre hook (which normally\n-        triggers unshard).\n+            before:  sharded: new weights   unsharded: old weights\n+            after:   sharded: freed         unsharded: new weights (what CUDA graphs read)\n \n-        This should be called during initialization and after each weight sync.\n-        For the full weight sync lifecycle, see `prepare_for_state_dict_load`.\n+        The unshard is explicit because CUDA graph replays skip FSDP's forward pre-hook.\n         \"\"\"\n         from torch.distributed.fsdp._fully_shard._fsdp_param import free_storage\n \n         with torch.inference_mode():\n-            for module in self.model.modules():\n-                if not isinstance(module, FSDPModule):\n-                    continue\n-                module.unshard()\n-                # TODO: replace this with FSDPModule._free_sharded_params()\n-                for param_group in module._get_fsdp_state()._fsdp_param_groups:\n-                    for param in param_group.fsdp_params:\n-                        sharded_data = param._sharded_param_data\n-                        if isinstance(sharded_data, _ShardedFSDPTensor):\n-                            sharded_data = sharded_data._tensor\n-                        free_storage(sharded_data)\n+            module.unshard()\n+            # TODO: replace this with FSDPModule._free_sharded_params()\n+            for param_group in module._get_fsdp_state()._fsdp_param_groups:\n+                for param in param_group.fsdp_params:\n+                    sharded_data = param._sharded_param_data\n+                    if isinstance(sharded_data, _ShardedFSDPTensor):\n+                        sharded_data = sharded_data._tensor\n+                    free_storage(sharded_data)\n \n     def set_num_valid_tokens(self, num_valid_tokens: int) -> None:\n         \"\"\"Publish how many of this step's tokens are real, for the padding mask.",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ca8a218249045608174b6fc300023701cee3e79e/torchtitan%2Frl%2Fmodel%2Fvllm_wrapper.py",
+      "sha": "285ef7212975da3312f54e9abc4e640452458251",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "```suggestion\n        model.load_state_dict(model_sd)\n```",
+      "created_at": "2026-10-11T01:32:39Z",
+      "diff_hunk": "@@ -1566,10 +1566,8 @@ async def _pull_model_state_dict(self, version: int) -> None:\n         # live trainer GPU tensors while optimizer steps may be mutating them.\n         model = self._get_model()\n         model_sd = self._prefetched_model_state_dict\n-        model.prepare_for_state_dict_load()\n         # Perform the local CPU-to-GPU copy\n-        model.model.load_state_dict(model_sd, strict=True)\n-        model.prepare_for_forward()\n+        model.load_model_state_dict(model_sd)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239868364",
+      "id": 4239868364,
+      "line": null,
+      "original_line": 1570,
+      "path": "torchtitan/rl/generator.py",
+      "updated_at": "2026-10-11T02:05:50Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "oh this looks a bit subtle -- IIUC the existence of the dict at all is because you want this per- FSDP group behavior\n> For each group of modules sharded together (e.g. [norm, lm_head]), it adds a temporary pre-hook on the first module, which calls prepare_for_state_dict_load for that group, and a post-hook on the last, which calls prepare_for_forward.\n\nbut curious why do we want the per-group behavior -- it seems because the code below has\n`for param_group in module._get_fsdp_state()._fsdp_param_groups` which covers one whole group at a time\n\nPlease add some documents, as the code is not very readable\n\ncc @weifengpy ",
+      "created_at": "2026-10-11T02:00:10Z",
+      "diff_hunk": "@@ -377,7 +379,44 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:\n+        \"\"\"\n+        Copy new weights into the model, one FSDP module at a time.\n+\n+        Why hooks, not one `load_state_dict` per FSDP module: that call also loads the\n+        nested FSDP modules, whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Same keys and shards as `self.model.state_dict()`, e.g. the\n+                generator's pinned CPU copy.\n+        \"\"\"\n+        # Modules sharded together share one FSDP state, e.g. [norm, lm_head]: re-allocate\n+        # before the first one loads and unshard after the last one. With tied embeddings\n+        # the group is [tok_embeddings, norm, lm_head], so its sharded buffers stay\n+        # allocated for the whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239925628",
+      "id": 4239925628,
+      "line": 414,
+      "original_line": 400,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T02:05:50Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "> Why hooks, not one load_state_dict per FSDP module? That call also loads the nested FSDP modules, whose sharded buffers are still freed.\n\nPlease add a comment on why doing this",
+      "created_at": "2026-10-11T02:00:59Z",
+      "diff_hunk": "@@ -377,7 +379,44 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:\n+        \"\"\"\n+        Copy new weights into the model, one FSDP module at a time.\n+\n+        Why hooks, not one `load_state_dict` per FSDP module: that call also loads the\n+        nested FSDP modules, whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Same keys and shards as `self.model.state_dict()`, e.g. the\n+                generator's pinned CPU copy.\n+        \"\"\"\n+        # Modules sharded together share one FSDP state, e.g. [norm, lm_head]: re-allocate\n+        # before the first one loads and unshard after the last one. With tied embeddings\n+        # the group is [tok_embeddings, norm, lm_head], so its sharded buffers stay\n+        # allocated for the whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239927439",
+      "id": 4239927439,
+      "line": 420,
+      "original_line": 404,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T02:05:50Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "from what I read we only need\n```suggestion\n        self, module: torch.nn.Module\n```\nand maybe even should be a torchtitan `Module`",
+      "created_at": "2026-10-11T02:03:53Z",
+      "diff_hunk": "@@ -377,7 +379,44 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:\n+        \"\"\"\n+        Copy new weights into the model, one FSDP module at a time.\n+\n+        Why hooks, not one `load_state_dict` per FSDP module: that call also loads the\n+        nested FSDP modules, whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Same keys and shards as `self.model.state_dict()`, e.g. the\n+                generator's pinned CPU copy.\n+        \"\"\"\n+        # Modules sharded together share one FSDP state, e.g. [norm, lm_head]: re-allocate\n+        # before the first one loads and unshard after the last one. With tied embeddings\n+        # the group is [tok_embeddings, norm, lm_head], so its sharded buffers stay\n+        # allocated for the whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(\n+                    lambda module, *args: self.prepare_for_state_dict_load([module])\n+                )\n+            )\n+            handles.append(\n+                modules[-1].register_load_state_dict_post_hook(\n+                    lambda module, *args: self.prepare_for_forward([module])\n+                )\n+            )\n+        self.model.load_state_dict(state_dict, strict=True)\n+        for handle in handles:\n+            handle.remove()\n+\n+    def prepare_for_state_dict_load(\n+        self, modules: Iterable[torch.nn.Module] | None = None",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239933604",
+      "id": 4239933604,
+      "line": null,
+      "original_line": 418,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T02:05:50Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "similar",
+      "created_at": "2026-10-11T02:04:15Z",
+      "diff_hunk": "@@ -391,28 +430,30 @@ def prepare_for_state_dict_load(self) -> None:\n         memory. Sharded buffers are only re-allocated temporarily to receive\n         updated weights during weight sync, and are promptly freed afterwards.\n \n-        Note: This currently incurs a memory spike every weight sync (step 2),\n-        since FSDP maintains separate buffers for sharded and unsharded weights,\n-        and both must be resident during the weight sync. E.g. for bf16 generator\n-        and fsdp=1, weight sync currently maintains 2x model memory. This may be\n-        fine since this is not peak memory, but we should revisit in the future.\n+        `load_model_state_dict` runs this per FSDP module, so a sync adds about one\n+        module's weights instead of the whole model's: 1.6 GiB vs 64.6 GiB for bf16\n+        Qwen3.5-35B-A3B at TP1 on an H100.\n+\n+        Args:\n+            modules: Modules to prepare. Defaults to `self.model.modules()`.\n         \"\"\"\n         from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage\n \n-        for module in self.model.modules():\n+        for module in self.model.modules() if modules is None else modules:\n             if not isinstance(module, FSDPModule):\n                 continue\n             # TODO: replace this with FSDPModule._restore_sharded_params()\n             for param_group in module._get_fsdp_state()._fsdp_param_groups:\n-                if param_group.is_sharded:\n-                    continue\n+                # Don't skip is_sharded groups: FSDP's load pre-hook reshards e.g. tok_embeddings before ours.\n                 for param in param_group.fsdp_params:\n                     sharded_data = param._sharded_param_data\n                     if isinstance(sharded_data, _ShardedFSDPTensor):\n                         sharded_data = sharded_data._tensor\n                     alloc_storage(sharded_data)\n \n-    def prepare_for_forward(self) -> None:\n+    def prepare_for_forward(\n+        self, modules: Iterable[torch.nn.Module] | None = None",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4239934363",
+      "id": 4239934363,
+      "line": null,
+      "original_line": 455,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T02:05:50Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "Do we need `strict` and `assign`? If not let's remove",
+      "created_at": "2026-10-11T03:23:16Z",
+      "diff_hunk": "@@ -377,7 +379,58 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_state_dict(\n+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240098437",
+      "id": 4240098437,
+      "line": null,
+      "original_line": 383,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T03:27:30Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "```suggestion\n    def _prepare_for_state_dict_load(\n```\nbut I think we should embed this hook function inline",
+      "created_at": "2026-10-11T03:24:04Z",
+      "diff_hunk": "@@ -377,7 +379,58 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_state_dict(\n+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False\n+    ):\n+        \"\"\"\n+        Copy new weights into `self.model`, one FSDP group at a time.\n+\n+        Allocating every sharded buffer before the load would hold a second copy of the\n+        weights next to the unsharded buffers that forward reads (see\n+        `prepare_for_state_dict_load`). Instead, temporary hooks bracket each group: a\n+        pre-hook on its first module allocates the group's sharded buffers, and a post-hook\n+        on its last module unshards and frees them.\n+\n+        A group is the modules passed to one `fully_shard` call, e.g. [norm, lm_head]. They\n+        share one FSDP state, and both prepare methods act on the whole state, so unsharding\n+        after `norm` would all-gather `lm_head` before it is loaded.\n+\n+        Why hooks on one `load_state_dict`, not one call per FSDP module: that call\n+        recurses into children, so loading a module also loads the FSDP modules nested in it\n+        (e.g. the root holds every block), whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`, e.g.\n+                the generator's pinned CPU copy.\n+        \"\"\"\n+        # Each group's modules in load order. With tied embeddings the group is\n+        # [tok_embeddings, norm, lm_head], so its sharded buffers stay allocated for the\n+        # whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(\n+                    lambda module, *args: self.prepare_for_state_dict_load(module)\n+                )\n+            )\n+            handles.append(\n+                modules[-1].register_load_state_dict_post_hook(\n+                    lambda module, *args: self.prepare_for_forward(module)\n+                )\n+            )\n+        try:\n+            return self.model.load_state_dict(state_dict, strict, assign)\n+        finally:\n+            for handle in handles:\n+                handle.remove()\n+\n+    def prepare_for_state_dict_load(",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240100169",
+      "id": 4240100169,
+      "line": null,
+      "original_line": 431,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T03:27:30Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "- would it ever be `None`? If not let's remove until it's needed later, also remove default value.\n- also I think this can be an inline embedded function in `load_state_dict()` and it doesn't need `self`, either",
+      "created_at": "2026-10-11T03:25:02Z",
+      "diff_hunk": "@@ -377,7 +379,58 @@ def __init__(\n         # based on the model's actual representation used during forward\n         self.prepare_for_forward()\n \n-    def prepare_for_state_dict_load(self) -> None:\n+    def load_state_dict(\n+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False\n+    ):\n+        \"\"\"\n+        Copy new weights into `self.model`, one FSDP group at a time.\n+\n+        Allocating every sharded buffer before the load would hold a second copy of the\n+        weights next to the unsharded buffers that forward reads (see\n+        `prepare_for_state_dict_load`). Instead, temporary hooks bracket each group: a\n+        pre-hook on its first module allocates the group's sharded buffers, and a post-hook\n+        on its last module unshards and frees them.\n+\n+        A group is the modules passed to one `fully_shard` call, e.g. [norm, lm_head]. They\n+        share one FSDP state, and both prepare methods act on the whole state, so unsharding\n+        after `norm` would all-gather `lm_head` before it is loaded.\n+\n+        Why hooks on one `load_state_dict`, not one call per FSDP module: that call\n+        recurses into children, so loading a module also loads the FSDP modules nested in it\n+        (e.g. the root holds every block), whose sharded buffers are still freed.\n+\n+        Args:\n+            state_dict: Keyed like `self.model.state_dict()`, not `self.state_dict()`, e.g.\n+                the generator's pinned CPU copy.\n+        \"\"\"\n+        # Each group's modules in load order. With tied embeddings the group is\n+        # [tok_embeddings, norm, lm_head], so its sharded buffers stay allocated for the\n+        # whole load.\n+        modules_by_fsdp_state = defaultdict(list)\n+        for module in self.model.modules():\n+            if isinstance(module, FSDPModule):\n+                modules_by_fsdp_state[module._get_fsdp_state()].append(module)\n+        handles = []\n+        for modules in modules_by_fsdp_state.values():\n+            handles.append(\n+                modules[0].register_load_state_dict_pre_hook(\n+                    lambda module, *args: self.prepare_for_state_dict_load(module)\n+                )\n+            )\n+            handles.append(\n+                modules[-1].register_load_state_dict_post_hook(\n+                    lambda module, *args: self.prepare_for_forward(module)\n+                )\n+            )\n+        try:\n+            return self.model.load_state_dict(state_dict, strict, assign)\n+        finally:\n+            for handle in handles:\n+                handle.remove()\n+\n+    def prepare_for_state_dict_load(\n+        self, module: torch.nn.Module | None = None",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240102230",
+      "id": 4240102230,
+      "line": null,
+      "original_line": 432,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T03:27:30Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "similar",
+      "created_at": "2026-10-11T03:27:19Z",
+      "diff_hunk": "@@ -391,28 +444,30 @@ def prepare_for_state_dict_load(self) -> None:\n         memory. Sharded buffers are only re-allocated temporarily to receive\n         updated weights during weight sync, and are promptly freed afterwards.\n \n-        Note: This currently incurs a memory spike every weight sync (step 2),\n-        since FSDP maintains separate buffers for sharded and unsharded weights,\n-        and both must be resident during the weight sync. E.g. for bf16 generator\n-        and fsdp=1, weight sync currently maintains 2x model memory. This may be\n-        fine since this is not peak memory, but we should revisit in the future.\n+        `load_state_dict` runs this per FSDP group, so a sync adds about one group's\n+        weights instead of the whole model's: 1.6 GiB vs 64.6 GiB for bf16\n+        Qwen3.5-35B-A3B at TP1 on an H100.\n+\n+        Args:\n+            module: Prepare this module's FSDP group. Defaults to every group in\n+                `self.model`.\n         \"\"\"\n         from torch.distributed.fsdp._fully_shard._fsdp_param import alloc_storage\n \n-        for module in self.model.modules():\n+        modules = self.model.modules() if module is None else [module]\n+        for module in modules:\n             if not isinstance(module, FSDPModule):\n                 continue\n             # TODO: replace this with FSDPModule._restore_sharded_params()\n             for param_group in module._get_fsdp_state()._fsdp_param_groups:\n-                if param_group.is_sharded:\n-                    continue\n+                # Don't skip is_sharded groups: FSDP's load pre-hook reshards e.g. tok_embeddings before ours.\n                 for param in param_group.fsdp_params:\n                     sharded_data = param._sharded_param_data\n                     if isinstance(sharded_data, _ShardedFSDPTensor):\n                         sharded_data = sharded_data._tensor\n                     alloc_storage(sharded_data)\n \n-    def prepare_for_forward(self) -> None:\n+    def prepare_for_forward(self, module: torch.nn.Module | None = None) -> None:",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#discussion_r4240107381",
+      "id": 4240107381,
+      "line": null,
+      "original_line": 470,
+      "path": "torchtitan/rl/model/vllm_wrapper.py",
+      "updated_at": "2026-10-11T03:27:30Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "reply by claude: All comments are addressed. Summary of the changes:\r\n\r\n- **`model.load_state_dict(model_sd)`:** `VLLMModelWrapper` now overrides `load_state_dict`. Keys are those of `self.model` (no `model.` prefix). `strict=True` is fixed: with `strict=False`, a missing param would end up with uninitialized memory.\r\n- **Why per FSDP group:** modules from one `fully_shard` call, e.g. `[norm, lm_head]`, share one FSDP state. Unsharding right after `norm` would all-gather `lm_head` before it loads. The docstring now draws when each group is allocated and freed.\r\n- **Why hooks:** calling `load_state_dict` per module would also load its nested modules while their buffers are still freed. The hooks run inside one call, right before and after each group. Added a comment.\r\n- **One module:** `prepare_for_state_dict_load` / `prepare_for_forward` take one `module: FSDPModule` (they call `_get_fsdp_state()` and `unshard()`). `__init__` loops over the FSDP modules.\r\n- **Tests:** CPU unit tests, a new CPU FSDP2 regression test, 2-GPU bitwise parity, and the 9B / 35B-A3B engine probes all pass.\r\n- **Red CI:** \"1 GPU Integration (Fake PG)\" fails on the SFT loss golden. That's main: the recent in-place WGRAD change updated `real_pg/a10g/sft.txt` but not `fake_pg/a10g/sft.txt`. Not from this PR.\r\n",
+      "created_at": "2026-10-11T04:01:08Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#issuecomment-6105244701",
+      "id": 6105244701,
+      "updated_at": "2026-10-11T04:07:45Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5268,
+  "refs": {
+    "base": {
+      "commit": "2a00be295a20be5eccc5dddb5dd13fef2f2c6fbc",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "ca8a218249045608174b6fc300023701cee3e79e",
+      "repository": "felipemello1/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "nice! Happy to stamp after you addressed comments",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#pullrequestreview-5481493866",
+      "id": 5481493866,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-11T02:05:50Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5268#pullrequestreview-5481723328",
+      "id": 5481723328,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-11T03:27:30Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ]
+}

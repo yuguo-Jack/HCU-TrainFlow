@@ -9,42 +9,48 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/rl/trainer/trainer.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 35f0171826f745ea5c82458b176831e2e5ced1969ac352d5f60092fc4ad0b65c
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: f52d1d78a769b06bc511dc638486626592d0f0bdbd249d14a2f8df4107d0c3b3
 - source: pytorch-torchtitan
   path: torchtitan/rl/generator/generator.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: aecf95576c0710a68846850e63703b928fa41f5e426232a36069a0b3b424175e
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: fe3ccd0288aa613d11234607fa24e91e98953015dd75a49657da0b4c7dd56b01
 - source: pytorch-torchtitan
   path: torchtitan/rl/generator/vllm/model_wrapper.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: fafc5445e083d8a5eaecfbee41c16c2e1c7ea43790296217bcd7827b0841a974
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: dfd3054a05f24eefa3e7bfaa5ffc24433700ede8579e53d8371277ae9a0f56e8
 - source: pytorch-torchtitan
   path: torchtitan/rl/actors/monarch/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 5f4cdb46330683cb8bd2a65d764662712972fb8989afe35a9b9dfbe5e3270209
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 3b46f79840dec9f3efd25319247fe259c0009daeec74bf381d06c483ddea8b09
 - source: pytorch-torchtitan
   path: tests/rl/unit_tests/cpu/test_vllm_wrapper.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0fb187c2c30227b547566cd0b2195426be17d095234dcafdb8059d0df70d7797
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 56b1b2822e75fd8eb63441a8937e758ca31e9aefa0bf0a6df8f8288915efa705
 - source: pytorch-torchtitan
   path: tests/rl/unit_tests/cpu/test_trainer_loop.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 56708d030bafecf2b37c81362f9ae50a6744db9d94e41522b6af62ba5d6a92f3
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 6787b02e01bfb80565c070eea69f6fbf63494a4dce00cbe4c55ea9e456163a3f
 - source: pytorch-torchtitan
   path: torchtitan/rl/actors/monarch/system.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 99f940aa2efdf924cf99838de83266d752fe2f9a3e39a75b34dac5e3e06c0345
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: fe63bfd041a5f03d4f8afc4f80b77f1085c7c808ae2b4a2d3cf4786b938c1bb9
 - source: pytorch-torchtitan
   path: torchtitan/rl/generator/engine_loop.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 9c4679f1923f8d2f0a946b8576bccec5a810bf54e3996cc5c0af385341222a15
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 08690a20311acba28c61b8ca65a2062da4bbfd0ee2cb2168b50543887dd401b0
+- source: pytorch-torchtitan
+  path: tests/rl/unit_tests/cpu/test_engine_loop.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: b9a5defb95961aad5fab4f6cf65705e2e118f74d5292f1b89e3e785b7cc85c0f
+
 pr_sources:
 - pr-pytorch--torchtitan-5107
 - pr-pytorch--torchtitan-5268
@@ -55,21 +61,21 @@ pr_sources:
 
 RL 权重同步可能同时在 trainer 和 generator 产生大块临时存储。PR #5107 处理 trainer 的 GPU cast/snapshot；PR #5268 处理 generator 加载时的全模型双份驻留。它们不是同一个开关，也不能只测一边的峰值。
 
-## 训练侧：稳定 CPU mirror 与同步所有权
+## 训练侧：Store 快照与同步所有权
 
-旧路径若在 GPU 把完整模型转换为生成 dtype，会产生接近模型大小的临时副本。改动将持久 CPU mirror 放在匹配 GPU NUMA 的 pinned memory，用它完成发布前的稳定快照，再进入 TorchStore。
+PR #5107 的 pinned CPU mirror 是历史阶段。当前 `Trainer.push_model_state_dict` → `_put_model_state_dict` 直接发布 live 模型 tensor，移除了 `_setup_staging_model_state_dict` / `_stage_model_state_dict`。SharedMemory transport 可直接把 tensor 复制/转换到 StorageVolume；其他 transport 可能按批临时 GPU cast。容量预算应按实际 transport 测 GPU/Host 和 Store，不能继续固定计入 trainer 自有整模型镜像，也不能据此说没有任何暂存。
 
-当前入口在 `rl/trainer/trainer.py`：追踪 `Trainer._setup_staging_model_state_dict`、`_stage_model_state_dict`、`_wait_for_staging_and_put_model_state_dict` 及 `push_model_state_dict`；Controller/router负责相应pull，旧weight-sync端点名与目录已迁移。下一轮 forward/backward 可以在不修改相应权重时 overlap，但 optimizer 修改原权重前必须等待必要 staging 完成；CPU buffer/key 在 pull 未完成前不可覆盖。否则发布的 tensor 可能混合两个 optimizer step。
+独立 push stream 在 optimizer 更新最终完成时捕获依赖；worker 将该 stream 设为 current 并同步，因为 RDMA 读可能在 stream 顺序之外。Controller 在下次 optimizer 修改权重前等待 push，在下次 push 覆盖 Store key 前等待所有 generator pull。forward/backward overlap 依赖其不修改 persistent model state；违反该条件会混合两步权重。
 
-把 GPU 等待和阻塞发布安排在线程中维持事件循环响应，不代表数据已经复制完成。代价包括主机 pinned memory、CPU/NUMA 带宽与 TorchStore 的复制；要同时测 Host 峰值和同步暴露时长。#5107 的说明不是一组通用的端到端提速百分比。
+transfer dtype 从根 `precision.param_dtype` 与基础 `precision.dtype` 决定，buffers 与 `preserve_dtype_params` 以自身 dtype 发送。节省一份 Host 镜像也可能把转换或等待移到另一端，按真实有效 rollout/训练时间评价。
 
 ## 生成侧：按 FSDP group 加载
 
-生成侧平时保留 unsharded 权重。若加载前给所有 FSDP group 一次性重建 sharded buffer，瞬时驻留接近两份模型；vLLM 已用大部分余量分配 KV cache 时，首次 sync 就可能 OOM。
+生成侧平时保留 unsharded 权重，逐组加载仍控制 sharded 临时峰值。当前入口为 `VLLMModelWrapper.load_model_state_dict(fetch)`，取代旧的一次 `load_state_dict` pre/post hooks：按共享 FSDP state 分组，显式 reshard → 分配 sharded storage → fetch 全部该组参数 → unshard → 释放，再处理 buffers。tied embedding/norm/LM-head 同组，不能按单个 module 提前 all-gather；`_reshard` 还处理 FORWARD 状态下 public reshard 会 no-op 的情形，并保持 Graph 使用的 unsharded storage。
 
-#5268 在当前 `rl/generator/vllm/model_wrapper.py::VLLMModelWrapper.load_state_dict` 的一次完整加载内，利用 pre/post hook 按共享 FSDP state 的 **group** 分配、复制、unshard、释放；不能简单按每个子 module 调一次 load。`fully_shard([norm,lm_head])` 的成员共享状态，tied embeddings 的跨模块 group 生命周期更长，必须一起处理。
+默认 `cpu_prefetch` 在生成期间读完整 pinned CPU 副本，load 再复制；`gpu_fetch` 不建这份副本，暂停 engine 后逐组直接读取 Store，拒绝量化参数，增加同步暴露时间。fetch 在 stream 顺序外写入时，必须先等旧工作及新分配完成，返回前写入完成。
 
-不应为了通过加载就设 `strict=False`：缺失参数可能留下未初始化 buffer。失败条件还包括重复同步后 pointer/state 不一致、graph 引用旧存储、group 提前 unshard 读未加载参数、权重版本未完成就开始 rollout。
+每个参数 key 都要填充，缺失报错；gpu_fetch 的 `strict=False` 只允许未发布 buffers 保持原值。某 rank fetch 失败后仍完成剩余组 collective，随后传播错误并让所有 generator ranks 停止 loop，避免其他 rank 卡住或继续使用部分新权重。失败后不能直接重用已污染模型继续 rollout。
 
 ## 上游证据
 
@@ -83,24 +89,24 @@ PR 包含 CPU FSDP group 生命周期回归、两卡 parity、相同/扰动/恢�
 
 HCU 接入先查已有 RL/推理工程的同步实现与底层通信库，不机械照搬 CUDA/TorchStore 的硬件假设。无法保证异步 buffer 生命周期时先回到明确同步的可靠基线，再逐项引入 overlap；完整恢复和训练质量优先于隐藏一次等待。
 
-可定位到 CPU `test_vllm_wrapper.py::test_load_state_dict_allocates_one_fsdp_group_at_a_time`：构造 tied embedding group 与三个 block，检查复制前已分配、峰值至多两个 group、结束后释放且全部参数更新。当前 `test_trainer_loop.py` 检查push→pull→release、optimizer前等待上次push、下次push前等待上次pull、最后一次transfer收尾和异常传播；这些控制逻辑检查仍不能替代真实 RDMA/设备/多次训练更新的验证。
+可定位到 CPU `test_vllm_wrapper.py` 的逐 FSDP group 加载、fetch 失败与缺失参数回归：构造 tied embedding group 与三个 block，检查复制前已分配、峰值至多两个 group、结束后释放且全部参数更新。当前 `test_trainer_loop.py` 检查push→pull→release、optimizer前等待上次push、下次push前等待上次pull、最后一次transfer收尾和异常传播；这些控制逻辑检查仍不能替代真实 RDMA/设备/多次训练更新的验证。
 
 ## 当前传输 API 与统计范围
 
-主干将这条链明确称为model state dict transfer。MonarchActorSystem先在trainer mesh建立TorchStore storage并初始化全部角色client；trainer复用pinned CPU mirror，当前put显式 `direct_rdma=False`。不能因TorchStore一般支持RDMA就把本发布步骤记成GPU-to-GPU零拷贝，也不能把RDMA microbatch数据传输混入权重同步收益。
+MonarchActorSystem 在 trainer mesh 建立 StorageVolume 并初始化所有角色 client；权重 PUT 仍显式 `direct_rdma=False`。Store 快照、generator 可选 pinned CPU prefetch、逐组 GPU 临时 storage 和 KV cache 是不同容量项；RDMA microbatch 数据不混入权重同步收益。
 
-Generator在engine loop的step边界加载，排队load可合并到最高版本；Controller等待所有generator完成pull才释放新的rollout groups。这既影响策略freshness，也让早完成的generator可能等慢者。指标名和trace入口已采用 `trainer_push_model_state_dict` / `generator_pull_model_state_dict`，比较旧报告时按相同stage边界映射。当前group加载机制及strict=True仍保留，但历史H100数字不是重构后的新基准。
+排队 load 可合并到最高版本；gpu_fetch load 只有全部 ranks 读完才完成。Controller 继续等待所有 generator pull 才释放下一批 rollout groups，早完成者可能等最慢者。指标仍为 `trainer_push_model_state_dict` / `generator_pull_model_state_dict`。历史 #5268 的 H100 数字只证明当时 group-loading 改动，不是当前 transport/load-mode 重构后的基准。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/rl/trainer/trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/trainer/trainer.py)
-- [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/generator/generator.py)
-- [torchtitan/rl/generator/vllm/model_wrapper.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/generator/vllm/model_wrapper.py)
-- [torchtitan/rl/actors/monarch/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/README.md)
-- [tests/rl/unit_tests/cpu/test_vllm_wrapper.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/rl/unit_tests/cpu/test_vllm_wrapper.py)
-- [tests/rl/unit_tests/cpu/test_trainer_loop.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/rl/unit_tests/cpu/test_trainer_loop.py)
+- [torchtitan/rl/trainer/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/trainer/trainer.py)
+- [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/generator.py)
+- [torchtitan/rl/generator/vllm/model_wrapper.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/vllm/model_wrapper.py)
+- [torchtitan/rl/actors/monarch/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/actors/monarch/README.md)
+- [tests/rl/unit_tests/cpu/test_vllm_wrapper.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/rl/unit_tests/cpu/test_vllm_wrapper.py)
+- [tests/rl/unit_tests/cpu/test_trainer_loop.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/rl/unit_tests/cpu/test_trainer_loop.py)
 
 - [PR #5107：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5107.md)
 - [PR #5268：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5268.md)
@@ -111,5 +117,7 @@ Generator在engine loop的step边界加载，排队load可合并到最高版本�
 
 ## 本次补充的实现与测试依据
 
-- [torchtitan/rl/actors/monarch/system.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/system.py)
-- [torchtitan/rl/generator/engine_loop.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/generator/engine_loop.py)
+- [torchtitan/rl/actors/monarch/system.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/actors/monarch/system.py)
+- [torchtitan/rl/generator/engine_loop.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/engine_loop.py)
+
+- [tests/rl/unit_tests/cpu/test_engine_loop.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/rl/unit_tests/cpu/test_engine_loop.py)

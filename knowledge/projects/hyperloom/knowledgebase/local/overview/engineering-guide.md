@@ -9,7 +9,7 @@ stages:
 visibility: public
 review_level: selected-source-and-document-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 sources:
 - source: yuguo-jack-hyperloom
   path: README.md
@@ -62,3 +62,5 @@ TrainFlow 的具体采用位置见 [性能方法来源](../../../../../../docs/p
 - [docs/kernelforge/conceptual/architecture.md](https://github.com/yuguo-Jack/Hyperloom/blob/0425bde3f6e76e1588400c37d056dfd3bb75ac11/docs/kernelforge/conceptual/architecture.md)
 
 按该仓完整目录与文档增量检查新增入口；通过 `wiki-search-pr` 搜索改动原因，再追当前实现和测试。正文是选定源码/官方文档解读，未在新现场运行。新 commit、接口、返回 schema 或依赖变化时，同时复核本页和相关工作流。
+
+2026-11-04 再核对固定树及上述 README、组件索引、KernelForge 架构文档：提交仍为 `0425bde3f6e76e1588400c37d056dfd3bb75ac11`，选定文件内容未变。保护测量 driver、独立验收及停滞时重看轨迹的边界仍适用；这只确认所读方法，没有新增 HCU 执行资格。

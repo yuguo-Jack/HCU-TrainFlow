@@ -1,0 +1,360 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "3bfa597b38ee502a98fd806215d589bcab7046a7233fc7ce0012a07425255799",
+      "isPrivate": false,
+      "numbers": [
+        64633,
+        64631,
+        64630,
+        64629,
+        64628,
+        64627,
+        64626,
+        64625
+      ],
+      "observed_at": "2026-11-04T17:10:40.320519+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4796,
+        "resetAt": "2026-11-04T17:50:07Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "8b10bda57ceab3a741d2fb3718af48cef691023e",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Problem\n\nLevel-1 sleep backs up every cumem allocation to host memory with `torch.empty(size, pin_memory=True)`. torch's `CachingHostAllocator` rounds each pinned block up to a power of two and keeps freed blocks in its cache, so the level-1 backup costs up to ~2x the offloaded bytes in host memory, and that memory is never returned to the OS. On Mistral Large 4 at TP8 the backup is 85.19 GiB per GPU, which turned into roughly +578 GiB of host memory per node.\n\n## Root cause\n\nThe backup size is chosen by the caching host allocator, not by the allocation. The old code already kept the memory across wake-ups: the freed pinned block stayed in the cache and was handed back on the next sleep, which is why repeated sleeps were fast. The bug is the rounding. Nothing in this path asks for the cache.\n\n## Fix\n\nData model: `AllocationData.cpu_backup_tensor` is the allocation's host backup buffer, one per allocation.\n\n- Lifetime: created exact-size on the first level-1 offload of that allocation, reused on every later offload, released only when the allocation is freed or its contents are discarded (level-2 sleep, tags not offloaded, `discard()`).\n- Validity is derived, not stored: wake restores an allocation iff it is asleep and has a buffer.\n- Invariant: asleep + buffer => the buffer holds this sleep's data. Every transition to asleep (`sleep` and `discard`) goes through one helper, `_put_to_sleep(ptr, data, offload)`, which either copies into the buffer or releases it before unmapping. So a buffer left over from an earlier offload can never be restored after a discard. The existing already-asleep policy checks (`cpu_backup_tensor is not None` on asleep allocations) keep their meaning unchanged.\n- CUDA/ROCm (`cumem.py`): the buffer is an anonymous `mmap` wrapped with `torch.frombuffer` and pinned with the existing `libcudart.cudaHostRegister` wrapper. If registration fails, the error is drained with `cudaGetLastError`, a warning is logged once and the backup stays pageable, the same fallback as the other `cudaHostRegister` callers (`shm_tensor_arena.py`, `ec_shared_region.py`). Release unregisters only a pinned buffer, ignores the return code (draining any error) and never raises, since it also runs from the allocator's free callback; then the reference is dropped, which unmaps it.\n- XPU (`xpumem.py`): same single-field reuse/release semantics with its existing pinned torch tensor. Exact-size pinning is not available there.\n\nNo config, env var, API or protocol change. None is needed: the old behavior already kept the backup memory between sleeps, and this keeps it at exactly the offloaded size.\n\n## Results\n\nQwen3-8B, 1x GB200, `enable_sleep_mode=True`, 4 cycles of `sleep(level=1)`, `wake_up()` and greedy generate. Host memory is node `MemTotal - MemAvailable` relative to before the first sleep.\n\n| | host asleep | host awake | first sleep | later sleeps | wake | outputs identical |\n|---|---|---|---|---|---|---|\n| main | 23.00 GiB | 22.99 GiB | 1.16 s | 0.16-0.18 s | 0.13-0.14 s | yes (4/4) |\n| this PR | 16.92 GiB | 16.92 GiB | 0.84 s | 0.15 s | 0.13 s | yes (4/4) |\n\nHost memory is flat across cycles in both cases. Sleep and wake are as fast as before.\n\n## Test plan\n\nNo new test function; the existing tests in `tests/basic_correctness/memory/cumem/test_cumem.py` are strengthened with deterministic checks (no RSS thresholds). Every level-1 backup must be exactly its allocation's size and page-locked, and torch's pinned host caching allocator must not be used across sleep (`torch.cuda.host_memory_stats()[\"allocated_bytes.allocated\"]` unchanged).\n\n- `test_release_kv_cache_memory_preserves_generation` (kv-only / sleep-1 / sleep-2) and `test_sleep_with_only_weights_asleep` (first x second level): 3 and 2 sleep/wake cycles with greedy output identical to pre-sleep every cycle. Worker-side state is read via `collective_rpc`: offloaded tags hold exact pinned backups and others hold none; the same buffers are kept after wake and reused on the next sleep; a level-1 then level-2 cycle leaves weights with no backup.\n- `test_basic_cumem` (`pinned` / `register-fails`): 3 level-1 cycles with changing data, same buffers reused. A sleep that does not offload the tag releases (unregisters) its backup. Freeing an allocation releases its backup. In `register-fails`, `cudaHostRegister` returns an error: sleep/wake data is still correct, backups are pageable, a warning is logged, and release never calls `cudaHostUnregister`.\n- `test_discard_tags`: `discard()` releases the kv backup, so the following wake has nothing stale to restore; weights keep and reuse theirs.\n- `test_level2_discards_ordinary_tensor_with_weights_tag`: level-1 cycle, then a level-2 style sleep releases the backup; the poisoned wake proves nothing was restored.\n- `test_reentered_tag`: freeing an offloaded allocation while awake releases its backup.\n- `test_runtime_state_survives_sleep`: runtime backups are exact, pinned and kept at both levels without the host caching allocator.\n\n## Test result (GB200)\n\n- With this PR: full `test_cumem.py` 22 passed, 3 runs in a row; `test_basic_cumem[pinned]` and `test_basic_cumem[register-fails]` also pass run alone. `register-fails` fails on the previous revision of this PR, which raised on a registration failure.\n- Same tests against main's `cumem.py`: 13 failed, 8 passed. Failing: `test_basic_cumem`, `test_release_kv_cache_memory_preserves_generation[sleep-1,sleep-2]`, `test_sleep_with_only_weights_asleep[all 4]`, `test_runtime_state_survives_sleep[sleep-1,sleep-2]` (torch host caching allocator used during sleep: +32 MiB to +2.5 GB), and `test_discard_tags`, `test_reentered_tag[both]`, `test_level2_discards_ordinary_tensor_with_weights_tag` (backups dropped on wake). With the host-stats check neutralized, the same 13 still fail on backup reuse.\n- Engine smoke: see the table above.\n\nXPU change is untested on hardware.\n\nFollow-up option: an opt-in \"release the backup on wake\" for host-memory-constrained colocated RL is one extra `release_cpu_backup` after the restore copy in `wake_up`. The invariant still holds because it only constrains asleep allocations. Not part of this PR.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--64630.org.readthedocs.build/en/64630/",
+            "createdAt": "2026-10-30T01:56:46Z",
+            "databaseId": 6513049521,
+            "updatedAt": "2026-10-30T01:56:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6513049521"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-30T08:09:17Z",
+            "databaseId": 6518138971,
+            "updatedAt": "2026-10-30T08:09:17Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518138971"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #98640](https://buildkite.com/vllm/ci/builds/98640) for commit `fd7ad94b001b`.",
+            "createdAt": "2026-10-30T08:11:06Z",
+            "databaseId": 6518186073,
+            "updatedAt": "2026-10-30T08:11:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518186073"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Hi @aoshen02, the pre-commit checks have failed. Please run:\n\n```bash \nuv pip install pre-commit>=4.5.1\npre-commit install\npre-commit run --all-files\n```\n\nThen, commit the changes and push to your branch.\n\nFor future commits, `pre-commit` will run automatically on changed files before each commit.\n",
+            "createdAt": "2026-10-30T08:14:26Z",
+            "databaseId": 6518269330,
+            "updatedAt": "2026-10-30T08:14:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518269330"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "aoshen02"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-30T08:24:34Z",
+            "databaseId": 6518432016,
+            "updatedAt": "2026-10-30T08:24:34Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518432016"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #98645](https://buildkite.com/vllm/ci/builds/98645) for commit `307bfebde178`.",
+            "createdAt": "2026-10-30T08:24:55Z",
+            "databaseId": 6518437495,
+            "updatedAt": "2026-10-30T08:24:55Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518437495"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYSHdnc=",
+          "hasNextPage": false
+        },
+        "totalCount": 6
+      },
+      "headRefOid": "307bfebde1780d62631fde5a6bac3905a2a6c174",
+      "headRepository": {
+        "nameWithOwner": "aoshen02/vllm"
+      },
+      "mergeCommit": {
+        "oid": "deacc3670153845db2f013ea24085d6eaf338874"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-30T09:44:54Z",
+      "number": 64630,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5707223160,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-30T01:56:12Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#pullrequestreview-5707223160"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZJY0516"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5709637992,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-30T08:08:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64630#pullrequestreview-5709637992"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0zMFQwODowODo1Mlq0MjAyNi0xMC0zMFQwODowODo1MlrPAAAAAVRSKWg=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Bugfix][SleepMode] Exact-size, reusable pinned CPU backup for level-1 sleep",
+      "updatedAt": "2026-10-30T12:40:58Z",
+      "url": "https://github.com/vllm-project/vllm/pull/64630"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "8b10bda57ceab3a741d2fb3718af48cef691023e"
+    },
+    "body": "## Problem\n\nLevel-1 sleep backs up every cumem allocation to host memory with `torch.empty(size, pin_memory=True)`. torch's `CachingHostAllocator` rounds each pinned block up to a power of two and keeps freed blocks in its cache, so the level-1 backup costs up to ~2x the offloaded bytes in host memory, and that memory is never returned to the OS. On Mistral Large 4 at TP8 the backup is 85.19 GiB per GPU, which turned into roughly +578 GiB of host memory per node.\n\n## Root cause\n\nThe backup size is chosen by the caching host allocator, not by the allocation. The old code already kept the memory across wake-ups: the freed pinned block stayed in the cache and was handed back on the next sleep, which is why repeated sleeps were fast. The bug is the rounding. Nothing in this path asks for the cache.\n\n## Fix\n\nData model: `AllocationData.cpu_backup_tensor` is the allocation's host backup buffer, one per allocation.\n\n- Lifetime: created exact-size on the first level-1 offload of that allocation, reused on every later offload, released only when the allocation is freed or its contents are discarded (level-2 sleep, tags not offloaded, `discard()`).\n- Validity is derived, not stored: wake restores an allocation iff it is asleep and has a buffer.\n- Invariant: asleep + buffer => the buffer holds this sleep's data. Every transition to asleep (`sleep` and `discard`) goes through one helper, `_put_to_sleep(ptr, data, offload)`, which either copies into the buffer or releases it before unmapping. So a buffer left over from an earlier offload can never be restored after a discard. The existing already-asleep policy checks (`cpu_backup_tensor is not None` on asleep allocations) keep their meaning unchanged.\n- CUDA/ROCm (`cumem.py`): the buffer is an anonymous `mmap` wrapped with `torch.frombuffer` and pinned with the existing `libcudart.cudaHostRegister` wrapper. If registration fails, the error is drained with `cudaGetLastError`, a warning is logged once and the backup stays pageable, the same fallback as the other `cudaHostRegister` callers (`shm_tensor_arena.py`, `ec_shared_region.py`). Release unregisters only a pinned buffer, ignores the return code (draining any error) and never raises, since it also runs from the allocator's free callback; then the reference is dropped, which unmaps it.\n- XPU (`xpumem.py`): same single-field reuse/release semantics with its existing pinned torch tensor. Exact-size pinning is not available there.\n\nNo config, env var, API or protocol change. None is needed: the old behavior already kept the backup memory between sleeps, and this keeps it at exactly the offloaded size.\n\n## Results\n\nQwen3-8B, 1x GB200, `enable_sleep_mode=True`, 4 cycles of `sleep(level=1)`, `wake_up()` and greedy generate. Host memory is node `MemTotal - MemAvailable` relative to before the first sleep.\n\n| | host asleep | host awake | first sleep | later sleeps | wake | outputs identical |\n|---|---|---|---|---|---|---|\n| main | 23.00 GiB | 22.99 GiB | 1.16 s | 0.16-0.18 s | 0.13-0.14 s | yes (4/4) |\n| this PR | 16.92 GiB | 16.92 GiB | 0.84 s | 0.15 s | 0.13 s | yes (4/4) |\n\nHost memory is flat across cycles in both cases. Sleep and wake are as fast as before.\n\n## Test plan\n\nNo new test function; the existing tests in `tests/basic_correctness/memory/cumem/test_cumem.py` are strengthened with deterministic checks (no RSS thresholds). Every level-1 backup must be exactly its allocation's size and page-locked, and torch's pinned host caching allocator must not be used across sleep (`torch.cuda.host_memory_stats()[\"allocated_bytes.allocated\"]` unchanged).\n\n- `test_release_kv_cache_memory_preserves_generation` (kv-only / sleep-1 / sleep-2) and `test_sleep_with_only_weights_asleep` (first x second level): 3 and 2 sleep/wake cycles with greedy output identical to pre-sleep every cycle. Worker-side state is read via `collective_rpc`: offloaded tags hold exact pinned backups and others hold none; the same buffers are kept after wake and reused on the next sleep; a level-1 then level-2 cycle leaves weights with no backup.\n- `test_basic_cumem` (`pinned` / `register-fails`): 3 level-1 cycles with changing data, same buffers reused. A sleep that does not offload the tag releases (unregisters) its backup. Freeing an allocation releases its backup. In `register-fails`, `cudaHostRegister` returns an error: sleep/wake data is still correct, backups are pageable, a warning is logged, and release never calls `cudaHostUnregister`.\n- `test_discard_tags`: `discard()` releases the kv backup, so the following wake has nothing stale to restore; weights keep and reuse theirs.\n- `test_level2_discards_ordinary_tensor_with_weights_tag`: level-1 cycle, then a level-2 style sleep releases the backup; the poisoned wake proves nothing was restored.\n- `test_reentered_tag`: freeing an offloaded allocation while awake releases its backup.\n- `test_runtime_state_survives_sleep`: runtime backups are exact, pinned and kept at both levels without the host caching allocator.\n\n## Test result (GB200)\n\n- With this PR: full `test_cumem.py` 22 passed, 3 runs in a row; `test_basic_cumem[pinned]` and `test_basic_cumem[register-fails]` also pass run alone. `register-fails` fails on the previous revision of this PR, which raised on a registration failure.\n- Same tests against main's `cumem.py`: 13 failed, 8 passed. Failing: `test_basic_cumem`, `test_release_kv_cache_memory_preserves_generation[sleep-1,sleep-2]`, `test_sleep_with_only_weights_asleep[all 4]`, `test_runtime_state_survives_sleep[sleep-1,sleep-2]` (torch host caching allocator used during sleep: +32 MiB to +2.5 GB), and `test_discard_tags`, `test_reentered_tag[both]`, `test_level2_discards_ordinary_tensor_with_weights_tag` (backups dropped on wake). With the host-stats check neutralized, the same 13 still fail on backup reuse.\n- Engine smoke: see the table above.\n\nXPU change is untested on hardware.\n\nFollow-up option: an opt-in \"release the backup on wake\" for host-memory-constrained colocated RL is one extra `release_cpu_backup` after the restore copy in `wake_up`. The invariant still holds because it only constrains asleep allocations. Not part of this PR.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 3,
+    "head": {
+      "repo": {
+        "full_name": "aoshen02/vllm"
+      },
+      "sha": "307bfebde1780d62631fde5a6bac3905a2a6c174"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/64630",
+    "merge_commit_sha": "deacc3670153845db2f013ea24085d6eaf338874",
+    "merged": true,
+    "merged_at": "2026-10-30T09:44:54Z",
+    "number": 64630,
+    "state": "closed",
+    "title": "[Bugfix][SleepMode] Exact-size, reusable pinned CPU backup for level-1 sleep",
+    "updated_at": "2026-10-30T12:40:58Z"
+  },
+  "files": [
+    {
+      "additions": 196,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/307bfebde1780d62631fde5a6bac3905a2a6c174/tests%2Fbasic_correctness%2Fmemory%2Fcumem%2Ftest_cumem.py",
+      "changes": 238,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fbasic_correctness%2Fmemory%2Fcumem%2Ftest_cumem.py?ref=307bfebde1780d62631fde5a6bac3905a2a6c174",
+      "deletions": 42,
+      "filename": "tests/basic_correctness/memory/cumem/test_cumem.py",
+      "patch": "@@ -10,10 +10,12 @@\n from vllm import LLM, SamplingParams\n from vllm.device_allocator import get_mem_allocator_instance\n from vllm.platforms import current_platform\n+from vllm.utils.torch_utils import PIN_MEMORY\n \n from ....utils import create_new_process_for_each_test\n \n DEVICE_TYPE = current_platform.device_type\n+OFFLOAD_TAGS = {1: {\"weights\", \"runtime\", \"cudagraph\"}, 2: {\"runtime\", \"cudagraph\"}}\n \n \n def mapped_usage(allocator) -> int:\n@@ -31,6 +33,69 @@ def mapped_usage(allocator) -> int:\n     )\n \n \n+def host_cache_bytes() -> int:\n+    if not current_platform.is_cuda_alike():\n+        return 0\n+    return torch.cuda.host_memory_stats()[\"allocated_bytes.allocated\"]\n+\n+\n+def cpu_backups(allocator, tags, pinned=PIN_MEMORY) -> dict[int, torch.Tensor]:\n+    backups = {\n+        ptr: data.cpu_backup_tensor\n+        for ptr, data in allocator.pointer_to_data.items()\n+        if data.cpu_backup_tensor is not None\n+    }\n+    assert backups.keys() == {\n+        ptr for ptr, data in allocator.pointer_to_data.items() if data.tag in tags\n+    }\n+    for ptr, backup in backups.items():\n+        assert backup.nbytes == allocator.pointer_to_data[ptr].handle[1]\n+        assert backup.is_pinned() == pinned\n+    return backups\n+\n+\n+def data_ptrs(backups: dict[int, torch.Tensor]) -> dict[int, int]:\n+    return {ptr: backup.data_ptr() for ptr, backup in backups.items()}\n+\n+\n+def assert_released(backups: dict[int, torch.Tensor]) -> None:\n+    assert backups\n+    if current_platform.is_cuda_alike():\n+        assert not any(backup.is_pinned() for backup in backups.values())\n+\n+\n+def backup_state(worker) -> tuple[dict[int, tuple], int]:\n+    allocator = get_mem_allocator_instance()\n+    state = {}\n+    for ptr, data in allocator.pointer_to_data.items():\n+        backup = data.cpu_backup_tensor\n+        state[ptr] = (data.tag, data.handle[1], None, 0, False)\n+        if backup is not None:\n+            state[ptr] = (\n+                data.tag,\n+                data.handle[1],\n+                backup.data_ptr(),\n+                backup.nbytes,\n+                backup.is_pinned(),\n+            )\n+    return state, host_cache_bytes()\n+\n+\n+def sleep_and_check_backups(llm, level: int) -> dict[int, tuple]:\n+    host_before = llm.collective_rpc(backup_state)[0][1]\n+    llm.sleep(level=level)\n+    state, host_after = llm.collective_rpc(backup_state)[0]\n+    assert host_after == host_before\n+    for tag, size, backup_ptr, backup_bytes, pinned in state.values():\n+        if tag in OFFLOAD_TAGS[level]:\n+            assert backup_ptr is not None\n+            assert (backup_bytes, pinned) == (size, PIN_MEMORY)\n+        else:\n+            assert backup_ptr is None\n+    assert any(tag == \"weights\" for tag, *_ in state.values())\n+    return {ptr: s for ptr, s in state.items() if s[2] is not None}\n+\n+\n def _wake_up_with_poisoned_mappings(allocator, byte_value: int = 0xA5) -> None:\n     \"\"\"Wake discarded allocations with deterministic nonzero contents.\"\"\"\n     original_create_and_map = cumem.create_and_map\n@@ -72,8 +137,9 @@ def test_python_error():\n         allocator.wake_up()\n \n \n+@pytest.mark.parametrize(\"register_error\", [0, 1], ids=[\"pinned\", \"register-fails\"])\n @create_new_process_for_each_test(\"fork\" if current_platform.is_cuda() else \"spawn\")\n-def test_basic_cumem(monkeypatch):\n+def test_basic_cumem(register_error, monkeypatch):\n     # some tensors from default memory pool\n     shape = (1024, 1024)\n     x = torch.empty(shape, device=DEVICE_TYPE)\n@@ -106,15 +172,43 @@ def record_empty_cache():\n         return original_empty_cache()\n \n     monkeypatch.setattr(torch.accelerator, \"empty_cache\", record_empty_cache)\n-    allocator.sleep()\n-    assert len(empty_cache_calls) == 1\n-    assert mapped_usage(allocator) == 0\n-    allocator.wake_up()\n-    assert mapped_usage(allocator) == mapped_bytes\n+    if register_error:\n+        monkeypatch.setattr(\n+            cumem.libcudart, \"cudaHostRegister\", lambda *args: register_error\n+        )\n+    unregistered = []\n+    original_unregister = cumem.libcudart.cudaHostUnregister\n \n-    # they can be used together\n-    output = x + y + z\n-    assert torch.allclose(output, torch.ones_like(output) * 3)\n+    def record_unregister(ptr):\n+        unregistered.append(ptr)\n+        return original_unregister(ptr)\n+\n+    monkeypatch.setattr(cumem.libcudart, \"cudaHostUnregister\", record_unregister)\n+    warnings = []\n+    monkeypatch.setattr(\n+        cumem.logger, \"warning_once\", lambda msg, *args: warnings.append(msg % args)\n+    )\n+    pinned = PIN_MEMORY and not register_error\n+    backup_ptrs = None\n+    for _ in range(3):\n+        host_before = host_cache_bytes()\n+        empty_cache_calls.clear()\n+        allocator.sleep()\n+        assert len(empty_cache_calls) == 1\n+        assert mapped_usage(allocator) == 0\n+        assert host_cache_bytes() == host_before\n+        backups = cpu_backups(allocator, {\"default\"}, pinned)\n+        assert backup_ptrs in (None, data_ptrs(backups))\n+        backup_ptrs = data_ptrs(backups)\n+        allocator.wake_up()\n+        assert mapped_usage(allocator) == mapped_bytes\n+        assert data_ptrs(cpu_backups(allocator, {\"default\"}, pinned)) == backup_ptrs\n+\n+        # they can be used together\n+        output = x + y + z\n+        assert torch.allclose(output, torch.ones_like(output) * 3)\n+        y.add_(1)\n+        z.sub_(1)\n \n     # Freeing a cuMem allocation synchronizes its device through the accelerator.\n     sync_devices = []\n@@ -126,7 +220,12 @@ def record_synchronize(device=None):\n \n     monkeypatch.setattr(torch.accelerator, \"synchronize\", record_synchronize)\n     with allocator.use_memory_pool(\"free-test\"):\n-        temp = torch.empty(4 << 20, dtype=torch.uint8, device=DEVICE_TYPE)\n+        temp = torch.full((4 << 20,), 7, dtype=torch.uint8, device=DEVICE_TYPE)\n+    allocator.sleep(offload_tags=\"free-test\")\n+    assert_released(backups)\n+    temp_backups = cpu_backups(allocator, {\"free-test\"}, pinned)\n+    allocator.wake_up()\n+    assert torch.equal(temp, torch.full_like(temp, 7))\n     device_index = torch.accelerator.current_device_index()\n     del temp\n     gc.collect()\n@@ -135,6 +234,13 @@ def record_synchronize(device=None):\n         pass\n     assert device_index is not None\n     assert device_index in sync_devices\n+    assert_released(temp_backups)\n+    assert not cpu_backups(allocator, set())\n+    assert backup_ptrs is not None\n+    released = [*backup_ptrs.values(), *data_ptrs(temp_backups).values()]\n+    assert sorted(unregistered) == (sorted(released) if pinned else [])\n+    assert bool(warnings) == (PIN_MEMORY and bool(register_error))\n+    assert all(\"pageable\" in warning for warning in warnings)\n \n \n @pytest.mark.parametrize(\"full_sleep\", [0, 1, 2], ids=[\"kv-only\", \"sleep-1\", \"sleep-2\"])\n@@ -174,25 +280,33 @@ def get_mapped_bytes_by_tag(worker):\n     assert not llm.llm_engine.is_sleeping()\n     assert llm.generate(prompt, sampling_params)[0].outputs[0].token_ids == expected\n \n-    llm.sleep(level=0)\n-    llm.release_kv_cache_memory()\n-    mapped_after, kv_cache_after = llm.collective_rpc(get_mapped_bytes_by_tag)[0]\n-    assert kv_cache_before > 0\n-    assert kv_cache_after == 0\n-    assert mapped_before - mapped_after >= kv_cache_before\n-    assert mapped_after > 0\n-    assert llm.llm_engine.is_sleeping()\n-\n-    if full_sleep:\n-        llm.sleep(level=full_sleep)\n-        assert llm.collective_rpc(get_mapped_bytes_by_tag)[0][0] == 0\n-    llm.wake_up(tags=None if full_sleep else [\"kv_cache\"])\n-    if full_sleep == 2:\n-        llm.collective_rpc(\"reload_weights\")\n-    assert llm.collective_rpc(get_mapped_bytes_by_tag)[0][0] == mapped_before\n-    assert not llm.llm_engine.is_sleeping()\n-    actual = llm.generate(prompt, sampling_params)[0].outputs[0].token_ids\n-    assert actual == expected\n+    backups = None\n+    for _ in range(3):\n+        llm.sleep(level=0)\n+        llm.release_kv_cache_memory()\n+        mapped_after, kv_cache_after = llm.collective_rpc(get_mapped_bytes_by_tag)[0]\n+        assert kv_cache_before > 0\n+        assert kv_cache_after == 0\n+        assert mapped_before - mapped_after >= kv_cache_before\n+        assert mapped_after > 0\n+        assert llm.llm_engine.is_sleeping()\n+\n+        if full_sleep:\n+            cycle_backups = sleep_and_check_backups(llm, full_sleep)\n+            assert backups in (None, cycle_backups)\n+            backups = cycle_backups\n+            assert llm.collective_rpc(get_mapped_bytes_by_tag)[0][0] == 0\n+        llm.wake_up(tags=None if full_sleep else [\"kv_cache\"])\n+        if full_sleep == 2:\n+            llm.collective_rpc(\"reload_weights\")\n+        if full_sleep:\n+            assert backups is not None\n+            state = llm.collective_rpc(backup_state)[0][0]\n+            assert {ptr: state[ptr] for ptr in backups} == backups\n+        assert llm.collective_rpc(get_mapped_bytes_by_tag)[0][0] == mapped_before\n+        assert not llm.llm_engine.is_sleeping()\n+        actual = llm.generate(prompt, sampling_params)[0].outputs[0].token_ids\n+        assert actual == expected\n \n \n @pytest.mark.parametrize(\"first_level\", [1, 2])\n@@ -217,18 +331,26 @@ def test_sleep_with_only_weights_asleep(first_level, second_level, monkeypatch):\n     def get_mapped_bytes(worker):\n         return mapped_usage(get_mem_allocator_instance())\n \n-    llm.sleep(level=first_level)\n-    llm.wake_up(tags=[\"kv_cache\"])\n-    mapped_before = llm.collective_rpc(get_mapped_bytes)[0]\n-    assert mapped_before > 0\n-    llm.sleep(level=second_level)\n-    assert llm.collective_rpc(get_mapped_bytes)[0] == mapped_before\n-    llm.wake_up(tags=[\"weights\"])\n-    if first_level == 2:\n-        llm.collective_rpc(\"reload_weights\")\n-    assert not llm.llm_engine.is_sleeping()\n-    actual = llm.generate(prompt, sampling_params)[0].outputs[0].token_ids\n-    assert actual == expected\n+    backups_by_level: dict[int, dict[int, tuple]] = {}\n+    for level, other_level in (\n+        (first_level, second_level),\n+        (second_level, first_level),\n+    ):\n+        backups = sleep_and_check_backups(llm, level)\n+        assert backups_by_level.setdefault(level, backups) == backups\n+        llm.wake_up(tags=[\"kv_cache\"])\n+        mapped_before = llm.collective_rpc(get_mapped_bytes)[0]\n+        assert mapped_before > 0\n+        llm.sleep(level=other_level)\n+        assert llm.collective_rpc(get_mapped_bytes)[0] == mapped_before\n+        state = llm.collective_rpc(backup_state)[0][0]\n+        assert {ptr: s for ptr, s in state.items() if s[2] is not None} == backups\n+        llm.wake_up(tags=[\"weights\"])\n+        if level == 2:\n+            llm.collective_rpc(\"reload_weights\")\n+        assert not llm.llm_engine.is_sleeping()\n+        actual = llm.generate(prompt, sampling_params)[0].outputs[0].token_ids\n+        assert actual == expected\n \n \n @create_new_process_for_each_test(\"fork\" if current_platform.is_cuda() else \"spawn\")\n@@ -244,9 +366,21 @@ def test_discard_tags():\n         kv = torch.ones(512, 512, device=DEVICE_TYPE)\n \n     mapped_bytes = mapped_usage(allocator)\n+    allocator.sleep(offload_tags=(\"weights\", \"kv_cache\"))\n+    allocator.wake_up()\n+    assert torch.equal(kv, torch.ones_like(kv))\n+    backups = cpu_backups(allocator, {\"weights\", \"kv_cache\"})\n+    kv_backups = {\n+        ptr: backup\n+        for ptr, backup in backups.items()\n+        if allocator.pointer_to_data[ptr].tag == \"kv_cache\"\n+    }\n \n     # Discard kv_cache only — weights should remain valid\n     allocator.discard(\"kv_cache\")\n+    assert_released(kv_backups)\n+    weight_ptrs = data_ptrs(cpu_backups(allocator, {\"weights\"}))\n+    assert weight_ptrs.items() <= data_ptrs(backups).items()\n \n     mapped_bytes_after_discard = mapped_usage(allocator)\n     assert mapped_bytes - mapped_bytes_after_discard >= kv.nbytes\n@@ -258,11 +392,14 @@ def test_discard_tags():\n     # Wake up and verify kv_cache is remapped; discarded contents are undefined.\n     allocator.wake_up()\n     assert kv.shape == (512, 512)\n+    assert data_ptrs(cpu_backups(allocator, {\"weights\"})) == weight_ptrs\n \n     # Full sleep/wake cycle still works after discard\n+    weights.fill_(2)\n     allocator.sleep(offload_tags=\"weights\")\n+    assert data_ptrs(cpu_backups(allocator, {\"weights\"})) == weight_ptrs\n     allocator.wake_up()\n-    assert torch.allclose(weights, torch.ones_like(weights))\n+    assert torch.equal(weights, torch.full_like(weights, 2))\n \n \n @pytest.mark.parametrize(\"tag\", [\"workspace\", None], ids=[\"workspace\", \"default\"])\n@@ -354,6 +491,13 @@ def test_reentered_tag(free_x_early):\n     allocator.sleep(offload_tags=\"t\")\n     allocator.wake_up()\n     assert int(y.sum()) == y.numel()\n+    backups = cpu_backups(allocator, {\"t\"})\n+    del y\n+    gc.collect()\n+    with allocator.use_memory_pool(\"t\"):\n+        pass\n+    assert not allocator.pointer_to_data\n+    assert_released(backups)\n     allocator.release_pools()\n \n \n@@ -376,10 +520,14 @@ def test_runtime_state_survives_sleep(level):\n     }\n \n     backend = CuMemBackend()\n+    host_before = host_cache_bytes()\n     backend.suspend(level=level)\n     assert mapped_usage(allocator) == 0\n+    assert host_cache_bytes() == host_before\n+    backups = cpu_backups(allocator, {\"runtime\"})\n \n     backend.resume(tags=[\"weights\"])\n+    assert data_ptrs(cpu_backups(allocator, {\"runtime\"})) == data_ptrs(backups)\n     assert torch.equal(state, torch.arange(1 << 20, device=DEVICE_TYPE))\n     backend.resume(tags=[\"kv_cache\"])\n     kv.fill_(1)\n@@ -399,7 +547,13 @@ def test_level2_discards_ordinary_tensor_with_weights_tag():\n         )\n \n     pointers = (fake_weight.data_ptr(), ordinary_tensor.data_ptr())\n+    allocator.sleep(offload_tags=\"weights\")\n+    allocator.wake_up()\n+    assert torch.all(fake_weight == 0x44)\n+    backups = cpu_backups(allocator, {\"weights\"})\n     allocator.sleep(offload_tags=())\n+    assert_released(backups)\n+    assert not cpu_backups(allocator, set())\n     _wake_up_with_poisoned_mappings(allocator)\n     torch.accelerator.synchronize()\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/307bfebde1780d62631fde5a6bac3905a2a6c174/tests%2Fbasic_correctness%2Fmemory%2Fcumem%2Ftest_cumem.py",
+      "sha": "4fb94f0c4e8fe7066bce0c081387cdd33f008624",
+      "status": "modified"
+    },
+    {
+      "additions": 46,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/307bfebde1780d62631fde5a6bac3905a2a6c174/vllm%2Fdevice_allocator%2Fcumem.py",
+      "changes": 75,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdevice_allocator%2Fcumem.py?ref=307bfebde1780d62631fde5a6bac3905a2a6c174",
+      "deletions": 29,
+      "filename": "vllm/device_allocator/cumem.py",
+      "patch": "@@ -10,6 +10,7 @@\n # the only successful approach is to call cuda driver API in C.\n import atexit\n import gc\n+import mmap\n from collections.abc import Callable, Iterator\n from contextlib import contextmanager\n from typing import Any\n@@ -61,6 +62,27 @@ def unmap_and_release(allocation_handle: HandleType) -> None:\n     python_unmap_and_release(*allocation_handle)\n \n \n+def create_cpu_backup(size_in_bytes: int) -> torch.Tensor:\n+    backup = torch.frombuffer(\n+        mmap.mmap(-1, size_in_bytes, flags=mmap.MAP_PRIVATE), dtype=torch.uint8\n+    )\n+    if PIN_MEMORY:\n+        error = libcudart.cudaHostRegister(backup.data_ptr(), size_in_bytes)\n+        if error:\n+            libcudart.cudaGetLastError()\n+            logger.warning_once(\n+                \"cudaHostRegister failed (error %d); sleep mode CPU backups \"\n+                \"fall back to pageable memory.\",\n+                error,\n+            )\n+    return backup\n+\n+\n+def release_cpu_backup(backup: torch.Tensor) -> None:\n+    if backup.is_pinned() and libcudart.cudaHostUnregister(backup.data_ptr()):\n+        libcudart.cudaGetLastError()\n+\n+\n def get_pluggable_allocator(\n     python_malloc_fn: Callable[[HandleType], None],\n     python_free_func: Callable[[int], HandleType],\n@@ -207,6 +229,7 @@ def _python_free_callback(self, ptr: int) -> HandleType:\n         \"\"\"\n         data = self.pointer_to_data.pop(ptr)\n         if data.cpu_backup_tensor is not None:\n+            release_cpu_backup(data.cpu_backup_tensor)\n             data.cpu_backup_tensor = None\n         if data.is_asleep and current_platform.is_rocm():\n             # On ROCm, sleep() already unmapped and released this allocation's\n@@ -260,24 +283,11 @@ def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:\n                 if requests_offload != was_offloaded:\n                     has_policy_conflict = True\n                 continue\n-            handle = data.handle\n-            total_bytes += handle[1]\n-            if data.tag in offload_tags:\n-                backup_bytes += handle[1]\n-                size_in_bytes = handle[1]\n-                cpu_backup_tensor = torch.empty(\n-                    size_in_bytes,\n-                    dtype=torch.uint8,\n-                    device=\"cpu\",\n-                    pin_memory=PIN_MEMORY,\n-                )\n-                cpu_ptr = cpu_backup_tensor.data_ptr()\n-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)\n-                data.cpu_backup_tensor = cpu_backup_tensor\n-            try:\n-                unmap_and_release(handle)\n-            finally:\n-                data.is_asleep = True\n+            offload = data.tag in offload_tags\n+            total_bytes += data.handle[1]\n+            if offload:\n+                backup_bytes += data.handle[1]\n+            self._put_to_sleep(ptr, data, offload)\n \n         logger.info(\n             \"CuMemAllocator: sleep freed %.2f GiB memory in total, of which \"\n@@ -297,23 +307,36 @@ def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:\n         gc.collect()\n         torch.accelerator.empty_cache()\n \n+    def _put_to_sleep(self, ptr: int, data: AllocationData, offload: bool) -> None:\n+        if offload:\n+            if data.cpu_backup_tensor is None:\n+                data.cpu_backup_tensor = create_cpu_backup(data.handle[1])\n+            cpu_ptr = data.cpu_backup_tensor.data_ptr()\n+            libcudart.cudaMemcpy(cpu_ptr, ptr, data.handle[1])\n+        elif data.cpu_backup_tensor is not None:\n+            release_cpu_backup(data.cpu_backup_tensor)\n+            data.cpu_backup_tensor = None\n+        try:\n+            unmap_and_release(data.handle)\n+        finally:\n+            data.is_asleep = True\n+\n     def discard(self, tags: tuple[str, ...] | str) -> None:\n         \"\"\"Discard mapped allocations with the given tags without CPU backup.\"\"\"\n         if isinstance(tags, str):\n             tags = (tags,)\n \n         discarded_bytes = 0\n         has_policy_conflict = False\n-        for data in self.pointer_to_data.values():\n+        for ptr, data in self.pointer_to_data.items():\n             if data.tag not in tags:\n                 continue\n             if data.is_asleep:\n                 if data.cpu_backup_tensor is not None:\n                     has_policy_conflict = True\n                 continue\n             torch.accelerator.synchronize(data.handle[0])\n-            unmap_and_release(data.handle)\n-            data.is_asleep = True\n+            self._put_to_sleep(ptr, data, offload=False)\n             discarded_bytes += data.handle[1]\n \n         logger.info(\n@@ -350,14 +373,8 @@ def wake_up(self, tags: list[str] | None = None) -> None:\n                 create_and_map(handle)\n                 data.is_asleep = False\n                 if data.cpu_backup_tensor is not None:\n-                    cpu_backup_tensor = data.cpu_backup_tensor\n-                    if cpu_backup_tensor is not None:\n-                        size_in_bytes = (\n-                            cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()\n-                        )\n-                        cpu_ptr = cpu_backup_tensor.data_ptr()\n-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)\n-                        data.cpu_backup_tensor = None\n+                    cpu_ptr = data.cpu_backup_tensor.data_ptr()\n+                    libcudart.cudaMemcpy(ptr, cpu_ptr, handle[1])\n                 elif current_platform.is_rocm():\n                     # amdgpu <6.14 may return stale VRAM (#44972); drop with its support\n                     libcudart.cudaMemset(ptr, 0, handle[1])",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/307bfebde1780d62631fde5a6bac3905a2a6c174/vllm%2Fdevice_allocator%2Fcumem.py",
+      "sha": "61aab422c37da8fe73c932b06540aad96cb6cb3b",
+      "status": "modified"
+    },
+    {
+      "additions": 24,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/307bfebde1780d62631fde5a6bac3905a2a6c174/vllm%2Fdevice_allocator%2Fxpumem.py",
+      "changes": 55,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdevice_allocator%2Fxpumem.py?ref=307bfebde1780d62631fde5a6bac3905a2a6c174",
+      "deletions": 31,
+      "filename": "vllm/device_allocator/xpumem.py",
+      "patch": "@@ -185,33 +185,11 @@ def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:\n                 if requests_offload != was_offloaded:\n                     has_policy_conflict = True\n                 continue\n-            size_in_bytes = data.handle[1]\n-            total_bytes += size_in_bytes\n-            if data.tag not in offload_tags:\n-                unmap_and_release(data.handle)\n-                data.is_asleep = True\n-                continue\n-\n-            backup_bytes += size_in_bytes\n-            device, _, _, _ = data.handle\n-            cpu_backup_tensor = torch.empty(\n-                size_in_bytes,\n-                dtype=torch.uint8,\n-                device=\"cpu\",\n-                pin_memory=PIN_MEMORY,\n-            )\n-            cpu_ptr = cpu_backup_tensor.data_ptr()\n-            _xpu_memcpy_sync(\n-                cpu_ptr,\n-                ptr,\n-                size_in_bytes,\n-                MEMCPY_DEVICE_TO_HOST,\n-                device,\n-            )\n-            data.cpu_backup_tensor = cpu_backup_tensor\n-\n-            unmap_and_release(data.handle)\n-            data.is_asleep = True\n+            offload = data.tag in offload_tags\n+            total_bytes += data.handle[1]\n+            if offload:\n+                backup_bytes += data.handle[1]\n+            self._put_to_sleep(ptr, data, offload)\n \n         logger.info(\n             \"XpuMemAllocator: sleep freed %.2f GiB memory in total, of which \"\n@@ -233,23 +211,39 @@ def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:\n         if callable(xpu_empty_cache):\n             xpu_empty_cache()\n \n+    def _put_to_sleep(self, ptr: int, data: AllocationData, offload: bool) -> None:\n+        device, size_in_bytes, _, _ = data.handle\n+        if offload:\n+            if data.cpu_backup_tensor is None:\n+                data.cpu_backup_tensor = torch.empty(\n+                    size_in_bytes,\n+                    dtype=torch.uint8,\n+                    device=\"cpu\",\n+                    pin_memory=PIN_MEMORY,\n+                )\n+            cpu_ptr = data.cpu_backup_tensor.data_ptr()\n+            _xpu_memcpy_sync(cpu_ptr, ptr, size_in_bytes, MEMCPY_DEVICE_TO_HOST, device)\n+        else:\n+            data.cpu_backup_tensor = None\n+        unmap_and_release(data.handle)\n+        data.is_asleep = True\n+\n     def discard(self, tags: tuple[str, ...] | str) -> None:\n         \"\"\"Discard mapped allocations with the given tags without CPU backup.\"\"\"\n         if isinstance(tags, str):\n             tags = (tags,)\n \n         discarded_bytes = 0\n         has_policy_conflict = False\n-        for data in self.pointer_to_data.values():\n+        for ptr, data in self.pointer_to_data.items():\n             if data.tag not in tags:\n                 continue\n             if data.is_asleep:\n                 if data.cpu_backup_tensor is not None:\n                     has_policy_conflict = True\n                 continue\n             torch.accelerator.synchronize(data.handle[0])\n-            unmap_and_release(data.handle)\n-            data.is_asleep = True\n+            self._put_to_sleep(ptr, data, offload=False)\n             discarded_bytes += data.handle[1]\n \n         logger.info(\n@@ -289,7 +283,6 @@ def wake_up(self, tags: list[str] | None = None) -> None:\n                 MEMCPY_HOST_TO_DEVICE,\n                 device,\n             )\n-            data.cpu_backup_tensor = None\n \n     def release_pools(self) -> None:\n         \"\"\"Release pools, retaining allocators until their allocations are freed.\"\"\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/307bfebde1780d62631fde5a6bac3905a2a6c174/vllm%2Fdevice_allocator%2Fxpumem.py",
+      "sha": "e3981bec3fa3f598f56151aabb9ee803a6cd1738",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Documentation preview: https://vllm--64630.org.readthedocs.build/en/64630/",
+      "created_at": "2026-10-30T01:56:46Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6513049521",
+      "id": 6513049521,
+      "updated_at": "2026-10-30T01:56:46Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-30T08:09:17Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518138971",
+      "id": 6518138971,
+      "updated_at": "2026-10-30T08:09:17Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #98640](https://buildkite.com/vllm/ci/builds/98640) for commit `fd7ad94b001b`.",
+      "created_at": "2026-10-30T08:11:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518186073",
+      "id": 6518186073,
+      "updated_at": "2026-10-30T08:11:06Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "Hi @aoshen02, the pre-commit checks have failed. Please run:\n\n```bash \nuv pip install pre-commit>=4.5.1\npre-commit install\npre-commit run --all-files\n```\n\nThen, commit the changes and push to your branch.\n\nFor future commits, `pre-commit` will run automatically on changed files before each commit.\n",
+      "created_at": "2026-10-30T08:14:26Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518269330",
+      "id": 6518269330,
+      "updated_at": "2026-10-30T08:14:26Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-30T08:24:34Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518432016",
+      "id": 6518432016,
+      "updated_at": "2026-10-30T08:24:34Z",
+      "user": {
+        "login": "aoshen02"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #98645](https://buildkite.com/vllm/ci/builds/98645) for commit `307bfebde178`.",
+      "created_at": "2026-10-30T08:24:55Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#issuecomment-6518437495",
+      "id": 6518437495,
+      "updated_at": "2026-10-30T08:24:55Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 64630,
+  "refs": {
+    "base": {
+      "commit": "8b10bda57ceab3a741d2fb3718af48cef691023e",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "307bfebde1780d62631fde5a6bac3905a2a6c174",
+      "repository": "aoshen02/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#pullrequestreview-5707223160",
+      "id": 5707223160,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-30T01:56:12Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64630#pullrequestreview-5709637992",
+      "id": 5709637992,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-30T08:08:52Z",
+      "user": {
+        "login": "ZJY0516"
+      }
+    }
+  ]
+}

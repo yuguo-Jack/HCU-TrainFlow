@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/features/fsdp2/arguments.md
-raw_sha256: 5ef6ae7b5c907a95d3df408288e5b6fad7dda8581dea48664c6793ad37d390ae
+raw_sha256: a7bef1f7758c5608ec9900b33158fd58df2edb8def520bb44fc757568fe829db
 sources: []
-generated_body_sha256: f9dc65c514b3db85759879c0bd5fecfb6658135c38b02e30a0d1d0d5ca22f16b
+generated_body_sha256: dc9687bfa5c9bb9311f2920fd27b9f8d65e18092b6ef1e936ab9540cd1f00c59
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/features/fsdp2/arguments.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/fsdp2/arguments.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/fsdp2/arguments.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -35,7 +35,7 @@ Contains parameters related to model and tokenizer loading and initialization.
 <table>
   <thead>
     <tr>
-      <th>Parameter name</th>
+      <th>Parameter Name</th>
       <th>Type</th>
       <th>Default</th>
       <th>Details</th>
@@ -50,7 +50,7 @@ Contains parameters related to model and tokenizer loading and initialization.
     </tr>
     <tr>
       <td>model_id</td>
-      <td>Optional[Literal[&quot;gpt_oss&quot;, &quot;qwen3&quot;, &quot;qwen3_moe&quot;, &quot;qwen3_next&quot;, &quot;step35&quot;, &quot;mamba3&quot;, &quot;minimax_m27&quot;]]</td>
+      <td>Optional[Literal[&quot;gpt_oss&quot;, &quot;qwen3&quot;, &quot;qwen3_moe&quot;, &quot;qwen3_next&quot;, &quot;step35&quot;, &quot;mamba3&quot;, &quot;minimax_m27&quot;, &quot;longcat_flash_ngram&quot;, &quot;deepseek_v4&quot;]]</td>
       <td>None</td>
       <td>Model type identifier. If you do not configure it, the system runs the native Transformer model forward pass. If you configure it, the system runs the custom model forward pass of the repository. To add a new model type, register it in the <code>ModelRegistry</code> class in <code>mindspeed_llm/fsdp2/models/model_registry.py</code>.</td>
     </tr>
@@ -157,6 +157,18 @@ Contains parameters related to model and tokenizer loading and initialization.
       <td>The quantization strategy.</td>
     </tr>
     <tr>
+      <td>quant_format</td>
+      <td>str</td>
+      <td>&quot;E4M3&quot;</td>
+      <td>The FP8 data format used for quantization. Supported values are <code>E4M3</code>, <code>E5M2</code>, and <code>HIF8</code>.</td>
+    </tr>
+    <tr>
+      <td>quant_block_size</td>
+      <td>int</td>
+      <td>32</td>
+      <td>The block size for MXFP8 block quantization.</td>
+    </tr>
+    <tr>
       <td>quant_apply_modules</td>
       <td>List[str]</td>
       <td>['model.layers.{*}']</td>
@@ -196,7 +208,7 @@ Contains parameters related to dataset loading, preprocessing, and data formats.
 <table>
   <thead>
     <tr>
-      <th>Parameter name</th>
+      <th>Parameter Name</th>
       <th>Type</th>
       <th>Default</th>
       <th>Details</th>
@@ -348,6 +360,18 @@ Contains parameters related to dataset loading, preprocessing, and data formats.
       <td>Whether to enable thinking mode for inference models. When enabled, the model generates intermediate reasoning steps. True means enabled, False means disabled, and None means the system does not remove the <code>CoT</code> tag from the raw data. This is suitable when the raw data contains mixed types.</td>
     </tr>
     <tr>
+      <td>reasoning_effort</td>
+      <td>Optional[str]</td>
+      <td>None</td>
+      <td>The reasoning effort level for DeepSeek-V4. The supported values are None, <code>high</code>, and <code>max</code>. <code>max</code> inserts the maximum reasoning effort instruction prefix (Reasoning Effort: Absolute maximum) before the first message. <code>high</code> is a reserved value with no effect at present. None does not insert the prefix. This field takes effect only when you use the DeepSeek-V4 template. Use it together with <code>enable_thinking=True</code>. It corresponds to the <code>--reasoning-effort</code> parameter in Megatron.</td>
+    </tr>
+    <tr>
+      <td>drop_thinking</td>
+      <td>Optional[bool]</td>
+      <td>True</td>
+      <td>Whether to drop the thinking content (reasoning_content) of previous rounds during multi-turn conversation training. When set to True (the default), the system strips the thinking content of previous rounds and uses only the reasoning part of the last assistant reply as the loss target. When set to False, the system keeps the thinking content of all rounds. This field takes effect only when you use the DeepSeek-V4 template, and the system does not drop the thinking content when the messages contain tool calls (<code>tools</code>). It corresponds to the <code>--drop-thinking</code> parameter in Megatron.</td>
+    </tr>
+    <tr>
       <td>tokenized_path</td>
       <td>Optional[str]</td>
       <td>None</td>
@@ -411,7 +435,7 @@ Contains parameters related to distributed parallel strategies and memory optimi
 <table>
   <thead>
     <tr>
-      <th>Parameter name</th>
+      <th>Parameter Name</th>
       <th>Type</th>
       <th>Default</th>
       <th>Details</th>
@@ -550,6 +574,54 @@ Contains parameters related to distributed parallel strategies and memory optimi
       <td>1</td>
       <td>The number of modules prefetched during the FSDP backward pass. This helps optimize pipeline efficiency.</td>
     </tr>
+    <tr>
+      <td>hook_modules</td>
+      <td>List[str]</td>
+      <td>[&quot;model.layers.{*}&quot;]</td>
+      <td>The model layer structure to which the FSDP2 hook manager is attached. The system applies FSDP hooks to the matching modules.</td>
+    </tr>
+    <tr>
+      <td>fsdp_implementation</td>
+      <td>Literal[&quot;custom&quot;, &quot;native&quot;]</td>
+      <td>native</td>
+      <td>The FSDP implementation. 1. custom: use the FSDPTurbo custom FSDP implementation. 2. native (default): use the native PyTorch FSDP implementation.</td>
+    </tr>
+    <tr>
+      <td>enable_chunk_batch</td>
+      <td>bool</td>
+      <td>False</td>
+      <td>Whether to enable the ChunkMBS feature. When you enable it, the system splits the original batch into multiple smaller micro-batches along the batch dimension and runs the forward pass for the selected modules in chunks within a single FSDP unshard. Compared with increasing the micro-batch, this saves memory because the peak activation and temporary memory decrease as the batch size decreases. Compared with gradient accumulation, this reduces communication overhead. Use it together with parameters such as <code>chunk_mbs</code>.</td>
+    </tr>
+    <tr>
+      <td>chunk_mbs</td>
+      <td>int</td>
+      <td>1</td>
+      <td>The micro-batch size after chunking. For example, if the original micro_batch_size is 8 and you split it into 4 parts of 2 each, set this field to 2.</td>
+    </tr>
+    <tr>
+      <td>chunk_mbs_batch_dim</td>
+      <td>int</td>
+      <td>0</td>
+      <td>The batch dimension along which to chunk when you run ChunkMBS. Hugging Face style decoder layers usually use 0.</td>
+    </tr>
+    <tr>
+      <td>chunk_mbs_modules</td>
+      <td>List[str]</td>
+      <td>[&quot;model.layers.{*}&quot;]</td>
+      <td>The model layer structure to which ChunkMBS applies. The system runs chunked micro-batches only for the forward passes of these modules.</td>
+    </tr>
+    <tr>
+      <td>chunk_mbs_arg_indexs</td>
+      <td>List[int]</td>
+      <td>[0]</td>
+      <td>The list of positional argument indexes to split along the batch dimension in the forward pass.</td>
+    </tr>
+    <tr>
+      <td>chunk_mbs_kwarg_names</td>
+      <td>List[str]</td>
+      <td>[&quot;position_embeddings&quot;, &quot;position_ids&quot;, &quot;attention_mask&quot;, &quot;input_ids&quot;]</td>
+      <td>The list of keyword argument names to split along the batch dimension in the forward pass.</td>
+    </tr>
   </tbody>
 </table>
 
@@ -560,7 +632,7 @@ Contains parameters related to training hyperparameters, optimizers, model savin
 <table>
   <thead>
     <tr>
-      <th>Parameter name</th>
+      <th>Parameter Name</th>
       <th>Type</th>
       <th>Default</th>
       <th>Details</th>
@@ -632,6 +704,18 @@ Contains parameters related to training hyperparameters, optimizers, model savin
       <td>float</td>
       <td>1e-6</td>
       <td>The minimum learning rate. This field takes effect only when you use the cosine scheduler.</td>
+    </tr>
+    <tr>
+      <td>indexer_loss_coeff</td>
+      <td>float</td>
+      <td>1.0</td>
+      <td>The coefficient for the indexer loss.</td>
+    </tr>
+    <tr>
+      <td>router_aux_loss_coef</td>
+      <td>float</td>
+      <td>0.0</td>
+      <td>The coefficient for the auxiliary loss.</td>
     </tr>
     <tr>
       <td>num_train_epochs</td>
@@ -759,6 +843,18 @@ Contains parameters related to training hyperparameters, optimizers, model savin
       <td>True</td>
       <td>Whether to save Hugging Face format weights after training finishes.</td>
     </tr>
+    <tr>
+      <td>mtp_loss_scaling_factor</td>
+      <td>float</td>
+      <td>0.3</td>
+      <td>The scaling factor for the Multi Token Prediction (MTP) loss.</td>
+    </tr>
+    <tr>
+      <td>deterministic</td>
+      <td>bool</td>
+      <td>True</td>
+      <td>Whether to enable deterministic computation.</td>
+    </tr>
   </tbody>
 </table>
 
@@ -769,7 +865,7 @@ Contains parameters related to performance profiling data collection.
 <table>
   <thead>
     <tr>
-      <th>Parameter name</th>
+      <th>Parameter Name</th>
       <th>Type</th>
       <th>Default</th>
       <th>Details</th>
@@ -851,6 +947,70 @@ Contains parameters related to performance profiling data collection.
   </tbody>
 </table>
 
+## msProbe Parameters
+
+Contains parameters related to precision data collection during FSDP2 training.
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter Name</th>
+      <th>Type</th>
+      <th>Default</th>
+      <th>Details</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>msprobe</td>
+      <td>bool</td>
+      <td>False</td>
+      <td>Whether to enable msProbe precision data collection.</td>
+    </tr>
+    <tr>
+      <td>msprobe_config_path</td>
+      <td>Optional[str]</td>
+      <td>None</td>
+      <td>The path to a custom msProbe configuration file. If you do not configure it, the system uses the default <code>msprobe_config.json</code> in the repository.</td>
+    </tr>
+  </tbody>
+</table>
+
+## Model Input and Output Collection Parameters
+
+Contains parameters related to full-model module forward and backward hooks and batch input collection for FSDP2.
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter Name</th>
+      <th>Type</th>
+      <th>Default</th>
+      <th>Details</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>model_io_trace</td>
+      <td>bool</td>
+      <td>False</td>
+      <td>Whether to enable model input and output collection.</td>
+    </tr>
+    <tr>
+      <td>model_io_trace_config_path</td>
+      <td>Optional[str]</td>
+      <td>None</td>
+      <td>The path to a custom configuration file for model input and output collection. If you do not configure it, the system uses the default <code>model_io_trace_config.json</code> in the repository.</td>
+    </tr>
+    <tr>
+      <td>model_io_trace_output_path</td>
+      <td>Optional[str]</td>
+      <td>None</td>
+      <td>The path for saving the model input and output collection results. You must configure it when you enable the collection.</td>
+    </tr>
+  </tbody>
+</table>
+
 ## Inference Arguments (`InferenceArguments`)
 
 Contains inference-related parameters.
@@ -858,7 +1018,7 @@ Contains inference-related parameters.
 <table>
 <thead>
 <tr>
-<th>Parameter name</th>
+<th>Parameter Name</th>
 <th>Type</th>
 <th>Default</th>
 <th>Details</th>
@@ -893,7 +1053,7 @@ Contains parameters related to fused operator enablement, memory optimization fe
 <table>
   <thead>
     <tr>
-      <th>Parameter name</th>
+      <th>Parameter Name</th>
       <th>Type</th>
       <th>Default</th>
       <th>Details</th>
@@ -943,10 +1103,16 @@ Contains parameters related to fused operator enablement, memory optimization fe
       <td>Whether to enable the sparse indexer KL loss fused operator. Only supported for DeepSeek-V3.2 and GLM-5 series models.</td>
     </tr>
     <tr>
-      <td>indexer_loss_coeff</td>
-      <td>float</td>
-      <td>1.0</td>
-      <td>The coefficient for the indexer loss.</td>
+      <td>use_ascend_mhc</td>
+      <td>bool</td>
+      <td>False</td>
+      <td>Whether to enable the MHC fused operator. Only supported for DeepSeek-V4 series models.</td>
+    </tr>
+    <tr>
+      <td>use_triton_swiglu_limit</td>
+      <td>bool</td>
+      <td>False</td>
+      <td>Whether to enable the SwiGLU limit fused operator. Only supported for DeepSeek-V4 series models.</td>
     </tr>
     <tr>
       <td>pre_tokens</td>
@@ -1004,9 +1170,9 @@ Contains parameters related to fused operator enablement, memory optimization fe
 <table>
   <thead>
     <tr>
-      <th>Parameter type</th>
-      <th>FSDP2 parameter</th>
-      <th>Megatron parameter</th>
+      <th>Parameter Type</th>
+      <th>FSDP2 Parameter</th>
+      <th>Megatron Parameter</th>
     </tr>
   </thead>
   <tbody>
@@ -1020,7 +1186,7 @@ Contains parameters related to fused operator enablement, memory optimization fe
       <td>--tokenizer-name-or-path</td>
     </tr>
     <tr>
-      <td rowspan="4">DataArguments</td>
+      <td rowspan="6">DataArguments</td>
       <td>dataset</td>
       <td>--data-path</td>
     </tr>
@@ -1035,6 +1201,14 @@ Contains parameters related to fused operator enablement, memory optimization fe
     <tr>
       <td>packing</td>
       <td>--pack</td>
+    </tr>
+    <tr>
+      <td>reasoning_effort</td>
+      <td>--reasoning-effort</td>
+    </tr>
+    <tr>
+      <td>drop_thinking</td>
+      <td>--drop-thinking</td>
     </tr>
     <tr>
       <td rowspan="5">ParallelArguments</td>

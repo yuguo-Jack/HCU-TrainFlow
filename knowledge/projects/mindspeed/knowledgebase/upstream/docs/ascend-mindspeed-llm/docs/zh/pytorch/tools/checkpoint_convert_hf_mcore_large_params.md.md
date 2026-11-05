@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md
-raw_sha256: d7b1036e8545dfb55e36116640685d50522d6933f35372b3a3d76d11412e121d
+raw_sha256: 0a6bf27b44af72385b8bbbec9a58c89ef1ea985788d8f114cfa41b32c28c0995
 sources: []
-generated_body_sha256: 1c45c06401ee4f2d6a740db45094ebff37a67c6eac3553f31b8f6e510494cbcf
+generated_body_sha256: 0b57d58de1d3896b35ac93a4c21b0e61cf69088c78142257f6000ad6db61f24f
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -94,7 +94,7 @@ cd ../../
 
 - ModelScope下载指南：<https://modelscope.cn/docs/models/download>
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 如果出现下载速度太慢或者无法访问下载的情况，请配置可用的代理或国内镜像源重试。
 
@@ -112,7 +112,7 @@ cd ../../
 
 权重转换实现了HuggingFace权重到Megatron-Mcore格式的转换，支持多种并行策略（如张量并行、流水并行等），确保转换后可以在MindSpeed LLM框架下继续训练和推理。
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 在做权重转换前，请先确认训练时的参数配置，根据您的训练配置修改仓上的权重转换脚本（因为这些配置会改变权重的结构，如果与训练的参数不一致的话，会导致训练无法加载权重），需要确认的训练配置见[表 1](#table1)。
 
@@ -176,7 +176,7 @@ MindSpeed LLM提供预置的模型权重转换脚本。以下列出HuggingFace�
 bash examples/mcore/qwen3_moe/ckpt_convert_qwen3_moe_235b_hf2mcore.sh
 ```
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 需在权重转换脚本中配置并行参数、权重词表路径、权重加载路径（包括词表等配置文件）以及权重保存的路径。
 
@@ -221,7 +221,7 @@ MindSpeed LLM提供预置的模型权重转换脚本。以下列出Megatron-Mcor
 bash examples/mcore/qwen3_moe/ckpt_convert_qwen3_moe_235b_mcore2hf.sh
 ```
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 需在权重转换脚本中配置并行参数、权重词表路径、权重加载路径（包括词表等配置文件）以及权重保存的路径。
 

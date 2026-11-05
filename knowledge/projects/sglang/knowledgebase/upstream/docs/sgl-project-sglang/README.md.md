@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: c6e822c29b9bb3d392e65a7bcb271a5d2d63613d
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: README.md
-raw_sha256: 7c99b50fa5ef9f4a666a2f73860f746d3fc259e7e7912d4bff88dffdc1dc4c5e
+raw_sha256: a7654a48a8cd08c824e4445cb906405704148a3c55fb84362c7071d27397303c
 sources: []
-generated_body_sha256: 60ed45ca2733e86f0ddb39f58e6c17522d1d9384783b52f1b400f5aa404216a3
+generated_body_sha256: bb3e83ade8055362177b183bd11e12bcf447b8ae16ee15bd4adcd77339a5bf5f
 source_state: current-scan
 ---
 
 # sgl-project/sglang / README.md
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/c6e822c29b9bb3d392e65a7bcb271a5d2d63613d/README.md)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -50,6 +50,11 @@ SGLang is an open-source inference framework for large language, vision-language
 
 👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
 
+> **[SGLang Summit 2026: Meet the builders of open AI](https://www.sglang.io/summit)**<br>
+> **Our flagship annual gathering · November 12–13 · San Francisco**
+>
+> Go deep on inference, training, and AI hardware through technical talks, live demos, and hands-on workshops. Bring your deployment challenges and meet the engineers and researchers building the stack.
+
 ## Get Started
 
 Pull the Docker image, which includes SGLang and its dependencies:
@@ -77,13 +82,15 @@ SGLang supports a wide range of GPUs, TPUs, NPUs, CPUs, and Apple Silicon platfo
 | --- | --- |
 | [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | B200/B300/GB200/GB300; H100/H200/H800/H20; A100; RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; DGX Spark, Jetson Orin |
 | [AMD](https://docs.sglang.io/docs/hardware-platforms/amd_gpu) | Instinct MI300X, MI325X, MI350X, MI355X |
-| [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGL-JAX](https://github.com/sgl-project/sglang-jax) / [SGL-torchtpu](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/) |
+| [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) / [SGL-JAX](https://github.com/sgl-project/sglang-jax) |
 | Intel ([GPU](https://docs.sglang.io/docs/hardware-platforms/xpu) / [CPU](https://docs.sglang.io/docs/hardware-platforms/cpu_server)) | Arc / Arc Pro B-Series GPUs, Xeon CPUs |
 | [Apple Silicon](https://docs.sglang.io/docs/hardware-platforms/apple_metal) | Macs via Metal / MLX |
 | [Huawei Ascend](https://docs.sglang.io/docs/hardware-platforms/ascend-npus/getting-started/installation) | A2, A3, 950PR/DT NPUs |
 | [Moore Threads](https://docs.sglang.io/docs/hardware-platforms/mthreads_gpu) | MTT S5000 GPUs |
 
 Integrations in progress: AWS Trainium, [Alibaba T-Head PPU](https://github.com/sgl-project/sglang/issues/37519), [Cambricon MLU](https://github.com/sgl-project/sglang/pull/26898), Qualcomm QAIC, MetaX, Hygon HCU/DCU, Iluvatar CoreX, and more.
+
+SGLang-TorchTPU brings the SGLang serving engine to Google TPUs through PyTorch, torch_tpu, and Pallas kernels. It supports LLM and vision-language serving on TPU7x (Ironwood), including tensor and expert parallelism across hosts. SGL-JAX provides the JAX-based TPU serving path.
 
 See the [Cookbook](https://cookbook.sglang.io/) and platform guides for model compatibility and setup.
 

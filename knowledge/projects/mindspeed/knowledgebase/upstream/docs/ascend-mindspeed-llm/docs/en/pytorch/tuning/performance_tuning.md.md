@@ -15,7 +15,7 @@ path: docs/en/pytorch/tuning/performance_tuning.md
 raw_sha256: 53318ba94620ee7a738de3e83f7711a23f9e8559f0655b2073959b42956a0d03
 sources: []
 generated_body_sha256: c93fd9ce2c0d8cfcde3e19ec9f2926e3cea06ac715d6e99fdfb173f55312dd20
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/tuning/performance_tuning.md

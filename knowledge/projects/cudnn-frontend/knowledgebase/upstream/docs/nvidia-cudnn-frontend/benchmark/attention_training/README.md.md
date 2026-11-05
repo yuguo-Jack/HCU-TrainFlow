@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: 51a3de73e122aeedafe68070acf3b7ff3970534e
+commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
 path: benchmark/attention_training/README.md
-raw_sha256: 8d2ed7ffeb4cb61548bd8e9e934f3b5da6150b69ee9d260aa29f38627066f0d4
+raw_sha256: 8b00ebd7339e5a542983eb3296cdb43e53557beaaab97802328d9259547c759c
 sources: []
-generated_body_sha256: 00ea3f7e612efdb6900f386f213a1d5d692d1b86fbadb439bef8e96a07616d15
+generated_body_sha256: 407e3248fe2bae1e5f45d2d221844d5d7bda511ae13b195f9edfcaa9a8d243ed
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / benchmark/attention_training/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/51a3de73e122aeedafe68070acf3b7ff3970534e/benchmark/attention_training/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/benchmark/attention_training/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -48,6 +48,8 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
   - `auto_regressive_dit.py` - Autoregressive video DiT (short Q, long cached KV, bf16/mxfp8, no_mask)
   - `kimi_k3.py` - Kimi K3 MLA benchmarks (96 heads, unabsorbed 192/128, NoPE)
   - `deepseek_v4.py` - DeepSeek-V4 shared-K=V MQA benchmarks (head_dim=512, SWA=128)
+  - `context_parallel_a2a.py` - Per-rank THD attention of CP4 all-to-all context parallelism (64 x 8192-token causal batch, 8/2 heads per rank, d128/d256)
+  - `context_parallel_allgather.py` - Per-rank THD attention calls of load-balanced AllGather context parallelism (Q chunk vs gathered KV, bottom-right causal, d256)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration
 - `charts.py` - Chart generation utilities
@@ -96,6 +98,10 @@ python -m benchmark.attention_training.runner --config kimi_k3
 # Run DeepSeek-V4 benchmark suite (shared-K=V MQA, head_dim=512)
 python -m benchmark.attention_training.runner --config deepseek_v4
 
+# Run the context-parallel THD suites (cuDNN legs, equal-length and ragged sequences)
+python -m benchmark.attention_training.runner --config context_parallel_a2a
+python -m benchmark.attention_training.runner --config context_parallel_allgather
+
 # Dry run (show what would be executed)
 python -m benchmark.attention_training.runner --config llama --dry-run
 
@@ -134,7 +140,7 @@ python -m benchmark.attention_training.runner --config llama --dtype bfloat16
        data_types=["bfloat16", "fp8"],
        attn_masks=["top_left", "no_mask"],
        profile_pass="fwd",  # "fwd", "bwd", or "both"
-       num_iterations=10,
+       num_iterations=20,
    )
    ```
 
@@ -154,9 +160,11 @@ python -m benchmark.attention_training.runner --config llama --dtype bfloat16
 | `attn_masks` | Attention masks (`top_left`, `no_mask`) | `["top_left"]` |
 | `profile_pass` | Which pass to profile (`fwd`, `bwd`, `both`) | `"fwd"` |
 | `batch_size` | Batch size | `1` |
-| `num_iterations` | Iterations per benchmark | `10` |
+| `num_iterations` | Iterations per benchmark (the median drops the first 5) | `20` |
 | `deterministic_bwd` | Deterministic modes for backward | `[False]` |
 | `sliding_window_size` | Sliding window attention size (requires `top_left` mask) | `None` |
+| `layout` | `bshd`, or `thd` for packed variable-length sequences (cuDNN legs, bf16/fp16; `batch_size` counts sequences, each `seqlens` entry is the longest) | `"bshd"` |
+| `thd_min_fills` | THD only: shortest sequence as a fraction of the longest, one case per entry (`1.0` = equal lengths) | `[1.0]` |
 
 ### Model Presets
 
@@ -253,6 +261,13 @@ python benchmark_single_sdpa.py \
     --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
     --sdpa_backend cudnn_oss --data_type mxfp8_mxfp8 \
     --attn_mask no_mask --profile_pass fwd
+
+# cuDNN Frontend, packed THD: 64 sequences of 4096-8192 tokens (seeded), causal
+python benchmark_single_sdpa.py \
+    --batch_size 64 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 8 --num_kv_heads 2 --head_dim 128 \
+    --sdpa_backend cudnn_auto --data_type bfloat16 \
+    --attn_mask top_left --layout thd --thd_min_fill 0.5 --fwd_bwd
 
 # FlashAttention 4
 python benchmark_single_sdpa.py \
@@ -362,6 +377,7 @@ runner.save_csv(results, config)
 |---------|-------------|
 | `cudnn` | cuDNN (native, via cuDNN Frontend) |
 | `cudnn_oss` | cuDNN OSS FROST engines (open-source CuTe-DSL kernels, via cuDNN Frontend) |
+| `cudnn_auto` | cuDNN Frontend default dispatch: the plan the heuristics pick (native or FROST), nothing deselected or pinned. Should match the faster of `cudnn` / `cudnn_oss`; see `python -m benchmark.heuristics_regret` |
 | `flash_attention_4` | FlashAttention 4 |
 | `flash_attention_3` | FlashAttention 3 |
 | `pyt_flash_attention` | PyTorch FlashAttention |

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/hicache_storage_runtime_attach_detach.mdx
-raw_sha256: 8c7cae654afc8057fba07a7bbb8b1195ebd9f2bd12e07f6c05772c3f97b62000
+raw_sha256: 870a075111a39ac9c5e3014e3f913fac56ff0d0c124e33aa0bc4d07a0dcb8073
 sources: []
-generated_body_sha256: e55d3d5fb3b5ef8d170bb453df5b6d3c976767ffc1d5541535ce00d7a4f1c8c9
+generated_body_sha256: dc35a416d3487d2e8eec5a711ab412eaecb3a944af3c5a794f219aabf4a12302
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/hicache_storage_runtime_attach_detach.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/hicache_storage_runtime_attach_detach.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/hicache_storage_runtime_attach_detach.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -31,7 +31,7 @@ title: "Runtime Attach/Detach HiCache Storage Backend (No Restart)"
 metatags:
     description: "Dynamically attach/detach HiCache L3 storage backends at runtime via HTTP API. No restart required, idle-state safety checks."
 ---
-This document explains how to **dynamically attach/detach the HiCache L3 storage backend at runtime** (e.g., `mooncake` / `hf3fs` / `nixl` / `file` / `aibrix` / `eic`) while **SGLang is already running and serving traffic**, without restarting the process.
+This document explains how to **dynamically attach/detach the HiCache L3 storage backend at runtime** (e.g., `mooncake` / `hf3fs` / `nixl` / `fast_file` / `file` / `aibrix` / `eic`) while **SGLang is already running and serving traffic**, without restarting the process.
 
 For safety and consistency, the current implementation **strictly requires** these operations to happen only when the service is **idle**:
 

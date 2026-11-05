@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/tools/profiling.md
-raw_sha256: e3127ecf7870a923e0ab92759794c3ee82fc97bc98529985bb5f60b83884b327
+raw_sha256: a6b6a6b32416260df09a36d703df3d2dad87691fc65b76a34a6f63b3e5c75735
 sources: []
-generated_body_sha256: 219554fc40074ddf5178a3cba90689a3a92a6aa6f6a88e9a1f7a78530669aa96
+generated_body_sha256: a1422a01bb9432e0e12579dbb574f10bfc59191bf38a2d3470cbd1c6acb5a54f
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/tools/profiling.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/tools/profiling.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/tools/profiling.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -146,13 +146,13 @@ Here are two configuration examples that show common usage scenarios. Add the pr
 
 After training ends, a profiling file is generated in the specified path. Example:
 
-```shell
+```text
 localhost.localdomain_3687609_20260129150104894_ascend_pt
 ```
 
 The directory structure of this file is as follows:
 
-```shell
+```text
  localhost.localdomain_3687609_20260129150104894_ascend_pt
     ├─ASCEND_PROFILER_OUTPUT
     ├─logs
@@ -167,7 +167,7 @@ The directory structure of this file is as follows:
 
 ## Visual Performance Analysis
 
-Using the MindStudio Insight tool as an example, refer to the [MindStudio Insight installation guide](https://gitcode.com/Ascend/msinsight/blob/26.1.0/docs/en/install_guide/mindstudio_insight_install_guide.md) to deploy the tool, then import the generated profiling file into the tool for performance breakdown analysis.
+Using the MindStudio Insight tool as an example, refer to the [MindStudio Insight installation guide](https://gitcode.com/Ascend/msinsight/blob/master/docs/en/install_guide/mindstudio_insight_install_guide.md) to deploy the tool, then import the generated profiling file into the tool for performance breakdown analysis.
 
 The following briefly introduces the main interfaces of MindStudio Insight:
 
@@ -189,7 +189,7 @@ The following briefly introduces the main interfaces of MindStudio Insight:
 
     ![Operator](../figures/profiling/operator.png)
 
-> [!NOTE]
+> [!NOTE] Note
 >
-> - If you want to learn more about how to use the tool, refer to the [MindStudio Insight system tuning](https://gitcode.com/Ascend/msinsight/blob/26.1.0/docs/en/user_guide/system_tuning.md#usage-description) section in the official MindStudio Insight documentation.
-> - If you need a more customized profiling collection method, refer to the ["Performance Data Collection and Automatic Parsing"](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0033.html) section in the *CANN Performance Tuning Tool User Guide* to customize data collection and analysis by modifying the collection code.
+> - If you want to learn more about how to use the tool, refer to the [MindStudio Insight system tuning](https://gitcode.com/Ascend/msinsight/blob/master/docs/en/user_guide/system_tuning.md#usage-description) section in the official MindStudio Insight documentation.
+> - If you need a more customized profiling collection method, refer to the ["Performance Data Collection and Automatic Parsing"](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/920/devaids/Profiling/atlasprofiling_16_0033.html) section in the *CANN Performance Tuning Tool User Guide* to customize data collection and analysis by modifying the collection code.

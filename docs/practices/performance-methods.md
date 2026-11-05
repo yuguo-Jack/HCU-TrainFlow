@@ -18,7 +18,9 @@
 
 2026-10-20 增量复核中，BBuf [`e51089a`](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/e51089a7b5b25939d5ab6f2216df0ba07be30225) 的 profiler/incident 两个登记方法入口正文未变；新增讲解视频资料不改变训练分析与诊断契约。登记 Hyperloom fork 的固定文档仍为 [`0425bde`](https://github.com/yuguo-Jack/Hyperloom/tree/0425bde3f6e76e1588400c37d056dfd3bb75ac11)，采用规则继续按下文专项解释。GEAK 和 AMD Hyperloom 的通用规则复用上表固定源码，仅重读有关测量、证据刷新和停止策略；这不构成未登记来源或全仓最新实现已同步的声明。原有 dispatch/oracle、重叠归因、组合回归和训练状态门槛继续适用，不引入外部的固定阈值或自动编排器。
 
-TraceLens 原生 Agent 的方法另按 HCU fork `f22c517ee6a87850bcc3668facc6452c1b3b5bd2` 的[分析步骤](https://github.com/yuguo-Jack/TraceLens/blob/f22c517ee6a87850bcc3668facc6452c1b3b5bd2/TraceLens/Agent/Analysis/skills/analysis-orchestrator/reference.md)复核。其 top-10 选项和 idle >15% 的 CPU 分析触发条件是该工具的筛选策略，不是 TrainFlow 的 ≥90% 端到端覆盖标准；未生成某类 finding 也不证明不存在该瓶颈。Agent 的字段/表一致性检查只验证报告契约，实际因果、训练正确性与收益仍按本仓闭环复验。`fusion_flagged` 去重不能作为已近上限或停止算子迭代的理由。
+2026-11-04 再核对登记来源：Hyperloom 仍为上述 `0425bde`；BBuf 当前观察 [`371dee04ee30ed918b240823b2a12c139d1a67fa`](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/371dee04ee30ed918b240823b2a12c139d1a67fa)。其监测文档仅 README 变化，profiler、incident 和 model-optimization 入口哈希未变；README 新增发行/视频说明，仍要求精确工作负载、原件、实际路径精度和“来源刷新不是 GPU 重测”。这些变化不改变上表三表、oracle、重叠归因与停止方法；GEAK 继续只声明已列固定源码的有界查证，不称已全仓更新。
+
+TraceLens 原生 Agent 的方法另按当前固定 HCU fork `22786b16d429783927981bd592a47ad0f79db3ba` 的[分析步骤](https://github.com/yuguo-Jack/TraceLens/blob/22786b16d429783927981bd592a47ad0f79db3ba/TraceLens/Agent/Analysis/skills/analysis-orchestrator/reference.md)及 `hcu_analysis.py` 复核。其 top-10 选项和 idle >15% 的 CPU 分析触发条件是该工具的筛选策略，不是 TrainFlow 的 ≥90% 端到端覆盖标准；未生成某类 finding 也不证明不存在该瓶颈。类别执行、metrics、findings 和最终报告各有状态/输入绑定；`metrics_complete` 或字段/表一致性检查不证明推理正确，实际因果、训练正确性与收益仍按本仓闭环复验。`fusion_flagged` 去重不能作为已近上限或停止算子迭代的理由。
 
 ## 真实训练案例的采用边界
 
@@ -46,11 +48,12 @@ TraceLens 原生 Agent 的方法另按 HCU fork `f22c517ee6a87850bcc3668facc6452
 | `runtime-failure-triage`、`rccl-sm-free-p2p` | 数据/通信契约和异步错误；减少占用 CU 的路径是否有利，要看实际调用和模型重叠而非变量存在 |
 | `pytorch-memory-stream-graph-lifecycle`、`torchcomms-async-functional-watchdog` | 调用返回、设备完成、消费 stream 依赖和 host 检测不同；buffer/graph/异步通信生命周期 |
 | `aiter-int8-fp8-collective-contract`、`rocshmem-hcu-engineering`、`deepep-current-hcu` | 位传输、数值规约与量化的 oracle 分开；真实消费者的固定依赖、provider 和原地输出协议决定安全回退，独立库 HEAD 的新能力不能直接外推 |
-| `primus-turbo-current-maintenance-line`、`te-fp8-state-and-recompute`、`te-linear-norm-communication-lifecycle` | 每次 backward 的主梯度累加、编译准备阶段的写入副作用、低精度持久状态和 UB 编译缓存须随候选复核；compile 支持与 Graph 资格分开 |
+| `primus-turbo-current-maintenance-line`、`primus-prepared-graph-ck-contract`、`te-fp8-state-and-recompute`、`te-linear-norm-communication-lifecycle` | 每次 backward 的独立 dW 或直写 main_grad sink 必须恰好累计一次；prepared Graph 的 source owner、重放标记、编译准备阶段副作用、低精度持久状态和 UB 缓存须随候选复核，compile 与 Graph 资格分开 |
+| `miopen-tuning-and-cached-solution`、`rocshmem-registered-memory-stream-contract`、`moonep-release-contract` | handle 策略与环境/缓存、注册内存与 stream 生命周期、状态折叠与错误传播按消费者及制品查证；减少 host 读取不证明设备完成或错误已检查 |
 | `dcc-engineering-handbook`、`galaxy-engineering-handbook`、`triton-hcu-mls-pipeline-contract`、`tilelang-hcu-pass-ownership` | 前端/后端/runtime 与生成代码分别固定；同步所有权、memory scope、capture 限制与 launch ABI 变化会使旧证据失效，静态资源数字不替代计数器或硬件回归 |
 | `rocblas-kme-padding-contract` | 孔明e GEMM padding 案例；分析 GEMM 连同额外 copy/workspace，不能只量主矩阵指令 |
 
-以上联查入口于 2026-10-20 对照 HCU-Knowledge `3829ef06e7c7` 复核；ID 以当前 KB 索引为准，缺项时按标题/机制搜索。具体接口检查落在优化 Skill 的[库接入](../../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)和[通信专项](../../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，不在本页复制一套实现说明。知识中的源码分析和历史实验都有各自范围，不自动成为当前硬件的性能基线。
+以上联查入口于 2026-11-04 对照 HCU-Knowledge `c08470f7c1032f8ad9f072a161c687d2a6b50a3b` 复核；ID 以当前 KB 索引为准，缺项时按标题/机制搜索。新库布局、provider、直写梯度和状态折叠会使旧 dispatch/oracle/重叠证据失效，按现有刷新规则重评；历史实验仍保持原条件。具体接口检查落在优化 Skill 的[库接入](../../skills/hcu-train-analyze-and-optimize/references/hcu-library-integration.md)和[通信专项](../../skills/hcu-train-analyze-and-optimize/references/communication-optimization.md)，不在本页复制一套实现说明。知识中的源码分析和历史实验不自动成为当前硬件的性能基线。
 
 ## 在现有流程中的位置
 

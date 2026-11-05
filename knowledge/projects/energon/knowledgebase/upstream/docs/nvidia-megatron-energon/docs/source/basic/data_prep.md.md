@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/basic/data_prep.md
-raw_sha256: 61bc96b43877e1fe96c221ff58ebf845ce8c71f6e50f90b9ea16011d56c64cef
+raw_sha256: b18aef80f309a2405a73cecd24c59be1a83d99edb1fb3e82072dc981415313d6
 sources: []
-generated_body_sha256: fe6a66a01810d2f9a3b869f788c504a0c3ea05b97a56060d73f4e2ba7961e846
+generated_body_sha256: 5407f225257be73ed245a2637a58db1424c3df3eb53081ffb4c6051e60cb8152
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/basic/data_prep.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/basic/data_prep.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/basic/data_prep.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -36,7 +36,8 @@ The aim of data preparation is to convert your data to a format that the energon
 Energon's primary prepared format is a manifest dataset with extra information stored in a folder called `.nv-meta`.
 The most common manifest-backed format is [WebDataset](https://github.com/webdataset/webdataset).
 Below in [](data-on-disk) we explain the details about this format.
-We also support direct JSONL datasets, which are interpreted as [crude data](crude-data).
+We also support direct JSONL and [Megatron-LM BinIdx](binidx-dataset)
+datasets, which are interpreted as [crude data](crude-data).
 
 ## Important Considerations
 
@@ -96,7 +97,7 @@ These are the typical steps to get your data ready:
 2. Create the auxiliary dataset(s). Can be multiple datasets, e.g. one per modality.
     * Either as a folder on disk with all the media files inside
     * Or as another WebDataset that contains just the media files (with the exact same names)
-3. Run our preparation tool `energon prepare` **on both datasets** (yes also on JSONL files) to convert to an energon-compatible format
+3. Run our preparation tool `energon prepare` **on both datasets** (yes also on JSONL files or directories) to convert to an energon-compatible format
     * Configure WebDataset-based crude datasets as `CrudeWebdataset`; JSONL datasets are loaded as crude data by default.
     * For the auxiliary datasets, we recommend to enable the [media metadata feature](media-metadata) to store additional information about the media (like image size, resolution, video duration etc.)
 4. Create a [recipe](../basic/recipe) that specifies what auxiliary data to load for each primary dataset
@@ -111,7 +112,7 @@ It has fewer features, but can easily be read using a standard editor.
 ```{admonition} Good to know
 :class: tip
 A JSONL dataset cannot contain media files, but it can reference media files elsewhere (auxiliary data).
-A direct JSONL file has no train/val/test split.
+A direct JSONL file has no train/val/test split; a prepared directory of JSONL shards can define splits.
 It cannot be used as an auxiliary dataset by other primary datasets.
 It cannot be mounted using `energon mount`.
 ```
@@ -167,6 +168,159 @@ splits:
 
 An auxiliary data source can be a local or remote folder, or other energon-prepared webdatasets. Even multiple auxiliary sources can be used.
 For all the options and to see how to specify a matching cooker, please check out the section on [auxiliary data](aux-data).
+
+### A Directory of JSONL Shards
+
+Use a prepared shard directory when one JSONL file is too large, when the
+dataset should be distributed as an indexed shard list across ranks and workers,
+or when train/validation/test splits should be assigned by shard. Energon discovers
+`.jsonl` files recursively:
+
+```text
+my_jsonl_dataset/
+├── train/
+│   ├── shard_000.jsonl
+│   └── shard_001.jsonl
+└── validation/
+    └── shard_000.jsonl
+```
+
+Prepare the directory rather than an individual file:
+
+```shell
+energon prepare /path/to/my_jsonl_dataset \
+    --split-parts 'train:train/.*' \
+    --split-parts 'val:validation/.*' \
+    --non-interactive
+```
+
+Each `--split-parts SPLIT:PATTERN` assigns the shards whose path relative to the
+dataset root matches the regular expression. Without patterns, `--split-ratio 8,1,1`
+assigns complete shards, not individual JSONL records, in path order (shuffled
+with `--shuffle-tars`) and ignores the folder layout. In interactive mode,
+omitting both options prompts for the ratio. If the directory also contains tar
+files, `energon prepare` prepares it as a WebDataset and ignores the JSONL files.
+
+Preparation creates an index beside every shard and a manifest for the whole
+directory, see [Dataset Format on Disk for JSONL Datasets](data-on-disk-jsonl).
+
+A Recipe can select a different physical split for a logical split:
+
+```yaml
+__module__: megatron.energon
+__class__: Recipe
+splits:
+  train:
+    path: ./my_jsonl_dataset
+    split_part: train
+  val:
+    path: ./my_jsonl_dataset
+    split_part: val
+```
+
+If the size of a JSONL shard no longer matches its index, the index is considered
+stale and reading that shard fails. Run `energon prepare` again (using `--force-overwrite` in
+non-interactive workflows) to rebuild the indexes and manifest. Pass
+`--skip-dataset-yaml` to keep a customized `dataset.yaml`. If only index files are
+missing, `--tar-index-only` rebuilds them without changing `.nv-meta`. Prepared JSONL
+shard directories support shard-level splits but not sample-level excludes.
+
+(binidx-dataset)=
+## Using a Megatron-LM BinIdx Dataset
+
+Energon can load a Megatron-LM indexed dataset directly as a crude,
+pre-tokenized dataset. The two files must be next to each other and have the same
+stem:
+
+```text
+my_dataset/
+├── tokens.bin
+└── tokens.idx
+```
+
+The `.idx` file must use the version 1 `MMIDIDX` format produced by
+`megatron.core.datasets.indexed_dataset`. It stores the token dtype, sequence
+lengths, and byte offsets into the `.bin` file. Each indexed sequence becomes one
+Energon sample.
+
+Pass the `.bin` path—not the `.idx` path—to {py:func}`get_train_dataset
+<megatron.energon.get_train_dataset>` or {py:func}`get_val_dataset
+<megatron.energon.get_val_dataset>`. Energon detects the matching `.idx` file
+automatically, so no `energon prepare` step or `.nv-meta` directory is required.
+
+The default factory yields a {py:class}`CrudeSample
+<megatron.energon.CrudeSample>` with:
+
+* `sample["tokens"]`: a one-dimensional NumPy array using the dtype recorded in
+  the `.idx` header,
+* `sample["__key__"]`: the decimal sequence index as a string, and
+* the standard Energon source and restore metadata.
+
+Use a cooker to convert that crude representation to the sample type expected by
+the task:
+
+```python
+import numpy as np
+
+from megatron.energon import (
+    Cooker,
+    CrudeSample,
+    DefaultTaskEncoder,
+    Sample,
+    basic_sample_keys,
+    edataclass,
+    stateless,
+)
+
+
+@edataclass
+class TokenSample(Sample):
+    tokens: np.ndarray
+
+
+@stateless
+def cook_tokens(sample: CrudeSample) -> TokenSample:
+    return TokenSample(
+        **basic_sample_keys(sample),
+        tokens=sample["tokens"],
+    )
+
+
+class TokenTaskEncoder(DefaultTaskEncoder):
+    cookers = [Cooker(cook=cook_tokens)]
+```
+
+Then load it like any other dataset:
+
+```python
+from megatron.energon import WorkerConfig, get_train_dataset
+
+dataset = get_train_dataset(
+    "/data/my_dataset/tokens.bin",
+    worker_config=WorkerConfig.default_worker_config(),
+    task_encoder=TokenTaskEncoder(),
+    batch_size=1,
+    shuffle_buffer_size=100,
+    max_samples_per_sequence=None,
+)
+```
+
+Real token sequences usually have different lengths. For larger batches, extend
+the task encoder with the padding, packing, and batching behavior required by the
+model instead of relying on the minimal example above.
+
+A recipe may also refer to the `.bin` file directly:
+
+```yaml
+__module__: megatron.energon
+__class__: Recipe
+splits:
+  train:
+    path: ./my_dataset/tokens.bin
+```
+
+A BinIdx pair has no internal train/validation/test split. Use different file
+pairs or recipe subsets when the training and evaluation data must differ.
 
 (wds-format)=
 ## Step 1: Creating a WebDataset
@@ -558,7 +712,7 @@ For more information please also read [](custom-sample-loader).
 
 The energon library supports loading large multi-modal datasets from disk. A
 manifest-backed WebDataset must comply with the format described in this
-section; direct JSONL datasets use the layout above.
+section; direct JSONL and BinIdx datasets use the layouts above.
 
 A valid energon dataset must contain an `.nv-meta` folder with certain files as shown below.
 
@@ -723,11 +877,49 @@ The `media_metadata` table is used to store the media metadata for the selected 
 (data-on-disk-jsonl)=
 ## Dataset Format on Disk for JSONL Datasets
 
+A direct JSONL file and a prepared JSONL shard directory have different metadata
+layouts.
+
 For a direct file, `energon prepare` creates only an index with the same base
 filename. If the dataset is named `my_dataset.jsonl`, the resulting index is
 `my_dataset.jsonl.idx`. The direct file is loaded as crude data and has no
 train/validation/test split; callers may pass a split name for API consistency,
 but the full file is used.
+
+For a directory of shards, each JSONL file has its own adjacent `.idx` file and
+the directory has a `.nv-meta` manifest:
+
+```text
+my_jsonl_dataset/
+├── .nv-meta/
+│   ├── .info.json
+│   ├── dataset.yaml
+│   └── split.yaml
+├── shard_000.jsonl
+├── shard_000.jsonl.idx
+├── shard_001.jsonl
+└── shard_001.jsonl.idx
+```
+
+The shards may also be organized in subdirectories, for example to assign splits
+with `--split-parts`:
+
+```text
+my_jsonl_dataset/
+├── .nv-meta/
+│   └── ...
+├── train/
+│   ├── shard_000.jsonl
+│   ├── shard_000.jsonl.idx
+│   ├── shard_001.jsonl
+│   └── shard_001.jsonl.idx
+└── validation/
+    ├── shard_000.jsonl
+    └── shard_000.jsonl.idx
+```
+
+The manifest records the ordered shard list, sample counts, and shard-level
+split assignment.
 
 (data-on-disk-filesystem)=
 ## Dataset Format on Disk for Filesystem Datasets

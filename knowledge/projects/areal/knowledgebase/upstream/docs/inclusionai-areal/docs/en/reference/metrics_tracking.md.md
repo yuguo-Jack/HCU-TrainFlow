@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
 path: docs/en/reference/metrics_tracking.md
-raw_sha256: 61d093af25e7537db076ed88e946d7472ac712d70286f0f3b5e379b1d55cd089
+raw_sha256: 60449b0a631ff0663d16c4e4d60f13cff229348172a430cebd5d0c1b0cbe5441
 sources: []
-generated_body_sha256: 3921225c1174cc0d4315128b252288e860f1a21aa04b075512f4e1499ca700fd
+generated_body_sha256: e04e70904d9ca25325520636551aaa1bb8ae1008da6a9651e77c6ed8bd46a17e
 source_state: current-scan
 ---
 
 # areal-project/AReaL / docs/en/reference/metrics_tracking.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/docs/en/reference/metrics_tracking.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/docs/en/reference/metrics_tracking.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -400,6 +400,16 @@ filtering**, counted once per `_ppo_update`, independently of minibatch forwards
 `n_valid_generated_tokens` sums these observations; reused trajectories in separate
 updates are counted again. Empty populations omit averages and extrema rather than
 reporting a fabricated zero.
+
+`ppo_actor/update/version_stats/age_{0..16}_fraction` reports the fraction of all
+supervised tokens generated at each policy-version age, where age is the current actor
+version minus the token's aligned generation version. `age_gt_16_fraction` groups older
+tokens; `invalid_version_fraction` counts negative versions, and
+`future_version_fraction` counts versions newer than the actor. Prompt and padding
+positions are excluded. These disjoint fractions use the same pre-filter supervised
+token denominator, sum to one when that denominator is nonzero, and are calculated from
+token counts aggregated across workers rather than averaged worker fractions. Empty
+populations omit the fractions.
 
 New diagnostics use `stat_compact`: each metric stores only four float64 scalars (masked
 sum, count, minimum, maximum) per batch until export. This avoids the former

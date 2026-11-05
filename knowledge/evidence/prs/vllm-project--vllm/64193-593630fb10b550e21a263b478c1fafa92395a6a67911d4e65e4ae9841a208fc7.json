@@ -1,0 +1,471 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "fe6d8288a5941b15ca57830c858108f10cea51387eb0f93ffd15b0fdff9530df",
+      "isPrivate": false,
+      "numbers": [
+        64197,
+        64196,
+        64195,
+        64194,
+        64193,
+        64191,
+        64190,
+        64189
+      ],
+      "observed_at": "2026-11-04T19:45:06.220468+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4992,
+        "resetAt": "2026-11-04T20:41:45Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "77f58e530450416d217e4816727a35910bf3d9bf",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Overview\n\nToday the Mooncake prefiller holds a finished request's KV until the decoder pulls it, or until `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` (480 s) runs out. This PR adds an opt-in `kv_lease_duration` that replaces that fixed timeout with a lease the decoder renews, following NixlConnector's lease (#41383, [design](https://github.com/vllm-project/vllm/blob/main/docs/design/nixl_kv_cache_lease.md)). It addresses the \"480s expire fallback\" in item 6 of RFC #60523.\n\n## Claims\n\n- **D crash:** P frees the dead decoder's KV within one lease of D's last renewal, instead of after 480 s.\n- **D overload:** requests queued on a busy decoder keep their KV for as long as they wait. A short fixed timeout fails them.\n- **Late pulls:** a pull for KV that P has already freed fails at once, instead of waiting out the timeout. This also applies when the lease is off.\n- Without `kv_lease_duration`, behavior is unchanged.\n\n## Validation\n\n**Unit tests:** `pytest tests/v1/kv_connector/unit/test_mooncake_connector.py` → 144 passed (A800, `huggingface_hub==1.31.0` as in CI). The new tests use the real scheduler, real ZMQ sockets and a stubbed bootstrap service. They cover:\n- renewal is off without the option, and throttled to every `lease / 6` with it;\n- D renews until the pull settles or the request aborts;\n- renewals reach every paired P worker, querying the bootstrap first if needed;\n- on P, renewals extend only known transfers and never shorten a deadline, and a P without the lease rejects them;\n- pulls on the same channel still work;\n- a pull for freed KV gets an immediate error.\n\n`pre-commit` passes.\n\n**End to end:** 2× A800 with 200G HDR IB, Mooncake TE 0.3.13.post1, DeepSeek-MoE-16B, TP=1 per side. Both sides run main `10e8e921b`, with only `mooncake_connector.py` swapped (baseline vs this PR).\n- Load: 128 requests, 3,000-token prompts, 1,000 output tokens. That is 2.4× D's KV capacity, so D always has a queue.\n- Probe: a 512-token request sent straight to P every 10 s.\n\n| Case | Unmodified main | This PR |\n|---|---|---|\n| **A.** D killed at t≈23 s; 480 s timeout vs 30 s lease | P's KV stays at 99% until t≈484 s; the probe sent at t≈10 s takes 475.5 s | P's KV is below 5% at t≈103 s; that probe takes 61.3 s, later probes 36–46 ms |\n| **B.** No crash, requests wait on D up to ~80 s; 20 s timeout vs 20 s lease | 79 / 128 requests fail | 128 / 128 succeed, no lease expires |\n\nIn case A, requests still queued on P when D died are prefilled afterwards. The baseline holds them for another 480 s, and P is still at 37% KV when the run ends at t=660 s. The lease holds each for one 30 s lease.\n\n<details>\n<summary>Reproduction</summary>\n\n```bash\n# Same on D with \"kv_role\":\"kv_consumer\" and --port 8020. Drop kv_lease_duration for the baseline;\n# case B's baseline sets VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=20 on both sides.\nvllm serve deepseek-ai/deepseek-moe-16b-chat --port 8010 --dtype bfloat16 --trust-remote-code \\\n    --max-model-len 4096 --gpu-memory-utilization 0.85 --no-enable-prefix-caching \\\n    --kv-transfer-config '{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"device_name\":\"mlx5_102\",\"kv_lease_duration\":30}}'\npython examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \\\n    --port 8000 --prefill http://<P>:8010 8998 --decode http://<D>:8020\n```\n\n- Load: 128 streaming completions sent at once through the proxy, each with random prompt token ids, `max_tokens=1000` and `ignore_eos`.\n- Probe: a plain completion with `max_tokens=1`, sent to P without `kv_transfer_params`.\n- Case A sends `SIGKILL` to D's process group 20 s after the load starts.\n</details>\n\n**Overhead:**\n- P checks each side-channel message for a renewal: 0.7 µs for a steady pull, 1.3 µs for a pull carrying the layout, 21 µs for an 18 KB pull of 32 requests.\n- D sends one message of about 1 KB per 128 transfer ids, to each paired P worker every `lease / 6`.\n\n## Details\n\n**Flow**\n1. D starts tracking a request in `on_new_request`, while it may still be queued.\n2. Every `lease / 6`, `build_connector_meta` groups the tracked transfer ids by P engine.\n3. `start_load_kv` sends them to each P worker that D would pull from.\n4. P sets `expire_time = now + lease` when prefill ends. On each renewal it sets `expire_time = max(expire_time, now + 2/3 · lease)`.\n5. D stops renewing on `finished_recving` or `request_finished`.\n6. When renewals stop, P frees the blocks on its next scan and remembers the transfer id, so a later pull fails at once.\n\n**Design notes**\n- **Opt-in, unlike NIXL.** Mooncake has no handshake compatibility check, so an old decoder paired with a lease-enabled prefiller would silently lose the KV of requests queued longer than the lease. The docs say to set the same value on both sides and to upgrade prefillers first. An old prefiller rejects renewals, and D warns once.\n- **Transport.** Renewals use P's existing ZMQ ROUTER, so there is no new port and the pull format is unchanged.\n  - A pull decodes as an empty renewal, because msgspec skips unknown fields.\n  - P's listener answers renewals itself, since all sender workers may be blocked waiting for prefills.\n  - D waits for the reply, because a `linger=0` socket drops unsent messages.\n  - Renewals go to the same P workers as the pull, using the address selection now shared with `receive_kv`. A P engine that D has not contacted yet gets a bootstrap query first.\n- **Expiry scan.** P keeps scanning every entry, because renewals reorder deadlines; NIXL's ordered reaper hit this in #58222. Deadlines never cross processes, so there is no clock skew (cf. #50326).\n- **Limitation.** Backpressure is unchanged: P holds KV for as long as a slow decoder needs it. In case B with the lease, P sits at 99% for about 40 s and a probe waits 35 s. The 20 s timeout frees KV sooner (probe 17 s) only by failing requests. Fixing that needs D-side staging (rd2h / host receive).\n- **#57530 failure spine.** With the lease on, P's deadline is the lease. `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` still bounds the wait for an unfinished prefill and how long freed transfer ids are remembered.\n\n**Not a duplicate.** I searched for Mooncake lease, heartbeat, `ABORT_REQUEST_TIMEOUT` and `expire_time`. #63420 and #59522 are leases in the Mooncake Store connector. #63804 is an external connector, and #57529 is a standalone failure ledger. Open PRs on this file (#62657, #62658, #62255, #61974) do not change P's expiry.\n\n**AI assistance:** written with Claude Code. I reviewed every changed line, ran all tests and experiments above, and can answer for the design.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--64193.org.readthedocs.build/en/64193/",
+            "createdAt": "2026-10-28T02:58:32Z",
+            "databaseId": 6459450252,
+            "updatedAt": "2026-10-28T02:58:32Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6459450252"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ @CJJ1008, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-10-28T09:23:59Z",
+            "databaseId": 6465315655,
+            "updatedAt": "2026-10-28T09:23:59Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465315655"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "CJJ1008"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-28T09:32:09Z",
+            "databaseId": 6465471668,
+            "updatedAt": "2026-10-28T09:32:09Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465471668"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #97935](https://buildkite.com/vllm/ci/builds/97935) for commit `55c29ff24b9b`.\n\nℹ️ This PR is 24 commits behind upstream `main`. Merged upstream `main` into this branch as `55c29ff24b9b` before starting CI. Pull the branch before pushing more changes.",
+            "createdAt": "2026-10-28T09:32:38Z",
+            "databaseId": 6465480557,
+            "updatedAt": "2026-10-28T09:32:38Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465480557"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "wangxiyuan"
+            },
+            "body": "Follow-up idea (not blocking): turn P/D lease misconfiguration into an explicit error instead of a docs-level constraint.",
+            "createdAt": "2026-10-28T09:35:52Z",
+            "databaseId": 6465541491,
+            "updatedAt": "2026-10-28T09:35:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465541491"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "CJJ1008"
+            },
+            "body": "Thanks, good point! I'll handle it in a follow-up PR after this one lands. Rough idea for now (haven't validated it yet):\n\n- P advertises its `kv_lease_duration` via the bootstrap server, and D checks it when it looks P up. That catches D renewing against a P that has the lease off or a different value.\n- D also sends its `kv_lease_duration` with each pull (an optional field, so older P just ignores it), and P checks that. That catches P having the lease on while D isn't renewing, including older D builds.\n- If they don't match, the affected requests fail with a clear error showing both values, instead of relying on the docs.\n\nIf you have any other ideas, feel free to let me know. I'd be glad to keep contributing here.\n",
+            "createdAt": "2026-10-28T09:54:51Z",
+            "databaseId": 6465903653,
+            "updatedAt": "2026-10-28T09:54:51Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465903653"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "CJJ1008"
+            },
+            "body": "Hi @ivanium, this one's been approved and CI is green. Would you mind taking a look, and approving and merging it if it looks good to you? Thanks!",
+            "createdAt": "2026-10-29T16:33:18Z",
+            "databaseId": 6502492016,
+            "updatedAt": "2026-10-29T16:33:18Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6502492016"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYOUJ3A=",
+          "hasNextPage": false
+        },
+        "totalCount": 7
+      },
+      "headRefOid": "55c29ff24b9b418fec90fa6767cd026817bb3025",
+      "headRepository": {
+        "nameWithOwner": "CJJ1008/vllm"
+      },
+      "mergeCommit": {
+        "oid": "aa738c38c3cf9861f63332b981a87bdf85166791"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-29T20:46:05Z",
+      "number": 64193,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5677226531,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-28T02:58:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#pullrequestreview-5677226531"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "wangxiyuan"
+            },
+            "body": "The change LGTM. just a nit. Feel free to update if need follow-up change.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "wangxiyuan"
+                  },
+                  "body": "it's good to add a log here before `return` for better debug.",
+                  "createdAt": "2026-10-28T09:22:03Z",
+                  "databaseId": 4398838445,
+                  "diffHunk": "@@ -2677,17 +2857,69 @@ def receive_kv(\n                 self.receive_kv_from_single_worker(worker_addr, pull_metas)\n             )\n \n+    async def _query_bootstrap(self, remote_bootstrap_addr: str):\n+        \"\"\"Query a bootstrap server, or wait for the query already running.\"\"\"\n+        if remote_bootstrap_addr not in self._pending_bootstrap_queries:\n+            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()\n+            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)\n+        else:\n+            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()\n+\n+    async def _send_lease_heartbeat(\n+        self, remote_engine_id: EngineId, heartbeat: LeaseHeartbeat\n+    ):\n+        \"\"\"Renew the leases one P engine holds for this worker's requests.\"\"\"\n+        if remote_engine_id not in self._remote_agents:\n+            # The requests may still be queued. Query now so this renewal,\n+            # and the pull later, can reach P's workers.\n+            await self._query_bootstrap(heartbeat.remote_bootstrap_addr)\n+            if remote_engine_id not in self._remote_agents:",
+                  "line": 2876,
+                  "originalLine": 2876,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+                  "updatedAt": "2026-10-28T09:22:58Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/64193#discussion_r4398838445"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOFQwOToyMjowM1rPAAAAAQYw8q0=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5680353336,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-28T09:22:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#pullrequestreview-5680353336"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "CJJ1008"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "CJJ1008"
+                  },
+                  "body": "Added a warning before the `return` in fbf1e7f26. Thanks for the review!",
+                  "createdAt": "2026-10-28T09:31:42Z",
+                  "databaseId": 4398934052,
+                  "diffHunk": "@@ -2677,17 +2857,69 @@ def receive_kv(\n                 self.receive_kv_from_single_worker(worker_addr, pull_metas)\n             )\n \n+    async def _query_bootstrap(self, remote_bootstrap_addr: str):\n+        \"\"\"Query a bootstrap server, or wait for the query already running.\"\"\"\n+        if remote_bootstrap_addr not in self._pending_bootstrap_queries:\n+            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()\n+            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)\n+        else:\n+            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()\n+\n+    async def _send_lease_heartbeat(\n+        self, remote_engine_id: EngineId, heartbeat: LeaseHeartbeat\n+    ):\n+        \"\"\"Renew the leases one P engine holds for this worker's requests.\"\"\"\n+        if remote_engine_id not in self._remote_agents:\n+            # The requests may still be queued. Query now so this renewal,\n+            # and the pull later, can reach P's workers.\n+            await self._query_bootstrap(heartbeat.remote_bootstrap_addr)\n+            if remote_engine_id not in self._remote_agents:",
+                  "line": 2876,
+                  "originalLine": 2876,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+                  "updatedAt": "2026-10-28T09:31:42Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/64193#discussion_r4398934052"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOFQwOTozMTo0MlrPAAAAAQYyaCQ=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5680481185,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-28T09:31:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/64193#pullrequestreview-5680481185"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yOFQwOTozMTo0Mlq0MjAyNi0xMC0yOFQwOTozMTo0MlrPAAAAAVKVQ6E=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "MERGED",
+      "title": "[KV Connector][Mooncake] Renew prefill KV leases from the decoder",
+      "updatedAt": "2026-10-29T20:46:06Z",
+      "url": "https://github.com/vllm-project/vllm/pull/64193"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "77f58e530450416d217e4816727a35910bf3d9bf"
+    },
+    "body": "## Overview\n\nToday the Mooncake prefiller holds a finished request's KV until the decoder pulls it, or until `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` (480 s) runs out. This PR adds an opt-in `kv_lease_duration` that replaces that fixed timeout with a lease the decoder renews, following NixlConnector's lease (#41383, [design](https://github.com/vllm-project/vllm/blob/main/docs/design/nixl_kv_cache_lease.md)). It addresses the \"480s expire fallback\" in item 6 of RFC #60523.\n\n## Claims\n\n- **D crash:** P frees the dead decoder's KV within one lease of D's last renewal, instead of after 480 s.\n- **D overload:** requests queued on a busy decoder keep their KV for as long as they wait. A short fixed timeout fails them.\n- **Late pulls:** a pull for KV that P has already freed fails at once, instead of waiting out the timeout. This also applies when the lease is off.\n- Without `kv_lease_duration`, behavior is unchanged.\n\n## Validation\n\n**Unit tests:** `pytest tests/v1/kv_connector/unit/test_mooncake_connector.py` → 144 passed (A800, `huggingface_hub==1.31.0` as in CI). The new tests use the real scheduler, real ZMQ sockets and a stubbed bootstrap service. They cover:\n- renewal is off without the option, and throttled to every `lease / 6` with it;\n- D renews until the pull settles or the request aborts;\n- renewals reach every paired P worker, querying the bootstrap first if needed;\n- on P, renewals extend only known transfers and never shorten a deadline, and a P without the lease rejects them;\n- pulls on the same channel still work;\n- a pull for freed KV gets an immediate error.\n\n`pre-commit` passes.\n\n**End to end:** 2× A800 with 200G HDR IB, Mooncake TE 0.3.13.post1, DeepSeek-MoE-16B, TP=1 per side. Both sides run main `10e8e921b`, with only `mooncake_connector.py` swapped (baseline vs this PR).\n- Load: 128 requests, 3,000-token prompts, 1,000 output tokens. That is 2.4× D's KV capacity, so D always has a queue.\n- Probe: a 512-token request sent straight to P every 10 s.\n\n| Case | Unmodified main | This PR |\n|---|---|---|\n| **A.** D killed at t≈23 s; 480 s timeout vs 30 s lease | P's KV stays at 99% until t≈484 s; the probe sent at t≈10 s takes 475.5 s | P's KV is below 5% at t≈103 s; that probe takes 61.3 s, later probes 36–46 ms |\n| **B.** No crash, requests wait on D up to ~80 s; 20 s timeout vs 20 s lease | 79 / 128 requests fail | 128 / 128 succeed, no lease expires |\n\nIn case A, requests still queued on P when D died are prefilled afterwards. The baseline holds them for another 480 s, and P is still at 37% KV when the run ends at t=660 s. The lease holds each for one 30 s lease.\n\n<details>\n<summary>Reproduction</summary>\n\n```bash\n# Same on D with \"kv_role\":\"kv_consumer\" and --port 8020. Drop kv_lease_duration for the baseline;\n# case B's baseline sets VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=20 on both sides.\nvllm serve deepseek-ai/deepseek-moe-16b-chat --port 8010 --dtype bfloat16 --trust-remote-code \\\n    --max-model-len 4096 --gpu-memory-utilization 0.85 --no-enable-prefix-caching \\\n    --kv-transfer-config '{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"device_name\":\"mlx5_102\",\"kv_lease_duration\":30}}'\npython examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \\\n    --port 8000 --prefill http://<P>:8010 8998 --decode http://<D>:8020\n```\n\n- Load: 128 streaming completions sent at once through the proxy, each with random prompt token ids, `max_tokens=1000` and `ignore_eos`.\n- Probe: a plain completion with `max_tokens=1`, sent to P without `kv_transfer_params`.\n- Case A sends `SIGKILL` to D's process group 20 s after the load starts.\n</details>\n\n**Overhead:**\n- P checks each side-channel message for a renewal: 0.7 µs for a steady pull, 1.3 µs for a pull carrying the layout, 21 µs for an 18 KB pull of 32 requests.\n- D sends one message of about 1 KB per 128 transfer ids, to each paired P worker every `lease / 6`.\n\n## Details\n\n**Flow**\n1. D starts tracking a request in `on_new_request`, while it may still be queued.\n2. Every `lease / 6`, `build_connector_meta` groups the tracked transfer ids by P engine.\n3. `start_load_kv` sends them to each P worker that D would pull from.\n4. P sets `expire_time = now + lease` when prefill ends. On each renewal it sets `expire_time = max(expire_time, now + 2/3 · lease)`.\n5. D stops renewing on `finished_recving` or `request_finished`.\n6. When renewals stop, P frees the blocks on its next scan and remembers the transfer id, so a later pull fails at once.\n\n**Design notes**\n- **Opt-in, unlike NIXL.** Mooncake has no handshake compatibility check, so an old decoder paired with a lease-enabled prefiller would silently lose the KV of requests queued longer than the lease. The docs say to set the same value on both sides and to upgrade prefillers first. An old prefiller rejects renewals, and D warns once.\n- **Transport.** Renewals use P's existing ZMQ ROUTER, so there is no new port and the pull format is unchanged.\n  - A pull decodes as an empty renewal, because msgspec skips unknown fields.\n  - P's listener answers renewals itself, since all sender workers may be blocked waiting for prefills.\n  - D waits for the reply, because a `linger=0` socket drops unsent messages.\n  - Renewals go to the same P workers as the pull, using the address selection now shared with `receive_kv`. A P engine that D has not contacted yet gets a bootstrap query first.\n- **Expiry scan.** P keeps scanning every entry, because renewals reorder deadlines; NIXL's ordered reaper hit this in #58222. Deadlines never cross processes, so there is no clock skew (cf. #50326).\n- **Limitation.** Backpressure is unchanged: P holds KV for as long as a slow decoder needs it. In case B with the lease, P sits at 99% for about 40 s and a probe waits 35 s. The 20 s timeout frees KV sooner (probe 17 s) only by failing requests. Fixing that needs D-side staging (rd2h / host receive).\n- **#57530 failure spine.** With the lease on, P's deadline is the lease. `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` still bounds the wait for an unfinished prefill and how long freed transfer ids are remembered.\n\n**Not a duplicate.** I searched for Mooncake lease, heartbeat, `ABORT_REQUEST_TIMEOUT` and `expire_time`. #63420 and #59522 are leases in the Mooncake Store connector. #63804 is an external connector, and #57529 is a standalone failure ledger. Open PRs on this file (#62657, #62658, #62255, #61974) do not change P's expiry.\n\n**AI assistance:** written with Claude Code. I reviewed every changed line, ran all tests and experiments above, and can answer for the design.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 3,
+    "head": {
+      "repo": {
+        "full_name": "CJJ1008/vllm"
+      },
+      "sha": "55c29ff24b9b418fec90fa6767cd026817bb3025"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/64193",
+    "merge_commit_sha": "aa738c38c3cf9861f63332b981a87bdf85166791",
+    "merged": true,
+    "merged_at": "2026-10-29T20:46:05Z",
+    "number": 64193,
+    "state": "closed",
+    "title": "[KV Connector][Mooncake] Renew prefill KV leases from the decoder",
+    "updated_at": "2026-10-29T20:46:06Z"
+  },
+  "files": [
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/55c29ff24b9b418fec90fa6767cd026817bb3025/docs%2Ffeatures%2Fmooncake_connector_usage.md",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/docs%2Ffeatures%2Fmooncake_connector_usage.md?ref=55c29ff24b9b418fec90fa6767cd026817bb3025",
+      "deletions": 2,
+      "filename": "docs/features/mooncake_connector_usage.md",
+      "patch": "@@ -66,6 +66,7 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).\n - `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`: Timeout (in seconds) for automatically releasing the prefiller’s KV cache for a particular request. (Optional)\n     - Default: 480\n     - If a request is aborted and the decoder has not yet notified the prefiller, the prefill instance will release its KV-cache blocks after this timeout to avoid holding them indefinitely.\n+    - When `kv_lease_duration` is set, the lease decides when those blocks are released instead. This timeout still bounds how long a pull waits for a prefill that has not finished.\n \n ## KV Transfer Config\n \n@@ -80,6 +81,10 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).\n - **num_workers**: Size of thread pool for one prefiller worker to transfer KV caches by mooncake. (default 10)\n - **mooncake_protocol**: Mooncake connector protocol. (default \"rdma\")\n - **device_name**: Comma-separated whitelist of RDMA devices (e.g. `\"mlx5_0,mlx5_1\"`) to restrict topology discovery to. Empty discovers every device. Useful on hosts exposing a mix of InfiniBand and RoCE ports, where both peers must settle on the same link layer.\n+- **kv_lease_duration**: Seconds the prefiller holds a finished request's KV blocks before the decoder must renew them. (default unset)\n+    - Unset keeps the fixed `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`.\n+    - When set, the decoder renews the lease every `kv_lease_duration / 6` seconds from the time the request arrives until its pull settles, and each renewal extends it to at least `kv_lease_duration * 2 / 3` seconds from then, as in [NixlConnector](../design/nixl_kv_cache_lease.md). Blocks of a decoder that crashed are freed within about `kv_lease_duration` seconds, while requests queued on a busy decoder keep their blocks.\n+    - Set the same value on prefill and decode instances. A decoder without it does not renew, so its requests that wait longer than the lease lose their prefilled KV; a prefiller without it rejects renewals, and the decoder logs a warning. Prefill instances from releases without this option log an error for each renewal they receive, so upgrade them before enabling it on decode instances.\n - **bootstrap_server_address**: Optional `\"host:port\"` of an already running Mooncake bootstrap server. All prefiller ranks register with this endpoint instead of launching an embedded server. The caller owns the server lifetime and must configure the proxy to use the same endpoint. The example proxy assumes the bootstrap server is on the prefiller API host; a different host requires a proxy that supplies that address in `remote_bootstrap_addr`. Omit this option to use the embedded server and `VLLM_MOONCAKE_BOOTSTRAP_PORT`.\n \n ## Prometheus metrics\n@@ -102,8 +107,9 @@ The following Prometheus metrics are exported when MooncakeConnector is active,\n \n !!! tip\n     High `vllm:mooncake_num_kv_expired_reqs` indicates that the prefiller's\n-    lease duration is too short for your network or workload. Increase it via\n-    `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`.\n+    lease duration is too short for your network or workload. Increase\n+    `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`, or set `kv_lease_duration` on both\n+    instances so that queued requests keep their blocks.\n \n ## Example Scripts/Code\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/55c29ff24b9b418fec90fa6767cd026817bb3025/docs%2Ffeatures%2Fmooncake_connector_usage.md",
+      "sha": "e0df25436ca261efd244fe9d9a263273fedf17e3",
+      "status": "modified"
+    },
+    {
+      "additions": 321,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/55c29ff24b9b418fec90fa6767cd026817bb3025/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_mooncake_connector.py",
+      "changes": 322,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_mooncake_connector.py?ref=55c29ff24b9b418fec90fa6767cd026817bb3025",
+      "deletions": 1,
+      "filename": "tests/v1/kv_connector/unit/test_mooncake_connector.py",
+      "patch": "@@ -27,9 +27,11 @@\n from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (\n     _SHARED_REGION_GROUP_ID,\n     KVConnectorRole,\n+    LeaseHeartbeat,\n     MooncakeConnector,\n     MooncakeConnectorMetadata,\n     MooncakeConnectorWorker,\n+    MooncakeLeaseHeartbeat,\n     MooncakeXferMetadata,\n     MooncakeXferResponse,\n     MooncakeXferResponseStatus,\n@@ -62,6 +64,7 @@\n from vllm.v1.request import RequestStatus\n \n from .utils import (\n+    create_model_runner_output,\n     create_request,\n     create_scheduler,\n     create_vllm_config,\n@@ -180,11 +183,14 @@ def _make_test_kv_cache_config() -> KVCacheConfig:\n     )\n \n \n-def _make_worker_vllm_config(kv_role: str):\n+def _make_worker_vllm_config(\n+    kv_role: str, kv_connector_extra_config: dict | None = None\n+):\n     return create_vllm_config(\n         kv_connector=\"MooncakeConnector\",\n         kv_role=kv_role,\n         block_size=maybe_update_block_size(16),\n+        kv_connector_extra_config=kv_connector_extra_config,\n     )\n \n \n@@ -1855,6 +1861,320 @@ async def test_worker_get_finished_timeout(monkeypatch):\n         assert \"tx-active\" in prefill_worker.reqs_need_send\n \n \n+class _BootstrapClientStub:\n+    \"\"\"httpx.AsyncClient stand-in for the prefill bootstrap server.\"\"\"\n+\n+    def __init__(self, workers: dict | None = None, **kwargs):\n+        self.workers = workers or {}\n+\n+    async def __aenter__(self):\n+        return self\n+\n+    async def __aexit__(self, *exc_info):\n+        return False\n+\n+    async def post(self, url, json=None):\n+        return MagicMock()\n+\n+    async def get(self, url):\n+        response = MagicMock()\n+        response.json.return_value = self.workers\n+        return response\n+\n+\n+def _lease_decode_scheduler(kv_lease_duration: float | None):\n+    extra_config = (\n+        {} if kv_lease_duration is None else {\"kv_lease_duration\": kv_lease_duration}\n+    )\n+    vllm_config = create_vllm_config(\n+        kv_connector=\"MooncakeConnector\",\n+        kv_role=\"kv_consumer\",\n+        kv_connector_extra_config=extra_config,\n+    )\n+    return create_scheduler(vllm_config), vllm_config.cache_config.block_size\n+\n+\n+def _remote_prefill_request(request_id: int, block_size: int):\n+    request = create_request(\n+        request_id=request_id,\n+        block_size=block_size,\n+        num_tokens=block_size * 2,\n+        do_remote_prefill=True,\n+    )\n+    request.kv_transfer_params.update(\n+        {\n+            \"transfer_id\": f\"xfer-{request_id}\",\n+            \"remote_bootstrap_addr\": \"http://prefill:8998\",\n+        }\n+    )\n+    return request\n+\n+\n+@pytest.mark.parametrize(\"kv_lease_duration\", [None, 30])\n+def test_decode_lease_renewal_is_opt_in_and_throttled(kv_lease_duration):\n+    scheduler, block_size = _lease_decode_scheduler(kv_lease_duration)\n+    scheduler.add_request(_remote_prefill_request(1, block_size))\n+\n+    output = scheduler.schedule()\n+    if kv_lease_duration is None:\n+        assert not output.kv_connector_metadata.lease_heartbeats\n+    else:\n+        assert output.kv_connector_metadata.lease_heartbeats == {\n+            \"my-engine-id\": LeaseHeartbeat(\n+                remote_bootstrap_addr=\"http://prefill:8998\", transfer_ids=[\"xfer-1\"]\n+            )\n+        }\n+    scheduler.update_from_output(output, create_model_runner_output(reqs=[]))\n+    # At most one renewal per kv_lease_duration / 6 seconds.\n+    assert not scheduler.schedule().kv_connector_metadata.lease_heartbeats\n+\n+\n+def _next_lease_heartbeats(scheduler, scheduler_output, timeout: float = 5.0):\n+    connector = scheduler.get_kv_connector()\n+    deadline = time.monotonic() + timeout\n+    while time.monotonic() < deadline:\n+        meta = connector.build_connector_meta(scheduler_output)\n+        if meta.lease_heartbeats:\n+            return meta.lease_heartbeats\n+        time.sleep(0.005)\n+    return {}\n+\n+\n+@pytest.mark.parametrize(\"settled_by\", [\"finished_recving\", \"abort\"])\n+def test_decode_renews_lease_until_pull_settles(settled_by):\n+    # Renew every 10 ms so the test can wait for the next renewal.\n+    scheduler, block_size = _lease_decode_scheduler(0.06)\n+    settled = _remote_prefill_request(1, block_size)\n+    kept = _remote_prefill_request(2, block_size)\n+    scheduler.add_request(settled)\n+    scheduler.add_request(kept)\n+\n+    output = scheduler.schedule()\n+    meta = output.kv_connector_metadata\n+    assert len(meta.reqs_to_recv[\"my-engine-id\"]) == 2\n+    assert sorted(meta.lease_heartbeats[\"my-engine-id\"].transfer_ids) == [\n+        \"xfer-1\",\n+        \"xfer-2\",\n+    ]\n+    if settled_by == \"finished_recving\":\n+        scheduler.update_from_output(\n+            output,\n+            create_model_runner_output(reqs=[], finished_recving={settled.request_id}),\n+        )\n+    else:\n+        scheduler.update_from_output(output, create_model_runner_output(reqs=[]))\n+        scheduler.finish_requests(settled.request_id, RequestStatus.FINISHED_ABORTED)\n+\n+    # The pull of `kept` has been issued but not settled, so it is still renewed.\n+    assert _next_lease_heartbeats(scheduler, output) == {\n+        \"my-engine-id\": LeaseHeartbeat(\n+            remote_bootstrap_addr=\"http://prefill:8998\", transfer_ids=[\"xfer-2\"]\n+        )\n+    }\n+\n+\n+@pytest.mark.asyncio\n+async def test_decode_heartbeat_reaches_every_paired_prefill_worker():\n+    \"\"\"A renewal for a request still queued on D queries P's bootstrap first.\"\"\"\n+    vllm_config = _make_worker_vllm_config(\n+        \"kv_consumer\", kv_connector_extra_config={\"kv_lease_duration\": 30}\n+    )\n+    # P TP=2 serves this D TP=1 worker from both of its ranks.\n+    workers = {\n+        \"0\": {\n+            \"engine_id\": \"p-engine\",\n+            \"worker_addr\": {\n+                \"0\": {\"0\": \"tcp://prefill-tp0:1234\"},\n+                \"1\": {\"0\": \"tcp://prefill-tp1:1234\"},\n+            },\n+        }\n+    }\n+    with (\n+        set_current_vllm_config(vllm_config),\n+        patch_worker_dependencies() as mocks,\n+        patch.object(\n+            mooncake_connector.httpx,\n+            \"AsyncClient\",\n+            lambda **kwargs: _BootstrapClientStub(workers),\n+        ),\n+    ):\n+        worker = MooncakeConnector(\n+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()\n+        ).connector_worker\n+        sock = mocks[\"mock_socket_object\"]\n+        sock.recv.return_value = msgspec.msgpack.encode(\n+            MooncakeXferResponse(status=MooncakeXferResponseStatus.FINISH)\n+        )\n+        metadata = MooncakeConnectorMetadata()\n+        metadata.lease_heartbeats = {\n+            \"p-engine\": LeaseHeartbeat(\n+                remote_bootstrap_addr=\"http://prefill:8998\",\n+                transfer_ids=[\"xfer-1\", \"xfer-2\"],\n+            )\n+        }\n+        worker.start_load_kv(metadata)\n+\n+        deadline = time.monotonic() + 10\n+        while sock.send.await_count < 2 and time.monotonic() < deadline:\n+            await asyncio.sleep(0.01)\n+        addrs = sorted(c.args[1] for c in mocks[\"mock_make_zmq\"].call_args_list)\n+        assert addrs == [\"tcp://prefill-tp0:1234\", \"tcp://prefill-tp1:1234\"]\n+        for call in sock.send.await_args_list:\n+            heartbeat = msgspec.msgpack.decode(\n+                call.args[0], type=MooncakeLeaseHeartbeat\n+            )\n+            assert heartbeat.lease_transfer_ids == [\"xfer-1\", \"xfer-2\"]\n+        worker.shutdown()\n+\n+\n+@pytest.mark.asyncio\n+@pytest.mark.parametrize(\"kv_lease_duration\", [30, None])\n+async def test_prefill_side_channel_renews_leases(kv_lease_duration):\n+    extra_config = (\n+        {} if kv_lease_duration is None else {\"kv_lease_duration\": kv_lease_duration}\n+    )\n+    vllm_config = _make_worker_vllm_config(\n+        \"kv_producer\", kv_connector_extra_config=extra_config\n+    )\n+    with (\n+        set_current_vllm_config(vllm_config),\n+        patch_worker_dependencies(),\n+        patch.object(mooncake_connector.httpx, \"AsyncClient\", _BootstrapClientStub),\n+    ):\n+        producer = MooncakeConnector(\n+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()\n+        ).connector_worker\n+\n+        # Allocation, then prefill end, as the scheduler reports them.\n+        for block_ids in ([], [[1]]):\n+            meta = MooncakeConnectorMetadata()\n+            meta.reqs_to_send = {f\"p-req-{i}\": (f\"xfer-{i}\", block_ids) for i in (1, 2)}\n+            before = time.perf_counter()\n+            await producer.record_send_reqs(meta)\n+        initial = kv_lease_duration or envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\n+        for send_meta in producer.reqs_need_send.values():\n+            assert before + initial <= send_meta.expire_time\n+            assert send_meta.expire_time <= time.perf_counter() + initial\n+            # Both deadlines pass.\n+            send_meta.expire_time = before - 1\n+\n+        listener = asyncio.create_task(\n+            producer._mooncake_sender_listener(threading.Event())\n+        )\n+        ctx = zmq.asyncio.Context()\n+        dealer = ctx.socket(zmq.DEALER)\n+        try:\n+            while not producer.side_channel_port:\n+                await asyncio.sleep(0.01)\n+            dealer.connect(f\"tcp://127.0.0.1:{producer.side_channel_port}\")\n+\n+            async def request(message) -> MooncakeXferResponse:\n+                await dealer.send(msgspec.msgpack.encode(message))\n+                reply = await asyncio.wait_for(dealer.recv(), timeout=10)\n+                return msgspec.msgpack.decode(reply, type=MooncakeXferResponse)\n+\n+            renewal = MooncakeLeaseHeartbeat(lease_transfer_ids=[\"xfer-1\", \"xfer-9\"])\n+            response = await request(renewal)\n+            if kv_lease_duration is None:\n+                assert response.status == MooncakeXferResponseStatus.ERROR\n+                expired = {\"p-req-1\", \"p-req-2\"}\n+            else:\n+                assert response.status == MooncakeXferResponseStatus.FINISH\n+                renewed = producer.reqs_need_send[\"xfer-1\"].expire_time\n+                assert renewed >= before + kv_lease_duration * 2 / 3\n+                # A renewal never recreates a transfer P does not hold, and\n+                # never shortens a deadline.\n+                assert \"xfer-9\" not in producer.reqs_need_send\n+                producer.reqs_need_send[\"xfer-1\"].expire_time = renewed + 100\n+                await request(renewal)\n+                assert producer.reqs_need_send[\"xfer-1\"].expire_time == renewed + 100\n+                expired = {\"p-req-2\"}\n+\n+            # Pulls on the same channel still reach the sender workers.\n+            pull = _xfer_meta(\n+                [_region(0x2000)], {\"d-req-1\": (\"xfer-1\", [[1]])}, remote_tp_rank=1\n+            )\n+            response = await request(pull)\n+            assert response.status == MooncakeXferResponseStatus.ERROR\n+            assert \"not paired\" in response.err_msg\n+\n+            assert await producer.fetch_finished_sending_reqs() == expired\n+        finally:\n+            listener.cancel()\n+            with contextlib.suppress(asyncio.CancelledError):\n+                await listener\n+            dealer.close(linger=0)\n+            ctx.term()\n+            producer.shutdown()\n+\n+\n+@pytest.mark.asyncio\n+@pytest.mark.parametrize(\"with_live_req\", [False, True])\n+async def test_pull_after_expiry_fails_without_waiting(with_live_req):\n+    \"\"\"A pull for KV that P already freed must not wait for a prefill.\"\"\"\n+    vllm_config = _make_worker_vllm_config(\"kv_producer\")\n+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():\n+        producer = MooncakeConnector(\n+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()\n+        ).connector_worker\n+        producer.kv_caches_base_addr = [0x1000]\n+        producer.block_len_per_layer = [256]\n+        producer.kv_block_len_per_layer = [256]\n+        producer.registered_layer_names = [\"model.layers.0.self_attn\"]\n+        producer.registered_layer_indices = [0]\n+        sender_loop = producer.sender_loop\n+        producer.sender_loop = asyncio.get_running_loop()\n+\n+        producer.reqs_need_send[\"xfer-expired\"] = SendBlockMeta(\n+            p_req_id=\"p-req-expired\",\n+            transfer_id=\"xfer-expired\",\n+            local_block_ids=[[1]],\n+            ready=asyncio.Event(),\n+            expire_time=time.perf_counter() - 1,\n+        )\n+        assert await producer.fetch_finished_sending_reqs() == {\"p-req-expired\"}\n+\n+        req_blocks = {\"d-req-expired\": (\"xfer-expired\", [[100]])}\n+        if with_live_req:\n+            live = SendBlockMeta(\n+                p_req_id=\"p-req-live\",\n+                transfer_id=\"xfer-live\",\n+                local_block_ids=[[2]],\n+                ready=asyncio.Event(),\n+                expire_time=time.perf_counter() + 100,\n+            )\n+            live.ready.set()\n+            producer.reqs_need_send[\"xfer-live\"] = live\n+            req_blocks[\"d-req-live\"] = (\"xfer-live\", [[200]])\n+        metadata = _xfer_meta(\n+            [_region(0x2000, row_offset=-1, layer_name=\"model.layers.0.self_attn\")],\n+            req_blocks,\n+        )\n+        sock = AsyncMock(spec=zmq.asyncio.Socket, send_multipart=AsyncMock())\n+        with patch.object(producer, \"_send_blocks\", return_value=0):\n+            await producer.send_kv_to_decode(b\"consumer\", sock, metadata)\n+\n+        # No placeholder that would wait for a prefill that already ran.\n+        assert \"xfer-expired\" not in producer.reqs_need_send\n+        responses = [\n+            producer._xfer_resp_decoder.decode(c.args[0][1])\n+            for c in sock.send_multipart.call_args_list\n+        ]\n+        assert responses[0].err_reqs == [\"d-req-expired\"]\n+        if with_live_req:\n+            assert responses[0].status == MooncakeXferResponseStatus.CONTINUE\n+            assert len(responses) == 2\n+            assert responses[1].status == MooncakeXferResponseStatus.FINISH\n+            assert responses[1].ok_reqs == [\"d-req-live\"]\n+            assert producer.finished_sending_reqs == {\"p-req-live\"}\n+        else:\n+            assert responses[0].status == MooncakeXferResponseStatus.FINISH\n+            assert len(responses) == 1\n+\n+        producer.sender_loop = sender_loop\n+        producer.shutdown()\n+\n+\n @pytest.mark.parametrize(\n     (\"layout\", \"separate_kv_head_groups\"),\n     [",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/55c29ff24b9b418fec90fa6767cd026817bb3025/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_mooncake_connector.py",
+      "sha": "f947102a07b974a974534f1186da7ad290186d24",
+      "status": "modified"
+    },
+    {
+      "additions": 275,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/55c29ff24b9b418fec90fa6767cd026817bb3025/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fmooncake_connector.py",
+      "changes": 299,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fmooncake_connector.py?ref=55c29ff24b9b418fec90fa6767cd026817bb3025",
+      "deletions": 24,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+      "patch": "@@ -77,6 +77,7 @@\n     SlidingWindowSpec,\n )\n from vllm.v1.metrics.cache_hit_source import CacheHitSource\n+from vllm.v1.outputs import KVConnectorOutput\n from vllm.v1.request import RequestStatus\n from vllm.v1.worker.utils import select_common_block_size\n \n@@ -676,6 +677,38 @@ class MooncakeXferResponse(\n     layout_id: int = 0\n \n \n+class MooncakeLeaseHeartbeat(\n+    msgspec.Struct,\n+    omit_defaults=True,  # type: ignore[call-arg]\n+):\n+    \"\"\"Sent by D to renew P's lease on KV blocks that D has not pulled yet.\n+\n+    It shares P's side channel with pulls. A pull decodes as a heartbeat with\n+    no transfer ids, because msgspec skips the fields it does not know.\n+    \"\"\"\n+\n+    lease_transfer_ids: list[TransferId] = msgspec.field(default_factory=list)\n+\n+\n+@dataclass\n+class LeaseHeartbeat:\n+    \"\"\"Transfers that one P engine holds for this D engine under a lease.\"\"\"\n+\n+    remote_bootstrap_addr: str\n+    transfer_ids: list[TransferId]\n+\n+\n+def _get_kv_lease_duration(kv_transfer_config: KVTransferConfig) -> float | None:\n+    \"\"\"Return `kv_lease_duration` in seconds, or None when leases are off.\"\"\"\n+    duration = kv_transfer_config.get_from_extra_config(\"kv_lease_duration\", None)\n+    if duration is None:\n+        return None\n+    duration = float(duration)\n+    if duration <= 0:\n+        raise ValueError(f\"kv_lease_duration must be positive, got {duration}.\")\n+    return duration\n+\n+\n @dataclass\n class PullReqMeta:\n     d_req_id: ReqId\n@@ -711,6 +744,8 @@ def __init__(self):\n         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)\n         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}\n         self.reqs_not_processed: set[TransferId] = set()\n+        # D side: lease renewals to send this step, by remote P engine.\n+        self.lease_heartbeats: dict[EngineId, LeaseHeartbeat] = {}\n \n     def add_new_req(\n         self,\n@@ -814,6 +849,10 @@ def on_new_request(self, request: \"Request\") -> None:\n         assert self.connector_scheduler is not None\n         self.connector_scheduler.on_new_request(request)\n \n+    def update_connector_output(self, connector_output: KVConnectorOutput):\n+        assert self.connector_scheduler is not None\n+        self.connector_scheduler.update_connector_output(connector_output)\n+\n     def request_finished(\n         self,\n         request: \"Request\",\n@@ -980,6 +1019,13 @@ def __init__(\n         # remote prefill or aborted.\n         self._reqs_not_processed: set[TransferId] = set()\n \n+        # D side: requests whose KV P still holds under a lease, from arrival\n+        # until the pull settles. A request can wait in the queue for longer\n+        # than the lease, so renewal cannot wait until it is scheduled.\n+        self._kv_lease_duration = _get_kv_lease_duration(vllm_config.kv_transfer_config)\n+        self._lease_reqs: dict[ReqId, tuple[EngineId, str, TransferId]] = {}\n+        self._last_heartbeat_time = 0.0\n+\n         # Compute sliding window block counts per KV cache group.\n         sw_sizes_tokens: list[tuple[int, int]] = [\n             (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)\n@@ -1058,6 +1104,26 @@ def on_new_request(self, request: \"Request\") -> None:\n         ):\n             self._truncate_mamba_request_for_prefill(request)\n \n+        if (\n+            self._kv_lease_duration is not None\n+            and params is not None\n+            and params.get(\"do_remote_prefill\")\n+            and all(\n+                params.get(p)\n+                for p in (\"remote_engine_id\", \"remote_bootstrap_addr\", \"transfer_id\")\n+            )\n+        ):\n+            self._lease_reqs[request.request_id] = (\n+                params[\"remote_engine_id\"],\n+                params[\"remote_bootstrap_addr\"],\n+                params[\"transfer_id\"],\n+            )\n+\n+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:\n+        # Failed pulls are reported here too.\n+        for req_id in connector_output.finished_recving or ():\n+            self._lease_reqs.pop(req_id, None)\n+\n     def get_num_new_matched_tokens(\n         self, request: \"Request\", num_computed_tokens: int\n     ) -> tuple[int, bool]:\n@@ -1131,6 +1197,10 @@ def update_state_after_alloc(\n                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)\n                 # Get unhashed blocks to pull from remote.\n                 self._reqs_need_recv[request.request_id] = (request, local_block_ids)\n+                if not any(local_block_ids):\n+                    # This pull only releases P's blocks and never reaches\n+                    # finished_recving, so stop renewing the lease now.\n+                    self._lease_reqs.pop(request.request_id, None)\n             else:\n                 logger.warning(\n                     \"Got invalid KVTransferParams: %s. This \"\n@@ -1165,6 +1235,23 @@ def build_connector_meta(\n                 )\n             self._reqs_need_recv.clear()\n \n+            # Renew every lease in one message per P engine, every\n+            # kv_lease_duration / 6 seconds (as NixlConnector does).\n+            now = time.perf_counter()\n+            if (\n+                self._lease_reqs\n+                and self._kv_lease_duration is not None\n+                and now - self._last_heartbeat_time >= self._kv_lease_duration / 6\n+            ):\n+                self._last_heartbeat_time = now\n+                for engine_id, bootstrap_addr, transfer_id in self._lease_reqs.values():\n+                    heartbeat = meta.lease_heartbeats.get(engine_id)\n+                    if heartbeat is None:\n+                        heartbeat = meta.lease_heartbeats[engine_id] = LeaseHeartbeat(\n+                            remote_bootstrap_addr=bootstrap_addr, transfer_ids=[]\n+                        )\n+                    heartbeat.transfer_ids.append(transfer_id)\n+\n         if not self.is_kv_consumer:\n             for req_id, (req, block_ids) in self._reqs_need_send.items():\n                 assert req.kv_transfer_params is not None\n@@ -1196,6 +1283,7 @@ def request_finished(\n             request.status,\n             params,\n         )\n+        self._lease_reqs.pop(request.request_id, None)\n         if not params or not params.get(\"transfer_id\"):\n             return False, None\n \n@@ -1335,6 +1423,14 @@ def __init__(\n         self.kv_caches_base_addr: list[int] = []\n         self.device_kv_caches: dict[str, torch.Tensor] = {}\n         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}\n+        # P holds a finished request's blocks for kv_lease_duration seconds,\n+        # and each renewal from D moves the deadline to at least 2/3 of that\n+        # from now (as NixlConnector does). Unset keeps the fixed\n+        # VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT.\n+        self._kv_lease_duration = _get_kv_lease_duration(kv_transfer_config)\n+        # Expired transfers in expiry order, so a late pull fails at once\n+        # instead of waiting for a prefill that already happened.\n+        self._expired_transfer_ids: OrderedDict[TransferId, float] = OrderedDict()\n \n         # For kv_both, we will act both prefiller and decoder.\n         if not self.is_kv_consumer:\n@@ -1422,6 +1518,7 @@ def __init__(\n         self._encoder = msgspec.msgpack.Encoder()\n         self._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)\n         self._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)\n+        self._heartbeat_decoder = msgspec.msgpack.Decoder(MooncakeLeaseHeartbeat)\n \n     def _sync_block_size_with_kernel(self) -> None:\n         # When speculative decoding (e.g. Eagle) is enabled, the main model\n@@ -1540,6 +1637,15 @@ async def _mooncake_sender_listener(self, ready_event: threading.Event):\n         try:\n             while True:\n                 identity, metadata_bytes = await sock.recv_multipart()\n+                # Renew here, not in a sender worker: those can all be\n+                # waiting for prefills, and the renewal must not wait.\n+                heartbeat = self._decode_heartbeat(metadata_bytes)\n+                if heartbeat is not None:\n+                    response = self._renew_kv_leases(heartbeat.lease_transfer_ids)\n+                    await sock.send_multipart(\n+                        (identity, self._encoder.encode(response))\n+                    )\n+                    continue\n                 await self.sender_worker_queue.put((identity, metadata_bytes))\n         except zmq.ContextTerminated:\n             logger.debug(\"ZMQ context terminated, exiting Mooncake sender thread.\")\n@@ -1552,6 +1658,29 @@ async def _mooncake_sender_listener(self, ready_event: threading.Event):\n             await asyncio.gather(*sender_tasks, return_exceptions=True)\n             sock.close()\n \n+    def _decode_heartbeat(self, message: bytes) -> MooncakeLeaseHeartbeat | None:\n+        try:\n+            heartbeat = self._heartbeat_decoder.decode(message)\n+        except msgspec.DecodeError:\n+            # Leave malformed messages to the sender worker, which reports them.\n+            return None\n+        return heartbeat if heartbeat.lease_transfer_ids else None\n+\n+    def _renew_kv_leases(self, transfer_ids: list[TransferId]) -> MooncakeXferResponse:\n+        if self._kv_lease_duration is None:\n+            return MooncakeXferResponse(\n+                status=MooncakeXferResponseStatus.ERROR,\n+                err_msg=\"kv_lease_duration is not set on this prefill instance.\",\n+            )\n+        new_expire_time = time.perf_counter() + self._kv_lease_duration * 2 / 3\n+        for transfer_id in transfer_ids:\n+            # Skip transfers not prefilled yet or already freed; a renewal\n+            # must not recreate them.\n+            send_meta = self.reqs_need_send.get(transfer_id)\n+            if send_meta is not None:\n+                send_meta.expire_time = max(send_meta.expire_time, new_expire_time)\n+        return MooncakeXferResponse(status=MooncakeXferResponseStatus.FINISH)\n+\n     async def _sender_worker(self, sock: zmq.asyncio.Socket):\n         while True:\n             try:\n@@ -1656,8 +1785,12 @@ async def send_kv_to_decode(\n             )\n             await sock.send_multipart((identity, self._encoder.encode(response)))\n             return\n+        expired_reqs: list[ReqId] = []\n         for d_req_id, (transfer_id, _) in meta.req_blocks.items():\n             if transfer_id not in self.reqs_need_send:\n+                if transfer_id in self._expired_transfer_ids:\n+                    expired_reqs.append(d_req_id)\n+                    continue\n                 # This req is not enqueued in P side yet, create it here.\n                 self.reqs_need_send[transfer_id] = SendBlockMeta(\n                     p_req_id=\"\",\n@@ -1668,6 +1801,21 @@ async def send_kv_to_decode(\n             send_meta = self.reqs_need_send[transfer_id]\n             pending_reqs[d_req_id] = send_meta\n \n+        if expired_reqs:\n+            logger.warning(\n+                \"Requests %s were pulled after their KV expired on P side.\",\n+                expired_reqs,\n+            )\n+            response = MooncakeXferResponse(\n+                status=MooncakeXferResponseStatus.CONTINUE\n+                if pending_reqs\n+                else MooncakeXferResponseStatus.FINISH,\n+                err_reqs=expired_reqs,\n+                err_msg=\"KV expired on P side before the pull.\",\n+                layout_id=meta.layout_id,\n+            )\n+            await sock.send_multipart((identity, self._encoder.encode(response)))\n+\n         async def wait_and_ret(\n             d_req_id: ReqId, send_meta: SendBlockMeta\n         ) -> tuple[ReqId, SendBlockMeta]:\n@@ -2355,24 +2503,41 @@ async def fetch_finished_sending_reqs(self) -> set[ReqId]:\n         now = time.perf_counter()\n \n         expired_transfer_id = []\n+        # Scan every entry: renewals move deadlines, so the map is not in\n+        # expiry order.\n         for transfer_id, send_meta in self.reqs_need_send.items():\n             if (\n                 send_meta.p_req_id\n                 and send_meta.expire_time < now\n                 and send_meta.sending == 0\n             ):\n-                logger.warning(\n-                    \"Request %s timed out after %d seconds without \"\n-                    \"being sent. Freeing its blocks on the producer side.\",\n-                    send_meta.p_req_id,\n-                    envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,\n-                )\n+                if self._kv_lease_duration is None:\n+                    logger.warning(\n+                        \"Request %s timed out after %d seconds without \"\n+                        \"being sent. Freeing its blocks on the producer side.\",\n+                        send_meta.p_req_id,\n+                        envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,\n+                    )\n+                else:\n+                    logger.warning(\n+                        \"KV lease of request %s expired before the decoder \"\n+                        \"pulled it. Freeing its blocks on the producer side.\",\n+                        send_meta.p_req_id,\n+                    )\n                 self.xfer_stats.record_kv_expired_req()\n                 finished_sending_reqs.add(send_meta.p_req_id)\n                 expired_transfer_id.append(transfer_id)\n \n         for transfer_id in expired_transfer_id:\n             del self.reqs_need_send[transfer_id]\n+            self._expired_transfer_ids[transfer_id] = now\n+        # A pull later than this falls back to the ready-wait timeout.\n+        horizon = now - envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\n+        while self._expired_transfer_ids:\n+            transfer_id, expired_at = next(iter(self._expired_transfer_ids.items()))\n+            if expired_at >= horizon:\n+                break\n+            del self._expired_transfer_ids[transfer_id]\n \n         return finished_sending_reqs\n \n@@ -2643,31 +2808,46 @@ async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):\n         self._pending_bootstrap_queries[remote_bootstrap_addr].set()\n         del self._pending_bootstrap_queries[remote_bootstrap_addr]\n \n-    def receive_kv(\n-        self,\n-        remote_engine_id: EngineId,\n-        pull_metas: dict[ReqId, PullReqMeta],\n-    ):\n+    def _select_remote_workers(\n+        self, remote_engine_id: EngineId\n+    ) -> dict[int, list[int]]:\n+        \"\"\"Return the producer PP ranks to pull from, by producer TP rank.\"\"\"\n         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(\n             self._tp_size[remote_engine_id]\n         )\n-        worker_addrs: list[str] = []\n         selected_remote_pp: dict[int, list[int]] = {}\n         for remote_tp_rank in remote_tp_ranks:\n             pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]\n             if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:\n-                pp_ranks = [self.pp_rank]\n+                selected_remote_pp[remote_tp_rank] = [self.pp_rank]\n             else:\n-                pp_ranks = sorted(pp_to_addr)\n-            selected_remote_pp[remote_tp_rank] = pp_ranks\n-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)\n+                selected_remote_pp[remote_tp_rank] = sorted(pp_to_addr)\n+        return selected_remote_pp\n+\n+    def _remote_worker_addrs(\n+        self, remote_engine_id: EngineId, selected_remote_pp: dict[int, list[int]]\n+    ) -> list[str]:\n+        agents = self._remote_agents[remote_engine_id]\n+        return [\n+            agents[tp_rank][pp_rank]\n+            for tp_rank, pp_ranks in selected_remote_pp.items()\n+            for pp_rank in pp_ranks\n+        ]\n+\n+    def receive_kv(\n+        self,\n+        remote_engine_id: EngineId,\n+        pull_metas: dict[ReqId, PullReqMeta],\n+    ):\n+        selected_remote_pp = self._select_remote_workers(remote_engine_id)\n+        worker_addrs = self._remote_worker_addrs(remote_engine_id, selected_remote_pp)\n \n         count = len(worker_addrs)\n         logger.debug(\n             \"Receiving Mooncake KV for engine %s from producer TP ranks %s \"\n             \"and PP ranks %s\",\n             remote_engine_id,\n-            remote_tp_ranks,\n+            list(selected_remote_pp),\n             selected_remote_pp,\n         )\n         for pull_meta in pull_metas.values():\n@@ -2677,17 +2857,76 @@ def receive_kv(\n                 self.receive_kv_from_single_worker(worker_addr, pull_metas)\n             )\n \n+    async def _query_bootstrap(self, remote_bootstrap_addr: str):\n+        \"\"\"Query a bootstrap server, or wait for the query already running.\"\"\"\n+        if remote_bootstrap_addr not in self._pending_bootstrap_queries:\n+            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()\n+            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)\n+        else:\n+            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()\n+\n+    async def _send_lease_heartbeat(\n+        self, remote_engine_id: EngineId, heartbeat: LeaseHeartbeat\n+    ):\n+        \"\"\"Renew the leases one P engine holds for this worker's requests.\"\"\"\n+        if remote_engine_id not in self._remote_agents:\n+            # The requests may still be queued. Query now so this renewal,\n+            # and the pull later, can reach P's workers.\n+            await self._query_bootstrap(heartbeat.remote_bootstrap_addr)\n+            if remote_engine_id not in self._remote_agents:\n+                logger.warning(\n+                    \"Skipping KV lease renewal for %d requests: remote \"\n+                    \"engine_id %s not found from bootstrap server %s.\",\n+                    len(heartbeat.transfer_ids),\n+                    remote_engine_id,\n+                    heartbeat.remote_bootstrap_addr,\n+                )\n+                return\n+        payload = self._encoder.encode(\n+            MooncakeLeaseHeartbeat(lease_transfer_ids=heartbeat.transfer_ids)\n+        )\n+        selected_remote_pp = self._select_remote_workers(remote_engine_id)\n+        await asyncio.gather(\n+            *(\n+                self._send_heartbeat_to_worker(addr, payload)\n+                for addr in self._remote_worker_addrs(\n+                    remote_engine_id, selected_remote_pp\n+                )\n+            )\n+        )\n+\n+    async def _send_heartbeat_to_worker(self, worker_addr: str, payload: bytes):\n+        assert self._kv_lease_duration is not None\n+        try:\n+            with make_zmq_socket(\n+                self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0\n+            ) as sock:\n+                # Wait for the reply: linger=0 drops a message still unsent.\n+                sock.setsockopt(zmq.RCVTIMEO, int(self._kv_lease_duration / 6 * 1000))\n+                await sock.send(payload)\n+                response = self._xfer_resp_decoder.decode(await sock.recv())\n+        except zmq.ContextTerminated:\n+            return\n+        except Exception as e:\n+            # The pull reports a P that is really gone.\n+            logger.debug(\"KV lease renewal to %s failed: %s\", worker_addr, e)\n+            return\n+        if response.status == MooncakeXferResponseStatus.ERROR:\n+            logger.warning_once(\n+                \"Mooncake prefill worker %s rejected a KV lease renewal (%s). \"\n+                \"Set the same kv_lease_duration on prefill and decode \"\n+                \"instances.\",\n+                worker_addr,\n+                response.err_msg,\n+            )\n+\n     async def handle_new_engine_id(\n         self,\n         remote_engine_id: EngineId,\n         pull_metas: dict[ReqId, PullReqMeta],\n     ):\n         remote_bootstrap_addr = next(iter(pull_metas.values())).remote_bootstrap_addr\n-        if remote_bootstrap_addr not in self._pending_bootstrap_queries:\n-            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()\n-            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)\n-        else:\n-            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()\n+        await self._query_bootstrap(remote_bootstrap_addr)\n \n         if remote_engine_id not in self._remote_agents:\n             self._handle_failed_recv(\n@@ -2718,8 +2957,8 @@ async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):\n                 send_meta = self.reqs_need_send[transfer_id]\n                 send_meta.p_req_id = p_req_id\n                 send_meta.local_block_ids = block_ids\n-                send_meta.expire_time = (\n-                    time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\n+                send_meta.expire_time = time.perf_counter() + (\n+                    self._kv_lease_duration or envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT\n                 )\n                 send_meta.ready.set()\n             else:\n@@ -2739,12 +2978,24 @@ async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):\n             if send_meta:\n                 assert not send_meta.ready.is_set()\n \n+    async def _send_lease_heartbeats(\n+        self, lease_heartbeats: dict[EngineId, LeaseHeartbeat]\n+    ):\n+        for remote_engine_id, heartbeat in lease_heartbeats.items():\n+            asyncio.create_task(self._send_lease_heartbeat(remote_engine_id, heartbeat))\n+\n     def start_load_kv(self, metadata: MooncakeConnectorMetadata):\n         if not self.is_kv_producer and metadata.reqs_to_recv:\n             asyncio.run_coroutine_threadsafe(\n                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop\n             )\n \n+        if not self.is_kv_producer and metadata.lease_heartbeats:\n+            asyncio.run_coroutine_threadsafe(\n+                self._send_lease_heartbeats(metadata.lease_heartbeats),\n+                self.receiver_loop,\n+            )\n+\n         if not self.is_kv_consumer and (\n             metadata.reqs_to_send or metadata.reqs_not_processed\n         ):",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/55c29ff24b9b418fec90fa6767cd026817bb3025/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmooncake%2Fmooncake_connector.py",
+      "sha": "cabec9a0c74408546aa7498ee7c970ec50d54731",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "it's good to add a log here before `return` for better debug.",
+      "created_at": "2026-10-28T09:22:03Z",
+      "diff_hunk": "@@ -2677,17 +2857,69 @@ def receive_kv(\n                 self.receive_kv_from_single_worker(worker_addr, pull_metas)\n             )\n \n+    async def _query_bootstrap(self, remote_bootstrap_addr: str):\n+        \"\"\"Query a bootstrap server, or wait for the query already running.\"\"\"\n+        if remote_bootstrap_addr not in self._pending_bootstrap_queries:\n+            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()\n+            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)\n+        else:\n+            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()\n+\n+    async def _send_lease_heartbeat(\n+        self, remote_engine_id: EngineId, heartbeat: LeaseHeartbeat\n+    ):\n+        \"\"\"Renew the leases one P engine holds for this worker's requests.\"\"\"\n+        if remote_engine_id not in self._remote_agents:\n+            # The requests may still be queued. Query now so this renewal,\n+            # and the pull later, can reach P's workers.\n+            await self._query_bootstrap(heartbeat.remote_bootstrap_addr)\n+            if remote_engine_id not in self._remote_agents:",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#discussion_r4398838445",
+      "id": 4398838445,
+      "line": 2876,
+      "original_line": 2876,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+      "updated_at": "2026-10-28T09:22:58Z",
+      "user": {
+        "login": "wangxiyuan"
+      }
+    },
+    {
+      "body": "Added a warning before the `return` in fbf1e7f26. Thanks for the review!",
+      "created_at": "2026-10-28T09:31:42Z",
+      "diff_hunk": "@@ -2677,17 +2857,69 @@ def receive_kv(\n                 self.receive_kv_from_single_worker(worker_addr, pull_metas)\n             )\n \n+    async def _query_bootstrap(self, remote_bootstrap_addr: str):\n+        \"\"\"Query a bootstrap server, or wait for the query already running.\"\"\"\n+        if remote_bootstrap_addr not in self._pending_bootstrap_queries:\n+            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()\n+            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)\n+        else:\n+            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()\n+\n+    async def _send_lease_heartbeat(\n+        self, remote_engine_id: EngineId, heartbeat: LeaseHeartbeat\n+    ):\n+        \"\"\"Renew the leases one P engine holds for this worker's requests.\"\"\"\n+        if remote_engine_id not in self._remote_agents:\n+            # The requests may still be queued. Query now so this renewal,\n+            # and the pull later, can reach P's workers.\n+            await self._query_bootstrap(heartbeat.remote_bootstrap_addr)\n+            if remote_engine_id not in self._remote_agents:",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#discussion_r4398934052",
+      "id": 4398934052,
+      "line": 2876,
+      "original_line": 2876,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+      "updated_at": "2026-10-28T09:31:42Z",
+      "user": {
+        "login": "CJJ1008"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Documentation preview: https://vllm--64193.org.readthedocs.build/en/64193/",
+      "created_at": "2026-10-28T02:58:32Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6459450252",
+      "id": 6459450252,
+      "updated_at": "2026-10-28T02:58:32Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "✅ @CJJ1008, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-10-28T09:23:59Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465315655",
+      "id": 6465315655,
+      "updated_at": "2026-10-28T09:23:59Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-28T09:32:09Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465471668",
+      "id": 6465471668,
+      "updated_at": "2026-10-28T09:32:09Z",
+      "user": {
+        "login": "CJJ1008"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #97935](https://buildkite.com/vllm/ci/builds/97935) for commit `55c29ff24b9b`.\n\nℹ️ This PR is 24 commits behind upstream `main`. Merged upstream `main` into this branch as `55c29ff24b9b` before starting CI. Pull the branch before pushing more changes.",
+      "created_at": "2026-10-28T09:32:38Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465480557",
+      "id": 6465480557,
+      "updated_at": "2026-10-28T09:32:38Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "Follow-up idea (not blocking): turn P/D lease misconfiguration into an explicit error instead of a docs-level constraint.",
+      "created_at": "2026-10-28T09:35:52Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465541491",
+      "id": 6465541491,
+      "updated_at": "2026-10-28T09:35:52Z",
+      "user": {
+        "login": "wangxiyuan"
+      }
+    },
+    {
+      "body": "Thanks, good point! I'll handle it in a follow-up PR after this one lands. Rough idea for now (haven't validated it yet):\n\n- P advertises its `kv_lease_duration` via the bootstrap server, and D checks it when it looks P up. That catches D renewing against a P that has the lease off or a different value.\n- D also sends its `kv_lease_duration` with each pull (an optional field, so older P just ignores it), and P checks that. That catches P having the lease on while D isn't renewing, including older D builds.\n- If they don't match, the affected requests fail with a clear error showing both values, instead of relying on the docs.\n\nIf you have any other ideas, feel free to let me know. I'd be glad to keep contributing here.\n",
+      "created_at": "2026-10-28T09:54:51Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6465903653",
+      "id": 6465903653,
+      "updated_at": "2026-10-28T09:54:51Z",
+      "user": {
+        "login": "CJJ1008"
+      }
+    },
+    {
+      "body": "Hi @ivanium, this one's been approved and CI is green. Would you mind taking a look, and approving and merging it if it looks good to you? Thanks!",
+      "created_at": "2026-10-29T16:33:18Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#issuecomment-6502492016",
+      "id": 6502492016,
+      "updated_at": "2026-10-29T16:33:18Z",
+      "user": {
+        "login": "CJJ1008"
+      }
+    }
+  ],
+  "number": 64193,
+  "refs": {
+    "base": {
+      "commit": "77f58e530450416d217e4816727a35910bf3d9bf",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "55c29ff24b9b418fec90fa6767cd026817bb3025",
+      "repository": "CJJ1008/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#pullrequestreview-5677226531",
+      "id": 5677226531,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-28T02:58:01Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "The change LGTM. just a nit. Feel free to update if need follow-up change.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#pullrequestreview-5680353336",
+      "id": 5680353336,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-28T09:22:58Z",
+      "user": {
+        "login": "wangxiyuan"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/64193#pullrequestreview-5680481185",
+      "id": 5680481185,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-28T09:31:42Z",
+      "user": {
+        "login": "CJJ1008"
+      }
+    }
+  ]
+}

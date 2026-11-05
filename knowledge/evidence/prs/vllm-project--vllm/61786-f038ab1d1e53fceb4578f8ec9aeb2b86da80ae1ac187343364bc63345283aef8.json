@@ -1,0 +1,477 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "2989cdab3fa7badd0e43bd7e50eab83adecad4362eaea602628a4b2424b3b970",
+      "isPrivate": false,
+      "numbers": [
+        61794,
+        61793,
+        61792,
+        61791,
+        61790,
+        61789,
+        61788,
+        61786
+      ],
+      "observed_at": "2026-11-04T20:16:16.412753+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4610,
+        "resetAt": "2026-11-04T20:41:45Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "db3b0f0fae4bc98492b3863685e541e62bc59576",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nFixes #51567.\n\nWhen EPLB is enabled, expert tensors whose dtype NCCL does not support make engine startup fail. MXFP4 and MXFP8 experts store block scales as `torch.float8_e8m0fnu`. ROCm AITER MXFP4 also views expert weights as `torch.float4_e2m1fn_x2`. Neither dtype exists in NCCL or RCCL.\n\nI hit this with DeepSeek-V4.1-Flash using MXFP4 experts (Humming MoE backend), TP8 + EP + EPLB, on 8x H20. The crash happens in the first rearrange during memory profiling.\n\nWith `communicator=torch_nccl`:\n\n```text\nFile \"vllm/v1/worker/gpu_worker.py\", line 572, in determine_available_memory\nFile \"vllm/v1/worker/gpu/eplb_utils.py\", line 126, in step\nFile \"vllm/distributed/eplb/eplb_state.py\", line 580, in step\n...\nFile \"torch/distributed/distributed_c10d.py\", line 4280, in all_gather\n    work = group.allgather([tensor_list], [tensor], opts)\nTypeError: Input tensor data type is not supported for NCCL process group: Float8_e8m0fnu\n```\n\nWith `communicator=pynccl`:\n\n```text\nFile \"vllm/distributed/eplb/eplb_communicator.py\", line 756, in create_eplb_communicator\n    return _create_pynccl()\nFile \"vllm/distributed/eplb/eplb_communicator.py\", line 693, in _create_pynccl\n    raise RuntimeError(\nRuntimeError: EPLB communicator 'pynccl' requested but expert weights contain unsupported dtypes: (torch.float8_e8m0fnu).\n```\n\n## When this triggers\n\nThe bug is not tied to a specific model architecture. It depends on the dtype that the MoE backend leaves in the expert parameters after weight post-processing. Startup fails when all of these hold:\n\n1. EPLB is enabled (`--enable-eplb`, with EP).\n2. The experts use MX quantization (MXFP4/MXFP8 with E8M0 block scales).\n3. After post-processing, the backend stores an expert tensor in a 1-byte dtype that NCCL/RCCL does not support. For example:\n   - Marlin MXFP4 MoE: `mxfp4_marlin_process_scales()` returns scales as `float8_e8m0fnu`.\n   - ROCm AITER MXFP4: expert weights are viewed as `float4_e2m1fn_x2` (`oracle/mxfp4.py`).\n   - Humming MXFP4 (my repro): scales are stored as `float8_e8m0fnu`.\n\n   Backends that keep these tensors as `uint8` are not affected.\n4. The tensor is returned by `get_expert_weights()`, so it is registered for EPLB transport.\n\nConverting at load time is not enough. DeepSeek-V4/V4.1 loaders already view checkpoint E8M0 scales as `uint8`, but the backend's kernel-format conversion writes `float8_e8m0fnu` back into the parameter. The fix therefore belongs where the tensors are registered for EPLB, not in individual loaders or backends.\n\n## Root cause\n\nEPLB treats expert tensors as opaque payload. It only sends, receives, and all-gathers them, and never reduces them. However, it passes their numeric dtype straight to the communicator. On the first rearrange (the dummy all-gather during `determine_available_memory`), the communicator has to map that dtype to an NCCL dtype. NCCL only supports `int8/uint8/int32/int64/fp16/fp32/fp64/bf16` and FP8 E4M3/E5M2, so the mapping fails:\n\n- `torch_nccl` raises `TypeError` inside `all_gather`.\n- `pynccl` rejects the dtype earlier, when the communicator is created.\n\n## Fix\n\nEPLB only copies expert bytes between ranks. It never reduces them, so the numeric dtype does not matter to the transport. In `MixtureOfExperts.set_eplb_state()`, every 1-byte expert tensor is now registered as `w.view(torch.uint8)`:\n\n- The view keeps the shape, stride, and storage, so a rearrange writes directly into the parameter that the kernels read in the original dtype.\n- Applying the view at this registration point covers `FusedMoE` layers, models with their own `get_expert_weights()` (for example DeepSeek-V4 MegaMoE), and elastic EP re-registration.\n- 1-byte dtypes that NCCL already supports (`int8`, `uint8`, `float8_e4m3fn`) move the same bytes as before.\n\n## Test Plan\n\n```bash\n.venv/bin/python -m pytest tests/distributed/test_eplb_execute.py -k byte_dtypes -v\npre-commit run --files tests/distributed/test_eplb_execute.py vllm/model_executor/models/interfaces.py\n```\n\n## Test Result\n\n**Unit test:** the new test is parametrized over `float8_e8m0fnu` and `float4_e2m1fn_x2`. Both cases pass with this change and fail on `main`. pre-commit (ruff, mypy) passes.\n\n**MXFP4 deployment with EPLB (8x H20, SM90):** DeepSeek-V4.1-Flash with MXFP4 experts, Humming MoE backend (`HummingIndexedExperts`), TP8 + EP + EPLB (sync, `pynccl`, 16 redundant experts, `step_interval=1500`). The image is `vllm/vllm-openai:v0.30.0` with this PR's diff applied to `interfaces.py`. On this setup, startup previously failed with the tracebacks above.\n\n- Startup: the profile rearrange passes and the server starts.\n  ```text\n  Rearranging experts sync mode (profile)...\n  Rearranged experts  (profile)  in 2.30 s.\n  Application startup complete.\n  ```\n- Real rearranges: three ran during the GSM8K run below. The first took 6.64 s and the next two took 0.27 s each. Balancedness was about 0.70 before the first rearrange and 0.82 to 0.87 after.\n- Accuracy across rearranges (GSM8K, all 1319 questions, 5-shot chat, concurrency 32): flex-extract 89.92% ± 0.83 (1186/1319). This matches our production deployment of the same model without EPLB (90.1%). All 8 smoke prompts were also answered correctly.\n- None of the 8 ranks logged `Traceback`, `Float8_e8m0fnu`, `unsupported dtypes`, or `TypeError`.\n\n## AI assistance\n\nThis PR was prepared with AI assistance (Claude). I reviewed every changed line and ran the tests above.\n\n\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "luoyuctl"
+            },
+            "body": "@ZJY0516 @ilmarkov @SageMoore hi, do you have time to review? thx",
+            "createdAt": "2026-10-15T10:45:35Z",
+            "databaseId": 6190241061,
+            "updatedAt": "2026-10-15T10:45:35Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6190241061"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ilmarkov"
+            },
+            "body": "Fix looks good to me. Please, add the validation results for mxfp4 model deployment with eplb to PR description.",
+            "createdAt": "2026-10-15T12:03:02Z",
+            "databaseId": 6191584296,
+            "updatedAt": "2026-10-15T12:03:02Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6191584296"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "luoyuctl"
+            },
+            "body": "<img width=\"833\" height=\"388\" alt=\"Clipboard_Screenshot_1792080596\" src=\"https://github.com/user-attachments/assets/89c8f111-c825-4515-8b99-0d52b353250e\" />\r\n<img width=\"791\" height=\"185\" alt=\"Clipboard_Screenshot_1792080487\" src=\"https://github.com/user-attachments/assets/d332a802-b2bd-4937-8610-61d0f481dff3\" />\r\n\r\n@ilmarkov i ran a e2e test and full GSM8K eval test , both worked. also added the MXFP4 + EPLB deployment results (DeepSeek-V4.1-Flash, Humming MXFP4 MoE, EP8 with sync EPLB on 8x H20) to the description, you can check it , thanks \r\n\r\n",
+            "createdAt": "2026-10-15T16:16:14Z",
+            "databaseId": 6196769868,
+            "updatedAt": "2026-10-15T16:16:14Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6196769868"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chaunceyjiang"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-21T12:14:41Z",
+            "databaseId": 6315643533,
+            "updatedAt": "2026-10-21T12:14:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6315643533"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ @luoyuctl, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-10-21T12:14:47Z",
+            "databaseId": 6315645630,
+            "updatedAt": "2026-10-21T12:14:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6315645630"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #96411](https://buildkite.com/vllm/ci/builds/96411) for commit `5536663eff72`.",
+            "createdAt": "2026-10-21T12:15:01Z",
+            "databaseId": 6315649915,
+            "updatedAt": "2026-10-21T12:15:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6315649915"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "luoyuctl"
+            },
+            "body": "@chaunceyjiang i tried, our environment is aliyun edrma, which isn't a standard IB/RoCE NIC so the compatibility is poor, thanks for suggestion",
+            "createdAt": "2026-10-22T03:01:50Z",
+            "databaseId": 6331627158,
+            "updatedAt": "2026-10-22T03:01:50Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6331627158"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chaunceyjiang"
+            },
+            "body": "> @chaunceyjiang i tried, our environment is aliyun edrma, which isn't a standard IB/RoCE NIC so the compatibility is poor, thanks for suggestion\r\n\r\nmake sense.\r\n\r\nLGTM",
+            "createdAt": "2026-10-22T03:17:36Z",
+            "databaseId": 6331821620,
+            "updatedAt": "2026-10-22T03:17:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6331821620"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXln7jQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 8
+      },
+      "headRefOid": "5536663eff722be0c1f97989c2302ff0684ca7b6",
+      "headRepository": {
+        "nameWithOwner": "luoyuctl/vllm"
+      },
+      "mergeCommit": {
+        "oid": "876d5da8316a81180b8c7f10dea5ffab5b5a849f"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-22T03:22:17Z",
+      "number": 61786,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5530998603,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-15T09:33:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5530998603"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ilmarkov"
+            },
+            "body": "LGTM",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5585177663,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-20T12:47:33Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5585177663"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chaunceyjiang"
+            },
+            "body": "LGTM",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5599446088,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-21T12:12:28Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5599446088"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chaunceyjiang"
+            },
+            "body": "Thanks for the PR! I independently ran into the same issue yesterday.\n\nI also tried NIXL, and it worked fine for me. Could you give NIXL a try as well?\n\nIf NIXL works for you too, I think we can hold off on merging this PR for now.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5608657739,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-22T02:42:14Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5608657739"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "chaunceyjiang"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5608865392,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-22T03:17:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5608865392"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yMlQwMzoxNzo1OFq0MjAyNi0xMC0yMlQwMzoxNzo1OFrPAAAAAU5QfnA=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "MERGED",
+      "title": "[Bugfix][EPLB] Move 1-byte expert tensors as uint8 views",
+      "updatedAt": "2026-10-22T03:22:17Z",
+      "url": "https://github.com/vllm-project/vllm/pull/61786"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "db3b0f0fae4bc98492b3863685e541e62bc59576"
+    },
+    "body": "## Purpose\n\nFixes #51567.\n\nWhen EPLB is enabled, expert tensors whose dtype NCCL does not support make engine startup fail. MXFP4 and MXFP8 experts store block scales as `torch.float8_e8m0fnu`. ROCm AITER MXFP4 also views expert weights as `torch.float4_e2m1fn_x2`. Neither dtype exists in NCCL or RCCL.\n\nI hit this with DeepSeek-V4.1-Flash using MXFP4 experts (Humming MoE backend), TP8 + EP + EPLB, on 8x H20. The crash happens in the first rearrange during memory profiling.\n\nWith `communicator=torch_nccl`:\n\n```text\nFile \"vllm/v1/worker/gpu_worker.py\", line 572, in determine_available_memory\nFile \"vllm/v1/worker/gpu/eplb_utils.py\", line 126, in step\nFile \"vllm/distributed/eplb/eplb_state.py\", line 580, in step\n...\nFile \"torch/distributed/distributed_c10d.py\", line 4280, in all_gather\n    work = group.allgather([tensor_list], [tensor], opts)\nTypeError: Input tensor data type is not supported for NCCL process group: Float8_e8m0fnu\n```\n\nWith `communicator=pynccl`:\n\n```text\nFile \"vllm/distributed/eplb/eplb_communicator.py\", line 756, in create_eplb_communicator\n    return _create_pynccl()\nFile \"vllm/distributed/eplb/eplb_communicator.py\", line 693, in _create_pynccl\n    raise RuntimeError(\nRuntimeError: EPLB communicator 'pynccl' requested but expert weights contain unsupported dtypes: (torch.float8_e8m0fnu).\n```\n\n## When this triggers\n\nThe bug is not tied to a specific model architecture. It depends on the dtype that the MoE backend leaves in the expert parameters after weight post-processing. Startup fails when all of these hold:\n\n1. EPLB is enabled (`--enable-eplb`, with EP).\n2. The experts use MX quantization (MXFP4/MXFP8 with E8M0 block scales).\n3. After post-processing, the backend stores an expert tensor in a 1-byte dtype that NCCL/RCCL does not support. For example:\n   - Marlin MXFP4 MoE: `mxfp4_marlin_process_scales()` returns scales as `float8_e8m0fnu`.\n   - ROCm AITER MXFP4: expert weights are viewed as `float4_e2m1fn_x2` (`oracle/mxfp4.py`).\n   - Humming MXFP4 (my repro): scales are stored as `float8_e8m0fnu`.\n\n   Backends that keep these tensors as `uint8` are not affected.\n4. The tensor is returned by `get_expert_weights()`, so it is registered for EPLB transport.\n\nConverting at load time is not enough. DeepSeek-V4/V4.1 loaders already view checkpoint E8M0 scales as `uint8`, but the backend's kernel-format conversion writes `float8_e8m0fnu` back into the parameter. The fix therefore belongs where the tensors are registered for EPLB, not in individual loaders or backends.\n\n## Root cause\n\nEPLB treats expert tensors as opaque payload. It only sends, receives, and all-gathers them, and never reduces them. However, it passes their numeric dtype straight to the communicator. On the first rearrange (the dummy all-gather during `determine_available_memory`), the communicator has to map that dtype to an NCCL dtype. NCCL only supports `int8/uint8/int32/int64/fp16/fp32/fp64/bf16` and FP8 E4M3/E5M2, so the mapping fails:\n\n- `torch_nccl` raises `TypeError` inside `all_gather`.\n- `pynccl` rejects the dtype earlier, when the communicator is created.\n\n## Fix\n\nEPLB only copies expert bytes between ranks. It never reduces them, so the numeric dtype does not matter to the transport. In `MixtureOfExperts.set_eplb_state()`, every 1-byte expert tensor is now registered as `w.view(torch.uint8)`:\n\n- The view keeps the shape, stride, and storage, so a rearrange writes directly into the parameter that the kernels read in the original dtype.\n- Applying the view at this registration point covers `FusedMoE` layers, models with their own `get_expert_weights()` (for example DeepSeek-V4 MegaMoE), and elastic EP re-registration.\n- 1-byte dtypes that NCCL already supports (`int8`, `uint8`, `float8_e4m3fn`) move the same bytes as before.\n\n## Test Plan\n\n```bash\n.venv/bin/python -m pytest tests/distributed/test_eplb_execute.py -k byte_dtypes -v\npre-commit run --files tests/distributed/test_eplb_execute.py vllm/model_executor/models/interfaces.py\n```\n\n## Test Result\n\n**Unit test:** the new test is parametrized over `float8_e8m0fnu` and `float4_e2m1fn_x2`. Both cases pass with this change and fail on `main`. pre-commit (ruff, mypy) passes.\n\n**MXFP4 deployment with EPLB (8x H20, SM90):** DeepSeek-V4.1-Flash with MXFP4 experts, Humming MoE backend (`HummingIndexedExperts`), TP8 + EP + EPLB (sync, `pynccl`, 16 redundant experts, `step_interval=1500`). The image is `vllm/vllm-openai:v0.30.0` with this PR's diff applied to `interfaces.py`. On this setup, startup previously failed with the tracebacks above.\n\n- Startup: the profile rearrange passes and the server starts.\n  ```text\n  Rearranging experts sync mode (profile)...\n  Rearranged experts  (profile)  in 2.30 s.\n  Application startup complete.\n  ```\n- Real rearranges: three ran during the GSM8K run below. The first took 6.64 s and the next two took 0.27 s each. Balancedness was about 0.70 before the first rearrange and 0.82 to 0.87 after.\n- Accuracy across rearranges (GSM8K, all 1319 questions, 5-shot chat, concurrency 32): flex-extract 89.92% ± 0.83 (1186/1319). This matches our production deployment of the same model without EPLB (90.1%). All 8 smoke prompts were also answered correctly.\n- None of the 8 ranks logged `Traceback`, `Float8_e8m0fnu`, `unsupported dtypes`, or `TypeError`.\n\n## AI assistance\n\nThis PR was prepared with AI assistance (Claude). I reviewed every changed line and ran the tests above.\n\n\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "luoyuctl/vllm"
+      },
+      "sha": "5536663eff722be0c1f97989c2302ff0684ca7b6"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/61786",
+    "merge_commit_sha": "876d5da8316a81180b8c7f10dea5ffab5b5a849f",
+    "merged": true,
+    "merged_at": "2026-10-22T03:22:17Z",
+    "number": 61786,
+    "state": "closed",
+    "title": "[Bugfix][EPLB] Move 1-byte expert tensors as uint8 views",
+    "updated_at": "2026-10-22T03:22:17Z"
+  },
+  "files": [
+    {
+      "additions": 23,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5536663eff722be0c1f97989c2302ff0684ca7b6/tests%2Fdistributed%2Ftest_eplb_execute.py",
+      "changes": 23,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fdistributed%2Ftest_eplb_execute.py?ref=5536663eff722be0c1f97989c2302ff0684ca7b6",
+      "deletions": 0,
+      "filename": "tests/distributed/test_eplb_execute.py",
+      "patch": "@@ -2,6 +2,7 @@\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n \n import random\n+from types import SimpleNamespace\n \n import pytest\n import torch\n@@ -23,11 +24,33 @@\n     ensure_model_parallel_initialized,\n     get_tp_group,\n )\n+from vllm.model_executor.models.interfaces import MixtureOfExperts\n from vllm.platforms import current_platform\n \n from .eplb_utils import distributed_run, set_env_vars_and_device\n \n \n+@pytest.mark.parametrize(\"dtype\", [torch.float8_e8m0fnu, torch.float4_e2m1fn_x2])\n+def test_set_eplb_state_registers_byte_dtypes_as_uint8_views(dtype):\n+    \"\"\"NCCL lacks these dtypes, so EPLB must see their bytes as uint8 views\n+    sharing storage with the parameter the kernel reads.\"\"\"\n+    weight = torch.zeros(2, 8, dtype=torch.int32)\n+    scale = torch.zeros(2, 4, dtype=torch.uint8).view(dtype)\n+    layer = SimpleNamespace(\n+        get_expert_weights=lambda: [weight, scale],\n+        set_eplb_state=lambda **_: None,\n+    )\n+    model = SimpleNamespace(moe_layers=[layer])\n+    empty = torch.empty(0)\n+    MixtureOfExperts.set_eplb_state(model, empty, empty, empty)\n+\n+    registered_weight, registered_scale = model.expert_weights[0]\n+    assert registered_weight is weight\n+    assert registered_scale.dtype == torch.uint8\n+    registered_scale.fill_(127)\n+    assert torch.equal(scale.view(torch.uint8), registered_scale)\n+\n+\n @pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n def test_gloo_receive_staging_does_not_force_gpu_sync(monkeypatch):\n     \"\"\"Gloo receives must reach the GPU without an implicit pageable copy.\"\"\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5536663eff722be0c1f97989c2302ff0684ca7b6/tests%2Fdistributed%2Ftest_eplb_execute.py",
+      "sha": "6d0f89248d47e9e6f7011269e4fcc97dd581a20f",
+      "status": "modified"
+    },
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/5536663eff722be0c1f97989c2302ff0684ca7b6/vllm%2Fmodel_executor%2Fmodels%2Finterfaces.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fmodels%2Finterfaces.py?ref=5536663eff722be0c1f97989c2302ff0684ca7b6",
+      "deletions": 2,
+      "filename": "vllm/model_executor/models/interfaces.py",
+      "patch": "@@ -1109,8 +1109,14 @@ def set_eplb_state(\n         \"\"\"\n         self.expert_weights = []\n         for layer_idx, layer in enumerate(self.moe_layers):\n-            # Register the expert weights.\n-            self.expert_weights.append(list(layer.get_expert_weights()))\n+            # Register the expert weights. EPLB only moves bytes, so 1-byte\n+            # dtypes NCCL lacks (e.g. E8M0, FP4x2) go as uint8 views.\n+            self.expert_weights.append(\n+                [\n+                    w.view(torch.uint8) if w.element_size() == 1 else w\n+                    for w in layer.get_expert_weights()\n+                ]\n+            )\n             layer.set_eplb_state(\n                 moe_layer_idx=layer_idx,\n                 expert_load_view=expert_load_view,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/5536663eff722be0c1f97989c2302ff0684ca7b6/vllm%2Fmodel_executor%2Fmodels%2Finterfaces.py",
+      "sha": "bd0a6881c7a9050a233741aefa182166cc3b0901",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "@ZJY0516 @ilmarkov @SageMoore hi, do you have time to review? thx",
+      "created_at": "2026-10-15T10:45:35Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6190241061",
+      "id": 6190241061,
+      "updated_at": "2026-10-15T10:45:35Z",
+      "user": {
+        "login": "luoyuctl"
+      }
+    },
+    {
+      "body": "Fix looks good to me. Please, add the validation results for mxfp4 model deployment with eplb to PR description.",
+      "created_at": "2026-10-15T12:03:02Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6191584296",
+      "id": 6191584296,
+      "updated_at": "2026-10-15T12:03:02Z",
+      "user": {
+        "login": "ilmarkov"
+      }
+    },
+    {
+      "body": "<img width=\"833\" height=\"388\" alt=\"Clipboard_Screenshot_1792080596\" src=\"https://github.com/user-attachments/assets/89c8f111-c825-4515-8b99-0d52b353250e\" />\r\n<img width=\"791\" height=\"185\" alt=\"Clipboard_Screenshot_1792080487\" src=\"https://github.com/user-attachments/assets/d332a802-b2bd-4937-8610-61d0f481dff3\" />\r\n\r\n@ilmarkov i ran a e2e test and full GSM8K eval test , both worked. also added the MXFP4 + EPLB deployment results (DeepSeek-V4.1-Flash, Humming MXFP4 MoE, EP8 with sync EPLB on 8x H20) to the description, you can check it , thanks \r\n\r\n",
+      "created_at": "2026-10-15T16:16:14Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6196769868",
+      "id": 6196769868,
+      "updated_at": "2026-10-15T16:16:14Z",
+      "user": {
+        "login": "luoyuctl"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-21T12:14:41Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6315643533",
+      "id": 6315643533,
+      "updated_at": "2026-10-21T12:14:41Z",
+      "user": {
+        "login": "chaunceyjiang"
+      }
+    },
+    {
+      "body": "✅ @luoyuctl, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-10-21T12:14:47Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6315645630",
+      "id": 6315645630,
+      "updated_at": "2026-10-21T12:14:47Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #96411](https://buildkite.com/vllm/ci/builds/96411) for commit `5536663eff72`.",
+      "created_at": "2026-10-21T12:15:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6315649915",
+      "id": 6315649915,
+      "updated_at": "2026-10-21T12:15:01Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "@chaunceyjiang i tried, our environment is aliyun edrma, which isn't a standard IB/RoCE NIC so the compatibility is poor, thanks for suggestion",
+      "created_at": "2026-10-22T03:01:50Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6331627158",
+      "id": 6331627158,
+      "updated_at": "2026-10-22T03:01:50Z",
+      "user": {
+        "login": "luoyuctl"
+      }
+    },
+    {
+      "body": "> @chaunceyjiang i tried, our environment is aliyun edrma, which isn't a standard IB/RoCE NIC so the compatibility is poor, thanks for suggestion\r\n\r\nmake sense.\r\n\r\nLGTM",
+      "created_at": "2026-10-22T03:17:36Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#issuecomment-6331821620",
+      "id": 6331821620,
+      "updated_at": "2026-10-22T03:17:36Z",
+      "user": {
+        "login": "chaunceyjiang"
+      }
+    }
+  ],
+  "number": 61786,
+  "refs": {
+    "base": {
+      "commit": "db3b0f0fae4bc98492b3863685e541e62bc59576",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "5536663eff722be0c1f97989c2302ff0684ca7b6",
+      "repository": "luoyuctl/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5530998603",
+      "id": 5530998603,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-15T09:33:21Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "LGTM",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5585177663",
+      "id": 5585177663,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-20T12:47:33Z",
+      "user": {
+        "login": "ilmarkov"
+      }
+    },
+    {
+      "body": "LGTM",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5599446088",
+      "id": 5599446088,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-21T12:12:28Z",
+      "user": {
+        "login": "chaunceyjiang"
+      }
+    },
+    {
+      "body": "Thanks for the PR! I independently ran into the same issue yesterday.\n\nI also tried NIXL, and it worked fine for me. Could you give NIXL a try as well?\n\nIf NIXL works for you too, I think we can hold off on merging this PR for now.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5608657739",
+      "id": 5608657739,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-22T02:42:14Z",
+      "user": {
+        "login": "chaunceyjiang"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/61786#pullrequestreview-5608865392",
+      "id": 5608865392,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-22T03:17:58Z",
+      "user": {
+        "login": "chaunceyjiang"
+      }
+    }
+  ]
+}

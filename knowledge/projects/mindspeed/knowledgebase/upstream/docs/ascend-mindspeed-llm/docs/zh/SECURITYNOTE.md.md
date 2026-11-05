@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/SECURITYNOTE.md
-raw_sha256: 284f72b4eeeaac272bb901dbe165cbee73ec56ac4967225b1f3028f35f65a0af
+raw_sha256: d7d19aa0862cf9c4f59008f5b4c1a5713d6a395e2932cf24a1a8ecd6ccaf2461
 sources: []
-generated_body_sha256: f54fc64176287428a63d64dd40e51b76458fa372017463228a8e3922b65817ce
+generated_body_sha256: ab1692b30681beda1a57df2b965af917c9bce43ba9a3b24dca0ef5d9f5067712
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/SECURITYNOTE.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/SECURITYNOTE.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/SECURITYNOTE.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,7 +38,7 @@ Upstream source document; original commands, claims and links require their stat
 
 ## 运行用户建议
 
-出于安全性及权限最小化角度考虑，不建议使用root等管理员类型账户使用MindSpeed LLM。
+出于安全性及权限最小化角度考虑，不建议使用root等管理员类型账户运行MindSpeed LLM。
 
 ## 文件权限控制
 

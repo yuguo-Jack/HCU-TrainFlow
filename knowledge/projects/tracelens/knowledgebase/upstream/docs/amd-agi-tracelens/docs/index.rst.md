@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/index.rst
-raw_sha256: 87c83311ad79cb22dd1c16943ac3d252f5bb4413f193195b3f0fbbde8dd9e5c3
+raw_sha256: 1e1e46aabb50949207a1e784fd2cda153f754734359bdeca4d98ce5f0ba1ce09
 sources: []
-generated_body_sha256: 435476cfd29254a1defceb62cfc075d944510b473f184c1c1f1e59b97e754663
+generated_body_sha256: d20827562b8aeb1bcc47cf42dccc94c04b639ef0a65d05e4625c32ebfb0ffc6e
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/index.rst
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/index.rst)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/index.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -72,9 +72,11 @@ The TraceLens source code is hosted at `github.com/AMD-AGI/TraceLens <https://gi
       * :doc:`Analyze traces with the SDK <how-to/sdk-analysis>`
       * :doc:`Index a corpus of traces <how-to/trace-index>`
       * :doc:`Model op performance without a trace <how-to/perf-model-without-trace>`
+      * :doc:`Project a model's roofline from its checkpoint <how-to/generate-model-roofline-projection>`
       * :doc:`Analyze collective communication <how-to/nccl-analysis>`
       * :doc:`Estimate kernel times with Origami <how-to/origami-integration>`
       * :doc:`Agentic performance analysis with the TraceLens Agent <how-to/agent>`
+      * :doc:`Visualize a model with the TraceLens Agent <how-to/visualize-model>`
 
    .. grid-item-card:: Concepts
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/evaluation/evaluation_datasets/needlebench-evaluation.md
-raw_sha256: b934b53f8d9a5296b310ac65d53eea11eb315541553eef231319588b7f81301c
+raw_sha256: 8b85aac128cef7c55644eed1803b4c4ec1e4a1536b0461d68ab1df59d4904e8c
 sources: []
-generated_body_sha256: 5763f36793e2f58c645ae0701f7429982870eaa4cab591840231252ab16816b4
+generated_body_sha256: 45911c8b50e2f5f2c527f434801850c0183885bf0691bd289398cfc02d3a3cc6
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/evaluation/evaluation_datasets/needlebench-evaluation.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/evaluation/evaluation_datasets/needlebench-evaluation.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/evaluation/evaluation_datasets/needlebench-evaluation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -46,7 +46,7 @@ Currently, the MindSpeed LLM repository supports only the Single-Needle-Retrieva
 
 The NeedleBench accuracy test results are as follows:
 
-| Model | Task | MindSpeed LLM | Community Version ([OpenCompass](https://opencompass.readthedocs.io/en/latest/advanced_guides/needleinahaystack_eval.html)) |
+| Model | Task | MindSpeed LLM | Community Version ([OpenCompass](https://doc.opencompass.org.cn/faq/needleinahaystack_eval.html)) |
 |---|---|---|---|
 | [Qwen2-7B-Instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | NeedleBench-128K-Single-Needle-Retrieval | 70.19% | 70.25% |
 | [Qwen2-7B-Instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) + YaRN | NeedleBench-128K-Single-Needle-Retrieval | 87.03% | 88.63% |

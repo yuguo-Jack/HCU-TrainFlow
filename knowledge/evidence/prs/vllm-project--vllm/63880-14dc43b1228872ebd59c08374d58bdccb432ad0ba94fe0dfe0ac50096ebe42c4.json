@@ -1,0 +1,924 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "beee69dce22252ec3c75c8f42ae9ee964de17c9c4785681ed83657575d9c297e",
+      "isPrivate": false,
+      "numbers": [
+        63885,
+        63884,
+        63883,
+        63882,
+        63881,
+        63880,
+        63879,
+        63878
+      ],
+      "observed_at": "2026-11-04T19:49:15.919613+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4975,
+        "resetAt": "2026-11-04T20:42:56Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "ed1a7307950ab5e6593d25123579ed7ca998b350",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "<!-- markdownlint-disable -->\r\n\r\n## Overview\r\n\r\nIn MoRIIO WRITE mode, the prefill can wait for a request's RDMA completion on the model forward thread (`wait_for_save` → `seal_pending_transfers` → `_finalize_if_complete`). A transfer timeout there raises `TransferError` out of `execute_model` on one rank, and the engine dies. This PR moves that wait to the existing write-worker thread. A failed or timed-out transfer now sends `write_failed` to decode, so only that request fails.\r\n\r\n## Claims\r\n\r\n- A WRITE transfer that fails or times out no longer kills the prefill engine. It fails only its own request: decode reports it in `failed_recving`, and `kv_load_failure_policy` applies.\r\n- The forward thread never blocks on RDMA completion. Previously it could stall prefill for every other request for up to `transfer_timeout` (30 s by default).\r\n- On the write-worker path, the same failure now notifies decode. Previously the prefill freed its blocks and the decode request hung in `WAITING_FOR_REMOTE_KVS`.\r\n\r\n## Validation\r\n\r\n**Setup.** GLM-5.3-FP8 on MI300X, MoRIIO WRITE, PD disaggregation.\r\n\r\n**On `main`.** `vllm/vllm-openai-rocm` nightly built from `00b6c4c565` (HIP 7.15, AITER 0.1.26); `moriio_engine.py` there is byte-identical to this PR's base. \"With fix\" is the same image with this PR's files copied in (together with #63878 and #63879, which do not touch this path). DP8/EP8 1P1D, `kv_connector_extra_config.transfer_timeout=0.02` so long transfers fail. Sequence: one small request, one 128K request, `/health` on both engines, then 3 small requests.\r\n\r\n| | Small request before | 128K request | 3 small requests after | `/health` P / D after | Prefill log |\r\n|---|---|---|---|---|---|\r\n| Nightly | 200 | hung until the 1200 s client timeout | each hung until the 600 s client timeout | 200 / 200 | 4× \"Write task failed … marking done\" (blocks freed, decode not told) |\r\n| Nightly + this PR | 200 | **HTTP 500 after 46 s** | **HTTP 500 in 0.4–0.6 s each** | 200 / 200 | 4× \"WRITE transfer failed\" (new path: `write_failed` sent to decode) |\r\n\r\nThe small requests after the 128K one also fail with the fix because the 20 ms timeout is still forced. The difference is fail-fast versus hanging. Neither arm logged `EngineDeadError`: in this run every timeout surfaced on the write worker, so this run exercises the `write_failed` half of the change; the forward-thread half is covered by the unit test below and the 700K v0.32.0 run.\r\n\r\n**On v0.32.0** (same finalize path as `main`), with an earlier, larger version of this fix. That version polled completions on the worker and sent the same `write_failed` message, which decode on `main` already handles.\r\n\r\n| Scenario | Without fix | With fix |\r\n|---|---|---|\r\n| TP8 prefill + TP8 decode, 2 concurrent 700K-token requests; the KV transfer outlived the 30 s default timeout | `TransferError: RDMA transfer timed out after 30s` raised on one prefill rank. Its peers waited in the next collective; after the 1800 s RPC timeout: `EngineDeadError` | Only the affected request fails (next row). With `transfer_timeout=300`, the same workload completed 2/2 requests in each of 2 reps, 0 errors |\r\n| DP8/EP8 1P1D, timeout forced to 20 ms so every long transfer fails | — | A 128K request returned HTTP 500 after 50.5 s; it did not hang. 14 producer failures matched 14 decode `write_failed` receipts. Both engines stayed `/health` 200; 0 `EngineDeadError` |\r\n\r\n**Unit tests** (`tests/v1/kv_connector/unit/test_moriio_write_done_routing.py`). Each new test fails on `main` and passes with this PR:\r\n\r\n| Test | On `main` |\r\n|---|---|\r\n| `test_seal_on_forward_thread_never_waits_for_rdma` | `seal_pending_transfers()` runs the RDMA wait inline |\r\n| `test_failed_rdma_write_fails_only_that_request_on_decode` | `seal_pending_transfers()` raises `TransferError` (the engine-killing path) |\r\n\r\nAll MoRIIO unit tests pass: 770 passed, 35 skipped (768 on `main` plus the 2 new tests).\r\n\r\n```bash\r\npytest tests/v1/kv_connector/unit/test_moriio_*.py\r\n```\r\n\r\n## Details\r\n\r\n**Request flow (WRITE):**\r\n1. D allocates blocks for request R and sends them to P (`RemoteAllocInfo`).\r\n2. In P's forward, `save_kv_layer` queues one write task per layer. The write worker thread posts the RDMA writes and records their statuses.\r\n3. After the forward, `wait_for_save` → `seal_pending_transfers` records how many writes R expects.\r\n4. Once all of R's writes are posted and sealed, `_finalize_if_complete` waits for R's RDMA statuses, sends `write_done` to D, and frees P's blocks. D then schedules R for decode.\r\n\r\n**Root cause.** Two threads can run step 4: the write worker, after the last write, or the forward thread in step 3 when the worker finished first. The step-4 wait is bounded by `transfer_timeout`:\r\n- **On the forward thread,** the wait blocks the forward. On timeout, `TransferError` escapes `execute_model` on that rank only, while the other ranks enter the next step's collectives.\r\n- **On the write worker,** the exception is caught (\"Write task failed … marking done\"). P frees its blocks, but D is never told.\r\n\r\n**Fix:**\r\n- `seal_pending_transfers` queues sealed transfers on `_finalize_q`. The write-worker loop drains that queue before taking new write tasks, so step 4 now always runs on the worker.\r\n- In `_finalize_if_complete`, a `TransferError` from the completion wait now sends `write_failed` to each notify target (the same message `_notify_write_failed` already uses for an allocation that never arrived) and marks the transfer done.\r\n\r\nTradeoffs and limits:\r\n- `write_done` / `write_failed` now always comes from the worker thread. That adds up to one 10 ms poll interval of latency when the forward thread used to finalize.\r\n- The worker still waits for one transfer at a time, the same as the existing worker path.\r\n- After a timeout, D releases its blocks while the timed-out writes could in theory still land. With a sane `transfer_timeout` that needs a link stalled for that long. The READ path's `recv_abort_timeout` has the same property.\r\n- With fan-in (several prefill ranks writing to one decode rank), one writer's `write_failed` fails the request. The other writers' later `write_done` messages are ignored.\r\n- There is no new host/device synchronization. The `transfer_timeout` default (30 s) is unchanged; long-context deployments can raise it through `kv_connector_extra_config.transfer_timeout`.\r\n\r\n**CI :** this path needs RDMA between MI300X/MI355X nodes and a transfer that fails. The E2E results above were measured outside CI.\r\n\r\nRelated:\r\n- #62552 (draft) also sends `write_failed`, for a write task that fails before or while posting (e.g. a missing session). This PR covers the completion wait after the writes are posted, and moves that wait off the forward thread. The two merge without textual conflicts.\r\n- #58962 (open) adds a consumer-side WRITE receive timeout, the other half of ROCm/mori#655. This PR makes the producer report failures right away instead of leaving D to time out.\r\n- #39276 replaces a blocking `Wait()` with a polling loop, but that wait stays on the forward thread.\r\n\r\n---\r\n\r\n<details>\r\n<summary> Pull Request Checklist </summary>\r\n\r\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\r\n- [x] AI assistance was used during the creation of this PR.\r\n\r\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\r\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\r\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\r\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\r\n</details>\r\n\r\n**BEFORE SUBMITTING, PLEASE READ <https://docs.vllm.ai/en/latest/contributing>** (anything written below this line will be removed by GitHub Actions)\r\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "dllehr-amd"
+            },
+            "body": "@lcskrishna This looks good on my side, can you see any potential issues with adding the finalize_q?",
+            "createdAt": "2026-10-28T17:03:27Z",
+            "databaseId": 6475409094,
+            "updatedAt": "2026-10-28T17:03:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/63880#issuecomment-6475409094"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "lcskrishna"
+            },
+            "body": "@MohitAMD Please note: there is an RDMA CI coverage with AMD. It is part of .buildkite/amd-disagg/pipeline-disagg.yaml which runs various models on an MI355 + AINIC. So the statement of no CI coverage in description is wrong - seems like AI generated content. Since this uses GLM 5.3 FP8 a similar path for GLM 5.2 FP8 is avaialble which might get affected. \r\n\r\nPlease reach out offline if you need to run on a specific PR. \r\n\r\ncc: @dllehr-amd @chunfangamd @ChuanLi1101 \r\n\r\n",
+            "createdAt": "2026-10-29T02:57:31Z",
+            "databaseId": 6486636624,
+            "updatedAt": "2026-10-29T03:09:50Z",
+            "url": "https://github.com/vllm-project/vllm/pull/63880#issuecomment-6486636624"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MohitAMD"
+            },
+            "body": "**Perf A/B: neutral.**\n\nGLM-5.3-FP8, MI300X, 1P1D disagg (EP8 prefill + EP8 decode), MoRIIO WRITE, MTP n=3, vLLM ROCm nightly `00b6c4c565`.\nbase = nightly; PR = nightly + this PR's `moriio_engine.py` (`de952b4`). Arms interleaved on the same nodes, fresh boot each.\n\n`vllm bench serve --dataset-name random --random-input-len <ISL> --random-output-len 1024 --ignore-eos --num-warmups 2 --max-concurrency <c> --num-prompts <n> --request-rate inf`\n\nSweep (2 runs/arm, n = max(8, 4c)):\n\n| ISL | c | TTFT p50 (s) main → PR | ITL p50 | Output tok/s |\n|---|---|---|---|---|\n| 8K | 1 | 2.74 → 2.71 | = | 33 → 31 |\n| 8K | 4 | 2.85 → 2.79 | = | 111 → 103 |\n| 8K | 8 | 4.45 → 3.70 | = | 183 → 193 |\n| 64K | 1 | 21.6 → 21.5 | = | 21 → 20 |\n| 64K | 4 | 24.8 → 25.4 | = | 61 → 62 |\n\nConfirmation at c8 (2 node pairs, counterbalanced order, 4 boots/arm; p = permutation test on per-boot means):\n\n| ISL | runs/arm | Output tok/s main → PR | TTFT p50 (s) | p |\n|---|---|---|---|---|\n| 64K (n=64) | 8 | 116.2 → 115.9 (−0.3%) | 28.44 → 28.44 | 0.91 |\n| 128K (n=32) | 4 | 70.5 → 69.3 (−1.6%) | 60.9 → 61.4 | 0.51 |\n\n- Decode unchanged (ITL within ±1%); c1 TTFT flat, so no visible cost from the write-worker tick.\n- 8K c8 TTFT −17% is from 2 runs/arm and was not re-tested; output tok/s at c ≤ 4 varies ±15% between same-arm runs (MTP acceptance on random tokens).\n- 0 TransferError / write_failed / engine errors in any run.\n\n**Why neutral:** a temporary timer (same in both arms) shows that on a healthy fabric, RDMA writes finish after the forward seals them, so main already finalizes on the write worker (100% of transfers). Seal → `write_done` time is identical in both arms. The PR only changes the slow/stuck-transfer path.\n\n**Conclusion:** no measurable perf change on the happy path (TTFT, ITL, throughput within noise, p ≥ 0.5 at 64K/128K c8). The PR is a robustness fix: a slow or failed transfer now fails only that request instead of stalling the prefill engine.",
+            "createdAt": "2026-10-30T19:26:02Z",
+            "databaseId": 6531695492,
+            "updatedAt": "2026-10-30T19:26:02Z",
+            "url": "https://github.com/vllm-project/vllm/pull/63880#issuecomment-6531695492"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYVRw4Q=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "de952b4d15b6dd3d69662f56537161681da552d7",
+      "headRepository": {
+        "nameWithOwner": "MohitAMD/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 63880,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5672963241,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-27T19:20:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/63880#pullrequestreview-5672963241"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "simondanielsson"
+            },
+            "body": "Thanks for the fix!",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "simondanielsson"
+                  },
+                  "body": "**Question**: do we need this part as well, similar to below?\n\n```\n                message_fields=(\n                    {\"num_writers\": num_writers} if num_writers != 1 else None\n                ),\n```",
+                  "createdAt": "2026-10-28T17:02:56Z",
+                  "databaseId": 4403630545,
+                  "diffHunk": "@@ -619,7 +633,21 @@ def _finalize_if_complete(\n             request_info.completion_notified = True\n \n         # Wait for this request's transfers to complete.\n-        self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)\n+        try:\n+            self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)\n+        except TransferError:\n+            # Fail only this request: decode reports it in failed_recving.\n+            logger.exception(\n+                \"WRITE transfer failed for (request, transfer) %s, %s\",\n+                request_id,\n+                transfer_id,\n+            )\n+            for remote_ip, remote_port in notify_targets:\n+                self.worker.moriio_wrapper.send_notify(\n+                    transfer_id, remote_ip, remote_port, message_type=\"write_failed\"",
+                  "line": 647,
+                  "originalLine": 647,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py",
+                  "updatedAt": "2026-10-28T17:04:20Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/63880#discussion_r4403630545"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "simondanielsson"
+                  },
+                  "body": "**Question**: for my understanding, when can this be triggered vs the transfer error below? ",
+                  "createdAt": "2026-10-28T17:04:10Z",
+                  "databaseId": 4403643490,
+                  "diffHunk": "@@ -187,12 +189,24 @@ def seal_pending_transfers(self) -> None:\n                     request_info.writes_expected = write_count\n                     pending.append((transfer_id, request_info))\n \n-        for transfer_id, request_info in pending:\n-            self._finalize_if_complete(transfer_id, request_info)\n+        # Runs on the forward thread: the RDMA wait in _finalize_if_complete\n+        # belongs to the write worker.\n+        for item in pending:\n+            self._finalize_q.put(item)\n \n     def _write_worker_loop(self) -> None:\n         \"\"\"Main loop for the write worker thread.\"\"\"\n         while True:\n+            while not self._finalize_q.empty():\n+                transfer_id, request_info = self._finalize_q.get_nowait()\n+                try:\n+                    self._finalize_if_complete(transfer_id, request_info)\n+                except Exception:",
+                  "line": 204,
+                  "originalLine": 204,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py",
+                  "updatedAt": "2026-10-28T17:04:20Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/63880#discussion_r4403643490"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOFQxNzowNDoxMFrPAAAAAQZ6RGI=",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5686597869,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-28T17:04:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/63880#pullrequestreview-5686597869"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "lcskrishna"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "lcskrishna"
+                  },
+                  "body": "Can you evaluate if we need to send write_failed too here? Currently it calls _mark_request_done(transfer_id) without notifying the decode - which will have similar symptom in decode with a hang. ",
+                  "createdAt": "2026-10-29T02:52:58Z",
+                  "databaseId": 4408234367,
+                  "diffHunk": "@@ -187,12 +189,24 @@ def seal_pending_transfers(self) -> None:\n                     request_info.writes_expected = write_count\n                     pending.append((transfer_id, request_info))\n \n-        for transfer_id, request_info in pending:\n-            self._finalize_if_complete(transfer_id, request_info)\n+        # Runs on the forward thread: the RDMA wait in _finalize_if_complete\n+        # belongs to the write worker.\n+        for item in pending:\n+            self._finalize_q.put(item)\n \n     def _write_worker_loop(self) -> None:\n         \"\"\"Main loop for the write worker thread.\"\"\"\n         while True:\n+            while not self._finalize_q.empty():\n+                transfer_id, request_info = self._finalize_q.get_nowait()\n+                try:\n+                    self._finalize_if_complete(transfer_id, request_info)\n+                except Exception:\n+                    logger.exception(\n+                        \"Finalizing transfer %s failed, marking done\", transfer_id\n+                    )\n+                    self._mark_request_done(transfer_id)",
+                  "line": 208,
+                  "originalLine": 208,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py",
+                  "updatedAt": "2026-10-29T02:53:33Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/63880#discussion_r4408234367"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQwMjo1Mjo1OFrPAAAAAQbAUX8=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5692298015,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-29T02:53:33Z",
+            "url": "https://github.com/vllm-project/vllm/pull/63880#pullrequestreview-5692298015"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yOVQwMjo1MzozM1q0MjAyNi0xMC0yOVQwMjo1Mjo1OFrPAAAAAVNJkx8=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "OPEN",
+      "title": "[Bugfix][KV Connector][MoRIIO] WRITE: keep the RDMA completion wait off the forward thread and fail only the affected request",
+      "updatedAt": "2026-10-30T19:26:02Z",
+      "url": "https://github.com/vllm-project/vllm/pull/63880"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/63880/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/63880/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/63880"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/63880"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/63880/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/63880"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/de952b4d15b6dd3d69662f56537161681da552d7"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 73,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 24403,
+        "forks_count": 24403,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9860,
+        "open_issues_count": 9860,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T19:34:18Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 343901,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 96314,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-04T19:34:28Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 96314,
+        "watchers_count": 96314,
+        "web_commit_signoff_required": true
+      },
+      "sha": "ed1a7307950ab5e6593d25123579ed7ca998b350",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "<!-- markdownlint-disable -->\r\n\r\n## Overview\r\n\r\nIn MoRIIO WRITE mode, the prefill can wait for a request's RDMA completion on the model forward thread (`wait_for_save` → `seal_pending_transfers` → `_finalize_if_complete`). A transfer timeout there raises `TransferError` out of `execute_model` on one rank, and the engine dies. This PR moves that wait to the existing write-worker thread. A failed or timed-out transfer now sends `write_failed` to decode, so only that request fails.\r\n\r\n## Claims\r\n\r\n- A WRITE transfer that fails or times out no longer kills the prefill engine. It fails only its own request: decode reports it in `failed_recving`, and `kv_load_failure_policy` applies.\r\n- The forward thread never blocks on RDMA completion. Previously it could stall prefill for every other request for up to `transfer_timeout` (30 s by default).\r\n- On the write-worker path, the same failure now notifies decode. Previously the prefill freed its blocks and the decode request hung in `WAITING_FOR_REMOTE_KVS`.\r\n\r\n## Validation\r\n\r\n**Setup.** GLM-5.3-FP8 on MI300X, MoRIIO WRITE, PD disaggregation.\r\n\r\n**On `main`.** `vllm/vllm-openai-rocm` nightly built from `00b6c4c565` (HIP 7.15, AITER 0.1.26); `moriio_engine.py` there is byte-identical to this PR's base. \"With fix\" is the same image with this PR's files copied in (together with #63878 and #63879, which do not touch this path). DP8/EP8 1P1D, `kv_connector_extra_config.transfer_timeout=0.02` so long transfers fail. Sequence: one small request, one 128K request, `/health` on both engines, then 3 small requests.\r\n\r\n| | Small request before | 128K request | 3 small requests after | `/health` P / D after | Prefill log |\r\n|---|---|---|---|---|---|\r\n| Nightly | 200 | hung until the 1200 s client timeout | each hung until the 600 s client timeout | 200 / 200 | 4× \"Write task failed … marking done\" (blocks freed, decode not told) |\r\n| Nightly + this PR | 200 | **HTTP 500 after 46 s** | **HTTP 500 in 0.4–0.6 s each** | 200 / 200 | 4× \"WRITE transfer failed\" (new path: `write_failed` sent to decode) |\r\n\r\nThe small requests after the 128K one also fail with the fix because the 20 ms timeout is still forced. The difference is fail-fast versus hanging. Neither arm logged `EngineDeadError`: in this run every timeout surfaced on the write worker, so this run exercises the `write_failed` half of the change; the forward-thread half is covered by the unit test below and the 700K v0.32.0 run.\r\n\r\n**On v0.32.0** (same finalize path as `main`), with an earlier, larger version of this fix. That version polled completions on the worker and sent the same `write_failed` message, which decode on `main` already handles.\r\n\r\n| Scenario | Without fix | With fix |\r\n|---|---|---|\r\n| TP8 prefill + TP8 decode, 2 concurrent 700K-token requests; the KV transfer outlived the 30 s default timeout | `TransferError: RDMA transfer timed out after 30s` raised on one prefill rank. Its peers waited in the next collective; after the 1800 s RPC timeout: `EngineDeadError` | Only the affected request fails (next row). With `transfer_timeout=300`, the same workload completed 2/2 requests in each of 2 reps, 0 errors |\r\n| DP8/EP8 1P1D, timeout forced to 20 ms so every long transfer fails | — | A 128K request returned HTTP 500 after 50.5 s; it did not hang. 14 producer failures matched 14 decode `write_failed` receipts. Both engines stayed `/health` 200; 0 `EngineDeadError` |\r\n\r\n**Unit tests** (`tests/v1/kv_connector/unit/test_moriio_write_done_routing.py`). Each new test fails on `main` and passes with this PR:\r\n\r\n| Test | On `main` |\r\n|---|---|\r\n| `test_seal_on_forward_thread_never_waits_for_rdma` | `seal_pending_transfers()` runs the RDMA wait inline |\r\n| `test_failed_rdma_write_fails_only_that_request_on_decode` | `seal_pending_transfers()` raises `TransferError` (the engine-killing path) |\r\n\r\nAll MoRIIO unit tests pass: 770 passed, 35 skipped (768 on `main` plus the 2 new tests).\r\n\r\n```bash\r\npytest tests/v1/kv_connector/unit/test_moriio_*.py\r\n```\r\n\r\n## Details\r\n\r\n**Request flow (WRITE):**\r\n1. D allocates blocks for request R and sends them to P (`RemoteAllocInfo`).\r\n2. In P's forward, `save_kv_layer` queues one write task per layer. The write worker thread posts the RDMA writes and records their statuses.\r\n3. After the forward, `wait_for_save` → `seal_pending_transfers` records how many writes R expects.\r\n4. Once all of R's writes are posted and sealed, `_finalize_if_complete` waits for R's RDMA statuses, sends `write_done` to D, and frees P's blocks. D then schedules R for decode.\r\n\r\n**Root cause.** Two threads can run step 4: the write worker, after the last write, or the forward thread in step 3 when the worker finished first. The step-4 wait is bounded by `transfer_timeout`:\r\n- **On the forward thread,** the wait blocks the forward. On timeout, `TransferError` escapes `execute_model` on that rank only, while the other ranks enter the next step's collectives.\r\n- **On the write worker,** the exception is caught (\"Write task failed … marking done\"). P frees its blocks, but D is never told.\r\n\r\n**Fix:**\r\n- `seal_pending_transfers` queues sealed transfers on `_finalize_q`. The write-worker loop drains that queue before taking new write tasks, so step 4 now always runs on the worker.\r\n- In `_finalize_if_complete`, a `TransferError` from the completion wait now sends `write_failed` to each notify target (the same message `_notify_write_failed` already uses for an allocation that never arrived) and marks the transfer done.\r\n\r\nTradeoffs and limits:\r\n- `write_done` / `write_failed` now always comes from the worker thread. That adds up to one 10 ms poll interval of latency when the forward thread used to finalize.\r\n- The worker still waits for one transfer at a time, the same as the existing worker path.\r\n- After a timeout, D releases its blocks while the timed-out writes could in theory still land. With a sane `transfer_timeout` that needs a link stalled for that long. The READ path's `recv_abort_timeout` has the same property.\r\n- With fan-in (several prefill ranks writing to one decode rank), one writer's `write_failed` fails the request. The other writers' later `write_done` messages are ignored.\r\n- There is no new host/device synchronization. The `transfer_timeout` default (30 s) is unchanged; long-context deployments can raise it through `kv_connector_extra_config.transfer_timeout`.\r\n\r\n**CI :** this path needs RDMA between MI300X/MI355X nodes and a transfer that fails. The E2E results above were measured outside CI.\r\n\r\nRelated:\r\n- #62552 (draft) also sends `write_failed`, for a write task that fails before or while posting (e.g. a missing session). This PR covers the completion wait after the writes are posted, and moves that wait off the forward thread. The two merge without textual conflicts.\r\n- #58962 (open) adds a consumer-side WRITE receive timeout, the other half of ROCm/mori#655. This PR makes the producer report failures right away instead of leaving D to time out.\r\n- #39276 replaces a blocking `Wait()` with a polling loop, but that wait stays on the forward thread.\r\n\r\n---\r\n\r\n<details>\r\n<summary> Pull Request Checklist </summary>\r\n\r\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\r\n- [x] AI assistance was used during the creation of this PR.\r\n\r\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\r\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\r\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\r\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\r\n</details>\r\n\r\n**BEFORE SUBMITTING, PLEASE READ <https://docs.vllm.ai/en/latest/contributing>** (anything written below this line will be removed by GitHub Actions)\r\n",
+    "changed_files": 3,
+    "closed_at": null,
+    "comments": 3,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/63880/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/63880/commits",
+    "created_at": "2026-10-27T00:36:07Z",
+    "deletions": 3,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/63880.diff",
+    "draft": false,
+    "head": {
+      "label": "MohitAMD:moriio-write-nonblocking-finalize",
+      "ref": "moriio-write-nonblocking-finalize",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/MohitAMD/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/MohitAMD/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/MohitAMD/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/MohitAMD/vllm/branches{/branch}",
+        "clone_url": "https://github.com/MohitAMD/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/MohitAMD/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/MohitAMD/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/MohitAMD/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/MohitAMD/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/MohitAMD/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/MohitAMD/vllm/contributors",
+        "created_at": "2026-07-24T17:59:14Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/MohitAMD/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/MohitAMD/vllm/downloads",
+        "events_url": "https://api.github.com/repos/MohitAMD/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/MohitAMD/vllm/forks",
+        "full_name": "MohitAMD/vllm",
+        "git_commits_url": "https://api.github.com/repos/MohitAMD/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/MohitAMD/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/MohitAMD/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/MohitAMD/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/MohitAMD/vllm/hooks",
+        "html_url": "https://github.com/MohitAMD/vllm",
+        "id": 1311300404,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/MohitAMD/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/MohitAMD/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/MohitAMD/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/MohitAMD/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/MohitAMD/vllm/labels{/name}",
+        "language": null,
+        "languages_url": "https://api.github.com/repos/MohitAMD/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/MohitAMD/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/MohitAMD/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOTijbNA",
+        "notifications_url": "https://api.github.com/repos/MohitAMD/vllm/notifications{?since,all,participating}",
+        "open_issues": 1,
+        "open_issues_count": 1,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/243221462?v=4",
+          "events_url": "https://api.github.com/users/MohitAMD/events{/privacy}",
+          "followers_url": "https://api.github.com/users/MohitAMD/followers",
+          "following_url": "https://api.github.com/users/MohitAMD/following{/other_user}",
+          "gists_url": "https://api.github.com/users/MohitAMD/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/MohitAMD",
+          "id": 243221462,
+          "login": "MohitAMD",
+          "node_id": "U_kgDODn9D1g",
+          "organizations_url": "https://api.github.com/users/MohitAMD/orgs",
+          "received_events_url": "https://api.github.com/users/MohitAMD/received_events",
+          "repos_url": "https://api.github.com/users/MohitAMD/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/MohitAMD/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/MohitAMD/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/MohitAMD",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/MohitAMD/vllm/pulls{/number}",
+        "pushed_at": "2026-10-29T05:30:06Z",
+        "releases_url": "https://api.github.com/repos/MohitAMD/vllm/releases{/id}",
+        "size": 326698,
+        "ssh_url": "git@github.com:MohitAMD/vllm.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/MohitAMD/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/MohitAMD/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/MohitAMD/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/MohitAMD/vllm/subscription",
+        "svn_url": "https://github.com/MohitAMD/vllm",
+        "tags_url": "https://api.github.com/repos/MohitAMD/vllm/tags",
+        "teams_url": "https://api.github.com/repos/MohitAMD/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/MohitAMD/vllm/git/trees{/sha}",
+        "updated_at": "2026-07-24T17:59:14Z",
+        "url": "https://api.github.com/repos/MohitAMD/vllm",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": true
+      },
+      "sha": "de952b4d15b6dd3d69662f56537161681da552d7",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/243221462?v=4",
+        "events_url": "https://api.github.com/users/MohitAMD/events{/privacy}",
+        "followers_url": "https://api.github.com/users/MohitAMD/followers",
+        "following_url": "https://api.github.com/users/MohitAMD/following{/other_user}",
+        "gists_url": "https://api.github.com/users/MohitAMD/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/MohitAMD",
+        "id": 243221462,
+        "login": "MohitAMD",
+        "node_id": "U_kgDODn9D1g",
+        "organizations_url": "https://api.github.com/users/MohitAMD/orgs",
+        "received_events_url": "https://api.github.com/users/MohitAMD/received_events",
+        "repos_url": "https://api.github.com/users/MohitAMD/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/MohitAMD/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/MohitAMD/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/MohitAMD",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/63880",
+    "id": 5026766044,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/63880",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d73a4a",
+        "default": true,
+        "description": "Something isn't working",
+        "id": 5135047172,
+        "name": "bug",
+        "node_id": "LA_kwDOI7xefs8AAAABMhKaBA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/bug"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "4417cb",
+        "default": false,
+        "description": "",
+        "id": 9306392211,
+        "name": "kv-connector",
+        "node_id": "LA_kwDOI7xefs8AAAACKrRGkw",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/kv-connector"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "4e881a232d0965042c2d22e4984adba42126fe33",
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABK55c3A",
+    "number": 63880,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/63880.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/4355494?v=4",
+        "events_url": "https://api.github.com/users/xuechendi/events{/privacy}",
+        "followers_url": "https://api.github.com/users/xuechendi/followers",
+        "following_url": "https://api.github.com/users/xuechendi/following{/other_user}",
+        "gists_url": "https://api.github.com/users/xuechendi/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/xuechendi",
+        "id": 4355494,
+        "login": "xuechendi",
+        "node_id": "MDQ6VXNlcjQzNTU0OTQ=",
+        "organizations_url": "https://api.github.com/users/xuechendi/orgs",
+        "received_events_url": "https://api.github.com/users/xuechendi/received_events",
+        "repos_url": "https://api.github.com/users/xuechendi/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/xuechendi/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/xuechendi/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/xuechendi",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/10706289?v=4",
+        "events_url": "https://api.github.com/users/NickLucche/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NickLucche/followers",
+        "following_url": "https://api.github.com/users/NickLucche/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NickLucche/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NickLucche",
+        "id": 10706289,
+        "login": "NickLucche",
+        "node_id": "MDQ6VXNlcjEwNzA2Mjg5",
+        "organizations_url": "https://api.github.com/users/NickLucche/orgs",
+        "received_events_url": "https://api.github.com/users/NickLucche/received_events",
+        "repos_url": "https://api.github.com/users/NickLucche/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NickLucche/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NickLucche/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/NickLucche",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/17067717?v=4",
+        "events_url": "https://api.github.com/users/ivanium/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ivanium/followers",
+        "following_url": "https://api.github.com/users/ivanium/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ivanium/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ivanium",
+        "id": 17067717,
+        "login": "ivanium",
+        "node_id": "MDQ6VXNlcjE3MDY3NzE3",
+        "organizations_url": "https://api.github.com/users/ivanium/orgs",
+        "received_events_url": "https://api.github.com/users/ivanium/received_events",
+        "repos_url": "https://api.github.com/users/ivanium/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ivanium/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ivanium/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ivanium",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/17771355?v=4",
+        "events_url": "https://api.github.com/users/orozery/events{/privacy}",
+        "followers_url": "https://api.github.com/users/orozery/followers",
+        "following_url": "https://api.github.com/users/orozery/following{/other_user}",
+        "gists_url": "https://api.github.com/users/orozery/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/orozery",
+        "id": 17771355,
+        "login": "orozery",
+        "node_id": "MDQ6VXNlcjE3NzcxMzU1",
+        "organizations_url": "https://api.github.com/users/orozery/orgs",
+        "received_events_url": "https://api.github.com/users/orozery/received_events",
+        "repos_url": "https://api.github.com/users/orozery/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/orozery/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/orozery/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/orozery",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/25103655?v=4",
+        "events_url": "https://api.github.com/users/ApostaC/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ApostaC/followers",
+        "following_url": "https://api.github.com/users/ApostaC/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ApostaC/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ApostaC",
+        "id": 25103655,
+        "login": "ApostaC",
+        "node_id": "MDQ6VXNlcjI1MTAzNjU1",
+        "organizations_url": "https://api.github.com/users/ApostaC/orgs",
+        "received_events_url": "https://api.github.com/users/ApostaC/received_events",
+        "repos_url": "https://api.github.com/users/ApostaC/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ApostaC/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ApostaC/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ApostaC",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/51183510?v=4",
+        "events_url": "https://api.github.com/users/wzhao18/events{/privacy}",
+        "followers_url": "https://api.github.com/users/wzhao18/followers",
+        "following_url": "https://api.github.com/users/wzhao18/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wzhao18/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/wzhao18",
+        "id": 51183510,
+        "login": "wzhao18",
+        "node_id": "MDQ6VXNlcjUxMTgzNTEw",
+        "organizations_url": "https://api.github.com/users/wzhao18/orgs",
+        "received_events_url": "https://api.github.com/users/wzhao18/received_events",
+        "repos_url": "https://api.github.com/users/wzhao18/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/wzhao18/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wzhao18/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/wzhao18",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 3,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/63880/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/de952b4d15b6dd3d69662f56537161681da552d7",
+    "title": "[Bugfix][KV Connector][MoRIIO] WRITE: keep the RDMA completion wait off the forward thread and fail only the affected request",
+    "updated_at": "2026-10-30T19:26:02Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/63880",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/243221462?v=4",
+      "events_url": "https://api.github.com/users/MohitAMD/events{/privacy}",
+      "followers_url": "https://api.github.com/users/MohitAMD/followers",
+      "following_url": "https://api.github.com/users/MohitAMD/following{/other_user}",
+      "gists_url": "https://api.github.com/users/MohitAMD/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/MohitAMD",
+      "id": 243221462,
+      "login": "MohitAMD",
+      "node_id": "U_kgDODn9D1g",
+      "organizations_url": "https://api.github.com/users/MohitAMD/orgs",
+      "received_events_url": "https://api.github.com/users/MohitAMD/received_events",
+      "repos_url": "https://api.github.com/users/MohitAMD/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/MohitAMD/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/MohitAMD/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/MohitAMD",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 41,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/de952b4d15b6dd3d69662f56537161681da552d7/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_moriio_write_done_routing.py",
+      "changes": 41,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_moriio_write_done_routing.py?ref=de952b4d15b6dd3d69662f56537161681da552d7",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/test_moriio_write_done_routing.py",
+      "patch": "@@ -21,6 +21,7 @@\n     MoRIIOMode,\n     RemoteAllocInfo,\n     ReqMeta,\n+    TransferError,\n     WriteTask,\n     get_port_offset,\n )\n@@ -273,6 +274,46 @@ def test_finalize_single_pod_port_uses_global_rank():\n     assert port == base + get_port_offset(3, 2)\n \n \n+def _sealable_write(waiting_for_transfer_complete) -> tuple[Any, Any]:\n+    info = RemoteAllocInfo(block_ids=None, decode_dp_rank=3)\n+    worker = _fake_worker({\"tA\": info})\n+    worker.moriio_wrapper.waiting_for_transfer_complete = waiting_for_transfer_complete\n+    writer = make_moriio_writer(worker)\n+    writer._mark_request_done = lambda transfer_id: (  # type: ignore[method-assign]\n+        worker.moriio_wrapper.done_req_ids.append(transfer_id)\n+    )\n+    # Resolves the notify endpoint; the one scheduled layer write is done.\n+    writer._execute_write_task(_write_task(\"tA\", \"10.0.0.1\"))\n+    writer._scheduled_writes[\"tA\"] = 1\n+    info.writes_done = 1\n+    return writer, worker\n+\n+\n+def test_seal_on_forward_thread_never_waits_for_rdma():\n+    def waiting_for_transfer_complete(statuses):\n+        raise AssertionError(\"RDMA wait ran on the forward thread\")\n+\n+    writer, worker = _sealable_write(waiting_for_transfer_complete)\n+\n+    writer.seal_pending_transfers()\n+\n+    assert worker.moriio_wrapper.sent_notifies == []\n+    assert writer._finalize_q.qsize() == 1\n+\n+\n+def test_failed_rdma_write_fails_only_that_request_on_decode():\n+    def waiting_for_transfer_complete(statuses):\n+        raise TransferError(\"RDMA transfer timed out after 30s\")\n+\n+    writer, worker = _sealable_write(waiting_for_transfer_complete)\n+    writer.seal_pending_transfers()\n+\n+    writer._finalize_if_complete(*writer._finalize_q.get_nowait())\n+\n+    assert [n[3] for n in worker.moriio_wrapper.sent_notifies] == [\"write_failed\"]\n+    assert worker.moriio_wrapper.done_req_ids == [\"tA\"]\n+\n+\n def test_execute_write_task_writes_every_fanout_target():\n     info = RemoteAllocInfo(block_ids=[2], decode_dp_rank=0)\n     alloc = {\"tA\": info}",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/de952b4d15b6dd3d69662f56537161681da552d7/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_moriio_write_done_routing.py",
+      "sha": "1cd63ededde61b8a7f6e69254329c73646db9533",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/de952b4d15b6dd3d69662f56537161681da552d7/tests%2Fv1%2Fkv_connector%2Funit%2Futils.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Futils.py?ref=de952b4d15b6dd3d69662f56537161681da552d7",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/utils.py",
+      "patch": "@@ -677,6 +677,7 @@ def make_moriio_writer(fake_worker: Any) -> Any:\n     writer = MoRIIOWriter.__new__(MoRIIOWriter)\n     writer._worker_ref = lambda: fake_worker\n     writer._write_task_q = Queue()\n+    writer._finalize_q = Queue()\n     writer._write_state_lock = threading.Lock()\n     writer._scheduled_writes = defaultdict(int)\n     writer._scheduled_layers = defaultdict(set)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/de952b4d15b6dd3d69662f56537161681da552d7/tests%2Fv1%2Fkv_connector%2Funit%2Futils.py",
+      "sha": "7024904e03a446fd12054bb68832c39579beff15",
+      "status": "modified"
+    },
+    {
+      "additions": 31,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/de952b4d15b6dd3d69662f56537161681da552d7/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmoriio%2Fmoriio_engine.py",
+      "changes": 34,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmoriio%2Fmoriio_engine.py?ref=de952b4d15b6dd3d69662f56537161681da552d7",
+      "deletions": 3,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py",
+      "patch": "@@ -102,6 +102,8 @@ def __init__(self, worker: \"MoRIIOConnectorWorker\"):\n         \"\"\"\n         self._worker_ref: weakref_ref[MoRIIOConnectorWorker] = weakref_ref(worker)\n         self._write_task_q: Queue[WriteTask] = Queue()\n+        # Sealed transfers whose RDMA completion the write worker must await.\n+        self._finalize_q: Queue[tuple[TransferId, RemoteAllocInfo]] = Queue()\n         self._write_worker_started = False\n         self._write_worker_lock = threading.Lock()\n         self._write_state_lock = threading.Lock()\n@@ -187,12 +189,24 @@ def seal_pending_transfers(self) -> None:\n                     request_info.writes_expected = write_count\n                     pending.append((transfer_id, request_info))\n \n-        for transfer_id, request_info in pending:\n-            self._finalize_if_complete(transfer_id, request_info)\n+        # Runs on the forward thread: the RDMA wait in _finalize_if_complete\n+        # belongs to the write worker.\n+        for item in pending:\n+            self._finalize_q.put(item)\n \n     def _write_worker_loop(self) -> None:\n         \"\"\"Main loop for the write worker thread.\"\"\"\n         while True:\n+            while not self._finalize_q.empty():\n+                transfer_id, request_info = self._finalize_q.get_nowait()\n+                try:\n+                    self._finalize_if_complete(transfer_id, request_info)\n+                except Exception:\n+                    logger.exception(\n+                        \"Finalizing transfer %s failed, marking done\", transfer_id\n+                    )\n+                    self._mark_request_done(transfer_id)\n+\n             # Process deferred tasks first\n             self._process_deferred_tasks()\n \n@@ -619,7 +633,21 @@ def _finalize_if_complete(\n             request_info.completion_notified = True\n \n         # Wait for this request's transfers to complete.\n-        self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)\n+        try:\n+            self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)\n+        except TransferError:\n+            # Fail only this request: decode reports it in failed_recving.\n+            logger.exception(\n+                \"WRITE transfer failed for (request, transfer) %s, %s\",\n+                request_id,\n+                transfer_id,\n+            )\n+            for remote_ip, remote_port in notify_targets:\n+                self.worker.moriio_wrapper.send_notify(\n+                    transfer_id, remote_ip, remote_port, message_type=\"write_failed\"\n+                )\n+            self._mark_request_done(transfer_id)\n+            return\n \n         # Consider using RDMA immediate data in decode side\n         # to eliminate the need for this notification.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/de952b4d15b6dd3d69662f56537161681da552d7/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmoriio%2Fmoriio_engine.py",
+      "sha": "e97814eb621911c5efe2bf48c9b16b333917c0f6",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "**Question**: do we need this part as well, similar to below?\n\n```\n                message_fields=(\n                    {\"num_writers\": num_writers} if num_writers != 1 else None\n                ),\n```",
+      "created_at": "2026-10-28T17:02:56Z",
+      "diff_hunk": "@@ -619,7 +633,21 @@ def _finalize_if_complete(\n             request_info.completion_notified = True\n \n         # Wait for this request's transfers to complete.\n-        self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)\n+        try:\n+            self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)\n+        except TransferError:\n+            # Fail only this request: decode reports it in failed_recving.\n+            logger.exception(\n+                \"WRITE transfer failed for (request, transfer) %s, %s\",\n+                request_id,\n+                transfer_id,\n+            )\n+            for remote_ip, remote_port in notify_targets:\n+                self.worker.moriio_wrapper.send_notify(\n+                    transfer_id, remote_ip, remote_port, message_type=\"write_failed\"",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#discussion_r4403630545",
+      "id": 4403630545,
+      "line": 647,
+      "original_line": 647,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py",
+      "updated_at": "2026-10-28T17:04:20Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    },
+    {
+      "body": "**Question**: for my understanding, when can this be triggered vs the transfer error below? ",
+      "created_at": "2026-10-28T17:04:10Z",
+      "diff_hunk": "@@ -187,12 +189,24 @@ def seal_pending_transfers(self) -> None:\n                     request_info.writes_expected = write_count\n                     pending.append((transfer_id, request_info))\n \n-        for transfer_id, request_info in pending:\n-            self._finalize_if_complete(transfer_id, request_info)\n+        # Runs on the forward thread: the RDMA wait in _finalize_if_complete\n+        # belongs to the write worker.\n+        for item in pending:\n+            self._finalize_q.put(item)\n \n     def _write_worker_loop(self) -> None:\n         \"\"\"Main loop for the write worker thread.\"\"\"\n         while True:\n+            while not self._finalize_q.empty():\n+                transfer_id, request_info = self._finalize_q.get_nowait()\n+                try:\n+                    self._finalize_if_complete(transfer_id, request_info)\n+                except Exception:",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#discussion_r4403643490",
+      "id": 4403643490,
+      "line": 204,
+      "original_line": 204,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py",
+      "updated_at": "2026-10-28T17:04:20Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    },
+    {
+      "body": "Can you evaluate if we need to send write_failed too here? Currently it calls _mark_request_done(transfer_id) without notifying the decode - which will have similar symptom in decode with a hang. ",
+      "created_at": "2026-10-29T02:52:58Z",
+      "diff_hunk": "@@ -187,12 +189,24 @@ def seal_pending_transfers(self) -> None:\n                     request_info.writes_expected = write_count\n                     pending.append((transfer_id, request_info))\n \n-        for transfer_id, request_info in pending:\n-            self._finalize_if_complete(transfer_id, request_info)\n+        # Runs on the forward thread: the RDMA wait in _finalize_if_complete\n+        # belongs to the write worker.\n+        for item in pending:\n+            self._finalize_q.put(item)\n \n     def _write_worker_loop(self) -> None:\n         \"\"\"Main loop for the write worker thread.\"\"\"\n         while True:\n+            while not self._finalize_q.empty():\n+                transfer_id, request_info = self._finalize_q.get_nowait()\n+                try:\n+                    self._finalize_if_complete(transfer_id, request_info)\n+                except Exception:\n+                    logger.exception(\n+                        \"Finalizing transfer %s failed, marking done\", transfer_id\n+                    )\n+                    self._mark_request_done(transfer_id)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#discussion_r4408234367",
+      "id": 4408234367,
+      "line": 208,
+      "original_line": 208,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py",
+      "updated_at": "2026-10-29T02:53:33Z",
+      "user": {
+        "login": "lcskrishna"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "@lcskrishna This looks good on my side, can you see any potential issues with adding the finalize_q?",
+      "created_at": "2026-10-28T17:03:27Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#issuecomment-6475409094",
+      "id": 6475409094,
+      "updated_at": "2026-10-28T17:03:27Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    },
+    {
+      "body": "@MohitAMD Please note: there is an RDMA CI coverage with AMD. It is part of .buildkite/amd-disagg/pipeline-disagg.yaml which runs various models on an MI355 + AINIC. So the statement of no CI coverage in description is wrong - seems like AI generated content. Since this uses GLM 5.3 FP8 a similar path for GLM 5.2 FP8 is avaialble which might get affected. \r\n\r\nPlease reach out offline if you need to run on a specific PR. \r\n\r\ncc: @dllehr-amd @chunfangamd @ChuanLi1101 \r\n\r\n",
+      "created_at": "2026-10-29T02:57:31Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#issuecomment-6486636624",
+      "id": 6486636624,
+      "updated_at": "2026-10-29T03:09:50Z",
+      "user": {
+        "login": "lcskrishna"
+      }
+    },
+    {
+      "body": "**Perf A/B: neutral.**\n\nGLM-5.3-FP8, MI300X, 1P1D disagg (EP8 prefill + EP8 decode), MoRIIO WRITE, MTP n=3, vLLM ROCm nightly `00b6c4c565`.\nbase = nightly; PR = nightly + this PR's `moriio_engine.py` (`de952b4`). Arms interleaved on the same nodes, fresh boot each.\n\n`vllm bench serve --dataset-name random --random-input-len <ISL> --random-output-len 1024 --ignore-eos --num-warmups 2 --max-concurrency <c> --num-prompts <n> --request-rate inf`\n\nSweep (2 runs/arm, n = max(8, 4c)):\n\n| ISL | c | TTFT p50 (s) main → PR | ITL p50 | Output tok/s |\n|---|---|---|---|---|\n| 8K | 1 | 2.74 → 2.71 | = | 33 → 31 |\n| 8K | 4 | 2.85 → 2.79 | = | 111 → 103 |\n| 8K | 8 | 4.45 → 3.70 | = | 183 → 193 |\n| 64K | 1 | 21.6 → 21.5 | = | 21 → 20 |\n| 64K | 4 | 24.8 → 25.4 | = | 61 → 62 |\n\nConfirmation at c8 (2 node pairs, counterbalanced order, 4 boots/arm; p = permutation test on per-boot means):\n\n| ISL | runs/arm | Output tok/s main → PR | TTFT p50 (s) | p |\n|---|---|---|---|---|\n| 64K (n=64) | 8 | 116.2 → 115.9 (−0.3%) | 28.44 → 28.44 | 0.91 |\n| 128K (n=32) | 4 | 70.5 → 69.3 (−1.6%) | 60.9 → 61.4 | 0.51 |\n\n- Decode unchanged (ITL within ±1%); c1 TTFT flat, so no visible cost from the write-worker tick.\n- 8K c8 TTFT −17% is from 2 runs/arm and was not re-tested; output tok/s at c ≤ 4 varies ±15% between same-arm runs (MTP acceptance on random tokens).\n- 0 TransferError / write_failed / engine errors in any run.\n\n**Why neutral:** a temporary timer (same in both arms) shows that on a healthy fabric, RDMA writes finish after the forward seals them, so main already finalizes on the write worker (100% of transfers). Seal → `write_done` time is identical in both arms. The PR only changes the slow/stuck-transfer path.\n\n**Conclusion:** no measurable perf change on the happy path (TTFT, ITL, throughput within noise, p ≥ 0.5 at 64K/128K c8). The PR is a robustness fix: a slow or failed transfer now fails only that request instead of stalling the prefill engine.",
+      "created_at": "2026-10-30T19:26:02Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#issuecomment-6531695492",
+      "id": 6531695492,
+      "updated_at": "2026-10-30T19:26:02Z",
+      "user": {
+        "login": "MohitAMD"
+      }
+    }
+  ],
+  "number": 63880,
+  "refs": {
+    "base": {
+      "commit": "ed1a7307950ab5e6593d25123579ed7ca998b350",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "de952b4d15b6dd3d69662f56537161681da552d7",
+      "repository": "MohitAMD/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#pullrequestreview-5672963241",
+      "id": 5672963241,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-27T19:20:46Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Thanks for the fix!",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#pullrequestreview-5686597869",
+      "id": 5686597869,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-28T17:04:20Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/63880#pullrequestreview-5692298015",
+      "id": 5692298015,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-29T02:53:33Z",
+      "user": {
+        "login": "lcskrishna"
+      }
+    }
+  ]
+}

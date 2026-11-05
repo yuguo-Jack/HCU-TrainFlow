@@ -9,39 +9,40 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
   path: README.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: f4e2131aeab9f5f6697805b9546aef78544370a6950a5c046ff3637b066ed4fa
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 13505fbe9dda7756a916f924600a2e7b44e22515129aa4ba16971f02e1c2e790
 - source: nvidia-cudnn-frontend
   path: setup.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 2f928bd4305e6dda4cda1f74dba910a1706eb65028dfaf855d04c74fd7c0ab55
 - source: nvidia-cudnn-frontend
   path: pyproject.toml
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: e2493ad4ae041a32c698d9b6a870ed3cd2f06d9c641fcc8fb1658ec22fc57eb4
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 16a9fb227c1c78b00a791f5bca576074e3d0cc249603675de822c69b0e30efb0
 - source: nvidia-cudnn-frontend
   path: CMakeLists.txt
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: b52e3feb56f99ef81cfb24b78f4b8d58bebdae96a9ff422f5e1586a3d9d9f9c4
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: fde803f82ba122a58da737d194479cb613901f90412876c42b36563279d5c304
 - source: nvidia-cudnn-frontend
   path: samples/cpp/CMakeLists.txt
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 082d97b1796be55f09fa144c9a510be9ccd3db25725b7eee483492bcbf838ed9
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: bffe7f6b1a813839e39ae67a1614458c13cced33d8ed89f3f6291713ad17d13e
 - source: nvidia-cudnn-frontend
   path: samples/cpp/sdpa/fp16_bwd.cpp
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 62f47b922848b39b6ec9ee07f2dbac8e65b2f46cfffb1e327e9b050a4d9f6bc2
 - source: nvidia-cudnn-frontend
   path: docs/quickstart.mdx
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: b2d16117ddd1956a6b5fe4e231b5a9260dce41f6130b47627e77d2b77e8a378a
 - source: nvidia-cudnn-frontend-docs
   path: quickstart
-  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
+  commit: 62596f777aca773f340569b88fbd42c5fcd807249e8a188810cd38297d19cab9
   sha256: a360753931c52ab40d573da739ed74d9d730d7c0063c3634116f89b7075f6c7c
   url: https://docs.nvidia.com/cudnn/quickstart/
   revision_kind: web-content-fingerprint
@@ -65,6 +66,8 @@ C++ Frontend 主要通过头文件接入；编译应用和样例仍需匹配 CUD
 
 当前 `a7269d7607db` 已把 Python binding 从 pybind11 改为 nanobind 3.0.1以上且小于4，CMake 最低3.26；源码安装须按本版 build-system 准备，旧构建依赖不是当前合同。可选 `CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON` 仅接受 CPython≥3.12 且 GIL 开启，默认 OFF；它不把整个 Python 支持下界提高到3.12，也不证明所有可选 GPU runtime/平台都有对应 wheel。
 
+2026-11-04 的 `f88a1ef2a35b` 保留上述 binding 合同，将项目版本升至1.33.0，依赖中的 `nvidia-cutlass-dsl[cu13]` 下界升为4.8.0；绕过依赖解析时仍受各 engine 的版本/架构门禁。当前 Windows 动态加载要求 CUDA13 headers/runtime，并校验 override 指向的 runtime major；Linux 多个 libcudart 匹配改为告警并保留首个匹配。应保存实际加载位置，不能据导入成功推断加载的是期望版本。
+
 新官网 Quick Start 使用 `with cudnn.Graph(...) as graph` 构图，退出 context 时 validate/build，之后 `graph(...)` 执行；inputs/outputs 名字列表确定调用次序。构图时只用 tensor 元数据，执行时才读值。这个高级入口与显式 pygraph 的计划/工作区生命周期可以对照，不能把教程的矩阵尺寸、宽松误差和性能当训练验收；主控不因此安装 NV 包。
 
 ## 正确性与性能验收
@@ -75,13 +78,13 @@ C++ Frontend 主要通过头文件接入；编译应用和样例仍需匹配 CUD
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/README.md)
-- [nvidia-cudnn-frontend: setup.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/setup.py)
-- [nvidia-cudnn-frontend: pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/pyproject.toml)
-- [nvidia-cudnn-frontend: CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/CMakeLists.txt)
-- [nvidia-cudnn-frontend: samples/cpp/CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/cpp/CMakeLists.txt)
-- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/cpp/sdpa/fp16_bwd.cpp)
-- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/quickstart.mdx)
+- [nvidia-cudnn-frontend: README.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/README.md)
+- [nvidia-cudnn-frontend: setup.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/setup.py)
+- [nvidia-cudnn-frontend: pyproject.toml](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/pyproject.toml)
+- [nvidia-cudnn-frontend: CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/CMakeLists.txt)
+- [nvidia-cudnn-frontend: samples/cpp/CMakeLists.txt](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/samples/cpp/CMakeLists.txt)
+- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/samples/cpp/sdpa/fp16_bwd.cpp)
+- [nvidia-cudnn-frontend: docs/quickstart.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/quickstart.mdx)
 - [nvidia-cudnn-frontend-docs: quickstart](https://docs.nvidia.com/cudnn/quickstart/)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。

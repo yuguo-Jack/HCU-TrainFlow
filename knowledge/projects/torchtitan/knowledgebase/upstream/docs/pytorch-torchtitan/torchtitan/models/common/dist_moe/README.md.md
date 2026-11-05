@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/models/common/dist_moe/README.md
-raw_sha256: 03d47172e2c7e13a7eda28d210745f5c8da680e3dee2f9f5c2bbab97af3ad897
+raw_sha256: 8a08b2adb05e081feaf3116b7acebe509a6e731d66d80f5e3f6333c5231673cf
 sources: []
-generated_body_sha256: 5a0db9621bb75ee29d11d3ba09440141e556797ff5313d3c8ede2a1192f88ef3
+generated_body_sha256: 0ae871cfe72aa7763f625f2e42e4d0b594258f8ce74de52ecbd8845316b31a76
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/common/dist_moe/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/dist_moe/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/dist_moe/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -37,7 +37,7 @@ combine as one ordered operation.
 TorchTitan supports BF16 and asynchronous MXFP8 Dist-MoE training on NVIDIA
 SM100 or newer. The annex also provides NVFP4 inference, which TorchTitan does
 not expose yet. Dist-MoE requires
-`training.mixed_precision_param="bfloat16"` because FSDP unshards its persistent
+`precision.param_dtype="bfloat16"` because FSDP unshards its persistent
 parameters in BF16.
 
 ## Installation
@@ -107,6 +107,38 @@ config = apply_transforms(
 )
 ```
 
+For an MXFP8 RL generator, the fused-SwiGLU Mega kernel needs the inference
+weight format and an inference runtime:
+
+```python
+import dist_moe
+
+from torchtitan.config.transform import apply_transforms
+from torchtitan.config.transform.dist_moe import DistMoeTransform
+from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
+from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_30b_a3b_varlen
+
+config = rl_grpo_qwen3_30b_a3b_varlen()
+config.generator.dist_moe_runtime = DistMoeRuntime.Config(
+    inference=True,
+    scratch_capacity_factor=4.0,
+)
+config.generator = apply_transforms(
+    config.generator,
+    [
+        DistMoeTransform(
+            expert_precision="mxfp8",
+            block_scaled_config=dist_moe.BlockScaledConfig(pipeline="mega"),
+            mxfp8_mega_fused_inference=True,
+        )
+    ],
+)
+```
+
+Set `mxfp8_mega_fused_inference` only on the RL generator, since it does not
+support backward. During validation, the trainer runs under `torch.no_grad()`
+instead.
+
 Verified 671B recipes live in `torchtitan_recipes.models.deepseek_v3`, while
 debug and 16B CI recipes live in `torchtitan_recipes.tests.models.deepseek_v3`.
 GraphTrainer follows the corresponding `graph_trainer` and
@@ -136,6 +168,7 @@ Per-layer settings belong to the transform:
 | `inplace_wgrad_accum` | Let annex WGRAD kernels accumulate directly into standard `parameter.grad` storage. This is enabled by default for BF16 and MXFP8 experts. GraphTrainer recipes temporarily disable it because tracing functionalizes parameters into graph inputs; a graph pass must bind those inputs to their leaf `parameter.grad` destinations before enabling accumulation. |
 | `bf16_grouped_gemm_preset` | Optional BF16 FPROP/DGRAD schedule override for expert users. `None` uses the annex's shape-aware production defaults. BF16 WGRAD has its own production schedule. |
 | `block_scaled_config` | MXFP8-only annex policy. `pipeline="staged"` uses separate expert kernels; `pipeline="mega"` uses the fused chunk-pipelined implementation. `fast_math` selects approximate fused-SwiGLU sigmoid math, and `kernel_config` is an expert-only CuTe tuning override. |
+| `mxfp8_mega_fused_inference` | MXFP8 RL generator only; requires `pipeline="mega"`. Prepare weights in the interleaved format so the Mega kernel can fuse SwiGLU into the W13 GEMM, for inference only. Quantized weights and scales match training numerics exactly. |
 
 One `DistMoeRuntime.Config` owns rank-wide resources shared by every local
 Dist-MoE layer:
@@ -160,7 +193,7 @@ parameter's declared gradient dtype, existing gradient storage, or parameter
 dtype. GraphTrainer uses the BF16 mixed-precision parameter dtype for its
 functional WGrad output because prepared MXFP8 graph operands do not expose a
 live parameter destination. Current FSDP casts the resulting local BF16 WGrad
-to `training.mixed_precision_reduce` for reduction. If FSDP later declares an
+to `precision.reduce_dtype` for reduction. If FSDP later declares an
 FP32 parameter gradient dtype, eager Dist-MoE will use it without a separate
 TorchTitan override.
 

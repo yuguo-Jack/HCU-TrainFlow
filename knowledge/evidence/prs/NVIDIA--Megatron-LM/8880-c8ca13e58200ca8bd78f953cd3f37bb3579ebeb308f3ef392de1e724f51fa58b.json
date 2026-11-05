@@ -1,0 +1,559 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "0cd7ecbc3c94a0feb8a9b058ea2c22c859827e69e91d753e25c664d90723b859",
+      "isPrivate": false,
+      "numbers": [
+        8880,
+        8879,
+        8878,
+        8877,
+        8876,
+        8875,
+        8874,
+        8873
+      ],
+      "observed_at": "2026-11-04T15:18:27.818463+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4938,
+        "resetAt": "2026-11-04T15:50:00Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\n`fused_multimem_rs_add_norm_ag`, the fused TP communication kernel of `--inference-fuse-tp-communication`, now launches one block per token. Before, at decode sizes with H < 8192, each block ran 2-4 tokens in series with most of its threads idle. The output is unchanged bit for bit.\n\n**Problem (performance).**\n- **What the kernel does:** it runs each token's multimem reduce-scatter, residual add, RMSNorm and multimem all-gather. Every block processes its tokens one per loop iteration, and each iteration is a dependent chain: `multimem.ld_reduce`, residual add and store, block-wide sum of squares, rsqrt, reload, `multimem.st`.\n- **Old geometry:** the launcher sized `BLOCK_SIZE` and the grid from the whole per-rank shard, `cdiv(T * H / 8, world_size)` threads, capped at 1024 threads and 128 blocks. One row only needs `H / 8` threads.\n- **Effect below H = 8192:** a block covers several tokens and runs them in series while the extra threads are masked:\n\n  | Shape | Blocks | Tokens per block | Lanes active |\n  |---|---|---|---|\n  | TP8, H = 4096, T = 64 | 4 | 2 | 50% |\n  | TP8, H = 2048, T = 64 | 2 | 4 | 25% |\n  | TP2, H = 2048, T = 16 | 2 | 4 | 25% |\n\n  The kernel runs twice per layer. Models with H >= 8192 were not affected, and batch-invariant mode never uses this kernel.\n\n## Fix\n\nThe launcher sizes blocks per token, as the variable-count collectives (`multimem_reduce_scatter_v` etc.) already do:\n- `BLOCK_SIZE = min(next_pow2(H / 8), 1024)`;\n- one block per token on this rank, capped at `max_num_blocks`;\n- `num_warps = max(1, BLOCK_SIZE // 32)`, which also removes the old `num_warps = 0` corner for shards under 32 threads.\n\nBoth values depend only on values that are equal on every rank, as `kernel_config.py` requires. The kernel body is unchanged apart from one comment.\n\n**Why the bits do not change.** For the same row, a block now has the same number of threads as before or fewer.\n- **Rows longer than 1024 chunks (H > 8192):** both geometries use 1024 threads, so the per-window loop is the same.\n- **Shorter rows:** the old block's extra threads only added masked +0.0 to the block-wide sum of squares. Triton reduces within warps and then folds warp partials with an xor butterfly, so the zero warps fold onto the same tree. The sum of squares is >= +0, so adding +0.0 is exact.\n- **Rest of the computation:** elementwise per token.\n\n## Timing\n\nRecorded, not asserted, and preliminary. H100, 2 ranks only, per-call CUDA-event time of the real kernel from the step-3 repro run. The old and new geometries always ran in the same order, never interleaved:\n\n| H | T = 16 | T = 64 | T = 256 |\n|---|---|---|---|\n| 2048 | 38.5 → 22.5 µs | 32.8 → 25.3 µs | 33.6 → 26.7 µs |\n| 4096 | 30.5 → 22.4 µs | 30.5 → 24.3 µs | 36.0 → 32.4 µs |\n| 8192 (same geometry) | 27.7 → 23.0 µs | 30.7 → 27.0 µs | 50.4 → 45.3 µs |\n\nAt H = 8192 both geometries are identical, so the 3.7-5.1 µs gap there is measurement-order bias, to be subtracted from the H <= 4096 gains at the same T. The H = 2048 rows and H = 4096 at T <= 64 clear that bias by 2-11 µs. At H = 4096, T = 256 the raw gain (3.6 µs) is below the bias at T = 256 (5.1 µs), so that point shows no measured gain. The GPU verification run below checked correctness only and did not time the kernel. Interleaved old and new launches, TP8 and a full decode step are still not timed, so the acceptance bar (a gain of at least 1% per decode step) is not yet checked.\n\nThe same run logged only the normalized output's maximum absolute difference, which was 0. It did not compare the residual or the gathered outputs bit for bit. The bit-identity claim rests on the argument above and on `test_replays_and_matches_shard_sized_launch` below, which compares both outputs bitwise against the old launch and passes on H100 at TP2 and TP8.\n\n## Tests\n\n`tests/unit_tests/determinism/kernels/test_nvls_fused_collectives.py`:\n- `test_launch_runs_one_token_per_block` (no GPU): calls the real launcher with the kernel replaced by a recorder, for TP 2-8, H 2048-16384 and T 16-4096. Every block covers one row, and each token on the rank gets its own block up to `max_num_blocks`. Fails on `main` for every shape except the H = 8192 control.\n- `test_replays_and_matches_shard_sized_launch` (2+ H100 with NVLink multicast; skips without): random partials, residuals and norm weights, for H in {2048, 3584, 4096, 16384} and 8, 64 and 256 tokens per rank. 256 tokens per rank means 2 tokens per block. The residual output and the normalized all-gathered output must replay bit-exactly and equal the old shard-sized launch of the same kernel.\n\nOn H100 in the CI image (`mcore_ci_dev:main`, 2026-11-02), at 2 and at 8 ranks, `test_nvls_fused_collectives.py` passes (12 cases: 8 geometry cases and 4 replays). On `main`, 7 of the 8 geometry cases fail at both world sizes (the H = 8192 control passes); the 4 replays also pass there, since on `main` the launch under test is the old one. The neighbor tests (`test_manifest.py` and `test_dynamic_engine_parallel_and_chunked_prefill.py::TestDynamicInferenceEngineParallel::test_mtp_kv_cache_inference_optimized_sequence_parallel`) pass (303 cases).\n\nThe kernel manifest moves `fused_collectives.py` out of the exempt `inference_nvls_symmetric_memory_collectives` entry into its own tested entry, `inference_nvls_fused_rs_add_norm_ag`. The determinism gate then requires this test to change with the kernel; it passes.\n\n**Related PRs.** #8709 (n12, inference all-gather barriers) changes only the docstring of `fused_multimem_rs_add_norm_ag`; the barrier contract is unchanged. The two PRs merge cleanly and compose. If this PR lands first, `fused_collectives.py` is in a tested manifest entry, so #8709 must touch `test_nvls_fused_collectives.py` or carry `determinism-exempt`. #8709 already needs that label for its other files, so the label covers this file too. #8561 (d1), #8704 (n8) and #8712 (n16) call this launcher unchanged and merge cleanly.\n\n## Issue tracking\n\nLinked issue: none. Found in code review.\n\n## Code provenance\n\nNo code was copied from external sources.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 3,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+            "createdAt": "2026-11-03T04:21:38Z",
+            "databaseId": 6595377014,
+            "updatedAt": "2026-11-03T04:21:38Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8880#issuecomment-6595377014"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkdd3Y=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "a7d002f766438fe02a3da9e92887a097ed6f3c73",
+      "headRepository": {
+        "nameWithOwner": "lmcafee-nvidia/Megatron-LM"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 8880,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[Inference] Launch one block per token in the fused TP reduce-scatter + RMSNorm + all-gather",
+      "updatedAt": "2026-11-03T17:20:31Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/8880"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8880/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8880/commits"
+      },
+      "html": {
+        "href": "https://github.com/NVIDIA/Megatron-LM/pull/8880"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8880"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8880/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8880"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/a7d002f766438fe02a3da9e92887a097ed6f3c73"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 192,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "NVIDIA:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/NVIDIA/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contributors",
+        "created_at": "2019-03-21T16:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/events",
+        "fork": false,
+        "forks": 4700,
+        "forks_count": 4700,
+        "forks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/forks",
+        "full_name": "NVIDIA/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/NVIDIA/Megatron-LM.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/hooks",
+        "html_url": "https://github.com/NVIDIA/Megatron-LM",
+        "id": 176982014,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "MDEwOlJlcG9zaXRvcnkxNzY5ODIwMTQ=",
+        "notifications_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 1937,
+        "open_issues_count": 1937,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+          "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NVIDIA/followers",
+          "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NVIDIA",
+          "id": 1728152,
+          "login": "NVIDIA",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+          "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+          "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+          "repos_url": "https://api.github.com/users/NVIDIA/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/NVIDIA",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T15:15:18Z",
+        "releases_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/releases{/id}",
+        "size": 178037,
+        "ssh_url": "git@github.com:NVIDIA/Megatron-LM.git",
+        "stargazers_count": 18328,
+        "stargazers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscription",
+        "svn_url": "https://github.com/NVIDIA/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/teams",
+        "topics": [
+          "large-language-models",
+          "model-para",
+          "transformers"
+        ],
+        "trees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-11-04T13:28:01Z",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM",
+        "visibility": "public",
+        "watchers": 18328,
+        "watchers_count": 18328,
+        "web_commit_signoff_required": false
+      },
+      "sha": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+        "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NVIDIA/followers",
+        "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NVIDIA",
+        "id": 1728152,
+        "login": "NVIDIA",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+        "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+        "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+        "repos_url": "https://api.github.com/users/NVIDIA/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/NVIDIA",
+        "user_view_type": "public"
+      }
+    },
+    "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\n`fused_multimem_rs_add_norm_ag`, the fused TP communication kernel of `--inference-fuse-tp-communication`, now launches one block per token. Before, at decode sizes with H < 8192, each block ran 2-4 tokens in series with most of its threads idle. The output is unchanged bit for bit.\n\n**Problem (performance).**\n- **What the kernel does:** it runs each token's multimem reduce-scatter, residual add, RMSNorm and multimem all-gather. Every block processes its tokens one per loop iteration, and each iteration is a dependent chain: `multimem.ld_reduce`, residual add and store, block-wide sum of squares, rsqrt, reload, `multimem.st`.\n- **Old geometry:** the launcher sized `BLOCK_SIZE` and the grid from the whole per-rank shard, `cdiv(T * H / 8, world_size)` threads, capped at 1024 threads and 128 blocks. One row only needs `H / 8` threads.\n- **Effect below H = 8192:** a block covers several tokens and runs them in series while the extra threads are masked:\n\n  | Shape | Blocks | Tokens per block | Lanes active |\n  |---|---|---|---|\n  | TP8, H = 4096, T = 64 | 4 | 2 | 50% |\n  | TP8, H = 2048, T = 64 | 2 | 4 | 25% |\n  | TP2, H = 2048, T = 16 | 2 | 4 | 25% |\n\n  The kernel runs twice per layer. Models with H >= 8192 were not affected, and batch-invariant mode never uses this kernel.\n\n## Fix\n\nThe launcher sizes blocks per token, as the variable-count collectives (`multimem_reduce_scatter_v` etc.) already do:\n- `BLOCK_SIZE = min(next_pow2(H / 8), 1024)`;\n- one block per token on this rank, capped at `max_num_blocks`;\n- `num_warps = max(1, BLOCK_SIZE // 32)`, which also removes the old `num_warps = 0` corner for shards under 32 threads.\n\nBoth values depend only on values that are equal on every rank, as `kernel_config.py` requires. The kernel body is unchanged apart from one comment.\n\n**Why the bits do not change.** For the same row, a block now has the same number of threads as before or fewer.\n- **Rows longer than 1024 chunks (H > 8192):** both geometries use 1024 threads, so the per-window loop is the same.\n- **Shorter rows:** the old block's extra threads only added masked +0.0 to the block-wide sum of squares. Triton reduces within warps and then folds warp partials with an xor butterfly, so the zero warps fold onto the same tree. The sum of squares is >= +0, so adding +0.0 is exact.\n- **Rest of the computation:** elementwise per token.\n\n## Timing\n\nRecorded, not asserted, and preliminary. H100, 2 ranks only, per-call CUDA-event time of the real kernel from the step-3 repro run. The old and new geometries always ran in the same order, never interleaved:\n\n| H | T = 16 | T = 64 | T = 256 |\n|---|---|---|---|\n| 2048 | 38.5 → 22.5 µs | 32.8 → 25.3 µs | 33.6 → 26.7 µs |\n| 4096 | 30.5 → 22.4 µs | 30.5 → 24.3 µs | 36.0 → 32.4 µs |\n| 8192 (same geometry) | 27.7 → 23.0 µs | 30.7 → 27.0 µs | 50.4 → 45.3 µs |\n\nAt H = 8192 both geometries are identical, so the 3.7-5.1 µs gap there is measurement-order bias, to be subtracted from the H <= 4096 gains at the same T. The H = 2048 rows and H = 4096 at T <= 64 clear that bias by 2-11 µs. At H = 4096, T = 256 the raw gain (3.6 µs) is below the bias at T = 256 (5.1 µs), so that point shows no measured gain. The GPU verification run below checked correctness only and did not time the kernel. Interleaved old and new launches, TP8 and a full decode step are still not timed, so the acceptance bar (a gain of at least 1% per decode step) is not yet checked.\n\nThe same run logged only the normalized output's maximum absolute difference, which was 0. It did not compare the residual or the gathered outputs bit for bit. The bit-identity claim rests on the argument above and on `test_replays_and_matches_shard_sized_launch` below, which compares both outputs bitwise against the old launch and passes on H100 at TP2 and TP8.\n\n## Tests\n\n`tests/unit_tests/determinism/kernels/test_nvls_fused_collectives.py`:\n- `test_launch_runs_one_token_per_block` (no GPU): calls the real launcher with the kernel replaced by a recorder, for TP 2-8, H 2048-16384 and T 16-4096. Every block covers one row, and each token on the rank gets its own block up to `max_num_blocks`. Fails on `main` for every shape except the H = 8192 control.\n- `test_replays_and_matches_shard_sized_launch` (2+ H100 with NVLink multicast; skips without): random partials, residuals and norm weights, for H in {2048, 3584, 4096, 16384} and 8, 64 and 256 tokens per rank. 256 tokens per rank means 2 tokens per block. The residual output and the normalized all-gathered output must replay bit-exactly and equal the old shard-sized launch of the same kernel.\n\nOn H100 in the CI image (`mcore_ci_dev:main`, 2026-11-02), at 2 and at 8 ranks, `test_nvls_fused_collectives.py` passes (12 cases: 8 geometry cases and 4 replays). On `main`, 7 of the 8 geometry cases fail at both world sizes (the H = 8192 control passes); the 4 replays also pass there, since on `main` the launch under test is the old one. The neighbor tests (`test_manifest.py` and `test_dynamic_engine_parallel_and_chunked_prefill.py::TestDynamicInferenceEngineParallel::test_mtp_kv_cache_inference_optimized_sequence_parallel`) pass (303 cases).\n\nThe kernel manifest moves `fused_collectives.py` out of the exempt `inference_nvls_symmetric_memory_collectives` entry into its own tested entry, `inference_nvls_fused_rs_add_norm_ag`. The determinism gate then requires this test to change with the kernel; it passes.\n\n**Related PRs.** #8709 (n12, inference all-gather barriers) changes only the docstring of `fused_multimem_rs_add_norm_ag`; the barrier contract is unchanged. The two PRs merge cleanly and compose. If this PR lands first, `fused_collectives.py` is in a tested manifest entry, so #8709 must touch `test_nvls_fused_collectives.py` or carry `determinism-exempt`. #8709 already needs that label for its other files, so the label covers this file too. #8561 (d1), #8704 (n8) and #8712 (n16) call this launcher unchanged and merge cleanly.\n\n## Issue tracking\n\nLinked issue: none. Found in code review.\n\n## Code provenance\n\nNo code was copied from external sources.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 3,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8880/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8880/commits",
+    "created_at": "2026-11-03T04:21:34Z",
+    "deletions": 16,
+    "diff_url": "https://github.com/NVIDIA/Megatron-LM/pull/8880.diff",
+    "draft": true,
+    "head": {
+      "label": "lmcafee-nvidia:fix/fused-rs-per-token-blocks",
+      "ref": "fix/fused-rs-per-token-blocks",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contributors",
+        "created_at": "2025-10-27T15:58:06Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/forks",
+        "full_name": "lmcafee-nvidia/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/index.html#quick-start",
+        "hooks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/hooks",
+        "html_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "id": 1084385341,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "R_kgDOQKJoPQ",
+        "notifications_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 82,
+        "open_issues_count": 82,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+          "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+          "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+          "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+          "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/lmcafee-nvidia",
+          "id": 85179052,
+          "login": "lmcafee-nvidia",
+          "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+          "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+          "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+          "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/lmcafee-nvidia",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T14:49:01Z",
+        "releases_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/releases{/id}",
+        "size": 115739,
+        "ssh_url": "git@github.com:lmcafee-nvidia/Megatron-LM.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscription",
+        "svn_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-08-25T16:48:34Z",
+        "url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "a7d002f766438fe02a3da9e92887a097ed6f3c73",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+        "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+        "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+        "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+        "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/lmcafee-nvidia",
+        "id": 85179052,
+        "login": "lmcafee-nvidia",
+        "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+        "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+        "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+        "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/lmcafee-nvidia",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8880",
+    "id": 5131846091,
+    "issue_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8880",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "0E8A16",
+        "default": false,
+        "description": "Limited: metrics, hardening, supplementary coverage, or unmeasured performance opportunities.",
+        "id": 12756650040,
+        "name": "P3",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsIOA",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/P3"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D73A4A",
+        "default": false,
+        "description": "Production correction with focused regressions; includes historical aggregates containing fixes.",
+        "id": 12756651122,
+        "name": "Production Fix",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsMcg",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/Production%20Fix"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "0d2c20b5ec1dd38b5d87a7dcef3b93a4f59015cf",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOCoyH_s8AAAABMeHByw",
+    "number": 8880,
+    "patch_url": "https://github.com/NVIDIA/Megatron-LM/pull/8880.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8880/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/a7d002f766438fe02a3da9e92887a097ed6f3c73",
+    "title": "[Inference] Launch one block per token in the fused TP reduce-scatter + RMSNorm + all-gather",
+    "updated_at": "2026-11-03T17:20:31Z",
+    "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8880",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+      "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+      "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+      "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+      "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/lmcafee-nvidia",
+      "id": 85179052,
+      "login": "lmcafee-nvidia",
+      "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+      "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+      "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+      "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/lmcafee-nvidia",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 12,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/a7d002f766438fe02a3da9e92887a097ed6f3c73/megatron%2Fcore%2Finference%2Fcommunication%2Ftorch_symm_triton%2Ffused_collectives.py",
+      "changes": 27,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Finference%2Fcommunication%2Ftorch_symm_triton%2Ffused_collectives.py?ref=a7d002f766438fe02a3da9e92887a097ed6f3c73",
+      "deletions": 15,
+      "filename": "megatron/core/inference/communication/torch_symm_triton/fused_collectives.py",
+      "patch": "@@ -152,7 +152,7 @@ def _multimem_reduce_scatter_residual_add_kernel(\n         for thread_offset in range(0, numel_per_token, BLOCK_SIZE):\n             offsets = program_offset + thread_offset + tid\n \n-            # BLOCK_SIZE is sized from the whole per-rank shard, capped at 1024.\n+            # BLOCK_SIZE is one token's row rounded up to a power of 2, capped at 1024.\n             #   if BLOCK_SIZE > numel_per_token -   deactivates the extra threads.\n             #   if BLOCK_SIZE < numel_per_token -   deactivates threads of the last window\n             #                                       [thread_offset, thread_offset + BLOCK_SIZE)\n@@ -254,28 +254,25 @@ def fused_multimem_rs_add_norm_ag(\n         input_tensor.numel() % numel_per_thread == 0\n     ), \"The number of elements must be 128-bit aligned.\"\n \n-    num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)\n-\n-    if num_threads < MAX_BLOCK_SIZE:\n-        block_size = 1\n-        while block_size < num_threads:\n-            block_size *= 2\n-        num_warps = block_size // WARP_SIZE\n-        num_blocks = 1\n-    else:\n-        block_size = MAX_BLOCK_SIZE\n-        num_warps = MAX_BLOCK_SIZE // WARP_SIZE\n-        num_blocks = min(triton.cdiv(num_threads, MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)\n+    hsize = input_tensor.size(-1)\n+    num_tokens = input_tensor.numel() // hsize\n+\n+    # One token per block, as in the variable-count collectives: each block processes its\n+    # tokens one after another, so sizing blocks from the whole shard would run several\n+    # tokens in series with most threads idle.\n+    numel_per_token = triton.cdiv(hsize, numel_per_thread)\n+    block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)\n+    num_warps = max(1, block_size // WARP_SIZE)\n+    num_blocks = min(triton.cdiv(num_tokens, symm_mem_hdl.world_size), MAX_NUM_BLOCKS)\n     SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)\n \n-    hsize = input_tensor.size(-1)\n     _multimem_reduce_scatter_residual_add_kernel[(num_blocks, 1, 1)](\n         residual_output_tensor.data_ptr(),\n         residual_input_tensor.data_ptr(),\n         rms_norm_weights.data_ptr(),\n         symm_mem_hdl.multicast_ptr,\n         symm_mem_hdl.signal_pad_ptrs_dev,\n-        input_tensor.numel() // hsize,\n+        num_tokens,\n         eps=eps,\n         HIDDEN_SIZE=hsize,\n         BLOCK_SIZE=block_size,",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/a7d002f766438fe02a3da9e92887a097ed6f3c73/megatron%2Fcore%2Finference%2Fcommunication%2Ftorch_symm_triton%2Ffused_collectives.py",
+      "sha": "cdd1b944e40e81e16ed519e7dee89fa5de245fb6",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/a7d002f766438fe02a3da9e92887a097ed6f3c73/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py?ref=a7d002f766438fe02a3da9e92887a097ed6f3c73",
+      "deletions": 1,
+      "filename": "tests/unit_tests/determinism/kernels/manifest.py",
+      "patch": "@@ -706,12 +706,21 @@ class KernelEntry:\n         kind=\"torch-op\",\n         exempt_reason=\"bincount / scatter_add_ / index_add_ on integer counts: exact regardless of order.\",\n     ),\n+    KernelEntry(\n+        name=\"inference_nvls_fused_rs_add_norm_ag\",\n+        sources=(\"megatron/core/inference/communication/torch_symm_triton/fused_collectives.py\",),\n+        tests=(K + \"test_nvls_fused_collectives.py\",),\n+        kind=\"triton\",\n+        training_path=False,\n+        notes=\"Fused multimem reduce-scatter + residual add + RMSNorm + all-gather, one block \"\n+        \"per token. On an NVLink multicast group its outputs replay bit-exactly and equal the \"\n+        \"shard-sized launch it replaced; the launch geometry is checked without a GPU.\",\n+    ),\n     KernelEntry(\n         name=\"inference_nvls_symmetric_memory_collectives\",\n         sources=(\n             \"megatron/core/inference/communication/torch_symm_triton/barrier.py\",\n             \"megatron/core/inference/communication/torch_symm_triton/collectives.py\",\n-            \"megatron/core/inference/communication/torch_symm_triton/fused_collectives.py\",\n             \"megatron/core/inference/communication/torch_symm_triton/kernel_config.py\",\n             \"megatron/core/inference/communication/torch_symm_triton/multimem_asm.py\",\n             \"megatron/core/inference/communication/torch_symm_triton/utils.py\",",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/a7d002f766438fe02a3da9e92887a097ed6f3c73/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py",
+      "sha": "cd9eba030635230adb352af1f7d117e41c315879",
+      "status": "modified"
+    },
+    {
+      "additions": 170,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/a7d002f766438fe02a3da9e92887a097ed6f3c73/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_nvls_fused_collectives.py",
+      "changes": 170,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_nvls_fused_collectives.py?ref=a7d002f766438fe02a3da9e92887a097ed6f3c73",
+      "deletions": 0,
+      "filename": "tests/unit_tests/determinism/kernels/test_nvls_fused_collectives.py",
+      "patch": "@@ -0,0 +1,170 @@\n+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n+\n+\"\"\"Fused NVLS reduce-scatter + residual add + RMSNorm + all-gather of fused TP communication.\n+\n+``fused_multimem_rs_add_norm_ag`` launches one block per token: each block processes its tokens\n+one after another, so a block sized from the whole per-rank shard ran several tokens in series\n+with most of its threads idle. The launch geometry is checked on the real launcher without a\n+GPU. On an NVLink multicast group, the kernel replays bit-exactly and gives the bits of the\n+shard-sized launch it replaced: the extra threads of a wider block only add zeros to the\n+block-wide sum of squares.\n+\"\"\"\n+\n+import math\n+from types import SimpleNamespace\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+from megatron.core.inference.communication.torch_symm_triton import fused_collectives\n+from megatron.core.inference.communication.torch_symm_triton.kernel_config import (\n+    SYMM_MEM_KERNEL_CONFIG,\n+)\n+from tests.unit_tests.determinism.kernels.harness import bytes_equal\n+from tests.unit_tests.test_utilities import Utils\n+\n+MAX_NUM_BLOCKS = SYMM_MEM_KERNEL_CONFIG.max_num_blocks\n+MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size\n+NUMEL_PER_THREAD = 8  # 128 bits of bf16\n+\n+\n+def _next_power_of_2(n: int) -> int:\n+    return 1 << (n - 1).bit_length()\n+\n+\n+class _LaunchRecorder:\n+    \"\"\"Stands in for the Triton kernel: records the grid and launch arguments.\"\"\"\n+\n+    def __init__(self):\n+        self.launches = []\n+\n+    def __getitem__(self, grid):\n+        return lambda *args, **kwargs: self.launches.append(dict(grid=grid, kwargs=kwargs))\n+\n+\n+@pytest.mark.parametrize(\n+    \"world_size,hidden,tokens\",\n+    [\n+        (8, 4096, 64),\n+        (8, 2048, 64),\n+        (8, 3584, 256),\n+        (4, 4096, 32),\n+        (2, 2048, 16),\n+        (2, 8192, 16),\n+        (2, 16384, 64),\n+        (8, 4096, 4096),\n+    ],\n+)\n+def test_launch_runs_one_token_per_block(monkeypatch, world_size, hidden, tokens):\n+    \"\"\"Each block covers one token's row, and up to max_num_blocks tokens per rank get a\n+    block each.\"\"\"\n+    pytest.importorskip(\"triton\")\n+    recorder = _LaunchRecorder()\n+    monkeypatch.setattr(fused_collectives, \"_multimem_reduce_scatter_residual_add_kernel\", recorder)\n+    handle = SimpleNamespace(world_size=world_size, rank=0, multicast_ptr=0, signal_pad_ptrs_dev=0)\n+    symm = torch.empty(tokens, hidden, dtype=torch.bfloat16)\n+    residual = torch.empty(tokens // world_size, hidden, dtype=torch.bfloat16)\n+    weight = torch.empty(hidden, dtype=torch.bfloat16)\n+\n+    fused_collectives.fused_multimem_rs_add_norm_ag(residual, symm, handle, residual, weight, 1e-5)\n+\n+    (launch,) = recorder.launches\n+    tokens_per_rank = tokens // world_size\n+    row_threads = math.ceil(hidden / NUMEL_PER_THREAD)\n+    block_size = launch[\"kwargs\"][\"BLOCK_SIZE\"]\n+    assert launch[\"grid\"] == (min(tokens_per_rank, MAX_NUM_BLOCKS), 1, 1)\n+    assert block_size == min(_next_power_of_2(row_threads), MAX_BLOCK_SIZE)\n+    assert launch[\"kwargs\"][\"num_warps\"] == max(1, block_size // SYMM_MEM_KERNEL_CONFIG.warp_size)\n+\n+\n+@pytest.fixture(scope=\"module\")\n+def tp_symm_buffer():\n+    if not torch.cuda.is_available() or Utils.world_size < 2:\n+        pytest.skip(\"needs at least two GPUs\")\n+    if Utils.world_size & (Utils.world_size - 1):\n+        pytest.skip(\"the symmetric-memory barrier needs a power-of-two world size\")\n+    from megatron.core.inference.communication.torch_symm_triton.utils import is_device_nvls_capable\n+\n+    if not is_device_nvls_capable(torch.device(\"cuda\", torch.cuda.current_device())):\n+        pytest.skip(\"NVLS multicast requires a Hopper+ GPU (SM >= 9)\")\n+    from megatron.core import parallel_state\n+    from megatron.core.inference.symmetric_memory import SymmetricMemoryManager\n+\n+    Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)\n+    try:\n+        tp_group = parallel_state.get_tensor_model_parallel_group()\n+        buf = SymmetricMemoryManager.get_buffer(\"tp\", process_group=tp_group)\n+        if buf.symm_mem_hdl is None:\n+            pytest.skip(f\"symmetric memory unavailable: {buf.init_failure_reason}\")\n+        yield tp_group, buf\n+    finally:\n+        SymmetricMemoryManager.destroy(\"tp\")\n+        Utils.destroy_model_parallel()\n+\n+\n+def _shard_sized_launch(residual_output, symm, handle, residual_input, weight, eps):\n+    \"\"\"The same kernel with the launch geometry it had before: BLOCK_SIZE and the grid sized\n+    from the whole per-rank shard.\"\"\"\n+    num_threads = math.ceil(symm.numel() // NUMEL_PER_THREAD / handle.world_size)\n+    if num_threads < MAX_BLOCK_SIZE:\n+        block_size, num_blocks = _next_power_of_2(num_threads), 1\n+    else:\n+        block_size = MAX_BLOCK_SIZE\n+        num_blocks = min(math.ceil(num_threads / MAX_BLOCK_SIZE), MAX_NUM_BLOCKS)\n+    hidden = symm.size(-1)\n+    fused_collectives._multimem_reduce_scatter_residual_add_kernel[(num_blocks, 1, 1)](\n+        residual_output.data_ptr(),\n+        residual_input.data_ptr(),\n+        weight.data_ptr(),\n+        handle.multicast_ptr,\n+        handle.signal_pad_ptrs_dev,\n+        symm.numel() // hidden,\n+        eps=eps,\n+        HIDDEN_SIZE=hidden,\n+        BLOCK_SIZE=block_size,\n+        NUMEL_PER_THREAD=NUMEL_PER_THREAD,\n+        RANK=handle.rank,\n+        WORLD_SIZE=handle.world_size,\n+        num_warps=block_size // SYMM_MEM_KERNEL_CONFIG.warp_size,\n+    )\n+\n+\n+def _all_ranks_ok(ok: bool) -> bool:\n+    flag = torch.tensor([int(ok)], device=\"cuda\")\n+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)\n+    return bool(flag.item())\n+\n+\n+@pytest.mark.parametrize(\"hidden\", [2048, 3584, 4096, 16384])\n+def test_replays_and_matches_shard_sized_launch(tp_symm_buffer, hidden):\n+    \"\"\"Residual output and normalized all-gathered output replay bit-exactly and equal the\n+    shard-sized launch's, with one or several tokens per block.\"\"\"\n+    tp_group, buf = tp_symm_buffer\n+    world_size = dist.get_world_size(tp_group)\n+    rank = dist.get_rank(tp_group)\n+    eps = 1e-5\n+    weight_gen = torch.Generator(device=\"cuda\").manual_seed(7)  # same norm weights on all ranks\n+    weight = (1 + 0.1 * torch.randn(hidden, device=\"cuda\", generator=weight_gen)).bfloat16()\n+    for tokens_per_rank in (8, 64, 256):\n+        tokens = tokens_per_rank * world_size\n+        symm = buf.maybe_get_tensor([tokens, hidden], torch.bfloat16)\n+        assert symm[\"handle\"] is not None\n+        gen = torch.Generator(device=\"cuda\").manual_seed(100 + rank)\n+        partial = torch.randn(tokens, hidden, device=\"cuda\", generator=gen).bfloat16()\n+        residual = torch.randn(tokens_per_rank, hidden, device=\"cuda\", generator=gen).bfloat16()\n+\n+        def run(launch):\n+            symm[\"tensor\"].copy_(partial)\n+            out = residual.clone()\n+            launch(out, symm[\"tensor\"], symm[\"handle\"], out, weight, eps)\n+            return out, symm[\"tensor\"].clone()\n+\n+        expected = run(_shard_sized_launch)\n+        for replay in range(3):\n+            actual = run(fused_collectives.fused_multimem_rs_add_norm_ag)\n+            ok = all(bytes_equal(a, e) for a, e in zip(actual, expected))\n+            assert _all_ranks_ok(ok), (\n+                f\"H={hidden}, {tokens_per_rank} tokens per rank, replay {replay}: output \"\n+                \"differs from the shard-sized launch\"\n+            )",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/a7d002f766438fe02a3da9e92887a097ed6f3c73/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_nvls_fused_collectives.py",
+      "sha": "217f8905b6ab21c6bd1890153f845bd5121b73b4",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+      "created_at": "2026-11-03T04:21:38Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8880#issuecomment-6595377014",
+      "id": 6595377014,
+      "updated_at": "2026-11-03T04:21:38Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    }
+  ],
+  "number": 8880,
+  "refs": {
+    "base": {
+      "commit": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "a7d002f766438fe02a3da9e92887a097ed6f3c73",
+      "repository": "lmcafee-nvidia/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": []
+}

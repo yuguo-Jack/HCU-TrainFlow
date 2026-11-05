@@ -9,76 +9,77 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
   path: docs/developer/graph-api.mdx
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 70e4a64b5341538895fc178ff027d27ce61e10c051ea5d229b793ad5c9ffa597
 - source: nvidia-cudnn-frontend
   path: include/cudnn_frontend/graph_interface.h
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: fe55a7781cf88836bc3e7905b32cf7f18230ec6147c9c3b752c7447efc10d661
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: ccbf7ef8e59ad7db33dfde5fb0926e7cbfe768690a4e95ed538b1276835cf9e0
 - source: nvidia-cudnn-frontend
   path: include/cudnn_frontend/plans.h
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 5117c8558899950fb02c39e558313900fe37962652820a75cabad568bf7d0803
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: c48eea291766af3ac73c83dc5e35e391663a2244f036d0059d5b1ccbd76c4f44
 - source: nvidia-cudnn-frontend
   path: include/cudnn_frontend/backend/kernel_cache.h
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 3ec261ac7b819ee1aac540a4227fa343e9677bdb9524457f0944f61e2dc863be
 - source: nvidia-cudnn-frontend
   path: python/cudnn/_pygraph.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 7b033ce20a300a3a933d0ea67970a123dff21ed7c551fd5e9dfd5728d703587f
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 99738780798d18ea38c5870b4a60ab5aa180638e0ef4d875d4920708819e5f5c
 - source: nvidia-cudnn-frontend
   path: docs/utilities/dynamic-kernel-cache.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: a179f7f5607256b25a7239f3a9e3954c04402d46db9a6a2953c1417c1941513a
 - source: nvidia-cudnn-frontend
   path: docs/utilities/python_graph_and_execution_backends.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: e73978234e7afd4325f2b886ea9c7b9c8051dd0a963d0922bae4ca2e3691179d
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 041561bad1b5dfc70aa930d9617045c59a9983ebc2412b1979b6f3084cd24f98
 - source: nvidia-cudnn-frontend-docs
   path: graph-api
-  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
-  sha256: 5330d9ae79b7a32d3d557dbe1b0bc4c927a807d1b97d459f6fe6bc9d8c7ddc16
+  commit: 62596f777aca773f340569b88fbd42c5fcd807249e8a188810cd38297d19cab9
+  sha256: 7e2b3c0e0c3d40fd841f823308af5e101f0e122020942ea4ab9564e94fa20d3b
   url: https://docs.nvidia.com/cudnn/developer/graph-api
   revision_kind: web-content-fingerprint
 - source: nvidia-cudnn-frontend-docs
   path: dynamic-cache
-  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
-  sha256: a04d09bc60b596cafa2b29a2e5ceff433c14bae3cf6acd457d19a3c09cf409a7
+  commit: 62596f777aca773f340569b88fbd42c5fcd807249e8a188810cd38297d19cab9
+  sha256: 481446d36f4d782142608a553f8af939f3a758967a8c98f53c103e9b3efdfeb8
   url: https://docs.nvidia.com/cudnn/utilities/dynamic-kernel-cache
   revision_kind: web-content-fingerprint
 - source: nvidia-cudnn-frontend
   path: docs/operations/Normalizations.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 270cae42775cde1448aa45d40120efc7a44b196b17dfe94eec8b6c0e8ecb8c4b
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: c56d2980195384db8250f31d1ca3141be6815c1e3ae20a5ac5e4909778127eb8
 - source: nvidia-cudnn-frontend
   path: python/pygraph/norm.cpp
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: a05133d6fcbf06b45f63b5fd5ecfd8978e8b82e36cd576c6e800b522ec6988b5
 - source: nvidia-cudnn-frontend
   path: test/python/norm/graph/test_layernorm.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: ec724c494c7acb618e231d3443fd3f679a1041b9125dddc354629911520fc960
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 91423a247181ac8f7ccf528b0135f3661571803489ffb9f54a8dc39520fe90da
 - source: nvidia-cudnn-frontend
   path: docs/developer/overview.mdx
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 920383cc59860d33321643185b7491445ea9c5135b56e727990a5039eb8b8870
 - source: nvidia-cudnn-frontend
   path: python/cudnn/__init__.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 81e1159443902bfb9bdcf1bf86accb21e8793a0e214feec81f38fd711e332503
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: da22296651440287ad82d13cca464243f9d5fac69793d806bc456ea013e07eea
 - source: nvidia-cudnn-frontend
   path: test/python/sdpa/frost/test_flashinfer_consumed_surface.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 7d5189f6a4d7ab65792c27a40b880b72487f301ff2daf96c5314b1cf3f5a49cc
 - source: nvidia-cudnn-frontend
   path: test/python/core/graph/test_graph_native.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 83d7968864add5bcabae178686938f2fb95b48edddc5efd130d968319a6d04aa
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 7ebdaceb2f26927deb00d4eeac923fbab89167f5d301f45fc7a98ff2e3feae17
 ---
 
 # cuDNN Graph、执行计划、Workspace 与动态形状缓存
@@ -97,9 +98,17 @@ heuristic A/B 提供候选，fallback 注重可运行性；候选还需 check_su
 
 ## 缓存与显存所有权
 
+当前 CUDA Graph 默认 `PER_GRAPH` retention 持有 plan、kernel code 与 host-copy 数据，捕获后即使原 Graph 被销毁仍保留所需资源。选择 `NONE` 会把责任交给调用方：所有关联 graph、clone 和 graph exec 完成并销毁前，plan/host-copy 数据都须存活且不变；单保留 Graph 对象但重新 build/deserialize 同样会替换资源。cuDNN≥9.28 会一起应用 backend retention 设置，9.27 仅能去掉 Frontend 引用。性能收益需单独测量，不能默认关闭引用。
+
+新 `populate_cuda_graph_direct` 仅用于已选 cuDNN backend plan、空的调用方图，以及没有 Frontend memcpy/memset 节点的计划；资格不等于 workspace=0。它必须与 `update_cuda_graph_direct` 配对；旧 populate/update 继续配对，不能猜拓扑混用。Python engine 路线应捕获 execute，不由这个 backend 专用接口推导同等支持。
+
 计划缓存要按真正影响语义和支持面的条件区分，如图结构、形状、stride、dtype、相关选项、设备与库版本。复用 plan 不代表可以复用任意 buffer；执行期间 workspace、输出、saved tensors 与 stream/event 的生命周期要明确。多个并发 stream 不能无同步共享仍在使用的 scratch。
 
 教程区分 build 侧的 dynamic-shape kernel cache 与 execute 侧的 shape override。前者可降低同拓扑图的重复编译成本，后者受实际 plan 的运行时形状支持约束；不能据“支持动态 shape”推导任意长度、stride 或 dtype 均能复用。跨版本反序列化也需验证，而非把缓存当永久二进制接口。
+
+当前 Python engine 的 serialize 保存图 IR、engine 身份/knobs，以及可选编译缓存原件；不能精确表示的 callback/框架对象会被拒绝，build 时绑定的实际 tensor 不随 blob 保存。deserialize 只在编译环境 manifest 完全一致时 seed kernel，否则重新编译，`enforce_precompiled=True` 则拒绝回编译；C++ Graph 不读取这种 `CUDNN_FE_PYPLAN` 格式。新缓存冷启动去重依赖 POSIX advisory lock，不支持锁时继续编译；使用中的 `.locks` inode 不应删除。
+
+官网的 backend 默认 kernel cache 另按设备维护并使用 LRU，与上述 Python 编译制品缓存不是同一层；传入 custom cache 时，容量/生命周期策略也不同。缓存命中不能替代输出地址、长度及 stream 生命周期校验。
 
 ## 故障定位顺序
 
@@ -117,13 +126,13 @@ FlashInfer 消费的 `selected_engine`、`backend_plan_entries()` 与 native bin
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: docs/developer/graph-api.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/developer/graph-api.mdx)
-- [nvidia-cudnn-frontend: include/cudnn_frontend/graph_interface.h](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/include/cudnn_frontend/graph_interface.h)
-- [nvidia-cudnn-frontend: include/cudnn_frontend/plans.h](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/include/cudnn_frontend/plans.h)
-- [nvidia-cudnn-frontend: include/cudnn_frontend/backend/kernel_cache.h](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/include/cudnn_frontend/backend/kernel_cache.h)
-- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/_pygraph.py)
-- [nvidia-cudnn-frontend: docs/utilities/dynamic-kernel-cache.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/utilities/dynamic-kernel-cache.md)
-- [nvidia-cudnn-frontend: docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/utilities/python_graph_and_execution_backends.md)
+- [nvidia-cudnn-frontend: docs/developer/graph-api.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/developer/graph-api.mdx)
+- [nvidia-cudnn-frontend: include/cudnn_frontend/graph_interface.h](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/include/cudnn_frontend/graph_interface.h)
+- [nvidia-cudnn-frontend: include/cudnn_frontend/plans.h](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/include/cudnn_frontend/plans.h)
+- [nvidia-cudnn-frontend: include/cudnn_frontend/backend/kernel_cache.h](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/include/cudnn_frontend/backend/kernel_cache.h)
+- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/_pygraph.py)
+- [nvidia-cudnn-frontend: docs/utilities/dynamic-kernel-cache.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/utilities/dynamic-kernel-cache.md)
+- [nvidia-cudnn-frontend: docs/utilities/python_graph_and_execution_backends.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/utilities/python_graph_and_execution_backends.md)
 - [nvidia-cudnn-frontend-docs: graph-api](https://docs.nvidia.com/cudnn/developer/graph-api)
 - [nvidia-cudnn-frontend-docs: dynamic-cache](https://docs.nvidia.com/cudnn/utilities/dynamic-kernel-cache)
 
@@ -137,13 +146,13 @@ FlashInfer 消费的 `selected_engine`、`backend_plan_entries()` 与 native bin
 
 补充固定证据：
 
-- [docs/operations/Normalizations.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/operations/Normalizations.md)
-- [python/pygraph/norm.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/pygraph/norm.cpp)
-- [test/python/norm/graph/test_layernorm.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/test/python/norm/graph/test_layernorm.py)
+- [docs/operations/Normalizations.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/operations/Normalizations.md)
+- [python/pygraph/norm.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/pygraph/norm.cpp)
+- [test/python/norm/graph/test_layernorm.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/norm/graph/test_layernorm.py)
 
 ## 本次补充的实现与测试依据
 
-- [nvidia-cudnn-frontend: docs/developer/overview.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/developer/overview.mdx)
-- [nvidia-cudnn-frontend: python/cudnn/__init__.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/__init__.py)
-- [nvidia-cudnn-frontend: test/python/sdpa/frost/test_flashinfer_consumed_surface.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/test/python/sdpa/frost/test_flashinfer_consumed_surface.py)
-- [nvidia-cudnn-frontend: test/python/core/graph/test_graph_native.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/test/python/core/graph/test_graph_native.py)
+- [nvidia-cudnn-frontend: docs/developer/overview.mdx](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/developer/overview.mdx)
+- [nvidia-cudnn-frontend: python/cudnn/__init__.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/__init__.py)
+- [nvidia-cudnn-frontend: test/python/sdpa/frost/test_flashinfer_consumed_surface.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/sdpa/frost/test_flashinfer_consumed_surface.py)
+- [nvidia-cudnn-frontend: test/python/core/graph/test_graph_native.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/core/graph/test_graph_native.py)

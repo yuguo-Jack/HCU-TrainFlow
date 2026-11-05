@@ -10,73 +10,74 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: amd-agi-primus
   path: README.md
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
-  sha256: da7a135294ce239c33abefaeddf09aa2efc066cee6a8c887f66de5fbe0528e2d
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
+  sha256: 2d1bca053a8e10b7fdf55e859aac1c9058a2a7e439be1922ea65486f3c5c404f
 - source: amd-agi-primus
   path: .gitmodules
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
-  sha256: 87776b069e8d90da0320eed14cf3cac2c31a5e420fd7a0f814958af4b5e5cf5c
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
+  sha256: b8851f80ca77c6e30434e4beeb3e666dd07f53d08241940d997ef4695aadb53b
 - source: amd-agi-primus
   path: pyproject.toml
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 9210165bd9a0b88af34750e9e9e79a51b79f5857bb49cd169587749fe8b866ea
 - source: amd-agi-primus
   path: docs/01-getting-started/release-notes.md
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
-  sha256: 20edb8970b99c41b5e11b77cebfe297af4e8bce627dd53913fc6bfbf5dbec6c5
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
+  sha256: 9ec28e457b212b7ae4763ec8b4eb5c27e6c66779c2b9ec3c41e33675e6eacc97
 - source: amd-agi-primus
   path: docs/02-user-guide/configuration-system.md
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 75400ddb115e87b357745d06f73a4e086e6f750dc3db352e5205444fafdc89a9
 - source: amd-agi-primus
   path: docs/02-user-guide/megatron-lm-training.md
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: e1c828a5bb9b42ad164a0962034704d60d59ed878a80866a3f7ae284f207bb22
 - source: amd-agi-primus
   path: primus/core/runtime/train_runtime.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 63c969944700b1d63d2393a9e96cb79ff373f25541f6f1e1fef060bdeb57de1c
 - source: amd-agi-primus
   path: primus/core/patches/patch_runner.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 330529f72986ec1d291222b0c3fbf556863ca03b7e72c986cba1f2ac081a645e
 - source: amd-agi-primus
   path: docs/04-technical-guides/fault-tolerance-and-elastic-training.md
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 95a139372f53910555884c391081d1a6da9cae86901aadd20ca4ce32b174be00
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/args/mock_data_patches.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
-  sha256: dc95c00d57cf27f68195433e73756ec90831884e1a2c6044aaa4b7840562e1fa
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
+  sha256: 75a7844f025cc9ab464ed5101d9cab182d0870d216c0d53688d299df12c3d6c5
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/args/rocm_arg_validation.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: e315df8c624f52567641d42ef2a100cfe687ae6ffd5f469a05e5bc1fe0d8ea28
 - source: amd-agi-primus
   path: runner/helpers/hooks/05_check_expandable_segments.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
-  sha256: ff3fe15b20573c9e9443bd61d92ead1e116e88d2e8de056ea9f66274b5619e46
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
+  sha256: ba3859c90b2840a29b5bd098a63b9ee0fe75b26bb5e492df63dc15d17192e8b0
 - source: amd-agi-primus
   path: runner/primus-cli-direct.sh
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 318b0ec634ca27688f5c716ba7423f18453d7b37d431ebdfe40e8a273ab6d4ed
 - source: amd-agi-primus
   path: primus/core/launcher/parser.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
-  sha256: 4635b9c64d94f5fbb7ace923c3cf69d50813a271ddba7fe24ead18bf39121c90
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
+  sha256: 263461f9befd3bc7107c507994589bc313713d2affc9921a3f72734955165fba
 - source: amd-agi-primus
   path: tests/unit_tests/backends/megatron/patches/test_mock_data_patches.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
-  sha256: 35ec2d4998b81917084d94e94e0dc9d110227cc84844394048359efc88bc0749
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
+  sha256: 7b75eb1891c43c494e7658237ae4c176fcba81d2f88de6af391a504468a139c2
 - source: amd-agi-primus
   path: tests/unit_tests/backends/megatron/test_rocm_arg_validation.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: e3f0d1747f0bcfc4ff8225214d94e59c0700abbf43c956f3117556d3e7341f19
+retrieved_on: '2026-11-04'
 ---
 
 # AMD Primus：配置、后端补丁、并行与恢复
@@ -105,17 +106,17 @@ Primus 为多个训练后端提供统一配置、启动、补丁、测试及性�
 
 `pyproject.toml` 要求 Python >=3.10，提供两个入口：`primus-cli` 是统一 Bash runner，`primus` 是 Python 命令。先按官方 bare-metal 或容器安装指南确认实际 Torch/ROCm/TE/Primus-Turbo，再安装父仓与后端；仅装 Python 壳不能证明后端扩展可用。递归 clone 或 submodule update 应保留父提交及 gitlink，避免“父仓固定、子仓浮动”。
 
-本页当前父仓 `8e7a2406111e1c2c3d22112ddb3a1741c619b2ea` 锁定以下已核对的主要后端；本次 Core/Bridge/torchtitan/maxtext 子提交未变，不把父仓新提交理解成后端全部升级：
+本页于 2026-11-04 检索并核对父仓 `bab82720d72cadbdfbedcc050c9fb49de3b353be` 的完整树及以下 gitlink。相对上轮，Core 与 MaxText 已推进，Bridge、TorchTitan 和 HunyuanWorld-Mirror 未变；父仓改动与各后端版本分别判断：
 
 | gitlink | 实际固定提交 |
 | --- | --- |
-| `third_party/Megatron-LM` | `d3528a21301db2d12e92912b3ec025dc8a2ed4d6` |
+| `third_party/Megatron-LM` | `4b4acac9a1d28ea6829c8d4f566d75698a21249d` |
 | `third_party/Megatron-Bridge` | `9577b1280eaadd60b9d7b0ce6df09ac80e87e323` |
 | `third_party/torchtitan` | `73a0e6979dd10b6b1904098eb3c8f62c18ab87ce` |
-| `third_party/maxtext` | `07c240fa070b9ef288e40deb60289f8057c553b6`，URL 为 ROCm/maxtext |
-| `third_party/HunyuanWorld-Mirror-rocm` | 新增 `c61300e47ce06db2f02c8e2551aae68be7ae3a0b`，URL 为 Tencent-Hunyuan/HunyuanWorld-Mirror；本页只核对依赖身份，未审计完整训练实现 |
+| `third_party/maxtext` | `8d1d43c039297a449c4e2af012e6adbed1c4ef04`，URL 为 ROCm/maxtext |
+| `third_party/HunyuanWorld-Mirror-rocm` | `c61300e47ce06db2f02c8e2551aae68be7ae3a0b`，URL 为 Tencent-Hunyuan/HunyuanWorld-Mirror；本页只核对依赖身份，未审计完整训练实现 |
 
-官方使用指南推荐 `rocm/primus:v26.8` 配合 `release/v26.8`，这是发布配对；本页精读 main 与该发布分支不同。指南还说明容器实际使用挂载的 host checkout，不能把镜像内烘焙代码版本当成正在执行版本。HCU 用现场镜像/DTK 的配套工程，核对 `import` 路径、git revision、共享库和 backend 日志。
+README 新增 `26.2.0rc1` wheel / 源码安装路线：wheel 提供 CLI，不包含全部重型后端；`primus-cli deps sync --dir ...` 拉取固定后端及递归子模块，首次使用仍可能下载，不能据此承诺离线。官方使用指南推荐 `rocm/primus:v26.8` 配合 `release/v26.8`，这是发布配对；本页精读 main 与该发布分支不同。发布说明还区分 `rocm/primus` 的 ROCm 10.1 / PyTorch 2.14 与 `rocm/primus-maxtext` 的 ROCm 10.2 nightly / JAX 0.11.1；同为 v26.8 不表示软件栈同步，MaxText 镜像需挂载对应 Primus 分支。这里记录的是官方配对说明，没有验证这些镜像或其 HCU 适用性。指南还说明容器实际使用挂载的 host checkout，不能把镜像内烘焙代码版本当成正在执行版本。HCU 用现场镜像/DTK 的配套工程，核对 `import` 路径、git revision、共享库和 backend 日志。
 
 ## 4. 配置、运行与测试
 
@@ -129,7 +130,7 @@ Primus 为多个训练后端提供统一配置、启动、补丁、测试及性�
 
 模型 YAML 决定结构、dtype、attention/MLP、并行和 optimizer。保留模型真实性：缩层只用于明确的容量目的，不把配方误写成新模型；数据集类型、tokenizer、sequence length、有效 token、GBS/MB/梯度累计、shuffle 与恢复位置随实验保存。distributed optimizer 与 FSDP2 的约束不同，官方 guide 指出 FSDP2 不能照用其 distributed optimizer / parameter gather overlap 组合。
 
-`mock_data_patches.py` 会清除真实数据路径并强制 NullTokenizer。显式 `vocab_size` 原样保留，不自动减一；未指定时从 tokenizer model 的 HF config 顶层或 text_config 取词表，再减去 NullTokenizer 自加 EOD 的一个槽位。因此将 HF 原词表大小直接写入显式 preset，与自动推导路径并非同一数值；EOD 和 padding 可能使最终 embedding/output 尺寸不同，比较前须核对有效配置。
+`mock_data_patches.py` 会清除真实数据路径并强制 NullTokenizer。先使用显式 `vocab_size`，缺省时从 tokenizer model 的 HF config 顶层或 text_config 推导词表并减一；随后 `_null_tokenizer_vocab_includes_eod()` 检查当前 Core 的新路径 `megatron.core.tokenizers.text.libraries.null_tokenizer.NullTokenizer.__init__` 是否含 `eod_id`，命中则再加一。旧路径导入失败时保持旧语义。因此显式词表在新 Core 下也可能调整，不能继续断言原样保留；应核对 tokenizer 接口、EOD、有效与 padded vocab、最终 embedding/output 尺寸，防止把模型大小变化计作吞吐改进。
 
 下载、打开文件或 JSON 解析异常会被捕获；正常返回 None 才走默认词表并告警。`config.get(...)` 位于 try 外，非 mapping 配置、没有顶层有效词表且 `text_config:null` 等 schema 问题仍可能抛错，不保证所有配置失败都自动回退。HF ID 可能触发配置下载，本地 config 则直接读取。mock 吞吐比较需核对最终 embedding/output 和 padded vocab，不能把旧的默认大词表与新真实词表差异当作 kernel 加速；它仍不验证真实 token、监督或收敛。
 
@@ -152,7 +153,7 @@ Primus 为多个训练后端提供统一配置、启动、补丁、测试及性�
 
 compile 有效但步时不降时，查 graph breaks、hook 所属 bucket、通信是否已经隐藏；overlap 卡住时检查 rank group、collective 顺序、启停 hook 和共享参数；重算异常时检查全局层 offset、RNG、低精度 context 和 MTP。性能比较保持数据/GBS、热身和稳定窗口一致，阶段验证 loss 与梯度，不频繁以长训替代局部回归。
 
-Turbo grouped GEMM 将一层专家堆成较大参数，optimizer 主梯度/状态的大块分配可能增加碎片和 peak reserved。ROCm 参数校验在未请求 expandable segments 时告警；全局 `05_check_expandable_segments.py` 则在检测到请求后读取 Torch allocator snapshot，支持但未生效时退出失败。两者不自动证明显存收益或 HCU 可用，也不把某个 allocator 变量升级为通用默认。
+Turbo grouped GEMM 将一层专家堆成较大参数，optimizer 主梯度/状态的大块分配可能增加碎片和 peak reserved。ROCm 参数校验在未请求 expandable segments 时告警；全局 `05_check_expandable_segments.py` 在检测到请求后读取 Torch allocator snapshot，支持但未生效时退出失败。新版本随后在子进程执行一次 CUDA 设备 allocation / synchronize，60 秒超时退出失败，提示特定 ROCm 10.x 与 amdgpu DRM <3.64 的已知挂起组合；该提示不是 HCU 根因判定。子进程 `CalledProcessError` 当前仅 WARN/SKIP，之后仍会打印 verified 并返回 0，必须检查原始子进程结果，不能只读最后一行。两类检查都不自动证明显存收益或 HCU 可用，也不把某个 allocator 变量升级为通用默认。
 
 这项启动检查有覆盖边界：当前 helper 只识别 `--config`，未识别 launcher 同时接受的 `--exp`；只从 YAML 取三个 allocator 字段，未按声明顺序应用其他环境项；direct runner 的 `direct.env` / `--env` 文件又在 hooks 之后加载。缺 Torch、无可见 GPU 或 snapshot 不暴露设置时会提示 skip 并返回 0。因此采用这些入口时核对最终进程的实际设置和检查日志，不能以 hook 返回 0 断言已验证。相关实现和讨论见 [#1257](../../upstream/prs/AMD-AGI--Primus/PR-1257.md)。
 
@@ -162,28 +163,32 @@ Turbo grouped GEMM 将一层专家堆成较大参数，optimizer 主梯度/状�
 
 官方发布说明、[Releases](https://github.com/AMD-AGI/Primus/releases)、[PR 列表](https://github.com/AMD-AGI/Primus/pulls) 是持续变化入口；不能把 main 某项实现直接列成 v26.8 已发布。当前值得联查的固定 PR：[#1237 保留 HIP_VISIBLE_DEVICES](../../upstream/prs/AMD-AGI--Primus/PR-1237.md) 防止 runner 重置共享设备选择；[#1240 router backward BF16](../../upstream/prs/AMD-AGI--Primus/PR-1240.md) 是默认关闭且保留精度 fallback 的局部机制，需读其 Core/TE 依赖和测试。
 
-新增的 [SpecForge 指南](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/04-technical-guides/specforge/introduction.md) 和 [ZAYA1 验证记录](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/04-technical-guides/zaya1/validation.md)分别提供后端路线和特定配方证据。后者记录的是 MI300X、GSM8K 短序列训练及另一个已发布权重的 forward 对照；MI355X 配方内容相同不代表该设备已跑，更不代表 HCU 训练/收敛通过。mock 词表变化见 [#1249](../../upstream/prs/AMD-AGI--Primus/PR-1249.md)，其多项配方调整的性能不能归为单独源码改动。
+新增的 [SpecForge 指南](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/04-technical-guides/specforge/introduction.md) 和 [ZAYA1 验证记录](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/04-technical-guides/zaya1/validation.md)分别提供后端路线和特定配方证据。后者记录的是 MI300X、GSM8K 短序列训练及另一个已发布权重的 forward 对照；MI355X 配方内容相同不代表该设备已跑，更不代表 HCU 训练/收敛通过。mock 词表变化见 [#1249](../../upstream/prs/AMD-AGI--Primus/PR-1249.md)，其多项配方调整的性能不能归为单独源码改动。
 
 [全仓源码导航](../../upstream/source-map/amd-agi-primus.md)、[官方文档原文](../../upstream/docs/amd-agi-primus)用于继续深入。`wiki-search-pr "问题或符号" --engine primus` 可找未写案例的线上 PR，随后追固定代码。更新父仓时必须联查 gitlink、runner 环境契约、runtime/patch API、模型 YAML、两篇专题和案例，不能只刷新 README。
 
+2026-11-04 的保留依据：`PrimusRuntime._run_phase_patches`、`run_patches`、配置继承和 ROCm 参数校验所引文件与上轮字节相同，故保留补丁异常默认记录、配置覆盖顺序和 allocator 告警的既有边界。parser 新增 backend alias 规范化和隐藏 `--backend`（阻止 argparse 将其缩写为 `--backend_path`），不代表仅传该字段就切换 trainer；继续以解析后的 module/framework 与启动器检查为准。重算 patch 已增加 Core 模块级函数路径，见对应专题；编译补丁自身未变也不能替代新 Core 的组合验证。
+
+2026-11-04 的固定 GitHub 最近10条 release 观测包含 [`v26.8.0`](https://github.com/AMD-AGI/Primus/releases/tag/v26.8.0)（2026-10-12）；本页 main 的新补丁/CLI 不据此自动归入该发行版。没有遍历全部发行历史，仍沿目标 tag 与消费者 gitlink 核对。
+
 ## 固定证据与复核范围
 
-- [README.md](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/README.md)
-- [.gitmodules](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/.gitmodules)
-- [pyproject.toml](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/pyproject.toml)
-- [docs/01-getting-started/release-notes.md](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/01-getting-started/release-notes.md)
-- [docs/02-user-guide/configuration-system.md](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/02-user-guide/configuration-system.md)
-- [docs/02-user-guide/megatron-lm-training.md](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/02-user-guide/megatron-lm-training.md)
-- [primus/core/runtime/train_runtime.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/core/runtime/train_runtime.py)
-- [primus/core/patches/patch_runner.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/core/patches/patch_runner.py)
-- [docs/04-technical-guides/fault-tolerance-and-elastic-training.md](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/04-technical-guides/fault-tolerance-and-elastic-training.md)
+- [README.md](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/README.md)
+- [.gitmodules](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/.gitmodules)
+- [pyproject.toml](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/pyproject.toml)
+- [docs/01-getting-started/release-notes.md](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/01-getting-started/release-notes.md)
+- [docs/02-user-guide/configuration-system.md](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/02-user-guide/configuration-system.md)
+- [docs/02-user-guide/megatron-lm-training.md](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/02-user-guide/megatron-lm-training.md)
+- [primus/core/runtime/train_runtime.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/primus/core/runtime/train_runtime.py)
+- [primus/core/patches/patch_runner.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/primus/core/patches/patch_runner.py)
+- [docs/04-technical-guides/fault-tolerance-and-elastic-training.md](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/04-technical-guides/fault-tolerance-and-elastic-training.md)
 
-- [primus/backends/megatron/patches/args/mock_data_patches.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/backends/megatron/patches/args/mock_data_patches.py)
-- [primus/backends/megatron/patches/args/rocm_arg_validation.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/backends/megatron/patches/args/rocm_arg_validation.py)
-- [runner/helpers/hooks/05_check_expandable_segments.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/runner/helpers/hooks/05_check_expandable_segments.py)
-- [runner/primus-cli-direct.sh](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/runner/primus-cli-direct.sh)
-- [primus/core/launcher/parser.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/primus/core/launcher/parser.py)
-- [tests/unit_tests/backends/megatron/patches/test_mock_data_patches.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/tests/unit_tests/backends/megatron/patches/test_mock_data_patches.py)
-- [tests/unit_tests/backends/megatron/test_rocm_arg_validation.py](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/tests/unit_tests/backends/megatron/test_rocm_arg_validation.py)
+- [primus/backends/megatron/patches/args/mock_data_patches.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/primus/backends/megatron/patches/args/mock_data_patches.py)
+- [primus/backends/megatron/patches/args/rocm_arg_validation.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/primus/backends/megatron/patches/args/rocm_arg_validation.py)
+- [runner/helpers/hooks/05_check_expandable_segments.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/runner/helpers/hooks/05_check_expandable_segments.py)
+- [runner/primus-cli-direct.sh](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/runner/primus-cli-direct.sh)
+- [primus/core/launcher/parser.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/primus/core/launcher/parser.py)
+- [tests/unit_tests/backends/megatron/patches/test_mock_data_patches.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/tests/unit_tests/backends/megatron/patches/test_mock_data_patches.py)
+- [tests/unit_tests/backends/megatron/test_rocm_arg_validation.py](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/tests/unit_tests/backends/megatron/test_rocm_arg_validation.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

@@ -7,19 +7,25 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/models/gpt/gpt_layer_specs.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
-  sha256: 9e153c7f3d3a671f1bd9b84023bfe0f14711fe942c4c0df3dc1dec288100c4af
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: 6bd190dd820eeb5fe55baeb700fb4b4589f73995fffc600b332db58a997de794
 - source: nvidia-megatron-lm
   path: tests/unit_tests/transformer/test_multi_latent_attention.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: 062766158e7bf127e0d2971c0caae021e4b0651fd58ee3ebba90fb2a535195ab
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/multi_latent_attention.py
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: 82f7c8aea4522bf28e1a08fc40282d9feece2034a9df08ee7f69aef5cc1fe497
 pr_sources:
 - pr-nvidia--megatron-lm-7942
 kind: authored
+retrieved_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 ---
 
 # 案例：MLA 融合分支遗漏 residual 声明，导致反向少一层融合
@@ -52,14 +58,16 @@ kind: authored
 
 本轮固定主干仍保留 residual 声明与输出/输入梯度/参数梯度对照；新增 MLA KV RoPE+量化融合属于另一条有架构/布局门禁的路径，见 [Core→TE](../topics/transformer-engine.md)。不能因本案例的 norm 属性测试通过，就推定所有新 MLA 融合均生效。
 
+本轮与前次固定源码逐项对照：`test_multi_latent_attention.py` 原件未变，`test_moe_pre_mlp_layernorm_has_residual` 与 `test_fused_residual_norm_matches_unfused` 仍分别检查属性和前反向；当前 spec 的 normalization fallback/MTP backend 变化没有删除 has_residual 声明，因此保留案例因果与测试边界。另一个真实 delta 是 MLA 显式 softmax_scale 现在参与计算并再乘 mscale²，应单独冻结数值基线，不能归因为本案例所述 backward 融合。
+
 ## 证据边界
 
 PR head 为 `0e98321a9ddacc11141177202769712415d9f4bd`，merge 为 `91655aa78007e74e55c963f99861b8a97368c024`。本页源码链接固定到本轮官方主干快照；没有执行 NVIDIA/HCU GPU 测试，也没有编造吞吐提升比例。
 
 ## 固定源码与更新范围
 
-- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/models/gpt/gpt_layer_specs.py)
-- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/transformer/test_multi_latent_attention.py)
+- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/megatron/core/models/gpt/gpt_layer_specs.py)
+- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/tests/unit_tests/transformer/test_multi_latent_attention.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。
 
@@ -67,6 +75,6 @@ PR head 为 `0e98321a9ddacc11141177202769712415d9f4bd`，merge 为 `91655aa78007
 
 ## 当前主干复核：修复与数值对照仍保留
 
-2026-10-12 固定主干的 MLA MoE spec 仍将 `has_residual=True` 传入 pre-MLP norm；`test_moe_pre_mlp_layernorm_has_residual` 和融合/非融合层对照继续保留。旧 PR 记录解释为何改，当前文件说明该修复在本轮官方快照中仍存在；这两个证据层不相互替代。
+2026-11-04 固定主干的 MLA MoE spec 仍将 `has_residual=True` 传入 pre-MLP norm；`test_moe_pre_mlp_layernorm_has_residual` 和融合/非融合层对照继续保留。旧 PR 记录解释为何改，当前文件说明该修复在本轮官方快照中仍存在；这两个证据层不相互替代。
 
 本案例不宣称 HCU TE 的同名配置已经实现相同 backward 融合。应用时按 [Core→TE](../topics/transformer-engine.md) 检查 norm 工厂、返回类型、module 属性和最终 kernel，再使用部署依赖下的前反向局部回归及阶段 loss 证据。

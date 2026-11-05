@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/references/production_metrics.mdx
-raw_sha256: a05a65699c4597d4a0b9aac6aaecfda0f97cb5d1077312fd1d689f32cab03acf
+raw_sha256: 3a26d5270c349e989dd58075be3025b17f0f216366c4d53023037d98816dbf6a
 sources: []
-generated_body_sha256: 77c8430840a96e311014c2ebf37bb59e4ccecd7bee6ff520280b495066cff65b
+generated_body_sha256: da3f8f8cf537928fe18e2a9dafb6e46db2ddda89a4b40ec755cdda34ac63f6cb
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/references/production_metrics.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/references/production_metrics.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/references/production_metrics.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -247,7 +247,7 @@ To modify Grafana's port to the other one(like 3090) in your Docker Compose file
 *   **No Data on Dashboard:**
     *   Generate some traffic to your SGLang server to produce metrics. For example, run a benchmark:
         ```bash Command
-        python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 100 --random-input 128 --random-output 128
+        python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num-prompts 100 --random-input 128 --random-output 128
         ```
     *   Check the Prometheus UI (`http://localhost:9090`) under `Status` -> `Targets` to see if the SGLang endpoint is being scraped successfully.
     *   Verify the `model_name` and `instance` labels in your Prometheus metrics match the variables used in the Grafana dashboard. You might need to adjust the Grafana dashboard variables or the labels in your Prometheus configuration.
@@ -268,7 +268,7 @@ You can customize the setup by modifying these files. For instance, you might ne
 
 Run:
 ```text Output
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 3000 \

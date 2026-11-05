@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/fsdp2_quick_start.md
-raw_sha256: 084048bdafe76112fb4b17adf4f58abdb4b3875955712e43b3df4f1f8b21657b
+raw_sha256: 13b5f4ac148df4a84ed79a5c9f78be2b157b4a826fde918a18641b46d222f89a
 sources: []
-generated_body_sha256: e109430aca71dc2ab0cf9f88a649b2c7d2a6f11bdd931e5e30fd4e1f6f43c14b
+generated_body_sha256: e985005a954b78bf55e32a9d7021f1b8329438245bb22338695bab2f7f6af438
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/fsdp2_quick_start.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/fsdp2_quick_start.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/fsdp2_quick_start.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -30,18 +30,13 @@ Upstream source document; original commands, claims and links require their stat
 
 ## Overview
 
-This document provides a simple example to help developers who are new to MindSpeed LLM quickly start model training tasks and complete LLM pretraining and fine-tuning tasks using the FSDP2 backend.
+This document provides a simple example to help developers who are new to MindSpeed LLM and use the FSDP2 backend quickly start model training tasks.
+
 Using Qwen3-8B as an example, this document guides you through LLM pretraining and fine-tuning tasks. The main steps are:
 
 - Prepare the environment: Set up the environment according to the installation guide.
 - Prepare weights and datasets: Download the Qwen3-8B open-source model weights from Hugging Face and obtain the Alpaca dataset.
 - Start training tasks: Use the FSDP2 backend to run pretraining and fine-tuning on Ascend NPUs.
-
-> [!NOTE]
->
-> MindSpeed LLM supports <term>Ascend 950 products</term>, <term>Atlas A3 training products</term>, and <term>Atlas A2 training products</term>. Single-NPU on-chip memory of 64 GB or more is required. For details, see [Supported Models in the PyTorch Framework](../models/supported_models.md).
->
-> The current Qwen3-8B example script uses `NPUS_PER_NODE=8`, which requires 8 NPUs. If your actual configuration is lower than this, you may encounter Out of Memory (OOM) issues.
 
 Developer prerequisites:
 
@@ -49,15 +44,23 @@ Developer prerequisites:
 - Basic Python development experience.
 - Basic understanding of Fully Sharded Data Parallel (FSDP).
 
+> [!NOTE] Note
+>
+> MindSpeed LLM supports <term>Ascend 950PR&950DT products</term>, <term>Atlas A3 training products</term>, and <term>Atlas A2 training products</term>. Single-NPU on-chip memory of 64 GB or more is required. For details, see [Supported Models in the PyTorch Framework](../models/supported_models.md).
+>
+> This document is a **quick start follow-along tutorial**. If you need to change the model, register a custom dataset, or review a more complete description of the YAML configuration, see the [FSDP2 Backend Fine-Tuning Guide](./finetune/fsdp2/finetune_fsdp2.md).
+>
+> The current Qwen3-8B example script uses `NPUS_PER_NODE=8`, which requires 8 NPUs. If your actual configuration is lower than this, you may encounter Out of Memory (OOM) issues.
+
 ## Environment Preparation
 
-Click [MindSpeed Quick Installation](https://www.hiascend.com/en/developer/software/mindspeed/download) and follow the guidance to set up the environment. For detailed installation instructions, see [MindSpeed LLM Installation](install_guide.md).
+Click [MindSpeed Quick Installation](https://www.hiascend.com/developer/software/mindspeed/download) and follow the guidance to set up the environment. For detailed installation instructions, see [MindSpeed LLM Installation](install_guide.md).
 
 ## Weight and Dataset Preparation
 
 1. Obtain open-source model weights.
 
-    Create a directory to store the weight files.
+    Create a directory in the root directory of MindSpeed LLM to store the weight files.
 
     ```shell
     mkdir -p ./model_from_hf/qwen3_hf
@@ -66,41 +69,41 @@ Click [MindSpeed Quick Installation](https://www.hiascend.com/en/developer/softw
 
     Obtain model weight files from Hugging Face or ModelScope (choose one).
 
-    Method 1: From Hugging Face
+    - Method 1: From Hugging Face
 
-    ```shell
-    # Use wget to download the weight files
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/generation_config.json
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/merges.txt
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00001-of-00005.safetensors
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00002-of-00005.safetensors
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00003-of-00005.safetensors
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00004-of-00005.safetensors
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00005-of-00005.safetensors
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model.safetensors.index.json
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/tokenizer.json
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/tokenizer_config.json
-    wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/vocab.json
-    ```
+      ```shell
+      # Use wget to download the weight files
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/generation_config.json
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/merges.txt
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00001-of-00005.safetensors
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00002-of-00005.safetensors
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00003-of-00005.safetensors
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00004-of-00005.safetensors
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model-00005-of-00005.safetensors
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model.safetensors.index.json
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/tokenizer.json
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/tokenizer_config.json
+      wget https://huggingface.co/Qwen/Qwen3-8B/resolve/main/vocab.json
+      ```
 
-    Method 2: From ModelScope (recommended for China)
+    - Method 2: From ModelScope (recommended for China)
 
-    ```shell
-    # Use wget to download the weight files (from ModelScope)
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/config.json
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/generation_config.json
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/merges.txt
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00001-of-00005.safetensors
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00002-of-00005.safetensors
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00003-of-00005.safetensors
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00004-of-00005.safetensors
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00005-of-00005.safetensors
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model.safetensors.index.json
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/tokenizer.json
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/tokenizer_config.json
-    wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/vocab.json
-    ```
+      ```shell
+      # Use wget to download the weight files (from ModelScope)
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/config.json
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/generation_config.json
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/merges.txt
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00001-of-00005.safetensors
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00002-of-00005.safetensors
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00003-of-00005.safetensors
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00004-of-00005.safetensors
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model-00005-of-00005.safetensors
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/model.safetensors.index.json
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/tokenizer.json
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/tokenizer_config.json
+      wget https://www.modelscope.cn/models/Qwen/Qwen3-8B/resolve/master/vocab.json
+      ```
 
     Verify the correctness and integrity of the weight files by calculating the SHA-256 values with `sha256sum`.
 
@@ -116,7 +119,7 @@ Click [MindSpeed Quick Installation](https://www.hiascend.com/en/developer/softw
 
 2. Obtain the dataset.
 
-    Obtain the Alpaca dataset from Hugging Face.
+    Obtain the Alpaca dataset from Hugging Face or ModelScope.
 
     ```shell
     mkdir dataset
@@ -169,7 +172,15 @@ At this stage, we modify the pretraining example script and configuration file, 
         --master_port $MASTER_PORT
     "
 
-    torchrun $DISTRIBUTED_ARGS train_fsdp2.py examples/fsdp2/qwen3/pretrain_qwen3_8b_4k_fsdp2_A2.yaml
+    torchrun $DISTRIBUTED_ARGS train_fsdp2.py examples/fsdp2/qwen3/pretrain_qwen3_8b_4k_fsdp2_A2.yaml \
+        --model.model_name_or_path ./model_from_hf/qwen3_hf/ \
+        --data.dataset '{"file_name": "./dataset/train-00000-of-00001-a09b74b3ef9c3b56.parquet"}' \
+        --parallel.fsdp_size 8 \
+        --parallel.ep_size 1 \
+        --parallel.ep_fsdp_size 1 \
+        --training.per_device_train_batch_size 1 \
+        --training.gradient_accumulation_steps 1 \
+        --training.output_dir ./output
     ```
 
 3. Edit the training parameter configuration file.
@@ -184,13 +195,10 @@ At this stage, we modify the pretraining example script and configuration file, 
 
     ```yaml
     model:
-      model_name_or_path: ./model_from_hf/qwen3_hf/     # Replace with the path of the downloaded Hugging Face weights
       trust_remote_code: False
       train_from_scratch: False
 
     data:
-      dataset:
-        file_name: ./dataset/train-00000-of-00001-a09b74b3ef9c3b56.parquet   # Replace with the path of the downloaded dataset
       template: qwen3
       cutoff_len: 4096
       max_samples: 100000
@@ -199,24 +207,24 @@ At this stage, we modify the pretraining example script and configuration file, 
       data_manager_type: mg
 
     parallel:
-      fsdp_size: 8                                       # Number of FSDP shards. Must be equal to NPUS_PER_NODE * NNODES (that is, the world size)
       fsdp_modules:
         - model.layers.{*}
         - model.embed_tokens
         - lm_head
-      tp_size: 1
+      ep_modules:
+        - model.layers.{*}.mlp.experts
+      ep_fsdp_modules:
+        - model.layers.{*}.mlp.experts
+      ep_dispatcher: eager
       recompute: True
       recompute_modules:
         - model.layers.{*}
 
     training:
       stage: pt                                          # Training stage. pt indicates pretraining
-      per_device_train_batch_size: 1
-      gradient_accumulation_steps: 1
       dataloader_num_workers: 4
       seed: 42
       dataloader_drop_last: True
-      output_dir: ./output                               # Output directory for saving training weights
       optimizer: adamw
       lr: 1e-05
       max_steps: 2000
@@ -232,7 +240,7 @@ At this stage, we modify the pretraining example script and configuration file, 
 
     After the script runs for a while, you can see the following output in the terminal.
 
-    ```shell
+    ```Output
     INFO [2026-06-22 19:28:40] >>  iteration        1/    2000 | consumed samples:          8 | consumed tokens:      32768 | elapsed time per iteration (ms): 10520.60 | learning rate: 9.999994E-06 | global batch size:     8 | lm loss: 1.304194E+00 | grad norm: 8.515 | max_memory_allocated(GB): 19.07 | max_memory_reserved(GB): 20.87 |
     INFO [2026-06-22 19:28:41] >>  iteration        2/    2000 | consumed samples:         16 | consumed tokens:      65536 | elapsed time per iteration (ms): 1879.90 | learning rate: 9.999978E-06 | global batch size:     8 | lm loss: 1.232217E+00 | grad norm: 4.346 | max_memory_allocated(GB): 19.65 | max_memory_reserved(GB): 25.59 |
     INFO [2026-06-22 19:28:43] >>  iteration        3/    2000 | consumed samples:         24 | consumed tokens:      98304 | elapsed time per iteration (ms): 1769.99 | learning rate: 9.999950E-06 | global batch size:     8 | lm loss: 1.134654E+00 | grad norm: 1.550 | max_memory_allocated(GB): 19.65 | max_memory_reserved(GB): 25.59 |
@@ -240,7 +248,7 @@ At this stage, we modify the pretraining example script and configuration file, 
 
     When training enters iterations, it indicates that training is proceeding normally.
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > - For multi-node training, start the pretraining script in multiple terminals at the same time. The pretraining script in each terminal differs only in the `NODE_RANK` parameter. `MASTER_ADDR` is the IP address of the master node for all terminals. All other parameters stay the same.
 > - The FSDP2 backend automatically shards the model parameters across NPUs so that each NPU stores only part of the parameters, enabling training of ultra-large-scale models.
@@ -277,7 +285,15 @@ At this stage, we modify the fine-tuning example script and configuration file, 
         --master_port $MASTER_PORT
     "
 
-    torchrun $DISTRIBUTED_ARGS train_fsdp2.py examples/fsdp2/qwen3/tune_qwen3_8b_4k_fsdp2_A2.yaml
+    torchrun $DISTRIBUTED_ARGS train_fsdp2.py examples/fsdp2/qwen3/tune_qwen3_8b_4k_fsdp2_A2.yaml \
+        --model.model_name_or_path ./model_from_hf/qwen3_hf/ \
+        --data.dataset '{"file_name": "./dataset/train-00000-of-00001-a09b74b3ef9c3b56.parquet"}' \
+        --parallel.fsdp_size 8 \
+        --parallel.ep_size 1 \
+        --parallel.ep_fsdp_size 1 \
+        --training.per_device_train_batch_size 1 \
+        --training.gradient_accumulation_steps 1 \
+        --training.output_dir ./output
     ```
 
 3. Edit the fine-tuning parameter configuration file.
@@ -292,14 +308,10 @@ At this stage, we modify the fine-tuning example script and configuration file, 
 
     ```yaml
     model:
-      model_name_or_path: ./model_from_hf/qwen3_hf/     # Replace with the path of the downloaded Hugging Face weights
       trust_remote_code: False
       train_from_scratch: False
 
     data:
-      dataset:
-          file_name: "/home/dataset/train-00000-of-00001-a09b74b3ef9c3b56.parquet"   # Replace with the path of the downloaded dataset
-          formatting: "alpaca"                                                       # Dataset data format. The default is alpaca
       template: qwen3
       cutoff_len: 4096
       max_samples: 100000
@@ -307,24 +319,24 @@ At this stage, we modify the fine-tuning example script and configuration file, 
       preprocessing_num_workers: 1
 
     parallel:
-      fsdp_size: 8                                       # Number of FSDP shards. Must be equal to NPUS_PER_NODE * NNODES (that is, the world size)
       fsdp_modules:
         - model.layers.{*}
         - model.embed_tokens
         - lm_head
-      tp_size: 1
+      ep_modules:
+        - model.layers.{*}.mlp.experts
+      ep_fsdp_modules:
+        - model.layers.{*}.mlp.experts
+      ep_dispatcher: eager
       recompute: True
       recompute_modules:
         - model.layers.{*}
 
     training:
-      per_device_train_batch_size: 1
-      gradient_accumulation_steps: 1
       dataloader_num_workers: 4
-      disable_shuffling: 1
+      disable_shuffling: True
       seed: 42
       dataloader_drop_last: True
-      output_dir: ./output                               # Output directory for fine-tuning results
       optimizer: adamw
       lr: 1e-05
       weight_decay: 0.01
@@ -345,7 +357,7 @@ At this stage, we modify the fine-tuning example script and configuration file, 
 
     After the script runs for a while, you can see the following output in the terminal.
 
-    ```shell
+    ```Output
     INFO [2026-06-22 19:25:37] >>  iteration        1/    2000 | consumed samples:          8 | consumed tokens:        564 | elapsed time per iteration (ms): 7827.39 | learning rate: 1.666667E-07 | global batch size:     8 | lm loss: 3.316887E+00 | grad norm: 70.959 | max_memory_allocated(GB): 19.07 | max_memory_reserved(GB): 20.90 |
     INFO [2026-06-22 19:25:38] >>  iteration        2/    2000 | consumed samples:         16 | consumed tokens:       1357 | elapsed time per iteration (ms): 1331.74 | learning rate: 3.333333E-07 | global batch size:     8 | lm loss: 2.443476E+00 | grad norm: 41.986 | max_memory_allocated(GB): 19.07 | max_memory_reserved(GB): 22.43 |
     INFO [2026-06-22 19:25:38] >>  iteration        3/    2000 | consumed samples:         24 | consumed tokens:       2113 | elapsed time per iteration (ms): 981.08 | learning rate: 5.000000E-07 | global batch size:     8 | lm loss: 2.669216E+00 | grad norm: 45.335 | max_memory_allocated(GB): 19.07 | max_memory_reserved(GB): 22.43 |
@@ -353,28 +365,35 @@ At this stage, we modify the fine-tuning example script and configuration file, 
 
     When training enters iterations, it indicates that training is proceeding normally.
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > - For multi-node fine-tuning, start the fine-tuning script in multiple terminals at the same time. The fine-tuning script in each terminal differs only in the `NODE_RANK` parameter. `MASTER_ADDR` is the IP address of the master node for all terminals. All other parameters stay the same.
-> - Fine-tuning uses the Alpaca dataset format by default. To use other datasets, see the "Data Arguments" section in [Full Parameter Reference (Based on the FSDP2 Training Backend)](../features/fsdp2/arguments.md).
+> - Fine-tuning uses the Alpaca dataset format by default. To use other datasets, see the dataset configuration instructions in the [FSDP2 Backend Fine-Tuning Guide](./finetune/fsdp2/finetune_fsdp2.md), or the "Data Arguments" section in [Full Parameter Reference (Based on the FSDP2 Training Backend)](../features/fsdp2/arguments.md).
 
-The script includes training parameters. The following table explains some of them.
+The pretraining and fine-tuning scripts include training parameters. The following table explains some of them.
 
 **Table 1** Training script parameters
 
 |Parameter|Description|Example Configuration|
 |----|----|----|
-|`fsdp_size`|Size of fully sharded data parallelism. It must be equal to the world size (that is, `NPUS_PER_NODE * NNODES`).|Positive integer, such as 8 or 16|
-|`fsdp_modules`|List of model layer structures on which FSDP is enabled.|`["model.layers.{*}", "model.embed_tokens", "lm_head"]`|
-|`recompute`|Whether to enable recomputation to save on-chip memory at the cost of some computation.|`True`/`False`|
-|`recompute_modules`|Model layer structures on which activation recomputation is enabled.|`["model.layers.{*}"]`|
-|`data_manager_type`|Data manager type. `mg` indicates the pretraining scenario and does not need to be configured for fine-tuning.|Pretraining: `mg`. Fine-tuning: not configured|
-|`dataset`|Dataset. Use a name from the dataset registry or a local dataset path.|`alpaca_full`, `sharegpt4_zh`|
-|`template`|Name of the template used to build prompts during fine-tuning.|`qwen3`, `gpt`|
-|`cutoff_len`|Truncation length for input sequences after tokenization. Sequences longer than this value are truncated.|`2048`, `4096`, `16384`|
+|`model_name_or_path`|Path to the Hugging Face weight directory. Replace it with the actual model path.|`./model_from_hf/qwen3_hf/`|
 |`trust_remote_code`|Whether to allow loading models from custom modeling files on Hugging Face.|`True`/`False`|
 |`train_from_scratch`|Whether to train the model from scratch with random weights without loading the model weights.|`True`/`False`|
+|`dataset`|Dataset. Use a JSON string to specify a local path, or use a name from [dataset_info.json](../../../../configs/fsdp2/data/dataset_info.json).|`'{"file_name": "..."}'`, `alpaca_full`|
+|`template`|Name of the template used to build prompts.|`qwen3`, `gpt`|
+|`cutoff_len`|Truncation length for input sequences after tokenization. Sequences longer than this value are truncated.|2048, 4096, 16384|
+|`data_manager_type`|Data manager type. `mg` indicates the pretraining scenario and does not need to be configured for fine-tuning.|Pretraining: `mg`. Fine-tuning: not configured|
+|`fsdp_size`|Size of fully sharded data parallelism. It must be equal to the world size (that is, `NPUS_PER_NODE * NNODES`).|Positive integer, such as 8 or 16|
+|`fsdp_modules`|List of model layer structures on which FSDP is enabled.|`["model.layers.{*}", "model.embed_tokens", "lm_head"]`|
+|`ep_size`|Size of expert parallelism.|Positive integer, such as 1 or 4|
+|`ep_fsdp_size`|Size of FSDP in an expert parallelism group.|Positive integer, such as 1 or 4|
+|`recompute`|Whether to enable recomputation to save on-chip memory at the cost of some computation.|`True`/`False`|
+|`recompute_modules`|Model layer structures on which activation recomputation is enabled.|`["model.layers.{*}"]`|
+|`per_device_train_batch_size`|Training batch size per device.|Positive integer, such as 1 or 4|
+|`gradient_accumulation_steps`|Number of gradient accumulation steps.|Positive integer, such as 1 or 8|
+|`output_dir`|Output directory for saving training weights.|`./output`|
 
-> [!NOTE]
+> [!NOTE] Note
 >
-> 🔍 For a complete description of the parameters, see [Full Parameter Reference (Based on the FSDP2 Training Backend)](../features/fsdp2/arguments.md).
+> - For a complete description of the parameters, see [Full Parameter Reference (Based on the FSDP2 Training Backend)](../features/fsdp2/arguments.md).
+> - For YAML configuration and dataset registration examples, see the [FSDP2 Backend Fine-Tuning Guide](./finetune/fsdp2/finetune_fsdp2.md).

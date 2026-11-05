@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/observability/SILENT_DATA_CORRUPTION.md
-raw_sha256: afa42ea21b54ad5fe81f1c31da417a3c9b893a5a30eb4f37e7e781c91f5f854e
+raw_sha256: ef4f74ab5b9970fd47d3bde84102db4855696777ccdd5b231c5e13e039809bf2
 sources: []
-generated_body_sha256: 7218ac95fb5c80b15dfef4ff3b49b570e3e5f88a79101111bc647f548b70bc8a
+generated_body_sha256: 5e2956116036df4a9aca43f7d3db52b7b23e73355e4288dbc1a6fcc8c9219074
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/observability/SILENT_DATA_CORRUPTION.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/observability/SILENT_DATA_CORRUPTION.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/observability/SILENT_DATA_CORRUPTION.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -77,10 +77,10 @@ Gradient values are never snapshotted. The checked forward/backward must
 begin with no pending gradients (`None` or zeros, the post-`zero_grad`
 state), and restore rebuilds that entry state directly: parameters that
 entered without a gradient return to `None`, and entry gradient tensors are
-zeroed in place, preserving their storage addresses for CUDA graphs, with no
+zeroed in place, preserving their storage addresses for accelerator graphs, with no
 gradient-sized clone or copy kernels on checked steps.
 
-Eager execution, `torch.compile`, CUDA graphs, symmetric-memory FSDP,
+Eager execution, `torch.compile`, accelerator graphs, symmetric-memory FSDP,
 distributed GEMM, async TP, DeepEP v2, and HybridEP can
 participate in replay. GraphTrainer uses the same replay boundary. Execution
 backends do not need their internal scratch state restored as long as one
@@ -90,7 +90,7 @@ snapshotted nor included in the replay signature.
 
 ## Limitations
 
-CUDA graphs currently require `sdc_replayer.num_replays=1`. Additional replays
+Accelerator graphs currently require `sdc_replayer.num_replays=1`. Additional replays
 would require restoring graph-owned gradient and optional-buffer storage
 without changing its captured addresses.
 

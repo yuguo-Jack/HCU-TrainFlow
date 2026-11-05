@@ -1,0 +1,1334 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "4ec0f9c2b0a5673dd3a2a421a536cb71793bcd3cc6869fc10aa5db115a512680",
+      "isPrivate": false,
+      "numbers": [
+        42977,
+        42976,
+        42974,
+        42973,
+        42971,
+        42970,
+        42968,
+        42957
+      ],
+      "observed_at": "2026-11-04T20:03:15.403434+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4907,
+        "resetAt": "2026-11-04T20:42:56Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "2e80af28577dc0ca19a3cc685841f4c49be108c8",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Motivation\r\n\r\nOn DeepSeek-V4.1-Flash the ratio-1/2 sparse indexer is fully replicated across the attention-TP group: `wq_b` and `weights_proj` are `ReplicatedLinear`, `n_local_heads == n_heads`, and every attention-TP rank holds the same query rows of a prefill chunk. So under TP4 each of the four ranks runs the identical dense `fp8_fp4_mqa_logits` scan over every row against the whole compressed context, then the identical top-k on it, and arrives at the identical selection. Three quarters of that work is redundant.\r\n\r\nThat redundant work is the largest O(context²) term of a long prefill. In a 1 M-token prefill on 4× B200 (TP4 + EP4, DSPARK, the cookbook low-latency recipe) the dense index logits are **6.8 s of kernel time per rank** across 2 746 launches, and the ragged top-k that reads the same score tiles is another **1.9 s**. Both grow with context per chunk, so the share keeps rising with length.\r\n\r\n## Modifications\r\n\r\nBehind `SGLANG_OPT_DSV4_INDEXER_TP_SHARD` (default **off**), each attention-TP rank scores a contiguous share of the chunk's rows and the selections are all-gathered, so every rank still ends up with the full selection.\r\n\r\n<img width=\"2460\" height=\"1058\" alt=\"shot-muy3qvkh\" src=\"https://github.com/user-attachments/assets/85a2ae63-e596-4600-8603-902385ebd9df\" />\r\n\r\n- **`RowShard`** (`v41_indexer/types.py`) partitions the rows into rank-ordered shares of `ceil(rows / world)` rounded up to the score kernel's `128 // heads` row grouping, so every MMA tile holds exactly the rows it holds unsharded. `gather` is one `all_gather_into_tensor` over the attention-TP group; the last share's padding rows fall past the row count and are dropped.\r\n- **Full top-k path** (`scoring.py`, `full_topk.py`): `score_tiles` and `dense_prefill_topk` take an optional row range (default: all rows, so the replicated path is unchanged), and `sharded_dense_prefill_topk` scores this rank's share and all-gathers the `[rows, topk]` selection.\r\n- **Candidate publish path** (`sparse_table.py`): the row-parallel half of `publish_prefill_table` is split out as `select_prefill_rows`. With a shard, each rank computes its share's own top-k and its top candidate blocks, all-gathers both, and then builds the sparse table over every row: DeepGEMM's schedule is built per row set and cannot be sliced, and the build is cheap next to the scan.\r\n\r\n<img width=\"2512\" height=\"820\" alt=\"shot-muy3rfqx\" src=\"https://github.com/user-attachments/assets/2c5d489b-1871-4260-bf55-90ff2ead3246\" />\r\n\r\n- **Gate** (`deepseek_v4_backend.py`): the shard is attached to `PrefillInputs` only on the eager extend path, when attention TP > 1 and the chunk has at least 512 rows. Prefill context parallelism keeps the replicated path, since each CP rank already holds its own interleaved subset of rows. Decode and the captured prefill graph are untouched.\r\n\r\n**Why this is exact.** A dense score depends only on its own query row, and the aligned shares keep every MMA tile's row set the same, so each rank computes the same bits for its rows as the replicated path would, and the gathered selection is bitwise the replicated one. Every input of the gate is identical on all attention-TP ranks, so either all of them reach the all-gather or none does. The indexer runs on the `stream_sources` side stream, and the all-gather is the only collective issued during that window of `forward_prepare`; the main stream joins it before attention.\r\n\r\n<img width=\"2504\" height=\"894\" alt=\"shot-muy3rw38\" src=\"https://github.com/user-attachments/assets/14a6829b-d735-4408-92fc-7884e56a6a94\" />\r\n\r\n## Accuracy\r\n\r\nGSM8K, 200 examples, `--temperature 0`, both servers built from the same tree in the same session:\r\n\r\n| | score | score:std |\r\n|---|---|---|\r\n| flag off | 0.990 | 0.0995 |\r\n| flag on | 0.995 | 0.0705 |\r\n\r\nThe one-question difference is run-to-run nondeterminism, not the change: the selection is bitwise the replicated one (see Tests), and two replicated runs of this model already differ, because the consumer layers' bf16 top-k breaks ties at the selection floor by race.\r\n\r\n## Benchmarks\r\n\r\n4× B200, TP4 + EP4, DSPARK block 5, `--cuda-graph-max-bs-decode 64`, `--context-length 1050624`, bs = 1, random-token prompts, 16 K prefill chunks. Same tree on both servers; only the flag differs. One warm-up, then three seeds per point:\r\n\r\n| context | flag off TTFT | flag on TTFT | Δ |\r\n|---|---|---|---|\r\n| 1 M (1 048 000) | 27.73–27.80 s | 20.93–21.00 s | **−6.8 s (−24.5 %)** |\r\n| 256 K (262 144) | 4.91–4.92 s | 4.50 s | −0.42 s (−8.5 %) |\r\n\r\nTP-0 kernel time over the 1 M prefill. The baseline trace was taken on a tree that differs from this one only in the compressed-cache dequant path, so only the indexer kernels below are compared; the consumer-side kernels (`sm100_paged_sparse_mqa_logits`, `topk_bf16_small`) are unchanged to the launch, as expected:\r\n\r\n| kernel | flag off | flag on |\r\n|---|---|---|\r\n| dense `sm100_mqa_logits` | 2 746 launches, 6.80 s | 775 launches, 1.73 s |\r\n| `topk_ragged` | 3 827 launches, 1.90 s | 1 067 launches, 0.47 s |\r\n| `amax8_varlen` (block keys) | 1 087 launches, 0.36 s | 298 launches, 0.09 s |\r\n| `AllGather` (new) | — | 320 launches, 0.10 s |\r\n\r\nNet, the indexer loses 6.66 s of kernel time per rank, which matches the −6.8 s of TTFT: at 1 M the side-stream indexer is on the critical path, so the saving passes straight through. Decode is unaffected.\r\n\r\n**Stacked with per-ratio candidate publishing.** Same session, one tree that also carries the compressed-cache dequant dedup and per-ratio candidate publishing (#TBD) with both their flags on; only this flag differs:\r\n\r\n| context | without this PR | with this PR | Δ |\r\n|---|---|---|---|\r\n| 1 M (1 048 000) | 23.78–23.83 s | 19.19–19.21 s | **−4.6 s (−19.3 %)** |\r\n| 256 K (262 144) | 4.70–4.71 s | 4.42–4.43 s | −0.28 s (−6.0 %) |\r\n\r\nThe saving on top of per-ratio publishing is smaller than on main (−4.6 s instead of −6.8 s), because that change already removes two of the dense scans and leaves less to split. Together the three changes take a 1 M prefill from 27.73–27.80 s on main to 19.19–19.21 s (−8.6 s, −31 %). GSM8K on the stacked tree: 0.995 with this flag, 0.990 without.\r\n\r\n## Tests\r\n\r\nTwo cases are added to `test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py` (`base-b-kernel-unit`, 4-gpu-b200), which already holds the publish/consume tests these paths share. Both run the sharded code as every rank of an attention-TP group inside one process, through a two-pass all-gather: pass one runs the production code as each rank and records the share it contributes, pass two returns every rank's recorded share in rank order, which is what the NCCL all-gather returns. The unsharded path is the oracle.\r\n\r\n- `test_row_shards_publish_the_replicated_table`: the own top-k, `blocks`, `phys_blocks` and `valid_lens` match the replicated publish bit for bit on every rank; the schedule is compared by the sparse scores it drives on every valid position. Its buffer holds bytes the build never writes, so two replicated builds of one input already differ in about a third of its bytes and a byte comparison would be meaningless.\r\n- `test_row_shards_select_the_replicated_full_topk`: the sharded full top-k equals the replicated one on every rank.\r\n\r\nCases cover a padded last share, an even split, an empty share, and shares that cut a request in two. A precondition that the shares tile the rows fails cleanly before any kernel runs; without it, a broken partition hands uninitialized block ids to the schedule build, which crashes and poisons the CUDA context for every later test in the file. Shifting each share by one row turns all seven new subtests red on that precondition and leaves the six existing tests green. On B200 the file runs 8 tests in 1.6 s warm.\r\n\r\n## Reproduction\r\n\r\n```bash\r\n# server (the A/B above: flag on vs off, everything else equal)\r\nSGLANG_OPT_DSV4_INDEXER_TP_SHARD=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \\\r\npython3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \\\r\n  --tp 4 --ep-size 4 --mem-fraction-static 0.8 --speculative-algorithm DSPARK \\\r\n  --speculative-dspark-block-size 5 --cuda-graph-max-bs-decode 64 \\\r\n  --context-length 1050624 --port 31000\r\n\r\n# sharded vs replicated selection\r\npython3 test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py\r\n\r\n# accuracy\r\npython3 -m sglang.test.run_eval --eval-name gsm8k --num-examples 200 --num-threads 32 --temperature 0 --port 31000\r\n```\r\n\r\n## Checklist\r\n\r\n- [ ] Format your code: `pre-commit run --all-files` (not run locally; the changed files pass `ruff format`, `isort` and `codespell` at the pinned versions, and `ruff check` reports nothing new)\r\n- [x] Add unit tests: two cases in the existing indexer test file, results in Tests\r\n- [x] Update documentation as needed: the new env var is documented at its definition in `environ.py`\r\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:no_entry_sign: [Run #41379835388](https://github.com/sgl-project/sglang/actions/runs/41379835388)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:hourglass_flowing_sand: [Run #41379835394](https://github.com/sgl-project/sglang/actions/runs/41379835394)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:white_check_mark: [Run #41379835379](https://github.com/sgl-project/sglang/actions/runs/41379835379)<!-- slot:pr-test-amd:end -->\n\n> [!TIP]\n> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:\n>\n> ```text\n> Find the registered tests this PR affects and run them with /rerun-test, following https://github.com/sgl-project/sglang/blob/main/.agents/skills/rerun-test/SKILL.md\n> ```\n<!-- pr-states:end -->",
+      "changedFiles": 11,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=41182446774,41182448347 -->\nRequired checks failed on ff4e6e9; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/41182446774))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.\n\n**Lint** ([run](https://github.com/sgl-project/sglang/actions/runs/41182448347))\nRun `pre-commit run --all-files` locally and push the result. The run log shows any other failing step.",
+            "createdAt": "2026-10-31T07:58:18Z",
+            "databaseId": 6540882492,
+            "updatedAt": "2026-10-31T08:12:58Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6540882492"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "<!-- pr-check-comment runs=41183362749 -->\nRequired checks failed on 55abf45; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/41183362749))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+            "createdAt": "2026-10-31T08:12:57Z",
+            "databaseId": 6541013925,
+            "updatedAt": "2026-10-31T08:53:55Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6541013925"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-01T02:19:30Z",
+            "databaseId": 6552258231,
+            "updatedAt": "2026-11-01T02:19:30Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6552258231"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "[BBuf Review Agent] @yuan-luo these CI failures look related to this change, could you take a look?\n- [`jit-kernel-unit-test-4-gpu-b200`](https://github.com/sgl-project/sglang/actions/runs/41183364763/job/124485319162): `✗ FAILED: /actions-runner/_work/sglang/sglang/test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py returned exit code 1\" This test is changed by the diff and exercises the modifi`",
+            "createdAt": "2026-11-01T02:19:33Z",
+            "databaseId": 6552258580,
+            "updatedAt": "2026-11-01T02:19:33Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6552258580"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-01T03:26:01Z",
+            "databaseId": 6552857654,
+            "updatedAt": "2026-11-01T03:26:01Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6552857654"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-01T03:59:50Z",
+            "databaseId": 6553145708,
+            "updatedAt": "2026-11-01T03:59:50Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6553145708"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-01T09:54:57Z",
+            "databaseId": 6555777790,
+            "updatedAt": "2026-11-01T09:54:57Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6555777790"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "/rerun-failed-ci extra",
+            "createdAt": "2026-11-01T09:55:08Z",
+            "databaseId": 6555779553,
+            "updatedAt": "2026-11-01T09:55:08Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6555779553"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "[BBuf Review Agent] @yuan-luo these CI failures look related to this change, could you take a look?\n- [`jit-kernel-unit-test-4-gpu-b200`](https://github.com/sgl-project/sglang/actions/runs/41183364763/job/124853675521): `✗ FAILED: /actions-runner/_work/sglang/sglang/test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py returned exit code 1\" The failing test file and the indexer code it exercises a`",
+            "createdAt": "2026-11-01T14:06:45Z",
+            "databaseId": 6559030184,
+            "updatedAt": "2026-11-01T14:06:45Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6559030184"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-01T19:30:55Z",
+            "databaseId": 6562798080,
+            "updatedAt": "2026-11-01T19:30:55Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6562798080"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-01T20:54:06Z",
+            "databaseId": 6563744439,
+            "updatedAt": "2026-11-01T20:54:06Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6563744439"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-01T21:40:23Z",
+            "databaseId": 6564273745,
+            "updatedAt": "2026-11-01T21:40:23Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6564273745"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-02T01:02:02Z",
+            "databaseId": 6566581711,
+            "updatedAt": "2026-11-02T01:02:02Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6566581711"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "[BBuf Review Agent] @yuan-luo these CI failures look related to this change, could you take a look?\n- [`base-a-test-cpu (4)`](https://github.com/sgl-project/sglang/actions/runs/41317239116/job/125054008310): `RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use the 'spawn' start method\". The new test_dsv41_indexer_tp_shard.py:166 calls changed flat_in`",
+            "createdAt": "2026-11-02T02:11:49Z",
+            "databaseId": 6567413510,
+            "updatedAt": "2026-11-02T02:11:49Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6567413510"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-02T05:56:19Z",
+            "databaseId": 6570200486,
+            "updatedAt": "2026-11-02T05:56:19Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6570200486"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-02T07:58:46Z",
+            "databaseId": 6572053238,
+            "updatedAt": "2026-11-02T07:58:46Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6572053238"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-11-02T10:38:27Z",
+            "databaseId": 6575052729,
+            "updatedAt": "2026-11-02T10:38:27Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6575052729"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYfnV7k=",
+          "hasNextPage": false
+        },
+        "totalCount": 17
+      },
+      "headRefOid": "a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "headRepository": {
+        "nameWithOwner": "yuan-luo/sglang"
+      },
+      "mergeCommit": {
+        "oid": "e33cd0c3a10474c7a0f6efeb69ce2cf4b7a55021"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-02T14:24:47Z",
+      "number": 42968,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "DarkSharpness"
+            },
+            "body": "> (auto generated by Claude)\n\nDirection looks right; a few comments inline on the gate and on where the rows are split. Read-only review against 55abf45, no GPU run.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "> (auto generated by Claude)\n\n[P1] `rows_per_request is None` is also true on the prefill-graph break: `_prefill_graph_full_topk_break` calls this with `None`, so with the flag on, attn TP > 1 and >= 512 live rows, both `topk_prefill` and `publish_prefill_graph` -> `publish_prefill` all-gather inside the graph break. The description says the captured prefill graph is untouched. Is this intended? If yes, it needs a test through the break path; if not, could we gate on it explicitly (e.g. the caller passes whether sharding is allowed, plus an explicit `attn_cp_size == 1` check) instead of inferring \"not CP\" from `rows_per_request`?",
+                  "createdAt": "2026-10-31T14:00:15Z",
+                  "databaseId": 4431951843,
+                  "diffHunk": "@@ -3987,6 +3993,13 @@ def _make_low_ratio_prefill_indexer_inputs(\n     ) -> PrefillInputs:\n         core = self.forward_metadata.core_metadata\n         tail = self.forward_metadata.late_layer_tail\n+        # Prefill CP hands each rank its own interleaved subset of rows; every\n+        # other path holds the batch's rows on every attention-TP rank.\n+        row_shard = (\n+            self._indexer_row_shard(layer, num_rows=x.shape[0])\n+            if rows_per_request is None",
+                  "line": null,
+                  "originalLine": 4000,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:00:15Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951843"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "> (auto generated by Claude)\n\n[P2] Contiguous shares are unbalanced under causal prefill: later rows see longer `compress_lens`, and the all-gather waits for the slowest rank. For a chunk with no prefix on TP4, the last share costs ~1.75x the mean, so the scan speedup is ~2.3x instead of 4x; it only vanishes when prefix >> chunk, which is why 1M looks good and 256K only gets -8.5%. Could we split by the cost prefix sum (`seq_lens_cpu` / `rows_per_request` are on host), or interleave like CP's `interleave_rows_per_request` and permute after the gather?",
+                  "createdAt": "2026-10-31T14:00:15Z",
+                  "databaseId": 4431951849,
+                  "diffHunk": "@@ -32,6 +33,38 @@ def tail(self, rows_per_request: List[int]) -> CandidateMetadata:\n         raise NotImplementedError(f\"{type(self).__name__} is not a prefill publish\")\n \n \n+class RowShard(msgspec.Struct, frozen=True, kw_only=True):\n+    \"\"\"This rank's share of a prefill chunk's query rows across a group whose\n+    ranks all hold the same rows.\n+\n+    The indexer is replicated, so every rank of the attention-TP group would\n+    score every row identically. Each rank scores a contiguous share instead and\n+    the selections are all-gathered. A dense score depends only on its own query\n+    row, so the gathered selection is bitwise the replicated one.\"\"\"\n+\n+    group: GroupCoordinator\n+    rank: int\n+    world: int\n+    # The score kernel groups 128 // heads consecutive rows into one MMA tile;\n+    # aligned shares keep every tile's row set the same as unsharded.\n+    row_align: int\n+\n+    def rows_per_rank(self, num_rows: int) -> int:\n+        return ceil_align(ceil_div(num_rows, self.world), self.row_align)\n+\n+    def local_rows(self, num_rows: int) -> slice:",
+                  "line": 55,
+                  "originalLine": 55,
+                  "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/types.py",
+                  "updatedAt": "2026-10-31T14:00:15Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951849"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "> (auto generated by Claude)\n\n[P2] Threading `rows` through `score_tiles`, `dense_prefill_topk` and `select_prefill_rows` slices the data at every consumer, while `_index_q_and_weights` still projects/quantizes every row on every rank. Could we narrow at the source instead, i.e. `get_deep_gemm_prefill_data(inputs, rows=...)` (or a `DeepGEMMPrefillData.narrow`) that only builds the local rows' `q_fp4/q_sf/weights/request_starts/compress_lens`? Then these three functions keep their signatures, the q projection is sharded too, and the shape matches the CP path, which already hands the indexer only its own rows.",
+                  "createdAt": "2026-10-31T14:00:15Z",
+                  "databaseId": 4431951853,
+                  "diffHunk": "@@ -267,13 +267,20 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil\n     )\n \n \n-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):\n+def score_tiles(\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    *,\n+    rows: Optional[slice] = None,\n+) -> Generator[Tuple[slice, torch.Tensor], None, None]:\n+    \"\"\"Tiles of ``rows`` (all by default); a tile slice is relative to ``rows``.\"\"\"\n+    rows = slice(0, data.num_rows) if rows is None else rows\n     yield from flat_index_logits_tiles(\n-        q=(data.q_fp4, data.q_sf),\n+        q=(data.q_fp4[rows], data.q_sf[rows]),",
+                  "line": null,
+                  "originalLine": 279,
+                  "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py",
+                  "updatedAt": "2026-10-31T14:00:16Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951853"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "> (auto generated by Claude)\n\nNon-blocking: this branch repeats `sharded_dense_prefill_topk` (allocate local outputs, run on `local_rows`, gather, `copy_`). Could this live in one `RowShard` helper, or could the unsharded case be a world-1 `RowShard` whose gather is a no-op, so `publish_prefill_table` keeps a single path?",
+                  "createdAt": "2026-10-31T14:00:15Z",
+                  "databaseId": 4431951860,
+                  "diffHunk": "@@ -534,8 +532,54 @@ def publish_prefill_table(\n             keys,\n             nblocks[tile],\n             out_offsets=zero_offsets[: logits.shape[0]],\n-            out_indices=blocks[tile],\n+            out_indices=out_blocks[tile],\n+        )\n+\n+\n+# TODO(dark): support fusion of publish + topk of publish layer\n+def publish_prefill_table(\n+    *,\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    index_page_table: torch.Tensor,\n+    index_page_size: int,\n+    topk_blocks: int,\n+    out_positions: torch.Tensor,\n+    row_shard: Optional[RowShard] = None,\n+) -> _SparsePrefillTable:\n+    \"\"\"The source's own top-k into ``out_positions`` (request-local compressed\n+    positions) and the chunk's table, from one pass over its dense scores;\n+    ``index_page_table`` is at ``index_page_size`` slots. With ``row_shard`` the\n+    scores are this rank's share and the selections are all-gathered; the table\n+    is then built over every row, because its schedule cannot be sliced.\"\"\"\n+    rows = data.num_rows\n+    device = data.q_fp4.device\n+    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)\n+    if row_shard is None:\n+        blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)\n+        select_prefill_rows(\n+            data=data,\n+            kv=kv,\n+            rows=slice(0, rows),\n+            nblocks=nblocks,\n+            out_positions=out_positions,\n+            out_blocks=blocks,\n+        )\n+    else:\n+        local = row_shard.local_rows(rows)",
+                  "line": 567,
+                  "originalLine": 569,
+                  "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/sparse_table.py",
+                  "updatedAt": "2026-10-31T14:00:16Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951860"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "> (auto generated by Claude)\n\nNon-blocking: `128 // n_heads` duplicates `row_alignment` in `flat_index_logits_rows_per_tile` (`kernels/ops/attention/dsv4/index_logits.py`); could we export one helper from there instead of re-deriving the kernel tiling in the backend? Also, is the alignment actually needed for bitwise equality? Each logits row only depends on its own q/weights, so rows in one MMA tile don't interact. If it isn't, arbitrary cut points would make the balanced split above easier.",
+                  "createdAt": "2026-10-31T14:00:15Z",
+                  "databaseId": 4431951864,
+                  "diffHunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all\n+        # of them reach the all-gather or none does.\n+        parallel = get_parallel()\n+        if (\n+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()\n+            or parallel.attn_tp_size == 1\n+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS\n+        ):\n+            return None\n+        return RowShard(\n+            group=parallel.attn_tp_group,\n+            rank=parallel.attn_tp_rank,\n+            world=parallel.attn_tp_size,\n+            row_align=128 // layer.indexer.n_heads,",
+                  "line": null,
+                  "originalLine": 4064,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:00:16Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951864"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "> (auto generated by Claude)\n\nNon-blocking: this all-gather runs on the `stream_sources` side stream, and safety relies on it being the only attn-TP collective issued in that window. Nothing enforces that; could the comment state it as a constraint so a later main-stream collective in `forward_prepare` doesn't reorder against it?",
+                  "createdAt": "2026-10-31T14:00:15Z",
+                  "databaseId": 4431951868,
+                  "diffHunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all",
+                  "line": 4063,
+                  "originalLine": 4051,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:00:16Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951868"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "DarkSharpness"
+                  },
+                  "body": "> (auto generated by Claude)\n\nNon-blocking: could you add TTFT for short prompts (e.g. 4K / 16K / 64K) to show the 512 floor doesn't regress them? Also the accuracy numbers use the deprecated `sglang.test.run_eval`; sgl-eval with the sampling settings stated would be preferred.",
+                  "createdAt": "2026-10-31T14:00:15Z",
+                  "databaseId": 4431951874,
+                  "diffHunk": "@@ -1037,6 +1038,11 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:\n     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))\n \n \n+# Arbitrary floor: below it the dense scores are short enough that the\n+# all-gather's fixed latency eats most of what sharding saves.\n+_INDEXER_TP_SHARD_MIN_ROWS = 512",
+                  "line": 1046,
+                  "originalLine": 1043,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:00:16Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951874"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDowMDoxNVrPAAAAAQgqOAI=",
+                "hasNextPage": false
+              },
+              "totalCount": 7
+            },
+            "databaseId": 5723062283,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:00:15Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723062283"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "yuan-luo"
+                  },
+                  "body": "Good catch. The local patch (not pushed yet) makes row sharding an explicit eager-caller opt-in; the prefill-graph break passes allow_row_shard=False, and the gate independently requires attn_cp_size == 1. Added CPU regression coverage through both full-topk and candidate-publish graph-break callers at 512/513 rows, plus the eager TP/CP/flag gates. These tests are registered but have not run locally because PyTorch is unavailable; this is dispatch coverage, not a CUDA graph replay claim.",
+                  "createdAt": "2026-10-31T14:46:44Z",
+                  "databaseId": 4432086907,
+                  "diffHunk": "@@ -3987,6 +3993,13 @@ def _make_low_ratio_prefill_indexer_inputs(\n     ) -> PrefillInputs:\n         core = self.forward_metadata.core_metadata\n         tail = self.forward_metadata.late_layer_tail\n+        # Prefill CP hands each rank its own interleaved subset of rows; every\n+        # other path holds the batch's rows on every attention-TP rank.\n+        row_shard = (\n+            self._indexer_row_shard(layer, num_rows=x.shape[0])\n+            if rows_per_request is None",
+                  "line": null,
+                  "originalLine": 4000,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:46:44Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432086907"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDo0Njo0NFrPAAAAAQgsR3s=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5723359277,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:46:44Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359277"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "yuan-luo"
+                  },
+                  "body": "Agreed that equal row counts can leave causal scan work imbalanced. The ~2.3x bound follows the visible-length cost model, but the existing TTFT measurements do not isolate that effect or prove it explains the 256K/1M gap. I am keeping aligned contiguous shares in this patch; cost-aware/interleaved partitioning needs per-rank timing and a short-/long-prefix A/B, including permutation and communication overhead. That optimization remains follow-up work.",
+                  "createdAt": "2026-10-31T14:46:45Z",
+                  "databaseId": 4432086919,
+                  "diffHunk": "@@ -32,6 +33,38 @@ def tail(self, rows_per_request: List[int]) -> CandidateMetadata:\n         raise NotImplementedError(f\"{type(self).__name__} is not a prefill publish\")\n \n \n+class RowShard(msgspec.Struct, frozen=True, kw_only=True):\n+    \"\"\"This rank's share of a prefill chunk's query rows across a group whose\n+    ranks all hold the same rows.\n+\n+    The indexer is replicated, so every rank of the attention-TP group would\n+    score every row identically. Each rank scores a contiguous share instead and\n+    the selections are all-gathered. A dense score depends only on its own query\n+    row, so the gathered selection is bitwise the replicated one.\"\"\"\n+\n+    group: GroupCoordinator\n+    rank: int\n+    world: int\n+    # The score kernel groups 128 // heads consecutive rows into one MMA tile;\n+    # aligned shares keep every tile's row set the same as unsharded.\n+    row_align: int\n+\n+    def rows_per_rank(self, num_rows: int) -> int:\n+        return ceil_align(ceil_div(num_rows, self.world), self.row_align)\n+\n+    def local_rows(self, num_rows: int) -> slice:",
+                  "line": 55,
+                  "originalLine": 55,
+                  "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/types.py",
+                  "updatedAt": "2026-10-31T14:46:45Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432086919"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDo0Njo0NVrPAAAAAQgsR4c=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5723359298,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:46:45Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359298"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "yuan-luo"
+                  },
+                  "body": "The local patch (not pushed yet) adds DeepGEMMPrefillData.narrow() and removes the rows parameter from score_tiles, dense_prefill_topk, and select_prefill_rows. Query operands are sliced together as views while global K layout/score width and the full published-table layout are preserved. Projection/quantization intentionally remain replicated: sharding them changes the projection GEMM shape and needs a separate numerical/performance A/B. This addresses the repeated slicing, not the remaining projection cost.",
+                  "createdAt": "2026-10-31T14:46:46Z",
+                  "databaseId": 4432086981,
+                  "diffHunk": "@@ -267,13 +267,20 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil\n     )\n \n \n-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):\n+def score_tiles(\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    *,\n+    rows: Optional[slice] = None,\n+) -> Generator[Tuple[slice, torch.Tensor], None, None]:\n+    \"\"\"Tiles of ``rows`` (all by default); a tile slice is relative to ``rows``.\"\"\"\n+    rows = slice(0, data.num_rows) if rows is None else rows\n     yield from flat_index_logits_tiles(\n-        q=(data.q_fp4, data.q_sf),\n+        q=(data.q_fp4[rows], data.q_sf[rows]),",
+                  "line": null,
+                  "originalLine": 279,
+                  "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py",
+                  "updatedAt": "2026-10-31T14:46:46Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432086981"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDo0Njo0NlrPAAAAAQgsR8U=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5723359368,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:46:46Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359368"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "yuan-luo"
+                  },
+                  "body": "I kept the two orchestration paths separate for now: table publication has two outputs/collectives, whereas full top-k has one, and the replicated path needs no local staging buffers or gather/copy. Both already use RowShard.local_rows/gather, and the local patch centralizes operand slicing in data.narrow(). A world-1/callback abstraction does not seem to simplify these distinct output lifetimes enough to justify it here.",
+                  "createdAt": "2026-10-31T14:46:49Z",
+                  "databaseId": 4432087082,
+                  "diffHunk": "@@ -534,8 +532,54 @@ def publish_prefill_table(\n             keys,\n             nblocks[tile],\n             out_offsets=zero_offsets[: logits.shape[0]],\n-            out_indices=blocks[tile],\n+            out_indices=out_blocks[tile],\n+        )\n+\n+\n+# TODO(dark): support fusion of publish + topk of publish layer\n+def publish_prefill_table(\n+    *,\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    index_page_table: torch.Tensor,\n+    index_page_size: int,\n+    topk_blocks: int,\n+    out_positions: torch.Tensor,\n+    row_shard: Optional[RowShard] = None,\n+) -> _SparsePrefillTable:\n+    \"\"\"The source's own top-k into ``out_positions`` (request-local compressed\n+    positions) and the chunk's table, from one pass over its dense scores;\n+    ``index_page_table`` is at ``index_page_size`` slots. With ``row_shard`` the\n+    scores are this rank's share and the selections are all-gathered; the table\n+    is then built over every row, because its schedule cannot be sliced.\"\"\"\n+    rows = data.num_rows\n+    device = data.q_fp4.device\n+    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)\n+    if row_shard is None:\n+        blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)\n+        select_prefill_rows(\n+            data=data,\n+            kv=kv,\n+            rows=slice(0, rows),\n+            nblocks=nblocks,\n+            out_positions=out_positions,\n+            out_blocks=blocks,\n+        )\n+    else:\n+        local = row_shard.local_rows(rows)",
+                  "line": 567,
+                  "originalLine": 569,
+                  "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/sparse_table.py",
+                  "updatedAt": "2026-10-31T14:46:49Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087082"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDo0Njo0OVrPAAAAAQgsSCo=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5723359475,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:46:49Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359475"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "yuan-luo"
+                  },
+                  "body": "The local patch (not pushed yet) shares flat_index_logits_row_alignment() between score-tile sizing and the backend. Also corrected the bitwise-equality claim: mathematical row independence does not guarantee identical bf16 results across kernel row counts; alignment alone is insufficient. I retain the current tile-aligned partition conservatively, without claiming arbitrary cuts are incorrect or that alignment proves parity.",
+                  "createdAt": "2026-10-31T14:46:51Z",
+                  "databaseId": 4432087224,
+                  "diffHunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all\n+        # of them reach the all-gather or none does.\n+        parallel = get_parallel()\n+        if (\n+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()\n+            or parallel.attn_tp_size == 1\n+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS\n+        ):\n+            return None\n+        return RowShard(\n+            group=parallel.attn_tp_group,\n+            rank=parallel.attn_tp_rank,\n+            world=parallel.attn_tp_size,\n+            row_align=128 // layer.indexer.n_heads,",
+                  "line": null,
+                  "originalLine": 4064,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:46:52Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087224"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDo0Njo1MVrPAAAAAQgsSLg=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5723359580,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:46:52Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359580"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "yuan-luo"
+                  },
+                  "body": "Added the constraint at the stream_sources launch site in the local patch (not pushed yet): until that stream is joined, neither the main nor KV stream may issue an attention-TP collective, since all ranks must preserve communicator ordering. This documents the ordering contract; it does not add runtime enforcement.",
+                  "createdAt": "2026-10-31T14:46:53Z",
+                  "databaseId": 4432087310,
+                  "diffHunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all",
+                  "line": 4063,
+                  "originalLine": 4051,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:46:53Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087310"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDo0Njo1M1rPAAAAAQgsSQ4=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5723359664,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:46:53Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359664"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "yuan-luo"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "yuan-luo"
+                  },
+                  "body": "Agreed; these measurements remain outstanding. The 512-row floor is a heuristic, not evidence of no regression at 4K/16K/64K. The follow-up needs warmed flag-off/on TTFT at those lengths with otherwise identical settings, plus an sgl-eval accuracy rerun with explicit sampling settings. I have not run those experiments in this update and would not relabel the existing legacy-harness GSM8K numbers as sgl-eval results.",
+                  "createdAt": "2026-10-31T14:46:55Z",
+                  "databaseId": 4432087378,
+                  "diffHunk": "@@ -1037,6 +1038,11 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:\n     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))\n \n \n+# Arbitrary floor: below it the dense scores are short enough that the\n+# all-gather's fixed latency eats most of what sharding saves.\n+_INDEXER_TP_SHARD_MIN_ROWS = 512",
+                  "line": 1046,
+                  "originalLine": 1043,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-31T14:46:55Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087378"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMVQxNDo0Njo1NVrPAAAAAQgsSVI=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5723359745,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-31T14:46:55Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359745"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "[BBuf Review Agent] LGTM. Please wait for the registered B200 indexer tests.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5725995090,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-01T02:14:24Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5725995090"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "BBuf"
+            },
+            "body": "LGTM.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5731393106,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-02T02:03:16Z",
+            "url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5731393106"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wMlQwMjowMzoxNlq0MjAyNi0xMS0wMlQwMjowMzoxNlrPAAAAAVWeHlI=",
+          "hasNextPage": false
+        },
+        "totalCount": 10
+      },
+      "state": "MERGED",
+      "title": "[Perf] DeepSeek-V4.1: Support indexer TP shard",
+      "updatedAt": "2026-11-02T14:24:48Z",
+      "url": "https://github.com/sgl-project/sglang/pull/42968"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "2e80af28577dc0ca19a3cc685841f4c49be108c8"
+    },
+    "body": "## Motivation\r\n\r\nOn DeepSeek-V4.1-Flash the ratio-1/2 sparse indexer is fully replicated across the attention-TP group: `wq_b` and `weights_proj` are `ReplicatedLinear`, `n_local_heads == n_heads`, and every attention-TP rank holds the same query rows of a prefill chunk. So under TP4 each of the four ranks runs the identical dense `fp8_fp4_mqa_logits` scan over every row against the whole compressed context, then the identical top-k on it, and arrives at the identical selection. Three quarters of that work is redundant.\r\n\r\nThat redundant work is the largest O(context²) term of a long prefill. In a 1 M-token prefill on 4× B200 (TP4 + EP4, DSPARK, the cookbook low-latency recipe) the dense index logits are **6.8 s of kernel time per rank** across 2 746 launches, and the ragged top-k that reads the same score tiles is another **1.9 s**. Both grow with context per chunk, so the share keeps rising with length.\r\n\r\n## Modifications\r\n\r\nBehind `SGLANG_OPT_DSV4_INDEXER_TP_SHARD` (default **off**), each attention-TP rank scores a contiguous share of the chunk's rows and the selections are all-gathered, so every rank still ends up with the full selection.\r\n\r\n<img width=\"2460\" height=\"1058\" alt=\"shot-muy3qvkh\" src=\"https://github.com/user-attachments/assets/85a2ae63-e596-4600-8603-902385ebd9df\" />\r\n\r\n- **`RowShard`** (`v41_indexer/types.py`) partitions the rows into rank-ordered shares of `ceil(rows / world)` rounded up to the score kernel's `128 // heads` row grouping, so every MMA tile holds exactly the rows it holds unsharded. `gather` is one `all_gather_into_tensor` over the attention-TP group; the last share's padding rows fall past the row count and are dropped.\r\n- **Full top-k path** (`scoring.py`, `full_topk.py`): `score_tiles` and `dense_prefill_topk` take an optional row range (default: all rows, so the replicated path is unchanged), and `sharded_dense_prefill_topk` scores this rank's share and all-gathers the `[rows, topk]` selection.\r\n- **Candidate publish path** (`sparse_table.py`): the row-parallel half of `publish_prefill_table` is split out as `select_prefill_rows`. With a shard, each rank computes its share's own top-k and its top candidate blocks, all-gathers both, and then builds the sparse table over every row: DeepGEMM's schedule is built per row set and cannot be sliced, and the build is cheap next to the scan.\r\n\r\n<img width=\"2512\" height=\"820\" alt=\"shot-muy3rfqx\" src=\"https://github.com/user-attachments/assets/2c5d489b-1871-4260-bf55-90ff2ead3246\" />\r\n\r\n- **Gate** (`deepseek_v4_backend.py`): the shard is attached to `PrefillInputs` only on the eager extend path, when attention TP > 1 and the chunk has at least 512 rows. Prefill context parallelism keeps the replicated path, since each CP rank already holds its own interleaved subset of rows. Decode and the captured prefill graph are untouched.\r\n\r\n**Why this is exact.** A dense score depends only on its own query row, and the aligned shares keep every MMA tile's row set the same, so each rank computes the same bits for its rows as the replicated path would, and the gathered selection is bitwise the replicated one. Every input of the gate is identical on all attention-TP ranks, so either all of them reach the all-gather or none does. The indexer runs on the `stream_sources` side stream, and the all-gather is the only collective issued during that window of `forward_prepare`; the main stream joins it before attention.\r\n\r\n<img width=\"2504\" height=\"894\" alt=\"shot-muy3rw38\" src=\"https://github.com/user-attachments/assets/14a6829b-d735-4408-92fc-7884e56a6a94\" />\r\n\r\n## Accuracy\r\n\r\nGSM8K, 200 examples, `--temperature 0`, both servers built from the same tree in the same session:\r\n\r\n| | score | score:std |\r\n|---|---|---|\r\n| flag off | 0.990 | 0.0995 |\r\n| flag on | 0.995 | 0.0705 |\r\n\r\nThe one-question difference is run-to-run nondeterminism, not the change: the selection is bitwise the replicated one (see Tests), and two replicated runs of this model already differ, because the consumer layers' bf16 top-k breaks ties at the selection floor by race.\r\n\r\n## Benchmarks\r\n\r\n4× B200, TP4 + EP4, DSPARK block 5, `--cuda-graph-max-bs-decode 64`, `--context-length 1050624`, bs = 1, random-token prompts, 16 K prefill chunks. Same tree on both servers; only the flag differs. One warm-up, then three seeds per point:\r\n\r\n| context | flag off TTFT | flag on TTFT | Δ |\r\n|---|---|---|---|\r\n| 1 M (1 048 000) | 27.73–27.80 s | 20.93–21.00 s | **−6.8 s (−24.5 %)** |\r\n| 256 K (262 144) | 4.91–4.92 s | 4.50 s | −0.42 s (−8.5 %) |\r\n\r\nTP-0 kernel time over the 1 M prefill. The baseline trace was taken on a tree that differs from this one only in the compressed-cache dequant path, so only the indexer kernels below are compared; the consumer-side kernels (`sm100_paged_sparse_mqa_logits`, `topk_bf16_small`) are unchanged to the launch, as expected:\r\n\r\n| kernel | flag off | flag on |\r\n|---|---|---|\r\n| dense `sm100_mqa_logits` | 2 746 launches, 6.80 s | 775 launches, 1.73 s |\r\n| `topk_ragged` | 3 827 launches, 1.90 s | 1 067 launches, 0.47 s |\r\n| `amax8_varlen` (block keys) | 1 087 launches, 0.36 s | 298 launches, 0.09 s |\r\n| `AllGather` (new) | — | 320 launches, 0.10 s |\r\n\r\nNet, the indexer loses 6.66 s of kernel time per rank, which matches the −6.8 s of TTFT: at 1 M the side-stream indexer is on the critical path, so the saving passes straight through. Decode is unaffected.\r\n\r\n**Stacked with per-ratio candidate publishing.** Same session, one tree that also carries the compressed-cache dequant dedup and per-ratio candidate publishing (#TBD) with both their flags on; only this flag differs:\r\n\r\n| context | without this PR | with this PR | Δ |\r\n|---|---|---|---|\r\n| 1 M (1 048 000) | 23.78–23.83 s | 19.19–19.21 s | **−4.6 s (−19.3 %)** |\r\n| 256 K (262 144) | 4.70–4.71 s | 4.42–4.43 s | −0.28 s (−6.0 %) |\r\n\r\nThe saving on top of per-ratio publishing is smaller than on main (−4.6 s instead of −6.8 s), because that change already removes two of the dense scans and leaves less to split. Together the three changes take a 1 M prefill from 27.73–27.80 s on main to 19.19–19.21 s (−8.6 s, −31 %). GSM8K on the stacked tree: 0.995 with this flag, 0.990 without.\r\n\r\n## Tests\r\n\r\nTwo cases are added to `test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py` (`base-b-kernel-unit`, 4-gpu-b200), which already holds the publish/consume tests these paths share. Both run the sharded code as every rank of an attention-TP group inside one process, through a two-pass all-gather: pass one runs the production code as each rank and records the share it contributes, pass two returns every rank's recorded share in rank order, which is what the NCCL all-gather returns. The unsharded path is the oracle.\r\n\r\n- `test_row_shards_publish_the_replicated_table`: the own top-k, `blocks`, `phys_blocks` and `valid_lens` match the replicated publish bit for bit on every rank; the schedule is compared by the sparse scores it drives on every valid position. Its buffer holds bytes the build never writes, so two replicated builds of one input already differ in about a third of its bytes and a byte comparison would be meaningless.\r\n- `test_row_shards_select_the_replicated_full_topk`: the sharded full top-k equals the replicated one on every rank.\r\n\r\nCases cover a padded last share, an even split, an empty share, and shares that cut a request in two. A precondition that the shares tile the rows fails cleanly before any kernel runs; without it, a broken partition hands uninitialized block ids to the schedule build, which crashes and poisons the CUDA context for every later test in the file. Shifting each share by one row turns all seven new subtests red on that precondition and leaves the six existing tests green. On B200 the file runs 8 tests in 1.6 s warm.\r\n\r\n## Reproduction\r\n\r\n```bash\r\n# server (the A/B above: flag on vs off, everything else equal)\r\nSGLANG_OPT_DSV4_INDEXER_TP_SHARD=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \\\r\npython3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \\\r\n  --tp 4 --ep-size 4 --mem-fraction-static 0.8 --speculative-algorithm DSPARK \\\r\n  --speculative-dspark-block-size 5 --cuda-graph-max-bs-decode 64 \\\r\n  --context-length 1050624 --port 31000\r\n\r\n# sharded vs replicated selection\r\npython3 test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py\r\n\r\n# accuracy\r\npython3 -m sglang.test.run_eval --eval-name gsm8k --num-examples 200 --num-threads 32 --temperature 0 --port 31000\r\n```\r\n\r\n## Checklist\r\n\r\n- [ ] Format your code: `pre-commit run --all-files` (not run locally; the changed files pass `ruff format`, `isort` and `codespell` at the pinned versions, and `ruff check` reports nothing new)\r\n- [x] Add unit tests: two cases in the existing indexer test file, results in Tests\r\n- [x] Update documentation as needed: the new env var is documented at its definition in `environ.py`\r\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:no_entry_sign: [Run #41379835388](https://github.com/sgl-project/sglang/actions/runs/41379835388)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:hourglass_flowing_sand: [Run #41379835394](https://github.com/sgl-project/sglang/actions/runs/41379835394)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:white_check_mark: [Run #41379835379](https://github.com/sgl-project/sglang/actions/runs/41379835379)<!-- slot:pr-test-amd:end -->\n\n> [!TIP]\n> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:\n>\n> ```text\n> Find the registered tests this PR affects and run them with /rerun-test, following https://github.com/sgl-project/sglang/blob/main/.agents/skills/rerun-test/SKILL.md\n> ```\n<!-- pr-states:end -->",
+    "changed_files": 11,
+    "head": {
+      "repo": {
+        "full_name": "yuan-luo/sglang"
+      },
+      "sha": "a3e9ef391391575ba193ce5ab5f883f2e390554f"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/42968",
+    "merge_commit_sha": "e33cd0c3a10474c7a0f6efeb69ce2cf4b7a55021",
+    "merged": true,
+    "merged_at": "2026-11-02T14:24:47Z",
+    "number": 42968,
+    "state": "closed",
+    "title": "[Perf] DeepSeek-V4.1: Support indexer TP shard",
+    "updated_at": "2026-11-02T14:24:48Z"
+  },
+  "files": [
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fdsv4%2Findex_logits.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fdsv4%2Findex_logits.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 1,
+      "filename": "python/sglang/kernels/ops/attention/dsv4/index_logits.py",
+      "patch": "@@ -51,6 +51,11 @@ def index_weights_dtype() -> torch.dtype:\n FLAT_LOGITS_WIDTH_ALIGN = 64\n \n \n+def flat_index_logits_row_alignment(heads: int) -> int:\n+    \"\"\"Query rows per 128-head-row MMA tile of the flat score kernel.\"\"\"\n+    return 128 // heads\n+\n+\n def flat_index_logits_rows_per_tile(\n     rows: int,\n     width: int,\n@@ -62,7 +67,7 @@ def flat_index_logits_rows_per_tile(\n     Tiles are sized as fp32 logits whatever the logits dtype: bf16 tiles then fill\n     half the budget, which leaves room for the per-row selection scratch that\n     grows with the tile.\"\"\"\n-    row_alignment = 128 // heads\n+    row_alignment = flat_index_logits_row_alignment(heads)\n     rows_per_chunk = mqa_logits_rows_per_chunk(\n         num_rows=ceil_align(rows, row_alignment),\n         row_bytes=mqa_logits_row_bytes(width),",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fkernels%2Fops%2Fattention%2Fdsv4%2Findex_logits.py",
+      "sha": "9c761a25638a2a18907f309c173bd0da4390c5b1",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Fenviron.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fenviron.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 0,
+      "filename": "python/sglang/srt/environ.py",
+      "patch": "@@ -1919,6 +1919,12 @@ class Envs:\n     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)\n     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)\n     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)\n+    # Shard the ratio-1/2 index sources' dense prefill scores across the\n+    # attention-TP group and all-gather the selections, instead of every rank\n+    # scoring every row. Identical to the replicated path under fp32 logits;\n+    # bf16 logits vary with the tile's row count, so picks near the selection\n+    # floor can differ there.\n+    SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)\n     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)\n     # Per-rank local query rows (after DP-attention sharding when enabled),\n     # not request ISL.",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Fenviron.py",
+      "sha": "6fb262b290aabab5347ad0318fc4b449bda7c418",
+      "status": "modified"
+    },
+    {
+      "additions": 46,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py",
+      "changes": 47,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 1,
+      "filename": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "patch": "@@ -35,6 +35,9 @@\n     fp8_dtype,\n     gather_dequant_requant_fp8_paged_dsv4,\n )\n+from sglang.kernels.ops.attention.dsv4.index_logits import (\n+    flat_index_logits_row_alignment,\n+)\n from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout\n from sglang.kernels.ops.attention.dsv4.metadata_kernel import (\n     fill_all_compressed_indices,\n@@ -85,6 +88,7 @@\n     CapturedPrefillInputs,\n     DecodeInputs,\n     PrefillInputs,\n+    RowShard,\n     is_sm100_or_newer,\n     make_candidate_indexer,\n     make_full_topk_indexer,\n@@ -1037,6 +1041,11 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:\n     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))\n \n \n+# Arbitrary floor: below it the dense scores are short enough that the\n+# all-gather's fixed latency eats most of what sharding saves.\n+_INDEXER_TP_SHARD_MIN_ROWS = 512\n+\n+\n def _prefill_graph_max_seq_len() -> Optional[int]:\n     from sglang.srt.runtime_context import get_exec\n \n@@ -3923,7 +3932,14 @@ def _low_ratio_index_topk(\n                 self.full_topk_indexer.topk_decode(inputs)\n         else:\n             inputs = self._make_low_ratio_prefill_indexer_inputs(\n-                layer, x, q_lora, req, pos, forward_batch, rows_per_request\n+                layer,\n+                x,\n+                q_lora,\n+                req,\n+                pos,\n+                forward_batch,\n+                rows_per_request,\n+                allow_row_shard=rows_per_request is None,\n             )\n             if is_source:\n                 published = self.prefill_candidates.publish_prefill(inputs)\n@@ -3984,9 +4000,18 @@ def _make_low_ratio_prefill_indexer_inputs(\n         pos,\n         forward_batch,\n         rows_per_request,\n+        *,\n+        allow_row_shard: bool = False,\n     ) -> PrefillInputs:\n         core = self.forward_metadata.core_metadata\n         tail = self.forward_metadata.late_layer_tail\n+        # Only the eager caller opts in. Graph breaks also have replicated rows,\n+        # but must not introduce these collectives into the prefill graph path.\n+        row_shard = (\n+            self._indexer_row_shard(layer, num_rows=x.shape[0])\n+            if allow_row_shard\n+            else None\n+        )\n         if rows_per_request is not None:\n             rows_per_request_device = async_h2d(\n                 rows_per_request, dtype=torch.int32, device=x.device\n@@ -4031,6 +4056,25 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all\n+        # of them reach the all-gather or none does.\n+        parallel = get_parallel()\n+        if (\n+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()\n+            or parallel.attn_tp_size == 1\n+            or parallel.attn_cp_size != 1\n+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS\n+        ):\n+            return None\n+        return RowShard(\n+            group=parallel.attn_tp_group,\n+            rank=parallel.attn_tp_rank,\n+            world=parallel.attn_tp_size,\n+            row_align=flat_index_logits_row_alignment(layer.indexer.n_heads),\n         )\n \n     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):\n@@ -4081,6 +4125,7 @@ def _prefill_graph_full_topk_break(\n             pos[:real],\n             forward_batch,\n             None,\n+            allow_row_shard=False,\n         )\n         if not indexer.is_candidate_source:\n             self.full_topk_indexer.topk_prefill(inputs)",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py",
+      "sha": "3ed21317b1a8d7ed3e3e65a8faf0ad315a0fcb29",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2F__init__.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2F__init__.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 0,
+      "filename": "python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py",
+      "patch": "@@ -19,6 +19,7 @@\n     DecodeInputs,\n     PrefillCandidates,\n     PrefillInputs,\n+    RowShard,\n )\n \n if TYPE_CHECKING:\n@@ -32,6 +33,7 @@\n     \"FullTopKIndexer\",\n     \"PrefillCandidates\",\n     \"PrefillInputs\",\n+    \"RowShard\",\n     \"has_dense_fp4_indexer\",\n     \"is_sm100_or_newer\",\n     \"make_candidate_indexer\",",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2F__init__.py",
+      "sha": "fd7b9e9ba83574fa9cb3cd1c9106cf8ad1770d02",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Ffull_topk.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Ffull_topk.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 1,
+      "filename": "python/sglang/srt/layers/attention/dsv4/v41_indexer/full_topk.py",
+      "patch": "@@ -23,6 +23,7 @@\n     get_deep_gemm_prefill_data,\n     prefill_requests,\n     select_decode,\n+    sharded_dense_prefill_topk,\n     write_prefill,\n )\n from .types import (\n@@ -71,7 +72,11 @@ def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:\n         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(\n             inputs.layer_id, data.k_slots\n         )\n-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])\n+        out = inputs.out_raw_indices[: data.num_rows]\n+        if inputs.row_shard is None:\n+            dense_prefill_topk(data, kv, out=out)\n+        else:\n+            sharded_dense_prefill_topk(data, kv, out=out, shard=inputs.row_shard)\n         data.write_page_indices(inputs)\n \n     def _torch_prefill(self, inputs: PrefillInputs) -> None:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Ffull_topk.py",
+      "sha": "4af29a8ab0bd8bca316afaeef1e62433b356c497",
+      "status": "modified"
+    },
+    {
+      "additions": 48,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fscoring.py",
+      "changes": 56,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fscoring.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 8,
+      "filename": "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py",
+      "patch": "@@ -5,7 +5,7 @@\n from __future__ import annotations\n \n import itertools\n-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple\n+from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple\n \n import msgspec\n import torch\n@@ -25,7 +25,7 @@\n from sglang.srt.runtime_context import get_platform\n from sglang.srt.utils.common import async_h2d\n \n-from .types import DecodeInputs, PrefillInputs\n+from .types import DecodeInputs, PrefillInputs, RowShard\n \n if TYPE_CHECKING:\n     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer\n@@ -75,6 +75,27 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):\n     def num_rows(self) -> int:\n         return self.q_fp4.shape[0]\n \n+    def narrow(self, rows: slice) -> DeepGEMMPrefillData:\n+        \"\"\"A contiguous query-row view, retaining the global flattened-K layout\n+        and score width. Projection stays replicated so its GEMM shape is unchanged.\"\"\"\n+        start, stop, step = rows.indices(self.num_rows)\n+        if step != 1:\n+            raise ValueError(\"prefill index data requires contiguous query rows\")\n+        request_offsets = itertools.accumulate(self.rows_per_request, initial=0)\n+        local_counts = [\n+            max(0, min(offset + count, stop) - max(offset, start))\n+            for offset, count in zip(request_offsets, self.rows_per_request)\n+        ]\n+        return msgspec.structs.replace(\n+            self,\n+            request_starts=self.request_starts[rows],\n+            rows_per_request=local_counts,\n+            compress_lens=self.compress_lens[rows],\n+            q_fp4=self.q_fp4[rows],\n+            q_sf=self.q_sf[rows],\n+            weights=self.weights[rows],\n+        )\n+\n     def empty_selection(self, topk: int) -> torch.Tensor:\n         return self.request_starts.new_full(\n             (self.num_rows, topk), -1, dtype=torch.int32\n@@ -267,7 +288,11 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil\n     )\n \n \n-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):\n+def score_tiles(\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+) -> Generator[Tuple[slice, torch.Tensor], None, None]:\n+    \"\"\"Score tiles whose row slices are relative to this data's query-row view.\"\"\"\n     yield from flat_index_logits_tiles(\n         q=(data.q_fp4, data.q_sf),\n         kv=kv,\n@@ -311,17 +336,32 @@ def dense_prefill_topk(\n     *,\n     out: torch.Tensor,\n ) -> None:\n-    \"\"\"Request-local compressed positions into ``out``, ``-1`` padded, unordered.\"\"\"\n+    \"\"\"Request-local compressed positions of the data's query rows into\n+    ``out``, one ``out`` row per scored row, ``-1`` padded, unordered.\"\"\"\n+    lens = data.compress_lens\n     # Score columns are request-relative, so a zero offset emits request-local positions.\n-    zero_offsets = torch.zeros_like(data.request_starts)\n+    zero_offsets = torch.zeros_like(lens)\n     for tile, logits in score_tiles(data, kv):\n-        topk_ragged(\n-            logits, data.compress_lens[tile], out=out[tile], offsets=zero_offsets[tile]\n-        )\n+        topk_ragged(logits, lens[tile], out=out[tile], offsets=zero_offsets[tile])\n         # Free this tile's logits before the generator scores the next one.\n         del logits\n \n \n+def sharded_dense_prefill_topk(\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    *,\n+    out: torch.Tensor,\n+    shard: RowShard,\n+) -> None:\n+    \"\"\"``dense_prefill_topk`` over this rank's share of the rows, all-gathered\n+    into ``out`` for every row.\"\"\"\n+    num_rows = data.num_rows\n+    local = out.new_full((shard.rows_per_rank(num_rows), out.shape[1]), -1)\n+    dense_prefill_topk(data.narrow(shard.local_rows(num_rows)), kv, out=local)\n+    out.copy_(shard.gather(local, num_rows))\n+\n+\n # ---------- torch ----------\n \n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fscoring.py",
+      "sha": "35c88cace96999cddc93e0ad34fe1b70590683cf",
+      "status": "modified"
+    },
+    {
+      "additions": 57,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fsparse_table.py",
+      "changes": 73,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fsparse_table.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 16,
+      "filename": "python/sglang/srt/layers/attention/dsv4/v41_indexer/sparse_table.py",
+      "patch": "@@ -50,6 +50,7 @@\n     CapturedPrefillInputs,\n     DecodeInputs,\n     PrefillInputs,\n+    RowShard,\n     get_tail_row_indices,\n )\n \n@@ -157,6 +158,7 @@ def publish_prefill(self, inputs: PrefillInputs):\n             index_page_size=index_page_size,\n             topk_blocks=self.topk_blocks,\n             out_positions=inputs.out_raw_indices[: data.num_rows],\n+            row_shard=inputs.row_shard,\n         )\n         data.write_page_indices(inputs)\n         return table\n@@ -499,27 +501,22 @@ def _row_pair_ids(rows_per_request: List[int], *, device: torch.device) -> torch\n     return (row - ((row - first_row[request]) & 1)).to(torch.int32)\n \n \n-# TODO(dark): support fusion of publish + topk of publish layer\n-def publish_prefill_table(\n+def select_prefill_rows(\n     *,\n     data: DeepGEMMPrefillData,\n     kv: Tuple[torch.Tensor, torch.Tensor],\n-    index_page_table: torch.Tensor,\n-    index_page_size: int,\n-    topk_blocks: int,\n+    nblocks: torch.Tensor,\n     out_positions: torch.Tensor,\n-) -> _SparsePrefillTable:\n-    \"\"\"The source's own top-k into ``out_positions`` (request-local compressed\n-    positions) and the chunk's table, from one pass over its dense scores;\n-    ``index_page_table`` is at ``index_page_size`` slots.\"\"\"\n-    rows = data.num_rows\n-    device = data.q_fp4.device\n-    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)\n-    blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)\n-    zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)\n+    out_blocks: torch.Tensor,\n+) -> None:\n+    \"\"\"The source's own top-k (request-local compressed positions) and its top\n+    blocks from one pass over this query-row view's dense scores; one row of\n+    each output per scored row, with ``nblocks`` matching the view.\"\"\"\n+    lens_all = data.compress_lens\n+    zero_offsets = torch.zeros_like(lens_all)\n     # the block keys read the score rows through 32-byte vectors\n     for tile, logits in score_tiles(data, kv):\n-        lens = data.compress_lens[tile]\n+        lens = lens_all[tile]\n         topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])\n         # keys past a row's block count stay unset; the top-k reads a row\n         # up to its block count only (v2 wants the stride a multiple of 4)\n@@ -534,8 +531,52 @@ def publish_prefill_table(\n             keys,\n             nblocks[tile],\n             out_offsets=zero_offsets[: logits.shape[0]],\n-            out_indices=blocks[tile],\n+            out_indices=out_blocks[tile],\n+        )\n+\n+\n+# TODO(dark): support fusion of publish + topk of publish layer\n+def publish_prefill_table(\n+    *,\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    index_page_table: torch.Tensor,\n+    index_page_size: int,\n+    topk_blocks: int,\n+    out_positions: torch.Tensor,\n+    row_shard: Optional[RowShard] = None,\n+) -> _SparsePrefillTable:\n+    \"\"\"The source's own top-k into ``out_positions`` (request-local compressed\n+    positions) and the chunk's table, from one pass over its dense scores;\n+    ``index_page_table`` is at ``index_page_size`` slots. With ``row_shard`` the\n+    scores are this rank's share and the selections are all-gathered; the table\n+    is then built over every row, because its schedule cannot be sliced.\"\"\"\n+    rows = data.num_rows\n+    device = data.q_fp4.device\n+    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)\n+    if row_shard is None:\n+        blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)\n+        select_prefill_rows(\n+            data=data,\n+            kv=kv,\n+            nblocks=nblocks,\n+            out_positions=out_positions,\n+            out_blocks=blocks,\n+        )\n+    else:\n+        local = row_shard.local_rows(rows)\n+        per = row_shard.rows_per_rank(rows)\n+        local_positions = out_positions.new_full((per, out_positions.shape[1]), -1)\n+        local_blocks = torch.empty(per, topk_blocks, dtype=torch.int32, device=device)\n+        select_prefill_rows(\n+            data=data.narrow(local),\n+            kv=kv,\n+            nblocks=nblocks[local],\n+            out_positions=local_positions,\n+            out_blocks=local_blocks,\n         )\n+        out_positions.copy_(row_shard.gather(local_positions, rows))\n+        blocks = row_shard.gather(local_blocks, rows).contiguous()\n     return _build_prefill_table(\n         blocks=blocks,\n         compress_lens=data.compress_lens,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fsparse_table.py",
+      "sha": "db54a99f85bb8b0557f1e9d4352a401999fefd0a",
+      "status": "modified"
+    },
+    {
+      "additions": 38,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Ftypes.py",
+      "changes": 39,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Ftypes.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 1,
+      "filename": "python/sglang/srt/layers/attention/dsv4/v41_indexer/types.py",
+      "patch": "@@ -7,9 +7,10 @@\n import msgspec\n import torch\n \n-from sglang.srt.utils.common import async_h2d\n+from sglang.srt.utils.common import async_h2d, ceil_align, ceil_div\n \n if TYPE_CHECKING:\n+    from sglang.srt.distributed.parallel_state import GroupCoordinator\n     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer\n     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata\n \n@@ -32,6 +33,38 @@ def tail(self, rows_per_request: List[int]) -> CandidateMetadata:\n         raise NotImplementedError(f\"{type(self).__name__} is not a prefill publish\")\n \n \n+class RowShard(msgspec.Struct, frozen=True, kw_only=True):\n+    \"\"\"This rank's share of a prefill chunk's query rows across a group whose\n+    ranks all hold the same rows.\n+\n+    Each rank scores a contiguous share instead of scoring every row, then\n+    all-gathers the selections. Rows are mathematically independent, but bf16\n+    logits can vary with the kernel's row count and change picks near the\n+    selection floor; alignment alone does not imply bitwise parity.\"\"\"\n+\n+    group: GroupCoordinator\n+    rank: int\n+    world: int\n+    # The score kernel groups 128 // heads consecutive rows into one MMA tile;\n+    # aligned shares keep every tile's row set the same as unsharded.\n+    row_align: int\n+\n+    def rows_per_rank(self, num_rows: int) -> int:\n+        return ceil_align(ceil_div(num_rows, self.world), self.row_align)\n+\n+    def local_rows(self, num_rows: int) -> slice:\n+        per = self.rows_per_rank(num_rows)\n+        start = min(self.rank * per, num_rows)\n+        return slice(start, min(start + per, num_rows))\n+\n+    def gather(self, local: torch.Tensor, num_rows: int) -> torch.Tensor:\n+        \"\"\"``[num_rows, ...]`` from every rank's ``[rows_per_rank, ...]`` share;\n+        the last share's padding rows fall past ``num_rows`` and are dropped.\"\"\"\n+        gathered = local.new_empty((self.world * local.shape[0], *local.shape[1:]))\n+        self.group.all_gather_into_tensor(gathered, local.contiguous())\n+        return gathered[:num_rows]\n+\n+\n class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):\n     \"\"\"An eager extend: the backend projects the queries and gathers the index K.\"\"\"\n \n@@ -70,6 +103,10 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):\n     out_raw_indices: torch.Tensor\n     out_page_indices: Optional[torch.Tensor]\n \n+    # Set when this rank scores only its share of the dense rows; backends\n+    # without a sharded path ignore it and score every row.\n+    row_shard: Optional[RowShard] = None\n+\n     def reset_outputs(self) -> None:\n         self.out_raw_indices.fill_(-1)\n         if self.out_page_indices is not None:",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Ftypes.py",
+      "sha": "412e72990ae03aa2f9f71a3bf74284cc2d51e88a",
+      "status": "modified"
+    },
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Fmodels%2Fdeepseek_v4.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmodels%2Fdeepseek_v4.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 0,
+      "filename": "python/sglang/srt/models/deepseek_v4.py",
+      "patch": "@@ -1992,6 +1992,10 @@ def _forward_prepare_low_ratio_multi_stream(\n         q = self._compute_q_b(q_for_wqb, positions, q_out)\n         if self.indexer is not None:\n             # Forked above, right after q_lora; recorded here, after the Q chain.\n+            # TP-row-sharded index scoring all-gathers on stream_sources. Until\n+            # its join below, neither the main nor KV stream may issue an\n+            # attention-TP collective: all ranks must keep the same communicator\n+            # ordering, even though the indexer overlaps local Q/KV work.\n             with torch.cuda.stream(stream_sources):\n                 attn_backend.forward_low_ratio_sources(\n                     layer=self,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/python%2Fsglang%2Fsrt%2Fmodels%2Fdeepseek_v4.py",
+      "sha": "6879e5669404243a666e5b480e8db96d1154a3d0",
+      "status": "modified"
+    },
+    {
+      "additions": 170,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Ftest_dsv41_prefill_sparse_indexer.py",
+      "changes": 171,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Ftest_dsv41_prefill_sparse_indexer.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 1,
+      "filename": "test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py",
+      "patch": "@@ -1,7 +1,9 @@\n \"\"\"The DeepGEMM two-level indexer on the dense prefill path against the torch\n block selection and the dense implementation of the same protocol.\"\"\"\n \n+import os\n import unittest\n+from contextlib import contextmanager\n from typing import NamedTuple\n \n import msgspec\n@@ -10,6 +12,10 @@\n from sglang.kernels.ops.attention.dsv4.candidate_blocks import (\n     select_candidate_block_ids,\n )\n+from sglang.kernels.ops.attention.dsv4.index_logits import (\n+    index_logits_dtype,\n+    index_weights_dtype,\n+)\n from sglang.kernels.ops.quantization.fp4_indexer_quant import (\n     quantize_fp4_indexer_tensor,\n )\n@@ -25,6 +31,8 @@\n TOPK_BLOCKS, BLOCK, TOPK = 2048, 8, 512\n PAGE = 128  # index-K pool page size under DeepGEMM's paged sparse logits\n CASES = [(256, 40000), (64, 3000)]  # (query rows, context): above and below 2048 blocks\n+# (query rows, context, ranks): a padded last share, an even split, an empty share\n+SHARD_CASES = [(250, 40000, 4), (256, 3000, 2), (10, 3000, 4)]\n \n # The sparse kernel scores with bf16 weights and accumulation, the dense one in\n # fp32; picks a few bf16 ulps from the selection floor can go either way.\n@@ -215,7 +223,7 @@ def reference_blocks(case: Case) -> torch.Tensor:\n     return keep[:, :num_blocks]\n \n \n-def publish_sparse(case: Case):\n+def publish_sparse(case: Case, row_shard=None):\n     \"\"\"(the DeepGEMM sparse table, the source layer's own top-k).\"\"\"\n     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (\n         publish_prefill_table,\n@@ -229,10 +237,65 @@ def publish_sparse(case: Case):\n         index_page_size=PAGE,\n         topk_blocks=TOPK_BLOCKS,\n         out_positions=own,\n+        row_shard=row_shard,\n     )\n     return table, own\n \n \n+class _CaptureShares:\n+    \"\"\"Pass one of an in-process all-gather: records, in call order, the share\n+    this rank contributes to each gather. It returns the replicated result,\n+    keyed by width, because the code after a gather relies on real values: the\n+    table build wants ascending, distinct block ids, and crashes on zeros.\"\"\"\n+\n+    def __init__(self, replicated):\n+        self.replicated = replicated\n+        self.shares = []\n+\n+    def all_gather_into_tensor(self, out, local):\n+        self.shares.append(local.clone())\n+        full = self.replicated[local.shape[1]]\n+        out.zero_()\n+        out[: full.shape[0]].copy_(full)\n+\n+\n+class _ReplayShares:\n+    \"\"\"Pass two: every gather returns all ranks' recorded shares in rank order,\n+    which is what the attention-TP all-gather returns.\"\"\"\n+\n+    def __init__(self, captures):\n+        self.captures = captures\n+        self.calls = 0\n+\n+    def all_gather_into_tensor(self, out, local):\n+        out.copy_(torch.cat([c.shares[self.calls] for c in self.captures]))\n+        self.calls += 1\n+\n+\n+def on_every_rank(world: int, num_rows: int, run, replicated):\n+    \"\"\"``run(row_shard)`` as each rank of a ``world``-rank attention-TP group\n+    sees it, every rank's share scored by the code under test; ``replicated``\n+    maps a gathered width to its unsharded result. The returned results derive\n+    from the recorded shares only, never from ``replicated``.\"\"\"\n+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import RowShard\n+\n+    def shard(rank, group):\n+        return RowShard(group=group, rank=rank, world=world, row_align=128 // HEADS)\n+\n+    # Rows a broken partition leaves out reach the table build uninitialized and\n+    # crash it, which poisons the CUDA context for every later test; fail first.\n+    covered = []\n+    for rank in range(world):\n+        rows = shard(rank, None).local_rows(num_rows)\n+        covered.extend(range(rows.start, rows.stop))\n+    assert covered == list(range(num_rows)), \"row shares must tile the rows in order\"\n+\n+    captures = [_CaptureShares(replicated) for _ in range(world)]\n+    for rank in range(world):\n+        run(shard(rank, captures[rank]))\n+    return [run(shard(rank, _ReplayShares(captures))) for rank in range(world)]\n+\n+\n def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):\n     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (\n         select_prefill_table,\n@@ -304,10 +367,39 @@ def block_scores(case: Case) -> torch.Tensor:\n     return scores.masked_fill(blocks[None, :] == last[:, None], torch.inf)\n \n \n+def valid_scores(table, case: Case) -> torch.Tensor:\n+    \"\"\"The paged sparse scores ``table`` drives, at every row's valid positions\n+    only; the logits past a row's length are never written.\"\"\"\n+    logits = logits_of(table, case.data, case.k_cache)\n+    cols = torch.arange(logits.shape[1], device=logits.device)\n+    return logits[cols[None, :] < table.valid_lens[:, None]]\n+\n+\n def picks(positions: torch.Tensor, row: int) -> set:\n     return set(positions[row].tolist()) - {-1}\n \n \n+@contextmanager\n+def fp32_index_logits():\n+    \"\"\"Pin the index logits (and weights) to fp32: bf16 logits vary with the\n+    tile's row count, so the shard and replicated passes -- equal by\n+    construction -- still pick differently a few ulps from the floor.\"\"\"\n+    key = \"SGLANG_OPT_DSV41_BF16_INDEX_LOGITS\"\n+    old = os.environ.get(key)\n+    os.environ[key] = \"0\"\n+    index_logits_dtype.cache_clear()\n+    index_weights_dtype.cache_clear()\n+    try:\n+        yield\n+    finally:\n+        if old is None:\n+            del os.environ[key]\n+        else:\n+            os.environ[key] = old\n+        index_logits_dtype.cache_clear()\n+        index_weights_dtype.cache_clear()\n+\n+\n @unittest.skipUnless(\n     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,\n     \"DeepGEMM's paged sparse MQA logits need SM100\",\n@@ -479,6 +571,83 @@ def test_block_ids_tail_does_not_sync_the_host(self):\n         rows = [3, 4, 12, 13, 14, 15, 16, 17, 18, 19]\n         torch.testing.assert_close(tail.blocks, blocks[rows])\n \n+    @torch.inference_mode()\n+    def test_row_shards_publish_the_replicated_table(self):\n+        \"\"\"Each attention-TP rank scoring only its share of the rows and\n+        all-gathering the selections publishes, on every rank, the replicated\n+        path's own top-k and table bit for bit, and a schedule that drives the\n+        same scores: shares that pad, come out empty, or cut a request in two\n+        included.\"\"\"\n+        with fp32_index_logits():\n+            cases = [\n+                (make_case(rows, ctx, seed=rows + ctx), world)\n+                for rows, ctx, world in SHARD_CASES\n+            ]\n+            cases.append((make_multi_case([100, 37, 120], 40000, seed=7), 4))\n+            for case, world in cases:\n+                with self.subTest(rows=case.data.num_rows, world=world):\n+                    table, own = publish_sparse(case)\n+                    ranks = on_every_rank(\n+                        world,\n+                        case.data.num_rows,\n+                        lambda s: publish_sparse(case, s),\n+                        {TOPK: own, TOPK_BLOCKS: table.blocks},\n+                    )\n+                    for rank, (got_table, got_own) in enumerate(ranks):\n+                        # the own top-k is unordered within a row\n+                        self.assertTrue(\n+                            torch.equal(got_own.sort(-1).values, own.sort(-1).values),\n+                            f\"rank {rank}: own top-k\",\n+                        )\n+                        for field in (\"blocks\", \"phys_blocks\", \"valid_lens\"):\n+                            self.assertTrue(\n+                                torch.equal(\n+                                    getattr(got_table, field), getattr(table, field)\n+                                ),\n+                                f\"rank {rank}: {field}\",\n+                            )\n+                        # The schedule buffer holds bytes its build never writes,\n+                        # so two replicated builds of one input already differ\n+                        # byte for byte; what it must reproduce is the scores it\n+                        # drives.\n+                        self.assertTrue(\n+                            torch.equal(\n+                                valid_scores(got_table, case), valid_scores(table, case)\n+                            ),\n+                            f\"rank {rank}: schedule\",\n+                        )\n+\n+    @torch.inference_mode()\n+    def test_row_shards_select_the_replicated_full_topk(self):\n+        \"\"\"An index layer outside the candidate scheme selects the replicated\n+        full top-k when its rows are scored by shares and all-gathered.\"\"\"\n+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (\n+            dense_prefill_topk,\n+            sharded_dense_prefill_topk,\n+        )\n+\n+        with fp32_index_logits():\n+            for rows, ctx, world in SHARD_CASES:\n+                with self.subTest(rows=rows, world=world):\n+                    case = make_case(rows, ctx, seed=rows * 5 + ctx)\n+                    expected = case.data.empty_selection(TOPK)\n+                    dense_prefill_topk(case.data, case.kv, out=expected)\n+\n+                    def run(shard):\n+                        out = case.data.empty_selection(TOPK)\n+                        sharded_dense_prefill_topk(\n+                            case.data, case.kv, out=out, shard=shard\n+                        )\n+                        return out\n+\n+                    for rank, got in enumerate(\n+                        on_every_rank(world, rows, run, {TOPK: expected})\n+                    ):\n+                        self.assertTrue(\n+                            torch.equal(got.sort(-1).values, expected.sort(-1).values),\n+                            f\"rank {rank}\",\n+                        )\n+\n \n if __name__ == \"__main__\":\n     unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/test%2Fregistered%2Fkernels%2Fops%2Fattention%2Ftest_dsv41_prefill_sparse_indexer.py",
+      "sha": "7c7c7e10d99d5ae6573008adbc44ab5e8d751c08",
+      "status": "modified"
+    },
+    {
+      "additions": 178,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a3e9ef391391575ba193ce5ab5f883f2e390554f/test%2Fregistered%2Funit%2Flayers%2Ftest_dsv41_indexer_tp_shard.py",
+      "changes": 178,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Flayers%2Ftest_dsv41_indexer_tp_shard.py?ref=a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "deletions": 0,
+      "filename": "test/registered/unit/layers/test_dsv41_indexer_tp_shard.py",
+      "patch": "@@ -0,0 +1,178 @@\n+\"\"\"Eager-only TP row sharding and query views for the V4.1 prefill indexer.\"\"\"\n+\n+import unittest\n+from types import SimpleNamespace\n+from unittest.mock import patch\n+\n+import torch\n+\n+from sglang.kernels.ops.attention.dsv4.index_logits import (\n+    flat_index_logits_row_alignment,\n+    flat_index_logits_rows_per_tile,\n+)\n+from sglang.srt.environ import envs\n+from sglang.srt.layers.attention import deepseek_v4_backend\n+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend\n+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DeepGEMMPrefillData\n+from sglang.srt.model_executor.forward_batch_info import ForwardMode\n+from sglang.test.ci.ci_register import register_cpu_ci\n+from sglang.test.test_utils import CustomTestCase\n+\n+register_cpu_ci(est_time=10, suite=\"base-a-test-cpu\")\n+\n+\n+class IndexerInputSink:\n+    \"\"\"Stop at the GPU backend boundary, retaining the actual dispatch inputs.\"\"\"\n+\n+    def topk_prefill(self, inputs):\n+        self.inputs = inputs\n+\n+    def publish_prefill(self, inputs):\n+        self.inputs = inputs\n+\n+    def publish_prefill_graph(self, inputs, padded_rows, table):\n+        self.inputs = inputs\n+\n+\n+class TestIndexerRowShardDispatch(CustomTestCase):\n+    def dispatch(self, *, graph, source, rows=512, tp=4, cp=1, enabled=True):\n+        backend = object.__new__(DeepseekV4AttnBackend)\n+        sink = IndexerInputSink()\n+        backend.full_topk_indexer = backend.prefill_candidates = sink\n+        backend.mega_attn = True\n+        out = torch.full((rows, 4), -1, dtype=torch.int32)\n+        backend.forward_metadata = SimpleNamespace(\n+            core_metadata=SimpleNamespace(\n+                page_table=torch.zeros((rows, 1), dtype=torch.int32),\n+                sparse_raw_indices=lambda ratio: out,\n+                sparse_page_indices=lambda ratio: out,\n+            ),\n+            late_layer_tail=None,\n+            low_ratio_k_slots={1: torch.arange(rows)},\n+            low_ratio_index_plans={},\n+            low_ratio_req_indices=torch.zeros(rows, dtype=torch.int32),\n+            candidate_metadata=None,\n+        )\n+        layer = SimpleNamespace(\n+            layer_id=0,\n+            compress_ratio=1,\n+            freqs_cis=torch.empty(0),\n+            indexer=SimpleNamespace(\n+                is_candidate_source=source, uses_candidates=False, n_heads=32\n+            ),\n+        )\n+        batch = SimpleNamespace(\n+            forward_mode=ForwardMode.EXTEND,\n+            global_num_token_non_padded_cpu=None,\n+            extend_num_tokens=rows,\n+            extend_seq_lens_cpu=[rows],\n+            extend_seq_lens=torch.tensor([rows]),\n+            seq_lens_cpu=[rows],\n+            req_pool_indices=torch.tensor([0]),\n+        )\n+        parallel = SimpleNamespace(\n+            attn_tp_size=tp,\n+            attn_tp_rank=0,\n+            attn_tp_group=object(),\n+            attn_cp_size=cp,\n+        )\n+        x = torch.empty(rows, 1)\n+        pos = torch.arange(rows)\n+        with (\n+            envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.override(enabled),\n+            patch.object(deepseek_v4_backend, \"get_parallel\", return_value=parallel),\n+        ):\n+            if graph:\n+                backend._prefill_graph_full_topk_break(layer, x, x, pos, batch, None)\n+            else:\n+                backend._low_ratio_index_topk(\n+                    layer,\n+                    x,\n+                    x,\n+                    backend.forward_metadata.low_ratio_req_indices,\n+                    pos,\n+                    batch,\n+                )\n+        return sink.inputs\n+\n+    def test_graph_break_keeps_full_topk_and_candidate_publish_replicated(self):\n+        # Both graph-break callers used to inherit a shard from\n+        # rows_per_request=None, despite neither opting in to TP collectives.\n+        for source in (False, True):\n+            for rows in (512, 513):\n+                with self.subTest(source=source, rows=rows):\n+                    eager = self.dispatch(graph=False, source=source, rows=rows)\n+                    captured = self.dispatch(graph=True, source=source, rows=rows)\n+                    self.assertIsNotNone(eager.row_shard)\n+                    self.assertIsNone(captured.row_shard)\n+                    self.assertEqual(captured.rows_per_request, [rows])\n+                    self.assertEqual(captured.out_raw_indices.shape[0], rows)\n+\n+    def test_eager_sharding_requires_enabled_tp_and_no_cp(self):\n+        for enabled, tp, cp, rows, expected in (\n+            (True, 4, 1, 512, True),\n+            (True, 4, 1, 511, False),\n+            (False, 4, 1, 512, False),\n+            (True, 1, 1, 512, False),\n+            (True, 4, 2, 512, False),\n+        ):\n+            with self.subTest(enabled=enabled, tp=tp, cp=cp, rows=rows):\n+                inputs = self.dispatch(\n+                    graph=False, source=False, enabled=enabled, tp=tp, cp=cp, rows=rows\n+                )\n+                self.assertEqual(inputs.row_shard is not None, expected)\n+                if expected:\n+                    self.assertEqual(inputs.row_shard.local_rows(rows), slice(0, 128))\n+\n+\n+class TestPrefillQueryView(CustomTestCase):\n+    def test_narrow_preserves_global_k_and_slices_all_row_operands(self):\n+        data = DeepGEMMPrefillData(\n+            k_slots=torch.arange(30),\n+            request_starts=torch.tensor([0] * 5 + [10] * 3),\n+            lens_per_request=[10, 0, 20],\n+            rows_per_request=[5, 0, 3],\n+            compress_lens=torch.arange(8),\n+            q_fp4=torch.arange(8 * 2 * 64).view(8, 2, 64),\n+            q_sf=torch.arange(16).view(8, 2),\n+            weights=torch.arange(16).view(8, 2).float(),\n+        )\n+        for rows, counts in ((slice(3, 7), [2, 0, 2]), (slice(8, 8), [0, 0, 0])):\n+            with self.subTest(rows=rows):\n+                local = data.narrow(rows)\n+                self.assertEqual(local.rows_per_request, counts)\n+                self.assertEqual(local.num_rows, sum(counts))\n+                self.assertIs(local.k_slots, data.k_slots)\n+                self.assertIs(local.lens_per_request, data.lens_per_request)\n+                for field in (\n+                    \"request_starts\",\n+                    \"compress_lens\",\n+                    \"q_fp4\",\n+                    \"q_sf\",\n+                    \"weights\",\n+                ):\n+                    original = getattr(data, field)\n+                    view = getattr(local, field)\n+                    torch.testing.assert_close(view, original[rows])\n+                    self.assertEqual(\n+                        view.untyped_storage().data_ptr(),\n+                        original.untyped_storage().data_ptr(),\n+                    )\n+        self.assertEqual(data.rows_per_request, [5, 0, 3])\n+\n+    @patch(\"torch.version.cuda\", None)\n+    def test_shard_and_budget_tiles_share_mma_alignment(self):\n+        # Test the host-side alignment math, not GPU-specific wave rounding.\n+        # A CUDA-built torch can be present in CPU CI; probing its SM count\n+        # would initialize CUDA in the fork worker.\n+        for heads in (16, 32, 64):\n+            alignment = flat_index_logits_row_alignment(heads)\n+            tile = flat_index_logits_rows_per_tile(\n+                1024, 4096, heads=heads, budget_bytes=4096 * 4 * 13\n+            )\n+            self.assertEqual(tile % alignment, 0)\n+            self.assertLessEqual(tile, 13)\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a3e9ef391391575ba193ce5ab5f883f2e390554f/test%2Fregistered%2Funit%2Flayers%2Ftest_dsv41_indexer_tp_shard.py",
+      "sha": "33207cde11b46f6de3e9f0ab73dcfa64524e36a7",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "> (auto generated by Claude)\n\n[P1] `rows_per_request is None` is also true on the prefill-graph break: `_prefill_graph_full_topk_break` calls this with `None`, so with the flag on, attn TP > 1 and >= 512 live rows, both `topk_prefill` and `publish_prefill_graph` -> `publish_prefill` all-gather inside the graph break. The description says the captured prefill graph is untouched. Is this intended? If yes, it needs a test through the break path; if not, could we gate on it explicitly (e.g. the caller passes whether sharding is allowed, plus an explicit `attn_cp_size == 1` check) instead of inferring \"not CP\" from `rows_per_request`?",
+      "created_at": "2026-10-31T14:00:15Z",
+      "diff_hunk": "@@ -3987,6 +3993,13 @@ def _make_low_ratio_prefill_indexer_inputs(\n     ) -> PrefillInputs:\n         core = self.forward_metadata.core_metadata\n         tail = self.forward_metadata.late_layer_tail\n+        # Prefill CP hands each rank its own interleaved subset of rows; every\n+        # other path holds the batch's rows on every attention-TP rank.\n+        row_shard = (\n+            self._indexer_row_shard(layer, num_rows=x.shape[0])\n+            if rows_per_request is None",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951843",
+      "id": 4431951843,
+      "line": null,
+      "original_line": 4000,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:00:15Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "> (auto generated by Claude)\n\n[P2] Contiguous shares are unbalanced under causal prefill: later rows see longer `compress_lens`, and the all-gather waits for the slowest rank. For a chunk with no prefix on TP4, the last share costs ~1.75x the mean, so the scan speedup is ~2.3x instead of 4x; it only vanishes when prefix >> chunk, which is why 1M looks good and 256K only gets -8.5%. Could we split by the cost prefix sum (`seq_lens_cpu` / `rows_per_request` are on host), or interleave like CP's `interleave_rows_per_request` and permute after the gather?",
+      "created_at": "2026-10-31T14:00:15Z",
+      "diff_hunk": "@@ -32,6 +33,38 @@ def tail(self, rows_per_request: List[int]) -> CandidateMetadata:\n         raise NotImplementedError(f\"{type(self).__name__} is not a prefill publish\")\n \n \n+class RowShard(msgspec.Struct, frozen=True, kw_only=True):\n+    \"\"\"This rank's share of a prefill chunk's query rows across a group whose\n+    ranks all hold the same rows.\n+\n+    The indexer is replicated, so every rank of the attention-TP group would\n+    score every row identically. Each rank scores a contiguous share instead and\n+    the selections are all-gathered. A dense score depends only on its own query\n+    row, so the gathered selection is bitwise the replicated one.\"\"\"\n+\n+    group: GroupCoordinator\n+    rank: int\n+    world: int\n+    # The score kernel groups 128 // heads consecutive rows into one MMA tile;\n+    # aligned shares keep every tile's row set the same as unsharded.\n+    row_align: int\n+\n+    def rows_per_rank(self, num_rows: int) -> int:\n+        return ceil_align(ceil_div(num_rows, self.world), self.row_align)\n+\n+    def local_rows(self, num_rows: int) -> slice:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951849",
+      "id": 4431951849,
+      "line": 55,
+      "original_line": 55,
+      "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/types.py",
+      "updated_at": "2026-10-31T14:00:15Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "> (auto generated by Claude)\n\n[P2] Threading `rows` through `score_tiles`, `dense_prefill_topk` and `select_prefill_rows` slices the data at every consumer, while `_index_q_and_weights` still projects/quantizes every row on every rank. Could we narrow at the source instead, i.e. `get_deep_gemm_prefill_data(inputs, rows=...)` (or a `DeepGEMMPrefillData.narrow`) that only builds the local rows' `q_fp4/q_sf/weights/request_starts/compress_lens`? Then these three functions keep their signatures, the q projection is sharded too, and the shape matches the CP path, which already hands the indexer only its own rows.",
+      "created_at": "2026-10-31T14:00:15Z",
+      "diff_hunk": "@@ -267,13 +267,20 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil\n     )\n \n \n-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):\n+def score_tiles(\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    *,\n+    rows: Optional[slice] = None,\n+) -> Generator[Tuple[slice, torch.Tensor], None, None]:\n+    \"\"\"Tiles of ``rows`` (all by default); a tile slice is relative to ``rows``.\"\"\"\n+    rows = slice(0, data.num_rows) if rows is None else rows\n     yield from flat_index_logits_tiles(\n-        q=(data.q_fp4, data.q_sf),\n+        q=(data.q_fp4[rows], data.q_sf[rows]),",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951853",
+      "id": 4431951853,
+      "line": null,
+      "original_line": 279,
+      "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py",
+      "updated_at": "2026-10-31T14:00:16Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "> (auto generated by Claude)\n\nNon-blocking: this branch repeats `sharded_dense_prefill_topk` (allocate local outputs, run on `local_rows`, gather, `copy_`). Could this live in one `RowShard` helper, or could the unsharded case be a world-1 `RowShard` whose gather is a no-op, so `publish_prefill_table` keeps a single path?",
+      "created_at": "2026-10-31T14:00:15Z",
+      "diff_hunk": "@@ -534,8 +532,54 @@ def publish_prefill_table(\n             keys,\n             nblocks[tile],\n             out_offsets=zero_offsets[: logits.shape[0]],\n-            out_indices=blocks[tile],\n+            out_indices=out_blocks[tile],\n+        )\n+\n+\n+# TODO(dark): support fusion of publish + topk of publish layer\n+def publish_prefill_table(\n+    *,\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    index_page_table: torch.Tensor,\n+    index_page_size: int,\n+    topk_blocks: int,\n+    out_positions: torch.Tensor,\n+    row_shard: Optional[RowShard] = None,\n+) -> _SparsePrefillTable:\n+    \"\"\"The source's own top-k into ``out_positions`` (request-local compressed\n+    positions) and the chunk's table, from one pass over its dense scores;\n+    ``index_page_table`` is at ``index_page_size`` slots. With ``row_shard`` the\n+    scores are this rank's share and the selections are all-gathered; the table\n+    is then built over every row, because its schedule cannot be sliced.\"\"\"\n+    rows = data.num_rows\n+    device = data.q_fp4.device\n+    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)\n+    if row_shard is None:\n+        blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)\n+        select_prefill_rows(\n+            data=data,\n+            kv=kv,\n+            rows=slice(0, rows),\n+            nblocks=nblocks,\n+            out_positions=out_positions,\n+            out_blocks=blocks,\n+        )\n+    else:\n+        local = row_shard.local_rows(rows)",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951860",
+      "id": 4431951860,
+      "line": 567,
+      "original_line": 569,
+      "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/sparse_table.py",
+      "updated_at": "2026-10-31T14:00:16Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "> (auto generated by Claude)\n\nNon-blocking: `128 // n_heads` duplicates `row_alignment` in `flat_index_logits_rows_per_tile` (`kernels/ops/attention/dsv4/index_logits.py`); could we export one helper from there instead of re-deriving the kernel tiling in the backend? Also, is the alignment actually needed for bitwise equality? Each logits row only depends on its own q/weights, so rows in one MMA tile don't interact. If it isn't, arbitrary cut points would make the balanced split above easier.",
+      "created_at": "2026-10-31T14:00:15Z",
+      "diff_hunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all\n+        # of them reach the all-gather or none does.\n+        parallel = get_parallel()\n+        if (\n+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()\n+            or parallel.attn_tp_size == 1\n+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS\n+        ):\n+            return None\n+        return RowShard(\n+            group=parallel.attn_tp_group,\n+            rank=parallel.attn_tp_rank,\n+            world=parallel.attn_tp_size,\n+            row_align=128 // layer.indexer.n_heads,",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951864",
+      "id": 4431951864,
+      "line": null,
+      "original_line": 4064,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:00:16Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "> (auto generated by Claude)\n\nNon-blocking: this all-gather runs on the `stream_sources` side stream, and safety relies on it being the only attn-TP collective issued in that window. Nothing enforces that; could the comment state it as a constraint so a later main-stream collective in `forward_prepare` doesn't reorder against it?",
+      "created_at": "2026-10-31T14:00:15Z",
+      "diff_hunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951868",
+      "id": 4431951868,
+      "line": 4063,
+      "original_line": 4051,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:00:16Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "> (auto generated by Claude)\n\nNon-blocking: could you add TTFT for short prompts (e.g. 4K / 16K / 64K) to show the 512 floor doesn't regress them? Also the accuracy numbers use the deprecated `sglang.test.run_eval`; sgl-eval with the sampling settings stated would be preferred.",
+      "created_at": "2026-10-31T14:00:15Z",
+      "diff_hunk": "@@ -1037,6 +1038,11 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:\n     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))\n \n \n+# Arbitrary floor: below it the dense scores are short enough that the\n+# all-gather's fixed latency eats most of what sharding saves.\n+_INDEXER_TP_SHARD_MIN_ROWS = 512",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4431951874",
+      "id": 4431951874,
+      "line": 1046,
+      "original_line": 1043,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:00:16Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "Good catch. The local patch (not pushed yet) makes row sharding an explicit eager-caller opt-in; the prefill-graph break passes allow_row_shard=False, and the gate independently requires attn_cp_size == 1. Added CPU regression coverage through both full-topk and candidate-publish graph-break callers at 512/513 rows, plus the eager TP/CP/flag gates. These tests are registered but have not run locally because PyTorch is unavailable; this is dispatch coverage, not a CUDA graph replay claim.",
+      "created_at": "2026-10-31T14:46:44Z",
+      "diff_hunk": "@@ -3987,6 +3993,13 @@ def _make_low_ratio_prefill_indexer_inputs(\n     ) -> PrefillInputs:\n         core = self.forward_metadata.core_metadata\n         tail = self.forward_metadata.late_layer_tail\n+        # Prefill CP hands each rank its own interleaved subset of rows; every\n+        # other path holds the batch's rows on every attention-TP rank.\n+        row_shard = (\n+            self._indexer_row_shard(layer, num_rows=x.shape[0])\n+            if rows_per_request is None",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432086907",
+      "id": 4432086907,
+      "line": null,
+      "original_line": 4000,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:46:44Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "Agreed that equal row counts can leave causal scan work imbalanced. The ~2.3x bound follows the visible-length cost model, but the existing TTFT measurements do not isolate that effect or prove it explains the 256K/1M gap. I am keeping aligned contiguous shares in this patch; cost-aware/interleaved partitioning needs per-rank timing and a short-/long-prefix A/B, including permutation and communication overhead. That optimization remains follow-up work.",
+      "created_at": "2026-10-31T14:46:45Z",
+      "diff_hunk": "@@ -32,6 +33,38 @@ def tail(self, rows_per_request: List[int]) -> CandidateMetadata:\n         raise NotImplementedError(f\"{type(self).__name__} is not a prefill publish\")\n \n \n+class RowShard(msgspec.Struct, frozen=True, kw_only=True):\n+    \"\"\"This rank's share of a prefill chunk's query rows across a group whose\n+    ranks all hold the same rows.\n+\n+    The indexer is replicated, so every rank of the attention-TP group would\n+    score every row identically. Each rank scores a contiguous share instead and\n+    the selections are all-gathered. A dense score depends only on its own query\n+    row, so the gathered selection is bitwise the replicated one.\"\"\"\n+\n+    group: GroupCoordinator\n+    rank: int\n+    world: int\n+    # The score kernel groups 128 // heads consecutive rows into one MMA tile;\n+    # aligned shares keep every tile's row set the same as unsharded.\n+    row_align: int\n+\n+    def rows_per_rank(self, num_rows: int) -> int:\n+        return ceil_align(ceil_div(num_rows, self.world), self.row_align)\n+\n+    def local_rows(self, num_rows: int) -> slice:",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432086919",
+      "id": 4432086919,
+      "line": 55,
+      "original_line": 55,
+      "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/types.py",
+      "updated_at": "2026-10-31T14:46:45Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "The local patch (not pushed yet) adds DeepGEMMPrefillData.narrow() and removes the rows parameter from score_tiles, dense_prefill_topk, and select_prefill_rows. Query operands are sliced together as views while global K layout/score width and the full published-table layout are preserved. Projection/quantization intentionally remain replicated: sharding them changes the projection GEMM shape and needs a separate numerical/performance A/B. This addresses the repeated slicing, not the remaining projection cost.",
+      "created_at": "2026-10-31T14:46:46Z",
+      "diff_hunk": "@@ -267,13 +267,20 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil\n     )\n \n \n-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):\n+def score_tiles(\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    *,\n+    rows: Optional[slice] = None,\n+) -> Generator[Tuple[slice, torch.Tensor], None, None]:\n+    \"\"\"Tiles of ``rows`` (all by default); a tile slice is relative to ``rows``.\"\"\"\n+    rows = slice(0, data.num_rows) if rows is None else rows\n     yield from flat_index_logits_tiles(\n-        q=(data.q_fp4, data.q_sf),\n+        q=(data.q_fp4[rows], data.q_sf[rows]),",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432086981",
+      "id": 4432086981,
+      "line": null,
+      "original_line": 279,
+      "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py",
+      "updated_at": "2026-10-31T14:46:46Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "I kept the two orchestration paths separate for now: table publication has two outputs/collectives, whereas full top-k has one, and the replicated path needs no local staging buffers or gather/copy. Both already use RowShard.local_rows/gather, and the local patch centralizes operand slicing in data.narrow(). A world-1/callback abstraction does not seem to simplify these distinct output lifetimes enough to justify it here.",
+      "created_at": "2026-10-31T14:46:49Z",
+      "diff_hunk": "@@ -534,8 +532,54 @@ def publish_prefill_table(\n             keys,\n             nblocks[tile],\n             out_offsets=zero_offsets[: logits.shape[0]],\n-            out_indices=blocks[tile],\n+            out_indices=out_blocks[tile],\n+        )\n+\n+\n+# TODO(dark): support fusion of publish + topk of publish layer\n+def publish_prefill_table(\n+    *,\n+    data: DeepGEMMPrefillData,\n+    kv: Tuple[torch.Tensor, torch.Tensor],\n+    index_page_table: torch.Tensor,\n+    index_page_size: int,\n+    topk_blocks: int,\n+    out_positions: torch.Tensor,\n+    row_shard: Optional[RowShard] = None,\n+) -> _SparsePrefillTable:\n+    \"\"\"The source's own top-k into ``out_positions`` (request-local compressed\n+    positions) and the chunk's table, from one pass over its dense scores;\n+    ``index_page_table`` is at ``index_page_size`` slots. With ``row_shard`` the\n+    scores are this rank's share and the selections are all-gathered; the table\n+    is then built over every row, because its schedule cannot be sliced.\"\"\"\n+    rows = data.num_rows\n+    device = data.q_fp4.device\n+    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)\n+    if row_shard is None:\n+        blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)\n+        select_prefill_rows(\n+            data=data,\n+            kv=kv,\n+            rows=slice(0, rows),\n+            nblocks=nblocks,\n+            out_positions=out_positions,\n+            out_blocks=blocks,\n+        )\n+    else:\n+        local = row_shard.local_rows(rows)",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087082",
+      "id": 4432087082,
+      "line": 567,
+      "original_line": 569,
+      "path": "python/sglang/srt/layers/attention/dsv4/v41_indexer/sparse_table.py",
+      "updated_at": "2026-10-31T14:46:49Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "The local patch (not pushed yet) shares flat_index_logits_row_alignment() between score-tile sizing and the backend. Also corrected the bitwise-equality claim: mathematical row independence does not guarantee identical bf16 results across kernel row counts; alignment alone is insufficient. I retain the current tile-aligned partition conservatively, without claiming arbitrary cuts are incorrect or that alignment proves parity.",
+      "created_at": "2026-10-31T14:46:51Z",
+      "diff_hunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all\n+        # of them reach the all-gather or none does.\n+        parallel = get_parallel()\n+        if (\n+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()\n+            or parallel.attn_tp_size == 1\n+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS\n+        ):\n+            return None\n+        return RowShard(\n+            group=parallel.attn_tp_group,\n+            rank=parallel.attn_tp_rank,\n+            world=parallel.attn_tp_size,\n+            row_align=128 // layer.indexer.n_heads,",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087224",
+      "id": 4432087224,
+      "line": null,
+      "original_line": 4064,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:46:52Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "Added the constraint at the stream_sources launch site in the local patch (not pushed yet): until that stream is joined, neither the main nor KV stream may issue an attention-TP collective, since all ranks must preserve communicator ordering. This documents the ordering contract; it does not add runtime enforcement.",
+      "created_at": "2026-10-31T14:46:53Z",
+      "diff_hunk": "@@ -4031,6 +4044,24 @@ def _make_low_ratio_prefill_indexer_inputs(\n                 if self._low_ratio_prefill_reads_page_indices(forward_batch)\n                 else None\n             ),\n+            row_shard=row_shard,\n+        )\n+\n+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:\n+        # Every input here is the same on all attention-TP ranks, so either all",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087310",
+      "id": 4432087310,
+      "line": 4063,
+      "original_line": 4051,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:46:53Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "Agreed; these measurements remain outstanding. The 512-row floor is a heuristic, not evidence of no regression at 4K/16K/64K. The follow-up needs warmed flag-off/on TTFT at those lengths with otherwise identical settings, plus an sgl-eval accuracy rerun with explicit sampling settings. I have not run those experiments in this update and would not relabel the existing legacy-harness GSM8K numbers as sgl-eval results.",
+      "created_at": "2026-10-31T14:46:55Z",
+      "diff_hunk": "@@ -1037,6 +1038,11 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:\n     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))\n \n \n+# Arbitrary floor: below it the dense scores are short enough that the\n+# all-gather's fixed latency eats most of what sharding saves.\n+_INDEXER_TP_SHARD_MIN_ROWS = 512",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#discussion_r4432087378",
+      "id": 4432087378,
+      "line": 1046,
+      "original_line": 1043,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-31T14:46:55Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "<!-- pr-check-comment runs=41182446774,41182448347 -->\nRequired checks failed on ff4e6e9; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/41182446774))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.\n\n**Lint** ([run](https://github.com/sgl-project/sglang/actions/runs/41182448347))\nRun `pre-commit run --all-files` locally and push the result. The run log shows any other failing step.",
+      "created_at": "2026-10-31T07:58:18Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6540882492",
+      "id": 6540882492,
+      "updated_at": "2026-10-31T08:12:58Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "<!-- pr-check-comment runs=41183362749 -->\nRequired checks failed on 55abf45; this PR cannot be merged until they pass.\n\n**PR title** ([run](https://github.com/sgl-project/sglang/actions/runs/41183362749))\n> PR title must use \"[Type] scope: title\" or \"[Type] [Hardware] scope: title\". Type must be one of: Feat, Fix, Refactor, Perf, Doc, Test, CI, Chore. Scope is required and may be any module or model name, with unrestricted letter case (letters, numbers, dots, underscores, slashes, or hyphens). Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. Reverts must use GitHub's default format: Revert \"original title\". Use one space between fields and after the colon, with a non-empty title and no leading or trailing whitespace. Examples: \"[Fix] attention: Fix KV cache indexing\", \"[Feat] qwen3: Add model support\", \"[Perf] [AMD] flash-attn: Optimize decode performance\".\nEdit the title; the check reruns on its own.",
+      "created_at": "2026-10-31T08:12:57Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6541013925",
+      "id": 6541013925,
+      "updated_at": "2026-10-31T08:53:55Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-01T02:19:30Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6552258231",
+      "id": 6552258231,
+      "updated_at": "2026-11-01T02:19:30Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "[BBuf Review Agent] @yuan-luo these CI failures look related to this change, could you take a look?\n- [`jit-kernel-unit-test-4-gpu-b200`](https://github.com/sgl-project/sglang/actions/runs/41183364763/job/124485319162): `✗ FAILED: /actions-runner/_work/sglang/sglang/test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py returned exit code 1\" This test is changed by the diff and exercises the modifi`",
+      "created_at": "2026-11-01T02:19:33Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6552258580",
+      "id": 6552258580,
+      "updated_at": "2026-11-01T02:19:33Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-01T03:26:01Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6552857654",
+      "id": 6552857654,
+      "updated_at": "2026-11-01T03:26:01Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-01T03:59:50Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6553145708",
+      "id": 6553145708,
+      "updated_at": "2026-11-01T03:59:50Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-01T09:54:57Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6555777790",
+      "id": 6555777790,
+      "updated_at": "2026-11-01T09:54:57Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci extra",
+      "created_at": "2026-11-01T09:55:08Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6555779553",
+      "id": 6555779553,
+      "updated_at": "2026-11-01T09:55:08Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "[BBuf Review Agent] @yuan-luo these CI failures look related to this change, could you take a look?\n- [`jit-kernel-unit-test-4-gpu-b200`](https://github.com/sgl-project/sglang/actions/runs/41183364763/job/124853675521): `✗ FAILED: /actions-runner/_work/sglang/sglang/test/registered/kernels/ops/attention/test_dsv41_prefill_sparse_indexer.py returned exit code 1\" The failing test file and the indexer code it exercises a`",
+      "created_at": "2026-11-01T14:06:45Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6559030184",
+      "id": 6559030184,
+      "updated_at": "2026-11-01T14:06:45Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-01T19:30:55Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6562798080",
+      "id": 6562798080,
+      "updated_at": "2026-11-01T19:30:55Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-01T20:54:06Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6563744439",
+      "id": 6563744439,
+      "updated_at": "2026-11-01T20:54:06Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-01T21:40:23Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6564273745",
+      "id": 6564273745,
+      "updated_at": "2026-11-01T21:40:23Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-02T01:02:02Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6566581711",
+      "id": 6566581711,
+      "updated_at": "2026-11-02T01:02:02Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "[BBuf Review Agent] @yuan-luo these CI failures look related to this change, could you take a look?\n- [`base-a-test-cpu (4)`](https://github.com/sgl-project/sglang/actions/runs/41317239116/job/125054008310): `RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use the 'spawn' start method\". The new test_dsv41_indexer_tp_shard.py:166 calls changed flat_in`",
+      "created_at": "2026-11-02T02:11:49Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6567413510",
+      "id": 6567413510,
+      "updated_at": "2026-11-02T02:11:49Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-02T05:56:19Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6570200486",
+      "id": 6570200486,
+      "updated_at": "2026-11-02T05:56:19Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-02T07:58:46Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6572053238",
+      "id": 6572053238,
+      "updated_at": "2026-11-02T07:58:46Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-11-02T10:38:27Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#issuecomment-6575052729",
+      "id": 6575052729,
+      "updated_at": "2026-11-02T10:38:27Z",
+      "user": {
+        "login": "BBuf"
+      }
+    }
+  ],
+  "number": 42968,
+  "refs": {
+    "base": {
+      "commit": "2e80af28577dc0ca19a3cc685841f4c49be108c8",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "a3e9ef391391575ba193ce5ab5f883f2e390554f",
+      "repository": "yuan-luo/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "> (auto generated by Claude)\n\nDirection looks right; a few comments inline on the gate and on where the rows are split. Read-only review against 55abf45, no GPU run.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723062283",
+      "id": 5723062283,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:00:15Z",
+      "user": {
+        "login": "DarkSharpness"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359277",
+      "id": 5723359277,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:46:44Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359298",
+      "id": 5723359298,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:46:45Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359368",
+      "id": 5723359368,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:46:46Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359475",
+      "id": 5723359475,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:46:49Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359580",
+      "id": 5723359580,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:46:52Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359664",
+      "id": 5723359664,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:46:53Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5723359745",
+      "id": 5723359745,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-31T14:46:55Z",
+      "user": {
+        "login": "yuan-luo"
+      }
+    },
+    {
+      "body": "[BBuf Review Agent] LGTM. Please wait for the registered B200 indexer tests.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5725995090",
+      "id": 5725995090,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-01T02:14:24Z",
+      "user": {
+        "login": "BBuf"
+      }
+    },
+    {
+      "body": "LGTM.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/42968#pullrequestreview-5731393106",
+      "id": 5731393106,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-02T02:03:16Z",
+      "user": {
+        "login": "BBuf"
+      }
+    }
+  ]
+}

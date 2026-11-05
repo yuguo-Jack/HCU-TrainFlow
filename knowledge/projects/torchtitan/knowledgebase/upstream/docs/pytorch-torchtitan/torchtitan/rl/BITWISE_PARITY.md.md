@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/rl/BITWISE_PARITY.md
-raw_sha256: 00e77fab6806fa0986f1f4b16ca3769ceee98f7959ea76680fd8ba81d064fce0
+raw_sha256: 830da7e6052e07ab5a9cc302436dc1ece1d97955a4fa28b66ec8e9833e2f3ac7
 sources: []
-generated_body_sha256: 5efa58e6c8f20eb9a3260354b8d842415f595347faaa6a3254ea88ff968874a0
+generated_body_sha256: efd8414f3e96505b4e62dc013e3c84d24605f9b0d06c9cce5b3c4968846f52ef
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/BITWISE_PARITY.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/BITWISE_PARITY.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/BITWISE_PARITY.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -126,12 +126,13 @@ need `cast_forward_inputs=True`.
 ## Precision requirements
 
 Batch-invariant mode requires bfloat16 computation in both trainer and
-generator so they operate at the same precision. The generator always runs in
-bfloat16 (`generator.model_dtype="bfloat16"`). The trainer reaches the same
-precision with FSDP mixed precision (`training.mixed_precision_param="bfloat16"`,
-the default): it keeps fp32 master weights and FSDP's `MixedPrecisionPolicy`
-casts them to bf16 before the forward, so the forward is numerically identical to
-the generator's bf16 path. The trainer always wraps the model in FSDP
+generator so they operate at the same precision (`precision.param_dtype="bfloat16"`,
+the default). The generator computes in `precision.param_dtype`. The trainer
+reaches the same precision with FSDP mixed precision: it keeps fp32 master
+weights and FSDP's `MixedPrecisionPolicy` casts them to bf16 before the forward,
+so the forward is numerically identical to the generator's bf16 path.
+Parameters listed in `preserve_dtype_params` stay in their master dtype on both
+sides. The trainer always wraps the model in FSDP
 (`Decoder._apply_fsdp` applies `apply_fsdp_to_decoder` for the trainer), so this
 cast happens even at `data_parallel_shard_degree=1`, where FSDP
 acts purely as a mixed-precision boundary (the degree-1 all-gather is a no-op but
@@ -139,7 +140,7 @@ still casts to bf16). No extra GPUs are required relative to TP-only. With
 `data_parallel_shard_degree > 1` the same cast happens during the sharded
 all-gather.
 
-The batch-invariant configs keep fp32 master weights (`TrainingConfig()` with
+The batch-invariant configs keep fp32 master weights (`PrecisionConfig()` with
 default `dtype="float32"`) and rely on FSDP mixed precision for the bf16 forward,
 so the optimizer updates fp32 weights while the forward stays bitwise identical
 to the generator.

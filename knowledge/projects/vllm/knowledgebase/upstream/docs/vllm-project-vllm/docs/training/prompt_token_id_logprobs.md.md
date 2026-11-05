@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: 25e7c5728d834335288d080e1c36810fa111d4da
 path: docs/training/prompt_token_id_logprobs.md
-raw_sha256: 14a1d07ceb9c9101752b9a2e5f79a7bdaa787422ad1d644051755f9f6e0666c8
+raw_sha256: 9def2841f00090e93c76e791f67f200f77100c1c57b8198909f32d21a2068f60
 sources: []
-generated_body_sha256: aad689ee644eb6f3ad02e47c5e6f7d51b2fa82042cd27d89e24d55f34d1ffe5a
+generated_body_sha256: 1675c02624bb11f75d85800e2d226bd49f809193c4d0b983b697c4f4b67c21e7
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/prompt_token_id_logprobs.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/docs/training/prompt_token_id_logprobs.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/training/prompt_token_id_logprobs.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -83,12 +83,18 @@ lists of Python ints are much slower to copy and serialize. With a logits
 - The longest row at most `--max-logprobs` candidates.
 - No `--kv-sharing-fast-prefill`.
 
-The request skips reading the prefix cache (local and KV connector), since
-cached rows have no logits to score.
+`prompt_logprob_start` also applies to `prompt_logprobs` (top-K prompt
+logprobs, V2 model runner only): positions up to and including
+`prompt_logprob_start` get `None`, and later positions are scored as usual.
+
+Scoring requests skip prefix-cache reads by default. Set
+`skip_reading_prefix_cache=False` to reuse locally cached KV for the rows before
+`prompt_logprob_start`; every scored row is still computed, and the hit is
+block-aligned, so reuse can end a few rows earlier. Without
+`prompt_logprob_start`, every row is scored and nothing is reused. KV connector
+hits are not used for scoring requests; only the local prefix cache is reused.
 
 ## Limitations
 
 - Non-streaming only; `stream=true` requests are rejected.
 - Not exposed through the OpenAI-compatible endpoints.
-- If a prefill starts past the first scored row (e.g. `skip_reading_prefix_cache=False`
-  with a cache hit), the result is `None` rather than a partial matrix.

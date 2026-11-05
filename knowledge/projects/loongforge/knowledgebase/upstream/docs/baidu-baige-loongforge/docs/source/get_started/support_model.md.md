@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source/get_started/support_model.md
-raw_sha256: 3506c11cf109f6f714b048ead0a2318b68095d2325bf4524dde39c47a146f68d
+raw_sha256: b2619c8382ff3b3207a47dadc766efc9b092d9f2cf7aba26553b627c5c1dbf9c
 sources: []
-generated_body_sha256: 5e5c03a802d1252882e1c3ab693bb807241c26fdc65adfb7e77a876a5376ae68
+generated_body_sha256: 54ef804ec5a028aa4c8edd90772c76be3149c8afc44cabafd5f6339a711a755e
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/get_started/support_model.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/get_started/support_model.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/get_started/support_model.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -120,10 +120,11 @@ Each model directory under `examples/` usually contains both training (pre-train
 ||ERNIE4.5-VL|ernie4.5_vl_28b_a3b||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/ernie4.5/finetuning/sft_ernie4.5_vl_28b_a3b.sh  ))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/ernie4_5_vl/ernie4_5_vl_28b_a3b.yaml)|
 |Video|Wan2.2|wan2.2_i2v_a14b||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/wan/pretrain_wan2.2_i2v_a14b.sh  ))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/wan/wan2_2_i2v.yaml)|
 |VLA|Pi05|pi05||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/pi05/run_pi05_ddp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/pi05.yaml)|
-||GR00T-N1.6|groot_n1_6||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/groot_n1_6/run_groot_n1_6_ddp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/groot_n1_6.yaml)|
-||GR00T-N1.7|groot_n1_7||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/groot_n1_7/run_groot_n1_7_ddp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/groot_n1_7.yaml)|
+||GR00T-N1.6|gr00t_n1_6||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/gr00t_n1_6/run_gr00t_n1_6_ddp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/gr00t_n1_6.yaml)|
+||GR00T-N1.7|gr00t_n1_7||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/gr00t_n1_7/run_gr00t_n1_7_ddp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/gr00t_n1_7.yaml)|
 ||X-VLA|xvla||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/xvla/run_xvla_ddp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/xvla.yaml)|
 ||Wall-OSS-0.5|wall_oss_0_5||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/wall_oss_0_5/run_wall_oss_dmuon_fsdp8.sh  ))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/wall_oss_0_5.yaml)|
+||LingBot-VLA-v2|lingbot_vla_v2||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/lingbot_vla_v2/run_lingbot_vla_v2_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/lingbot_vla_v2.yaml)|
 |WAM|LingBot-VA|lingbot_va_robotwin||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/lingbot_va/run_lingbot_va_robotwin_fsdp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/lingbot_va_robotwin.yaml)|
 |||lingbot_va_libero||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/lingbot_va/run_lingbot_va_libero_fsdp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/lingbot_va_libero.yaml)|
 ||Cosmos3|cosmos3_nano||✅([example](https://github.com/baidu-baige/LoongForge/tree/master/examples/embodied/cosmos3/run_cosmos3_nano_droid_fsdp_finetune.sh))|[model config](https://github.com/baidu-baige/LoongForge/tree/master/configs/models/embodied/cosmos3/nano.yaml)|

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/features/fsdp2/quantization.md
-raw_sha256: d54c422ed212ecabfafd0f2bc59c806b971a7ed9ad2f0daeb2b61905e437496d
+raw_sha256: ac2f252f8a0d2d8aa56e3acba8ad796b4c53aa7305edd85abad30072ab0022aa
 sources: []
-generated_body_sha256: a17dfd729b14b61860f93d2cc9f1412b44b932901cafa0cad4729728ed19080a
+generated_body_sha256: 89462c14422c38048572185aadfe45500450793fced1d91cc15c85529f244862
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/features/fsdp2/quantization.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/fsdp2/quantization.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/fsdp2/quantization.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -40,8 +40,10 @@ It improves training efficiency and memory utilization. By configuring a `Quanti
 | Parameter | Type | Default | Description |
 |------------------------------------------------|------|----------------------|--------------------|
 | --model.quant_recipe_name | str | mxfp8 (required) | Name of the quantization recipe. |
+| --model.quant_format | str | E4M3 | FP8 data format used for quantization. The supported formats are `E4M3`, `E5M2`, and `HIF8`. |
+| --model.quant_block_size | int | 32 | Block size for MXFP8 block quantization. |
 | --model.quant_apply_modules | str | 'model.layers.{*}' | Layers or modules to which quantization applies. |
-| --model.quant_ignored_modules | str | '*lm_head', '*gate' | List of submodules to which quantization does not apply. |
+| --model.quant_ignored_modules | str | '*lm_head' '*gate' | List of submodules to which quantization does not apply. |
 | --model.quant_converters | str | 'quantize.linear.mx' | List of quantization converters to use. |
 | --model.enable_fsdp_low_precision_all_gather | bool | True | Whether to enable low-precision communication. |
 | --model.fsdp_low_precision_all_gather_mode | str | 'on-demand' | FSDP low-precision all-gather mode. Aggregates the weights needed for the forward or backward pass on demand. |
@@ -122,9 +124,12 @@ The following example start-up script shows how to configure quantization parame
 ```bash
 QUANT_ARGS="
     --model.quant_recipe_name mxfp8 \
+    --model.quant_format E4M3 \
+    --model.quant_block_size 32 \
     --model.enable_fsdp_low_precision_all_gather \
     --model.quant_converters quantize.linear.mx quantize.moe.mx \
-    --parallel.efsdp_shard_placement_fn shard_by_dim_0
+    --parallel.efsdp_shard_placement_fn shard_by_dim_0 \
+    --parallel.fsdp_implementation custom
 "
 
 torchrun $DISTRIBUTED_ARGS train_fsdp2.py \

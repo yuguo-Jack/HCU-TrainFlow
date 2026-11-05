@@ -10,53 +10,65 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: thudm-slime
   path: train.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 9ab1d9a987182dc5ae57d19ca82a3807fd18adee8cecf0afe118cadbd8939939
 - source: thudm-slime
   path: slime/data/checkpoint.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 98e0b5724e59ee2e6f9df3459f4d598cc987a2e060f2de372abe15d92166adb7
 - source: thudm-slime
   path: slime/backends/megatron_utils/checkpoint.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
-  sha256: 2307489cbd9916ddbf6ab9f93f508cf3796d2dc3d9a986f9e58426d9fbeb830b
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: fad5ca5b0082c6c1f24c862b357b96eeee6098dbd24e01a5f8e22e714bee7f4d
 - source: thudm-slime
   path: slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: ac78a67f02d146331f377c9246b60109d039101b99b5d4058ad6932981411293
 - source: thudm-slime
   path: slime/backends/sglang_utils/sglang_engine.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
-  sha256: 9ccc2851e1ea0b37981154f2d9250226f8267d7bfa96262989930a1904c27eeb
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: d272fbec23e8baa00eaecfb8fbf87de4c1af80de1b0a29ff42a6d0f1e1a97f36
 - source: thudm-slime
   path: docs/en/advanced/delta-weight-sync.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 2c0f424890480c6d8465e3f0455542c2adc8495de0d7bad311149b0b342c9966
 - source: thudm-slime
   path: docs/en/advanced/fault-tolerance.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 1f120c4b4cd11d830dff3b0d4e50d676a293821a00f0370868a5cdedbc2e72ae
 - source: thudm-slime
   path: tests/test_disk_delta_recovery.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 0d0753a32ba90f91dc51871f7c62ca474f99ad1a13385dcf94ac8f0e4c56c125
 - source: thudm-slime
   path: tests/test_disk_delta_checkpoint_index.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 19e276c354338dea683ceed6854c247fe2eca34c56e28c51d74f029ef951fe28
 - source: thudm-slime
   path: tests/test_training_recovery.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 84797613939502cca123d0903761f8e3ae19f350ae1aaf5f18bddaaeefc8c7b9
 - source: thudm-slime
   path: tests/test_straw_checkpoint_rewind.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 4aed63ada40d8ec972e2fc963e0b8b503061a006498c7f7c8df93d6f0bc54d63
+- source: thudm-slime
+  path: requirements.txt
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: c647b19e3b921f5923a881c2567a3f9326a1ad5e3d55d23b3efabbc72e768ffa
+- source: thudm-slime
+  path: slime/backends/sglang_utils/server_control.py
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: fa1f4041d3a6d9d97c8955ff37d143e8c8f40c12ff5d9bdbb88a64c51eddc224
+- source: thudm-slime
+  path: tests/test_server_control.py
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: f4d802544e73352c69812900f56e16766cd1ad3173f441445857a11a45751010
 ---
 
 # Slime：disk delta 全量基线、版本发布与联合恢复
@@ -65,11 +77,11 @@ sources:
 
 本页是官方main的固定实现；HCU旧维护线可能第一轮仅capturebaseline，因此先核对真实`UpdateWeightFromDiskDelta.update_weights`。**当前main第一次、trainer恢复或engine拓扑改变时都发布当前训练权重的全量HFcheckpoint，并从这些精确tensor建立CPU snapshot**，不拿原始HFcheckpoint的旧weights当当前baseline。
 
-配置见[delta教程](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/delta-weight-sync.md)：`--update-weight-mode delta --update-weight-transport disk`，sharedversion目录与hostlocalcheckpoint分别设置。这是一条磁盘传输协议，不是普通tensorcollective，也不是optimizercheckpoint。目录必须为专用任务产物，不能指向原始模型材料。
+配置见[delta教程](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/docs/en/advanced/delta-weight-sync.md)：`--update-weight-mode delta --update-weight-transport disk`，sharedversion目录与hostlocalcheckpoint分别设置。这是一条磁盘传输协议，不是普通tensorcollective，也不是optimizercheckpoint。目录必须为专用任务产物，不能指向原始模型材料。
 
 ## 完整发布与增量链
 
-[`update_weight_from_disk_delta.py`](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py)维护`_needs_full_sync`和每tensorbyte snapshot。初始化/fullseed先扫描所有已有`weight_v*`目录，选高于**所有已尝试版本**的新版本，防止丢失回复后误认旧localcheckpoint已是新恢复状态；保留旧版本目录。
+[`update_weight_from_disk_delta.py`](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py)维护`_needs_full_sync`和每tensorbyte snapshot。初始化/fullseed先扫描所有已有`weight_v*`目录，选高于**所有已尝试版本**的新版本，防止丢失回复后误认旧localcheckpoint已是新恢复状态；保留旧版本目录。
 
 full发布遍历非expert/expertHFtensor，写safetensorsshards、精确bytesnapshot、assets并finalizeindex。后续将new与old的bytes差分，用xor/overwrite编码、zstd压缩，只写变更tensor，并记新完整tensorchecksum。
 
@@ -92,9 +104,9 @@ full发布遍历非expert/expertHFtensor，写safetensorsshards、精确bytesnap
 
 ## durable checkpoint 和恢复接管
 
-[`slime/data/checkpoint.py`](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/slime/data/checkpoint.py)先等待必要model/critic保存、rollout/data状态，再写jointcommit，最后通知`checkpoint_committed`允许recovery释放旧数据。它校验完整commit，不由modeltracker猜完成。`training_completed`只释放运行队列capacity，不推进durable边界。
+[`slime/data/checkpoint.py`](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/slime/data/checkpoint.py)先等待必要model/critic保存、rollout/data状态，再写jointcommit，最后通知`checkpoint_committed`允许recovery释放旧数据。它校验完整commit，不由modeltracker猜完成。`training_completed`只释放运行队列capacity，不推进durable边界。
 
-[容错文档](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/fault-tolerance.md)当前保留named detachedServingCluster，Ray不丢时新attempt可复用；RolloutManager处理数据转换/分发，TrainingRecovery管理checkpoint后需重放的batch。straw或debugrolloutdump保留样本/rewardpostprocessing，以便训练回退后重放；普通model保存不包含所有在途生成。
+[容错文档](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/docs/en/advanced/fault-tolerance.md)当前保留named detachedServingCluster，Ray不丢时新attempt可复用；RolloutManager处理数据转换/分发，TrainingRecovery管理checkpoint后需重放的batch。straw或debugrolloutdump保留样本/rewardpostprocessing，以便训练回退后重放；普通model保存不包含所有在途生成。
 
 恢复要保存model、scheduler、RNG及有状态optimizer；statelessAdam省moment有单独scheduler文件和精度边界，不承诺bitwise同样更新。TP/PP改变还可能重初始化RNG。recovery接入**不会自动重试训练job**，节点故障/集群抢占仍由调度器和既有容错规则处理。不能在重启前盲目`ray stop`/`pkill sglang`破坏可复用服务。
 
@@ -108,13 +120,21 @@ full发布遍历非expert/expertHFtensor，写safetensorsshards、精确bytesnap
 
 固定 `test_straw_checkpoint_rewind.py` 是四 GPU 的训练/serving 集成脚本，检查同目录从 step1 重新训练 step2 前的 producer cursor、pending 样本和空 in-flight 状态；`test_training_recovery.py` 补充不可用初始 rollout 不再反复校验、模型加载后再推进边界。脚本与断言提供验证入口，本轮未执行 GPU/多机恢复，不能把它写成已完成的容错实测。
 
+## Loader 请求与异步保存的完成边界
+
+固定 `8a53b680e82932dabb48cbfcd34f749854400857` 的 [`load_checkpoint`](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/slime/backends/megatron_utils/checkpoint.py)用 `inspect.signature` 判断底层 MCore 是否接受 `restore_training_state`，仅在支持时显式传入 `optimizer is not None`。有 optimizer 的续训不能只加载模型；无 optimizer 的权重读取也不能无条件请求训练状态。签名无法识别时回到旧接口，仍需现场核对底层 loader 行为及恢复后的 step/optimizer/scheduler/data/RNG，而非推断自动兼容成功。
+
+`async_save && offload_train` 现在对 mcore 与 nvrx 都启用 `_stage_async_save_on_cpu(async_strategy)`：选择对应 `FileSystemWriterAsync`，在 trainer 中执行 preload，把可发送CPU payload交给持久worker；临时替换的 class 方法由 finally 恢复。它避免TMS设备分配通过CUDA IPC发送，**不把异步磁盘写、跨rank finalize或joint commit提前变为完成**。`straw-queue>=0.1.5` 同时是当前恢复依赖下限。
+
+跨运行保留服务还须复核 router 的注册payload和健康。`register_worker` 只接受code/字段匹配的重复注册；旧worker仍有活动请求或PD transfer时，abort ACK不够，需要 `abort_servers_until_idle` 的全成员确认。控制错误、部分失败都应阻断后续权重/缓存切换，不能把重注册成功写成模型/数据已恢复。
+
 ## 证据、验证和更新
 
-[`test_disk_delta_recovery.py`](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/tests/test_disk_delta_recovery.py)用真实文件/tensorcodec、mockcollective/RPC测试当前fullseed、已有失败目录、丢回复后重试和xor/overwrite；不是实际SGLang多机reload测试。index/训练recovery测试是相邻契约入口。
+[`test_disk_delta_recovery.py`](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/tests/test_disk_delta_recovery.py)用真实文件/tensorcodec、mockcollective/RPC测试当前fullseed、已有失败目录、丢回复后重试和xor/overwrite；不是实际SGLang多机reload测试。index/训练recovery测试是相邻契约入口。
 
 现场验证应覆盖首次/稳态、旧HF与新恢复weights、空delta、缺shard/checksum、部分host失败、admission暂停、jointcommit失败和Ray丢失。分别标记服务恢复、模型恢复和data重放结果。本页未运行设备故障注入。更新publisher、SGLangconsumer、sessionidentity、checkpointcommit或训练loop时同时复核[总览](../overview/engineering-guide.md)及对应案例。
 
 
 ## 本轮补充固定证据
 
-- [tests/test_straw_checkpoint_rewind.py](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/tests/test_straw_checkpoint_rewind.py)
+- [tests/test_straw_checkpoint_rewind.py](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/tests/test_straw_checkpoint_rewind.py)

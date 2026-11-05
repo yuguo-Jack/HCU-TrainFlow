@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/how-to/generate-reports.md
-raw_sha256: 09f7e79a9dd2e5ad66e6cec7910d334feb703826742be8a31af935f849b5e52e
+raw_sha256: 6d71ad77d982f9558919b2bedcec2a9c2123040884e2b99318d8e00321ed4f25
 sources: []
-generated_body_sha256: 26de7b7331b22da3128a12944970e146b34a21ec36f287f88ef13a7a7f21b11b
+generated_body_sha256: 370fb28fbef0adf40c59b77cb43e9b87a7928e3e6c42503c8115bbcafa789c27
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/how-to/generate-reports.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/how-to/generate-reports.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/how-to/generate-reports.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -39,8 +39,9 @@ See LICENSE for license information.
 :keywords: TraceLens, performance report, PyTorch profiler, JAX, rocprofv3, collective communication, ROCm, GPU trace analysis
 ```
 
-TraceLens generates structured performance reports from GPU trace files produced by PyTorch, JAX, and the AMD ROCm profiler. Choose the topic for your trace format:
+TraceLens generates structured performance reports from GPU trace files produced by PyTorch, JAX, and the AMD ROCm profiler. For PyTorch training and inference traces, the recommended way is a YAML config. Choose the topic for your trace format:
 
+- [Generate performance reports from a YAML config](./generate-perf-report-from-config.md)
 - [Generate a PyTorch performance report](./generate-perf-report-pytorch.md)
 - [Generate a PyTorch inference performance report](./generate-perf-report-pytorch-inference.md)
 - [Generate a JAX performance report](./generate-perf-report-jax.md)

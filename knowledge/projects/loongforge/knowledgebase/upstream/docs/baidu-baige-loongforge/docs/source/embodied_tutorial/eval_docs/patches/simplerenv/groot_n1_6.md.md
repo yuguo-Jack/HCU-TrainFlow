@@ -15,7 +15,7 @@ path: docs/source/embodied_tutorial/eval_docs/patches/simplerenv/groot_n1_6.md
 raw_sha256: 635c3a8f9ab5dd8a7d0deeb34b4bd2f5ed78efc8f773313ed5cad8fbddea093b
 sources: []
 generated_body_sha256: 95c05c3cbba428fbac704e926d9107b02f35adc61198f2297ba3befcc3ace3b1
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # baidu-baige/LoongForge / docs/source/embodied_tutorial/eval_docs/patches/simplerenv/groot_n1_6.md

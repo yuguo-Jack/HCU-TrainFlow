@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/tools/msprobe.md
-raw_sha256: 441008418029fb0be749c39a4aca7ca53572e23767fa3ca6090343711d8c4e68
+raw_sha256: 1b9c2f2ffdfb5821295b9933df64d9e072b733c34d4a16d0944391a6a9a905f6
 sources: []
-generated_body_sha256: 404a883d73248460b771502c81a42b45d3737f6819641277e8d9911d05600e13
+generated_body_sha256: fd2831661829b9b3f327fd68d14627cad8854a5f1b9b2a8d49343cf42b94378e
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/tools/msprobe.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/tools/msprobe.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/tools/msprobe.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -71,7 +71,7 @@ training:
 
 - `msprobe_config_path`：可选参数，需要覆盖默认rank、step、采集级别或输出路径时可进行自定义配置。
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - `msprobe_config_path`参数未配置时，MindSpeed LLM默认使用[`msprobe_config.json`](../../../../mindspeed_llm/tools/msprobe_config.json)。
 > - 自定义配置文件`custom_msprobe_config.json`必须是所有训练进程均可访问的文件。
@@ -119,7 +119,7 @@ training:
 
 - `--msprobe-config-path`：可选参数，需要覆盖默认rank、step、采集级别或输出路径时可进行自定义配置。
 
-  > [!NOTE]
+  > [!NOTE] 说明
   >
   > `--msprobe-config-path`参数未配置时，MindSpeed LLM默认使用[`msprobe_config.json`](../../../../mindspeed_llm/tools/msprobe_config.json)。
 

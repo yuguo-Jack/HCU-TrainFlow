@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/finetune/mcore/lu_lora_finetune.md
-raw_sha256: 917ba041ebf4382b69b8df21b0b9fc3cf72c4861903988b016028fd9b12c9d0a
+raw_sha256: 990a7dc960465b0c025f280e7bb89c78ed11a3903075190bac6ea1f7a193d9ef
 sources: []
-generated_body_sha256: 2e51de72ee895c7bb6c7b8c21557288e1205f4fdd9e403bf618a948e0898a6e1
+generated_body_sha256: a0fcd7dbd12aa8573bfd15614be89ebf62ae61beec24b0c76968e103f470d129
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/finetune/mcore/lu_lora_finetune.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/finetune/mcore/lu_lora_finetune.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/finetune/mcore/lu_lora_finetune.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -77,17 +77,14 @@ bash tests/poc/llama2/ckpt_convert_llama2_hf2mcore.sh
 In the hf2mcore weight conversion script, use the following command:
 
 ```shell
-# Convert the weight format. Configure the required parallel settings and use --num-layers-per-virtual-pipeline-stage 5 together with --params-dtype bf16 as needed
-python convert_ckpt.py \
- --model-type GPT \
+# Convert the weight format. Configure the required parallel settings and use --num-layers-per-virtual-pipeline-stage 5
+python convert_ckpt_v2.py \
  --load-model-type hf \
  --save-model-type mg \
  --target-tensor-parallel-size 8 \
  --target-pipeline-parallel-size 1 \
  --load-dir ./model_from_hf/llama-2-7b-hf/ \
  --save-dir ./model_weights/llama2-mcore/ \
- --tokenizer-model ./model_from_hf/llama-2-7b-hf/tokenizer.model \
- --use-mcore-models \
  --model-type-hf llama2
 ```
 
@@ -131,34 +128,6 @@ After LU-LoRA fine-tuning, the obtained LU-LoRA weights differ from the base wei
  --lora-target-modules linear_qkv linear_proj linear_fc1 linear_fc2 \
 ```
 
-The following is an example command for converting LoRA weights to MCore weights:
-
-```shell
-source /usr/local/Ascend/cann/set_env.sh # Replace this with the actual Toolkit installation path
-
-python convert_ckpt.py \
- --use-mcore-models \
- --model-type GPT \
- --load-model-type mg \
- --save-model-type mg \
- --load-dir ./model_weights/llama-2-7b-mcore \
- --lora-load ./ckpt/llama-7b-lora-mcore-tp1pp1 \
- --save-dir ./model_weights/llama2-7b-lora2mcore \
- --lora-r 16 \
- --lora-alpha 32 \
- --lora-target-modules linear_qkv linear_proj linear_fc1 linear_fc2 \
- --target-tensor-parallel-size 1 \
- --target-pipeline-parallel-size 1 \
- --model-type-hf llama2
-```
-
-The following is an example of a launch script similar to the one used for LoRA conversion:
-
-```shell
-# Start the job
-bash examples/mcore/llama2/ckpt_convert_llama2_mg2mg_lora.sh
-```
-
 #### Merging LU-LoRA Weights and Converting Them to Hugging Face Weights
 
 If you want to merge LU-LoRA weights and convert them to the Hugging Face format, you can use the same LoRA conversion command:
@@ -166,9 +135,7 @@ If you want to merge LU-LoRA weights and convert them to the Hugging Face format
 ```shell
 source /usr/local/Ascend/cann/set_env.sh # Replace this with the actual Toolkit installation path
 
-python convert_ckpt.py \
-    --model-type GPT \
-    --use-mcore-models \
+python convert_ckpt_v2.py \
     --load-model-type mg \
     --save-model-type hf \
     --load-dir ./model_weights/llama-2-7b-mcore/ \
@@ -176,9 +143,8 @@ python convert_ckpt.py \
     --lora-r 16 \
     --lora-alpha 32 \
     --lora-target-modules linear_qkv linear_proj linear_fc1 linear_fc2 \
-    --target-tensor-parallel-size 1 \
-    --target-pipeline-parallel-size 1 \
-    --save-dir ./model_from_hf/llama-2-7b-hf/ # Fill in the original Hugging Face model path. The new weights will be stored in ./model_from_hf/llama-2-7b-hf/mg2hf/
+    --model-type-hf llama2 \
+    --save-dir ./model_from_hf/llama-2-7b-hf/
 ```
 
 The example launch script is as follows:

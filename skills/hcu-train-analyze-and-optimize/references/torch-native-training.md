@@ -36,6 +36,10 @@
 
 先从目标安装包/分支源码与 `--help` 确定接口，再读取匹配版本官方教程。可用当前版本支持的 `TORCH_LOGS` 类别收集 graph breaks/recompiles/guards；不能把某一 DTK/PyTorch 版本的私有开关固定为默认配置。若编译失败或结果不符，可在可复现脚本中逐层隔离 eager → Dynamo 捕获 → AOTAutograd 前后向 → Inductor/Triton，保留原输入、dtype、stride、随机种子和版本；这些诊断 backend 的可用名称由当前版本确认。
 
+当前 HCU 2.13 的日志文件变量是 `TORCH_LOGS_OUT`，结构化 `TORCH_TRACE` 供 tlparse 使用；输出分 rank 放任务目录，先确认类别和实际非空产物。NaN 检查及中间值打印也按版本区分：已读 Python wrapper 的 `TORCHINDUCTOR_NAN_ASSERTS` 检查图输入/返回，并非每个 kernel 前后；AOTI 打印会影响生成代码且有过滤/多 kernel 限制。需要首差时沿 output_code 的签名、wrapper 实参和 buffer producer 补中间值证据，不能把“无检查报错”当全部中间值正确。诊断 backend 通过只缩小范围，图分割/decomposition 也可能同时改变，不能据一次消融认定唯一根因。
+
+Inductor 调试原件的开关也要追消费者：已固定 HCU 2.13/2.16 `torch/_inductor/config.py::trace.enabled` 读取 `TORCH_COMPILE_DEBUG=1`。旧版 Hygon Triton Skill 的 `TORCHINDUCTOR_TRACE=1` 示例不能作为已开启这些原件的证明；按实际安装配置选择开关，确认本次生成的 FX/IR/output_code 目录和非空文件。autotune capture 补丁另依赖私有 CachingAutotuner 接口，导入前读已安装源码并把 cache/capture 放任务目录；不兼容时保留错误、改用最小 repro，关闭诊断开关后独立复测性能，不自动升级或修改共享 Skill/依赖。
+
 `fullgraph` 可用于暴露断图，但不规定全训练循环必须单图；DDP 的通信时机可能依赖图边界。不要默认 suppress errors 后声称编译生效。手改生成缓存只适合定位，正式方案回到模型、图变换、编译器或稳定自定义算子入口，验证清空缓存后的重建。
 
 训练 Graph 按完整优化器步及累积边界核对；一次 graph launch 可能只覆盖 fwd、bwd、重算或更新的一部分。capture 的源码映射与正式 replay 的时间分开，逐图保留准确 shape/stride/phase 特化和调用序列；不能用推理请求的 batch bucket 或相邻 launch 替代训练步语义。参数更新、共享 buffer 地址/存活期、grad 清零/累积、随机操作及动态 MoE 调度必须与原训练契约一致；编译图或 capture 成功后仍验证完整步数值、显存和 profiler-off 收益。
@@ -43,6 +47,10 @@
 `torch.compile` 可用与 Graph replay 安全分别验收。当前 HCU Primus Turbo 在特定 DTK 的 attention backward 注册中保留编译，却显式标记 `cudagraph_unsafe`；不要为追求整图删除这类门禁。先检查实际 op 注册、fake/meta、mutation/alias、生成代码和 capture 限制，再决定切分边界与回退。自定义流水或 Cython launcher 升级后也要核对当前 device/stream 与参数绑定，不能用旧缓存或一次 eager 通过替代变化输入 replay。
 
 编译期常量和缓存的失效属于正确性检查。TE UB、后端、量化 recipe、布局或工具链变化后，核对当前版本如何 reset/recompile，验证冷/热缓存都命中正确实现。对会写 out、累加梯度或更新状态的编译/autotune 路线，先检查准备阶段是否真的执行 kernel；在独立输出上准备或按实现保证只更新一次，不能把第一次执行当纯编译而遗漏副作用。具体梯度与状态检查见[底层库接入](hcu-library-integration.md#融合梯度与低精度状态的接入检查)。
+
+运行时版本变化后复核 Graph 的 RNG 保留、跨流依赖和释放协议。HCU 2.16 专项已有 capture 前预分配 RNG seed/offset、replay 流跟踪及释放前等待；这不取消 capture 原流到 replay 流的执行依赖，也不能倒推旧 2.13 已有同样实现。虚拟地址快照/IPC 导入与 Graph 原地址恢复分别核验；当前该原地址恢复在 `USE_ROCM` 被拒绝，不能从 CUDA 接口或测试推导 HCU 可用。
+
+DDP 通信调优同时检查 lazy bucket storage、gradient-as-view、comm hook Future、实际 Work 和完成后释放；参数 ready 的局部顺序不能破坏跨 rank bucket 提交顺序。FSDP 的参数 gather/reshard/prefetch 另沿实际版本调用链审查，不能由 DDP 的 buffer 规则或旧 FSDP 教材直接推导。communicator split/finalize 升级后保留 fresh-init、group 提交、逐 comm 完成和错误传播的区别，不将 group end 作为已完成依据；NCCL 兼容版本注释仍须与实际 RCCL ABI 对照。
 
 **AOTInductor/export 不作为默认训练加速方案。** 仅当项目确实使用导出路径，或冻结编码器/评估/rollout 等子模块有明确需求时评估；分别核查 autograd、参数更新与部署支持。AOTAutograd 的训练图处理不能和 AOTI 推理打包混为一谈。需要可训练自定义算子时补正确 backward，以及当前编译路径需要的注册/形状/别名描述，再交给已有 Hygon kernel Skill。
 
@@ -66,3 +74,5 @@ PyTorch 版本、RCCL 兼容宏、DTK/HIP 和库版本分别记录，原生接�
 - [DDP 文档](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html)、[编译与分布式 FAQ](https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler_faq.html)：bucket、累积和图边界。
 
 这些是滚动官方入口，不是 HCU 支持承诺。当前任务将实际读取版本/提交写入私有经验；升级时与 HCU-Knowledge 中的 PyTorch、编译器、runtime、库和教程交叉核对。
+
+2026-11-04 的大库选择将内部 `2.13.0-dev@e8aa84067ef78cfad25f72938084ceea94ecda29`、公开同代参考与内部 `main@c55e238d4b1c03e04d2b37c4642ed10d0117b929` 的 2.16 专项分开。具体从 `pytorch-compile-aoti-debug-contract`、`pytorch-ddp-collective-lifecycle`、`pytorch-memory-stream-graph-lifecycle` 进入；版本配套表、开发测试台账和发行 wheel 不是同一验收对象。上述日志与生命周期结论为固定资料/源码审阅，未新增编译、FSDP、多卡或训练实测。

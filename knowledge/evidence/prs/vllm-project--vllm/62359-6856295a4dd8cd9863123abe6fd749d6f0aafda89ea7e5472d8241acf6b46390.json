@@ -1,0 +1,438 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "34ed7d9e9ef316843834709e119d581cd5c753b9c921735519c2b6f472defbb5",
+      "isPrivate": false,
+      "numbers": [
+        62361,
+        62360,
+        62359,
+        62358,
+        62357,
+        62354,
+        62353,
+        62348
+      ],
+      "observed_at": "2026-11-04T20:10:02.573840+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4689,
+        "resetAt": "2026-11-04T20:41:45Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "66875d3127534183b5ea723964fc7ec388e89722",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Overview\n\nWith `dp_shared_memory`, node-local DP ranks share one registered `/dev/shm` mapping for the Engram host tables (2 layers x 94.4 GiB on DeepSeek-V4.1-Flash). Lookups are random row reads and on GB200 they are bound by GPU TLB misses: the registered mapping uses 64K pages.\n\nThis PR allocates the shared table as host-NUMA cuMem instead, which the GPU maps with 2M pages. Rank 0 creates it on its GPU's NUMA node and broadcasts FABRIC handles; the other node-local DP ranks import and map them. Where FABRIC handles are unavailable (probed once: create + export), the existing `/dev/shm` path is used and logged.\n\nAllocation never OOMs; it falls back instead:\n\n- Rank 0 allocates in 2 GiB chunks and stops once its NUMA node would drop below a 5% reserve. Freed cuMem pages stay in the driver's page pool (`NVreg_EnableSystemMemoryPools`), which this estimate does not count, so reusing them after a restart is not penalized.\n- The driver allocates with `__GFP_RETRY_MAYFAIL | __GFP_THISNODE`: the kernel compacts for 2M pages and fails the allocation rather than invoking the OOM killer. It never falls back to small pages.\n- Any create, export, import or map failure on any rank releases everything on every rank, logs a warning, and falls back to `/dev/shm`.\n\nTwo `/dev/shm` fixes, since that path is now the fallback:\n\n- **Orphaned tables:** rank 0 used to unlink the backing file only after every peer had registered it, and registration faults in the whole table. A rank killed in that window left a fully populated 94 GiB file in `/dev/shm` that nothing owned. Every rank now opens the file first, rank 0 unlinks it while it is still sparse, and only then do ranks mmap and register.\n- **OOM kills:** `check_shm_free_space` only checks tmpfs capacity. A table larger than available host memory was faulted in anyway and the OOM killer made room. `/dev/shm` sharing now also requires the tables to fit in available host memory (cgroup-aware; `get_available_memory`, moved from `weight_utils` to `cpu_resource_utils`), both when sharing is decided and before allocating. The pre-check requires this even where cuMem will be used, so a per-layer fallback always has room.\n- **NUMA binding:** under `--numa-bind` (`numactl --membind`), the fallback is most likely exactly when the GPU's node is full, and the membind confined the `/dev/shm` pages to that node, so the OOM killer fired despite free memory on the other node. The mapping now gets `mbind(MPOL_LOCAL)`: local node first, then any node.\n\nLookups only sort rows when the table has small (64K) pages. Sorting was keyed on \"no THP\", so cuMem tables were sorted too, which only adds the sort.\n\nFiles:\n\n- New NVIDIA-only `vllm/models/deepseek_v41/nvidia/ops/engram_host_table.py` holds all cuMem code, including the create/broadcast/import protocol (`share_host_table`).\n- `common/engram.py` (shared with ROCm): `DPSharedEngramStorage` keeps its interface. On CUDA it tries `share_host_table` first, behind an `is_cuda()` check and a lazy import; ROCm goes straight to `/dev/shm` as before. The `/dev/shm` fixes are platform-neutral and apply to ROCm too. The startup log says `via cuMem` or `via /dev/shm`.\n- No new config option.\n\nNot a duplicate: open Engram PRs cover pinned sizing (#59849), SP/PCP sharing (#57195, #61553), Mooncake and disk offload (#57023, #62238); none changes the shared host table backing.\n\n## Performance\n\n### Forward (GB200)\n\nGB200, DEP4, `--numa-bind`-equivalent binding (`numactl` per rank), dummy weights, uniformly random tokens. Same node, back-to-back A/B. Measured before the sort change, i.e. with cuMem lookups still sorted from 1536 tokens.\n\nEngram lookup, one layer, fresh ids every iteration:\n\n| tokens | /dev/shm | cuMem |\n| --- | --- | --- |\n| 16 | 69 us | 49 us |\n| 128 | 184 us | 90 us |\n| 1024 | 1.21 ms | 0.47 ms |\n| 4096 | 3.78 ms | 1.21 ms |\n| 32768 | 9.92 ms | 4.36 ms |\n\n`vllm bench forward` (median per-rank forward):\n\n| case | /dev/shm | cuMem | change |\n| --- | --- | --- | --- |\n| prefill 32768 | 346.76 ms | 333.93 ms | -3.7% |\n| prefill 4 x 8192 | 347.18 ms | 333.65 ms | -3.9% |\n| prefill 4 x 8192 @ 16384 ctx | 353.86 ms | 338.71 ms | -4.3% |\n| prefill 16384 | 181.99 ms | 170.87 ms | -6.1% |\n| prefill 4096 | 56.72 ms | 50.87 ms | -10.3% |\n| decode 64 @ 16384 | 16.61 ms | 16.61 ms | 0% |\n| decode 128 @ 16384 | 17.10 ms | 17.10 ms | 0% |\n\nDecode lookups already overlap on the side stream. Real text repeats 15-22% of rows, so real prefill gains should be somewhat smaller than the random-token numbers.\n\n```bash\nvllm bench forward --model deepseek-ai/DeepSeek-V4.1-Flash --tokenizer-mode deepseek_v41 --language-model-only -dp 4 --enable-expert-parallel --kv-cache-dtype fp8 --max-model-len 131072 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.75 --attention-config '{\"backend\":\"FLASHMLA_MEGA_ATTN_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}' --engram-config '{\"cpu_offload\":true,\"embedding_across_dp\":true,\"use_thp\":false}' --kernel-config '{\"enable_flashinfer_autotune\":false,\"moe_backend\":\"deep_gemm_mega_moe\",\"sparse_indexer_topk_backend\":\"deep_select\"}' --case p32k=32768 --case chunk4=4*8192 --case chunk4mid=4*8192@16384c --case p16k=16384 --case p4k=4096 --case d64=64*1@16384 --case d128=128*1@16384\n```\n\n### Row sorting (GB300)\n\n`ParallelEngramEmbedding.lookup` microbenchmark on GB300 with one real DeepSeek-V4.1-Flash layer (24 heads x 16M rows x 256, 94.4 GiB), shared by two ranks. Each cell is the median of 20 iterations with fresh uniformly random ids, packed FP8 output, and the sort included in the time. The ratio is sorted time over unsorted time.\n\n| tokens | cuMem unsorted | cuMem sorted | ratio | /dev/shm unsorted | /dev/shm sorted | ratio |\n| --- | --- | --- | --- | --- | --- | --- |\n| 128 | 62 us | 202 us | 3.24 | 141 us | 235 us | 1.67 |\n| 512 | 72 us | 217 us | 3.03 | 369 us | 384 us | 1.04 |\n| 1024 | 84 us | 250 us | 2.99 | 690 us | 624 us | 0.90 |\n| 1536 | 105 us | 265 us | 2.52 | 1021 us | 856 us | 0.84 |\n| 2048 | 124 us | 288 us | 2.33 | 1341 us | 1108 us | 0.83 |\n| 4096 | 192 us | 352 us | 1.84 | 2636 us | 2161 us | 0.82 |\n| 8192 | 330 us | 497 us | 1.51 | 5174 us | 3270 us | 0.63 |\n| 16384 | 609 us | 776 us | 1.27 | 10308 us | 4386 us | 0.43 |\n| 32768 | 1167 us | 1343 us | 1.15 | 61864 us | 37227 us | 0.60 |\n\n- **cuMem:** sorting only adds its own ~150-175 us at every size.\n- **/dev/shm:** sorting pays off from about 1024 tokens, which matches the existing 36864-row (1536-token) threshold, so the threshold is unchanged.\n- **This PR:** cuMem lookups now take the unsorted path, and the default thresholds measure the same as forced unsorted.\n- **Chunk size:** 1 handle, 48 x 2 GiB and 189 x 512 MiB chunks give the same lookup latency.\n\n## Accuracy\n\nGSM8K on the first revision of this branch (`via cuMem` in the startup log), DEP4 on one GB200 node, same server and lm-eval setup as #61039: `--max-num-seqs 64 --max-num-batched-tokens 16384 --max-model-len 32768`, `FULL_DECODE_ONLY` graphs up to 384, `cpu_offload` + `dp_shared_memory` Engram tables, DSpark with 5 speculative tokens, standard rejection sampling, adaptive verification off. lm-eval 0.4.13, 1319 problems, 5-shot, temperature 0, 1024-token cap, concurrency 32.\n\n| | strict match | flexible extract | acceptance length, incl. bonus | per-position acceptance |\n| --- | --- | --- | --- | --- |\n| this PR | 92.65% (±0.72) | 92.57% | 3.451 | 0.795 / 0.651 / 0.458 / 0.333 / 0.214 |\n| #61039 (`/dev/shm` tables) | 92.57% | 92.49% | 3.423 | 0.790 / 0.646 / 0.452 / 0.329 / 0.205 |\n\nSorted and unsorted lookups write the same rows, so the sort change does not affect outputs.\n\n## Tests\n\n- `pytest tests/distributed/test_engram_dp_shard.py`: 27 passed (GB300).\n  - New `_check_cumem_host_table`: chunked cuMem tables read back across ranks; a reserve failure on rank 0 or an import failure on rank 1 falls back to `/dev/shm` on all ranks.\n  - The existing shared-storage lifetime/failure test forces the `/dev/shm` path, so both paths stay covered.\n- Full-size stress on GB300 (2 ranks, one 94.4 GiB table):\n\n| scenario | result |\n| --- | --- |\n| cuMem, 48 chunks | maps in 2.4 s (0.9 s when served from the driver pool), cross-rank readback correct |\n| node reserve trips mid-allocation | stops at 66 GiB, releases, falls back to `/dev/shm`, readback correct |\n| real `cuMemCreate` OOM (470 GiB table, reserve disabled) | clean fallback to `/dev/shm`, no process OOM-killed |\n| another process holds 400 GiB on node 0 | cuMem fails (reserve or OOM), falls back; the holder survives, and a later 10 GiB node-0 allocation succeeds |\n| both nodes held, table exceeds `MemAvailable` | before: the OOM killer killed the 430 GiB holder; now: a clean `RuntimeError`, both holders survive |\n| SIGKILL during `/dev/shm` registration | before: an orphaned 95 GiB file; now: no file left, Shmem back to baseline |\n| SIGKILL both ranks holding a cuMem table | the driver frees it: a 420 GiB node-0 allocation then succeeds and node 0 is back to 464 GiB free |\n| two layers under `numactl --membind=0`; node 0 left with 60 GiB after layer 1; layer 2 cuMem fails | before: layer 2's `/dev/shm` pages were confined to node 0 and the OOM killer killed the other process; now: 49 GiB on node 0, 44 GiB on node 1, both layers read back, the other process survives |\n| same, with both nodes held (34 GiB available) | layer 2 cuMem hits the reserve at 16 GiB, then a clean `RuntimeError` (94.4 GiB exceeds 34.1 GiB available); no process killed |\n| table on node 0, lookups from a GPU on the other Grace | same latency as the local GPU (e.g. 32768 tokens: 1150 us vs 1160 us) |\n\n- `pre-commit run` on the changed files passes.\n\nAI assistance (Claude Code) was used for this change.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Juntian777.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-22T22:01:57Z",
+            "databaseId": 6352276912,
+            "updatedAt": "2026-10-22T22:01:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6352276912"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Juntian777"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-28T07:54:06Z",
+            "databaseId": 6463693564,
+            "updatedAt": "2026-10-28T07:54:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6463693564"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #97907](https://buildkite.com/vllm/ci/builds/97907) for commit `e3414516edc7`.",
+            "createdAt": "2026-10-28T07:55:05Z",
+            "databaseId": 6463711809,
+            "updatedAt": "2026-10-28T07:55:05Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6463711809"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Juntian777"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-28T21:07:11Z",
+            "databaseId": 6480702523,
+            "updatedAt": "2026-10-28T21:07:11Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6480702523"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Queued 4 failed job(s) for retry in [Buildkite CI #97907](https://buildkite.com/vllm/ci/builds/97907).",
+            "createdAt": "2026-10-28T21:08:04Z",
+            "databaseId": 6480719391,
+            "updatedAt": "2026-10-28T21:08:04Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6480719391"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Juntian777"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-29T04:24:13Z",
+            "databaseId": 6487887021,
+            "updatedAt": "2026-10-29T04:24:13Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6487887021"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #98196](https://buildkite.com/vllm/ci/builds/98196) for commit `205c7299575a`, running 2 failed step(s) from [Buildkite CI #97907](https://buildkite.com/vllm/ci/builds/97907).",
+            "createdAt": "2026-10-29T04:24:36Z",
+            "databaseId": 6487892717,
+            "updatedAt": "2026-10-29T04:24:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6487892717"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ @Juntian777, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-10-29T19:40:57Z",
+            "databaseId": 6506598047,
+            "updatedAt": "2026-10-29T19:40:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6506598047"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYPSzp8=",
+          "hasNextPage": false
+        },
+        "totalCount": 8
+      },
+      "headRefOid": "205c7299575a8d0b68d580e35b4e82b754022701",
+      "headRepository": {
+        "nameWithOwner": "Juntian777/vllm"
+      },
+      "mergeCommit": {
+        "oid": "4e0ad572036166a8bdf1782f4a07b4e33016646b"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-29T19:45:06Z",
+      "number": 62359,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5677249242,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-28T03:01:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#pullrequestreview-5677249242"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZJY0516"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5679118440,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-28T07:20:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62359#pullrequestreview-5679118440"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yOFQwNzoyMDo0N1q0MjAyNi0xMC0yOFQwNzoyMDo0N1rPAAAAAVKAeGg=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Perf][DSv4.1] Share Engram host tables as host-NUMA cuMem across DP ranks",
+      "updatedAt": "2026-10-29T19:45:06Z",
+      "url": "https://github.com/vllm-project/vllm/pull/62359"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "66875d3127534183b5ea723964fc7ec388e89722"
+    },
+    "body": "## Overview\n\nWith `dp_shared_memory`, node-local DP ranks share one registered `/dev/shm` mapping for the Engram host tables (2 layers x 94.4 GiB on DeepSeek-V4.1-Flash). Lookups are random row reads and on GB200 they are bound by GPU TLB misses: the registered mapping uses 64K pages.\n\nThis PR allocates the shared table as host-NUMA cuMem instead, which the GPU maps with 2M pages. Rank 0 creates it on its GPU's NUMA node and broadcasts FABRIC handles; the other node-local DP ranks import and map them. Where FABRIC handles are unavailable (probed once: create + export), the existing `/dev/shm` path is used and logged.\n\nAllocation never OOMs; it falls back instead:\n\n- Rank 0 allocates in 2 GiB chunks and stops once its NUMA node would drop below a 5% reserve. Freed cuMem pages stay in the driver's page pool (`NVreg_EnableSystemMemoryPools`), which this estimate does not count, so reusing them after a restart is not penalized.\n- The driver allocates with `__GFP_RETRY_MAYFAIL | __GFP_THISNODE`: the kernel compacts for 2M pages and fails the allocation rather than invoking the OOM killer. It never falls back to small pages.\n- Any create, export, import or map failure on any rank releases everything on every rank, logs a warning, and falls back to `/dev/shm`.\n\nTwo `/dev/shm` fixes, since that path is now the fallback:\n\n- **Orphaned tables:** rank 0 used to unlink the backing file only after every peer had registered it, and registration faults in the whole table. A rank killed in that window left a fully populated 94 GiB file in `/dev/shm` that nothing owned. Every rank now opens the file first, rank 0 unlinks it while it is still sparse, and only then do ranks mmap and register.\n- **OOM kills:** `check_shm_free_space` only checks tmpfs capacity. A table larger than available host memory was faulted in anyway and the OOM killer made room. `/dev/shm` sharing now also requires the tables to fit in available host memory (cgroup-aware; `get_available_memory`, moved from `weight_utils` to `cpu_resource_utils`), both when sharing is decided and before allocating. The pre-check requires this even where cuMem will be used, so a per-layer fallback always has room.\n- **NUMA binding:** under `--numa-bind` (`numactl --membind`), the fallback is most likely exactly when the GPU's node is full, and the membind confined the `/dev/shm` pages to that node, so the OOM killer fired despite free memory on the other node. The mapping now gets `mbind(MPOL_LOCAL)`: local node first, then any node.\n\nLookups only sort rows when the table has small (64K) pages. Sorting was keyed on \"no THP\", so cuMem tables were sorted too, which only adds the sort.\n\nFiles:\n\n- New NVIDIA-only `vllm/models/deepseek_v41/nvidia/ops/engram_host_table.py` holds all cuMem code, including the create/broadcast/import protocol (`share_host_table`).\n- `common/engram.py` (shared with ROCm): `DPSharedEngramStorage` keeps its interface. On CUDA it tries `share_host_table` first, behind an `is_cuda()` check and a lazy import; ROCm goes straight to `/dev/shm` as before. The `/dev/shm` fixes are platform-neutral and apply to ROCm too. The startup log says `via cuMem` or `via /dev/shm`.\n- No new config option.\n\nNot a duplicate: open Engram PRs cover pinned sizing (#59849), SP/PCP sharing (#57195, #61553), Mooncake and disk offload (#57023, #62238); none changes the shared host table backing.\n\n## Performance\n\n### Forward (GB200)\n\nGB200, DEP4, `--numa-bind`-equivalent binding (`numactl` per rank), dummy weights, uniformly random tokens. Same node, back-to-back A/B. Measured before the sort change, i.e. with cuMem lookups still sorted from 1536 tokens.\n\nEngram lookup, one layer, fresh ids every iteration:\n\n| tokens | /dev/shm | cuMem |\n| --- | --- | --- |\n| 16 | 69 us | 49 us |\n| 128 | 184 us | 90 us |\n| 1024 | 1.21 ms | 0.47 ms |\n| 4096 | 3.78 ms | 1.21 ms |\n| 32768 | 9.92 ms | 4.36 ms |\n\n`vllm bench forward` (median per-rank forward):\n\n| case | /dev/shm | cuMem | change |\n| --- | --- | --- | --- |\n| prefill 32768 | 346.76 ms | 333.93 ms | -3.7% |\n| prefill 4 x 8192 | 347.18 ms | 333.65 ms | -3.9% |\n| prefill 4 x 8192 @ 16384 ctx | 353.86 ms | 338.71 ms | -4.3% |\n| prefill 16384 | 181.99 ms | 170.87 ms | -6.1% |\n| prefill 4096 | 56.72 ms | 50.87 ms | -10.3% |\n| decode 64 @ 16384 | 16.61 ms | 16.61 ms | 0% |\n| decode 128 @ 16384 | 17.10 ms | 17.10 ms | 0% |\n\nDecode lookups already overlap on the side stream. Real text repeats 15-22% of rows, so real prefill gains should be somewhat smaller than the random-token numbers.\n\n```bash\nvllm bench forward --model deepseek-ai/DeepSeek-V4.1-Flash --tokenizer-mode deepseek_v41 --language-model-only -dp 4 --enable-expert-parallel --kv-cache-dtype fp8 --max-model-len 131072 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.75 --attention-config '{\"backend\":\"FLASHMLA_MEGA_ATTN_DSV41\",\"indexer_kv_dtype\":\"mxfp4\",\"indexer_sparse_logits\":true}' --engram-config '{\"cpu_offload\":true,\"embedding_across_dp\":true,\"use_thp\":false}' --kernel-config '{\"enable_flashinfer_autotune\":false,\"moe_backend\":\"deep_gemm_mega_moe\",\"sparse_indexer_topk_backend\":\"deep_select\"}' --case p32k=32768 --case chunk4=4*8192 --case chunk4mid=4*8192@16384c --case p16k=16384 --case p4k=4096 --case d64=64*1@16384 --case d128=128*1@16384\n```\n\n### Row sorting (GB300)\n\n`ParallelEngramEmbedding.lookup` microbenchmark on GB300 with one real DeepSeek-V4.1-Flash layer (24 heads x 16M rows x 256, 94.4 GiB), shared by two ranks. Each cell is the median of 20 iterations with fresh uniformly random ids, packed FP8 output, and the sort included in the time. The ratio is sorted time over unsorted time.\n\n| tokens | cuMem unsorted | cuMem sorted | ratio | /dev/shm unsorted | /dev/shm sorted | ratio |\n| --- | --- | --- | --- | --- | --- | --- |\n| 128 | 62 us | 202 us | 3.24 | 141 us | 235 us | 1.67 |\n| 512 | 72 us | 217 us | 3.03 | 369 us | 384 us | 1.04 |\n| 1024 | 84 us | 250 us | 2.99 | 690 us | 624 us | 0.90 |\n| 1536 | 105 us | 265 us | 2.52 | 1021 us | 856 us | 0.84 |\n| 2048 | 124 us | 288 us | 2.33 | 1341 us | 1108 us | 0.83 |\n| 4096 | 192 us | 352 us | 1.84 | 2636 us | 2161 us | 0.82 |\n| 8192 | 330 us | 497 us | 1.51 | 5174 us | 3270 us | 0.63 |\n| 16384 | 609 us | 776 us | 1.27 | 10308 us | 4386 us | 0.43 |\n| 32768 | 1167 us | 1343 us | 1.15 | 61864 us | 37227 us | 0.60 |\n\n- **cuMem:** sorting only adds its own ~150-175 us at every size.\n- **/dev/shm:** sorting pays off from about 1024 tokens, which matches the existing 36864-row (1536-token) threshold, so the threshold is unchanged.\n- **This PR:** cuMem lookups now take the unsorted path, and the default thresholds measure the same as forced unsorted.\n- **Chunk size:** 1 handle, 48 x 2 GiB and 189 x 512 MiB chunks give the same lookup latency.\n\n## Accuracy\n\nGSM8K on the first revision of this branch (`via cuMem` in the startup log), DEP4 on one GB200 node, same server and lm-eval setup as #61039: `--max-num-seqs 64 --max-num-batched-tokens 16384 --max-model-len 32768`, `FULL_DECODE_ONLY` graphs up to 384, `cpu_offload` + `dp_shared_memory` Engram tables, DSpark with 5 speculative tokens, standard rejection sampling, adaptive verification off. lm-eval 0.4.13, 1319 problems, 5-shot, temperature 0, 1024-token cap, concurrency 32.\n\n| | strict match | flexible extract | acceptance length, incl. bonus | per-position acceptance |\n| --- | --- | --- | --- | --- |\n| this PR | 92.65% (±0.72) | 92.57% | 3.451 | 0.795 / 0.651 / 0.458 / 0.333 / 0.214 |\n| #61039 (`/dev/shm` tables) | 92.57% | 92.49% | 3.423 | 0.790 / 0.646 / 0.452 / 0.329 / 0.205 |\n\nSorted and unsorted lookups write the same rows, so the sort change does not affect outputs.\n\n## Tests\n\n- `pytest tests/distributed/test_engram_dp_shard.py`: 27 passed (GB300).\n  - New `_check_cumem_host_table`: chunked cuMem tables read back across ranks; a reserve failure on rank 0 or an import failure on rank 1 falls back to `/dev/shm` on all ranks.\n  - The existing shared-storage lifetime/failure test forces the `/dev/shm` path, so both paths stay covered.\n- Full-size stress on GB300 (2 ranks, one 94.4 GiB table):\n\n| scenario | result |\n| --- | --- |\n| cuMem, 48 chunks | maps in 2.4 s (0.9 s when served from the driver pool), cross-rank readback correct |\n| node reserve trips mid-allocation | stops at 66 GiB, releases, falls back to `/dev/shm`, readback correct |\n| real `cuMemCreate` OOM (470 GiB table, reserve disabled) | clean fallback to `/dev/shm`, no process OOM-killed |\n| another process holds 400 GiB on node 0 | cuMem fails (reserve or OOM), falls back; the holder survives, and a later 10 GiB node-0 allocation succeeds |\n| both nodes held, table exceeds `MemAvailable` | before: the OOM killer killed the 430 GiB holder; now: a clean `RuntimeError`, both holders survive |\n| SIGKILL during `/dev/shm` registration | before: an orphaned 95 GiB file; now: no file left, Shmem back to baseline |\n| SIGKILL both ranks holding a cuMem table | the driver frees it: a 420 GiB node-0 allocation then succeeds and node 0 is back to 464 GiB free |\n| two layers under `numactl --membind=0`; node 0 left with 60 GiB after layer 1; layer 2 cuMem fails | before: layer 2's `/dev/shm` pages were confined to node 0 and the OOM killer killed the other process; now: 49 GiB on node 0, 44 GiB on node 1, both layers read back, the other process survives |\n| same, with both nodes held (34 GiB available) | layer 2 cuMem hits the reserve at 16 GiB, then a clean `RuntimeError` (94.4 GiB exceeds 34.1 GiB available); no process killed |\n| table on node 0, lookups from a GPU on the other Grace | same latency as the local GPU (e.g. 32768 tokens: 1150 us vs 1160 us) |\n\n- `pre-commit run` on the changed files passes.\n\nAI assistance (Claude Code) was used for this change.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "Juntian777/vllm"
+      },
+      "sha": "205c7299575a8d0b68d580e35b4e82b754022701"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/62359",
+    "merge_commit_sha": "4e0ad572036166a8bdf1782f4a07b4e33016646b",
+    "merged": true,
+    "merged_at": "2026-10-29T19:45:06Z",
+    "number": 62359,
+    "state": "closed",
+    "title": "[Perf][DSv4.1] Share Engram host tables as host-NUMA cuMem across DP ranks",
+    "updated_at": "2026-10-29T19:45:06Z"
+  },
+  "files": [
+    {
+      "additions": 41,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/205c7299575a8d0b68d580e35b4e82b754022701/tests%2Fdistributed%2Ftest_engram_dp_shard.py",
+      "changes": 41,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fdistributed%2Ftest_engram_dp_shard.py?ref=205c7299575a8d0b68d580e35b4e82b754022701",
+      "deletions": 0,
+      "filename": "tests/distributed/test_engram_dp_shard.py",
+      "patch": "@@ -214,6 +214,8 @@ def _worker(rank: int, tp_size: int, port: int) -> None:\n \n         for failure in (\"create\", \"open\", \"mmap\", \"register\", \"pinned\", None):\n             _check_shared_storage_lifetime_and_failures(failure)\n+        for failure in (None, \"create\", \"import\"):\n+            _check_cumem_host_table(failure)\n \n         # GPU peer reads need NVLink P2P, which CI's L4s lack.\n         p2p = current_platform.is_fully_connected(\n@@ -356,7 +358,11 @@ def unregister(pointer):\n         assert result.value == 0\n         return result\n \n+    from vllm.models.deepseek_v41.nvidia.ops import engram_host_table\n+\n     with pytest.MonkeyPatch.context() as patch:\n+        # Exercise the /dev/shm path even where cuMem tables are used.\n+        patch.setattr(engram_host_table, \"share_host_table\", lambda *args: None)\n         patch.setattr(\n             engram_ops,\n             \"tempfile\",\n@@ -405,6 +411,41 @@ def unregister(pointer):\n         assert all(not path.exists() for path in paths)\n \n \n+def _check_cumem_host_table(failure):\n+    \"\"\"Chunked cuMem tables read back across ranks; a failed allocation or\n+    import on any rank falls back to /dev/shm on all of them.\"\"\"\n+    from vllm.models.deepseek_v41.nvidia.ops import engram_host_table\n+\n+    if not engram_host_table.fabric_host_memory_supported():\n+        return\n+\n+    group = get_engram_dp_group()\n+    # Three 2 MiB chunks, the last one partial.\n+    rows = 5 * (1 << 20) // DIM\n+    with pytest.MonkeyPatch.context() as patch:\n+        patch.setattr(engram_host_table, \"CHUNK_BYTES\", 2 << 20)\n+        if failure == \"create\" and group.rank_in_group == 0:\n+            patch.setattr(engram_host_table, \"NUMA_RESERVE_FRACTION\", 1.0)\n+        if failure == \"import\" and group.rank_in_group == 1:\n+            patch.setattr(\n+                engram_host_table.cu,\n+                \"cuMemImportFromShareableHandle\",\n+                lambda *args: (\n+                    engram_host_table.cu.CUresult.CUDA_ERROR_INVALID_VALUE,\n+                    None,\n+                ),\n+            )\n+        storage = engram_ops.DPSharedEngramStorage(rows, DIM, BLOCK, group)\n+    assert storage.huge_pages == (failure is None)\n+    table = torch.arange(rows * DIM).remainder(251).to(torch.uint8).view(rows, DIM)\n+    if group.rank_in_group == 0:\n+        storage.weight.view(torch.uint8).copy_(table)\n+    group.barrier()\n+    weight, _ = storage.get_views(storage.weight, storage.weight_scale_inv)\n+    assert torch.equal(weight.view(torch.uint8).cpu(), table)\n+    group.barrier()\n+\n+\n def _check_table(\n     vllm_config, cpu_offload, dp_shared_memory, n_heads, sequence_parallel, p2p\n ):",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/205c7299575a8d0b68d580e35b4e82b754022701/tests%2Fdistributed%2Ftest_engram_dp_shard.py",
+      "sha": "0a2241e2ed19ef2e2a4ef2430c9dc791f59aea5d",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fconfig%2Fengram.py",
+      "changes": 9,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fconfig%2Fengram.py?ref=205c7299575a8d0b68d580e35b4e82b754022701",
+      "deletions": 4,
+      "filename": "vllm/config/engram.py",
+      "patch": "@@ -44,10 +44,11 @@ class EngramConfig:\n     dp_shared_memory: bool | None = None\n     \"\"\"Share CPU-offloaded embedding weights between co-located\n     DP replicas. Each node stores one copy of every TP shard, reducing host\n-    memory without per-step Engram DP collectives. Requires sufficient\n-    /dev/shm capacity and a shared IPC namespace. Defaults to enabled whenever\n-    the other settings allow it, falling back to per-replica tables when DP\n-    replicas are not co-located on one node or /dev/shm cannot hold them.\"\"\"\n+    memory without per-step Engram DP collectives. Uses host-NUMA cuMem shared\n+    by FABRIC handle where supported, else /dev/shm (which then needs capacity\n+    and a shared IPC namespace). Defaults to enabled whenever the other settings\n+    allow it, falling back to per-replica tables when DP replicas are not\n+    co-located on one node or the host cannot hold them.\"\"\"\n \n     use_thp: bool = False\n     \"\"\"Back private CPU-offloaded tables with transparent huge pages (best",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fconfig%2Fengram.py",
+      "sha": "a2b8c50e783400650d20841c84892f17d52d62e1",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fmodel_executor%2Fmodel_loader%2Fweight_utils.py",
+      "changes": 24,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fmodel_loader%2Fweight_utils.py?ref=205c7299575a8d0b68d580e35b4e82b754022701",
+      "deletions": 22,
+      "filename": "vllm/model_executor/model_loader/weight_utils.py",
+      "patch": "@@ -50,6 +50,7 @@\n from vllm.platforms import current_platform\n from vllm.tracing import instrument\n from vllm.transformers_utils.repo_utils import hf_api, hf_fs\n+from vllm.utils.cpu_resource_utils import get_available_memory\n from vllm.utils.import_utils import PlaceholderModule\n \n try:\n@@ -966,27 +967,6 @@ def _get_checkpoints_size_bytes(files: list[str]) -> int:\n     return sum(os.path.getsize(f) for f in files)\n \n \n-def _get_available_ram_bytes() -> int:\n-    \"\"\"Return available RAM, honoring cgroup limits.\"\"\"\n-    import psutil\n-\n-    host_available = psutil.virtual_memory().available\n-\n-    from vllm.utils.cpu_resource_utils import (\n-        get_cgroup_memory_limit,\n-        get_cgroup_memory_usage,\n-    )\n-\n-    cgroup_limit = get_cgroup_memory_limit()\n-    if cgroup_limit is None:\n-        return host_available\n-    cgroup_usage = get_cgroup_memory_usage()\n-    cgroup_available = (\n-        cgroup_limit if cgroup_usage is None else max(0, cgroup_limit - cgroup_usage)\n-    )\n-    return min(host_available, cgroup_available)\n-\n-\n def _get_fs_type(files: list[str]) -> str:\n     \"\"\"Get the filesystem type of the first file in *files* (Linux only).\"\"\"\n     if not files:\n@@ -1136,7 +1116,7 @@ def safetensors_weights_iterator(\n     fs_type = _get_fs_type(sorted_files)\n     is_net_fs = fs_type in (\"nfs\", \"nfs4\", \"lustre\")\n     total_bytes = _get_checkpoints_size_bytes(sorted_files)\n-    avail_bytes = _get_available_ram_bytes()\n+    avail_bytes = get_available_memory()\n     ram_threshold_pct = 90\n     fits_in_ram = total_bytes <= (ram_threshold_pct / 100.0) * avail_bytes\n     fs_name = fs_type.upper() if fs_type else \"unknown\"",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fmodel_executor%2Fmodel_loader%2Fweight_utils.py",
+      "sha": "1fa5625225423632353841111dc35b890dfff762",
+      "status": "modified"
+    },
+    {
+      "additions": 119,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fmodels%2Fdeepseek_v41%2Fcommon%2Fengram.py",
+      "changes": 161,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fdeepseek_v41%2Fcommon%2Fengram.py?ref=205c7299575a8d0b68d580e35b4e82b754022701",
+      "deletions": 42,
+      "filename": "vllm/models/deepseek_v41/common/engram.py",
+      "patch": "@@ -37,6 +37,7 @@\n import ctypes\n import mmap\n import os\n+import platform\n import sys\n import tempfile\n import weakref\n@@ -75,6 +76,7 @@\n )\n from vllm.platforms import current_platform\n from vllm.triton_utils import tl, triton\n+from vllm.utils.cpu_resource_utils import get_available_memory\n from vllm.utils.platform_utils import is_uva_available\n from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor\n \n@@ -778,46 +780,132 @@ def gather_engram_hashes(\n     return dp_group.all_gather(hash_ids, dim=0)\n \n \n+def describe_error(exc: Exception) -> str:\n+    return f\"{type(exc).__name__}: {exc}\"\n+\n+\n+def gather_errors(group: GroupCoordinator, error: str | None) -> str:\n+    \"\"\"Each rank's error, joined; empty if every rank succeeded.\"\"\"\n+    errors: list[str | None] = [None] * group.world_size\n+    torch.distributed.all_gather_object(errors, error, group=group.cpu_group)\n+    return \"; \".join(\n+        f\"EDP rank {rank}: {error}\" for rank, error in enumerate(errors) if error\n+    )\n+\n+\n+def _shm_shortfall(num_bytes: int) -> str | None:\n+    \"\"\"Why /dev/shm cannot hold a table of this size, or None if it can.\"\"\"\n+    if not os.path.isdir(SHM_PATH):\n+        return f\"{SHM_PATH} is not mounted\"\n+    try:\n+        check_shm_free_space(num_bytes, allocation_name=\"Engram tables\")\n+    except Exception as exc:\n+        return describe_error(exc)\n+    # tmpfs pages beyond available host memory are faulted in by the OOM killer.\n+    available = get_available_memory()\n+    if num_bytes > available:\n+        return (\n+            f\"{num_bytes / 2**30:.1f} GiB exceeds the \"\n+            f\"{available / 2**30:.1f} GiB of available host memory\"\n+        )\n+    return None\n+\n+\n+def _allow_any_numa_node(address: int, num_bytes: int) -> None:\n+    \"\"\"Let a mapping's pages spill to any NUMA node despite --numa-bind.\n+\n+    mbind(MPOL_LOCAL) overrides the task's membind for this range: pages still\n+    go to the faulting CPU's node first, then to any other node.\n+    \"\"\"\n+    sys_mbind = {\"aarch64\": 235, \"x86_64\": 237}.get(platform.machine())\n+    libc = ctypes.CDLL(None, use_errno=True)\n+    libc.syscall.restype = ctypes.c_long\n+    if sys_mbind is None or libc.syscall(\n+        ctypes.c_long(sys_mbind),\n+        ctypes.c_void_p(address),\n+        ctypes.c_ulong(num_bytes),\n+        ctypes.c_int(4),  # MPOL_LOCAL\n+        None,\n+        ctypes.c_ulong(0),\n+        ctypes.c_uint(0),\n+    ):\n+        logger.warning_once(\n+            \"Engram mbind(MPOL_LOCAL) failed; /dev/shm tables follow the \"\n+            \"process memory policy: %s\",\n+            os.strerror(ctypes.get_errno()),\n+        )\n+\n+\n class DPSharedEngramStorage:\n-    \"\"\"Registered host weights shared by a node-local DP group with one writer.\"\"\"\n+    \"\"\"Host weights shared by a node-local DP group with one writer: host-NUMA\n+    cuMem where FABRIC handles work, else a registered /dev/shm mapping.\"\"\"\n \n     def __init__(\n         self, num_rows: int, dim: int, block_size: int, group: GroupCoordinator\n     ) -> None:\n         self.group = group\n         weight_bytes = num_rows * dim\n-        storage = self._allocate(weight_bytes + weight_bytes // block_size)\n-        self.weight = storage[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)\n-        self.weight_scale_inv = storage[weight_bytes:].view(-1, dim // block_size)\n-        self._views: tuple[torch.Tensor, torch.Tensor] | None = None\n+        num_bytes = weight_bytes + weight_bytes // block_size\n+\n+        def split_table(table: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:\n+            weight = table[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)\n+            return weight, table[weight_bytes:].view(-1, dim // block_size)\n \n-    def _allocate(self, num_bytes: int) -> torch.Tensor:\n-        \"\"\"Map and register one physical allocation across a node-local DP group.\"\"\"\n+        views = None\n+        if current_platform.is_cuda():\n+            from vllm.models.deepseek_v41.nvidia.ops import engram_host_table\n+\n+            views = engram_host_table.share_host_table(num_bytes, group)\n+        # The GPU maps cuMem host memory with 2M pages, /dev/shm with 64K pages.\n+        self.huge_pages = views is not None\n+        host, gpu = views or self._allocate_shm(num_bytes)\n+        self.weight, self.weight_scale_inv = split_table(host)\n+        self._views = split_table(gpu)\n+\n+    def _allocate_shm(self, num_bytes: int) -> tuple[torch.Tensor, torch.Tensor]:\n+        \"\"\"Map and register one /dev/shm file across a node-local DP group.\n+\n+        Returns CPU and GPU views of the file.\n+        \"\"\"\n         group = self.group\n         with ExitStack() as stack:\n             path = error = None\n-            if group.rank_in_group == 0:\n+            if group.rank_in_group == 0 and not (error := _shm_shortfall(num_bytes)):\n                 try:\n-                    check_shm_free_space(num_bytes)\n                     backing_file = stack.enter_context(\n                         tempfile.NamedTemporaryFile(prefix=\"vllm_engram_\", dir=SHM_PATH)\n                     )\n                     backing_file.truncate(num_bytes)\n                     path = backing_file.name\n                 except Exception as exc:\n-                    error = f\"{type(exc).__name__}: {exc}\"\n+                    error = describe_error(exc)\n             path, error = group.broadcast_object((path, error))\n             if error is not None:\n                 raise RuntimeError(\n                     \"Engram shared-memory creation failed on EDP rank 0: \" + error\n                 )\n \n-            mapping = owner = tensor = None\n+            mapping = None\n             try:\n                 with open(path, \"r+b\") as file:\n                     mapping = mmap.mmap(file.fileno(), num_bytes, flags=mmap.MAP_SHARED)\n+            except Exception as exc:\n+                error = describe_error(exc)\n+            if failures := gather_errors(group, error):\n+                del mapping\n+                raise RuntimeError(\n+                    \"Engram shared-memory initialization failed: \" + failures\n+                )\n+            # Unlink while the file is still sparse, so a crash during the slow\n+            # registration below cannot orphan the table.\n+            stack.close()\n+            assert mapping is not None\n+\n+            owner = tensor = None\n+            try:\n                 owner = np.frombuffer(mapping, dtype=np.uint8)\n                 pointer = owner.ctypes.data\n+                _allow_any_numa_node(pointer, num_bytes)\n                 tensor = torch.from_numpy(owner)\n                 result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)\n                 if result.value != 0:\n@@ -830,24 +918,16 @@ def _allocate(self, num_bytes: int) -> torch.Tensor:\n                         \"cudaHostRegister did not pin the shared Engram mapping\"\n                     )\n             except Exception as exc:\n-                error = f\"{type(exc).__name__}: {exc}\"\n-\n-            # Also fences peer mappings before the leader unlinks the file.\n-            errors: list[str | None] = [None] * group.world_size\n-            torch.distributed.all_gather_object(errors, error, group=group.cpu_group)\n-            failures = \"; \".join(\n-                f\"EDP rank {rank}: {error}\"\n-                for rank, error in enumerate(errors)\n-                if error is not None\n-            )\n-            if failures:\n+                error = describe_error(exc)\n+\n+            if failures := gather_errors(group, error):\n                 # Dropping the owner runs the finalizer; the mapping then unmaps.\n                 del tensor, owner, mapping\n                 raise RuntimeError(\n                     \"Engram shared-memory initialization failed: \" + failures\n                 )\n             assert tensor is not None\n-            return tensor\n+            return tensor, get_accelerator_view_from_cpu_tensor(tensor)\n \n     @staticmethod\n     def _unregister(mapping: mmap.mmap, pointer: int) -> None:\n@@ -874,16 +954,11 @@ def get_views(\n             self.weight_scale_inv.data_ptr(),\n         ):\n             raise RuntimeError(\"Shared Engram parameter storage must not be replaced\")\n-        if self._views is None:\n-            self._views = (\n-                get_accelerator_view_from_cpu_tensor(self.weight),\n-                get_accelerator_view_from_cpu_tensor(self.weight_scale_inv),\n-            )\n         return self._views\n \n \n def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:\n-    \"\"\"Whether co-located DP replicas exist and /dev/shm can hold the full tables.\"\"\"\n+    \"\"\"Whether co-located DP replicas exist and can hold the full tables.\"\"\"\n     if get_engram_dp_size() == 1:\n         logger.warning_once(\n             \"Engram DP replicas are not co-located on one node; \"\n@@ -895,16 +970,9 @@ def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:\n     )\n     group = get_engram_dp_group()\n     assert group is not None\n-    # Only the leader allocates, so every replica follows its check.\n-    error = None\n-    if group.rank_in_group == 0:\n-        if not os.path.isdir(SHM_PATH):\n-            error = f\"{SHM_PATH} is not mounted\"\n-        else:\n-            try:\n-                check_shm_free_space(num_bytes, allocation_name=\"Engram tables\")\n-            except Exception as exc:\n-                error = f\"{type(exc).__name__}: {exc}\"\n+    # Only the leader allocates, so every replica follows its check. /dev/shm\n+    # must fit even where cuMem will, since it is the fallback.\n+    error = _shm_shortfall(num_bytes) if group.rank_in_group == 0 else None\n     error = group.broadcast_object(error)\n     if error is not None:\n         logger.warning_once(\n@@ -1069,7 +1137,10 @@ def __init__(\n                 self.part_num_embeddings,\n                 dim,\n                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,\n-                \"shared across DP replicas\" if dp_shared_memory else \"per rank\",\n+                \"per rank\"\n+                if self._shared_memory is None\n+                else \"shared across DP replicas via \"\n+                + (\"cuMem\" if self._shared_memory.huge_pages else \"/dev/shm\"),\n             )\n \n     def _get_shard_info(self) -> tuple[int, int]:\n@@ -1162,6 +1233,13 @@ def collapse_huge_pages(self) -> None:\n                 os.strerror(ctypes.get_errno()),\n             )\n \n+    @property\n+    def _uses_small_host_pages(self) -> bool:\n+        \"\"\"Whether the GPU maps this host table with pages too small for its TLB.\"\"\"\n+        if self._shared_memory is not None:\n+            return not self._shared_memory.huge_pages\n+        return self.cpu_offload and self._packed is None\n+\n     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:\n         if self._shared_memory is not None:\n             return self._shared_memory.get_views(self.weight, self.weight_scale_inv)\n@@ -1191,8 +1269,7 @@ def lookup(\n         ids_stride_t, ids_stride_h = indices.stride()\n         sort_min_rows, _ = _engram_lookup_thresholds(indices.device)\n         sort = (\n-            self.cpu_offload\n-            and self._packed is None\n+            self._uses_small_host_pages\n             and sort_min_rows is not None\n             and rows >= sort_min_rows\n         )",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fmodels%2Fdeepseek_v41%2Fcommon%2Fengram.py",
+      "sha": "b88293037ea20d1e9b3d6aa4fcbfa9cbf7f0d0de",
+      "status": "modified"
+    },
+    {
+      "additions": 241,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fmodels%2Fdeepseek_v41%2Fnvidia%2Fops%2Fengram_host_table.py",
+      "changes": 241,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fdeepseek_v41%2Fnvidia%2Fops%2Fengram_host_table.py?ref=205c7299575a8d0b68d580e35b4e82b754022701",
+      "deletions": 0,
+      "filename": "vllm/models/deepseek_v41/nvidia/ops/engram_host_table.py",
+      "patch": "@@ -0,0 +1,241 @@\n+# SPDX-License-Identifier: Apache-2.0\n+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+\"\"\"Engram host tables in host-NUMA cuMem, shared across DP ranks by FABRIC handle.\n+\n+GPUs map cuMem host memory with 2M pages instead of the 64K pages of a registered\n+/dev/shm mapping, so random row lookups miss the TLB far less.\n+\"\"\"\n+\n+import ctypes\n+import weakref\n+from functools import cache\n+from types import SimpleNamespace\n+from typing import NamedTuple\n+\n+import torch\n+from cuda.bindings import driver as cu\n+\n+from vllm.distributed.parallel_state import GroupCoordinator\n+from vllm.logger import init_logger\n+from vllm.models.deepseek_v41.common.engram import describe_error, gather_errors\n+from vllm.utils.cpu_resource_utils import get_memory_node_info\n+from vllm.utils.math_utils import round_up\n+\n+logger = init_logger(__name__)\n+\n+FABRIC_HANDLE = cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC\n+# Tables are created in chunks, so the creator can stop before draining its node.\n+CHUNK_BYTES = 2 << 30\n+# Fraction of the NUMA node left to other allocations.\n+NUMA_RESERVE_FRACTION = 0.05\n+\n+\n+class ExportedHostTable(NamedTuple):\n+    \"\"\"What a peer needs to map a table.\"\"\"\n+\n+    numa_node: int\n+    padded_bytes: int\n+    fabric_handles: list[bytes]\n+\n+\n+def _chunk_ranges(padded_bytes: int) -> list[tuple[int, int]]:\n+    return [\n+        (offset, min(CHUNK_BYTES, padded_bytes - offset))\n+        for offset in range(0, padded_bytes, CHUNK_BYTES)\n+    ]\n+\n+\n+def _call_driver(fn, *args):\n+    \"\"\"Call a CUDA driver API and return its result, raising on failure.\"\"\"\n+    error, *result = fn(*args)\n+    if error != cu.CUresult.CUDA_SUCCESS:\n+        raise RuntimeError(f\"{fn.__name__} failed: {error.name}\")\n+    return result[0] if result else None\n+\n+\n+def _gpu_numa_node() -> int:\n+    return _call_driver(\n+        cu.cuDeviceGetAttribute,\n+        cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,\n+        torch.accelerator.current_device_index(),\n+    )\n+\n+\n+def _host_allocation_prop(numa_node: int) -> cu.CUmemAllocationProp:\n+    prop = cu.CUmemAllocationProp()\n+    prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED\n+    prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA\n+    prop.location.id = numa_node\n+    prop.requestedHandleTypes = FABRIC_HANDLE\n+    return prop\n+\n+\n+def _allocation_granularity(prop: cu.CUmemAllocationProp) -> int:\n+    return _call_driver(cu.cuMemGetAllocationGranularity, prop, 0)\n+\n+\n+def _export_fabric_handle(handle) -> bytes:\n+    exported = _call_driver(cu.cuMemExportToShareableHandle, handle, FABRIC_HANDLE, 0)\n+    return bytes(exported.data)\n+\n+\n+def _release(handles: list) -> None:\n+    for handle in handles:\n+        cu.cuMemRelease(handle)\n+\n+\n+def _read_write_access(location_type, location_id: int) -> cu.CUmemAccessDesc:\n+    access = cu.CUmemAccessDesc()\n+    access.location.type = location_type\n+    access.location.id = location_id\n+    access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE\n+    return access\n+\n+\n+def _unmap(address: int, size: int, ranges: list[tuple[int, int]]) -> None:\n+    for offset, length in ranges:\n+        cu.cuMemUnmap(address + offset, length)\n+    cu.cuMemAddressFree(address, size)\n+\n+\n+@cache\n+def fabric_host_memory_supported() -> bool:\n+    \"\"\"Whether host-NUMA cuMem allocations can export FABRIC handles here.\"\"\"\n+    try:\n+        prop = _host_allocation_prop(_gpu_numa_node())\n+        handle = _call_driver(cu.cuMemCreate, _allocation_granularity(prop), prop, 0)\n+        try:\n+            _export_fabric_handle(handle)\n+        finally:\n+            cu.cuMemRelease(handle)\n+    except Exception as exc:\n+        logger.info_once(\n+            \"Host-NUMA cuMem FABRIC handles are unavailable (%s); Engram DP \"\n+            \"replicas share tables through /dev/shm.\",\n+            exc,\n+        )\n+        return False\n+    return True\n+\n+\n+def _create_table(num_bytes: int) -> tuple[list, ExportedHostTable]:\n+    \"\"\"Allocate and export a table on this GPU's host NUMA node.\n+\n+    Stops once the node would drop below its reserve. The kernel compacts to\n+    find 2M pages and fails the chunk, rather than OOM-killing, if it cannot.\n+    \"\"\"\n+    numa_node = _gpu_numa_node()\n+    prop = _host_allocation_prop(numa_node)\n+    padded_bytes = round_up(num_bytes, _allocation_granularity(prop))\n+    reserve = get_memory_node_info(numa_node).total_memory * NUMA_RESERVE_FRACTION\n+    handles: list = []\n+    try:\n+        for offset, length in _chunk_ranges(padded_bytes):\n+            handles.append(_call_driver(cu.cuMemCreate, length, prop, 0))\n+            if get_memory_node_info(numa_node).available_memory < reserve:\n+                raise MemoryError(\n+                    f\"NUMA node {numa_node} fell below its \"\n+                    f\"{reserve / 2**30:.1f} GiB reserve after \"\n+                    f\"{(offset + length) / 2**30:.1f} of \"\n+                    f\"{padded_bytes / 2**30:.1f} GiB\"\n+                )\n+        exported = [_export_fabric_handle(handle) for handle in handles]\n+    except BaseException:\n+        _release(handles)\n+        raise\n+    return handles, ExportedHostTable(numa_node, padded_bytes, exported)\n+\n+\n+def _map_table(\n+    table: ExportedHostTable, num_bytes: int, handles: list\n+) -> tuple[torch.Tensor, torch.Tensor]:\n+    \"\"\"Map a table, importing its handles unless given, and release the handles.\n+\n+    Returns CPU and GPU uint8 views; either keeps the mapping alive.\n+    \"\"\"\n+    device = torch.accelerator.current_device_index()\n+    address = None\n+    mapped: list[tuple[int, int]] = []\n+    try:\n+        if not handles:\n+            for exported in table.fabric_handles:\n+                handles.append(\n+                    _call_driver(\n+                        cu.cuMemImportFromShareableHandle, exported, FABRIC_HANDLE\n+                    )\n+                )\n+        address = int(_call_driver(cu.cuMemAddressReserve, table.padded_bytes, 0, 0, 0))\n+        for (offset, length), handle in zip(_chunk_ranges(table.padded_bytes), handles):\n+            _call_driver(cu.cuMemMap, address + offset, length, 0, handle, 0)\n+            mapped.append((offset, length))\n+        location = cu.CUmemLocationType\n+        access = [\n+            _read_write_access(location.CU_MEM_LOCATION_TYPE_DEVICE, device),\n+            _read_write_access(\n+                location.CU_MEM_LOCATION_TYPE_HOST_NUMA, table.numa_node\n+            ),\n+        ]\n+        _call_driver(\n+            cu.cuMemSetAccess, address, table.padded_bytes, access, len(access)\n+        )\n+    except BaseException:\n+        if address is not None:\n+            _unmap(address, table.padded_bytes, mapped)\n+        raise\n+    finally:\n+        # The mappings keep the allocations alive.\n+        _release(handles)\n+\n+    host_buffer = (ctypes.c_uint8 * num_bytes).from_address(address)\n+    finalizer = weakref.finalize(\n+        host_buffer, _unmap, address, table.padded_bytes, mapped\n+    )\n+    finalizer.atexit = False  # type: ignore[misc]\n+    # Torch retains this object, so the GPU view keeps the buffer alive too.\n+    # Name the device: an index-less \"cuda\" makes torch copy the table.\n+    gpu_view = torch.as_tensor(\n+        SimpleNamespace(\n+            __cuda_array_interface__={\n+                \"shape\": (num_bytes,),\n+                \"typestr\": \"|u1\",\n+                \"data\": (address, False),\n+                \"version\": 3,\n+            },\n+            owner=host_buffer,\n+        ),\n+        device=torch.device(\"cuda\", device),\n+    )\n+    return torch.frombuffer(host_buffer, dtype=torch.uint8), gpu_view\n+\n+\n+def share_host_table(\n+    num_bytes: int, group: GroupCoordinator\n+) -> tuple[torch.Tensor, torch.Tensor] | None:\n+    \"\"\"Map one table on every rank of a node-local group, or None on all of them.\n+\n+    Rank 0 creates the table and broadcasts its handles; the others import them.\n+    Returns CPU and GPU uint8 views of the table.\n+    \"\"\"\n+    handles: list = []\n+    table = error = None\n+    if group.rank_in_group == 0 and fabric_host_memory_supported():\n+        try:\n+            handles, table = _create_table(num_bytes)\n+        except Exception as exc:\n+            error = describe_error(exc)\n+    table, error = group.broadcast_object((table, error))\n+    if table is not None:\n+        views = None\n+        try:\n+            views = _map_table(table, num_bytes, handles)\n+        except Exception as exc:\n+            error = describe_error(exc)\n+        if not (error := gather_errors(group, error)):\n+            return views\n+    if error and group.rank_in_group == 0:\n+        logger.warning(\n+            \"Engram host table cannot use host-NUMA cuMem (%s); falling back \"\n+            \"to /dev/shm, whose 64K GPU pages make lookups slower.\",\n+            error,\n+        )\n+    return None",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Fmodels%2Fdeepseek_v41%2Fnvidia%2Fops%2Fengram_host_table.py",
+      "sha": "ca480de6056b0fc4d9d26662aac703242c84ef49",
+      "status": "added"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Futils%2Fcpu_resource_utils.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Futils%2Fcpu_resource_utils.py?ref=205c7299575a8d0b68d580e35b4e82b754022701",
+      "deletions": 0,
+      "filename": "vllm/utils/cpu_resource_utils.py",
+      "patch": "@@ -115,6 +115,16 @@ def get_cgroup_memory_usage() -> int | None:\n     return None\n \n \n+def get_available_memory() -> int:\n+    \"\"\"Return available host memory, honoring cgroup limits.\"\"\"\n+    available = psutil.virtual_memory().available\n+    cgroup_limit = get_cgroup_memory_limit()\n+    if cgroup_limit is None:\n+        return available\n+    cgroup_usage = get_cgroup_memory_usage()\n+    return min(available, max(0, cgroup_limit - (cgroup_usage or 0)))\n+\n+\n def check_cgroup_memory_available(\n     required_bytes: int,\n     allocation_name: str,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/205c7299575a8d0b68d580e35b4e82b754022701/vllm%2Futils%2Fcpu_resource_utils.py",
+      "sha": "b8d37f645476978cbd76629a8b2c7d26cde5a3f7",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Juntian777.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-22T22:01:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6352276912",
+      "id": 6352276912,
+      "updated_at": "2026-10-22T22:01:57Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-28T07:54:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6463693564",
+      "id": 6463693564,
+      "updated_at": "2026-10-28T07:54:06Z",
+      "user": {
+        "login": "Juntian777"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #97907](https://buildkite.com/vllm/ci/builds/97907) for commit `e3414516edc7`.",
+      "created_at": "2026-10-28T07:55:05Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6463711809",
+      "id": 6463711809,
+      "updated_at": "2026-10-28T07:55:05Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-28T21:07:11Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6480702523",
+      "id": 6480702523,
+      "updated_at": "2026-10-28T21:07:11Z",
+      "user": {
+        "login": "Juntian777"
+      }
+    },
+    {
+      "body": "✅ Queued 4 failed job(s) for retry in [Buildkite CI #97907](https://buildkite.com/vllm/ci/builds/97907).",
+      "created_at": "2026-10-28T21:08:04Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6480719391",
+      "id": 6480719391,
+      "updated_at": "2026-10-28T21:08:04Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-29T04:24:13Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6487887021",
+      "id": 6487887021,
+      "updated_at": "2026-10-29T04:24:13Z",
+      "user": {
+        "login": "Juntian777"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #98196](https://buildkite.com/vllm/ci/builds/98196) for commit `205c7299575a`, running 2 failed step(s) from [Buildkite CI #97907](https://buildkite.com/vllm/ci/builds/97907).",
+      "created_at": "2026-10-29T04:24:36Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6487892717",
+      "id": 6487892717,
+      "updated_at": "2026-10-29T04:24:36Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "✅ @Juntian777, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-10-29T19:40:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#issuecomment-6506598047",
+      "id": 6506598047,
+      "updated_at": "2026-10-29T19:40:57Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 62359,
+  "refs": {
+    "base": {
+      "commit": "66875d3127534183b5ea723964fc7ec388e89722",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "205c7299575a8d0b68d580e35b4e82b754022701",
+      "repository": "Juntian777/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#pullrequestreview-5677249242",
+      "id": 5677249242,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-28T03:01:16Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62359#pullrequestreview-5679118440",
+      "id": 5679118440,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-28T07:20:47Z",
+      "user": {
+        "login": "ZJY0516"
+      }
+    }
+  ]
+}

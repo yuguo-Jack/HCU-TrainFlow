@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/docs_guide.md
-raw_sha256: 786187795b99d2246ec64633b71ed2eeb3a3074bf5f89e55406b8d9711c88d62
+raw_sha256: aade331fa7f349c29480cad0c918bcaaacb5cc5dc3ebe73f6e409ec560ea1217
 sources: []
-generated_body_sha256: a170e10b7fd335ef551bc56eff3edcef938c50c55f047258bf9b6671c18f2dea
+generated_body_sha256: 3d05d65f06a1d04ff52bf8aaefeff0546f80d0e950f19262d1d2c0af95f66516
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/docs_guide.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/docs_guide.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/docs_guide.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -34,7 +34,7 @@ Upstream source document; original commands, claims and links require their stat
 
 The MindSpeed LLM documentation is organized by training framework and mainly includes the following core directories:
 
-- **pytorch/**: Documentation based on the PyTorch training framework. It mainly supports the MCore and FSDP2 training backends and includes installation guides, model lists, feature descriptions, training solutions, and toolchains.
+- `pytorch/`: documentation based on the PyTorch training framework. It mainly supports the MCore and FSDP2 training backends and includes installation guides, model lists, feature descriptions, training solutions, and toolchains.
 
 ### Documentation Directory Structure
 
@@ -46,6 +46,7 @@ docs/en/
 ├── introduction.md           # Project introduction
 ├── project_guide.md          # Project guide
 ├── docs_guide.md             # Documentation guide
+├── task_entry_guide.md       # Task entry guide
 ├── appendixes.md             # Appendix documents
 ├── release_notes_llm.md      # Release notes
 ├── replace_ascend_path_guide.md  # Ascend path replacement guide
@@ -65,6 +66,7 @@ docs/en/
     │   │   ├── checkpoint_resume.md              # Checkpoint resume
     │   │   ├── chunk_loss.md                     # Chunk loss
     │   │   ├── communication-over-computation.md  # Communication over computation
+    │   │   ├── deepseek4_fine_grained_recompute.md # DeepSeek V4 fine-grained recompute
     │   │   ├── environment_variable.md            # Environment variables
     │   │   ├── fine-tuning-with-context-parallel.md # Fine-tuning with context parallelism
     │   │   ├── high_availability.md               # High availability
@@ -89,7 +91,8 @@ docs/en/
     │   └── supported_models.md
     ├── training/             # Training solution documents
     │   ├── install_guide.md    # Installation guide
-    │   ├── quick_start.md      # Quick start guide
+    │   ├── quick_start.md      # MCore quick start guide
+    │   ├── fsdp2_quick_start.md # FSDP2 quick start guide
     │   ├── evaluation/         # Model evaluation
     │   │   ├── evaluation_guide.md
     │   │   ├── models_evaluation.md
@@ -102,10 +105,9 @@ docs/en/
     │   │   │   ├── multi_sample_pack_finetune.md # Multi-sample pack fine-tuning
     │   │   │   ├── single_sample_finetune.md    # Single-sample fine-tuning
     │   │   │   ├── multi_turn_conversation.md   # Multi-turn conversation fine-tuning
-    │   │   │   ├── offline_dpo.md               # Offline DPO
     │   │   │   ├── layerwise_disaggregated_training.md # Layer-wise disaggregated training fine-tuning
     │   │   │   └── pmcc_obfuscation.md          # PMCC obfuscation
-    │   │   └── fsdp2/        # FSDP2 fine-tuning solutions
+    │   │   └── fsdp2/        # FSDP2 training solutions
     │   │       └── finetune_fsdp2.md  # FSDP2 fine-tuning guide
     │   ├── inference/        # Model inference
     │   │   ├── inference.md
@@ -120,17 +122,18 @@ docs/en/
     └── tools/                # Tool documents
         ├── data_process_sft_alpaca_style.md   # Alpaca-style data processing
         ├── data_process_sft_sharegpt_style.md # ShareGPT-style data processing
-        ├── data_process_dpo_pairwise.md       # Pairwise data processing
         ├── data_process_pretrain.md           # Pretraining data processing
         ├── checkpoint_convert_hf_mcore_large_params.md  # Weight conversion
         ├── checkpoint_convert_hf_dcp.md       # HF-DCP weight conversion
         ├── profiling.md                       # Performance analysis
+        ├── msprobe.md                         # Precision data collection
+        ├── model_io_trace.md                  # Model input and output collection
         └── deterministic_computation.md       # Deterministic computation
 ```
 
 ## Core Documentation Navigation
 
-**Quick links:** [Getting Started](#getting-started) | [MCore Backend](#mcore-backend) | [FSDP2 Backend](#fsdp2-backend) | [Toolchain](#toolchain) | [Tuning Guide](#tuning-guide) | [Others](#others)
+**Quick links:** [Getting Started](#getting-started) | [Task Entry](./task_entry_guide.md) | [MCore Backend](#mcore-backend) | [FSDP2 Backend](#fsdp2-backend) | [Toolchain](#toolchain) | [Tuning Guide](#tuning-guide) | [Others](#others)
 
 ### Getting Started
 
@@ -140,6 +143,7 @@ docs/en/
 | [quick_start_pytorch](./pytorch/training/quick_start.md) |Quick start guidance for the MCore backend, covering the full process from environment setup to model pretraining and fine-tuning on the PyTorch framework|
 | [fsdp2_quick_start](./pytorch/training/fsdp2_quick_start.md) |Quick start guidance for the FSDP2 backend, covering the full process from environment setup to model pretraining and fine-tuning|
 | [supported_models](pytorch/models/supported_models.md) |Model support list|
+| [task_entry_guide](./task_entry_guide.md) |View entry scripts, example scripts, configuration sources, and implementation paths by task type|
 
 ### MCore Backend
 
@@ -167,7 +171,6 @@ docs/en/
 | | [multi_turn_conversation](pytorch/training/finetune/mcore/multi_turn_conversation.md) |Multi-turn conversation fine-tuning solution|
 | | [lora_finetune](pytorch/training/finetune/mcore/lora_finetune.md) |LoRA model fine-tuning solution|
 | | [lu_lora_finetune](pytorch/training/finetune/mcore/lu_lora_finetune.md) |LU-LoRA model fine-tuning solution|
-| | [offline_dpo](pytorch/training/finetune/mcore/offline_dpo.md) |Offline DPO alignment solution|
 | | [layerwise_disaggregated_training](pytorch/training/finetune/mcore/layerwise_disaggregated_training.md) |Layer-wise disaggregated training fine-tuning solution|
 | | [pmcc_obfuscation](pytorch/training/finetune/mcore/pmcc_obfuscation.md) |PMCC obfuscation solution|
 | Inference | [inference](pytorch/training/inference/inference.md) |Model inference|
@@ -197,6 +200,7 @@ docs/en/
 
 | Category | Content | Description |
 |------|------|------|
+| Quick Start | [fsdp2_quick_start](pytorch/training/fsdp2_quick_start.md) |Quick start for Qwen3-8B model pretraining and fine-tuning (follow-along tutorial)|
 | Fine-tuning | [finetune_fsdp2](pytorch/training/finetune/fsdp2/finetune_fsdp2.md) |FSDP2 full-parameter fine-tuning guide (model, dataset, YAML configuration, and parameter description)|
 
 ### Toolchain
@@ -208,8 +212,9 @@ docs/en/
 | [data_process_pretrain](pytorch/tools/data_process_pretrain.md) |Data preprocessing for pretraining tasks|
 | [data_process_sft_alpaca_style](pytorch/tools/data_process_sft_alpaca_style.md) |Alpaca-style data preprocessing for instruction fine-tuning|
 | [data_process_sft_sharegpt_style](pytorch/tools/data_process_sft_sharegpt_style.md) |ShareGPT-style data preprocessing for instruction fine-tuning|
-| [data_process_dpo_pairwise](pytorch/tools/data_process_dpo_pairwise.md) |Pairwise data processing for preference alignment|
 | [profiling](pytorch/tools/profiling.md) |Profiling data collection based on Ascend chips|
+| [msprobe](pytorch/tools/msprobe.md) |Precision data collection during FSDP2 and Megatron training|
+| [model_io_trace](pytorch/tools/model_io_trace.md) |Collects forward and backward model inputs and outputs plus batch previews based on Module Hook|
 | [deterministic_computation](pytorch/tools/deterministic_computation.md) | Enables deterministic computation based on Ascend chips. |
 
 ### Tuning Guide

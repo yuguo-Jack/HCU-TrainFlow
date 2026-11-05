@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/finetune/mcore/lu_lora_finetune.md
-raw_sha256: 95bc94e784f09e01e0a8d3e1e66124b0ddb892d5d7efac590f69f780aba254b2
+raw_sha256: 01685725b4c3b4a704a338df45695ece2916d62ce56c7939806c9f61a6bde3bb
 sources: []
-generated_body_sha256: ef72f1416f8c84673fb9fba688dba19e47c57684cd84428b48531fb949c64ff0
+generated_body_sha256: 714dcf87830ee9def0dbd265f60c4066432ae891f71d7d988e21b90122724fbe
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/finetune/mcore/lu_lora_finetune.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/finetune/mcore/lu_lora_finetune.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/finetune/mcore/lu_lora_finetune.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -143,6 +143,7 @@ python convert_ckpt_v2.py \
     --lora-r 16 \
     --lora-alpha 32 \
     --lora-target-modules linear_qkv linear_proj linear_fc1 linear_fc2 \
+    --model-type-hf llama2 \
     --save-dir ./model_from_hf/llama-2-7b-hf/
 ```
 

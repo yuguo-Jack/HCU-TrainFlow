@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source/embodied_tutorial/quick_start_index.md
-raw_sha256: 0bf38deb6aaf85086bcaaf05f306103356dc839a6d520fc131dae2e225abbf42
+raw_sha256: 726904ce0c37b7ee500e28d5cb188b16307e37c59b5562d45f5855e2f6faa4c5
 sources: []
-generated_body_sha256: 67a1a097cf9c16d8e6e360dc0367bb3be0d1ddbfaa1d11f3599ffd76a339bf2d
+generated_body_sha256: 402d1cc9753b00119b5df0f47ccb1cf0ffe3358267c1155fc86f675da078a94e
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/embodied_tutorial/quick_start_index.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/embodied_tutorial/quick_start_index.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/embodied_tutorial/quick_start_index.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,8 +38,8 @@ Vision-Language-Action models that map camera observations and language instruct
 :maxdepth: 1
 
 quick_start_pi05
-quick_start_groot_n1_6
-quick_start_groot_n1_7
+quick_start_gr00t_n1_6
+quick_start_gr00t_n1_7
 quick_start_xvla
 ```
 

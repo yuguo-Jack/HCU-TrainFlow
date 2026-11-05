@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/hisparse_guide.mdx
-raw_sha256: 9a86e90bfee876fe8b201d0d91b92937acaf69a9cbd1a3501daf0fd2be362f40
+raw_sha256: 38bb1607156391ef0337d9abc866a01eef4c15c56bbe7f50d22ed3f5127afc13
 sources: []
-generated_body_sha256: 8eabad60f6625084da962d1f75fe42e991488e4b16512e84ca3b8fe342ea3fd6
+generated_body_sha256: dea8b6d1a7147f3c6df79e7e66603882903d67dd6d135016c775cbfc8b5e070b
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/hisparse_guide.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/hisparse_guide.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/hisparse_guide.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -205,7 +205,7 @@ Dense-layer K/V and index K stay on GPU; sparse-layer K/V use host memory plus a
 ### Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     --dataset-name random \

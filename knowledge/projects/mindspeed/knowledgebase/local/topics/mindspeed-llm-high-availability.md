@@ -9,25 +9,26 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source, official documentation and related PR reading; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: ascend-mindspeed-llm
   path: docs/en/pytorch/features/mcore/high_availability.md
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
-  sha256: a8d47b4b928372aedc48a08798f11ccad2d6273c51166b578e93ae1f517d7fc6
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
+  sha256: 2ad824f6630415fa7dd583d09111bbd801ea5c61434392299e69c2c7e505280e
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/core/high_availability/tft_replica_optimizer.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: a323eab370c55231c87a2b2be00808efb70a8a3cf4f2dcb9230fe922400671e6
 - source: ascend-mindspeed-llm
   path: pretrain_gpt.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
-  sha256: 57022768d4b4b396cda2de61a1638733fe37767736a7dce0592a560bbac2c9fb
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
+  sha256: 698e53fab74c9ef3de9bf1983c0e37227307a2a625309a39d1485f3fc9636052
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/training/training.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
-  sha256: 4b0d387be430c0e4521db48950cd8554647ed2b52eafd71fc79a70cc4ea09599
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
+  sha256: a316fa37426f317b02f87d792156618012f6c33b305fcf09ce925a2208d42c77
+retrieved_on: '2026-11-04'
 ---
 
 # MindSpeed-LLM：Replica Optimizer、高可用与弹性恢复
@@ -56,11 +57,13 @@ sources:
 
 HCU任务以既有Cluster Manager等单一恢复系统为主，可以参考冗余状态、safe-point和弹性验收方法；不能把NPU flag或MindIO修复命令当HCU支持证明。未部署相关依赖时恢复到已验证的checkpoint+调度器/站点容错，预留最坏rank内存与节点池。更新时联动[总览](../overview/engineering-guide.md)、版本配对、optimizer和对应部署文档，不只改一个启动flag。
 
+2026-11-04 检索 LLM `f5f84bbbac05be79f883b30629d7f637e6f4649e`：HA 文档本次只调整措辞与跳转锚点，`TTPReplicaOptimizer` 原件字节未变，保留内存模型、DP/DP_CP、弹性与外部部署限制。实现还要求原 DP 大小可被 replica_num 整除，默认副本数 2；仅检查 DP>1 不足以保证配置合法。`pretrain_gpt.py` 删除的是 018 分支 optimizer reload patch 导入，`training.py` 的新增段处理 PEFT 专家 LoRA 可训练参数，均未新增 replica 恢复完成语义；不将这些邻近文件变更认作容错已回归。
+
 ## 固定证据与复核范围
 
-- [docs/en/pytorch/features/mcore/high_availability.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/pytorch/features/mcore/high_availability.md)
-- [mindspeed_llm/core/high_availability/tft_replica_optimizer.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/core/high_availability/tft_replica_optimizer.py)
-- [pretrain_gpt.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/pretrain_gpt.py)
-- [mindspeed_llm/training/training.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/training/training.py)
+- [docs/en/pytorch/features/mcore/high_availability.md](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/mcore/high_availability.md)
+- [mindspeed_llm/core/high_availability/tft_replica_optimizer.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/core/high_availability/tft_replica_optimizer.py)
+- [pretrain_gpt.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/pretrain_gpt.py)
+- [mindspeed_llm/training/training.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/training/training.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

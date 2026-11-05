@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/bert-pretraining.md
-raw_sha256: c6b656a4584da2c8500c8617c5690069323be02227ac650e53d499db4d596f09
+raw_sha256: ace249f339480a806e9193106dce6d8074275a3be28e82768d37a483f9e5cceb
 sources: []
-generated_body_sha256: c90a35179912323609f6e2cec536e3285b2447f5b93c7e3b4924f8c5365dfc6b
+generated_body_sha256: b947ca11282b02428fb13f599b5d3f1f2a65a7cbd28b6be457c0af34a4cd3a63
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/bert-pretraining.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/bert-pretraining.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/bert-pretraining.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -54,7 +54,7 @@ We work from adaptations of
 [huggingface/transformers](https://github.com/huggingface/transformers) and
 [NVIDIA/DeepLearningExamples](https://github.com/NVIDIA/DeepLearningExamples).
 We have forked this repo under
-[DeepSpeedExamples/bing_bert](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/bing_bert)
+[DeepSpeedExamples/bing_bert](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/bing_bert)
 and made several modifications in their script:
 
   * We adopted the modeling code from NVIDIA's BERT under `bing_bert/nvidia/`.
@@ -388,7 +388,7 @@ the scripts/json configs in our DeepSpeedExamples repo. Below is a table contain
 summary of the configurations. Specifically see the
 `ds_train_bert_bsz64k_seq128.sh` and `ds_train_bert_bsz32k_seq512.sh` scripts
 for more details in
-[DeepSpeedExamples](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/bing_bert).
+[DeepSpeedExamples](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/bing_bert).
 
 
 | Parameters               | 128 Sequence              | 512 Sequence              |

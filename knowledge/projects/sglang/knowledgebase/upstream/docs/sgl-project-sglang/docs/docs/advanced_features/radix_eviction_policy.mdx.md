@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/radix_eviction_policy.mdx
-raw_sha256: 4ba2e6210d27ed1de045ae5b6aad9e475f9a7debdd64671178c04193c560876b
+raw_sha256: 70047227797c889ebd70b034e6e5ae3f4ff26eaae511eb461f9076194b2d1ca4
 sources: []
-generated_body_sha256: 8c211b0f35272bf2b4b638c3fc23b0eda858ca2f1cd595c19b0d5fc4923ccdc6
+generated_body_sha256: 4fb9be9d1f3f1b21d2e9be167fd7516a2eab71028127a6d3128171dd9a302324
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/radix_eviction_policy.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/radix_eviction_policy.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/radix_eviction_policy.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -53,6 +53,7 @@ Select one with `--radix-eviction-policy`. All of them fall back to least-recent
 | `slru` | Prefixes still in the probationary segment, then the least recent within a segment. | Like `lfu`, but you want a hard floor on how much a one-off prefix can displace a proven one. See [`slru` parameters](#slru-parameters). |
 | `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
 | `tlru` | The tail of a conversation beyond what its next prefill needs to meet the TTFT budget ("TEL-safe" tokens), then the least recent. | Agentic / multi-turn workloads where tail TTFT matters more than raw hit rate. See [`tlru` parameters](#tlru-parameters). Requires the unified radix cache (the default tree). |
+| `joint_lru` | The least recent of the full-attention and SWA KV, ranked in one shared order. | Full/SWA hybrid models with `--enable-unified-memory` on the unified radix cache (the default tree), where both kinds of KV share one byte buffer; there it rejects `--enable-session-radix-cache` and tree cores without the joint walk, such as the `rust` tree core. Elsewhere it acts as `lru`. |
 
 Notes on the scoring inputs:
 
@@ -80,7 +81,7 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 
 ### Policy parameters
 
-`slru` and `tlru` take parameters. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
+`slru` and `tlru` take parameters. `lru`, `joint_lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
 
 #### `slru` parameters
 

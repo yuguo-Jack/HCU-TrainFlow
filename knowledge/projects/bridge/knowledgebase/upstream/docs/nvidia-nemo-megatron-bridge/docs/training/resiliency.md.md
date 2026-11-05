@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA-NeMo/Megatron-Bridge
-commit: 34ddd53b0e023d93f107f29b7dc61f9c5dd76a57
+commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
 path: docs/training/resiliency.md
-raw_sha256: d51d5f1746adef56ac62c96af1df08578f271da91d1fb8f7ae909ef6022d031c
+raw_sha256: e4a268e65b90e496820da0f75a947cad3ba5ec3f8324235ab156576c9f601eba
 sources: []
-generated_body_sha256: 5108d8d8eb234d7f82b2e974803a9235f66041844ecea364ba98d84161ea8c5e
+generated_body_sha256: 36ebe95cda25c071ce50dce4286aa67984b45dbd517a258abe8bb4e5ae0fbaee
 source_state: current-scan
 ---
 
 # NVIDIA-NeMo/Megatron-Bridge / docs/training/resiliency.md
 
-[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/34ddd53b0e023d93f107f29b7dc61f9c5dd76a57/docs/training/resiliency.md)
+[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/resiliency.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -176,6 +176,12 @@ Consider the re-run state machine when:
 
 ## In-Process Restart
 
+This integration requires an NVRx version that includes
+`nvidia_resiliency_ext.inprocess`. NVRx deprecated in-process restart in v0.6.0
+and removed it from upstream `main` after v0.7.0; the v0.6.0 and v0.7.0 releases
+still include the deprecated APIs. For new deployments, use in-job restart
+through `ft_launcher` instead (see [Fault Tolerance](#fault-tolerance)).
+
 In-process restart provides automatic fault recovery by restarting the training
 function within the same OS process. This avoids the overhead of launching new
 jobs, starting containers, and creating new CUDA contexts.
@@ -217,4 +223,4 @@ with job-level fault tolerance.
 - [skills/nemo-mbridge-resiliency/SKILL.md](../skills/nemo-mbridge-resiliency/SKILL.md)
 - [skills/nemo-mbridge-resiliency/card.yaml](../skills/nemo-mbridge-resiliency/card.yaml)
 - [NVIDIA Resiliency Extension](https://github.com/NVIDIA/nvidia-resiliency-ext)
-- [In-Process Restart Guide](https://nvidia.github.io/nvidia-resiliency-ext/inprocess/index.html)
+- [NVRx Fault Tolerance Usage Guide](https://nvidia.github.io/nvidia-resiliency-ext/fault_tolerance/usage_guide.html)

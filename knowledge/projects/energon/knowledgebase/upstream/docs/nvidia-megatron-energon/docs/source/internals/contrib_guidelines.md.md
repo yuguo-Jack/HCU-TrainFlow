@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/internals/contrib_guidelines.md
-raw_sha256: 4b7067c6bf09780bb56522271f626e39dab673a9ed6ae9d82b9a8f2bf8fb06b8
+raw_sha256: 172ea52ee4ff2f87f676a1e3c65aa4f4f9c739883c8e414ac632f47496716a7c
 sources: []
-generated_body_sha256: 31507d9d7a9b4aac06a8669f177c25cda44ab2e6c2aa33c3e4dcbbe4971bda9f
+generated_body_sha256: da076caf34c12afc5d276d5042d04e4e08a8cd075d958178f80813e556d90f92
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/internals/contrib_guidelines.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/internals/contrib_guidelines.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/internals/contrib_guidelines.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -117,7 +117,8 @@ Useful regression tests include:
 
 - `test_recipe.TestDataset.test_save_restore_state_train` for exact recipe save/restore;
 - the current-batch-index tests in `test_dataset.py` for stable iteration;
-- `test_dataset_factory_resolver.py` and format-specific suites for path detection.
+- `test_dataset_factory_resolver.py` and format-specific suites for path detection;
+- `test_filter_index.py` for filtered ordinal translation.
 
 New behavior should normally have a focused test next to the closest existing suite. When fixing a bug,
 write a test that fails for the original cause rather than only for one observed symptom.

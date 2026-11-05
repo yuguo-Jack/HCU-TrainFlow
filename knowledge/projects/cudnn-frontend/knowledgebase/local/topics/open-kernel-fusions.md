@@ -9,7 +9,8 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
   path: docs/fe-oss-apis/overview.md
@@ -25,20 +26,20 @@ sources:
   sha256: a97ce0e2aa903673d5ebaea87604b5d1ea46065ce862457cebfad52f8894ef53
 - source: nvidia-cudnn-frontend
   path: python/cudnn/gemm/cutedsl/grouped/swiglu/api.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: b5179853998d81b80f28552f437f26dabeb2ff31d41d67479e6747142354160e
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 6b9f3ef7b115e67cd4caeb8c247c438a3263a5b7ced54d8214551b51b21cb51c
 - source: nvidia-cudnn-frontend
   path: python/cudnn/gemm/cutedsl/grouped/glu/_blockscaled_api.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 20d696260fdd1aba288d2c23f51da3b2baf87b2dd01650c5d276913500ca7542
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: dfb9429444bfc4cbcd769986ee13f67e7f79adeb66af85b85561ce1cb157ca1d
 - source: nvidia-cudnn-frontend
   path: python/cudnn/gemm/frost/engine.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 8804aefd033b0419b3b300e2304922d04668bfdf0aceefec972e38967ec011fa
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 4cebb51cc79df5c1d750c39840aca508602d6d973d2885326e2c223c7642e88c
 - source: nvidia-cudnn-frontend
   path: python/cudnn/gemm/frost/graph_analyzer.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: d92a46ce14c54ffe90a9ea73ea212e9297c52d750d2cc9280fc867a51a9b68b3
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: e92c20c5b819d141c5b6b534824f64951901c783f2c16626d1ac723c4e5ff4cc
 - source: nvidia-cudnn-frontend
   path: docs/fe-oss-apis/bsa.md
   commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
@@ -53,36 +54,36 @@ sources:
   sha256: 8f3ee3863f9c80992e63e8ee7fa770d18eb08e430acaace04870cabc22873ce4
 - source: nvidia-cudnn-frontend
   path: python/cudnn/block_sparse_attention/api.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 43b47654126146d4ed53b5b414bcf4e134c020084ae9352ed5c6a6520546dd7a
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: a2f414f6ba96691b44322792b6d6245e5ca1ab62083fe0d8cf29eb9c3b647e94
 - source: nvidia-cudnn-frontend-docs
   path: open-kernels
-  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
-  sha256: e14115ad3751858b10e51100c0ab5f8983a683899cae5bfca3bf1d18e8119a27
+  commit: 62596f777aca773f340569b88fbd42c5fcd807249e8a188810cd38297d19cab9
+  sha256: e29e6fdef3be07b400a22661fd07e0078870bad0b4e09cb3e4df5e373f37888f
   url: https://docs.nvidia.com/cudnn/fe-oss-apis/overview
   revision_kind: web-content-fingerprint
 - source: nvidia-cudnn-frontend-docs
   path: sparse-attention
-  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
-  sha256: bb7d9f8b7422bf2b697f67b5a1e591263584aeffcbfe262f5227e94e5d35feb4
+  commit: 62596f777aca773f340569b88fbd42c5fcd807249e8a188810cd38297d19cab9
+  sha256: 0d9cc92b2e7b7918b7973c67b2c27b11ade120b4d03794030910c37214a2ec37
   url: https://docs.nvidia.com/cudnn/fe-oss-apis/bsa
   revision_kind: web-content-fingerprint
 - source: nvidia-cudnn-frontend
   path: python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 23094df9b2a8475f456f747957f0f48835280608685da1aa1128ac71fd0e0177
 - source: nvidia-cudnn-frontend
   path: python/cudnn/deepseek_sparse_attention/indexer_backward/api.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: d23b65aafc179485370d3d7d26c7372381a77895150d977fec23274d2b991fff
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 41809c353ed0f7cff66c6cf74dd42d7435c0058946bc910c4e1ec4f425005c2e
 - source: nvidia-cudnn-frontend
   path: python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 25814860ed2a96d84c9ba5d031bcb6e5b8ba13fdc4b8da0b47a7eb8410a85164
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: a7aa0afe4439cb47151af9f90284b4b85bf894761176c9b6d5ec0f2dcdb660e5
 - source: nvidia-cudnn-frontend
   path: python/cudnn/_pygraph.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 7b033ce20a300a3a933d0ea67970a123dff21ed7c551fd5e9dfd5728d703587f
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 99738780798d18ea38c5870b4a60ab5aa180638e0ef4d875d4920708819e5f5c
 ---
 # cuDNN 开放 Kernel：MoE 融合、FROST 与稀疏 Attention
 
@@ -117,14 +118,14 @@ Frontend OSS 提供直接调用的融合 kernel API；部分操作有自动管�
 - [nvidia-cudnn-frontend: docs/fe-oss-apis/overview.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/overview.md)
 - [nvidia-cudnn-frontend: docs/fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md)
 - [nvidia-cudnn-frontend: docs/fe-oss-apis/gemm_fusions/grouped_gemm_dswiglu.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/gemm_fusions/grouped_gemm_dswiglu.md)
-- [nvidia-cudnn-frontend: python/cudnn/gemm/cutedsl/grouped/swiglu/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/gemm/cutedsl/grouped/swiglu/api.py)
-- [nvidia-cudnn-frontend: python/cudnn/gemm/cutedsl/grouped/glu/_blockscaled_api.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/gemm/cutedsl/grouped/glu/_blockscaled_api.py)
-- [nvidia-cudnn-frontend: python/cudnn/gemm/frost/engine.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/gemm/frost/engine.py)
-- [nvidia-cudnn-frontend: python/cudnn/gemm/frost/graph_analyzer.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/gemm/frost/graph_analyzer.py)
+- [nvidia-cudnn-frontend: python/cudnn/gemm/cutedsl/grouped/swiglu/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/gemm/cutedsl/grouped/swiglu/api.py)
+- [nvidia-cudnn-frontend: python/cudnn/gemm/cutedsl/grouped/glu/_blockscaled_api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/gemm/cutedsl/grouped/glu/_blockscaled_api.py)
+- [nvidia-cudnn-frontend: python/cudnn/gemm/frost/engine.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/gemm/frost/engine.py)
+- [nvidia-cudnn-frontend: python/cudnn/gemm/frost/graph_analyzer.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/gemm/frost/graph_analyzer.py)
 - [nvidia-cudnn-frontend: docs/fe-oss-apis/bsa.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/bsa.md)
 - [nvidia-cudnn-frontend: docs/fe-oss-apis/dsa.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/dsa.md)
 - [nvidia-cudnn-frontend: docs/fe-oss-apis/nsa.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/nsa.md)
-- [nvidia-cudnn-frontend: python/cudnn/block_sparse_attention/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/block_sparse_attention/api.py)
+- [nvidia-cudnn-frontend: python/cudnn/block_sparse_attention/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/block_sparse_attention/api.py)
 - [nvidia-cudnn-frontend-docs: open-kernels](https://docs.nvidia.com/cudnn/fe-oss-apis/overview)
 - [nvidia-cudnn-frontend-docs: sparse-attention](https://docs.nvidia.com/cudnn/fe-oss-apis/bsa)
 
@@ -133,7 +134,7 @@ Frontend OSS 提供直接调用的融合 kernel API；部分操作有自动管�
 ## 开发线新增的接口约束
 
 - Grouped MXFP8 SwiGLU 的 JAX 入口归入统一 GLU，`discrete_col_sfd=True` 可按专家组织列 scale；不是所有 GLU/dGLU/wgrad 后端都支持 JAX。forward 尾部超过 `padded_offsets[-1]` 的行未定义；backward 只对原子累加所需 dprob 清零，不能把 padding 当零值参与 loss 或校验。接口提供显式反向不等于自动注册 `jax.grad`。
-- BSA Sage FP8 为 **forward-only**，输入 BF16、内部量化、输出 BF16，不返回 LSE、没有训练反向。SM120 新增 blk128；SM100/SM103 仍使用受限 blk64 路线。新增块尺寸不是训练支持面的通用扩展，迁移时先核对完整 fwd/bwd。
+- BSA Sage FP8 仍为 **forward-only**，输入 BF16、内部量化、输出 BF16，不返回 LSE、没有训练反向。当前 SM90、SM100/SM103、SM120 均有 native blk128，另保留各自 blk64 路线；SM100/SM103 blk128 才允许显式 split-KV，SM120 blk128 才可选择每 token K scale。量化粒度会改变数值，块尺寸/原件更新不扩大训练反向。
 - DSA Sparse Attention Backward 的 plan 强调 caller-owned 输出和 workspace：该 API 的所有后端要求传入 dq/dkv/d_sink；高层 wrapper 才负责可选分配。当前该 API 的 prepared SM100 路线在 `compile()` 依据无 storage 元数据准备实际 artifact，execute 不再 JIT；SM90 保留首执行编译。scratch 每次执行仍须初始化，输入/输出/live workspace 不得重叠，并发执行必须使用独立写出和 scratch；有 plan 不等于允许共享可写缓冲。Indexer Backward 是另一条编译链，不能套用此处首执行结论。
 - DSA Indexer 的 score 输出可为带 padding 行 stride 的视图；原始 plan 不自动 repack，便利 wrapper 对非连续输入可能额外复制。top-k 输出与 scratch 由调用方持有。比较模型与单测时计入 wrapper 的 copy、初始化和首轮编译；真实 stream、graph 捕获及并发生命周期需要单独验证。
 
@@ -147,13 +148,19 @@ Indexer backward 的 deterministic 路径使用固定 owner 的 FP32 dK planes �
 
 BSA 的 BF16 自动 split 策略采用 host-visible 元数据，性能假设是 Q 邻域近似均匀随机且较少重叠；高度局部/共享邻域需用相同 mask 比较显式 split，不能由 shape/density 相同推导相同性能。workspace 预算会限制自动选择，而显式超预算会拒绝；该假设不改变稀疏数学语义，也不扩大 Sage FP8 的 forward-only 边界。
 
+当前 BSA KPage 把部分有效的16行 KV page 汇入 MMA tile。`kpage=True` 当次建布局会同步 host，应把固定稀疏图的布局建设放出稳态；稀疏图变化则重新计入成本。其 BF16 backward 支持 GQA，但要求 blk128、padding 行 dO=0，blk64 KPage 仅 forward；它不接收普通路线的 pack_gqa/kv_splits/CLC 调度参数。
+
+IndexerBackward 已移除 `backend="sm100_v2"` 选择器；SM90 要求 H64，受支持的 SM100-family 路线限定 H32/H64、D128、128倍数 top-k 和正有限 scale，deterministic 仍是 request-or-fail。SM100 普通 BF16 dK 的私有 FP32 scratch 使用列置换并由尾部 cast 恢复，不能把该 scratch 当最终梯度；d_weights 只接受 BF16，不能假装输出 FP32 就获得 FP32 精度。
+
+SparseAttentionBackward 的 deterministic relay 另支持 SM90；`deterministic_relay_cluster_size` 为计划期选择，改变 scratch 和固定归并，不能在 execute/replay 时切换。SM90 仍需一次 eager warmup，之后固定地址的无分配执行才可捕获。Grouped GLU 的设备门禁现在检查 tcgen05，明确排除 cc12.x；SwiGLU wrapper cache 加入设备身份，多 GPU 不应误复用同一编译对象。
+
 当前源码将 canonical MXFP8 JAX 的 grouped SwiGLU/dSwiGLU 转到明确 wrapper 或 unified `grouped_gemm_glu_jax_sm100` / `grouped_gemm_dglu_jax_sm100`，旧 `cudnn.jax.*` / `cudnn.torch.*` 对应别名已移除。官网某些概览仍保留旧别名说明，应按本固定代码版本与单项 API 文档核对。统一 GLU/dGLU/wgrad 的 JAX 支持继续有精度、scale、输出与架构约束，显式反向 helper 不自动等于完整 autodiff 注册。
 
 源码还新增 Mamba-2 Python graph node、forward/backward/summary 入口，区别于带 erase 的 GDN；当前官方说明指定其 FROST engine 与 chunk/state-checkpoint 合同。这里只作为新模型机制入口，不由 node 注册推导原有稀疏 attention 或 HCU 已支持，完整数值/状态移植需追具体 engine 与测试。
 
 ## 本次补充的实现与测试依据
 
-- [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py)
-- [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/indexer_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/deepseek_sparse_attention/indexer_backward/api.py)
-- [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py)
-- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/_pygraph.py)
+- [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py)
+- [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/indexer_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/deepseek_sparse_attention/indexer_backward/api.py)
+- [nvidia-cudnn-frontend: python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/deepseek_sparse_attention/sparse_attention_backward/api.py)
+- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/_pygraph.py)

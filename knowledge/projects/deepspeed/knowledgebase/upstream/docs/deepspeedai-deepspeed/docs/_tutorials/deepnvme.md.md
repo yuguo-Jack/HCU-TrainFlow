@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/deepnvme.md
-raw_sha256: 6e4f81ad038823945bd4429428d6ddf92603e86cb5f041c6c932cb382991e063
+raw_sha256: d59d5185142da0576ef4817defc238d70b58a3dbd70dbe7c263db31a0e5753f2
 sources: []
-generated_body_sha256: 6135a0316b059f23de7633e3d4f38a1a87c1727db2dfe80b1a76851af0686416
+generated_body_sha256: 8c0837500f5fce3ef963326cb8d3d1b7ba3aaf0975d3216179ce3a3b89089395
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/deepnvme.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/deepnvme.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/deepnvme.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -30,7 +30,7 @@ Upstream source document; original commands, claims and links require their stat
 title: "DeepNVMe"
 tags: training inference IO large-model
 ---
-This tutorial will show how to use [DeepNVMe](https://github.com/deepspeedai/DeepSpeed/blob/master/blogs/deepspeed-gds/README.md) for data transfers between persistent storage and tensors residing in host or device memory. DeepNVMe improves the performance and efficiency of I/O operations in Deep Learning applications through powerful optimizations built on Non-Volatile Memory Express (NVMe) Solid State Drives (SSDs), Linux Asynchronous I/O (`libaio`), and NVIDIA Magnum IO<sup>TM</sup> GPUDirect® Storage (GDS).
+This tutorial will show how to use [DeepNVMe](https://github.com/deepspeedai/DeepSpeed/blob/master/blogs/deepnvme/08-2024/README.md) for data transfers between persistent storage and tensors residing in host or device memory. DeepNVMe improves the performance and efficiency of I/O operations in Deep Learning applications through powerful optimizations built on Non-Volatile Memory Express (NVMe) Solid State Drives (SSDs), Linux Asynchronous I/O (`libaio`), and NVIDIA Magnum IO<sup>TM</sup> GPUDirect® Storage (GDS).
 
 ## Requirements
 Ensure your environment is properly configured to use DeepNVMe. First, you need to install DeepSpeed version >= [0.15.0](https://github.com/deepspeedai/DeepSpeed/releases/tag/v0.15.0). Next, ensure that the DeepNVMe operators are available in the DeepSpeed installation. The `async_io` operator is required for any DeepNVMe functionality, while the `gds` operator is required only for GDS functionality. You can confirm availability of each operator by inspecting the output of `ds_report` to check that compatible status is <span style="color:green">[OKAY]</span>. Below is a snippet of `ds_report` output confirming the availability of both `async_io` and `gds` operators.

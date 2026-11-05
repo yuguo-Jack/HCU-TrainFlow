@@ -9,44 +9,45 @@ stages:
 visibility: public
 review_level: selected-source-and-tests-reviewed
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
   path: transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 1383ee108b6ad04f51ff14b816f3966875acaac919dff6daa4e33f100d4f037f
 - source: nvidia-transformerengine
   path: transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 8910abcd3d930ab1ac47dbebd045f0727d54931f528baf6e778f7abe7fb62c3f
 - source: nvidia-transformerengine
   path: tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 52d1857a9a41e2a21a94957e82f9c4d3f1c82e5a41059c8180fb98f848385b2c
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/csrc/extensions/normalization.cpp
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 63b73d6823b013daf2c29d55ce1aa7be1849b59c43a74d476b15e8defef2d349
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/csrc/quantizer.cpp
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 1983d51ddcc5210618176cd10e07acaf633f55fd1147a89032ec738e407fa7d3
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: a60886f3a507fadbc025fc503c0d695101a5cad16562d08eed908b29bc82726c
 - source: nvidia-transformerengine
   path: transformer_engine/common/common.h
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 2f8a2fb5e6f9ad4d4a1117fcb0f81d107ad349210d236ba15ba4676d3a4abf46
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 310c938e5ad6f55a150a57617ff5c67a52bfb55ac8a693329cda6793e78ad704
 - source: nvidia-transformerengine
   path: transformer_engine/common/transformer_engine.cpp
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 8a350cd395c10cb2f0c3b514111b8ade7b36c3336646b3bf48ec8d54e442198d
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 138e6f034efabcb120ec3023ea468d583381a7a140d25b2b0716b7e1a00d7133
 - source: nvidia-transformerengine
   path: transformer_engine/common/include/transformer_engine/transformer_engine.h
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 801c90c9a6ebd95ee02f32d0a757bee48eeaafca0d264d4a0baea87eaf73fa99
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 8a3e352ccab8ab6a9f7c944b833a084a6aa6b7133bdbc850b0f592c411ac2627
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/csrc/common.h
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: d1c958db87569b35117036ceb5e63e3e78566f40d3bd2a590b8b8c4c5dd778d8
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: c8a954fd7cd80e3c8b0ca8e3a584d1944edef330b8e8200020a0d9fcf0528de2
 pr_sources:
 - pr-nvidia--transformerengine-3657
 ---
@@ -88,6 +89,8 @@ MXFP8 输出且实现支持时，默认可以走 TE 路径；显式请求 cuDNN 
 
 不要为了消除报错伪造输出 shape 或丢弃布局约束；保留已有可靠的 normalize→量化路线，或在需要两向输出且满足合同的消费者中使用已测试的 row+column 形式，并计入额外存储。若采用 column-only，先修复实际包装/公共 API 并增加相应输出、scale 和异常输入测试；2D/unfused 路线应单独检查，不能由这个缺口推断全部量化路径均失败。
 
+2026-11-04 在 `720b25258be3b60f482afff8aef00d4cad88fa16` 重新沿 create_tensor→TensorWrapper setter→workspace-query 检查：本案例的 RMSNorm API、CUDA 实现和直接测试原件未变；变化集中于 NVFP4 alignment helper 与 grouped tensor 的 row-scaled 元数据，未修复上述普通 MXFP8 column-only 的 rowwise shape 检查。继续保留这一入口缺口及未设备重现状态，不能因为通用 tensor 文件有变化就删除原限制。
+
 ## HCU 借鉴与上限评估
 
 先查 HCU TE / Flash-Train 是否已有适用融合，冻结 eps、gamma、scale、两向输出及反向保存 rsigma 的契约。将基线的输入读取、中间写回/再读、输出与 scale 字节列出；融合后仍有 rsigma 读取和输出的必要开销，不能按“零中间量、一次读取”高估上限。使用真实 shape 的实测 HBM/计算参考，并检查小矩阵 launch 延迟与调度资源。
@@ -100,15 +103,15 @@ MXFP8 输出且实现支持时，默认可以走 TE 路径；显式请求 cuDNN 
 
 ## 固定源码
 
-- [transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp)
-- [transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu)
-- [tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py)
-- [transformer_engine/pytorch/csrc/extensions/normalization.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/csrc/extensions/normalization.cpp)
+- [transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/common/normalization/rmsnorm/rmsnorm_api.cpp)
+- [transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_mxfp8.cu)
+- [tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/tests/pytorch/mxfp8/test_mxfp8_rmsnorm_fwd.py)
+- [transformer_engine/pytorch/csrc/extensions/normalization.cpp](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/csrc/extensions/normalization.cpp)
 
-- [transformer_engine/pytorch/csrc/quantizer.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/csrc/quantizer.cpp)
-- [transformer_engine/common/common.h](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/common.h)
-- [transformer_engine/common/transformer_engine.cpp](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/transformer_engine.cpp)
-- [transformer_engine/common/include/transformer_engine/transformer_engine.h](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/include/transformer_engine/transformer_engine.h)
-- [transformer_engine/pytorch/csrc/common.h](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/csrc/common.h)
+- [transformer_engine/pytorch/csrc/quantizer.cpp](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/csrc/quantizer.cpp)
+- [transformer_engine/common/common.h](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/common/common.h)
+- [transformer_engine/common/transformer_engine.cpp](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/common/transformer_engine.cpp)
+- [transformer_engine/common/include/transformer_engine/transformer_engine.h](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/common/include/transformer_engine/transformer_engine.h)
+- [transformer_engine/pytorch/csrc/common.h](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/csrc/common.h)
 
 本文为官方源码、接口与测试阅读，未运行这些 NVIDIA 实现，不声称 HCU 支持或获得相同性能。

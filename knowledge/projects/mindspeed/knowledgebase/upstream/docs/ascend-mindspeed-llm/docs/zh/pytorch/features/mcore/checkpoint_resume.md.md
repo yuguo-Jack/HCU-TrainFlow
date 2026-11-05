@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/features/mcore/checkpoint_resume.md
-raw_sha256: 8ab9d85f2993daace112c276bde54608799e1ba876557d38ead37c938906c44c
+raw_sha256: da89b7b31efd892a4ee3fa3ef2747b8125ff881f3b61192d82b69c798dfded52
 sources: []
-generated_body_sha256: fdf78408dbc1c4aba7fd28b2191406f54e9b8e34cd5df4443834a8b57ab39a8d
+generated_body_sha256: 635b8349e2de0b2333c9e53743ce9d2bff334fdc9de64a895217f7f04f7904de
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/features/mcore/checkpoint_resume.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/features/mcore/checkpoint_resume.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/features/mcore/checkpoint_resume.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -49,7 +49,7 @@ Upstream source document; original commands, claims and links require their stat
 | `--no-load-optim`             | ❌ 不可设置，否则不会恢复优化器状态（如学习率、动量等）   |
 | `--no-load-rng`               | ❌ 不可设置，否则不会恢复随机状态              |
 
-> [!NOTE]
+> [!NOTE] 说明
 > 若设置了 `--finetune`、`--no-load-optim` 或 `--no-load-rng`，系统将不恢复优化器状态和随机状态，导致无法真正“续训”。
 
 ---

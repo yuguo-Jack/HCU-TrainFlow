@@ -1,0 +1,813 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "f409978a69e28b99ce1639a5a456f51f237c2ff9ebf84a0946697916ae71c513",
+      "isPrivate": false,
+      "numbers": [
+        59322,
+        59319,
+        59310,
+        59309,
+        59297,
+        59291,
+        59289,
+        59283
+      ],
+      "observed_at": "2026-11-04T21:59:32.540962+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4898,
+        "resetAt": "2026-11-04T22:47:37Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "ea106db806918f371b8f392cc896dc7a2d6677a1",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nFixes MTP acceptance collapsing with HiSparse + speculative decoding under FULL CUDA graphs once the HiSparse GPU pool saturates. Two independent causes; both are needed on current main.\n\n**1. Draft rows mirrored before the drafter writes them.** The MTP layers are HiSparse layers too, and HiSparse marks a page clean and releases it for all of its layers, target and draft, at once. Each step does:\n\n```\nstart_step → target forward → finish_forward → propose (drafter writes its rows)\n```\n\n`finish_forward` mirrored *all* layers to host, including draft layers whose rows `propose` had not written yet, and then reported the step's pages clean. The drafter's own per-layer mirror is skipped under FULL graphs, so the fresh draft rows never reached host. When the page's GPU block was reused, the drafter read stale host rows.\n\n**2. The residency resolver can read stale request ids** (regression from #59235). The resolver runs on the HiSparse copy stream, which outside PIECEWISE graphs waits only on `logical_topk_ready`, recorded right after the indexer. #59235 writes the masked request ids later, on the compute stream, so the resolver can read the previous call's ids. The MTP layer alternates four rows per request (draft prefill) with one (draft decode), so stale ids resolve draft rows against other requests' KV.\n\n## Changes\n\n- The speculator tags its draft attention layers (`AttentionLayerBase.is_draft_layer`); HiSparse binding marks their cache handles as draft layers.\n- `finish_forward` mirrors only target layers.\n- The next step's `start_step` first mirrors the previous step's draft-layer rows (the drafter has run by then), then submits that step's page transfers behind them on the same DMA stream, so a page is only reported clean after its draft rows are queued. They are queued before the step swaps host write events, so the new step's forward and host copies wait for them: by then the scheduler may have handed a finished request's GPU and host blocks to another request. No connector API changes (`wait_for_save` stays a no-op).\n- Build the resolver's masked request ids on the copy stream after its wait, into buffers owned by the HiSparse index group (moved from the generic `SparseMLAIndexGroup`); `swap_in` now requires the valid-row count.\n\n**Why not just move `finish_forward` after `propose`?** Outside FULL graphs the drafter re-prepares the draft handles with its own (decode-shaped) metadata, so a combined end-of-step mirror hits HiSparse's metadata consistency checks (`RuntimeError`) for every target/drafter graph-mode mix except FULL/FULL. Target and draft layers need to be mirrored at different points, which requires knowing which layers are draft layers.\n\n**Known limitation (follow-up).** A host block freed after step N (finished or preempted request) can be reallocated to a P/D import before step N's deferred copies land; NIXL writes are not ordered against the copy stream, so an imported request could, rarely, receive stale draft-layer rows (or, with the non-default lazy mirror mode, stale rows for all layers of a preempted request's spilled page). GPU writes and host copy-on-write are ordered: the next step waits for the deferred copies before its forward and host copies. The follow-up holds freed host blocks until the step's deferred writes are reported done.\n\n## Test Plan / Results\n\n**Unit:**\n- `test_draft_layer_rows_mirrored_after_drafter[FULL|NONE]` drives the real worker and checks that host draft rows equal the drafter's writes, with exactly one draft-layer copy and the page reported only after it. On main the FULL case fails.\n- `test_hisparse_resolver_reads_current_request_ids` (GPU) stalls the compute stream between `logical_topk_ready` and attention, then resolves four rows per request followed by one row per request plus a padding row. It fails on main and passes here.\n- H100: `test_sparse_mla_backends.py -k \"hisparse or index_group\"` 40 passed; HiSparse connector/worker tests pass.\n- `tests/v1/e2e/general/test_hisparse.py`: the FULL-graph host-mirror check now verifies MTP rows when the next step's start mirrors them (it compared them right after `finish_forward`, before the drafter writes them) and requires the MTP layer to be detected as a draft layer. 4 passed (H100); fails if the speculator stops tagging its layers.\n\n**E2E, cause 1 (on the pre-#59235 base):** H200 2×8, GLM-5.3 TP8/EP8 HiSparse decoder, MTP3, FULL_AND_PIECEWISE, NIXL P/D from a PCP8/DCP8 prefiller; Agent X workload at concurrency 48 (HiSparse GPU pool ≥95%).\n\n| | MTP acceptance | per position | output tok/s | ITL p50 |\n| --- | --- | --- | --- | --- |\n| before | 0.248 | 0.46/0.19/0.09 | 438* | 66.0 ms |\n| cause 1 fixed | **0.503** | 0.68/0.48/0.35 | **727.7** | 50.1 ms |\n| before, PIECEWISE only (per-layer mirror active) | 0.471 | 0.66/0.45/0.30 | 664.6 | 51.8 ms |\n\n\\* includes debug-counter overhead; the pre-fix sweep peaked at ~500 tok/s.\n\n- Host-vs-GPU audit of sealed MTP-layer pages: 98.7% mismatch before, 60.3% after, in line with the target layers' 58.6% (the audit also samples pages that are still being written).\n- gsm8k (5-shot, 500) through P/D: 0.928 (0.920–0.936 before).\n\n**E2E, current main:** B300 ×4, GLM-5.3 FP8 TP4, MTP3, `FULL_DECODE_ONLY`, GPU KV capped at 8 GiB (pool saturated), 40 code prompts × ~16k in / 512 out.\n\n| | acceptance length | output tok/s |\n| --- | --- | --- |\n| main | 1.37 | 113–138 |\n| cause 1 fix only | 1.31–1.48 | 123–138 |\n| cause 2 fix only | 1.37 | 133 |\n| **both (this PR)** | **2.68** | **295** |\n\nPIECEWISE on main under the same pressure: 2.29. The cause-2-only row used an earlier variant of the same fix (re-recording the event after the write).\n\nMirroring draft rows at the next `start_step` instead of in `wait_for_save` (B300, same setup, `--async-scheduling`, 2 runs each): acceptance length 2.80/2.72 vs 2.78/2.70, median ITL 33.6/34.0 ms vs 33.3/33.8 ms; throughput differences are within run-to-run noise.\n\nCost of the copy-stream build, per resolving layer in a CUDA graph (H100, 32 reqs × 4 rows, top-k 2048, all hot hits): 132.5 µs → 134.1 µs (+1.2%); with host misses the difference is within noise.\n\nNo other open PR addresses this. AI assistance (Claude Code) was used; changes reviewed and tested by the submitters.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n\n\n\n\n",
+      "changedFiles": 11,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "Documentation preview: https://vllm--59309.org.readthedocs.build/en/59309/",
+            "createdAt": "2026-09-29T21:59:58Z",
+            "databaseId": 5899842453,
+            "updatedAt": "2026-09-29T21:59:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5899842453"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @LucasWilkinson.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-09-30T03:25:28Z",
+            "databaseId": 5903446121,
+            "updatedAt": "2026-09-30T03:25:28Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5903446121"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-30T22:55:51Z",
+            "databaseId": 5921134534,
+            "updatedAt": "2026-09-30T22:55:51Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921134534"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "❌ This PR is 5 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5921134534 -->",
+            "createdAt": "2026-09-30T22:57:21Z",
+            "databaseId": 5921150809,
+            "updatedAt": "2026-09-30T22:57:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921150809"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-30T22:57:43Z",
+            "databaseId": 5921154822,
+            "updatedAt": "2026-09-30T22:57:43Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921154822"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #92266](https://buildkite.com/vllm/ci/builds/92266) for commit `1f783a6746c6`.",
+            "createdAt": "2026-09-30T22:58:06Z",
+            "databaseId": 5921158923,
+            "updatedAt": "2026-09-30T22:58:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921158923"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-09-30T23:00:42Z",
+            "databaseId": 5921187461,
+            "updatedAt": "2026-09-30T23:00:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921187461"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #92268](https://buildkite.com/vllm/ci/builds/92268) for commit `59626c4985db`.",
+            "createdAt": "2026-09-30T23:01:03Z",
+            "databaseId": 5921191293,
+            "updatedAt": "2026-09-30T23:01:03Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921191293"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-01T00:08:00Z",
+            "databaseId": 5921978577,
+            "updatedAt": "2026-10-01T00:08:00Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921978577"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #92279](https://buildkite.com/vllm/ci/builds/92279) for commit `934799a5e726`.",
+            "createdAt": "2026-10-01T00:08:20Z",
+            "databaseId": 5921982011,
+            "updatedAt": "2026-10-01T00:08:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921982011"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci retry",
+            "createdAt": "2026-10-01T00:36:53Z",
+            "databaseId": 5922326450,
+            "updatedAt": "2026-10-01T00:36:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922326450"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ The previous CI build is still running: https://buildkite.com/vllm/ci/builds/92279",
+            "createdAt": "2026-10-01T00:37:54Z",
+            "databaseId": 5922337820,
+            "updatedAt": "2026-10-01T00:37:54Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922337820"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci cancel",
+            "createdAt": "2026-10-01T00:39:01Z",
+            "databaseId": 5922350379,
+            "updatedAt": "2026-10-01T00:39:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922350379"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-01T00:39:06Z",
+            "databaseId": 5922351344,
+            "updatedAt": "2026-10-01T00:39:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922351344"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Requested cancellation of 1 CI build for `agentx/hisparse-mtp-mirror-fix`: [#92279](https://buildkite.com/vllm/ci/builds/92279).",
+            "createdAt": "2026-10-01T00:39:42Z",
+            "databaseId": 5922358153,
+            "updatedAt": "2026-10-01T00:39:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922358153"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "❌ This PR is 1 commit behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5922351344 -->",
+            "createdAt": "2026-10-01T00:41:50Z",
+            "databaseId": 5922380016,
+            "updatedAt": "2026-10-01T00:41:50Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922380016"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-01T00:42:26Z",
+            "databaseId": 5922386614,
+            "updatedAt": "2026-10-01T00:42:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922386614"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #92294](https://buildkite.com/vllm/ci/builds/92294) for commit `67988923e65e`.",
+            "createdAt": "2026-10-01T00:42:48Z",
+            "databaseId": 5922390295,
+            "updatedAt": "2026-10-01T00:42:48Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922390295"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-01T12:52:10Z",
+            "databaseId": 5931863825,
+            "updatedAt": "2026-10-01T12:52:10Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5931863825"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #92402](https://buildkite.com/vllm/ci/builds/92402) for commit `526b72985868`.",
+            "createdAt": "2026-10-01T12:52:30Z",
+            "databaseId": 5931869261,
+            "updatedAt": "2026-10-01T12:52:30Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5931869261"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @LucasWilkinson.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-01T21:50:58Z",
+            "databaseId": 5941384467,
+            "updatedAt": "2026-10-01T21:50:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5941384467"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-02T03:10:58Z",
+            "databaseId": 5944918200,
+            "updatedAt": "2026-10-02T03:10:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5944918200"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #92548](https://buildkite.com/vllm/ci/builds/92548) for commit `8c8b15e8436b`.",
+            "createdAt": "2026-10-02T03:11:17Z",
+            "databaseId": 5944921143,
+            "updatedAt": "2026-10-02T03:11:17Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5944921143"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWJYTDc=",
+          "hasNextPage": false
+        },
+        "totalCount": 23
+      },
+      "headRefOid": "8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "headRepository": {
+        "nameWithOwner": "LucasWilkinson/vllm"
+      },
+      "mergeCommit": {
+        "oid": "4056c8ac1f8a7e8fb50cf1c56ff96649fcadccc6"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-02T06:04:22Z",
+      "number": 59309,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5359857617,
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-29T23:47:51Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#pullrequestreview-5359857617"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "MatthewBonanni"
+            },
+            "body": "LGTM after some tweaks, thanks!",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5379536983,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-01T12:59:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/59309#pullrequestreview-5379536983"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0wMVQxMjo1OToyMFq0MjAyNi0xMC0wMVQxMjo1OToyMVrPAAAAAUClOFc=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Bugfix][HiSparse] Fix MTP acceptance collapse under FULL graphs with a saturated GPU pool",
+      "updatedAt": "2026-10-21T21:52:33Z",
+      "url": "https://github.com/vllm-project/vllm/pull/59309"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "ea106db806918f371b8f392cc896dc7a2d6677a1"
+    },
+    "body": "## Purpose\n\nFixes MTP acceptance collapsing with HiSparse + speculative decoding under FULL CUDA graphs once the HiSparse GPU pool saturates. Two independent causes; both are needed on current main.\n\n**1. Draft rows mirrored before the drafter writes them.** The MTP layers are HiSparse layers too, and HiSparse marks a page clean and releases it for all of its layers, target and draft, at once. Each step does:\n\n```\nstart_step → target forward → finish_forward → propose (drafter writes its rows)\n```\n\n`finish_forward` mirrored *all* layers to host, including draft layers whose rows `propose` had not written yet, and then reported the step's pages clean. The drafter's own per-layer mirror is skipped under FULL graphs, so the fresh draft rows never reached host. When the page's GPU block was reused, the drafter read stale host rows.\n\n**2. The residency resolver can read stale request ids** (regression from #59235). The resolver runs on the HiSparse copy stream, which outside PIECEWISE graphs waits only on `logical_topk_ready`, recorded right after the indexer. #59235 writes the masked request ids later, on the compute stream, so the resolver can read the previous call's ids. The MTP layer alternates four rows per request (draft prefill) with one (draft decode), so stale ids resolve draft rows against other requests' KV.\n\n## Changes\n\n- The speculator tags its draft attention layers (`AttentionLayerBase.is_draft_layer`); HiSparse binding marks their cache handles as draft layers.\n- `finish_forward` mirrors only target layers.\n- The next step's `start_step` first mirrors the previous step's draft-layer rows (the drafter has run by then), then submits that step's page transfers behind them on the same DMA stream, so a page is only reported clean after its draft rows are queued. They are queued before the step swaps host write events, so the new step's forward and host copies wait for them: by then the scheduler may have handed a finished request's GPU and host blocks to another request. No connector API changes (`wait_for_save` stays a no-op).\n- Build the resolver's masked request ids on the copy stream after its wait, into buffers owned by the HiSparse index group (moved from the generic `SparseMLAIndexGroup`); `swap_in` now requires the valid-row count.\n\n**Why not just move `finish_forward` after `propose`?** Outside FULL graphs the drafter re-prepares the draft handles with its own (decode-shaped) metadata, so a combined end-of-step mirror hits HiSparse's metadata consistency checks (`RuntimeError`) for every target/drafter graph-mode mix except FULL/FULL. Target and draft layers need to be mirrored at different points, which requires knowing which layers are draft layers.\n\n**Known limitation (follow-up).** A host block freed after step N (finished or preempted request) can be reallocated to a P/D import before step N's deferred copies land; NIXL writes are not ordered against the copy stream, so an imported request could, rarely, receive stale draft-layer rows (or, with the non-default lazy mirror mode, stale rows for all layers of a preempted request's spilled page). GPU writes and host copy-on-write are ordered: the next step waits for the deferred copies before its forward and host copies. The follow-up holds freed host blocks until the step's deferred writes are reported done.\n\n## Test Plan / Results\n\n**Unit:**\n- `test_draft_layer_rows_mirrored_after_drafter[FULL|NONE]` drives the real worker and checks that host draft rows equal the drafter's writes, with exactly one draft-layer copy and the page reported only after it. On main the FULL case fails.\n- `test_hisparse_resolver_reads_current_request_ids` (GPU) stalls the compute stream between `logical_topk_ready` and attention, then resolves four rows per request followed by one row per request plus a padding row. It fails on main and passes here.\n- H100: `test_sparse_mla_backends.py -k \"hisparse or index_group\"` 40 passed; HiSparse connector/worker tests pass.\n- `tests/v1/e2e/general/test_hisparse.py`: the FULL-graph host-mirror check now verifies MTP rows when the next step's start mirrors them (it compared them right after `finish_forward`, before the drafter writes them) and requires the MTP layer to be detected as a draft layer. 4 passed (H100); fails if the speculator stops tagging its layers.\n\n**E2E, cause 1 (on the pre-#59235 base):** H200 2×8, GLM-5.3 TP8/EP8 HiSparse decoder, MTP3, FULL_AND_PIECEWISE, NIXL P/D from a PCP8/DCP8 prefiller; Agent X workload at concurrency 48 (HiSparse GPU pool ≥95%).\n\n| | MTP acceptance | per position | output tok/s | ITL p50 |\n| --- | --- | --- | --- | --- |\n| before | 0.248 | 0.46/0.19/0.09 | 438* | 66.0 ms |\n| cause 1 fixed | **0.503** | 0.68/0.48/0.35 | **727.7** | 50.1 ms |\n| before, PIECEWISE only (per-layer mirror active) | 0.471 | 0.66/0.45/0.30 | 664.6 | 51.8 ms |\n\n\\* includes debug-counter overhead; the pre-fix sweep peaked at ~500 tok/s.\n\n- Host-vs-GPU audit of sealed MTP-layer pages: 98.7% mismatch before, 60.3% after, in line with the target layers' 58.6% (the audit also samples pages that are still being written).\n- gsm8k (5-shot, 500) through P/D: 0.928 (0.920–0.936 before).\n\n**E2E, current main:** B300 ×4, GLM-5.3 FP8 TP4, MTP3, `FULL_DECODE_ONLY`, GPU KV capped at 8 GiB (pool saturated), 40 code prompts × ~16k in / 512 out.\n\n| | acceptance length | output tok/s |\n| --- | --- | --- |\n| main | 1.37 | 113–138 |\n| cause 1 fix only | 1.31–1.48 | 123–138 |\n| cause 2 fix only | 1.37 | 133 |\n| **both (this PR)** | **2.68** | **295** |\n\nPIECEWISE on main under the same pressure: 2.29. The cause-2-only row used an earlier variant of the same fix (re-recording the event after the write).\n\nMirroring draft rows at the next `start_step` instead of in `wait_for_save` (B300, same setup, `--async-scheduling`, 2 runs each): acceptance length 2.80/2.72 vs 2.78/2.70, median ITL 33.6/34.0 ms vs 33.3/33.8 ms; throughput differences are within run-to-run noise.\n\nCost of the copy-stream build, per resolving layer in a CUDA graph (H100, 32 reqs × 4 rows, top-k 2048, all hot hits): 132.5 µs → 134.1 µs (+1.2%); with host misses the difference is within noise.\n\nNo other open PR addresses this. AI assistance (Claude Code) was used; changes reviewed and tested by the submitters.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n\n\n\n\n",
+    "changed_files": 11,
+    "head": {
+      "repo": {
+        "full_name": "LucasWilkinson/vllm"
+      },
+      "sha": "8c8b15e8436ba401f8b86256adddf5aec038befe"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/59309",
+    "merge_commit_sha": "4056c8ac1f8a7e8fb50cf1c56ff96649fcadccc6",
+    "merged": true,
+    "merged_at": "2026-10-02T06:04:22Z",
+    "number": 59309,
+    "state": "closed",
+    "title": "[Bugfix][HiSparse] Fix MTP acceptance collapse under FULL graphs with a saturated GPU pool",
+    "updated_at": "2026-10-21T21:52:33Z"
+  },
+  "files": [
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/docs%2Fdesign%2Fhisparse.md",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/docs%2Fdesign%2Fhisparse.md?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 1,
+      "filename": "docs/design/hisparse.md",
+      "patch": "@@ -133,7 +133,10 @@ duplicate mapping.\n Speculative decoding resolves all verification rows of a request in one pass:\n one block resolves the union of the rows' top-k against the request's hot-cache\n state, so rows that select the same host row share its hot row and no row\n-evicts a hot row another row of the step still reads.\n+evicts a hot row another row of the step still reads. Draft layers write their\n+rows after the target forward, so their host mirror runs at the start of the\n+next step, after the drafter, and the step's page transfers are submitted\n+behind it.\n \n ## P/D import target\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/docs%2Fdesign%2Fhisparse.md",
+      "sha": "8651b3a06dfdb144f9467bdfb419dd7b59cdc243",
+      "status": "modified"
+    },
+    {
+      "additions": 102,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py",
+      "changes": 137,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 35,
+      "filename": "tests/v1/attention/test_sparse_mla_backends.py",
+      "patch": "@@ -1943,6 +1943,10 @@ def _make_hisparse_cache_handle(\n     return HiSparseCacheHandle(runtime)\n \n \n+def _valid_rows(num_rows: int) -> torch.Tensor:\n+    return torch.tensor([num_rows], dtype=torch.int32, device=DEVICE_TYPE)\n+\n+\n @requires_hisparse_ops\n def test_hisparse_uses_graph_stable_request_state_mapping():\n     device = torch.device(DEVICE_TYPE)\n@@ -1969,6 +1973,7 @@ def test_hisparse_uses_graph_stable_request_state_mapping():\n         block_table=torch.tensor([[1]], dtype=torch.int32, device=device),\n         logical_topk_indices=torch.tensor([[0]], dtype=torch.int32, device=device),\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(1),\n     )\n     torch.accelerator.synchronize()\n \n@@ -2011,6 +2016,7 @@ def test_hisparse_maps_speculative_rows_through_request_state():\n         block_table=torch.zeros((1, 1), dtype=torch.int32, device=device),\n         logical_topk_indices=torch.zeros((4, 1), dtype=torch.int32, device=device),\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(4),\n     )\n     torch.accelerator.synchronize()\n \n@@ -2072,6 +2078,7 @@ def test_hisparse_speculative_rows_resolve_host_misses_consistently(\n             block_table=block_table,\n             logical_topk_indices=topk.clone(),\n             block_size=block_size,\n+            num_valid_rows=_valid_rows(num_rows),\n         )\n         torch.accelerator.synchronize()\n \n@@ -2115,12 +2122,99 @@ def test_hisparse_speculative_rows_count_a_shared_load_once():\n         block_table=block_table,\n         logical_topk_indices=topk,\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(2),\n     )\n     torch.accelerator.synchronize()\n \n     assert runtime.index_group.swap_stats.cpu().tolist() == [top_k, top_k]\n \n \n+@requires_hisparse_ops\n+def test_hisparse_resolver_reads_current_request_ids():\n+    \"\"\"The resolver must see this call's request ids, not the previous call's.\n+\n+    It runs on the copy stream after waiting only on ``logical_topk_ready``,\n+    which the indexer records before attention writes the ids. An MTP drafter\n+    alternates four rows per request with one, so stale ids resolve rows\n+    against other requests' KV. Stalling the compute stream exposes the race.\n+    \"\"\"\n+    device = torch.device(DEVICE_TYPE)\n+    block_size, row_width, top_k, blocks_per_req, num_reqs = 64, 16, 64, 4, 2\n+    kv_pool = torch.randn(\n+        (num_reqs * blocks_per_req + 1, block_size, row_width), dtype=torch.float32\n+    ).pin_memory()\n+    runtime = _make_hisparse_runtime(\n+        top_k=top_k,\n+        device_buffer_size=4 * top_k,\n+        max_num_reqs=num_reqs,\n+        row_width=row_width,\n+        block_size=block_size,\n+        max_swap_rows=4 * num_reqs,\n+    )\n+    runtime.bind_source_cache(kv_pool)\n+    ready = torch.Event()\n+    runtime.index_group.logical_topk_ready = ready\n+    cache = HiSparseCacheHandle(runtime)\n+    cache.all_context_pages_resident = False\n+    cache.source_block_table = torch.arange(\n+        1, num_reqs * blocks_per_req + 1, dtype=torch.int32, device=device\n+    ).view(num_reqs, blocks_per_req)\n+\n+    index_group = object.__new__(HiSparseMLAIndexGroup)\n+    index_group.caches = [cache]\n+    index_group.physical_topk_indices = torch.empty(\n+        (4 * num_reqs + 1, top_k), dtype=torch.int32, device=device\n+    )\n+\n+    # Four rows per request, then one per request plus a CUDA-graph padding\n+    # row, which maps to request 0 and must be skipped.\n+    for rows_per_req, num_padding in ((4, 0), (1, 1)):\n+        num_rows = num_reqs * rows_per_req\n+        req_ids = torch.arange(num_reqs, dtype=torch.int32, device=device)\n+        req_ids = torch.cat(\n+            [\n+                req_ids.repeat_interleave(rows_per_req),\n+                torch.zeros(num_padding, dtype=torch.int32, device=device),\n+            ]\n+        )\n+        topk = torch.stack(\n+            [\n+                torch.randperm(blocks_per_req * block_size, device=device)[:top_k]\n+                for _ in range(req_ids.numel())\n+            ]\n+        ).to(torch.int32)\n+        query_start_loc = torch.arange(\n+            0, num_rows + 1, rows_per_req, dtype=torch.int32, device=device\n+        )\n+        attn_metadata = SimpleNamespace(\n+            req_id_per_token=req_ids,\n+            query_start_loc=torch.cat([query_start_loc, query_start_loc[-1:]]),\n+            block_size=block_size,\n+        )\n+        runtime.begin_forward()\n+        ready.record(current_stream())\n+        torch.cuda._sleep(200_000_000)\n+        hot_indices = index_group.convert_logical_to_physical_topk(\n+            0, topk, attn_metadata, block_stride_rows=None, return_valid_counts=False\n+        )\n+        torch.accelerator.synchronize()\n+\n+        assert (hot_indices[num_rows:] == -1).all()\n+        global_ref = _triton_convert_reference_impl(\n+            req_ids[:num_rows],\n+            cache.source_block_table,\n+            topk[:num_rows],\n+            block_size,\n+            top_k,\n+        )\n+        gathered = runtime.hot.attention_cache.reshape(-1, row_width)[\n+            hot_indices[:num_rows].to(torch.long)\n+        ].cpu()\n+        torch.testing.assert_close(\n+            gathered, kv_pool.reshape(-1, row_width)[global_ref.cpu().to(torch.long)]\n+        )\n+\n+\n @requires_hisparse_ops\n def test_hisparse_union_table_scales_with_union_bound():\n     \"\"\"Shared memory follows the per-request union bound, not the hot buffer.\n@@ -2157,6 +2251,7 @@ def test_hisparse_union_table_scales_with_union_bound():\n         block_table=block_table,\n         logical_topk_indices=topk,\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(req_ids.numel()),\n     )\n     torch.accelerator.synchronize()\n \n@@ -2217,6 +2312,7 @@ def test_hisparse_resident_rows_bypass_hot_lru():\n         block_table=source_table,\n         logical_topk_indices=topk,\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(request_ids.numel()),\n         return_valid_counts=True,\n     )\n     torch.accelerator.synchronize()\n@@ -2280,6 +2376,7 @@ def test_hisparse_swap_in_preserves_rows_across_eviction():\n             block_table=block_table,\n             logical_topk_indices=topk.clone(),\n             block_size=block_size,\n+            num_valid_rows=_valid_rows(req_ids.numel()),\n             return_valid_counts=True,\n         )\n         torch.accelerator.synchronize()\n@@ -2361,6 +2458,7 @@ def make(\n             req_id_per_token=req_ids,\n             block_table=block_table,\n             block_size=block_size,\n+            num_valid_rows=_valid_rows(req_ids.numel()),\n         )\n         producer_indices = [\n             producer.swap_in(logical_topk_indices=topk.clone(), **kw) for topk in topks\n@@ -2435,6 +2533,7 @@ def test_hisparse_multi_step_writes_request_major_output():\n             block_table,\n             logical[:, step],\n             block_size=block_size,\n+            num_valid_rows=_valid_rows(request_ids.numel()),\n             return_valid_counts=True,\n             attention_indices_out=physical[:, step],\n             valid_counts_out=valid_counts[:, step],\n@@ -2618,6 +2717,7 @@ def test_hisparse_remaps_strided_hma_rows_for_attention():\n             [[0, 1, 2, 3]], dtype=torch.int32, device=device\n         ),\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(1),\n     )\n \n     assert runtime.hot.attention_cache is not None\n@@ -2751,6 +2851,7 @@ def test_hisparse_newest_write_and_recycled_slot_invalidation():\n         block_table=block_table,\n         logical_topk_indices=topk,\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(req_ids.numel()),\n     )\n     torch.accelerator.synchronize()\n     stale_hot_slot = hot_indices[0, 0].item()\n@@ -2766,6 +2867,7 @@ def test_hisparse_newest_write_and_recycled_slot_invalidation():\n         block_table=block_table,\n         logical_topk_indices=topk,\n         block_size=block_size,\n+        num_valid_rows=_valid_rows(req_ids.numel()),\n     )\n     torch.accelerator.synchronize()\n     idx = hot_indices.cpu().tolist()[0][0]\n@@ -3199,8 +3301,6 @@ def run_kernel(self, *, q, **kwargs):  # noqa: ARG001\n     index_group.physical_topk_indices = torch.empty(\n         (num_tokens + 1, 4), dtype=torch.int32, device=device\n     )\n-    index_group.row_indices = torch.arange(num_tokens, dtype=torch.int32, device=device)\n-    index_group.request_ids = torch.empty_like(index_group.row_indices)\n     impl = SimpleNamespace(\n         kv_lora_rank=1,\n         index_group=index_group,\n@@ -3254,39 +3354,6 @@ def test_hisparse_keeps_speculative_rows_as_decodes():\n     assert builder.reorder_batch_threshold == 4\n \n \n-def test_hisparse_decode_skips_padding_rows():\n-    \"\"\"Padding rows are masked, and the ids stay in the group's persistent buffer.\n-\n-    The resolver reads them on the HiSparse copy stream, where a compute-stream\n-    temporary can already be recycled (CUDA graphs do), scrambling rows' requests.\n-    \"\"\"\n-    topk = torch.arange(20, dtype=torch.int32).view(10, 2)\n-    cache = SimpleNamespace(\n-        source_block_table=torch.zeros((2, 1), dtype=torch.int32),\n-        swap_in=MagicMock(return_value=topk),\n-    )\n-    index_group = object.__new__(HiSparseMLAIndexGroup)\n-    index_group.caches = [cache]\n-    index_group.physical_topk_indices = torch.empty((11, 2), dtype=torch.int32)\n-    index_group.row_indices = torch.arange(10, dtype=torch.int32)\n-    index_group.request_ids = torch.empty_like(index_group.row_indices)\n-    metadata = SimpleNamespace(\n-        query_start_loc=torch.tensor([0, 8, 9], dtype=torch.int32),\n-        req_id_per_token=torch.tensor([0] * 8 + [1, 0], dtype=torch.int32),\n-        block_size=64,\n-    )\n-\n-    index_group.convert_logical_to_physical_topk(\n-        0, topk, metadata, block_stride_rows=None, return_valid_counts=False\n-    )\n-\n-    request_ids = cache.swap_in.call_args.args[0]\n-    assert request_ids.data_ptr() == index_group.request_ids.data_ptr()\n-    torch.testing.assert_close(\n-        request_ids, torch.tensor([0] * 8 + [1, -1], dtype=torch.int32)\n-    )\n-\n-\n def test_flashinfer_hisparse_decode_runs_batched_attention():\n     device = torch.device(\"cpu\")\n     num_tokens = 6",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fattention%2Ftest_sparse_mla_backends.py",
+      "sha": "a4d3e5ed73962ab6900a2be87f6e060b2644ac99",
+      "status": "modified"
+    },
+    {
+      "additions": 50,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fe2e%2Fgeneral%2Ftest_hisparse.py",
+      "changes": 77,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fe2e%2Fgeneral%2Ftest_hisparse.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 27,
+      "filename": "tests/v1/e2e/general/test_hisparse.py",
+      "patch": "@@ -95,6 +95,8 @@ def test_hisparse_spill_and_prefix_restore(\n \n     A regression omitted attention metadata before FULL graph replay, so decode\n     completed normally while its newly written KV rows were never copied to host.\n+    MTP layers write after the target forward; their rows used to be mirrored\n+    before the drafter wrote them, so the drafter later read stale host rows.\n     \"\"\"\n     capability = current_platform.get_device_capability()\n     if capability is None or capability.major < 9:\n@@ -171,49 +173,70 @@ def record_fullgraph(batch_desc):\n             model_runner.cudagraph_manager, \"run_fullgraph\", record_fullgraph\n         )\n \n+        # The MTP layer writes its rows after the target forward, so it is\n+        # mirrored at the start of the next step instead of in finish_forward.\n+        draft_layers = set(worker._draft_layers)\n+        assert draft_layers\n         original_finish_forward = worker.finish_forward\n-        verified_full_replay_rows = 0\n+        original_finish_previous_step = worker._finish_previous_step\n+        verified_rows = {\"target\": 0, \"draft\": 0}\n         copied_nonzero_kv = False\n+        draft_check_pending = False\n \n-        def finish_forward():\n-            nonlocal full_replay_pending, verified_full_replay_rows\n+        def check_host_rows(layer_indices: set[int], kind: str) -> None:\n             nonlocal copied_nonzero_kv\n+            # Synchronize only the test's inspection, not the worker itself.\n+            with gpu_sync_allowed():\n+                torch.accelerator.synchronize()\n+            assert worker._row_mirrors\n+            for layer_index in layer_indices:\n+                cache = worker.cache_handles[layer_index]\n+                source_index = cache.runtime.resident_source_index\n+                for mirror in worker._row_mirrors:\n+                    source_row = mirror.source_starts[source_index]\n+                    destination_row = mirror.destination_start\n+                    num_rows = mirror.num_rows\n+                    source_block, source_offset = divmod(\n+                        source_row, worker.kernel_block_size\n+                    )\n+                    with gpu_sync_allowed():\n+                        gpu_rows = worker.resident_caches[layer_index][\n+                            source_block, source_offset : source_offset + num_rows\n+                        ].cpu()\n+                    host_rows = worker.host_caches[layer_index][\n+                        destination_row : destination_row + num_rows\n+                    ]\n+                    assert torch.equal(host_rows, gpu_rows)\n+                    copied_nonzero_kv |= bool(torch.count_nonzero(gpu_rows).item())\n+                    verified_rows[kind] += num_rows\n+\n+        def finish_forward():\n+            nonlocal full_replay_pending, draft_check_pending\n             try:\n                 original_finish_forward()\n                 if not full_replay_pending:\n                     return\n-                # Synchronize only the test's inspection, not finish_forward itself.\n-                with gpu_sync_allowed():\n-                    torch.accelerator.synchronize()\n-                assert worker._row_mirrors\n-                for layer_index, cache in enumerate(worker.cache_handles):\n-                    source_index = cache.runtime.resident_source_index\n-                    for mirror in worker._row_mirrors:\n-                        source_row = mirror.source_starts[source_index]\n-                        destination_row = mirror.destination_start\n-                        num_rows = mirror.num_rows\n-                        source_block, source_offset = divmod(\n-                            source_row, worker.kernel_block_size\n-                        )\n-                        with gpu_sync_allowed():\n-                            gpu_rows = worker.resident_caches[layer_index][\n-                                source_block, source_offset : source_offset + num_rows\n-                            ].cpu()\n-                        host_rows = worker.host_caches[layer_index][\n-                            destination_row : destination_row + num_rows\n-                        ]\n-                        assert torch.equal(host_rows, gpu_rows)\n-                        copied_nonzero_kv |= bool(torch.count_nonzero(gpu_rows).item())\n-                        verified_full_replay_rows += num_rows\n+                target_layers = set(range(len(worker.cache_handles))) - draft_layers\n+                check_host_rows(target_layers, \"target\")\n+                draft_check_pending = True\n             finally:\n                 full_replay_pending = False\n \n+        def finish_previous_step():\n+            nonlocal draft_check_pending\n+            original_finish_previous_step()\n+            if draft_check_pending:\n+                draft_check_pending = False\n+                check_host_rows(draft_layers, \"draft\")\n+\n         monkeypatch.setattr(worker, \"finish_forward\", finish_forward)\n+        monkeypatch.setattr(worker, \"_finish_previous_step\", finish_previous_step)\n \n         expected = runner.generate_greedy([target], max_tokens=8)\n \n         assert full_graph_calls > 0\n-        assert verified_full_replay_rows > 0\n+        assert verified_rows[\"target\"] > 0\n+        assert verified_rows[\"draft\"] > 0\n         assert copied_nonzero_kv\n \n         runner.generate_greedy(pressure, max_tokens=8)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fe2e%2Fgeneral%2Ftest_hisparse.py",
+      "sha": "2409b5cb690b00b86497aea57107353502963dbc",
+      "status": "modified"
+    },
+    {
+      "additions": 202,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_hisparse_connector.py",
+      "changes": 202,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_hisparse_connector.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 0,
+      "filename": "tests/v1/kv_connector/unit/test_hisparse_connector.py",
+      "patch": "@@ -1,15 +1,21 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n+import contextlib\n+import ctypes\n from types import SimpleNamespace\n from unittest.mock import MagicMock\n \n import pytest\n import torch\n \n+from vllm.config.compilation import CUDAGraphMode\n from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole\n from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (\n     ExampleConnector,\n )\n+from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (\n+    worker as worker_module,\n+)\n from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (\n     HiSparseConnector,\n     HiSparseConnectorMetadata,\n@@ -19,8 +25,14 @@\n     HiSparseConnectorWorker,\n )\n from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector\n+from vllm.v1.hisparse import runtime as runtime_module\n from vllm.v1.hisparse.coordinator import get_hisparse_coordinator\n from vllm.v1.hisparse.runtime import HiSparseCacheHandle\n+from vllm.v1.hisparse.types import (\n+    SparseKVOffloadCommand,\n+    SparseKVPageTransfer,\n+    SparseKVRowMirror,\n+)\n from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector\n \n \n@@ -83,6 +95,7 @@ def test_full_graph_step_prepares_host_mirror_outside_model():\n     worker._group_leaders = ((\"layer\", handle),)\n     worker._per_layer_mirrored = set()\n     worker._submitted_mirror_layers = set()\n+    worker._draft_layers = ()\n     worker.is_host_writer = True\n     worker._enqueue_row_dma = MagicMock()\n     worker.start_step = MagicMock(\n@@ -116,6 +129,195 @@ def test_full_graph_step_prepares_host_mirror_outside_model():\n     runtime.invalidate_written_slots.assert_called_once()\n \n \n+class _FakeEvent:\n+    log: list[tuple[str, object]] = []\n+\n+    def __init__(self, *args, **kwargs) -> None:\n+        pass\n+\n+    def record(self, stream=None) -> None:\n+        self.log.append((\"event\", self))\n+\n+    def query(self) -> bool:\n+        return True\n+\n+    def synchronize(self) -> None:\n+        pass\n+\n+\n+@pytest.mark.parametrize(\"cg_mode\", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])\n+def test_draft_layer_rows_mirrored_after_drafter(monkeypatch, cg_mode):\n+    \"\"\"Draft-layer host rows must hold the drafter's writes before page release.\n+\n+    The drafter writes its layers' rows after the target forward. Mirroring\n+    them at the end of the target forward (the only mirror a FULL graph gets)\n+    leaves pre-draft rows on the host, and the page is still reported clean.\n+    \"\"\"\n+    block_size, width = 4, 8\n+    resident_block, host_block, transfer_id = 2, 1, 7\n+    log: list[tuple[str, object]] = []\n+    _FakeEvent.log = log\n+\n+    def swap_blocks_batch(src, dst, sizes):\n+        for src_ptr, dst_ptr, size in zip(src.tolist(), dst.tolist(), sizes.tolist()):\n+            ctypes.memmove(dst_ptr, src_ptr, size)\n+            log.append((\"dma\", dst_ptr))\n+\n+    monkeypatch.setattr(torch, \"Event\", _FakeEvent)\n+    monkeypatch.setattr(torch, \"Stream\", lambda *args, **kwargs: MagicMock())\n+    monkeypatch.setattr(torch.cuda, \"Stream\", lambda *args, **kwargs: MagicMock())\n+    monkeypatch.setattr(torch.cuda, \"stream\", lambda _: contextlib.nullcontext())\n+    compute_stream = MagicMock()\n+    monkeypatch.setattr(worker_module, \"current_stream\", lambda: compute_stream)\n+    monkeypatch.setattr(worker_module.ops, \"swap_blocks_batch\", swap_blocks_batch)\n+    monkeypatch.setattr(\n+        runtime_module,\n+        \"get_forward_context\",\n+        lambda: SimpleNamespace(cudagraph_runtime_mode=cg_mode),\n+    )\n+\n+    slots = torch.arange(block_size) + resident_block * block_size\n+    request_state_indices = torch.full((1,), -1, dtype=torch.int32)\n+    handles = []\n+    for draft_layer in (False, True):\n+        runtime = SimpleNamespace(\n+            is_group_leader=True,\n+            eager_host_mirror=True,\n+            resident_source_index=0,\n+            host_cache=torch.zeros(4 * block_size, width),\n+            request_state_indices=request_state_indices,\n+            begin_forward=MagicMock(),\n+            invalidate_written_slots=MagicMock(),\n+        )\n+        handle = HiSparseCacheHandle(runtime)\n+        handle.view = SimpleNamespace(\n+            block_size=block_size, cache=torch.zeros(4, block_size, width)\n+        )\n+        handle.slot_mapping = slots\n+        handle.mirror_slot_mapping = slots\n+        handle.draft_layer = draft_layer\n+        handles.append(handle)\n+    target, draft = handles\n+    # Rows the draft layer held before this step's drafter ran.\n+    draft.view.cache[resident_block] = -1.0\n+\n+    worker = HiSparseConnectorWorker(\n+        SimpleNamespace(\n+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),\n+            num_lookahead_tokens=3,\n+        ),\n+        MagicMock(),\n+    )\n+    worker.initialize(\n+        handles,\n+        [\"target\", \"draft\"],\n+        MagicMock(),\n+        max_num_reqs=1,\n+        host_num_blocks=4,\n+        device=torch.device(\"cpu\"),\n+        pinned_host_pools=[],\n+    )\n+    connector = object.__new__(HiSparseConnector)\n+    connector.connector_worker = worker\n+    connector._get_connector_metadata = MagicMock(\n+        return_value=HiSparseConnectorMetadata(\n+            SparseKVOffloadCommand(\n+                [\n+                    SparseKVPageTransfer(\n+                        transfer_id=transfer_id,\n+                        host_block_id=host_block,\n+                        resident_block_ids=(resident_block,),\n+                        after_forward=True,\n+                    )\n+                ]\n+            ),\n+            (),\n+            (),\n+            {\n+                \"req\": (\n+                    SparseKVRowMirror(\n+                        source_starts=(resident_block * block_size,),\n+                        destination_start=host_block * block_size,\n+                        num_rows=block_size,\n+                    ),\n+                )\n+            },\n+            True,\n+        )\n+    )\n+    # A verification step: four query tokens of one request fill the page.\n+    attn_metadata = SimpleNamespace(\n+        num_actual_tokens=block_size,\n+        num_decode_tokens=0,\n+        num_reqs=1,\n+        max_query_len=block_size,\n+        req_id_per_token=torch.zeros(block_size, dtype=torch.int32),\n+    )\n+\n+    connector.start_load_kv(\n+        SimpleNamespace(),\n+        request_state_indices=None,\n+        request_ids=[\"req\"],\n+        num_tokens=block_size,\n+        attn_metadata={\"target\": attn_metadata, \"draft\": attn_metadata},\n+    )\n+    target.view.cache[resident_block] = 1.0\n+    if cg_mode != CUDAGraphMode.FULL:\n+        target.finish_kv_update()\n+    connector.finish_forward()\n+    enqueued_before_draft = list(worker._enqueued_transfer_ids)\n+\n+    # The drafter writes the draft layer's rows for the same positions.\n+    if cg_mode != CUDAGraphMode.FULL:\n+        draft.prepare_group_for_batch(attn_metadata)\n+    draft.view.cache[resident_block] = 2.0\n+    if cg_mode != CUDAGraphMode.FULL:\n+        draft.finish_kv_update()\n+    # The next step's start mirrors the drafter's rows, then hands the page over.\n+    compute_stream.wait_event.reset_mock()\n+    connector._get_connector_metadata.return_value = HiSparseConnectorMetadata(\n+        None, (), (), {}, True\n+    )\n+    connector.start_load_kv(\n+        SimpleNamespace(),\n+        request_state_indices=None,\n+        request_ids=[],\n+        num_tokens=0,\n+        attn_metadata={},\n+    )\n+    ((completion_event, _),) = worker._pending_transfer_events\n+    worker_meta = connector.build_connector_worker_meta()\n+\n+    host_rows = slice(host_block * block_size, (host_block + 1) * block_size)\n+    torch.testing.assert_close(target.runtime.host_cache[host_rows], torch.ones(4, 8))\n+    torch.testing.assert_close(\n+        draft.runtime.host_cache[host_rows], torch.full((4, 8), 2.0)\n+    )\n+    draft_host = draft.runtime.host_cache\n+    draft_host_range = range(\n+        draft_host.data_ptr(),\n+        draft_host.data_ptr() + draft_host.numel() * draft_host.element_size(),\n+    )\n+    draft_copies = [\n+        index\n+        for index, (kind, ptr) in enumerate(log)\n+        if kind == \"dma\" and ptr in draft_host_range\n+    ]\n+    # One draft-layer copy, and the page is not handed back before it.\n+    assert len(draft_copies) == 1\n+    assert enqueued_before_draft == []\n+    assert log.index((\"event\", completion_event)) > draft_copies[0]\n+    # The next forward waits for the draft copy: the scheduler may already\n+    # have handed the blocks it reads and writes to another request.\n+    draft_copy_event = next(\n+        entry[1] for entry in log[draft_copies[0] :] if entry[0] == \"event\"\n+    )\n+    assert compute_stream.wait_event.call_args_list[0].args == (draft_copy_event,)\n+    assert worker_meta is not None\n+    assert worker_meta.enqueued_transfer_counts == {transfer_id: 1}\n+    assert worker_meta.completed_transfer_counts == {transfer_id: 1}\n+\n+\n def test_scheduled_prefix_hit_publishes_adopted_copies():\n     \"\"\"Copies adopted after scheduling must reach the worker's block table.\"\"\"\n     from tests.v1.core.test_prefix_caching import (",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_hisparse_connector.py",
+      "sha": "a2eeb8cd63b1dea2bf100569cc0b8b4e91edcb7c",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fworker%2Ftest_utils.py",
+      "changes": 26,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fworker%2Ftest_utils.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 24,
+      "filename": "tests/v1/worker/test_utils.py",
+      "patch": "@@ -44,6 +44,8 @@ def _make_hisparse_worker() -> HiSparseConnectorWorker:\n     worker._row_mirror_num_rows = 0\n     worker._per_layer_mirrored = set()\n     worker._submitted_mirror_layers = set()\n+    worker._draft_layers = ()\n+    worker._draft_mirror_pending = False\n     worker._pending_dma_descriptors = deque()\n     worker._dma_free_descriptors = []\n     worker.host_write_events = (MagicMock(), MagicMock())\n@@ -785,30 +787,6 @@ def test_hisparse_finish_forward_does_not_repeat_per_layer_mirrors():\n     worker._enqueue_row_dma.assert_not_called()\n \n \n-def test_hisparse_finish_forward_submits_lazy_post_forward_transfer(monkeypatch):\n-    runtime = SimpleNamespace(eager_host_mirror=False)\n-    worker = _make_hisparse_worker()\n-    worker.is_host_writer = True\n-    worker.cache_handles = [SimpleNamespace(runtime=runtime, num_actual_tokens=0)]\n-    transfer = SparseKVPageTransfer(7, 2, (1,), after_forward=True)\n-    worker._post_forward_transfers = [transfer]\n-    worker._forward_ready_event = MagicMock()\n-    worker._enqueue_host_mirror = MagicMock()\n-    worker._submit_transfers = MagicMock()\n-    worker._dma_submitted = False\n-    worker._submitted_mirror_layers = set()\n-    worker._finish_mirror_phase = MagicMock()\n-    worker._release_completed_dma_descriptors = MagicMock()\n-    stream = MagicMock()\n-    monkeypatch.setattr(hisparse_worker_module, \"current_stream\", lambda: stream)\n-\n-    worker.finish_forward()\n-\n-    worker._finish_mirror_phase.assert_called_once_with(worker._forward_ready_event)\n-    worker._submit_transfers.assert_called_once_with([transfer])\n-    worker.host_write_event.record.assert_called_once_with(stream)\n-\n-\n def test_hisparse_prefill_mirrors_source_groups_and_flushes_partial_group():\n     slots = torch.tensor([7, 8], dtype=torch.int64)\n     source_indices = [0, 0, 1, 1, 1, 1, 2]",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/tests%2Fv1%2Fworker%2Ftest_utils.py",
+      "sha": "abcbdb24f2f627116c2a7d39d361088ac2c9e864",
+      "status": "modified"
+    },
+    {
+      "additions": 35,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fhisparse%2Fworker.py",
+      "changes": 43,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fhisparse%2Fworker.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 8,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py",
+      "patch": "@@ -301,6 +301,10 @@ def initialize(\n         self._submitted_mirror_layers: set[int] = set()\n         self._layer_ready_events = tuple(torch.Event() for _ in cache_handles)\n         self._forward_ready_event = torch.Event()\n+        self._draft_layers = tuple(\n+            index for index, cache in enumerate(cache_handles) if cache.draft_layer\n+        )\n+        self._draft_mirror_pending = False\n         self._set_row_mirrors(())\n         self.cache_layer_names = cache_layer_names\n         self._group_leaders = tuple(\n@@ -344,9 +348,11 @@ def initialize(\n         self._init_dma()\n         if self.is_host_writer:\n             for layer_index, handle in enumerate(cache_handles):\n-                handle.submit_layer_mirror = partial(\n-                    self._enqueue_layer_mirror, layer_index\n-                )\n+                # Draft layers are mirrored once in the next start_step instead.\n+                if not handle.draft_layer:\n+                    handle.submit_layer_mirror = partial(\n+                        self._enqueue_layer_mirror, layer_index\n+                    )\n         self._initialized = True\n \n     def set_request_state_indices(self, indices: torch.Tensor) -> None:\n@@ -397,16 +403,17 @@ def start_step(\n         num_tokens: int = 0,\n     ) -> None:\n         self._stage_row_mirror_mapping(num_tokens)\n+        self._finish_previous_step()\n         previous_host_write_event = self.host_write_event\n         self.host_write_event = self.host_write_events[self._next_host_write_event]\n         self._next_host_write_event ^= 1\n         current_stream().wait_event(previous_host_write_event)\n         self._release_completed_dma_descriptors()\n+        self._dma_submitted = False\n         mirrors = _flatten_row_mirrors(metadata.row_mirrors, request_ids)\n         if self._slot_mapping_staging is not None:\n             self._slot_mapping_staging.candidates = mirrors\n         self._set_row_mirrors(mirrors)\n-        self._dma_submitted = False\n         self._clear_forward_mirror_state()\n         for handle in self.cache_handles:\n             handle.all_context_pages_resident = metadata.all_context_pages_resident\n@@ -849,7 +856,12 @@ def mirror_key(handle: HiSparseCacheHandle) -> tuple:\n         if num_rows == 0:\n             return\n         if self.is_host_writer:\n-            expected_layers = {index for index, _ in active}\n+            # The drafter has not written its layers' rows yet; the next\n+            # start_step mirrors them after it runs.\n+            self._draft_mirror_pending = bool(self._draft_layers)\n+            expected_layers = {index for index, _ in active}.difference(\n+                self._draft_layers\n+            )\n             if self._per_layer_mirrored and self._per_layer_mirrored != expected_layers:\n                 raise RuntimeError(\n                     \"HiSparse per-layer DMA did not mirror every active layer: \"\n@@ -884,9 +896,6 @@ def finish_forward(self) -> None:\n         compute_stream = current_stream()\n         self._forward_ready_event.record()\n         self._finish_mirror_phase(self._forward_ready_event)\n-        transfers = self._post_forward_transfers\n-        self._post_forward_transfers = []\n-        self._submit_transfers(transfers)\n         if self.is_host_writer:\n             if self._dma_submitted:\n                 compute_stream.wait_event(self.host_write_event)\n@@ -895,6 +904,24 @@ def finish_forward(self) -> None:\n                 self.host_write_event.record(compute_stream)\n         self._release_completed_dma_descriptors()\n \n+    def _finish_previous_step(self) -> None:\n+        \"\"\"Mirror the previous step's draft-layer rows, then hand its pages over.\n+\n+        Runs before this step's work, so after the previous step's drafter.\n+        Post-forward transfers are ordered behind the draft mirror, so a page is\n+        never reported clean, and its resident block never released, before\n+        its draft-layer rows reach the host. Both land in the previous step's\n+        host write event, which this step waits on before its forward and its\n+        host copies, since the scheduler may already have reused the\n+        finished requests' blocks they read and write.\n+        \"\"\"\n+        if self._draft_mirror_pending:\n+            self._draft_mirror_pending = False\n+            self._enqueue_row_dma(self._draft_layers)\n+        transfers = self._post_forward_transfers\n+        self._post_forward_transfers = []\n+        self._submit_transfers(transfers)\n+\n     def take_completed_host_copies(self) -> list[int]:\n         \"\"\"Drain host copies this worker has enqueued for this step.\"\"\"\n         completed = self._completed_host_copy_dst_ids",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fhisparse%2Fworker.py",
+      "sha": "bf6329b3bfdfdce1eee59e9a28e9b91d011547d7",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fmodel_executor%2Flayers%2Fattention_layer_base.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Fattention_layer_base.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 0,
+      "filename": "vllm/model_executor/layers/attention_layer_base.py",
+      "patch": "@@ -21,6 +21,8 @@ class AttentionLayerBase(ABC):\n \n     impl: \"AttentionImpl\"\n     supports_dcp: bool = True\n+    # Set by the speculator on its draft model's layers.\n+    is_draft_layer: bool = False\n \n     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:\n         \"\"\"Bind the allocated KV cache tensor to this layer.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fmodel_executor%2Flayers%2Fattention_layer_base.py",
+      "sha": "d5332a47a8e1e3bbe1e67596f5788d864ae94b6d",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Findex_group.py",
+      "changes": 22,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Findex_group.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 20,
+      "filename": "vllm/v1/attention/backends/mla/index_group.py",
+      "patch": "@@ -39,8 +39,6 @@ class SparseMLAIndexGroup:\n     logical_topk_indices: torch.Tensor\n     physical_topk_indices: torch.Tensor\n     valid_topk_counts: torch.Tensor\n-    row_indices: torch.Tensor\n-    request_ids: torch.Tensor\n     side_stream: torch.Stream\n     logical_topk_ready: torch.Event\n     physical_topk_ready: torch.Event\n@@ -252,19 +250,13 @@ def convert_logical_to_physical_topk(\n             )\n         source_block_table = cache.source_block_table\n         assert source_block_table is not None\n-        # CUDA-graph padding rows past the batch's tokens map to request 0;\n-        # mark them -1 so residency resolution skips them.\n-        request_ids = self.request_ids[:num_tokens]\n-        request_ids.copy_(req_id_per_token)\n-        request_ids.masked_fill_(\n-            self.row_indices[:num_tokens] >= attn_metadata.query_start_loc[-1], -1\n-        )\n         return cache.swap_in(\n-            request_ids,\n+            req_id_per_token,\n             block_table=source_block_table,\n             logical_topk_indices=logical_topk_indices,\n             block_size=attn_metadata.block_size,\n             return_valid_counts=return_valid_counts,\n+            num_valid_rows=attn_metadata.query_start_loc[-1:],\n         )\n \n     def stage_prefill_rows(\n@@ -384,16 +376,6 @@ def register_layer(\n                     dtype=torch.int32,\n                     device=self.logical_topk_indices.device,\n                 ),\n-                row_indices=torch.arange(\n-                    workspace_rows,\n-                    dtype=torch.int32,\n-                    device=self.logical_topk_indices.device,\n-                ),\n-                request_ids=torch.empty(\n-                    workspace_rows,\n-                    dtype=torch.int32,\n-                    device=self.logical_topk_indices.device,\n-                ),\n                 side_stream=_create_side_stream(self.logical_topk_indices.device),\n                 logical_topk_ready=_create_event(),\n                 physical_topk_ready=_create_event(),",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fattention%2Fbackends%2Fmla%2Findex_group.py",
+      "sha": "5a18332e41e1620355a192965546f7479e50376d",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fhisparse%2Fbinding.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fhisparse%2Fbinding.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 0,
+      "filename": "vllm/v1/hisparse/binding.py",
+      "patch": "@@ -276,6 +276,7 @@ def bind_hisparse_kv_caches(\n             assert source_cache.untyped_storage().data_ptr() == (\n                 host_pool.registered.untyped_storage().data_ptr()\n             )\n+            cache_handle.draft_layer = forward_context[layer_name].is_draft_layer\n             cache_handle.runtime.shared_host_region = host_pool.shared_region\n             cache_handle.runtime.bind_source_cache(\n                 source_cache,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fhisparse%2Fbinding.py",
+      "sha": "f4152edab37eb820dd2c126dfa95039993aaa0c2",
+      "status": "modified"
+    },
+    {
+      "additions": 20,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fhisparse%2Fruntime.py",
+      "changes": 21,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fhisparse%2Fruntime.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 1,
+      "filename": "vllm/v1/hisparse/runtime.py",
+      "patch": "@@ -662,6 +662,10 @@ def __init__(\n         self.lru_init = torch.arange(region_stride, dtype=torch.int16, device=device)\n         self.lru_slots = self.lru_init.repeat(max_num_reqs, 1).contiguous()\n         self.shared_topk = _create_shared_topk_state(device, max_swap_rows, top_k)\n+        # Request ids the resolver reads, built on the copy stream: a\n+        # compute-stream write would race with its logical_topk_ready wait.\n+        self.row_indices = torch.arange(max_swap_rows, dtype=torch.int32, device=device)\n+        self.request_ids = torch.empty_like(self.row_indices)\n         self.copy_stream = (\n             copy_stream if copy_stream is not None else _create_copy_stream(device)\n         )\n@@ -997,6 +1001,7 @@ def _resolve_and_stage_group(\n         shared_rows: slice,\n         attention_indices_out: torch.Tensor | None,\n         valid_counts_out: torch.Tensor | None,\n+        num_valid_rows: torch.Tensor,\n     ) -> None:\n         group = self.index_group\n         compute_stream = current_stream()\n@@ -1005,9 +1010,17 @@ def _resolve_and_stage_group(\n         else:\n             group.copy_stream.wait_stream(compute_stream)\n         with group.copy_stream:\n+            # CUDA-graph padding rows past the batch's tokens map to request 0;\n+            # mark them -1 so residency resolution skips them.\n+            num_tokens = logical_topk_indices.shape[0]\n+            request_ids = group.request_ids[:num_tokens]\n+            request_ids.copy_(req_id_per_token)\n+            request_ids.masked_fill_(\n+                group.row_indices[:num_tokens] >= num_valid_rows, -1\n+            )\n             self._resolve_residency(\n                 resident=resident,\n-                req_id_per_token=req_id_per_token,\n+                req_id_per_token=request_ids,\n                 block_table=block_table,\n                 topk_indices=logical_topk_indices,\n                 block_size=block_size,\n@@ -1051,6 +1064,7 @@ def swap_in(\n         block_table: torch.Tensor,\n         logical_topk_indices: torch.Tensor,\n         block_size: int,\n+        num_valid_rows: torch.Tensor,\n         return_valid_counts: bool = False,\n         attention_indices_out: torch.Tensor | None = None,\n         valid_counts_out: torch.Tensor | None = None,\n@@ -1074,6 +1088,7 @@ def swap_in(\n                 shared_rows=shared_rows,\n                 attention_indices_out=attention_indices_out,\n                 valid_counts_out=valid_counts_out,\n+                num_valid_rows=num_valid_rows,\n             )\n \n         if not self._swap_staged:\n@@ -1110,6 +1125,8 @@ def __init__(self, runtime: HiSparseRuntime) -> None:\n         self.mirror_staging_cache: torch.Tensor | None = None\n         self.mirror_staging_slots: torch.Tensor | None = None\n         self.submit_layer_mirror: Callable[[], None] | None = None\n+        # Speculator layers write their rows after the target forward.\n+        self.draft_layer = False\n         self.index_group_caches: list[HiSparseCacheHandle] = [self]\n \n     def prepare_group_for_batch(self, attn_metadata: Any | None) -> None:\n@@ -1203,6 +1220,7 @@ def swap_in(\n         logical_topk_indices: torch.Tensor,\n         *,\n         block_size: int,\n+        num_valid_rows: torch.Tensor,\n         return_valid_counts: bool = False,\n         attention_indices_out: torch.Tensor | None = None,\n         valid_counts_out: torch.Tensor | None = None,\n@@ -1216,6 +1234,7 @@ def swap_in(\n             return_valid_counts=return_valid_counts,\n             attention_indices_out=attention_indices_out,\n             valid_counts_out=valid_counts_out,\n+            num_valid_rows=num_valid_rows,\n         )\n \n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fhisparse%2Fruntime.py",
+      "sha": "fc415fa2eccf61d1eea7ba45c3ed09a7b22977ca",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fworker%2Fgpu%2Fspec_decode%2Fspeculator.py",
+      "changes": 12,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fworker%2Fgpu%2Fspec_decode%2Fspeculator.py?ref=8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "deletions": 6,
+      "filename": "vllm/v1/worker/gpu/spec_decode/speculator.py",
+      "patch": "@@ -224,13 +224,13 @@ def load_model(self, target_model: nn.Module) -> None:\n         self.model = self.load_draft_model(target_model, target_attn_layer_names)\n         self._validate_local_argmax_reduction()\n \n-        all_attn_layers = set[str](\n-            get_layers_from_vllm_config(\n-                self.vllm_config,\n-                AttentionLayerBase,  # type: ignore[type-abstract]\n-            ).keys()\n+        all_attn_layers = get_layers_from_vllm_config(\n+            self.vllm_config,\n+            AttentionLayerBase,  # type: ignore[type-abstract]\n         )\n-        self.draft_attn_layer_names = all_attn_layers - target_attn_layer_names\n+        self.draft_attn_layer_names = set(all_attn_layers) - target_attn_layer_names\n+        for layer_name in self.draft_attn_layer_names:\n+            all_attn_layers[layer_name].is_draft_layer = True\n \n         target_supports_mm = self.vllm_config.model_config.supports_multimodal_inputs\n         draft_supports_mm = supports_multimodal_embeddings(self.model)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/8c8b15e8436ba401f8b86256adddf5aec038befe/vllm%2Fv1%2Fworker%2Fgpu%2Fspec_decode%2Fspeculator.py",
+      "sha": "0728ddb87cb2a3ed0b8066ba741bbc2d63df191e",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Documentation preview: https://vllm--59309.org.readthedocs.build/en/59309/",
+      "created_at": "2026-09-29T21:59:58Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5899842453",
+      "id": 5899842453,
+      "updated_at": "2026-09-29T21:59:58Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @LucasWilkinson.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-09-30T03:25:28Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5903446121",
+      "id": 5903446121,
+      "updated_at": "2026-09-30T03:25:28Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-30T22:55:51Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921134534",
+      "id": 5921134534,
+      "updated_at": "2026-09-30T22:55:51Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "❌ This PR is 5 commits behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5921134534 -->",
+      "created_at": "2026-09-30T22:57:21Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921150809",
+      "id": 5921150809,
+      "updated_at": "2026-09-30T22:57:21Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-30T22:57:43Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921154822",
+      "id": 5921154822,
+      "updated_at": "2026-09-30T22:57:43Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #92266](https://buildkite.com/vllm/ci/builds/92266) for commit `1f783a6746c6`.",
+      "created_at": "2026-09-30T22:58:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921158923",
+      "id": 5921158923,
+      "updated_at": "2026-09-30T22:58:06Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-09-30T23:00:42Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921187461",
+      "id": 5921187461,
+      "updated_at": "2026-09-30T23:00:42Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #92268](https://buildkite.com/vllm/ci/builds/92268) for commit `59626c4985db`.",
+      "created_at": "2026-09-30T23:01:03Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921191293",
+      "id": 5921191293,
+      "updated_at": "2026-09-30T23:01:03Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-01T00:08:00Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921978577",
+      "id": 5921978577,
+      "updated_at": "2026-10-01T00:08:00Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #92279](https://buildkite.com/vllm/ci/builds/92279) for commit `934799a5e726`.",
+      "created_at": "2026-10-01T00:08:20Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5921982011",
+      "id": 5921982011,
+      "updated_at": "2026-10-01T00:08:20Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci retry",
+      "created_at": "2026-10-01T00:36:53Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922326450",
+      "id": 5922326450,
+      "updated_at": "2026-10-01T00:36:53Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ The previous CI build is still running: https://buildkite.com/vllm/ci/builds/92279",
+      "created_at": "2026-10-01T00:37:54Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922337820",
+      "id": 5922337820,
+      "updated_at": "2026-10-01T00:37:54Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci cancel",
+      "created_at": "2026-10-01T00:39:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922350379",
+      "id": 5922350379,
+      "updated_at": "2026-10-01T00:39:01Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-01T00:39:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922351344",
+      "id": 5922351344,
+      "updated_at": "2026-10-01T00:39:06Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Requested cancellation of 1 CI build for `agentx/hisparse-mtp-mirror-fix`: [#92279](https://buildkite.com/vllm/ci/builds/92279).",
+      "created_at": "2026-10-01T00:39:42Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922358153",
+      "id": 5922358153,
+      "updated_at": "2026-10-01T00:39:42Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "❌ This PR is 1 commit behind upstream `main`. Your branch must contain every commit currently on upstream `main`. No new CI build was started. Merge or rebase onto the latest `main`, then rerun `/ci run`. To test this branch at your own risk, use `/ci run --allow-stale`.\n\n<!-- vllm-ci-command:5922351344 -->",
+      "created_at": "2026-10-01T00:41:50Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922380016",
+      "id": 5922380016,
+      "updated_at": "2026-10-01T00:41:50Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-01T00:42:26Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922386614",
+      "id": 5922386614,
+      "updated_at": "2026-10-01T00:42:26Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #92294](https://buildkite.com/vllm/ci/builds/92294) for commit `67988923e65e`.",
+      "created_at": "2026-10-01T00:42:48Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5922390295",
+      "id": 5922390295,
+      "updated_at": "2026-10-01T00:42:48Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-01T12:52:10Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5931863825",
+      "id": 5931863825,
+      "updated_at": "2026-10-01T12:52:10Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #92402](https://buildkite.com/vllm/ci/builds/92402) for commit `526b72985868`.",
+      "created_at": "2026-10-01T12:52:30Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5931869261",
+      "id": 5931869261,
+      "updated_at": "2026-10-01T12:52:30Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @LucasWilkinson.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-01T21:50:58Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5941384467",
+      "id": 5941384467,
+      "updated_at": "2026-10-01T21:50:58Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-02T03:10:58Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5944918200",
+      "id": 5944918200,
+      "updated_at": "2026-10-02T03:10:58Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #92548](https://buildkite.com/vllm/ci/builds/92548) for commit `8c8b15e8436b`.",
+      "created_at": "2026-10-02T03:11:17Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#issuecomment-5944921143",
+      "id": 5944921143,
+      "updated_at": "2026-10-02T03:11:17Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 59309,
+  "refs": {
+    "base": {
+      "commit": "ea106db806918f371b8f392cc896dc7a2d6677a1",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "8c8b15e8436ba401f8b86256adddf5aec038befe",
+      "repository": "LucasWilkinson/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#pullrequestreview-5359857617",
+      "id": 5359857617,
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-29T23:47:51Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "LGTM after some tweaks, thanks!",
+      "html_url": "https://github.com/vllm-project/vllm/pull/59309#pullrequestreview-5379536983",
+      "id": 5379536983,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-01T12:59:20Z",
+      "user": {
+        "login": "MatthewBonanni"
+      }
+    }
+  ]
+}

@@ -15,7 +15,7 @@ path: docs/en/_menu.md
 raw_sha256: dc7bde787f0a70bf97089e54a9e6f3b20f7260ffc4ea7e55d1560c886e6ef642
 sources: []
 generated_body_sha256: ace88e489e76c5b98e748b623e0c71e6ad8138c223283666e778c7467ad43eed
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/_menu.md

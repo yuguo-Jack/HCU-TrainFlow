@@ -2,8 +2,11 @@
 import importlib
 from pathlib import Path
 import sys
+import warnings
 
 from .core import read_json, write_json
+from .tracelens_features import qualify_native_warnings
+from .tracelens_worker import summarize_warnings
 
 
 def run_native(module, *args):
@@ -21,6 +24,20 @@ def run_native(module, *args):
 
 
 def analyze(request, output):
+    captured = []
+    try:
+        with warnings.catch_warnings(record=True) as captured:
+            result = _analyze(request, output)
+    finally:
+        # Keep diagnostics even when the native API/CLI fails before its receipt.
+        for record in captured:
+            sys.stderr.write(warnings.formatwarning(record.message, record.category,
+                                                    record.filename, record.lineno))
+    result['native_warnings'] = summarize_warnings(captured)
+    return qualify_native_warnings(result)
+
+
+def _analyze(request, output):
     mode = request['mode']
     if mode == 'compare':
         from TraceLens.Reporting.generate_perf_report_pytorch import generate_perf_report_pytorch

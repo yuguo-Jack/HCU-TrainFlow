@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
 path: docs/04-technical-guides/specforge/configuration.md
-raw_sha256: 2207ac6ece56e685271fe120d41e1ce1ae324a95191e8146f863e24ec1c98a40
+raw_sha256: 925216c89cb60ff31a0fac3448bed5a8e22930be50f44516066ddca731d88427
 sources: []
-generated_body_sha256: 80456ac000b7463e3b3c97339c17c8e244bdd77ddcd598b21b47d486dbe136de
+generated_body_sha256: fb47c4f983fb77cff15d8d755da0030b5b7d21ddcf88c79d4c1ad6415bafc3ac
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/04-technical-guides/specforge/configuration.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/04-technical-guides/specforge/configuration.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/04-technical-guides/specforge/configuration.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -232,9 +232,14 @@ modules:
         trainer_gpus: ${TRAINER_GPUS:0}  # trainer GPU ids; 0 means 0,1,…,trainer_nproc-1
         trainer_nproc: ${NPROC_PER_NODE:1}  # trainer processes per trainer node
         target_model_path: ${TARGET_MODEL:Qwen/Qwen3.5-4B}  # HF id or local path
+        # Omit target_model_path here to let TARGET_MODEL beat the Hydra file.
+        # skip_tokenizer_init: true   # or SKIP_TOKENIZER_INIT; false inits the tokenizer
         mooncake_protocol: ${MOONCAKE_PROTOCOL:tcp}  # Mooncake transport
         mooncake_lease_ttl_ms: ${MOONCAKE_LEASE_TTL_MS:500}  # KV lease TTL
-        # capture_layer_ids: 1,8,15,22,29  # else from SpecForge draft json
+        # Capture layer ids come from the draft JSON named by model.draft_model_config.
+        # DFlash-family drafts use dflash_config.target_layer_ids. EAGLE drafts use
+        # eagle_config.eagle_aux_hidden_state_layer_ids, or the target depth when
+        # that list is omitted. They are not set here.
         # server_port: 30000             # first SGLang HTTP port
         # server_mem_fraction: 0.85      # SGLang GPU memory fraction
         # mooncake_rpc_port: 35551       # Mooncake RPC

@@ -15,7 +15,7 @@ path: docs/source/embodied_tutorial/quick_start_groot_n1_7.md
 raw_sha256: 2bf8bf37d9400291dc0c1bba446ff347464ecad96aafdfa0b315e8d453bb066a
 sources: []
 generated_body_sha256: 69ea2045694277fe8bc03b42bd020a84941a07cc49cd158106e4e5498db4b6a9
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # baidu-baige/LoongForge / docs/source/embodied_tutorial/quick_start_groot_n1_7.md

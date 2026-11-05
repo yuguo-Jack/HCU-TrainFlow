@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/tools/data_process_sft_alpaca_style.md
-raw_sha256: e5a578da186a32c4cd418a36ceda9573844ef0c50cc65c023fd4d22287aa6412
+raw_sha256: 840f6d32c0c1d3b37eafcfb28bc69ec62b9309a4b9f2bbad30caf3f712bfd2a7
 sources: []
-generated_body_sha256: 4b5af1dc990cf4d3c10ebd1bdf38379a5784ef482603f35c1b1714d5270dac81
+generated_body_sha256: 51b200486027a4624d8daffd2fb0ae194a577dbba85551c7c4aa2b67ccef2d72
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/tools/data_process_sft_alpaca_style.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/tools/data_process_sft_alpaca_style.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/tools/data_process_sft_alpaca_style.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -107,7 +107,7 @@ Alpaca风格示例：
 
 【--prompt-type】
 
-用于指定模型模板，能够让base模型微调后能具备更好的对话能力。`prompt-type`的可选项可以在[templates.json](../../../../configs/finetune/templates.json)文件内查看。
+用于指定模型模板，能够让base模型微调后具备更好的对话能力。`prompt-type`的可选项可以在[templates.json](../../../../configs/finetune/templates.json)文件内查看。
 
 【--handler-name】
 

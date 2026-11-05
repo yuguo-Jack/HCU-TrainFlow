@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/inference/inference.md
-raw_sha256: 6e7863e2904e1172c6877055ea63c2fedb1bd96aa55ea32fd5f5e5b306a9d18d
+raw_sha256: 56fa0aff68a50fa45ec251d93fe6e0bda3782398f878b27c14e55b2169a4602b
 sources: []
-generated_body_sha256: 04fcc171131865f670758790bb52163dc21f9c2579130cce1f4d651ed65a569e
+generated_body_sha256: f07f5ec0a38b79610145806174633e2e47034933b3b20c67e0a506db3f326df9
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/inference/inference.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/inference/inference.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/inference/inference.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -83,7 +83,7 @@ Upstream source document; original commands, claims and links require their stat
 
     - `TOKENIZER_MODEL`：指定模型的分词器文件路径（例如`tokenizer.model`）。
 
-    > [!NOTE]
+    > [!NOTE] 说明
     >
     > 除了路径的配置，推理脚本中的其他参数应与训练时的参数保持一致（例如，TP/PP/EP/VPP等并行切分，`--noop-layers`和`--num-layer-list`等自定义模型结构参数），否则会出现模型权重加载失败的情况。
 

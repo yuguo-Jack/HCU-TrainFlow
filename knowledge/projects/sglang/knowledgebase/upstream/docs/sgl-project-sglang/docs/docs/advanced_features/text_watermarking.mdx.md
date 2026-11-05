@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/text_watermarking.mdx
-raw_sha256: 04ae497d1d40dfd91aab45a6be4b6b5490211b745c3c016663609946dcf31823
+raw_sha256: d2f4deb549c7e94c5dc5b2879b235a97a91eaaf1b901406efaa1fb33499e0e4f
 sources: []
-generated_body_sha256: 0c0727f3f5dd499da31d3b691763f193e81c0ef19c5d3c684da7e39fbceca26c
+generated_body_sha256: 75c27667f8360e20de78e6eee9b06119eddf3d5b5c30168dc86a9dae13c1e9f1
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/text_watermarking.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/advanced_features/text_watermarking.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/text_watermarking.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -365,9 +365,10 @@ A detector written from scratch instead of reusing this package must implement t
 | NGRAM speculative decoding | Verified | Draft-node contexts are reconstructed before verification sampling. |
 | EAGLE and EAGLE3 speculative decoding | Verified | Tree nodes use their own ancestor-derived contexts. |
 | NEXTN speculative decoding | Verified | NEXTN resolves to the EAGLE verification path. |
+| DSPARK speculative decoding | Verified | Verify rows form a linear chain; each row's context is the committed tail followed by the earlier draft tokens. On a forced row, DSPARK's rejection-sampling accept, with or without block verification, emits exactly the watermarked token. |
 | Pipeline-parallel speculative decoding | Rejected | Startup validation fails closed. |
 | Other speculative algorithms | Rejected | Startup validation fails closed. |
-| Speculative rejection sampling | Rejected | Startup validation fails closed. |
+| `--speculative-use-rejection-sampling` | Rejected | Startup validation fails closed. |
 | Custom logit processors | Rejected | Startup validation fails closed because processor ordering is not defined. |
 | Token-oracle sampling backend | Rejected | Startup validation fails closed because oracle-selected tokens bypass the watermark selector. |
 | Beam search | Rejected | Request validation rejects watermarked beam-search requests. |
@@ -411,6 +412,16 @@ On a 2x GB300 node with public `Qwen/Qwen3.5-9B`, TP2, NEXTN 3/1/4, concurrency 
 | Change | +9.17% | -8.36% | +0.85% |
 
 Each speculative row still requires keyed selection, but tree-context reconstruction, repeated-context admission, accepted-context recording, and ring-buffer append run as fused GPU operations. The reported cost remains workload- and acceptance-dependent.
+
+On an 8x H200 node with public `deepseek-ai/DeepSeek-V4.1-Flash`, TP8 and EP8, DSPARK with `--speculative-dspark-block-size 5`, concurrency 8, 1,024-token random inputs, 512-token outputs, temperature 0.8, top-p 0.95, and top-k 20, watermarked and unwatermarked requests on the same server measured the following means over six repetitions from two server launches:
+
+| Watermark | Mean TPOT | Aggregate output throughput | Mean accept length |
+| --- | ---: | ---: | ---: |
+| Off | 5.879 ms | 1,226.0 token/s | 4.420 |
+| On | 6.098 ms | 1,198.4 token/s | 4.276 |
+| Change | +3.73% | -2.25% | -3.27% |
+
+A sampled DSPARK draft token is accepted on a forced row only when it equals the watermarked token, so the accept-length change depends on how closely the draft distribution tracks the target.
 
 ## See also
 

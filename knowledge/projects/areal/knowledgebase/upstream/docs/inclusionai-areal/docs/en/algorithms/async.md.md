@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
 path: docs/en/algorithms/async.md
-raw_sha256: fb2200da54686a7a923dcbe39ba5429c28a17bcd07b618103e7aeec25f947f81
+raw_sha256: 06d507cdd362479eb2cb805239311bfebb6c23273775bc8c1351d3b006ac5cd2
 sources: []
-generated_body_sha256: 2c1e90478738aac4bdf15956160602361a10fdcf3b1b2a782b357f3e77c7f8a0
+generated_body_sha256: d8fc4fb54df1bc04efa828918cd2e73b7dbe2252a1784af1049ade6ab724be10
 source_state: current-scan
 ---
 
 # areal-project/AReaL / docs/en/algorithms/async.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/docs/en/algorithms/async.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/docs/en/algorithms/async.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -62,6 +62,20 @@ Limit how stale rollouts can be relative to the current training policy:
 rollout:
   max_head_offpolicyness: 4  # Allow up to 4 version steps behind
 ```
+
+`mask_stale_tokens` defaults to `false`, preserving the existing training loss.
+To also filter individual actor loss targets by token policy-version age, enable it
+explicitly:
+
+```yaml
+rollout:
+  max_head_offpolicyness: 4
+  mask_stale_tokens: true
+```
+
+Tokens older than the limit are excluded from actor loss (including MTP). Rollouts
+continue normally; context, rewards, PRM scores, advantage computation, and the
+original loss normalization denominator are preserved.
 
 **Configuration tips:**
 

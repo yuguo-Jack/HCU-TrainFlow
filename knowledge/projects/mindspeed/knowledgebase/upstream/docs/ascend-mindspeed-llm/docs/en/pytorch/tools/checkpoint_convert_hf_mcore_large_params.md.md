@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md
-raw_sha256: f50bfd9e883ef03f861d16d175d991c6d9d7fb5b898bd71e4840784e0eefd608
+raw_sha256: 12133297ab6a821f007a9671fe9816014e79f8b84be6b350c1c7b635d6338243
 sources: []
-generated_body_sha256: 0c7dc1d8362ac6a215cf1ba9ffcebc178b4f2a7bf46a5a3c9a0229dddd281771
+generated_body_sha256: 1e6e85a633feab4cff1270b4b34a995ef6d68ca9d59ee5419e9100f4e0ff4176
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/tools/checkpoint_convert_hf_mcore_large_params.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -94,7 +94,7 @@ If you encounter any problems during the download, see:
 
 - ModelScope download guide: <https://modelscope.cn/docs/models/download>
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > If the download is too slow or inaccessible, configure a proxy or a local mirror site and try again.
 
@@ -112,7 +112,7 @@ If you encounter any problems during the download, see:
 
 Weight conversion converts Hugging Face weights to the MCore format. It supports multiple parallel strategies, such as tensor parallelism and pipeline parallelism, and ensures that you can continue training and inference in MindSpeed LLM after conversion.
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > Before you convert weights, first confirm the training-time parameter configuration and modify the weight conversion script in the repository according to your training configuration. These configurations change the structure of the weights. If they do not match the training parameters, training cannot load the weights. For the training configurations that need to be confirmed, see [Table 1](#table1).
 
@@ -129,7 +129,7 @@ Weight conversion converts Hugging Face weights to the MCore format. It supports
 | `--target-tensor-parallel-size` | TP. Specifies the tensor parallel size. | 1 | ✅ |
 | `--target-pipeline-parallel-size` | PP. Specifies the pipeline parallel size. | 1 | ✅ |
 | `--target-expert-parallel-size` | EP. Specifies the expert parallel size. | 1 | ✅ |
-| `--expert-tensor-parallel-size` | ETP. Specifies expert tensor parallelism. Currently only ETP=1 is supported after it is enabled. | None; equals the TP size during actual conversion | ✅ |
+| `--expert-tensor-parallel-size` | ETP. Specifies expert tensor parallelism. Currently only ETP=1 is supported after it is enabled. | None (equals the TP size during actual conversion) | ✅ |
 | `--num-layers-per-virtual-pipeline-stage` | VPP partitioning. Specifies the number of layers in each VPP stage. | None | ✅ |
 | `--num-layer-list` | Dynamic PP partitioning. It specifies the number of layers in each PP stage through a list. When you use it, separate the values with commas. The sum of the list values must equal the total number of model layers, and the length of the list must equal PP. For example, if the model has 14 layers, set `--num-layer-list 3,4,4,3` and `--target-pipeline-parallel-size 4`. | None | ✅ |
 | `--noop-layers` | Custom noop-layer operation. Specify where to insert noop layers in the model. After conversion, the number of layers equals the original Hugging Face model layer count plus the number of noop layers. | None | ✅ |
@@ -176,7 +176,7 @@ MindSpeed LLM provides prebuilt model weight conversion scripts. The following l
 bash examples/mcore/qwen3_moe/ckpt_convert_qwen3_moe_235b_hf2mcore.sh
 ```
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > Configure the parallel parameters, weight and vocabulary paths, weight loading paths (including vocabulary and other configuration files), and the weight save path in the weight conversion script.
 
@@ -221,7 +221,7 @@ MindSpeed LLM provides prebuilt model weight conversion scripts. The following l
 bash examples/mcore/qwen3_moe/ckpt_convert_qwen3_moe_235b_mcore2hf.sh
 ```
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > Configure the parallel parameters, weight and vocabulary paths, weight loading paths (including vocabulary and other configuration files), and the weight save path in the weight conversion script.
 
@@ -229,24 +229,24 @@ bash examples/mcore/qwen3_moe/ckpt_convert_qwen3_moe_235b_mcore2hf.sh
 
 This framework supports **reduced-layer debugging** when converting Hugging Face weights to the MCore format without changing the model configuration file. You can configure the reduction with the following CLI parameters.
 
-- `--num-layers`
+`--num-layers`
 
-  This specifies the number of layers in the reduced model. It cannot exceed the number of layers in the original model, and this number does **not** include MTP layers. The default value is None. **When you do not use reduced layers, the value comes from the configuration file. Therefore, you do not need to specify this parameter.**
+This specifies the number of layers in the reduced model. It cannot exceed the number of layers in the original model, and this number does **not** include MTP layers. The default value is None. **When you do not use reduced layers, the value comes from the configuration file. Therefore, you do not need to specify this parameter.**
 
-  If you configure noop layers with `--noop-layers`, the value of `num-layers` should be the real layer count. It should not include MTP layers or the `--noop-layers` count.
+If you configure noop layers, the value of `num-layers` should be the real layer count. It should not include MTP layers or the `--noop-layers` count.
 
-  If you need to use reduced-layer debugging together with the training script, note the following: when the `--noop-layers` configuration is not used, this parameter must be **consistent with the training script**; when the `--noop-layers` configuration is used, the `--num-layers` parameter for weight conversion is the real layer count (not including noop layers), while the `--num-layers` parameter in the training script is the total layer count (including the `--noop-layers` count).
+If you need to use reduced-layer debugging together with the training script, ensure that this parameter is **consistent with the training script**.
 
-- `--first-k-dense-replace`
+`--first-k-dense-replace`
 
-  This specifies the number of dense layers before MoE layers in the reduced model. It cannot exceed the number of dense layers in the original model. The default value is None. **When you do not use reduced layers, the value comes from the configuration file. Therefore, you do not need to specify this parameter.**
+This specifies the number of dense layers before MoE layers in the reduced model. It cannot exceed the number of dense layers in the original model. The default value is None. **When you do not use reduced layers, the value comes from the configuration file. Therefore, you do not need to specify this parameter.**
 
-  If you need to use reduced-layer debugging together with the training script, ensure that this parameter is **consistent with the training script**.
+If you need to use reduced-layer debugging together with the training script, ensure that this parameter is **consistent with the training script**.
 
-- `--mtp-num-layers`
+`--mtp-num-layers`
 
-  This is the number of MTP layers. The default value is 0. It supports configuring MTP layers during reduction, and the value cannot exceed the number of MTP layers in the original model.
+This is the number of MTP layers. The default value is 0. It supports configuring MTP layers during reduction, and the value cannot exceed the number of MTP layers in the original model.
 
-  If you need to configure MTP layers, you can set them on the CLI, for example `--mtp-num-layers 1`.
+If you need to configure MTP layers, you can set them on the CLI, for example `--mtp-num-layers 1`.
 
-  If you need to use reduced-layer debugging together with the training script, ensure that this parameter is **consistent with the training script**.
+If you need to use reduced-layer debugging together with the training script, ensure that this parameter is **consistent with the training script**.

@@ -10,97 +10,105 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: thudm-slime
   path: README.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: a564ad953d0961bd3d2f1343c74825dd900b2c1bf4a2b5471b9b7badc5d7b4d3
 - source: thudm-slime
   path: setup.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 3d6f0f81b68f4357388f499bf6b5d0e526d2892744e15ebced15a07400b501c2
 - source: thudm-slime
   path: requirements.txt
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
-  sha256: 44209321a1ff53467a850f6318626c925d7b5677fcba2a6338d8bfba85c342fa
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: c647b19e3b921f5923a881c2567a3f9326a1ad5e3d55d23b3efabbc72e768ffa
 - source: thudm-slime
   path: train.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 9ab1d9a987182dc5ae57d19ca82a3807fd18adee8cecf0afe118cadbd8939939
 - source: thudm-slime
   path: slime/ray/rollout.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 4b2cc58e04e583d5fd3d34d3a6f2ffbed79f37e52fefceaef95e63b8aa666304
 - source: thudm-slime
   path: slime/ray/actor_group.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: ded0c12645992c7ab5c7034a91b418f195a6109dda02c3af0d0548804f39340c
 - source: thudm-slime
   path: slime/backends/megatron_utils/actor.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 9f0e0cd3119c8354cd76c1972c908143b7f933b2653a1f53a2a898b1f8b13739
 - source: thudm-slime
   path: slime/backends/megatron_utils/arguments.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 20bc1b4278c0eaa051a877a8e5482f9671490d417c37a6b22375c5bbfef82dee
 - source: thudm-slime
   path: slime/backends/megatron_utils/data.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: b01a78b17b7d9ed93666982af378b6d2d74951473cad85f432e44d4cb8f926c8
 - source: thudm-slime
   path: slime/backends/megatron_utils/loss.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 92ca932bd18019d5899272da1ae65da4a9f8172c4dbdeecbf6897b1f62d7e754
 - source: thudm-slime
   path: slime/data/checkpoint.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 98e0b5724e59ee2e6f9df3459f4d598cc987a2e060f2de372abe15d92166adb7
 - source: thudm-slime
   path: slime/backends/megatron_utils/update_weight/update_weight_from_disk_delta.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: ac78a67f02d146331f377c9246b60109d039101b99b5d4058ad6932981411293
 - source: thudm-slime
   path: docs/en/get_started/quick_start.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 63be929c874a50862172c7fe923d122b4211a8d73592ad25ca1fb47ddb0e8b69
 - source: thudm-slime
   path: docs/en/get_started/usage.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 47a3a0cc04d9e575a9379024e75e9d75e5a0c69eb19e134a59d98e7c4ca76d86
 - source: thudm-slime
   path: docs/en/advanced/parallelism-memory.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 3f797e9973ec95f8a8f9a119eeb0b14aff6eff32129988bc950493efe49f8bed
 - source: thudm-slime
   path: docs/en/advanced/policy-mismatch.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 5cee4b66dc494b1146a0bbc7b549e50037602972ef39b74feb40a97f05501f74
 - source: thudm-slime
   path: docs/en/advanced/delta-weight-sync.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 2c0f424890480c6d8465e3f0455542c2adc8495de0d7bad311149b0b342c9966
 - source: thudm-slime
   path: docs/en/advanced/fault-tolerance.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 1f120c4b4cd11d830dff3b0d4e50d676a293821a00f0370868a5cdedbc2e72ae
 - source: thudm-slime
   path: docs/en/advanced/observability.md
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 32da138c5ee1e9ef3ef642465a23896d349c885b5bb7cf0bacee8ee12a982f8b
 - source: thudm-slime
   path: tests/test_policy_loss.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 120c60a9e284b691dab54be58027eb67ae534d1e39cf416f4a2555a14834c589
 - source: thudm-slime
   path: tests/test_disk_delta_recovery.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 0d0753a32ba90f91dc51871f7c62ca474f99ad1a13385dcf94ac8f0e4c56c125
 - source: thudm-slime
   path: tests/test_training_recovery.py
-  commit: a4202e0595467d9374d9a68d45a34f45c3f8d230
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
   sha256: 84797613939502cca123d0903761f8e3ae19f350ae1aaf5f18bddaaeefc8c7b9
+- source: thudm-slime
+  path: slime/backends/sglang_utils/server_control.py
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: fa1f4041d3a6d9d97c8955ff37d143e8c8f40c12ff5d9bdbb88a64c51eddc224
+- source: thudm-slime
+  path: tests/test_server_control.py
+  commit: 8a53b680e82932dabb48cbfcd34f749854400857
+  sha256: f4d802544e73352c69812900f56e16766cd1ad3173f441445857a11a45751010
 ---
 
 # Slime：Megatron–SGLang 闭环、数据并行与恢复工程指南
@@ -109,13 +117,13 @@ sources:
 
 Slime 连接 Megatron 训练、SGLang 生成、reward/data 插件和 Ray 资源调度，支持同步、异步数据生产以及训练/推理分离。其 RL 迭代由策略训练、权重发布、服务和数据进度共同决定；这些不是独立包导入即可完成的功能。
 
-本页精读官方 main 固定提交，`setup.py` 版本为0.4.0。HCU公开/内部维护线可能采用不同 Megatron/SGLang patch 与模型插件，包版本也可能落后于分支名。先用 HCU-Knowledge 选活跃 HCU 维护线并锁 SHA；官方 main 的新恢复/权重能力不能直接当成该线已支持。
+2026-11-04 复核官方 main 固定 `8a53b680e82932dabb48cbfcd34f749854400857`，`setup.py` 版本为0.4.0。HCU公开/内部维护线可能采用不同 Megatron/SGLang patch 与模型插件，包版本也可能落后于分支名。先用 HCU-Knowledge 选活跃 HCU 维护线并锁 SHA；官方 main 的新恢复/权重能力不能直接当成该线已支持。
 
 ## 2. 工程组织与源码入口
 
 | 位置 | 职责、下一层 |
 | --- | --- |
-| [`train.py`](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/train.py) | 本次训练attempt生命周期、rollout/训练、save、权重更新与eval |
+| [`train.py`](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/train.py) | 本次训练attempt生命周期、rollout/训练、save、权重更新与eval |
 | `slime/ray/placement_group.py`、`actor_group.py` | Ray资源、训练actor创建、RPC分发与等待 |
 | `slime/ray/rollout.py` | RolloutManager；生成/数据转换/训练分片、健康及恢复衔接 |
 | `slime/backends/megatron_utils/actor.py` | MegatronTrainRayActor、model/ref/critic、训练与状态装卸 |
@@ -129,7 +137,7 @@ Slime 连接 Megatron 训练、SGLang 生成、reward/data 插件和 Ray 资源�
 
 ## 3. 安装与依赖栈
 
-[Quick Start](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/get_started/quick_start.md)提供已匹配Megatron/SGLang/TE的NVIDIA镜像和源码pin路线，AMD另有平台指南；不能直接把 `--gpus all`、CUDA镜像或 `/root`构建脚本用于HCU。使用HCU已匹配镜像及仓内HCU入口，写入/安装保持任务映射目录边界。
+[Quick Start](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/docs/en/get_started/quick_start.md)提供已匹配Megatron/SGLang/TE的NVIDIA镜像和源码pin路线，AMD另有平台指南；不能直接把 `--gpus all`、CUDA镜像或 `/root`构建脚本用于HCU。使用HCU已匹配镜像及仓内HCU入口，写入/安装保持任务映射目录边界。
 
 在已有兼容软件栈中，官方使用 `python -m pip install -e . --no-deps` 保留镜像依赖；先检查 `import slime, sglang, megatron.core` 的实际路径及设备。`requirements.txt`含直接依赖、straw queue、checksum/compression等，但不独立构建全部GPU栈。记录Megatron/Bridge、SGLang及patch、Torch/DTK、TE/attention/MoE库完整版本；同样的Slime pip版本不能证明它们相同。
 
@@ -138,6 +146,8 @@ Slime 连接 Megatron 训练、SGLang 生成、reward/data 插件和 Ray 资源�
 当前 SGLang adapter 同时识别旧 `ServerArgs` dataclass 与新 msgspec Struct，并按真实字段映射部分 graph/DSA 配置名；旧参数别名兼容不是所有 SGLang 版本可混装的证明。独立 `sglang_python_executable` 路径还要求服务子进程与父进程分别核对版本、环境和健康状态。新的运行环境准备保留 host allocation 等有效设置，不能照旧把整个 allocator 配置无差别删掉。
 
 本轮模型配方已扩大长响应预算并新增 GLM5-next 的 allgather-CP 白名单；它们仍是官方配置起点，不是 HCU 容量或精度实测。按实际 response+prompt 总长度核对 KV、CP、activation 和 logprob workspace，不把文档示例卡数或默认128K当任务必需值。
+
+当前 `requirements.txt` 把 `straw-queue` 下限由0.1.3提高到0.1.5。队列/rewind/session 恢复属于依赖合同，不能保留旧包只改训练脚本，也不能由版本满足推断已有 durable 快照；核对实际安装与联合 manifest。
 
 ## 4. 配方、启动与验证
 
@@ -164,9 +174,9 @@ actor是否在critic-onlywarmup中更新、训练offload/release、eval与save�
 - [packed/CP、PPO loss与有效分母](../topics/packed-cp-and-policy-loss.md)：token切分、无lossrank的autograd路径、sample/token目标及局部回归。
 - [disk delta发布与训练恢复边界](../topics/delta-publication-and-recovery.md)：新fullbaseline、版本/checksum、服务保留、jointcheckpoint与调度器职责。
 
-[并行/显存教程](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/parallelism-memory.md)解释TP/PP/CP/EP和distributedoptimizer/offload/recompute。MoE容量用总参数，不能用active参数算权重存储；EP不是在dense TP×PP×CP×DP身份外再乘一遍。Adam示例18byte/parameter只是特定精度的状态账本，activation、通信buffer、refcopy、KV和转换峰值另算。
+[并行/显存教程](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/docs/en/advanced/parallelism-memory.md)解释TP/PP/CP/EP和distributedoptimizer/offload/recompute。MoE容量用总参数，不能用active参数算权重存储；EP不是在dense TP×PP×CP×DP身份外再乘一遍。Adam示例18byte/parameter只是特定精度的状态账本，activation、通信buffer、refcopy、KV和转换峰值另算。
 
-profile分别看训练forward/backward、rolloutprefill/decode、reward、同步、hostcompression/copy、保存/队列等待。[观测文档](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/observability.md)给出metrics/trace入口，指标不能代替kernel上限或数值证据。模型recipe的卡数/并行只是起点，不是实测最低显存或HCU最优组合。
+profile分别看训练forward/backward、rolloutprefill/decode、reward、同步、hostcompression/copy、保存/队列等待。[观测文档](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/docs/en/advanced/observability.md)给出metrics/trace入口，指标不能代替kernel上限或数值证据。模型recipe的卡数/并行只是起点，不是实测最低显存或HCU最优组合。
 
 本轮恢复采用原 save 目录内的 rewind/session 协议；旧 branches/current 指针说明不再代表当前写入路径。缺少可用 rollout 快照时可能以 empty queue 恢复模型，并告警数据重放边界，见[联合恢复专题](../topics/delta-publication-and-recovery.md)。日志中“加载成功”必须分别解释模型状态、样本流和 retained serving。
 
@@ -183,7 +193,11 @@ Logprob/entropy chunking 当前通过单一 autograd 节点在 backward 重算�
 | 模型保存后仍重复训练 | jointcommit、model/optimizer/RNG、数据receipts/进度；完成一次train并不持久化 |
 | 重启找不到serving | Ray仍存活、sessionidentity、namedactor与原配置兼容性 |
 
-[当前官方容错](https://github.com/THUDM/slime/blob/a4202e0595467d9374d9a68d45a34f45c3f8d230/docs/en/advanced/fault-tolerance.md)保留serving/rollout数据以便**重新提交**训练，并在下次权重更新前处理failedengines；不自动重试训练job，也不接管scheduler/node故障。Ray或ServingCluster丢失要重建服务并从checkpoint恢复，不能承诺所有在途token逐位续接。
+[当前官方容错](https://github.com/THUDM/slime/blob/8a53b680e82932dabb48cbfcd34f749854400857/docs/en/advanced/fault-tolerance.md)保留serving/rollout数据以便**重新提交**训练，并在下次权重更新前处理failedengines；不自动重试训练job，也不接管scheduler/node故障。Ray或ServingCluster丢失要重建服务并从checkpoint恢复，不能承诺所有在途token逐位续接。
+
+当前恢复 wrapper 会检查 Megatron loader 的真实签名，只在支持时传 `restore_training_state=(optimizer is not None)`；较旧 API 不接收新 keyword。异步保存+训练 offload 对 mcore/nvrx 两种 writer 都先在 trainer 执行 CPU staging，磁盘写与分布式 finalize 仍异步，详见[恢复专题](../topics/delta-publication-and-recovery.md)。
+
+外部 SGLang engine 跨运行存活时，注册现在只在409 `WORKER_ALREADY_EXISTS` **且 GET 列表中全部请求字段匹配**时保留旧注册；worker_type/bootstrap_port 不同仍失败。注册记录不是健康证据。`get_live_router_workers` 独立探测并剔除失败worker，abort/drain 还检查 core/disagg/queues，控制面不可达不按零请求处理；全部服务确认 idle 后才允许继续。固定测试覆盖重复注册不匹配、PD队列和部分 drain 失败，本轮仅阅读。
 
 ## 9. 文档、PR和持续维护
 

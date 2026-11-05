@@ -9,46 +9,47 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/observability/profiler.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 6132d3da9f53a8aa5d8ca389dd65dcb59bf12c44bb5b1ad71a54fc52dc97646a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 190e2e3b42af426de9f89c35f5ab0a38e05ac501da3c41f17bea953e15644ebc
 - source: pytorch-torchtitan
   path: torchtitan/observability/METRICS.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: b65315a4ad2ca68234e7b84bf5a6f4628fa993097830e462cb65176adbf089a8
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: ab58719b87a55a08bc9de86cdd1620905f9bcb99d74fca5260fa68c2a8038f69
 - source: pytorch-torchtitan
   path: torchtitan/observability/structured_logger/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 3fd386d188a8ba3245c1ac763c806ae5fa1d44e0b524382a8bca7e129dca0e23
 - source: pytorch-torchtitan
   path: torchtitan/trainer.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: c49922cf3d47918901135fc0b798141479cb16b24fb1004b19b255a663c13288
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 1e03e753238c07818a9b238b9264001cd3223528e5d18e4316eb88be14175135
 - source: pytorch-torchtitan
   path: torchtitan/distributed/PARALLELISM_CONTEXT.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 7df6f250d92b8a4bf37557a330a571cd4273062fce08a2f3268abfce7ee58916
 - source: pytorch-torchtitan
   path: docs/debugging.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0938badc6722b624d4c07d6e2a620c02fa9cf4bb0e7b26b9d5de77c8b0586b0a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 523e0d62eca05f837e9ec4da6530a60e4cd95a8f8f55d7f2a8a0f8b1d542fd49
 - source: pytorch-torchtitan
   path: tests/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0872f733f18e85e085802fff3813cd1ee359ec1cc10b8d5929642e62d4c4e712
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 73f9a9597a0aaeef657c103ec1cc544375c0e9229f49a9a50abcd8d3a02af248
 - source: pytorch-torchtitan
-  path: torchtitan/distributed/cuda_graph.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 29822760e2d35f6e816ae0b9655483b0ac366ff2a111bfc208bf6440e0b326b7
+  path: torchtitan/distributed/accelerator_graph.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: dec500ca70df82c8c8388b41e49970cd9dbbdd2a1c287217c4783827b576e9d5
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/optim.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 6303e04a5cac5781d3b9ac76fafb9ceaf509824b84e189d2aa1362f3cf3ffe24
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: b93bb590ff7c7eec2d1bd9c2668ad668bf3bee1e944fbe6b0e0415b2474e154b
 ---
 # TorchTitan 性能采集、TraceLens 联动与问题定位
 
@@ -76,6 +77,14 @@ Trainer 的 metrics 窗口会绕开一些 checkpoint/validation 开销；因此�
 
 每个实际存在的并行域选择至少两个具有代表性的 rank，并覆盖可能慢的 stage、专家和节点；资源只有一个成员时注明不可比较。保持同一迭代窗口、真实 rank map 与采样负载，避免把不同轮次的 trace 直接叠加。
 
+## Cuspy、输出格式与缺失标注
+
+新增 `profiler.cuspy: CuspyProfilerConfig | None`，默认 None 继续 Kineto。启用 Cuspy 要求该 Torch 暴露 CuspyConfig、可用 CUDA/CUPTI 及相应 encoder；不满足会报具体原因。可采 CUDA sync、environment counters、Graph dependency/event node ID 和 PM sampling，均不是 HCU 已支持的采集路径。
+
+`trace_format="json"` 默认输出 `rank<rank>_trace.json.gz`；`"pftrace"` 输出二进制 `rank<rank>_trace.pftrace.gz`，还要求 native Perfetto encoder。TrainFlow 当前 Torch trace/固定 TraceLens 消费者按 JSON 契约工作，不能改扩展名后直接解析 pftrace。PM 指标名需按实机枚举，lookback 要覆盖 warmup+active，否则早期样本丢失；采样间隔/窗口还受配置检查。
+
+`record_py_stacks` 把 capture 时的 kernel Python launch stacks 写为独立 `rank<rank>_cuda_graph_py_stacks.json.gz`，键为 `(graph id << 32) | graph node id`。没有 CUDA graph 或 annotation 能力会警告，缺标注不能解释为没有 kernel；sidecar 不是训练 trace 或调用耗时本身。
+
 ## 与 TraceLens 和算子流程衔接
 
 1. 保存原始 trace 与环境上下文；由 TrainFlow 的 Torch trace / TraceLens 入口解析，保留压缩原件。若具体工具只接收解压 JSON，解压到任务缓存，不重复登记共享 Wiki。
@@ -101,23 +110,23 @@ TorchTitan 自带 MFU/峰值表面向它支持的卡型；HCU 应使用已核实
 
 ## 当前启动/捕获窗口的额外事件
 
-首次optimizer update有一次CUDA等待和empty_cache；每个Graph wrapper首次capture前也释放未使用缓存。它们保留live tensor与Graph pool，不能据reserved短时下降推导模型常驻量减少。Graph的DEBUG memory日志按wrapper name与boundary记录allocated/reserved/active/inactive_split、peak和设备free；这些字段的层次不同，采样需对应同一阶段。wrapper命名可区分forward_backward、optimizer、validation，annotation由profiler导出路径消费。
+首次 optimizer update 有一次当前已初始化设备的等待和 empty_cache；每个Graph wrapper首次capture前也释放未使用缓存。它们保留live tensor与Graph pool，不能据reserved短时下降推导模型常驻量减少。Graph的DEBUG memory日志按wrapper name与boundary记录allocated/reserved/active/inactive_split、peak和设备free；这些字段的层次不同，采样需对应同一阶段。wrapper命名可区分forward_backward、optimizer、validation，annotation由profiler导出路径消费。
 
 共享eval pool可能使warmup阶段额外执行validation并延后训练capture；性能窗口同时保存capture/warmup状态与validation次数。当前profiler另为Neuron加入PrivateUse1活动和with_stack，不能把该分支误当作HCU已获得新的profiler后端；HCU证据仍按现场Torch/DTK采集链确认。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/observability/profiler.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/observability/profiler.py)
-- [torchtitan/observability/METRICS.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/observability/METRICS.md)
-- [torchtitan/observability/structured_logger/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/observability/structured_logger/README.md)
-- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/trainer.py)
-- [torchtitan/distributed/PARALLELISM_CONTEXT.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/PARALLELISM_CONTEXT.md)
-- [docs/debugging.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/docs/debugging.md)
-- [tests/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/README.md)
+- [torchtitan/observability/profiler.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/observability/profiler.py)
+- [torchtitan/observability/METRICS.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/observability/METRICS.md)
+- [torchtitan/observability/structured_logger/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/observability/structured_logger/README.md)
+- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/trainer.py)
+- [torchtitan/distributed/PARALLELISM_CONTEXT.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/PARALLELISM_CONTEXT.md)
+- [docs/debugging.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/docs/debugging.md)
+- [tests/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/README.md)
 
 ## 本次补充的实现与测试依据
 
-- [torchtitan/distributed/cuda_graph.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/cuda_graph.py)
-- [torchtitan/components/optim/optim.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/components/optim/optim.py)
+- [torchtitan/distributed/accelerator_graph.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/accelerator_graph.py)
+- [torchtitan/components/optim/optim.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/components/optim/optim.py)

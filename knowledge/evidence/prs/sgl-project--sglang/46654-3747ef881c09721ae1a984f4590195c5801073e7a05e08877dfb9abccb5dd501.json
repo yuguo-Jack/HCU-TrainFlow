@@ -1,0 +1,519 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "0e39f33f91d0d2b04e4ad62c0af2448596ecf0d4871f8e548219c7b516991507",
+      "isPrivate": false,
+      "numbers": [
+        46662,
+        46660,
+        46659,
+        46658,
+        46657,
+        46656,
+        46655,
+        46654
+      ],
+      "observed_at": "2026-11-04T17:00:43.285683+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4921,
+        "resetAt": "2026-11-04T17:50:07Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "e6ca9285e4117b95efcf897190d3387c10fec65b",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "[by Claude Code]\n\n## Motivation\n\n`--prefill-decode-interval N` holds back the next prefill for N scheduler rounds after each prefill batch, so requests that are already decoding get N decode steps in a row and keep a steady inter-token latency. The counter counts scheduler loop iterations, not decode steps. When no request is decoding, an iteration has nothing to run: it polls for new requests, does idle housekeeping, and goes round again. Chunked prefill splits a long prompt into chunks (8,192 tokens with `--chunked-prefill-size 8192`), and the scheduler treats each chunk as a prefill batch. So a long prompt that reaches an idle server waits through about N empty iterations after every chunk before its next chunk is scheduled, and the GPUs sit idle the whole time. There is no decode to protect, so the wait only delays the prompt.\n\nThis PR skips the interval when the running batch is empty or prefill-only (requests that generate no tokens), so the next chunk is scheduled at once. With DP attention the interval is unchanged, because its cadence is synchronized across DP ranks and a peer rank may still be decoding. Whenever a request is decoding, the scheduler behaves exactly as before. What each forward computes does not change in any case; only the time at which the next chunk is admitted moves.\n\nThe interval is off by default, but deployments do turn it on: SGLang sets 22 for Qwen3-VL on large Hopper GPUs, and the DeepSeek-V4.1 cookbook's agentic deployments set it as high as 192. At low concurrency, a session's next long prompt often arrives with nothing else decoding. This follows #44001, which added `--prefill-decode-interval-min-bs` to apply the interval only at or above a running-batch size. Setting that flag to 1 avoids this case without DP attention, but it is opt-in and also changes DP behavior. With this PR the idle case is handled at the default `min_bs = 0`, and the flag keeps controlling the small-batch policy.\n\n**Impact**\n\n- **Performance (measured):** DeepSeek-V4.1-Flash, TP4 on 4x B200, `--prefill-decode-interval 96`, `--chunked-prefill-size 8192`. A 122,880-token prompt (15 chunks) with nothing cached on an otherwise idle server: TTFT **2.546 s → 1.187 s (−53%)**, 6 runs per arm (ranges 2.516-2.577 s and 1.182-1.205 s). That is 170 → 79 ms per chunk. Before, a GPU trace shows 14 idle gaps of 97-107 ms between the chunks on every TP rank; after, no gap over 10 ms on any rank.\n- **The wait scales with N:** at `--prefill-decode-interval 192` the same prompt takes 3.858 s on main (3 runs, 3.831-3.895 s), with 14 gaps of 196-211 ms. With this PR the interval is not consulted while nothing decodes, so N should not matter here (expected ~1.19 s; this PR was measured at 96 only).\n- **Decode always running (concurrency 16):** no difference beyond run-to-run noise. Pooled over 5 runs per arm: output throughput +0.6%, median ITL +0.1%. In every run the server logged the same number of prefill batches in both arms, and only the run's first batch (and the benchmark's warm-up request) was admitted with nothing decoding.\n- **Accuracy:** unchanged by construction: the change only decides when the next prefill batch is admitted. Unit tests below.\n\n## Modifications\n\n**+7 / −1 runtime code (1 file), +48 / −6 tests (1 file), +2 / −2 flag help text (1 file) and +2 / −2 docs (1 file).** No kernel changes.\n\n- `Scheduler._should_defer_prefill` (`python/sglang/srt/managers/scheduler.py`): also clears the interval when the running batch is empty or prefill-only, unless `require_mlp_sync` is set (DP attention). The existing `--prefill-decode-interval-min-bs` check is unchanged.\n- Help text for `--prefill-decode-interval` and `--prefill-decode-interval-min-bs` (`python/sglang/srt/arg_groups/fields/schedule.py`, `docs/docs/advanced_features/server_arguments.mdx`): says the interval is skipped while nothing decodes without DP attention. `min-bs 0` now reads \"at any batch size\" instead of \"always\".\n- Tests (`test/registered/unit/managers/test_scheduler_prefill_decode_interval.py`): the fake running batch gains `is_empty` and `is_prefill_only`, and four cases are added (next section).\n\n## Accuracy Tests\n\nThe change touches no forward or sampling code. Unit tests (CPU, registered in `base-a-test-cpu`), each with the bug it catches:\n\n| Test | Catches |\n|---|---|\n| `test_empty_running_batch_does_not_defer` | the idle wait itself (fails on main) |\n| `test_prefill_only_running_batch_does_not_defer` | waiting behind prefill-only requests (fails on main); dropping the `is_prefill_only` check |\n| `test_dp_defers_without_local_decode` | skipping the interval under DP attention (dropping `not self.require_mlp_sync`) |\n| `test_single_decoding_request_keeps_interval` | skipping the interval for a small batch that is still decoding (for example treating `batch_size() <= 1` as idle) |\n\nEach test fails on the mutant named in its row, and the first two fail on main's `_should_defer_prefill`. The full file passes (7/7), and so do the scheduler tests that drive this method (`test_scheduler_chunked_req_gate.py`, `test_scheduler_dp_converted_batch_full.py`, `test_scheduler_hicache_events.py`) and `test_server_args_docs_coverage.py`.\n\n## Speed Tests and Profiling\n\n**Where on the curve, and why a static workload.** The change only acts while nothing is decoding, which happens at the low-concurrency end of the curve (and between bursts at any concurrency): a session's next long prompt arrives at an idle server and is prefilled chunk by chunk. A single long prompt on an idle server isolates exactly that wait. Whether the interval applies depends only on whether a decode batch exists, not on the request mix, so an AgentX replay is not needed; the concurrency-16 control covers the case where decode is always running.\n\n**Setup.** One node with 4x B200. Image `lmsysorg/sglang:nightly-dev-20261024-5994c559`, whose interval code is identical to current main. \"main\" is the image as shipped. \"This PR\" is the same image with this PR's `scheduler.py` change applied. Blocks ran in the order main, PR, PR, main, with a fresh server per block. Server flags are those of the public InferenceX B200 TP4 recipe for this model, with two changes: `--prefill-decode-interval 96` instead of 192, and real rather than simulated speculative acceptance.\n\n```bash\nSGLANG_DEFAULT_THINKING=1 SGLANG_DSV41_REASONING_EFFORT=high \\\nSGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \\\nSGLANG_OPT_DSV41_MEGA_MHC_PREFILL=1 NCCL_CUMEM_ENABLE=1 NCCL_MNNVL_ENABLE=1 NVSHMEM_REMOTE_TRANSPORT=none \\\npython3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --tensor-parallel-size 4 \\\n  --chunked-prefill-size 8192 --prefill-decode-interval 96 \\\n  --dsv4-attn-backend trtllm --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.76 --max-running-requests 16 \\\n  --schedule-policy shortest-prefill-first --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \\\n  --swa-prefix-tails 256 --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-decode 64 \\\n  --expert-parallel-size 1 --enable-metrics --reasoning-parser auto --tool-call-parser auto \\\n  --tokenizer-backend fastokens --trust-remote-code --watchdog-timeout 3600\n```\n\n**Prompt with nothing cached on an idle server.** After a warm-up (three short prompts, one 16K and one 120K prompt), three prompts of 122,880 random token ids are sent one at a time, with `/flush_cache` before each. Every response reported `cached_tokens == 0`. Client wall time with `max_new_tokens=1` is the TTFT:\n\n```python\nimport random, time, requests\n\nURL = \"http://127.0.0.1:30000\"\n\ndef cold_ttft(seed, n=122880):\n    rng = random.Random(seed)\n    ids = [rng.randrange(1000, 100000) for _ in range(n)]\n    requests.post(f\"{URL}/flush_cache\").raise_for_status()\n    time.sleep(2)\n    t = time.perf_counter()\n    r = requests.post(f\"{URL}/generate\", json={\"input_ids\": ids, \"sampling_params\": {\"max_new_tokens\": 1, \"temperature\": 0}})\n    dt = time.perf_counter() - t\n    assert r.json()[\"meta_info\"][\"cached_tokens\"] == 0\n    return dt\n\nprint([round(cold_ttft(seed), 4) for seed in (1, 2, 3)])\n```\n\n| Block | Arm | TTFT, seeds 1 / 2 / 3 (s) | Mean (s) |\n|---|---|---|---|\n| 1 | main | 2.526 / 2.566 / 2.577 | 2.556 |\n| 2 | this PR | 1.182 / 1.205 / 1.187 | 1.191 |\n| 3 | this PR | 1.182 / 1.183 / 1.184 | 1.183 |\n| 4 | main | 2.516 / 2.542 / 2.550 | 2.536 |\n| | **main** | | **2.546** |\n| | **this PR** | | **1.187 (−53.4%)** |\n\nPer chunk (TTFT / 15): 169.7 ms → 79.1 ms.\n\n**Where the time goes.** For each block, one more prompt (seed 4) was run under `/start_profile` with `{\"activities\": [\"GPU\"]}`. GPU idle is the time between consecutive kernels in each TP rank's trace. The profiler adds 0.1-0.3 s to that prompt's TTFT.\n\n| Block | Arm | Window (ms) | GPU busy (ms) | Gaps > 10 ms between chunks |\n|---|---|---|---|---|\n| 1 | main | 2676 | 1147 | 14, 99-105 ms each, 1.43-1.44 s in total (every rank) |\n| 2 | this PR | 1234 | 1162 | none on any rank (largest on rank 0: 1.6 ms) |\n| 3 | this PR | 1247 | 1145 | none on any rank (largest on rank 0: 1.5 ms) |\n| 4 | main | 2674 | 1144 | 14, 97-107 ms each, 1.42 s in total (every rank) |\n\nThe GPU work for the prompt is the same in both arms, about 1.15 s. On main, each of the 14 waits between chunks is ~96 empty scheduler iterations at ~1 ms each. At `--prefill-decode-interval 192` (main, same node, seeds 1-3): 3.895 / 3.847 / 3.831 s, with 14 gaps of 196-211 ms on rank 0. The wait doubles with N.\n\n**Decode always running.** `python3 -m sglang.bench_serving --backend sglang --dataset-name random-ids --random-input-len 4096 --random-output-len 1024 --random-range-ratio 1.0 --num-prompts 64 --max-concurrency 16 --seed 1`, once per block 1-4 on that block's server. Two more blocks (main, then this PR) ran it four times each with `--warmup-requests 0`. Their first run, which also captures graphs lazily, is excluded. Runs 2-4 reuse the prefix cache that the earlier runs on the same server left behind, so compare them by run index only.\n\n| Run | main: tok/s, median ITL (ms), accept length | this PR: tok/s, median ITL (ms), accept length |\n|---|---|---|\n| block 1 vs 2 | 2029.9, 1.33, 4.70 | 2152.3, 1.22, 5.22 |\n| block 4 vs 3 | 2101.5, 1.24, 5.08 | 2079.3, 1.22, 5.21 |\n| extra blocks, run 2 | 2478.4, 1.53, 4.99 | 2184.7, 1.59, 4.70 |\n| extra blocks, run 3 | 3229.6, 1.99, 5.05 | 3647.6, 1.99, 4.83 |\n| extra blocks, run 4 | 4648.3, 1.97, 5.07 | 4507.2, 2.05, 4.86 |\n| **mean** | **2897.6, 1.612** | **2914.2 (+0.6%), 1.614 (+0.1%)** |\n\nPaired runs differ by −12% to +13%, and the sign flips. The differences follow the speculative acceptance length, which varies between 4.70 and 5.22 within one arm on these random-token prompts; this PR does not touch speculative decoding. The scheduler logs show where this PR could act: in every run, both arms logged the same number of prefill batches, and only the first batch of the run (plus the benchmark's warm-up request, when there is one) was admitted with nothing decoding.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #40872035803](https://github.com/sgl-project/sglang/actions/runs/40872035803)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #40872035683](https://github.com/sgl-project/sglang/actions/runs/40872035683)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:white_check_mark: [Run #40872035945](https://github.com/sgl-project/sglang/actions/runs/40872035945)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mintlify"
+            },
+            "body": "<!-- mintlify-fork-preview-approval -->\n### Preview approval required\n\nThis pull request comes from a fork, so Mintlify won't build a preview until someone with write access approves commit `a89afe5`.\n\n[Approve preview](https://github.com/sgl-project/sglang/pull/46654/checks?check_run_id=123441242913)",
+            "createdAt": "2026-10-26T20:01:36Z",
+            "databaseId": 6426020301,
+            "updatedAt": "2026-10-29T12:17:24Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6426020301"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-test test/registered/unit/managers/test_scheduler_prefill_decode_interval.py test/registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py test/registered/vlm/test_vision_openai_server_a.py test/registered/e2e/quantization/test_awq.py test/registered/unit/server_args/test_server_args_docs_coverage.py test/registered/pp/test_pp_single_node_extra.py test/registered/perf/models/test_vlms_perf.py test/registered/vlm/test_encoder_dp.py test/registered/accuracy/models/test_vlms_mmmu_eval.py\r\n",
+            "createdAt": "2026-10-27T08:55:34Z",
+            "databaseId": 6437659726,
+            "updatedAt": "2026-10-27T08:55:34Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6437659726"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "🚀 `ubuntu-latest` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40476997967) <!--rrt:0:done-->\n```\ncd test/ && python3 registered/unit/managers/test_scheduler_prefill_decode_interval.py\ncd test/ && python3 registered/unit/server_args/test_server_args_docs_coverage.py\n```\n\n🚀 `4-gpu-h100` (3 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40477013966) <!--rrt:1:done-->\n```\ncd test/ && python3 registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py\ncd test/ && python3 registered/pp/test_pp_single_node_extra.py\ncd test/ && python3 registered/vlm/test_encoder_dp.py\n```\n\n🚀 `1-gpu-h100` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40477029842) <!--rrt:2:done-->\n```\ncd test/ && python3 registered/vlm/test_vision_openai_server_a.py\ncd test/ && python3 registered/e2e/quantization/test_awq.py\n```\n\n🚀 `2-gpu-h100` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40477045164) <!--rrt:3:done-->\n```\ncd test/ && python3 registered/perf/models/test_vlms_perf.py\ncd test/ && python3 registered/accuracy/models/test_vlms_mmmu_eval.py\n```",
+            "createdAt": "2026-10-27T08:55:58Z",
+            "databaseId": 6437667308,
+            "updatedAt": "2026-10-27T10:01:45Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6437667308"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "@Oasis-Git could you review this? thanks!",
+            "createdAt": "2026-10-27T11:19:20Z",
+            "databaseId": 6440603166,
+            "updatedAt": "2026-10-27T11:19:20Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6440603166"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/tag-and-rerun-ci",
+            "createdAt": "2026-10-29T12:17:54Z",
+            "databaseId": 6496447681,
+            "updatedAt": "2026-10-29T12:17:54Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6496447681"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "[by Claude Code] I've started babysitting the NVIDIA CI of this PR. I'll check it every 30 minutes until all NV pipelines pass. If a relevant job fails, I may rerun it, merge the latest `main` into this branch, push a small test-only fix, fix the PR title if the title check fails, or post a note here.\n\nAnyone can stop me at any time: just post a comment asking me to stop (for example, `stop babysitting`). I'll stop at my next check, within 30 minutes, and take no further action on this PR.\n\n<!-- sglang-pr-babysit:start -->\n",
+            "createdAt": "2026-10-29T12:20:03Z",
+            "databaseId": 6496497944,
+            "updatedAt": "2026-10-29T12:20:03Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6496497944"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-10-29T21:00:30Z",
+            "databaseId": 6508212188,
+            "updatedAt": "2026-10-29T21:00:30Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6508212188"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-10-30T00:30:45Z",
+            "databaseId": 6511876880,
+            "updatedAt": "2026-10-30T00:30:45Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6511876880"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-10-30T07:00:39Z",
+            "databaseId": 6516958687,
+            "updatedAt": "2026-10-30T07:00:39Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6516958687"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-10-30T10:40:40Z",
+            "databaseId": 6520719591,
+            "updatedAt": "2026-10-30T10:40:40Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6520719591"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "/rerun-failed-ci",
+            "createdAt": "2026-10-30T22:00:32Z",
+            "databaseId": 6534411466,
+            "updatedAt": "2026-10-30T22:00:32Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6534411466"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "[by Claude Code] All NV pipelines have passed.",
+            "createdAt": "2026-10-31T00:30:41Z",
+            "databaseId": 6536526263,
+            "updatedAt": "2026-10-31T00:30:41Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6536526263"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "Merge now since this is a low-risk small change, only affects it when prefill_decode_interval is used (not enabled by default). CI has passed.",
+            "createdAt": "2026-11-02T12:37:54Z",
+            "databaseId": 6577341711,
+            "updatedAt": "2026-11-02T12:37:54Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6577341711"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYgKRQ8=",
+          "hasNextPage": false
+        },
+        "totalCount": 13
+      },
+      "headRefOid": "a89afe5b5439dc67b8168f2ac2bb1d944da66a9c",
+      "headRepository": {
+        "nameWithOwner": "akhilg-nv/sglang"
+      },
+      "mergeCommit": {
+        "oid": "b55350bb93b5a4079749e370603f8b34863a9d64"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-02T12:38:00Z",
+      "number": 46654,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5662271848,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-27T04:38:25Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#pullrequestreview-5662271848"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5736650801,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-02T12:37:13Z",
+            "url": "https://github.com/sgl-project/sglang/pull/46654#pullrequestreview-5736650801"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wMlQxMjozNzoxM1q0MjAyNi0xMS0wMlQxMjozNzoxM1rPAAAAAVXuWDE=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Fix] scheduler: Skip --prefill-decode-interval when nothing is decoding",
+      "updatedAt": "2026-11-02T12:38:00Z",
+      "url": "https://github.com/sgl-project/sglang/pull/46654"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "e6ca9285e4117b95efcf897190d3387c10fec65b"
+    },
+    "body": "[by Claude Code]\n\n## Motivation\n\n`--prefill-decode-interval N` holds back the next prefill for N scheduler rounds after each prefill batch, so requests that are already decoding get N decode steps in a row and keep a steady inter-token latency. The counter counts scheduler loop iterations, not decode steps. When no request is decoding, an iteration has nothing to run: it polls for new requests, does idle housekeeping, and goes round again. Chunked prefill splits a long prompt into chunks (8,192 tokens with `--chunked-prefill-size 8192`), and the scheduler treats each chunk as a prefill batch. So a long prompt that reaches an idle server waits through about N empty iterations after every chunk before its next chunk is scheduled, and the GPUs sit idle the whole time. There is no decode to protect, so the wait only delays the prompt.\n\nThis PR skips the interval when the running batch is empty or prefill-only (requests that generate no tokens), so the next chunk is scheduled at once. With DP attention the interval is unchanged, because its cadence is synchronized across DP ranks and a peer rank may still be decoding. Whenever a request is decoding, the scheduler behaves exactly as before. What each forward computes does not change in any case; only the time at which the next chunk is admitted moves.\n\nThe interval is off by default, but deployments do turn it on: SGLang sets 22 for Qwen3-VL on large Hopper GPUs, and the DeepSeek-V4.1 cookbook's agentic deployments set it as high as 192. At low concurrency, a session's next long prompt often arrives with nothing else decoding. This follows #44001, which added `--prefill-decode-interval-min-bs` to apply the interval only at or above a running-batch size. Setting that flag to 1 avoids this case without DP attention, but it is opt-in and also changes DP behavior. With this PR the idle case is handled at the default `min_bs = 0`, and the flag keeps controlling the small-batch policy.\n\n**Impact**\n\n- **Performance (measured):** DeepSeek-V4.1-Flash, TP4 on 4x B200, `--prefill-decode-interval 96`, `--chunked-prefill-size 8192`. A 122,880-token prompt (15 chunks) with nothing cached on an otherwise idle server: TTFT **2.546 s → 1.187 s (−53%)**, 6 runs per arm (ranges 2.516-2.577 s and 1.182-1.205 s). That is 170 → 79 ms per chunk. Before, a GPU trace shows 14 idle gaps of 97-107 ms between the chunks on every TP rank; after, no gap over 10 ms on any rank.\n- **The wait scales with N:** at `--prefill-decode-interval 192` the same prompt takes 3.858 s on main (3 runs, 3.831-3.895 s), with 14 gaps of 196-211 ms. With this PR the interval is not consulted while nothing decodes, so N should not matter here (expected ~1.19 s; this PR was measured at 96 only).\n- **Decode always running (concurrency 16):** no difference beyond run-to-run noise. Pooled over 5 runs per arm: output throughput +0.6%, median ITL +0.1%. In every run the server logged the same number of prefill batches in both arms, and only the run's first batch (and the benchmark's warm-up request) was admitted with nothing decoding.\n- **Accuracy:** unchanged by construction: the change only decides when the next prefill batch is admitted. Unit tests below.\n\n## Modifications\n\n**+7 / −1 runtime code (1 file), +48 / −6 tests (1 file), +2 / −2 flag help text (1 file) and +2 / −2 docs (1 file).** No kernel changes.\n\n- `Scheduler._should_defer_prefill` (`python/sglang/srt/managers/scheduler.py`): also clears the interval when the running batch is empty or prefill-only, unless `require_mlp_sync` is set (DP attention). The existing `--prefill-decode-interval-min-bs` check is unchanged.\n- Help text for `--prefill-decode-interval` and `--prefill-decode-interval-min-bs` (`python/sglang/srt/arg_groups/fields/schedule.py`, `docs/docs/advanced_features/server_arguments.mdx`): says the interval is skipped while nothing decodes without DP attention. `min-bs 0` now reads \"at any batch size\" instead of \"always\".\n- Tests (`test/registered/unit/managers/test_scheduler_prefill_decode_interval.py`): the fake running batch gains `is_empty` and `is_prefill_only`, and four cases are added (next section).\n\n## Accuracy Tests\n\nThe change touches no forward or sampling code. Unit tests (CPU, registered in `base-a-test-cpu`), each with the bug it catches:\n\n| Test | Catches |\n|---|---|\n| `test_empty_running_batch_does_not_defer` | the idle wait itself (fails on main) |\n| `test_prefill_only_running_batch_does_not_defer` | waiting behind prefill-only requests (fails on main); dropping the `is_prefill_only` check |\n| `test_dp_defers_without_local_decode` | skipping the interval under DP attention (dropping `not self.require_mlp_sync`) |\n| `test_single_decoding_request_keeps_interval` | skipping the interval for a small batch that is still decoding (for example treating `batch_size() <= 1` as idle) |\n\nEach test fails on the mutant named in its row, and the first two fail on main's `_should_defer_prefill`. The full file passes (7/7), and so do the scheduler tests that drive this method (`test_scheduler_chunked_req_gate.py`, `test_scheduler_dp_converted_batch_full.py`, `test_scheduler_hicache_events.py`) and `test_server_args_docs_coverage.py`.\n\n## Speed Tests and Profiling\n\n**Where on the curve, and why a static workload.** The change only acts while nothing is decoding, which happens at the low-concurrency end of the curve (and between bursts at any concurrency): a session's next long prompt arrives at an idle server and is prefilled chunk by chunk. A single long prompt on an idle server isolates exactly that wait. Whether the interval applies depends only on whether a decode batch exists, not on the request mix, so an AgentX replay is not needed; the concurrency-16 control covers the case where decode is always running.\n\n**Setup.** One node with 4x B200. Image `lmsysorg/sglang:nightly-dev-20261024-5994c559`, whose interval code is identical to current main. \"main\" is the image as shipped. \"This PR\" is the same image with this PR's `scheduler.py` change applied. Blocks ran in the order main, PR, PR, main, with a fresh server per block. Server flags are those of the public InferenceX B200 TP4 recipe for this model, with two changes: `--prefill-decode-interval 96` instead of 192, and real rather than simulated speculative acceptance.\n\n```bash\nSGLANG_DEFAULT_THINKING=1 SGLANG_DSV41_REASONING_EFFORT=high \\\nSGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \\\nSGLANG_OPT_DSV41_MEGA_MHC_PREFILL=1 NCCL_CUMEM_ENABLE=1 NCCL_MNNVL_ENABLE=1 NVSHMEM_REMOTE_TRANSPORT=none \\\npython3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --tensor-parallel-size 4 \\\n  --chunked-prefill-size 8192 --prefill-decode-interval 96 \\\n  --dsv4-attn-backend trtllm --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.76 --max-running-requests 16 \\\n  --schedule-policy shortest-prefill-first --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \\\n  --swa-prefix-tails 256 --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-decode 64 \\\n  --expert-parallel-size 1 --enable-metrics --reasoning-parser auto --tool-call-parser auto \\\n  --tokenizer-backend fastokens --trust-remote-code --watchdog-timeout 3600\n```\n\n**Prompt with nothing cached on an idle server.** After a warm-up (three short prompts, one 16K and one 120K prompt), three prompts of 122,880 random token ids are sent one at a time, with `/flush_cache` before each. Every response reported `cached_tokens == 0`. Client wall time with `max_new_tokens=1` is the TTFT:\n\n```python\nimport random, time, requests\n\nURL = \"http://127.0.0.1:30000\"\n\ndef cold_ttft(seed, n=122880):\n    rng = random.Random(seed)\n    ids = [rng.randrange(1000, 100000) for _ in range(n)]\n    requests.post(f\"{URL}/flush_cache\").raise_for_status()\n    time.sleep(2)\n    t = time.perf_counter()\n    r = requests.post(f\"{URL}/generate\", json={\"input_ids\": ids, \"sampling_params\": {\"max_new_tokens\": 1, \"temperature\": 0}})\n    dt = time.perf_counter() - t\n    assert r.json()[\"meta_info\"][\"cached_tokens\"] == 0\n    return dt\n\nprint([round(cold_ttft(seed), 4) for seed in (1, 2, 3)])\n```\n\n| Block | Arm | TTFT, seeds 1 / 2 / 3 (s) | Mean (s) |\n|---|---|---|---|\n| 1 | main | 2.526 / 2.566 / 2.577 | 2.556 |\n| 2 | this PR | 1.182 / 1.205 / 1.187 | 1.191 |\n| 3 | this PR | 1.182 / 1.183 / 1.184 | 1.183 |\n| 4 | main | 2.516 / 2.542 / 2.550 | 2.536 |\n| | **main** | | **2.546** |\n| | **this PR** | | **1.187 (−53.4%)** |\n\nPer chunk (TTFT / 15): 169.7 ms → 79.1 ms.\n\n**Where the time goes.** For each block, one more prompt (seed 4) was run under `/start_profile` with `{\"activities\": [\"GPU\"]}`. GPU idle is the time between consecutive kernels in each TP rank's trace. The profiler adds 0.1-0.3 s to that prompt's TTFT.\n\n| Block | Arm | Window (ms) | GPU busy (ms) | Gaps > 10 ms between chunks |\n|---|---|---|---|---|\n| 1 | main | 2676 | 1147 | 14, 99-105 ms each, 1.43-1.44 s in total (every rank) |\n| 2 | this PR | 1234 | 1162 | none on any rank (largest on rank 0: 1.6 ms) |\n| 3 | this PR | 1247 | 1145 | none on any rank (largest on rank 0: 1.5 ms) |\n| 4 | main | 2674 | 1144 | 14, 97-107 ms each, 1.42 s in total (every rank) |\n\nThe GPU work for the prompt is the same in both arms, about 1.15 s. On main, each of the 14 waits between chunks is ~96 empty scheduler iterations at ~1 ms each. At `--prefill-decode-interval 192` (main, same node, seeds 1-3): 3.895 / 3.847 / 3.831 s, with 14 gaps of 196-211 ms on rank 0. The wait doubles with N.\n\n**Decode always running.** `python3 -m sglang.bench_serving --backend sglang --dataset-name random-ids --random-input-len 4096 --random-output-len 1024 --random-range-ratio 1.0 --num-prompts 64 --max-concurrency 16 --seed 1`, once per block 1-4 on that block's server. Two more blocks (main, then this PR) ran it four times each with `--warmup-requests 0`. Their first run, which also captures graphs lazily, is excluded. Runs 2-4 reuse the prefix cache that the earlier runs on the same server left behind, so compare them by run index only.\n\n| Run | main: tok/s, median ITL (ms), accept length | this PR: tok/s, median ITL (ms), accept length |\n|---|---|---|\n| block 1 vs 2 | 2029.9, 1.33, 4.70 | 2152.3, 1.22, 5.22 |\n| block 4 vs 3 | 2101.5, 1.24, 5.08 | 2079.3, 1.22, 5.21 |\n| extra blocks, run 2 | 2478.4, 1.53, 4.99 | 2184.7, 1.59, 4.70 |\n| extra blocks, run 3 | 3229.6, 1.99, 5.05 | 3647.6, 1.99, 4.83 |\n| extra blocks, run 4 | 4648.3, 1.97, 5.07 | 4507.2, 2.05, 4.86 |\n| **mean** | **2897.6, 1.612** | **2914.2 (+0.6%), 1.614 (+0.1%)** |\n\nPaired runs differ by −12% to +13%, and the sign flips. The differences follow the speculative acceptance length, which varies between 4.70 and 5.22 within one arm on these random-token prompts; this PR does not touch speculative decoding. The scheduler logs show where this PR could act: in every run, both arms logged the same number of prefill batches, and only the first batch of the run (plus the benchmark's warm-up request, when there is one) was admitted with nothing decoding.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [x] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #40872035803](https://github.com/sgl-project/sglang/actions/runs/40872035803)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #40872035683](https://github.com/sgl-project/sglang/actions/runs/40872035683)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:white_check_mark: [Run #40872035945](https://github.com/sgl-project/sglang/actions/runs/40872035945)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+    "changed_files": 4,
+    "head": {
+      "repo": {
+        "full_name": "akhilg-nv/sglang"
+      },
+      "sha": "a89afe5b5439dc67b8168f2ac2bb1d944da66a9c"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/46654",
+    "merge_commit_sha": "b55350bb93b5a4079749e370603f8b34863a9d64",
+    "merged": true,
+    "merged_at": "2026-11-02T12:38:00Z",
+    "number": 46654,
+    "state": "closed",
+    "title": "[Fix] scheduler: Skip --prefill-decode-interval when nothing is decoding",
+    "updated_at": "2026-11-02T12:38:00Z"
+  },
+  "files": [
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/docs%2Fdocs%2Fadvanced_features%2Fserver_arguments.mdx",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/docs%2Fdocs%2Fadvanced_features%2Fserver_arguments.mdx?ref=a89afe5b5439dc67b8168f2ac2bb1d944da66a9c",
+      "deletions": 2,
+      "filename": "docs/docs/advanced_features/server_arguments.mdx",
+      "patch": "@@ -474,13 +474,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s\n     </tr>\n         <tr>\n       <td style={{padding: \"9px 12px\", fontWeight: 500, backgroundColor: \"rgba(255,255,255,0.02)\"}}>`--prefill-decode-interval`</td>\n-      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.</td>\n+      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. Without data-parallel attention, the interval is skipped while no request is decoding. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.</td>\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.02)\"}}>`None`</td>\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>Type: int</td>\n     </tr>\n         <tr>\n       <td style={{padding: \"9px 12px\", fontWeight: 500, backgroundColor: \"rgba(255,255,255,0.02)\"}}>`--prefill-decode-interval-min-bs`</td>\n-      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>Apply `--prefill-decode-interval` only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to always apply the interval.</td>\n+      <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>Apply `--prefill-decode-interval` only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.</td>\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.02)\"}}>`0`</td>\n       <td style={{padding: \"9px 12px\", backgroundColor: \"rgba(255,255,255,0.05)\"}}>Type: int</td>\n     </tr>",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/docs%2Fdocs%2Fadvanced_features%2Fserver_arguments.mdx",
+      "sha": "4d545b351ff21897b59ae33eef72ccf3d0a2debc",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fschedule.py",
+      "changes": 4,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fschedule.py?ref=a89afe5b5439dc67b8168f2ac2bb1d944da66a9c",
+      "deletions": 2,
+      "filename": "python/sglang/srt/arg_groups/fields/schedule.py",
+      "patch": "@@ -56,13 +56,13 @@ class Schedule(msgspec.Struct):\n     prefill_decode_interval: A[\n         Optional[int],\n         Arg(\n-            help=\"The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.\",\n+            help=\"The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. Without data-parallel attention, the interval is skipped while no request is decoding. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.\",\n             resolvable=True,\n         ),\n     ] = None\n     prefill_decode_interval_min_bs: A[\n         int,\n-        \"Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to always apply the interval.\",\n+        \"Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.\",\n     ] = 0\n     enable_dynamic_chunking: A[\n         bool,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/python%2Fsglang%2Fsrt%2Farg_groups%2Ffields%2Fschedule.py",
+      "sha": "9d6510df03b02f2ee9e6c0059ec09ce8e641eeca",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py?ref=a89afe5b5439dc67b8168f2ac2bb1d944da66a9c",
+      "deletions": 1,
+      "filename": "python/sglang/srt/managers/scheduler.py",
+      "patch": "@@ -1411,7 +1411,13 @@ def _should_defer_prefill(self, running_batch: ScheduleBatch) -> bool:\n \n         # A small running batch admits prefill every round so it can grow;\n         # the interval only protects decode once the batch is large enough.\n-        if running_batch.batch_size() < self.prefill_decode_interval_min_bs:\n+        # With nothing decoding there is no decode to protect, and waiting only\n+        # idles the GPU between chunks. DP attention keeps the synchronized\n+        # cadence because peer ranks may still be decoding.\n+        nothing_decodes = running_batch.is_empty() or running_batch.is_prefill_only\n+        if running_batch.batch_size() < self.prefill_decode_interval_min_bs or (\n+            nothing_decodes and not self.require_mlp_sync\n+        ):\n             self._prefill_decode_interval_remaining = 0\n             return False\n ",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/python%2Fsglang%2Fsrt%2Fmanagers%2Fscheduler.py",
+      "sha": "444647a1730f5b0f6fa68b15e59acf90c39cd7c5",
+      "status": "modified"
+    },
+    {
+      "additions": 48,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/test%2Fregistered%2Funit%2Fmanagers%2Ftest_scheduler_prefill_decode_interval.py",
+      "changes": 54,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Fmanagers%2Ftest_scheduler_prefill_decode_interval.py?ref=a89afe5b5439dc67b8168f2ac2bb1d944da66a9c",
+      "deletions": 6,
+      "filename": "test/registered/unit/managers/test_scheduler_prefill_decode_interval.py",
+      "patch": "@@ -1,4 +1,4 @@\n-\"\"\"Tests for gating the prefill/decode interval on running batch size.\"\"\"\n+\"\"\"Tests for gating the prefill/decode interval on the running batch.\"\"\"\n \n import unittest\n from types import SimpleNamespace\n@@ -13,26 +13,32 @@\n register_cpu_ci(est_time=11, suite=\"base-a-test-cpu\")\n \n \n-def _make_scheduler(*, interval: int, min_bs: int) -> Scheduler:\n+def _make_scheduler(\n+    *, interval: int, min_bs: int, require_mlp_sync: bool = False\n+) -> Scheduler:\n     scheduler = Scheduler.__new__(Scheduler)\n     scheduler.prefill_decode_interval = interval\n     scheduler._prefill_decode_interval_remaining = 0\n     scheduler.prefill_decode_interval_min_bs = min_bs\n-    scheduler.require_mlp_sync = False\n+    scheduler.require_mlp_sync = require_mlp_sync\n     return scheduler\n \n \n def _arm(scheduler: Scheduler) -> None:\n     scheduler._arm_prefill_decode_interval(\n         SimpleNamespace(\n             forward_mode=SimpleNamespace(is_extend=lambda: True),\n-            is_extend_in_batch=False,\n+            is_extend_in_batch=True,\n         )\n     )\n \n \n-def _make_running_batch(batch_size: int):\n-    return SimpleNamespace(batch_size=lambda: batch_size)\n+def _make_running_batch(batch_size: int, *, prefill_only: bool = False):\n+    return SimpleNamespace(\n+        batch_size=lambda: batch_size,\n+        is_empty=lambda: batch_size == 0,\n+        is_prefill_only=prefill_only,\n+    )\n \n \n class TestPrefillDecodeIntervalMinBs(unittest.TestCase):\n@@ -62,5 +68,41 @@ def test_running_batch_shrinking_below_threshold_ends_interval(self):\n         self.assertEqual(scheduler._prefill_decode_interval_remaining, 0)\n \n \n+class TestPrefillDecodeIntervalNothingDecodes(unittest.TestCase):\n+    # These use the default min_bs=0, where the interval applies at any batch size.\n+\n+    def test_empty_running_batch_does_not_defer(self):\n+        # The next chunk of a long prompt on an idle server runs right away.\n+        scheduler = _make_scheduler(interval=4, min_bs=0)\n+        _arm(scheduler)\n+\n+        self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(0)))\n+\n+    def test_prefill_only_running_batch_does_not_defer(self):\n+        scheduler = _make_scheduler(interval=4, min_bs=0)\n+        _arm(scheduler)\n+\n+        running = _make_running_batch(3, prefill_only=True)\n+        self.assertFalse(scheduler._should_defer_prefill(running))\n+\n+    def test_single_decoding_request_keeps_interval(self):\n+        scheduler = _make_scheduler(interval=2, min_bs=0)\n+        _arm(scheduler)\n+\n+        self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(1)))\n+        self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(1)))\n+        self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(1)))\n+\n+    def test_dp_defers_without_local_decode(self):\n+        # Under DP attention, peer ranks may still be decoding.\n+        scheduler = _make_scheduler(interval=2, min_bs=0, require_mlp_sync=True)\n+        _arm(scheduler)\n+\n+        self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(0)))\n+        running = _make_running_batch(3, prefill_only=True)\n+        self.assertTrue(scheduler._should_defer_prefill(running))\n+        self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(0)))\n+\n+\n if __name__ == \"__main__\":\n     unittest.main()",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/a89afe5b5439dc67b8168f2ac2bb1d944da66a9c/test%2Fregistered%2Funit%2Fmanagers%2Ftest_scheduler_prefill_decode_interval.py",
+      "sha": "962e1000c881c2e396cda05596299cbb3fbbd9ea",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "<!-- mintlify-fork-preview-approval -->\n### Preview approval required\n\nThis pull request comes from a fork, so Mintlify won't build a preview until someone with write access approves commit `a89afe5`.\n\n[Approve preview](https://github.com/sgl-project/sglang/pull/46654/checks?check_run_id=123441242913)",
+      "created_at": "2026-10-26T20:01:36Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6426020301",
+      "id": 6426020301,
+      "updated_at": "2026-10-29T12:17:24Z",
+      "user": {
+        "login": "mintlify[bot]"
+      }
+    },
+    {
+      "body": "/rerun-test test/registered/unit/managers/test_scheduler_prefill_decode_interval.py test/registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py test/registered/vlm/test_vision_openai_server_a.py test/registered/e2e/quantization/test_awq.py test/registered/unit/server_args/test_server_args_docs_coverage.py test/registered/pp/test_pp_single_node_extra.py test/registered/perf/models/test_vlms_perf.py test/registered/vlm/test_encoder_dp.py test/registered/accuracy/models/test_vlms_mmmu_eval.py\r\n",
+      "created_at": "2026-10-27T08:55:34Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6437659726",
+      "id": 6437659726,
+      "updated_at": "2026-10-27T08:55:34Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "🚀 `ubuntu-latest` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40476997967) <!--rrt:0:done-->\n```\ncd test/ && python3 registered/unit/managers/test_scheduler_prefill_decode_interval.py\ncd test/ && python3 registered/unit/server_args/test_server_args_docs_coverage.py\n```\n\n🚀 `4-gpu-h100` (3 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40477013966) <!--rrt:1:done-->\n```\ncd test/ && python3 registered/lora/test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py\ncd test/ && python3 registered/pp/test_pp_single_node_extra.py\ncd test/ && python3 registered/vlm/test_encoder_dp.py\n```\n\n🚀 `1-gpu-h100` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40477029842) <!--rrt:2:done-->\n```\ncd test/ && python3 registered/vlm/test_vision_openai_server_a.py\ncd test/ && python3 registered/e2e/quantization/test_awq.py\n```\n\n🚀 `2-gpu-h100` (2 tests): ✅ [View workflow run](https://github.com/sgl-project/sglang/actions/runs/40477045164) <!--rrt:3:done-->\n```\ncd test/ && python3 registered/perf/models/test_vlms_perf.py\ncd test/ && python3 registered/accuracy/models/test_vlms_mmmu_eval.py\n```",
+      "created_at": "2026-10-27T08:55:58Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6437667308",
+      "id": 6437667308,
+      "updated_at": "2026-10-27T10:01:45Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "@Oasis-Git could you review this? thanks!",
+      "created_at": "2026-10-27T11:19:20Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6440603166",
+      "id": 6440603166,
+      "updated_at": "2026-10-27T11:19:20Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "/tag-and-rerun-ci",
+      "created_at": "2026-10-29T12:17:54Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6496447681",
+      "id": 6496447681,
+      "updated_at": "2026-10-29T12:17:54Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "[by Claude Code] I've started babysitting the NVIDIA CI of this PR. I'll check it every 30 minutes until all NV pipelines pass. If a relevant job fails, I may rerun it, merge the latest `main` into this branch, push a small test-only fix, fix the PR title if the title check fails, or post a note here.\n\nAnyone can stop me at any time: just post a comment asking me to stop (for example, `stop babysitting`). I'll stop at my next check, within 30 minutes, and take no further action on this PR.\n\n<!-- sglang-pr-babysit:start -->\n",
+      "created_at": "2026-10-29T12:20:03Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6496497944",
+      "id": 6496497944,
+      "updated_at": "2026-10-29T12:20:03Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-10-29T21:00:30Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6508212188",
+      "id": 6508212188,
+      "updated_at": "2026-10-29T21:00:30Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-10-30T00:30:45Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6511876880",
+      "id": 6511876880,
+      "updated_at": "2026-10-30T00:30:45Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-10-30T07:00:39Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6516958687",
+      "id": 6516958687,
+      "updated_at": "2026-10-30T07:00:39Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-10-30T10:40:40Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6520719591",
+      "id": 6520719591,
+      "updated_at": "2026-10-30T10:40:40Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci",
+      "created_at": "2026-10-30T22:00:32Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6534411466",
+      "id": 6534411466,
+      "updated_at": "2026-10-30T22:00:32Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "[by Claude Code] All NV pipelines have passed.",
+      "created_at": "2026-10-31T00:30:41Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6536526263",
+      "id": 6536526263,
+      "updated_at": "2026-10-31T00:30:41Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "Merge now since this is a low-risk small change, only affects it when prefill_decode_interval is used (not enabled by default). CI has passed.",
+      "created_at": "2026-11-02T12:37:54Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#issuecomment-6577341711",
+      "id": 6577341711,
+      "updated_at": "2026-11-02T12:37:54Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    }
+  ],
+  "number": 46654,
+  "refs": {
+    "base": {
+      "commit": "e6ca9285e4117b95efcf897190d3387c10fec65b",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "a89afe5b5439dc67b8168f2ac2bb1d944da66a9c",
+      "repository": "akhilg-nv/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#pullrequestreview-5662271848",
+      "id": 5662271848,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-27T04:38:25Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/46654#pullrequestreview-5736650801",
+      "id": 5736650801,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-02T12:37:13Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    }
+  ]
+}

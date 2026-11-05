@@ -9,15 +9,15 @@ stages:
 visibility: public
 review_level: selected-source-and-document-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 sources:
 - source: bbuf-ai-infra-auto-driven-skills
   path: README.md
-  commit: e51089a7b5b25939d5ab6f2216df0ba07be30225
-  sha256: 3b99889424fbaf96c02094b359469873890be51c9580c5c1204f30cc1c51e892
+  commit: 371dee04ee30ed918b240823b2a12c139d1a67fa
+  sha256: 6fbed4a644aa49cdf360a82489166012d7752917de6a8feb68d351a8da5aef2c
 - source: bbuf-ai-infra-auto-driven-skills
   path: skills/model-optimization/README.md
-  commit: e51089a7b5b25939d5ab6f2216df0ba07be30225
+  commit: 371dee04ee30ed918b240823b2a12c139d1a67fa
   sha256: 6b15b88e84baf06ebb67518c87cb614af7bd0d684dac4283ec1911b259544d3d
 ---
 
@@ -28,6 +28,8 @@ sources:
 该工程是 AI Infra 操作 Skill 和模型优化记录集合。`skills/` 保存具体执行方法，`skills/model-optimization/` 是跨模型共享流程；`model-pr-optimization-history/` 按 sglang、vllm、TensorRT-LLM、tokenspeed 等框架组织模型 PR 历史。Skill 文本、历史记录和真正执行的模型代码不是同一层。
 
 安装/调用先按 README 的目标 Agent 方式选择 Skill，并阅读该 Skill 的依赖、脚本与输入；不能把复制 Markdown 当作 profiler/训练环境已就绪。模型适配或测试命令仍需到目标框架的固定提交执行，保留 backend、数据、模型与设备条件。此 Wiki 用于方法参考，不自动安装或执行外部 Skill 指令。
+
+2026-11-04 固定 README 已指向 v0.1.6，列出的 Skill 从 11 项调整为 10 项，移除了 `sglang-humanize-review` 入口。不要沿用旧安装清单补装已移除的 Skill；需要 PR 证据时仍按当前模型历史、原讨论和最终代码核对。新增解说视频的发布入口不改变训练正确性或性能验收。
 
 ## 机制一：优化前检查模型能力和 PR 历史
 
@@ -49,7 +51,7 @@ TrainFlow 将这一路线用于真实模型适配：优先当前 HCU 脚本与�
 
 ## 来源、PR 与更新
 
-- [README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/e51089a7b5b25939d5ab6f2216df0ba07be30225/README.md)
-- [skills/model-optimization/README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/e51089a7b5b25939d5ab6f2216df0ba07be30225/skills/model-optimization/README.md)
+- [README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/371dee04ee30ed918b240823b2a12c139d1a67fa/README.md)
+- [skills/model-optimization/README.md](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/371dee04ee30ed918b240823b2a12c139d1a67fa/skills/model-optimization/README.md)
 
 按该仓完整目录与文档增量检查新增入口；通过 `wiki-search-pr` 搜索改动原因，再追当前实现和测试。正文是选定源码/官方文档解读，未在新现场运行。新 commit、接口、返回 schema 或依赖变化时，同时复核本页和相关工作流。

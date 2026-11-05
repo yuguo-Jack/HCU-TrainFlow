@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/rl/observability/metrics/README.md
-raw_sha256: df9c8957b9048a9739c617c6d339fd21efd3eb3606e416415f5b3c3f777b0885
+raw_sha256: 97fa0871d9c44375c0a5fdf4508f61c2749b6a35c62ba3d43ee13e98945bab83
 sources: []
-generated_body_sha256: 75056f94bedb568b31697c3017e95f1ba0ba2b03874fed5dff8f8ef99756d48e
+generated_body_sha256: 3e2cd2f04206078b0f4fb925bf7274efaba14c65d67c91781f610aaa9715ff2a
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/observability/metrics/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/observability/metrics/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/observability/metrics/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -168,10 +168,22 @@ metrics_processor.log(step=step, metrics=val_metrics, is_validation=True)
 
 ## Backends
 
-`MetricsProcessor.Config.enable_wandb` and `MetricsProcessor.Config.enable_tensorboard`
-add the corresponding backend at build time. Both require `log_dir` to be
-passed to `MetricsProcessor.Config.build(...)`. `WANDB_PROJECT` defaults to
-`titan_rl`; set the env var or `wandb_project=` on the config to override.
+`MetricsProcessor.Config.loggers` selects exporters by config type. Pass
+`log_dir` to `MetricsProcessor.Config.build(...)` when this list is non-empty.
+
+```python
+from torchtitan.observability.metrics import TensorBoardLogger, WandBLogger
+
+config.metrics.loggers = [
+    WandBLogger.Config(),
+    TensorBoardLogger.Config(),
+]
+```
+
+`WANDB_PROJECT` selects the W&B project; the default is `torchtitan` for both
+supervised and RL runs. Logger construction does not change the environment. See
+[metric exporter configuration](../../../observability/METRICS.md#configure-metric-exporters)
+for custom exporters.
 
 ## vLLM engine metrics
 
@@ -237,7 +249,7 @@ the destination changes:
 After completing the [DAPO Math setup](../../examples/dapo_math/README.md#setup),
 use `jsonl` for local inspection without a collector:
 
-Set `config.metrics.enable_wandb = False` in the selected recipe if W&B is not
+Set `config.metrics.loggers = []` in the selected recipe if W&B is not
 configured.
 
 ```bash

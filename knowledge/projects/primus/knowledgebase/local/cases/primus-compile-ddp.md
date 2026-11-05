@@ -8,8 +8,8 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/ddp_overlap_compile_patches.py
@@ -25,23 +25,24 @@ sources:
   sha256: 63c969944700b1d63d2393a9e96cb79ff373f25541f6f1e1fef060bdeb57de1c
 - source: amd-agi-primus
   path: primus/backends/megatron/patches/ddp_overlap_compile_patches.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 37b37010af2d8580fa8367e3037334388bee85ebfb6e6b11c3e3ba44f5ec86e2
 - source: amd-agi-primus
   path: primus/core/patches/patch_runner.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 330529f72986ec1d291222b0c3fbf556863ca03b7e72c986cba1f2ac081a645e
 - source: amd-agi-primus
   path: primus/core/runtime/train_runtime.py
-  commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+  commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
   sha256: 63c969944700b1d63d2393a9e96cb79ff373f25541f6f1e1fef060bdeb57de1c
+retrieved_on: '2026-11-04'
 ---
 
 # 案例：参数 gather overlap 与编译区域的 hook 边界
 
 ## 问题与瓶颈
 
-2026-10-20 核对 `main@8e7a2406111e`：DDP wrapper、patch runner 与 runtime 三份原件均与历史 `ab873556` 相同，仍包含 distributed optimizer、parameter gather overlap、torch.compile 联用时的 DDP hook 补丁。子模块 pre-hook 的 collective 与 Python/bucket 状态被编译追踪，可能造成 graph break 或错误同步边界。案例对“已证实这类问题”的目标路径有效，不是所有 compile 训练的默认步骤。
+2026-11-04 检索并核对 `bab82720d72cadbdfbedcc050c9fb49de3b353be`：DDP wrapper、patch runner 与 runtime 三份原件均与历史 `ab8735564c4cc3bb7c0475146057eee8dae4c650` 字节相同，仍包含 distributed optimizer、parameter gather overlap、torch.compile 联用时的 DDP hook 补丁。子模块 pre-hook 的 collective 与 Python/bucket 状态被编译追踪，可能造成 graph break 或错误同步边界。案例对“已证实这类问题”的目标路径有效，不是所有 compile 训练的默认步骤。
 
 ## 为什么这样改与实现位置
 
@@ -58,6 +59,8 @@ patch 函数会 raise，但**通用 runner 默认记录异常，当前 runtime �
 ## 失败与回退
 
 恢复原 hook，分别禁用 compile/overlap 缩小差异；不要混合半个新生命周期与旧 bucket 方法。官方加入等价能力后先完成同矩阵回归再移除 HCU patch。更新联动[总览](../overview/engineering-guide.md)、专题和受影响的测试/Skill。
+
+保留依据是 `megatron.ddp.overlap_param_gather_compile` 的启用条件、eager hook 包装及 `run_patches` / `_run_phase_patches` 的异常策略均未变化。父仓 Core gitlink 已更新为 `4b4acac9a1d28ea6829c8d4f566d75698a21249d`；这些不变文件不能证明新 Core DDP 的实际 bucket 生命周期已回归，仍需部署侧检查。
 
 ## 固定证据与复核范围
 

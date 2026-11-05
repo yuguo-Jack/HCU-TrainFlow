@@ -10,49 +10,21 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: docs/debugging.md
-raw_sha256: 0938badc6722b624d4c07d6e2a620c02fa9cf4bb0e7b26b9d5de77c8b0586b0a
+raw_sha256: 523e0d62eca05f837e9ec4da6530a60e4cd95a8f8f55d7f2a8a0f8b1d542fd49
 sources: []
-generated_body_sha256: e1dc5c416c47335241caad41f0f298345bec3cd43cf9224150ec48f79f254d14
+generated_body_sha256: 7c696e0265fe8021fed8330b4ade71ba35a5775d2193b6387f049651542a2450
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / docs/debugging.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/docs/debugging.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/docs/debugging.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
 ---
-
-## Enable Memory Profiling
-
-Configure profiling in the selected recipe:
-
-```python
-from torchtitan_recipes.tests.models.llama3 import llama3_debugmodel
-
-
-def my_debug_recipe() -> Trainer.Config:
-    config = llama3_debugmodel()
-    config.profiler.enable_memory_snapshot = True
-    config.profiler.save_memory_snapshot_folder = "memory_snapshot"
-    config.profiler.memory_snapshot_freq = 3
-    return config
-```
-
-Launch it with `MODULE=my_project.recipes CONFIG=my_debug_recipe
-./run_train.sh`. In case of an OOM, the snapshot is written under
-`step_{step:012d}_exit`; regular snapshots use `step_{step:012d}`.
-
-* `profiler.enable_memory_snapshot`: enables memory profiling.
-* `profiler.save_memory_snapshot_folder`: configures the output folder.
-* `profiler.memory_snapshot_freq`: controls how often regular snapshots are
-  taken and defaults to `profiler.profile_freq` when unset.
-
-You can find the saved pickle files in your output folder.
-To visualize a snapshot file, you can drag and drop it to <https://pytorch.org/memory_viz>. To learn more details on memory profiling, please visit this [tutorial](https://pytorch.org/blog/understanding-gpu-memory-1/).
 
 ## Debugging Config Values
 
@@ -79,7 +51,7 @@ debugging questions. They intentionally do not share a fallback path:
 | Mode | Physical processes | Real communication | Use it to validate |
 | --- | --- | --- | --- |
 | `fake` | One | None | Configuration, logical mesh construction, rank-local model ownership, tensor shapes, and PyTorch-managed memory for one selected PP rank at SPMD coordinate zero. |
-| `real_pp_fake_spmd` | Exactly one per PP rank | PP send/receive only | Pipeline scheduling, real PP buffers and transport, CUDA-graph capture, and rank-local memory while DP, TP, CP, and EP remain logically scaled. |
+| `real_pp_fake_spmd` | Exactly one per PP rank | PP send/receive only | Pipeline scheduling, real PP buffers and transport, accelerator-graph capture, and rank-local memory while DP, TP, CP, and EP remain logically scaled. |
 
 Use pure fake mode first when a full logical model would require more ranks than
 are locally available. Escalate to real-PP/fake-SPMD when the question involves
@@ -160,7 +132,7 @@ SPMD coordinate zero and therefore form one PP line through the logical mesh.
 ### Memory debugging workflow
 
 Keep the model, dtype, batch geometry, parallel degrees, activation
-checkpointing, FSDP policy, and CUDA-graph settings identical to the intended
+checkpointing, FSDP policy, and accelerator-graph settings identical to the intended
 real job. Then:
 
 1. Select the logical PP coordinate whose SPMD-zero ownership is under

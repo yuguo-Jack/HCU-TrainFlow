@@ -8,7 +8,8 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
   path: docs/fe-oss-apis/attention/flex_attention.md
@@ -20,11 +21,11 @@ sources:
   sha256: 1af61823a766ee7b81ad7cdf10a55a33031f289066d031bde5cf8c1b953167a7
 - source: nvidia-cudnn-frontend
   path: python/cudnn/flex_attention/api.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 112f3ce7a630bf6ae95820c301336839c6a3bb646592e11dbb29f26ba5fadad6
 - source: nvidia-cudnn-frontend
   path: python/cudnn/flex_attention/autograd.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: c167fb4d91e174ab2f593deaf0d6558b9e0888244c8c6b76155d1c9c5e7f5d78
 ---
 # cuDNN Flex Attention：区间 MaskPlan、反向和复用成本
@@ -65,9 +66,9 @@ sources:
 
 ## 固定来源与版本
 
-本页固定到 `develop` 的 `a7269d7607db343fb099dabf6d8fef47f4a2498c`，为源码与教程阅读。发布信息从[官方 Releases](https://github.com/NVIDIA/cudnn-frontend/releases)查询，开发分支不自动等于已安装 wheel。
+本页复核到 `develop` 的 `f88a1ef2a35bc405967691dd798eb062298fcd9a`，原件与语义复核日期为2026-11-04。四个登记的 Flex API/autograd/设计文档原件未变：sample-local 端点、创建时固定累计长度、build_backward 推断及显式 buffer 的生命周期继续成立。项目 DSL 下界和其他 engine 的计划序列化变化不自动扩大 Flex 的 mask/架构/反向支持面。发布信息从[官方 Releases](https://github.com/NVIDIA/cudnn-frontend/releases)查询，开发分支不自动等于已安装 wheel。
 
 - [docs/fe-oss-apis/attention/flex_attention.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/attention/flex_attention.md)
 - [docs/fe-oss-apis/attention/flex_attention_design.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/fe-oss-apis/attention/flex_attention_design.md)
-- [python/cudnn/flex_attention/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/flex_attention/api.py)
-- [python/cudnn/flex_attention/autograd.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/flex_attention/autograd.py)
+- [python/cudnn/flex_attention/api.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/flex_attention/api.py)
+- [python/cudnn/flex_attention/autograd.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/flex_attention/autograd.py)

@@ -10,84 +10,84 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: modelscope-ms-swift
   path: README.md
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: c011d9962ce6eb5ad01f7759a748b9f5a1062271d9f563e3061e64d36557ead3
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: e2d8821c76df81699ec7ae5df31927f4badc1fe59c920da88354c511214f013b
 - source: modelscope-ms-swift
   path: setup.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 1a7fe144134dff38afa385c749c201d88827cea7692ba4007e58f9ccfd379275
 - source: modelscope-ms-swift
   path: docs/source_en/GetStarted/SWIFT-installation.md
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: 2f80ce9327d85ebe959a9883bdd435027082e3eb4abb1b76883675da7bbd7fed
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 40c6c489095916148b52ca6cf7775dc06902b237495afecf52424ec7a8029fa2
 - source: modelscope-ms-swift
   path: swift/cli/main.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: fcc9f982a76102f792139c65de3b211b4af2c633801e7f0807996ac77dfcba88
 - source: modelscope-ms-swift
   path: swift/cli/_megatron/main.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: e1a89aee02857b246054b9ae232804b99670fa54545c2d9f22e78153bbc0d55f
 - source: modelscope-ms-swift
   path: swift/pipelines/train/sft.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 744ceb388ae51f3f50f95f9ceb208980696ba95eaa1f01aaabb0584bd78515b6
 - source: modelscope-ms-swift
   path: swift/template/base.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: a2d14012e37058ad392c1f242e220fd69bb654f29887baffb04aa552f3dfbc16
 - source: modelscope-ms-swift
   path: swift/trainers/seq2seq_trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 4bb65c60321cd619dd44a530e1b228ce470c625a9134666758c21d1337f79163
 - source: modelscope-ms-swift
   path: swift/megatron/arguments/megatron_args.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: ee5b040132967d6520efea1ed2eeed92fb45fc1b552a734652d1935e5a979230
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 8e9f08c9a8f7d9d072d9fd390b44ba7fe6f8bebfee057e8f591d1da2dc388161
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/base.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: a5e44bee709f375c7768f1eb864ec1cef04b06c7cb4f3dd9252b19be2427ccbd
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 6e13a1c838e9986537c72a09f9e12f434d01d39de91056dfa60b9042a79e16c1
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: b7efa15ead7a4f049495c4a0639c27edf6b99bddf9795c47c178a555cbcbf6dc
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/grpo_trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: 34ec4b21ec0e33b2920d1b3712e86abccf594f08cce055417ec723ea7b38378b
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: a8c5a75ebfd498ef61e6b6f2cc39408125dd8debe482d404646330f5b14667ce
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/rollout_mixin.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: c77710d5f900e455a8873f2a5495bdf57d7bd6628a6c2a54bed61b798272886d
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 44fa7807a6938e39636fc0c4d004059495bf7676d011fd7342655ff02b8647be
 - source: modelscope-ms-swift
   path: tests/train/test_packing.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 74ed18c014402f0ce0f2a22f947bf7e406184111a85cea9852765e06942f5c11
 - source: modelscope-ms-swift
   path: tests/train/test_chunked_cross_entropy.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: dfca2f2e3787ecbdaa555129d59dc2cb03e70c0f704432fa34f4af86fd8288a5
 - source: modelscope-ms-swift
   path: tests/train/test_trainer_partial_accumulation.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: dfeaa1943e3d70e1ffe458b547b11ce8d92d1fab2a08e033cde47f825ceccbe4
 - source: modelscope-ms-swift
   path: tests/train/test_vllm_weight_sync.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: c2ea7e3e682623d839fc5eb31fee97c659ee984811a5dfaa6777be97c7afd3d2
 - source: modelscope-ms-swift
   path: swift/ray/megatron/checkpoint_engine/manager.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: d25f1d84ebe9025a6710b1d13216a006be481959955b2cf1008c644acff463df
 - source: modelscope-ms-swift
   path: swift/ray/megatron/base_trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: a33beaa54b9eb6c1fb47deab437132a3265d7ae27ecd86138854bd62332ecc78
 ---
 
@@ -97,7 +97,7 @@ sources:
 
 ms-swift 连接模型/模板/数据注册、微调方法和多个训练/推理后端。普通 `swift sft` 基于 Transformers trainer，`megatron sft` 基于 Megatron Core，`swift rlhf`/`megatron rlhf` 又引入策略算法和 rollout 引擎。定位性能或精度问题时先写清入口、训练 backend、tuner、attention 实现和生成 backend；“使用 Swift”不足以确定执行链。
 
-本页阅读官方 main 固定提交 `2efb43ffe61294735be6816abca991fb2ca16011`。官方安装文档明确 main 对应 4.x、3.x 使用 `release/3.12`；不能把新 trainer 行为套到旧 HCU patch 分支。已有 HCU 配方和实际依赖优先，官方源用于确认机制和模型语义。
+2026-11-04 复核官方 main 固定提交 `9853e4672d014e35e2b6ba1bfd26d8204100adbb`。官方安装文档明确 main 对应 4.x、3.x 使用 `release/3.12`；不能把新 trainer 行为套到旧 HCU patch 分支。已有 HCU 配方和实际依赖优先，官方源用于确认机制和模型语义。
 
 深入专题：
 
@@ -124,11 +124,13 @@ ms-swift 连接模型/模板/数据注册、微调方法和多个训练/推理�
 
 ## 安装与依赖确认
 
-[官方安装说明](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/docs/source_en/GetStarted/SWIFT-installation.md)提供 `python -m pip install -e .` 和 `.[megatron]` 等 extras。HCU 任务在自身工作 checkout/镜像使用兼容依赖，安装后记录 `ms-swift`、PyTorch、Transformers、PEFT、Core/TE、attention 与 rollout 引擎的实际版本和导入路径；不能因 optional extra 安装成功就认定设备扩展可执行。
+[官方安装说明](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/docs/source_en/GetStarted/SWIFT-installation.md)提供 `python -m pip install -e .` 和 `.[megatron]` 等 extras。HCU 任务在自身工作 checkout/镜像使用兼容依赖，安装后记录 `ms-swift`、PyTorch、Transformers、PEFT、Core/TE、attention 与 rollout 引擎的实际版本和导入路径；不能因 optional extra 安装成功就认定设备扩展可执行。
 
 `setup.py` 注册 `swift` 与 Megatron CLI；普通入口解析配置中的 `ENV`，已有进程环境优先于配置同名值，并打印最终命令。`NPROC_PER_NODE` 或 `NNODES` 出现会启用 torchrun，继续读取 `MASTER_ADDR`、`MASTER_PORT`、`NODE_RANK`。因此环境核对要保存实际展开命令和有效环境，不能仅阅读 YAML 中写了什么。
 
 Core 和 vLLM/SGLang 的模型覆盖及 API 版本分别验证；同一容器里多个扩展来源时确认实际加载产物。官方 CUDA 镜像和安装片段提供上游依赖参考，HCU 启动仍选择目标 HCU 工程已支持的脚本。
+
+当前[安装表](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/docs/source_en/GetStarted/SWIFT-installation.md)把 DeepSpeed 范围改为 `>=0.19.3,<0.20`、推荐 `0.19.7`；这是上游配套要求，不授权切换现场 HCU 依赖。Megatron trainer 也已移除旧版参数组/RouterReplay 的兼容分支，直接使用当前 `param_group_identifier_keys`、layer-wise optimizer 标记和 Adam/SGD config API。锁定 Core 与 Swift 的实际组合，不能只靠旧版本判断 helper 继续运行。
 
 ## 运行、模型与数据契约
 
@@ -141,6 +143,8 @@ Megatron 链：Megatron CLI → 参数校验/模型桥接 → `BaseMegatronTrain
 SFT label 中 `-100` 表示不计训练目标；prompt、历史轮次和多模态占位的权重由模板/loss-scale 规则生成。packing 重置 position IDs、合并样本时仍需使 backend 尊重分段，详见 [数据专题](../topics/sft-packing-and-loss.md)。吞吐分别报告实际处理 token 和有效训练 token。
 
 新增 `task_type=decision` 进入独立 encode/collator/decode：模板按问题/选项组织 decision metadata，`target_probs` 进入训练 labels，标准 token labels/loss_scale 被移除。这是选项打分目标，不是 causal-LM SFT 的 `-100` mask 规则；新增 embedding/VL 支持表也不能证明同一模型已具备 Megatron、HCU 或所有 tuner 的后向实现。按实际 task_type 与最终 batch 核对数值目标。
+
+MTP 配置现在区分 `None`、整数与默认 `'auto'`，`mtp_shared_weights` 默认也变为 `None`，另有 `mtp_allow_random_init`。`megatron-bridge` 路径遇到 auto 会警告并禁用，不能把默认 auto 解读为所有模型都训练 MTP。蒸馏 teacher 单独复制参数并清除 MTP 深度、共享和 extra kwargs，避免继承 student 的附加预测头；按构造后的 teacher/student 配置分别验收。
 
 ## 性能与内存：该优化什么
 
@@ -168,14 +172,16 @@ SFT label 中 `-100` 表示不计训练目标；prompt、历史轮次和多模�
 
 `SwiftSft.train` 的 finally 保存 trainer state；这份日志并不等同已完成持久 checkpoint。Flash Checkpoint 有等待最新完整写入的调用；开启 elastic callback 会检查 Universal checkpoint，否则可能从头开始，不能把“进程重新启动”当成数据进度已恢复。
 
+Megatron FSDP 的 HF/safetensors 保存现在在需要导出时先对各 chunk 执行 `start_param_sync(force_sync=True)` 和 `_replace_param_with_raw_if_needed()`，再交给 bridge。即便跳过 DCP 保存，adapter/full-weight 导出仍可能物化参数；这段同步有保存峰值和等待成本。保存完成、分片训练状态和推理格式导出依旧分别验收，不能为降低峰值跳过必要 materialize。
+
 ## 分层验证与官方测试
 
 首次接入：导入与实际扩展 → 模板/编码样本 → 一次 forward/backward/step → 保存恢复 → 相同 policy version 的训练/生成闭环。后续优化使用局部契约回归和阶段 loss。以下是当前官方测试入口，本页没有在 HCU 执行它们：
 
-- [test_packing.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/tests/train/test_packing.py)：packing 示例与训练参数组合，实际依赖目标模型环境。
-- [test_chunked_cross_entropy.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/tests/train/test_chunked_cross_entropy.py)：CE/梯度、共享 logits、重复反向；CPU 数学契约不代表设备实现性能。
-- [test_trainer_partial_accumulation.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/tests/train/test_trainer_partial_accumulation.py)：实际不足设定梯度累积的窗口与合并 batch 对照。
-- [test_vllm_weight_sync.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/tests/train/test_vllm_weight_sync.py)：权重同步相关条件；模型、backend 和部署组合另做端到端验收。
+- [test_packing.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/tests/train/test_packing.py)：packing 示例与训练参数组合，实际依赖目标模型环境。
+- [test_chunked_cross_entropy.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/tests/train/test_chunked_cross_entropy.py)：CE/梯度、共享 logits、重复反向；CPU 数学契约不代表设备实现性能。
+- [test_trainer_partial_accumulation.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/tests/train/test_trainer_partial_accumulation.py)：实际不足设定梯度累积的窗口与合并 batch 对照。
+- [test_vllm_weight_sync.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/tests/train/test_vllm_weight_sync.py)：权重同步相关条件；模型、backend 和部署组合另做端到端验收。
 
 ## 教程、PR、发布与持续更新
 
@@ -189,5 +195,5 @@ SFT label 中 `-100` 表示不计训练目标；prompt、历史轮次和多模�
 ## 本轮补充固定证据
 
 
-- [swift/ray/megatron/checkpoint_engine/manager.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/checkpoint_engine/manager.py)
-- [swift/ray/megatron/base_trainer.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/base_trainer.py)
+- [swift/ray/megatron/checkpoint_engine/manager.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/manager.py)
+- [swift/ray/megatron/base_trainer.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/base_trainer.py)

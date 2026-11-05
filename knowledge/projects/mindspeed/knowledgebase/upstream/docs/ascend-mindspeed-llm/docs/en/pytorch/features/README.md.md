@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/features/README.md
-raw_sha256: 45bdf9a95773e550d0c695765f9499e023364ccfcd5068b6aef06557fdbfad6a
+raw_sha256: 9b958b69d8c95758eb8b54ebabe18b100175ead08024eecfddf02b22dade11ef
 sources: []
-generated_body_sha256: a785ab211d1c0cc1a93f777fa4356193ed522fde16be2cd3d57c9d40a7a1295a
+generated_body_sha256: db3fa6b90faab8786d94c5fefa984412855389e8494b89f95265c3cedd6bcd01
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/features/README.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/README.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -32,7 +32,7 @@ Upstream source document; original commands, claims and links require their stat
 
 MindSpeed LLM includes distributed pretraining and distributed fine-tuning schemes.
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > In the document tables, "Released" indicates the commercial version has been released, "✅" indicates support, and "❌" indicates no support.
 
@@ -113,13 +113,13 @@ The measured pretraining performance of MindSpeed LLM is as follows.
 <tbody>
   <tr>
     <td rowspan="5">SPTD Parallelism</td>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/tensor-parallel.md">Tensor Parallelism</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/tensor-parallel.md">Tensor Parallelism</a></td>
     <td>✅</td>
     <td>✅</td>
-    <td rowspan="30">[Ascend]</td>
+    <td rowspan="31">[Ascend]</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/pipeline-parallel.md">Pipeline Parallelism</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/pipeline-parallel.md">Pipeline Parallelism</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
@@ -129,12 +129,12 @@ The measured pretraining performance of MindSpeed LLM is as follows.
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/sequence-parallel.md">Sequence Parallelism</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/sequence-parallel.md">Sequence Parallelism</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/noop-layers.md">No-Op Layers</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/noop-layers.md">No-Op Layers</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
@@ -145,12 +145,12 @@ The measured pretraining performance of MindSpeed LLM is as follows.
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/ulysses-context-parallel.md">Ulysses Long-Sequence Parallelism</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/ulysses-context-parallel.md">Ulysses Long-Sequence Parallelism</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/hybrid-context-parallel.md">Hybrid Long-Sequence Parallelism</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/hybrid-context-parallel.md">Hybrid Long-Sequence Parallelism</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
@@ -161,23 +161,23 @@ The measured pretraining performance of MindSpeed LLM is as follows.
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/megatron_moe/megatron-moe-allgather-dispatcher.md">MoE Reordering Communication Optimization</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/megatron_moe/megatron-moe-allgather-dispatcher.md">MoE Reordering Communication Optimization</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td rowspan="6">Memory Optimization</td>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/reuse-fp32-param.md">Parameter Replica Reuse</a></td>
+    <td rowspan="7">Memory Optimization</td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/reuse-fp32-param.md">Parameter Replica Reuse</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
     <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/distributed-optimizer.md">Distributed Optimizer</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/distributed-optimizer.md">Distributed Optimizer</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/swap_attention.md">Swap Attention</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/swap_attention.md">Swap Attention</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
@@ -187,7 +187,12 @@ The measured pretraining performance of MindSpeed LLM is as follows.
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/norm-recompute.md">Norm Recompute</a></td>
+    <td><a href="mcore/deepseek4_fine_grained_recompute.md">DeepSeek V4 Fine-Grained Recompute</a></td>
+    <td>✅</td>
+    <td>❌</td>
+  </tr>
+  <tr>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/norm-recompute.md">Norm Recompute</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
@@ -198,7 +203,7 @@ The measured pretraining performance of MindSpeed LLM is as follows.
   </tr>
   <tr>
     <td rowspan="7">Fused Operators</td>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/flash-attention.md">Flash Attention</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/flash-attention.md">Flash Attention</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
@@ -208,43 +213,43 @@ The measured pretraining performance of MindSpeed LLM is as follows.
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/rms_norm.md">Fused RMSNorm</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/rms_norm.md">Fused RMSNorm</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/swiglu.md">Fused SwiGLU</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/swiglu.md">Fused SwiGLU</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/rotary-embedding.md">Fused Rotary Position Embedding</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/rotary-embedding.md">Fused Rotary Position Embedding</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/megatron_moe/megatron-moe-gmm.md">GMM</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/megatron_moe/megatron-moe-gmm.md">GMM</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/npu_matmul_add.md">Matmul Add</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/npu_matmul_add.md">Matmul Add</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
     <td rowspan="6">Communication Optimization</td>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/async-ddp-param-gather.md">Gradient Reduce Communication Overlap</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/async-ddp-param-gather.md">Gradient Reduce Communication Overlap</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/recompute_independent_pipelining.md">Recompute in Advance</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/recompute_independent_pipelining.md">Recompute in Advance</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/async-ddp-param-gather.md">Weight All-Gather Communication Overlap</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/async-ddp-param-gather.md">Weight All-Gather Communication Overlap</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
@@ -259,13 +264,13 @@ The measured pretraining performance of MindSpeed LLM is as follows.
     <td>❌</td>
   </tr>
   <tr>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/hccl-replace-gloo.md">Ascend Gloo Archive-to-Drive Optimization</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/hccl-replace-gloo.md">Ascend Gloo Archive-to-Drive Optimization</a></td>
     <td>✅</td>
     <td>✅</td>
   </tr>
   <tr>
     <td rowspan="1">Optimizer</td>
-    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/26.1.0_core_r0.12.1/docs/en/features/muon-optimizer.md">Muon Optimizer</a></td>
+    <td><a href="https://gitcode.com/Ascend/MindSpeed/blob/master/docs/en/features/muon-optimizer.md">Muon Optimizer</a></td>
     <td>✅</td>
     <td>❌</td>
   </tr>

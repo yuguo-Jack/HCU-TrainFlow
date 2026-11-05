@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: hiyouga/LlamaFactory
-commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
+commit: 702005ce5237ae10f3c572c3f7741ecfd1422fc9
 path: README.md
-raw_sha256: 2d61d3ee9a0b7a099800b17b0be7a8ef034ed9b08f43cb32bdac17642cc823dd
+raw_sha256: afa9f07accadf3521cd7f2521626f433843bb91b4b1ecfaf75979f902342b433
 sources: []
-generated_body_sha256: 1bba0ae7f5aa6f75be3c3b2610c2ea557122dfe2f091dd25f786e5229f105524
+generated_body_sha256: 924e61c8b448e6e200501c16134a417d730630aae886aaf7c3bbf4402eb560ac
 source_state: current-scan
 ---
 
 # hiyouga/LlamaFactory / README.md
 
-[Original at fixed commit](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/README.md)
+[Original at fixed commit](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -203,7 +203,7 @@ Read technical notes:
 
 [25/02/11] We supported saving the **[Ollama](https://github.com/ollama/ollama)** modelfile when exporting the model checkpoints. See [examples](examples/README.md) for usage.
 
-[25/02/05] We supported fine-tuning the **[Qwen2-Audio](Qwen/Qwen2-Audio-7B-Instruct)** and **[MiniCPM-o-2.6](https://huggingface.co/openbmb/MiniCPM-o-2_6)** on audio understanding tasks.
+[25/02/05] We supported fine-tuning the **[Qwen2-Audio](https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct)** and **[MiniCPM-o-2.6](https://huggingface.co/openbmb/MiniCPM-o-2_6)** on audio understanding tasks.
 
 [25/01/31] We supported fine-tuning the **[DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)** and **[Qwen2.5-VL](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)** models.
 
@@ -301,7 +301,7 @@ Read technical notes:
 
 [23/06/29] We provided a **reproducible example** of training a chat model using instruction-following datasets, see [Baichuan-7B-sft](https://huggingface.co/hiyouga/Baichuan-7B-sft) for details.
 
-[23/06/22] We aligned the [demo API](src/api_demo.py) with the [OpenAI's](https://platform.openai.com/docs/api-reference/chat) format where you can insert the fine-tuned model in **arbitrary ChatGPT-based applications**.
+[23/06/22] We aligned the [demo API](src/api.py) with the [OpenAI's](https://platform.openai.com/docs/api-reference/chat) format where you can insert the fine-tuned model in **arbitrary ChatGPT-based applications**.
 
 [23/06/03] We supported quantized training and inference (aka **[QLoRA](https://github.com/artidoro/qlora)**). See [examples](examples/README.md) for usage.
 
@@ -366,6 +366,7 @@ Read technical notes:
 | [Seed (OSS/Coder)](https://huggingface.co/ByteDance-Seed)         | 8B/36B                           | seed_oss/seed_coder  |
 | [StarCoder 2](https://huggingface.co/bigcode)                     | 3B/7B/15B                        | -                    |
 | [TeleChat 2-2.5](https://huggingface.co/Tele-AI)                  | 3B/7B/35B/115B                   | telechat2            |
+| [Xing4.0-29B-A4B](https://huggingface.co/XingChen-AGI)            | 29B-A4B                          | xing4_0              |
 | [Yuan 2](https://huggingface.co/IEITYuan)                         | 2B/51B/102B                      | yuan                 |
 
 > [!NOTE]
@@ -559,7 +560,7 @@ pip install -r requirements/metrics.txt
 
 Optional dependencies available: `metrics`, `deepspeed`. Install with: `pip install -e . && pip install -r requirements/metrics.txt -r requirements/deepspeed.txt`
 
-Additional dependencies for specific features are available in `examples/requirements/`.
+Additional dependencies for specific features are available in `requirements/`.
 
 #### Install from Docker Image
 

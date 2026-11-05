@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: verl-project/verl
-commit: 5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d
+commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
 path: README.md
-raw_sha256: ddf49da56b709047d7641c6885c00bb43a68944aa458f03965008978d75a019d
+raw_sha256: 9979fcb77c09dbeef48325ef3a0506fcbe88b709a0efdceb210e44571856b2ad
 sources: []
-generated_body_sha256: e85b9a7b1ba726a0a326441a61b28b512d6b757f141cdedc850d6b72f08ae1a5
+generated_body_sha256: 95528cf77ebda75e09896ee7d4e4058cf317d86ef03f65d6e045622d9a871b93
 source_state: current-scan
 ---
 
 # verl-project/verl / README.md
 
-[Original at fixed commit](https://github.com/verl-project/verl/blob/5ab22f8a4989c438c1a0dbeca87ce1a00ef5436d/README.md)
+[Original at fixed commit](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -134,7 +134,7 @@ verl is fast with:
 - Scales up to 671B models and hundreds of GPUs with [expert parallelism](https://github.com/verl-project/verl/pull/1467)
 - Multi-gpu [LoRA RL](https://verl.readthedocs.io/en/latest/advance/ppo_lora.html) support to save memory.
 - Experiment tracking with wandb, swanlab, mlflow and tensorboard.
-- Hardware Support: Supports NVIDIA, AMD, [Ascend](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/zh/README.md)
+- Hardware Support: Supports NVIDIA, AMD, [Huawei Ascend](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/zh/README.md)
 
 ## Getting Started
 

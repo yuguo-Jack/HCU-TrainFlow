@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/internals/recipe_checkpoint.md
-raw_sha256: fc1a74ecafe044dc8bb8635f86ced2257d51732017e4e2ea56b54efa7af0c5c5
+raw_sha256: c1e43efdc48be4f8d832ca74709714f5275572973c07c8af0e8bf5985dc7970f
 sources: []
-generated_body_sha256: a8669849e265231172389d9503f0e97bb318236cb6d229c8b3bcfe10fa2635b2
+generated_body_sha256: a728d70e2f774ee8d580708d9f41d67bf7d57fbe86cc7d5fe939e0bde394eb39
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/internals/recipe_checkpoint.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/internals/recipe_checkpoint.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/internals/recipe_checkpoint.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -39,7 +39,7 @@ Recipes are declarative graphs. Runtime datasets are wrapper trees built from th
 
 The main graph nodes are:
 
-- `DatasetReference`, a leaf path plus split, subset, shuffle, and tag settings;
+- `DatasetReference`, a leaf path plus split, subset, shuffle, filter, and tag settings;
 - `RecipeBlend` and `RecipeBlendEpochized`, weighted child graphs;
 - `Subset`, which expresses relative or absolute selection;
 - `Recipe`, which owns named splits and resolves the full graph.

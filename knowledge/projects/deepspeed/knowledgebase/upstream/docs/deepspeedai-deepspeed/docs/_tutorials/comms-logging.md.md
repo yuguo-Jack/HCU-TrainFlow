@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/comms-logging.md
-raw_sha256: 6b653a6ff7a457ce57d5215e1370e8644d331041da878d952b59b6ba5e21000c
+raw_sha256: fbc822e70c50653393973b8f5a92b4bc715a0a790d8259828c7c65aea09d0afe
 sources: []
-generated_body_sha256: c1c63b4eddf37bcd6b01dd01926d514d0cd51a4bc14fe1703682a7e89cea62ce
+generated_body_sha256: 95b4087320a5772ed8bdf152315722d732d165f36a944fcdf38471f3f7aab385
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/comms-logging.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/comms-logging.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/comms-logging.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -92,7 +92,7 @@ The steps to add DeepSpeed communication log summaries are as follows:
 2. (Optional) If your application contains `torch.distributed` calls that you wish to log, import `deepspeed.comm` package and modify `torch.distributed` calls to use `deepspeed.comm` (Note: The `deepspeed.comm` collective and pt2pt APIs exactly match `torch.distributed`)
 3. Call `deepspeed.comm.log_summary`
 
-For example usage, see the following modified [DeepSpeedExamples/cifar](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/cifar) example:
+For example usage, see the following modified [DeepSpeedExamples/cifar](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/cifar) example:
 
 ```python
 # Step 2: (Optional) Import deepspeed.comm

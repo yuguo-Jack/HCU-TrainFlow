@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/sglang_for_rl.mdx
-raw_sha256: 751d2c54c7cc87780a7e9005a76930f73a562c6cf4d9db1574bef4eafaeecd76
+raw_sha256: 68ed10e2b44ce57413380df288feb3dc0b1f8a6b650589cf6ba97a340566b20f
 sources: []
-generated_body_sha256: a9d85904fd4500741ffab5663ce3cb725242f86df39f508dcea7ac4806e176e5
+generated_body_sha256: d82a205efb2f3fe8e8f86e50cf50ebe75f5ca704b090d90eb9b74ba59f9dbcc1
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/sglang_for_rl.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/sglang_for_rl.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/sglang_for_rl.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -358,7 +358,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 ### Weight Update Session
 
-`update_weights_from_tensor` and `update_weights_from_distributed` must run inside a weight-update session. The update calls only write checkpoint-format values; `end_weight_update` runs every quantized layer's `process_weights_after_loading` once, turning them into kernel layout (Marlin repack, MXFP8 shuffles, ...), and runs `post_load_weights` if no weights were loaded through the engine during the session (P2P/RDMA writes). `begin_weight_update` first restores the few schemes whose kernel layout changes parameter shapes (today compressed-tensors W4A16 MoE on Marlin) so the checkpoint-format values fit. One session can span many update calls, so the finalize cost is paid once per refit rather than once per bucket. A call outside a session, a second `begin_weight_update`, or an `end_weight_update` without one is rejected with `success: false` (HTTP 400) and leaves the weights untouched.
+`update_weights_from_tensor` and `update_weights_from_distributed` must run inside a weight-update session. The update calls only write checkpoint-format values; `end_weight_update` runs every quantized layer's `process_weights_after_loading` once, turning them into kernel layout (Marlin repack, MXFP8 shuffles, ...), and runs `post_load_weights` if no weights were loaded through the engine during the session (P2P/RDMA writes). `begin_weight_update` first restores the few schemes whose kernel layout changes parameter shapes (today compressed-tensors W4A16 MoE on Marlin, and BF16 MoE on `flashinfer_trtllm` / `flashinfer_trtllm_routed`) so the checkpoint-format values fit. One session can span many update calls, so the finalize cost is paid once per refit rather than once per bucket. A call outside a session, a second `begin_weight_update`, or an `end_weight_update` without one is rejected with `success: false` (HTTP 400) and leaves the weights untouched.
 
 **Endpoints:** `POST /begin_weight_update`, `POST /end_weight_update`
 
@@ -636,6 +636,7 @@ A request can outlive a version change: the RL flow retracts it with `pause_gene
 ```
 
 - Ranges are half-open `[start, end)` over output-token indices, prompt excluded. The usual case is a single span.
+- `--enable-prefill-weight-versions` adds `prefill_weight_versions`, the same span list over the prompt tokens, so KV reused from the prefix cache under older weights is visible.
 
 ## Easy To Postpone Generation
 

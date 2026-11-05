@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: tests/README.md
-raw_sha256: 0872f733f18e85e085802fff3813cd1ee359ec1cc10b8d5929642e62d4c4e712
+raw_sha256: 73f9a9597a0aaeef657c103ec1cc544375c0e9229f49a9a50abcd8d3a02af248
 sources: []
-generated_body_sha256: 00dcba4ecb439c876fb9a88e926b44daa4234050b6f74c2fc48a35c3220f5360
+generated_body_sha256: ff92b6b71d7f73f6c5a38b0acaed77750d56313087fe1e616ce8478c90233853
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / tests/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/tests/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -52,7 +52,7 @@ This directory contains tests for the torchtitan project, including unit tests a
   - `flux.py`: Tests for the FLUX model (training, then image generation)
   - `h100.py`: Tests cases for H100 GPUs
   - `b200.py`: Test cases that require SM100 or SM103 GPUs
-  - `rl.py`: RL end-to-end suites (`rl`, `rl_kda`, `rl_b200`)
+  - `rl.py`: RL end-to-end suites (`rl`, `rl_h100`, `rl_b200`)
   - `run_tests.py`: The runner for every suite
 - `assets/`: Contains test assets and fixtures used by the tests
   - `losses/`: Golden loss and gradient norm curves for the numerics guards

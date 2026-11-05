@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: README.md
-raw_sha256: f4495ab1840fd4b1825402619ae44cd8e27b0bc111ef7ea99c6ca6807586a5d9
+raw_sha256: 2dc0c8abdfdc4c6bcdff7df203b6000ea4995a1450a5e7539c7152b1e45009f0
 sources: []
-generated_body_sha256: 137fac75864cad8a3f8c267ee770b5c1a5e64fd724a19ee2bc852315b60f9373
+generated_body_sha256: 449215a82a08a46b86f42db71f6ca5498518f12908ff4f0adcadb6192536c8fd
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / README.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/README.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -47,7 +47,7 @@ TraceLens is a Python library for **automated performance analysis of training a
 
 **Hierarchical Performance Breakdowns**: Pinpoint bottlenecks with a top-down view, moving from the overall GPU timeline (idle/busy) to operator categories, individual operators, and right down to unique argument shapes.
 
-**Compute & Roofline Modeling**: Automatically translate raw timings into efficiency metrics like TFLOP/s and TB/s for popular operations. Determine if an op is compute or memory bound and see how effectively your workload utilizes the hardware.
+**Compute & Roofline Modeling**: Automatically translate raw timings into efficiency metrics like TFLOP/s and TB/s for popular operations. Determine if an op is compute or memory bound and see how effectively your workload utilizes the hardware. Compare each op with predicted times from Origami or your own model; see [Add an op projection](docs/how-to/generate-perf-report-pytorch.md#add-an-op-projection).
 
 **Multi-GPU Communication Analysis**: Accurately diagnose scaling issues by dissecting collective operations. TraceLens separates pure communication time from synchronization skew and calculates effective bandwidth on your workload.
 
@@ -196,7 +196,7 @@ TraceLens/
 │   ├── EventReplay/      # Extracts meta data and replays almost arbitrary operations
 │   ├── TraceIndex/       # Build a searchable SQLite catalog of TraceLens reports
 │   ├── TraceUtils/       # Shared trace loaders and annotation helpers
-│   └── Agent/            # Agentic optimization report (Analysis) and trace collection (Profiling)
+│   └── Agent/            # Agentic analysis, profiling, and model visualization
 ├── docs/               # tool-specific guides
 ├── examples/           # example traces, notebooks, scripts, custom-workflows
 ├── notebooks/          # end-to-end profiling and analysis walkthroughs
@@ -224,7 +224,9 @@ TraceLens/
 | Multi-Rank Collective Report | [docs/how-to/collective-report.md](docs/how-to/collective-report.md)                                                             |
 | Performance Report Columns   | [docs/reference/perf-report-columns.md](docs/reference/perf-report-columns.md)                                                   |
 | TraceLens Agent              | [docs/how-to/agent.md](docs/how-to/agent.md)                                                                                     |
+| Model visualizer agent       | [docs/how-to/visualize-model.md](docs/how-to/visualize-model.md)                                                                 |
 | TraceIndex                   | [docs/how-to/trace-index.md](docs/how-to/trace-index.md)                                                                         |
+| Model Roofline Projection    | [docs/how-to/generate-model-roofline-projection.md](docs/how-to/generate-model-roofline-projection.md)                           |
 
 ---
 

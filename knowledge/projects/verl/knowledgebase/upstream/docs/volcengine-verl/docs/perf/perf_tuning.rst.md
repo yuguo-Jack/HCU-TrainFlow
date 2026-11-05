@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: verl-project/verl
-commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
 path: docs/perf/perf_tuning.rst
-raw_sha256: 4c64e886e6acff66fd48c82e68d7289f572ebc5dedad9bb8da44ab9cef21c7b3
+raw_sha256: eb81a625cc9c5481ca58a4d77d36e4fa5e29e48103d595e41ee22973a715f020
 sources: []
-generated_body_sha256: 08ad481ef887a1ecf0bd909248196e42f6c6c6649c5ccb444e3f3698d127dbcf
+generated_body_sha256: 3a9cc0540f9d38f28a29c7c4c287b693e8bd947839a0236deb8bedab72469646
 source_state: current-scan
 ---
 
 # verl-project/verl / docs/perf/perf_tuning.rst
 
-[Original at fixed commit](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/perf/perf_tuning.rst)
+[Original at fixed commit](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/docs/perf/perf_tuning.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -29,7 +29,7 @@ Upstream source document; original commands, claims and links require their stat
 Performance Tuning Guide
 ==============================
 
-Last updated: 10/01/2026.
+Last updated: 10/22/2026.
 
 Author: `Guangming Sheng <https://github.com/PeterSH6>`_, `Jiali Zheng <https://github.com/CurryRice233>`_
 
@@ -52,6 +52,8 @@ In this section, we will discuss how to tune the performance of all the stages i
 8. Reduce FSDP gradient synchronization during gradient accumulation
 
 9. Memory optimization for entropy calculation from logits
+
+10. Node-local low-precision gradient communication with VeOmni
 
 Rollout Generation Tuning
 --------------------------
@@ -359,6 +361,27 @@ FSDP2 offers notable improvements over FSDP1. According to `PyTorch TorchTitan b
 
 .. note:: 
    FSDP2 requires PyTorch 2.1+ and is recommended for models with transformer architecture.
+
+Node-local low-precision gradient communication with VeOmni
+---------------------------------------------------------
+
+VeOmni supports BF16 gradient communication with FP32 accumulation and output.
+This defaults to ``false`` and requires CUDA FSDP2, mixed precision, and the
+VeOmni version pinned by verl. To enable it for the actor:
+
+.. code-block:: bash
+
+   model_engine=veomni \
+   actor_rollout_ref.actor.veomni.mixed_precision=true \
+   actor_rollout_ref.actor.veomni.low_precision_reduce_scatter_comm=true
+
+Only eligible multi-rank shard groups confirmed to be on the same node use this
+path; other groups retain native communication. The option only affects backward
+gradient communication; forward-only inference does not execute it.
+
+The option uses additional temporary buffers and may slow small communication
+buckets. Compare actor-update time and peak memory with it on and off, and keep
+it disabled unless the measured workload benefits.
 
 Memory optimization for entropy calculation from logits
 ----------------------

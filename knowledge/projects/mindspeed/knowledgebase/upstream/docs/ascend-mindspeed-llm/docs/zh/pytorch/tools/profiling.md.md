@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 5a8ea03b12066067f39b1771782d12db236267ef
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/tools/profiling.md
-raw_sha256: ab5e2b99feb5ffa07e50a842ae91364b7b686e63b6fe5bff3e3dbc3fbf72ace8
+raw_sha256: 60956590cdd72ffb38350fab70746003321693f58c4cbb8996063ef951d7d73a
 sources: []
-generated_body_sha256: 312110c2045979836a66a88bcbf47e6034483362047cac471362e2dbb7217817
+generated_body_sha256: 3404df222cdecbed130b64621fbf10f9b3cd483ffa508f23909085c8e68a125e
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/tools/profiling.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/zh/pytorch/tools/profiling.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/tools/profiling.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -146,13 +146,13 @@ MindSpeed LLM支持基于昇腾芯片采集profiling数据，以提供对模型�
 
 训练结束后，指定路径下将生成profiling文件，命名格式示例：
 
-```shell
+```text
 localhost.localdomain_3687609_20260129150104894_ascend_pt
 ```
 
 该文件的目录结构如下：
 
-```shell
+```text
  localhost.localdomain_3687609_20260129150104894_ascend_pt
     ├─ASCEND_PROFILER_OUTPUT
     ├─logs
@@ -167,7 +167,7 @@ localhost.localdomain_3687609_20260129150104894_ascend_pt
 
 ## 可视化性能分析
 
-以MindStudio Insight工具为例，对采集到的profiling进行分析，请参考[MindStudio Insight安装指南](https://gitcode.com/Ascend/msinsight/blob/26.1.0/docs/zh/install_guide/mindstudio_insight_install_guide.md)进行工具部署，然后将生成的profiling文件导入到工具中，进行性能的拆解分析。
+以MindStudio Insight工具为例，对采集到的profiling进行分析，请参考[MindStudio Insight安装指南](https://gitcode.com/Ascend/msinsight/blob/master/docs/zh/install_guide/mindstudio_insight_install_guide.md)进行工具部署，然后将生成的profiling文件导入到工具中，进行性能的拆解分析。
 
 在这里我们简单介绍MindStudio Insight工具主要使用的几个界面：
 
@@ -189,7 +189,7 @@ localhost.localdomain_3687609_20260129150104894_ascend_pt
 
     ![算子](../figures/profiling/operator.png)
 
-> [!NOTE]
+> [!NOTE] 说明
 >
-> - 如果想要更多了解工具的使用方法，可以参考MindStudio Insight官方文档中的[MindStudio Insight系统调优](https://gitcode.com/Ascend/msinsight/blob/26.1.0/docs/zh/user_guide/system_tuning.md#%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E)。
+> - 如果想要更多了解工具的使用方法，可以参考MindStudio Insight官方文档中的[MindStudio Insight系统调优](https://gitcode.com/Ascend/msinsight/blob/master/docs/zh/user_guide/system_tuning.md#%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E)。
 > - 如果您希望更加定制化的profiling采集方式，可参考《CANN性能调优工具用户指南》中的“[性能数据采集和自动解析](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/devaids/Profiling/atlasprofiling_16_0033.html)”章节，通过修改采集代码进行自定义采集和拆解分析。

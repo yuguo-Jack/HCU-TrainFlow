@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/finetune/mcore/single_sample_finetune.md
-raw_sha256: e5f9807b37662fee43eb39b44625c6118c96c545c342f1b56901e8c3db9df0ad
+raw_sha256: 0d676c1de3279a28286c92d7e07ae2daff8d4a2a1dd8564c2ccc5190a424625e
 sources: []
-generated_body_sha256: 31dcd4f0fdda767e3cc547a430013fb78b90eb9ae16b1b92d198fc99534b6714
+generated_body_sha256: 3bf6aaa7b2265744df52ada1dd3a7bab0d78b4da51447e4f53d29bb7842e8771
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/finetune/mcore/single_sample_finetune.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/finetune/mcore/single_sample_finetune.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/finetune/mcore/single_sample_finetune.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -108,7 +108,6 @@ This section explains how to use single-sample data to perform instruction fine-
 
     - [Alpaca-Style Datasets](../../../tools/data_process_sft_alpaca_style.md)
     - [ShareGPT Datasets](../../../tools/data_process_sft_sharegpt_style.md)
-    - [Pairwise Dataset Processing](../../../tools/data_process_dpo_pairwise.md)
 
     Next, use the Alpaca dataset as an example for data preprocessing. For detailed configuration, see the [Qwen3 data preprocessing script](../../../../../../examples/mcore/qwen3/data_convert_qwen3_instruction.sh). Modify the paths in the script:
 
@@ -183,10 +182,10 @@ This section explains how to use single-sample data to perform instruction fine-
     - `no-pad-to-seq-lengths`: Supports dynamic sequence-length fine-tuning across mini-batches. By default, padding is rounded up to a multiple of 8, and you can change the multiple with `pad-to-multiple-of`. If you set the sequence length to 1024 during fine-tuning and enable `--no-pad-to-seq-lengths`, the sequence length is padded to the smallest value that is greater than or equal to the true data length and is a multiple of 8.
 
         **Figure 2** Variable sequence lengths
+
         ![Variable sequence lengths](../../../figures/instruction_finetune/variable_seq_lengths.png)
 
-    > [!NOTE]
-    >
+    > [!NOTE] Note
     > - The provided paths must be enclosed in double quotation marks.
     > - For multi-node training, ensure that the model path and dataset path on each machine are correct.
     > - The parallel configuration (including TP, PP, EP, VPP, and so on) used in the fine-tuning script must be consistent with the configuration used during weight conversion; otherwise, weight loading or conversion errors may occur. For specific parallel configuration, see [Converting Hugging Face Weights to the MCore Format](../../../tools/checkpoint_convert_hf_mcore_large_params.md#converting-hugging-face-weights-to-the-mcore-format).

@@ -5,7 +5,7 @@ kind: source-map
 review_level: navigation-only
 runtime_validated: false
 sources: []
-generated_body_sha256: 4bbddd12b3e0f9b4cb2cf5ad4fe3f30194be4adf3c83a0a4c0c52d49d4eb76ac
+generated_body_sha256: e8d4c4a096806fdc52330af9b809caa8185cb6ffbe881c00003ebb9be776aa1a
 ---
 
 # mindspeed
@@ -34,6 +34,7 @@ generated_body_sha256: 4bbddd12b3e0f9b4cb2cf5ad4fe3f30194be4adf3c83a0a4c0c52d49d
 - [ascend-mindspeed](https://github.com/Ascend/MindSpeed)
 - [ascend-mindspeed-llm](https://github.com/Ascend/MindSpeed-LLM)
 - [官方文档原文](knowledgebase/upstream/docs/)
+- [PR 描述、review 与固定代码](knowledgebase/upstream/prs/)
 - [完整源码路径](knowledgebase/upstream/source-map/)
 
 原始 PR JSON 集中保存在 [evidence/prs](../../evidence/prs/)；每篇 PR 原文页链接其固定原件。局部 Wiki 不重复维护 HCU 仓，参见[知识分工](../../../docs/knowledge-architecture.md#hcu-仓库知识的分工)。

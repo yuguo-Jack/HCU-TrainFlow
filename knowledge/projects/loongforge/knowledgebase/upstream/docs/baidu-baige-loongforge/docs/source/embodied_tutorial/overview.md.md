@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source/embodied_tutorial/overview.md
-raw_sha256: 0f33854b14660f9f9c9f0dd3629f50aa0729503b878d79c26b03ec93224b084a
+raw_sha256: d7ba99307f52971e5ea2daf2edaee1ebf3c1dfb439d1eebbacb0b4c62e41df67
 sources: []
-generated_body_sha256: 1b019810afe7873cbbb4703cba8c8be1816553b014765b6e745a0c293b7b3bc1
+generated_body_sha256: 17278eb547a17a778bae966533388ddbb33f0ff71b3c27002088ed46978490af
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/embodied_tutorial/overview.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/embodied_tutorial/overview.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/embodied_tutorial/overview.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -140,7 +140,7 @@ When using the LeRobot format, the following arguments give finer control over d
 | Feature | Argument | Default | Values / Type | Description |
 | --- | --- | --- | --- | --- |
 | LeRobotDataset version | `--lerobotdataset-version` | `v3.0` | `v2.0`, `v2.1`, `v3.0` | Parse different LeRobot on-disk formats |
-| Data strategy | `--dataset-strategy` | `default` | `default`, `fastwam`, `groot_n1_7`, `cosmos3_droid`, `dreamzero` | Select LeRobot build strategy |
+| Data strategy | `--dataset-strategy` | `default` | `default`, `fastwam`, `gr00t_n1_7`, `cosmos3_droid`, `dreamzero` | Select LeRobot build strategy |
 | Video backend | `--video-backend` | `torchcodec` | `torchcodec`, `decord`, `opencv`, `pyav`, `torchvision_av` | Video decoding implementation |
 | Robot type | `--robot-type` | `None` | String | Select embodiment / action-state layout |
 
@@ -247,11 +247,22 @@ Select the optimizer with `--optimizer`. Standard AdamW, several fused accelerat
 | `ApexFusedAdamW` | Apex FusedAdam |
 | `Adam` | torch Adam |
 | `SGD` | torch SGD |
+| `muon` | LoongForge Muon for `--distributed-strategy ddp`, see below |
 
 Notes on fused Adam implementations:
 
 - **TEFusedAdamW**: fuses the parameter update into a single CUDA kernel, significantly reducing memory bandwidth pressure; requires `Transformer-engine`
 - **ApexFusedAdamW**: fuses updates across multiple parameter groups, lowering optimizer step latency for large models; requires `apex`
+
+`muon` runs Muon on 2-D weights and AdamW on everything else (biases, norms, 3-D tensors, and weights whose name contains `embed` or `lm_head`). It works with any DDP trainer, for example:
+
+```bash
+--trainer-type FinetuneTrainer \
+--distributed-strategy ddp \
+--optimizer muon
+```
+
+With `FinetuneTrainer` every rank updates its full replica in the parameters' own dtype; the Muon update matches `torch.optim.Muon` bit for bit. With a tensor_wise trainer (section 4.2.3) the same optimizer runs on the fp32 masters, and a model's parameter policy can also route 3-D expert stacks to Muon, as `lingbot_vla_v2` does. `--zero-optimizer`, `--lr-group` and FSDP are rejected; use `Dmuon` under FSDP. Hyperparameters: `--muon-momentum`, `--muon-nesterov`, `--muon-ns-steps`, `--muon-adjust-lr-fn`.
 
 #### 3.3.3 Module-level Parameter-group LR
 
@@ -291,6 +302,7 @@ The checkpoint module offers:
 | Save format | `--save-format` | `safetensors` | `safetensors`, `pt`, `dcp` | Checkpoint file format |
 | Save training state | `--save-training-state` | `True` | Bool flag | Save optimizer, scheduler, RNG, and DataLoader state |
 | Async save | `--async-save` | `False` | Bool flag | Enable async saving for DCP format |
+| Save processor config | `--save-processor-config` | `False` | Bool flag | Write `processor_config.json` (training data config) into each `steps_N`; required by GR00T-N1.7 eval |
 
 Resume example:
 
@@ -440,6 +452,39 @@ The following arguments give fine-grained control over FSDP sharding, wrap polic
 When replicating frozen module classes, every matched parameter must have `requires_grad=False`. This mode is incompatible with `--init-on-meta`; if `--fsdp-ignored-frozen-param-dtype` is specified, it must match the training compute dtype selected by `--dtype`.
 
 Delta-FP8 changes only FSDP parameter communication precision; model computation remains in the dtype selected by the FSDP mixed-precision policy. See [FSDP2 Delta-FP8 Param AllGather](../features/delta_fp8_allgather.md) for prerequisites, usage, parameter reference, and troubleshooting.
+
+#### 4.2.3 tensor_wise (Tensor-wise Distributed Optimizer)
+
+tensor_wise (`TensorWiseOptimizer`) is a distributed optimizer under DDP: it keeps a complete compute replica on every rank and splits no tensor. Each parameter is assigned whole to one owner rank: gradients are reduced to the owner, the owner updates its fp32 master and optimizer state, and the updated parameter is broadcast back. It takes over gradient communication, so it replaces the DDP wrapper and is an alternative to `--zero-optimizer`, not a layer on top of it. Compared with `ddp` + `--zero-optimizer`, it uses reduce instead of all-reduce, can publish parameters in bf16 or fp8, and overlaps both collectives with computation. Because an owner holds whole tensors, Muon's Newton-Schulz runs once on the owner without gathering the matrix, unlike element-wise ZeRO-1. "Tensor-wise" is the unit of assignment, as "layer-wise" is in Megatron's `LayerWiseDistributedOptimizer`; collectives still run on owner-aligned buckets.
+
+Currently `lingbot_vla_v2` uses tensor_wise. The trainer enables it, with no separate flag: selecting `LingbotVlaV2Trainer` builds `TensorWiseOptimizer`:
+
+```bash
+--trainer-type LingbotVlaV2Trainer \
+--distributed-strategy ddp \
+--optimizer muon
+```
+
+The collective knobs are the `model.tensor_wise:` section of the model YAML, or per run `model.tensor_wise.<field>=...`:
+
+| Feature | Field (`model.tensor_wise.*`) | Default | Values / Type | Description |
+| --- | --- | --- | --- | --- |
+| Gradient reduce dtype | `grad_reduce_dtype` | `bf16` | `fp32`, `bf16`, `mixed`, `compute` | 1-D tensors always stay fp32 |
+| Parameter publish precision | `param_sync_precision` | `fp32` | `fp32`, `bf16`, `bf16_ef`, `bf16_ef_delta`, `fp8_e4m3_delta` | How masters reach the replicas |
+| Gradient overlap | `grad_overlap` | `true` | Bool | Reduce each bucket as backward produces it |
+| Parameter overlap | `param_overlap` | `true` | Bool | Broadcast each owner's parameters once updated |
+| Bucket size | `comm_bucket_mb` | `256` | Integer MB | `0` picks by gradient overlap |
+| In-flight cap | `grad_inflight_mb` | `3072` | Integer MB | A memory bound; lower it on smaller cards |
+
+The `param_sync_fp8_*` and `param_sync_bf16_with_fp8` fields apply only to `fp8_e4m3_delta`.
+
+To bring another model onto tensor_wise, start with `--trainer-type TensorWiseTrainer` (`trainers/custom/tensor_wise_trainer.py`). It needs no model-specific code and has been run end to end on FastWAM and Pi0.5; check the constraints below before using it on other models. It keeps every parameter in `--dtype` and runs the `--optimizer` optimizer on fp32 masters, so its loss differs from a `--dtype` DDP run, which updates the low-precision parameters in place. A model that needs its own precision classes, Muon on 3-D tensors (for example MoE expert stacks) or compile subclasses it the way `LingbotVlaV2Trainer` does, adds the new `--trainer-type` name to `TENSOR_WISE_TRAINERS` (`tensor_wise_optimizer/validation.py`), and returns a `ParameterClassPolicy` as its parameter policy. Either way, a `tensor_wise: TensorWiseConfig` field in the model config carries the knobs above; without it the defaults apply.
+
+Constraints:
+
+- Requires `--distributed-strategy ddp`; `--zero-optimizer`, `--fp8`, `--init-on-meta` and `--ddp-*` are rejected.
+- Training-state checkpoints require `--save-format dcp` and cannot be combined with `--use-lora`; pass `--no-save-training-state` to export weights only.
+- Module buffers (for example BatchNorm statistics) are not synchronized. Check this before moving a model onto tensor_wise.
 
 ### 4.3 Stability and Runtime Control
 

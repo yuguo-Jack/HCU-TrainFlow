@@ -19,6 +19,26 @@ hcu-trainflow --workspace /private/remote watch TASK /private/normalized.jsonl /
 
 生产使用站点 systemd/容器 supervisor/调度器托管；`examples/trainflow-watch.service` 是待填模板，不能原样部署。没有现场部署时，工程仅提供运行能力和接入契约。
 
+## 衔接站点恢复器
+
+首次接管、升级恢复器或改变 launcher/并行布局时，固定实际分支、镜像和启动配置，沿“检测 → 决策 → STOP → 全部旧成员核销 → START → checkpoint 加载 → 连续有效 step”逐段验收。TrainFlow watcher、独立 sentinel、Agent 和预检工具提供观察或诊断；训练动作仍归已有的唯一恢复 owner。远端执行超时或控制端失联后，先按[远程执行核销](remote-execution.md)检查原操作，不能因客户端退出或控制器状态改变就重新派发。
+
+恢复能力必须绑定实际包和 launcher。Megatron Bridge 官方固定 `41af2dcf0dfd83c8933f588bb871b7f56dbd4368` 的说明已区分 NVRx in-process 与 `ft_launcher` 的 in-job restart：前者自 NVRx v0.6.0 弃用，v0.6/v0.7 release 仍含旧 API，上游 main 在 v0.7.0 后移除；不能以“安装最新版”保留旧入口。新部署建议的 `ft_launcher` 也受其 Slurm、checkpoint 和平台条件限制，不能直接视为 HCU 已支持。现有站点继续使用已验证的固定版本及唯一 owner，升级时核对配置、停止范围和恢复验收；细节见 [Bridge 恢复专题](../knowledge/projects/bridge/knowledgebase/local/topics/bridge-checkpoint-recovery.md)。
+
+Cluster Manager 的预检、裸机/Slurm/MPI/Docker 恢复和 K8s operator 分开选择。当前源码与历史差异从[证据入口](../skills/hcu-train-scale-and-stability/references/evidence-sources.md)进入；部署时至少核对：
+
+| 接入点 | 必须留存的事实与判定 |
+| --- | --- |
+| 训练恢复入口 | 当前源码子目录为 `hcu-training-reliability/`，import 仍为 `cluster_manager`、console 仍为 `hcu-cluster-inspect`；目录、包名与现场制品分别确认 |
+| MPI 与训练 rank | `--mpi-ranks-per-node` / `MPI_RANKS_PER_NODE` 描述每节点 MPI 进程数，训练 `--slots` 描述 GPU worker 布局。MPI 每节点只起一个 torchrun 时两者不同；按实际 host 顺序和 rank 映射核对，未知、非均匀或重排布局不得按 slots 猜节点 |
+| Docker 启停 | 核对宿主 clush 准备、首计算节点单次启动、容器内 MPI 传播及替补容器准备。按进程名停止可能涵盖专属容器内其他 Python；空 hostfile 的成功不能证明失联旧成员已退出 |
+| NHC 与节点重入 | 核对检查在 host 还是 container 执行、实际权限和有效结果。无有效指标、缺标记、检查命令失败均保留缺口；K8s Ready 不足以解除隔离，只按原协议操作本 owner 管理的状态 |
+| envcheck 计划与重跑 | `--dry-run`、预检 PASS、载荷 PASS、清理 CONFIRMED 分开验收。保留完整结果目录、`.state`、原始组日志、参与/未参与节点和实际设备；`cleanup-unconfirmed` 时先核实原 run，不能从另一 token 重跑掩盖未决进程 |
+
+特别注意：固定 `1e54471b5b0f4e8401596f519b9632c5de8cff11` 的 `distributed_job_manager.py::_stop_training` 仍在三次停止失败后转入 `STARTING`。这个实现状态不是旧进程已结束的回执，不满足本流程“全成员 STOP 核销后才 START”的要求。拟采用该恢复器时，由同一个站点 owner 核对该分支的实际停止范围和失联处理，完成适用配置或修复及回归后再验收；未完成前保留部署缺口，不让 Agent 再增加一个竞争恢复器。本文不宣称上游或现场已经修复。
+
+Primus-SaFE 接管也要区分平台部署、实际 leader、训练任务与告警组件。node-agent、analysis、notification 各自的 Deployment/镜像和真实消息送达需独立留证；stdout 日志管线不保证采到容器文件日志，节点资源图也不等于任务独占用量。RayJob 的统一重启预算、旧 UID 收尾与 deployment 终态按该分支核对，不能套普通 Workload 的重试计数或用同名新对象替代旧作业核销。
+
 ## 检测与记录
 
 检测无 telemetry、telemetry 过期、step 停滞、同 attempt 步数回退、恢复超时、非有限 loss/grad、显存余量及持续吞吐下降。阈值按模型/步长/checkpoint/网络和历史基线制定，不使用通用生产默认。

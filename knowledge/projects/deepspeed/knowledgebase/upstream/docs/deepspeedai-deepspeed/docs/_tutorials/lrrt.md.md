@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/lrrt.md
-raw_sha256: 0d51c8d21a1f01d6e09b526c2efc52b457bfe0ae14d94e42c67b3ab97366c92d
+raw_sha256: b149cf378d286da2e36a5c97cf885cd05851fb9a55effba394e05570cfcbe57c
 sources: []
-generated_body_sha256: 51041abb111e02d686ce0dcb7e8da78c969657edf9d98617dfe68c1d7582b9df
+generated_body_sha256: 7933aab038b900a047dd8f9b5039f49be1a066d93958a02fcec9f528838bfc4f
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/lrrt.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/lrrt.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/lrrt.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -82,7 +82,7 @@ schedule that:
 ### PyTorch
 
 For PyTorch models, LRRT is implemented as a [learning rate
-scheduler](https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html),
+scheduler](https://docs.pytorch.org/docs/stable/optim.html),
 a feature that is available in PyTorch versions 1.0.1 and newer. Thus, you can
 add a `"scheduler"` entry of type `"LRRangeTest"` into your model configuration
 as illustrated below:

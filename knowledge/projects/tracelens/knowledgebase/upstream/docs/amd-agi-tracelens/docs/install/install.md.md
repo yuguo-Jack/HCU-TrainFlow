@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/install/install.md
-raw_sha256: 21a2fee048caca6ae062c4abfeed39223faa849abbd27c750672f61052e749f5
+raw_sha256: acee104069fcc917daeb5ed1a6c621edd7bf8798ae4ca3957399f43bd5203ef4
 sources: []
-generated_body_sha256: b5b8509aa39f1edc7b8d2a81059ac46563f7103af65fe4b8be8070a69a64d978
+generated_body_sha256: 5c10a4b4a1f85c58dd9590a01e2005792a6223ec63077c7628eb32d600b9ef23
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/install/install.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/install/install.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/install/install.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -94,6 +94,29 @@ suite. The `[dev]` extra installs the development and test dependencies, and
 git clone https://github.com/AMD-AGI/TraceLens.git && cd TraceLens
 pip install -e '.[dev,jax]'
 python -m pytest tests/ -v
+```
+
+### Optional: Visualizer (Model Explorer export)
+
+Install the CPU-only LLM architecture visualizer and its `huggingface_hub`
+dependency with the `[Visualizer]` extra:
+
+```bash
+pip install -e ".[Visualizer]"
+```
+
+This installs the `TraceLens.ModelUtils` and `TraceLens.Visualizer.model_explorer_export` packages and adds
+`TraceLens_visualize_model_in_explorer` (alias: `visualize_model_in_explorer`)
+to your `PATH`. See `TraceLens/Visualizer/README.md` for the CLI. The
+model visualizer agent that drives this command is
+`TraceLens/Agent/Visualizer/`; see
+[Visualize a model](../how-to/visualize-model.md).
+
+For development on the visualizer, combine extras:
+
+```bash
+pip install -e ".[Visualizer,dev]"
+python3 -m pytest tests/Visualizer/ tests/ModelUtils/
 ```
 
 ## Optional: `traceconv` for `.pftrace` input

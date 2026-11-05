@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/features/mcore/communication-over-computation.md
-raw_sha256: 74c8cb5d26ee6c4972ad9ebd84839f1b6dde828570246ff9724b648b80e7eb3c
+raw_sha256: 693066c46f2053374601b7963cd54d7be4e137f0a06adf1d1fbe1ce864b51290
 sources: []
-generated_body_sha256: da95c4a2276eb0f3426f4a37708fbe9ac80bfc19eafbb17b56a92df7c41e9882
+generated_body_sha256: abd8ac981918b6ef1bc0151092dd5ca8c04c4b6e03905cebeb20fe8ca92bc5bc
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/features/mcore/communication-over-computation.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/mcore/communication-over-computation.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/mcore/communication-over-computation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -99,6 +99,6 @@ This feature is not yet compatible with `--use-ascend-mc2`.
 
 This feature is not yet adapted for MoE models.
 
-The Atlas A2 training series and Atlas A3 training series fully support this feature, while the Ascend 950 series does not support fused operators.
+The Atlas A2 training series and Atlas A3 training series fully support this feature, while the Ascend 950PR&950DT products do not support fused operators.
 
 HDK supports versions later than 2024 RC2. CANN supports versions later than 2024 RC4.

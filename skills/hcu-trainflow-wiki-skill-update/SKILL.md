@@ -54,6 +54,8 @@ TraceLens 的官方来源为 `amd-agi-tracelens`；HCU fork 通过外部维护�
 
 TraceLens 接口更新同时核对报告/collective、Graph、Roofline、Agent、hipprof/counters，以及 split/merge/compare 的请求、输入哈希和状态。源码定位、索引、EventReplay 保留原生使用路线；按受影响功能执行真实输入或合成回归，缺硬件时保留缺口。同步安装包与固定 checkout，避免本机仍导入临时开发副本。无需为一次文档改动重复采集全部硬件证据。
 
+报告入口和复用该入口的高级分析分别检查 warning、跳样及失败回执；生成了表格或 Agent 材料不等于原生报告完整。子仓版本按父仓固定树的 gitlink 和 `.gitmodules` URL 选取，不能以独立子仓 HEAD 代替；父指针变化时重新采集子仓并核对真实消费者。以上检查保留固定输入和当前正文哈希，不能只更新版本字符串。
+
 精度方法维护还需复核项目 `docs/practices/model-accuracy-diagnosis.md` 与三个阶段的入口。按 HCU-Knowledge 的 dcu_probe 项目或当前源码核对 hcu-probe/hcuprobe 包与 CLI、配置、hook/异步快照/flush、compare 映射和跨 rank 首差、训推接入；同时核对 PyTorch/TE 的精度与随机性接口。来源变更不代表所有后端已实测，保留登记/离线/现场的验证范围，不自动刷新 HCU 大库。
 
 维护发布/开发线和模型 example/Cookbook 时，读取项目 `docs/practices/engine-delivery-tracks.md`：区分稳定插件的官方 release/HCU 发布锁与快速方案的指定官方/客户 commit，核对实际 HCU 算子/通信路径、TE 兼容、必要/可选补丁及验证状态。按任务开始/交付、相关发布和例行维护时机修订推荐入口、适用版本与替代说明；稳定线接管须验证所需功能、质量、性能/显存及恢复条件，再退役已替代的临时 patch，未替代优化或客户固定基点仍保留。不得把上游 release 已发布当成 HCU 已稳定支持，不自动切换运行任务、不更新外部仓或大知识库；只有明确授权范围内才修改对应 Cookbook/example。复核主控、三个阶段、交付及 Cookbook 时保持“路线与模式分开”：快速线不省略完整任务的分析、调参、热点优化、精度和约定规模/长稳验证；不能将 patch 重放或额外移植可选误写为优化可选。方法/引用更新后同步安装，不把本规约宣称为后台定时服务。

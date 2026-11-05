@@ -10,30 +10,38 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: reviewed training, parallel, state and backend implementation chains; not
-  all models or runtime combinations
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: nvidia-megatron-lm
   path: megatron/core/extensions/transformer_engine.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
-  sha256: 402dd8cf540b17fac15f0f77fba603acaa5fb4f6d9493536ff6550719f0bda47
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: ab48dd0b062fa44b816205ae9e8491a8785e1c934d2b88cefb3ee0768b6df7b1
 - source: nvidia-megatron-lm
   path: megatron/core/models/gpt/gpt_layer_specs.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
-  sha256: 9e153c7f3d3a671f1bd9b84023bfe0f14711fe942c4c0df3dc1dec288100c4af
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: 6bd190dd820eeb5fe55baeb700fb4b4589f73995fffc600b332db58a997de794
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/transformer_config.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
-  sha256: ec8de7059bf8d6c78663384a489794d0712eaa1b81685ad0339e2c77cb9e32e3
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: 39f34cb0f9005ad53b4d318346a7b6bbb88931a19d5f868805a42e83dd1eece6
 - source: nvidia-megatron-lm
   path: tests/unit_tests/transformer/test_multi_latent_attention.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: 062766158e7bf127e0d2971c0caae021e4b0651fd58ee3ebba90fb2a535195ab
 - source: nvidia-megatron-lm
   path: megatron/core/transformer/multi_latent_attention.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
-  sha256: 0cb02e328f77eeabb0131fb12b2eef13d565eeb8d2f795b5a6f16359cba24503
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: 82f7c8aea4522bf28e1a08fc40282d9feece2034a9df08ee7f69aef5cc1fe497
+- source: nvidia-megatron-lm
+  path: megatron/core/transformer/moe/paged_stash.py
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: c120b2e7ce96baf76be69b5a3a7944a584c406fd4c093c56e71b5be6e0313e53
+- source: nvidia-megatron-lm
+  path: megatron/core/optimizer/__init__.py
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: e3f559f8606e1373c1ce5343f74f65492ee16224543dde7d617131b74cf76b83
+retrieved_on: '2026-11-04'
 ---
 
 # Megatron Core→Transformer Engine：配置、融合、低精度与HCU接口
@@ -70,6 +78,10 @@ MTP 与主头共享权重时设置 `zero_tensor_dummy_wgrad`，由支持该属�
 
 MLA 新增 KV RoPE+MXFP8 量化融合，与已有 residual norm 修复是不同机制。当前路径要求 MXFP8 DPA、零 dropout 和支持的 CUDA 架构/布局；TP/CP>1、THD、FP16、相关重算、eval 或禁用对应 FP8 backward 时走未融合路径。检查配置前置报错、运行 fallback 和实际 kernel 三层，不将 fallback 单测算为融合路径通过。
 
+本轮 adapter 新增 TE 公共 `mark_grouped_tensor` 依赖：需要标记非空 operands 而当前 TE 无该符号时显式报错；cast/view 后由 adapter 传播 marker，Paged Stash 根据它识别 saved buffers，不能只手工复制 Python 属性。Grouped expert 总 token 数必须按256对齐，adapter 不自动 pad；op-fuser 若支持 split_alignment 参数也传同一常量。TE fused router 的 QB histogram 参数依函数签名探测，缺能力不会因配置字段存在而自动提供。
+
+拆分 LayerNormLinear 后新 norm 迁到 fused weight 的 device；TENorm 与 fused LayerNormLinear 为 RMSNorm gamma 标记 `is_rmsnorm_weight`，由 optimizer 的 `get_standard_config_overrides` 实际消费：只有显式设置非 None 的 rmsnorm_weight_decay_mult 时，gamma 才从通用1D免衰减规则排除并使用该倍率；默认 None 不改变原衰减策略。GPT spec 的 normalization=None 现在继承 config.normalization，MTP backend 也按实际 inference/local/TE backend 选择，不能固定假设 TE。MLA softmax_scale 新尊重显式配置后再乘 RoPE mscale²；该数值变动与 residual norm 修复、既有 KV RoPE 量化融合各自独立。现有 first-microbatch、dummy-wgrad 与受限 MLA fusion 契约未因这些接口改动消失，继续逐路径核验。
+
 ## HCU复用与交付
 
 已有HCU TE能力优先复用；通用training fusion/AI编译/cuDNN等需求查Flash-Train已实现功能，PrimusTurbo与消费者接入亦按真实版本参考。缺口按接口owner集中补实现，训练引擎保留调用/配置与测试，底层库接收其负责kernel/ABI/数值改动。
@@ -84,9 +96,9 @@ MLA 新增 KV RoPE+MXFP8 量化融合，与已有 residual norm 修复是不同�
 
 ## 固定源码与维护边界
 
-- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/extensions/transformer_engine.py)
-- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/models/gpt/gpt_layer_specs.py)
-- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/core/transformer/transformer_config.py)
-- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/tests/unit_tests/transformer/test_multi_latent_attention.py)
+- [megatron/core/extensions/transformer_engine.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/megatron/core/extensions/transformer_engine.py)
+- [megatron/core/models/gpt/gpt_layer_specs.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/megatron/core/models/gpt/gpt_layer_specs.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/megatron/core/transformer/transformer_config.py)
+- [tests/unit_tests/transformer/test_multi_latent_attention.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/tests/unit_tests/transformer/test_multi_latent_attention.py)
 
-2026-10-20按上述固定源码/官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。
+2026-11-04按上述固定源码、实际消费者与官方教程复核。源码机制、上游测试和HCU现场验收分别记录；本轮没有执行GPU训练或填造性能/loss结果。更新需同时核对同仓总览、相关专题/案例、消费者与Skill，发布/主干/开发PR/实际HCU依赖不得混作同一个版本。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: hiyouga/LlamaFactory
-commit: ce9dc9e072f80fa3abe0989d4ab90da25f083438
+commit: 702005ce5237ae10f3c572c3f7741ecfd1422fc9
 path: README_zh.md
-raw_sha256: 70742d8f3035ee68813aecfacdb398a73ca1e26d3b278f41f6ad09bb8ff8af91
+raw_sha256: f158e8f58bd8dd0a1a94b7d53bde9de067d19252114e8c2d564ecbe38b9d1d38
 sources: []
-generated_body_sha256: 25037214b26956b7fbbd23ce0b58d06af7871087441ddd78e8df51d510c75378
+generated_body_sha256: cd576c7d7428962e0a4e45b6a4a67f1a5b42c7541633ab7131c41b927774d11b
 source_state: current-scan
 ---
 
 # hiyouga/LlamaFactory / README_zh.md
 
-[Original at fixed commit](https://github.com/hiyouga/LlamaFactory/blob/ce9dc9e072f80fa3abe0989d4ab90da25f083438/README_zh.md)
+[Original at fixed commit](https://github.com/hiyouga/LlamaFactory/blob/702005ce5237ae10f3c572c3f7741ecfd1422fc9/README_zh.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -204,7 +204,7 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 
 [25/02/11] 我们支持了在导出模型时保存 **[Ollama](https://github.com/ollama/ollama)** 配置文件。详细用法请参照 [examples](examples/README_zh.md)。
 
-[25/02/05] 我们支持了在语音理解任务上微调 **[Qwen2-Audio](Qwen/Qwen2-Audio-7B-Instruct)** 和 **[MiniCPM-o-2.6](https://huggingface.co/openbmb/MiniCPM-o-2_6)** 模型。
+[25/02/05] 我们支持了在语音理解任务上微调 **[Qwen2-Audio](https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct)** 和 **[MiniCPM-o-2.6](https://huggingface.co/openbmb/MiniCPM-o-2_6)** 模型。
 
 [25/01/31] 我们支持了 **[DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)** 和 **[Qwen2.5-VL](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)** 模型的微调。
 
@@ -302,7 +302,7 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 
 [23/06/29] 我们提供了一个**可复现的**指令模型微调示例，详细内容请查阅 [Baichuan-7B-sft](https://huggingface.co/hiyouga/Baichuan-7B-sft)。
 
-[23/06/22] 我们对齐了[示例 API](src/api_demo.py) 与 [OpenAI API](https://platform.openai.com/docs/api-reference/chat) 的格式，您可以将微调模型接入**任意基于 ChatGPT 的应用**中。
+[23/06/22] 我们对齐了[示例 API](src/api.py) 与 [OpenAI API](https://platform.openai.com/docs/api-reference/chat) 的格式，您可以将微调模型接入**任意基于 ChatGPT 的应用**中。
 
 [23/06/03] 我们实现了 4 比特的 LoRA 训练（也称 **[QLoRA](https://github.com/artidoro/qlora)**）。详细用法请参照 [examples](examples/README_zh.md)。
 
@@ -367,6 +367,7 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 | [Seed (OSS/Coder)](https://huggingface.co/ByteDance-Seed)         | 8B/36B                           | seed_oss/seed_coder  |
 | [StarCoder 2](https://huggingface.co/bigcode)                     | 3B/7B/15B                        | -                    |
 | [TeleChat 2-2.5](https://huggingface.co/Tele-AI)                  | 3B/7B/35B/115B                   | telechat2            |
+| [Xing4.0-29B-A4B](https://huggingface.co/XingChen-AGI)            | 29B-A4B                          | xing4_0              |
 | [Yuan 2](https://huggingface.co/IEITYuan)                         | 2B/51B/102B                      | yuan                 |
 
 > [!NOTE]
@@ -560,7 +561,7 @@ pip install -r requirements/metrics.txt
 
 可选的额外依赖项：`metrics`、`deepspeed`。使用 `pip install -e . && pip install -r requirements/metrics.txt -r requirements/deepspeed.txt` 安装。
 
-其他可选依赖项请参考 `examples/requirements/` 目录下的文件。
+其他可选依赖项请参考 `requirements/` 目录下的文件。
 
 #### 从镜像安装
 

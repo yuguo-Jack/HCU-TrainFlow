@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/how-to/agent.md
-raw_sha256: e450067c245c148b5056b0578a24de58b6abbea9abee43f23de7288239c17595
+raw_sha256: 79c631621a6e6c71104dddcb6393ece2f68fea0c78c4e274c2a2c22d0a275048
 sources: []
-generated_body_sha256: 7750d9dc060efc3abd92333ce337c1adb861542ed5242e02a2f0a24977984c02
+generated_body_sha256: a22053cc0c0cb1397ebc8207eb6df0a55717c23c2757ac04869e12f8b84b078f
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/how-to/agent.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/how-to/agent.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/how-to/agent.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -130,6 +130,50 @@ or `inference` for vLLM, SGLang, or ATOM), the execution mode and capture-folder
 inference, environment details (node, container, or virtual environment), and an
 optional output directory.
 
+### Run the agent from a YAML config
+
+If you already have a run config, point the agent at it instead of answering the
+prompts:
+
+```text
+Follow the analysis orchestrator installed with TraceLens and run the full
+agentic analysis workflow from config <run.yaml>, <scope>
+```
+
+Replace `<scope>` with `standalone`, `comparative`, `semantic`, or `multi_trace`. You can
+leave the scope out when the config already implies it: a single job runs as `standalone`,
+two jobs with `compare_to` on the first job run as `comparative`, and a config with an
+`aggregation` block runs as `multi_trace`.
+
+| Scope | Config shape |
+|---|---|
+| `standalone` | One job. |
+| `comparative` | Two jobs, each with an optional `capture_folder`. `compare_to` on the first job can name the second job instead of repeating its paths. |
+| `semantic` | Two graph-replay-only jobs with `analysis_mode: inference` and no `capture_folder`. |
+| `multi_trace` | Two or more jobs on the same platform, each with a `phase` and a `node` (its index within the phase), and an `aggregation` block with policy `combine_by_node`. Each job is one node, `<phase>_<index>`, and the first job is the one that kernel fusion and system analysis focus on. |
+
+For example, a `multi_trace` config for a prefill trace and a decode trace:
+
+```yaml
+analysis_mode: inference
+output_dir: /abs/path/analysis_output
+aggregation:
+  policy: combine_by_node
+jobs:
+  - phase: prefill
+    node: 0
+    trace_path: /abs/path/prefill_0.json.gz
+    platform: MI300X
+  - phase: decode
+    node: 0
+    trace_path: /abs/path/decode.json.gz
+    platform: MI300X
+```
+
+Every job needs a `platform`, and all trace, capture folder, and output paths must be
+absolute. For the full schema and more examples, see
+[Generate performance reports from a YAML config](./generate-perf-report-from-config.md).
+
 ## Read the results
 
 Only `analysis.md` is intended for end-user review. Everything else under
@@ -186,19 +230,19 @@ matter.
 
 The high-level steps are:
 
-1. Query user inputs (comparison scope, trace paths, platforms, analysis mode,
-   environment setup).
-2. Generate the performance report (branching on analysis mode and comparison
-   scope).
-3. Prepare category data (GPU utilization, top operations, tree data, multi-kernel
+1. Query user inputs, or read a run YAML (environment setup is always asked).
+2. Generate the performance reports with one call on the completed run config.
+3. Check trace quality, with a fallback for graph-under-recorded traces.
+4. Prepare category data (GPU utilization, top operations, tree data, multi-kernel
    data, category filtering) and extract fusion candidates.
-4. Run system-level analysis (CPU/idle, multi-kernel, and kernel fusion) in
+5. Run system-level analysis (CPU/idle, multi-kernel, and kernel fusion) in
    parallel.
-5. Run the compute-kernel sub-agents in parallel.
-6. Aggregate the per-category findings into a globally ranked list.
-7. Validate sub-agent outputs for time sanity, efficiency anomalies, and coverage.
-8. Prepare report data and identify the model.
-9. Generate the final `analysis.md` report.
+6. Run the compute-kernel sub-agents in parallel.
+7. Aggregate the per-category findings into a globally ranked list.
+8. Validate sub-agent outputs for time sanity, efficiency anomalies, and coverage.
+9. Prepare report data and identify the model.
+10. Render the performance plot when no `agent_extension.py` is present.
+11. Generate the final `analysis.md` report.
 
 ### Sub-agents
 

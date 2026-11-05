@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/models/supported_models.md
-raw_sha256: c1f5419f0d86bc7277139b172e231d5642609cb69d506a2b72b2d766bb34053c
+raw_sha256: fbf0a6da4c9f8842a4bac51bd77367ca107da182ef6358c3fb5f0db91444cefe
 sources: []
-generated_body_sha256: ef29cc3d98db0ee129c430384901a54f4a825625e5e25fbc007da7c092dfc0aa
+generated_body_sha256: 630998b9f84ae18f6619e751ecd841a218df717e2145d49782223d078d69da6c
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/models/supported_models.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/models/supported_models.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/models/supported_models.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -44,7 +44,7 @@ PyTorch框架根据模型架构特点分为稠密模型、稀疏模型和状态�
 | **贡献方** | 模型贡献来源。|
 | **认证** | `【Pass】` 已通过官方测试；`【Test】` 内部测试中，如有问题请反馈至 [issues](https://gitcode.com/ascend/MindSpeed-LLM/issues) |
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - MindSpeed LLM支持<term>Ascend 950PR&950DT系列产品</term>、<term>Atlas A3训练系列产品</term>和<term>Atlas A2训练系列产品</term>，可通过[硬件信息查询](https://www.hiascend.com/cann/download)获取。并且要求单NPU的片上内存为64GB及以上，[安装驱动固件](../training/install_guide.md)后可通过npu-smi info查看单NPU的片上内存容量。
 > - 提供[模型训练示例脚本](../../../../examples)，训练脚本命名为`pretrain_模型名_参数_文本序列长度_训练方案_训练产品.sh`，微调脚本命名为`tune_模型名_参数_文本序列长度_训练方案_训练产品.sh`。
@@ -1294,12 +1294,21 @@ PyTorch框架根据模型架构特点分为稠密模型、稀疏模型和状态�
       <td>【Test】</td>
     </tr>
     <tr>
-      <td rowspan="1"><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base">DeepSeek-V4-Flash</a></td>
-      <td><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base/tree/main">284B</a></td>
+      <td rowspan="2"><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base">DeepSeek-V4-Flash</a></td>
+      <td rowspan="2"><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base/tree/main">284B</a></td>
       <td><a href="../../../../examples/mcore/deepseek4_flash">deepseekv4-flash</a></td>
       <td>4k</td>
       <th>Mcore</th>
       <td>8x16</td>
+      <td>  </td>
+      <td>【Ascend】</td>
+      <td>【Test】</td>
+    </tr>
+    <tr>
+      <td><a href="../../../../examples/fsdp2/deepseek4">deepseek4</a></td>
+      <td>4k</td>
+      <th>FSDP2</th>
+      <td>16x16</td>
       <td>  </td>
       <td>【Ascend】</td>
       <td>【Test】</td>
@@ -1449,7 +1458,7 @@ PyTorch框架根据模型架构特点分为稠密模型、稀疏模型和状态�
   </tbody>
 </table>
 
-> [!NOTE]
+> [!NOTE] 说明
 > GPT模型词表文件与常规模型不同，需按以下步骤配置：
 >
 > ```shell
@@ -1540,7 +1549,7 @@ PyTorch框架根据模型架构特点分为稠密模型、稀疏模型和状态�
   </tbody>
 </table>
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > Mamba2系列开源模型未提供词表文件。内部测试使用的词表文件 `mamba2_2.7b_from_8b.model` 为自定义设计，建议用户自行构建词表，训练效果不做保证。
 >

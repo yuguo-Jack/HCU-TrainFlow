@@ -9,35 +9,36 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
   path: docs/examples/op_fuser/op_fuser.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 95497fc7b153ba375d9687e6ce2333bdfee40da6f3653555624c274f9cf5f71d
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/ops/fuser.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: c7dda3b60819734a9a03f2e03d80731937e35d5d42bc1c7150c52694e14fc536
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: db2aad0d18bc881e8887d54eb582ee646d4a487584e4d0b83ea76fdc3064adf4
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/ops/sequential.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: ebb47e64acc5cad6b267437f6e751850827a4b9ac66f5c40e4515e6edb850c73
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/module/layernorm_mlp.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 6c2667e8935cb0fe54dd200edd2f8efe4685b63f403ef3c93b76741d78822002
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 10c26a70ea6f8a29d257df8d22d326cd604ff33024684da2d726b7189185fb55
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/module/grouped_linear.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: a4ccd1f6387b4ac897367a1ad667ef5e606ba90b4a1cba0905bab3843084cbfb
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 81285c46ceb62f2b01fe4331ca6c74de18f0ccc1f81085d5d6509b00b98ac9ce
 - source: nvidia-transformerengine
   path: docs/examples/gemm_profiling/gemm_profiling.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 31444db2fe36482719a7262091ea25ae69a95d13f898c19148b0b0efe91c52f2
 - source: nvidia-transformerengine
   path: benchmarks/gemm/benchmark_gemm.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 365eb2888a4dbc293efd454dd26cad604fb4bf44bb7e3ef019eb0364065beef2
 - source: nvidia-transformerengine-docs
   path: op-fuser
@@ -47,16 +48,24 @@ sources:
   revision_kind: web-content-fingerprint
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/ops/basic/grouped_linear.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: eee951ca3e44e2569e87fb093dd9bd13278af19c5b5beff680023c0e71341143
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: d8a8dacdc5c192408a93258968e96dbd178a208b5e9c95ffcc44e5f3ed9e2823
 - source: nvidia-transformerengine
   path: tests/pytorch/test_grouped_mlp.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 09685ac90c632b46ad5eafb3642ab97484b9ceddc09bd80171ea1064ae0ca6c2
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: fd23ca189afa3771c15706d8b5f52cf01955b2c0c9dadc945938afe5ab75577f
 - source: nvidia-transformerengine
   path: docs/envvars.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 7d0f440d41ba1122259bbc2d5daaf7892fd0e87de1fa17a79c2f185b1c8adf2d
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 5a2bc2206a8602f90ba8ca3aa00c921f23caa5795baa3149953bad5767f4b99a
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/ops/fused/grouped_mlp.py
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 4d60a9a3c400a27f1f4243e8bd76fe39ec2e99da753d2b878943685e42a8ffc1
+- source: nvidia-transformerengine
+  path: transformer_engine/pytorch/quantization.py
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 99bc9f487e38d5b1f43f8ec5a2c4b252af9ef4f8f0e75443d8fee32fce90a08b
 ---
 # TE 融合与形状级分析：OperationFuser 和 GEMM 教程
 
@@ -73,6 +82,12 @@ TE 的模块式接口如 LayerNormMLP 将多个操作封装在一个类中；`te
 `NVTE_CUTEDSL_FUSED_GROUPED_MLP` 已弃用：兼容读取会将 split alignment 覆盖为256并告警；当前接入应显式声明实际分片对齐，不能只设环境变量当作数据已满足条件。native GroupedTensor 的单参数权重/偏置还受设备、dtype、recipe 和功能组合约束，不能在不支持时静默拆回离散参数。`Sequential.reset_parameters()` 会清 `_module_groups` 再逐模块重置，避免 fuser 持有已经被替换的旧参数。
 
 当前 `test_grouped_mlp.py` 在相同 basic ops/quantizer wiring 下分别保留 fusion on/off 路线，并检查前后向实际融合；只有吞吐或模块名相同不够。单 group 与冻结参数的新增边界见[权重布局案例](../cases/grouped-mlp-weight-layout.md)。
+
+2026-11-04 的普通 GroupedLinear 将 `split_alignment` 默认改为 None：按实际 recipe/设备解析为块缩放128、Hopper current-scaling 16、其他1；GPU offset 生成同时校验每个 split，捕获后重放也不能靠虚报对齐绕过。block-scaled 融合仍要求实际256对齐，MXFP8 canonical-layout 则按 cuDNN wrapper 的能力标志选择，不能沿用旧 kernel-facing view。
+
+新 `GroupedMLP_CuTeGEMMGLUBf16` 是独立未量化路线：仅 recipe=None、BF16 权重/计算、受支持 GLU 和匹配的 SM10.x（minor<7），并探测 cuDNN Frontend 版本及 canonical-layout 能力。每专家和总 token 对齐均为256；FC1 scale_bias、不匹配的分布式权重组合、部分确定性梯度要求均有拒绝条件。当前 matcher 尚直接对 `split_alignment` 取模，未像 block-scaled 路线先解析 None；静态调用链显示匹配窗口在能力门通过后可能因省略该参数而失败。接入时显式声明真实对齐，保留默认参数的准入回归待验证，不将此源码观察写成本轮 GPU 重现。
+
+分布式权重还需保存该次 forward 的 quantizer：backward 重新 gather BF16 shard 后按所保存 recipe 量化，不能从已被后续 forward 替换的 live op 读取。wgrad 的 dtype、外部 main_grad alias、独立结果与 reduce-scatter 分别核对；延后 wgrad 已改为跨 tied 参数和 microbatch 累加，不能覆盖前一贡献。
 
 ## 官方 GEMM profiling 教程怎么用
 
@@ -92,19 +107,23 @@ TE 的模块式接口如 LayerNormMLP 将多个操作封装在一个类中；`te
 
 ## 来源与版本复核
 
-- [nvidia-transformerengine: docs/examples/op_fuser/op_fuser.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/op_fuser/op_fuser.rst)
-- [nvidia-transformerengine: transformer_engine/pytorch/ops/fuser.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/ops/fuser.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/ops/sequential.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/ops/sequential.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/module/layernorm_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/module/layernorm_mlp.py)
-- [nvidia-transformerengine: transformer_engine/pytorch/module/grouped_linear.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/module/grouped_linear.py)
-- [nvidia-transformerengine: docs/examples/gemm_profiling/gemm_profiling.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/gemm_profiling/gemm_profiling.rst)
-- [nvidia-transformerengine: benchmarks/gemm/benchmark_gemm.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/benchmarks/gemm/benchmark_gemm.py)
+- [nvidia-transformerengine: docs/examples/op_fuser/op_fuser.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/examples/op_fuser/op_fuser.rst)
+- [nvidia-transformerengine: transformer_engine/pytorch/ops/fuser.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/ops/fuser.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/ops/sequential.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/ops/sequential.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/module/layernorm_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/module/layernorm_mlp.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/module/grouped_linear.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/module/grouped_linear.py)
+- [nvidia-transformerengine: docs/examples/gemm_profiling/gemm_profiling.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/examples/gemm_profiling/gemm_profiling.rst)
+- [nvidia-transformerengine: benchmarks/gemm/benchmark_gemm.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/benchmarks/gemm/benchmark_gemm.py)
 - [nvidia-transformerengine-docs: op-fuser](https://docs.nvidia.com/deeplearning/transformer-engine/examples/op_fuser/op_fuser.html)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
 
 ## 本次补充的实现与测试依据
 
-- [nvidia-transformerengine: transformer_engine/pytorch/ops/basic/grouped_linear.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/ops/basic/grouped_linear.py)
-- [nvidia-transformerengine: tests/pytorch/test_grouped_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/test_grouped_mlp.py)
-- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/envvars.rst)
+- [nvidia-transformerengine: transformer_engine/pytorch/ops/basic/grouped_linear.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/ops/basic/grouped_linear.py)
+- [nvidia-transformerengine: tests/pytorch/test_grouped_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/tests/pytorch/test_grouped_mlp.py)
+- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/envvars.rst)
+
+- [transformer_engine/pytorch/ops/fused/grouped_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/ops/fused/grouped_mlp.py)
+
+- [transformer_engine/pytorch/quantization.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/quantization.py)

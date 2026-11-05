@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/TransformerEngine
-commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+commit: 720b25258be3b60f482afff8aef00d4cad88fa16
 path: docs/api/pytorch.rst
-raw_sha256: 4759218bf6eba4aba0fbeb969394011342bca371eb274099640a3c77a2cc0d7e
+raw_sha256: 91f25fd250aa28de9708a77c5d078b0db42dc25d35fcf5673c5859bdab51a3e0
 sources: []
-generated_body_sha256: 2a90871e61906c404df9d8b50ebdf6a18b4e92c073c718f30b15d84119d11a38
+generated_body_sha256: e0ab1a4e25fe0efef18a9c381b4d912e261281e4b91bccf23c4a487f9491b3df
 source_state: current-scan
 ---
 
 # NVIDIA/TransformerEngine / docs/api/pytorch.rst
 
-[Original at fixed commit](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/api/pytorch.rst)
+[Original at fixed commit](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/api/pytorch.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -127,15 +127,54 @@ Recipe availability
 Mixture of Experts (MoE) functions
 ----------------------------------
 
+See :doc:`Mixture of Experts <../features/mixture_of_experts/mixture_of_experts>` for an overview of
+how these functions fit together. ``GroupedLinear`` (the grouped GEMM used for the
+expert layers) is documented above with the other modules.
+
 .. autoapifunction:: transformer_engine.pytorch.moe_permute
 
 .. autoapifunction:: transformer_engine.pytorch.moe_permute_with_probs
+
+.. autoapifunction:: transformer_engine.pytorch.moe_permute_and_pad_with_probs
 
 .. autoapifunction:: transformer_engine.pytorch.moe_unpermute
 
 .. autoapifunction:: transformer_engine.pytorch.moe_sort_chunks_by_index
 
 .. autoapifunction:: transformer_engine.pytorch.moe_sort_chunks_by_index_with_probs
+
+.. autoapifunction:: transformer_engine.pytorch.router.fused_topk_with_score_function
+
+.. autoapifunction:: transformer_engine.pytorch.router.fused_compute_score_for_moe_aux_loss
+
+.. autoapifunction:: transformer_engine.pytorch.router.fused_moe_aux_loss
+
+Expert parallelism
+~~~~~~~~~~~~~~~~~~
+
+NCCL-based dispatch and combine for experts sharded across ranks. See
+:doc:`Expert parallelism <../features/mixture_of_experts/mixture_of_experts>`.
+
+``MoeDispatch`` and ``MoeCombine`` can wrap the local expert operations in a
+``transformer_engine.pytorch.ops.Sequential``. They share an ``EpConfig`` and
+an ``EpBuffer``; the guide shows how to connect the per-expert counts and
+routing weights through the sequence's extra-tensor channels.
+
+.. autoapiclass:: transformer_engine.pytorch.ops.MoeDispatch
+
+.. autoapiclass:: transformer_engine.pytorch.ops.MoeCombine
+
+.. autoapiclass:: transformer_engine.pytorch.ep.EpConfig
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_bootstrap
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_finalize
+
+.. autoapiclass:: transformer_engine.pytorch.ep.EpBuffer
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_dispatch
+
+.. autoapifunction:: transformer_engine.pytorch.ep.ep_combine
 
 
 Communication-computation overlap
@@ -246,6 +285,8 @@ Operation fuser
 
 .. autoapiclass:: transformer_engine.pytorch.ops.BasicLinear
    :members: _functional_forward, _functional_backward
+
+.. autoapiclass:: transformer_engine.pytorch.ops.BatchedLinear
 
 .. autoapiclass:: transformer_engine.pytorch.ops.Bias
 

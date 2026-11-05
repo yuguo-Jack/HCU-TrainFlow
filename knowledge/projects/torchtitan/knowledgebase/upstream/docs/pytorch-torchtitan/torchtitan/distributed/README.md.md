@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/distributed/README.md
-raw_sha256: 0f091154d9ad220ef32ad01b62d3ea1a422840689bc4b9f5d8200c62e83c3124
+raw_sha256: c04da512eb9e4a9159e3f3751b9e1074239aa13906d3d67b9d9be632c3b61b59
 sources: []
-generated_body_sha256: 14c02ed1501a2c7af0ca14b4edfce3b031c60d59945f7ec14360afcd67c37839
+generated_body_sha256: d574ea944c9b2b953226ba1755249a725547914ca324b82eaf9119704f184216
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/distributed/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -30,7 +30,7 @@ Upstream source document; original commands, claims and links require their stat
 
 This package holds the PyTorch-native parallelisms and the training techniques
 that have to compose with them. Not every module issues collectives: activation
-checkpointing, CUDA graphs and local compile run per device, but they live here
+checkpointing, accelerator graphs and local compile run per device, but they live here
 because each one interacts with sharding, pipeline schedules or SPMD regions and
 is applied during model parallelization.
 
@@ -52,7 +52,7 @@ is applied during model parallelization.
 | Module | Purpose |
 | --- | --- |
 | `activation_remat.py` | Activation remat (activation checkpointing) configs on `torch_remat`. See [REMAT.md](REMAT.md). |
-| `cuda_graph.py` | CUDA graph capture and replay of the training step. |
+| `accelerator_graph.py` | Accelerator graph capture and replay of the training step. |
 | `local_compile.py` | `torch.compile` of named model regions. |
 | `batch_invariant.py` | Batch-invariant (bitwise-reproducible) kernels. |
 | `offloading.py` | NUMA binding of each rank to the CPU node local to its GPU. |
@@ -62,7 +62,7 @@ is applied during model parallelization.
 `Optim.step()` releases unused CUDA cache on its first call, before gradient
 clipping. Each new `Optim` instance tracks its own first call, so a restored
 step number does not skip the release. It waits for GPU work to finish before
-releasing cache. Both calls run outside optimizer CUDA graph capture.
+releasing cache. Both calls run outside optimizer accelerator graph capture.
 
 NCCL allocates its internal communication buffers outside PyTorch's caching
 allocator. Unused PyTorch cache can block those allocations even when the live
@@ -75,7 +75,7 @@ This workaround requires:
 - Enough unused CUDA cache that can be released for the NCCL buffers.
 - The affected NCCL allocation to happen during the first optimizer call.
 
-The release keeps live tensors and active CUDA graph pools. It does not reduce
+The release keeps live tensors and active accelerator graph pools. It does not reduce
 NCCL buffer sizes or prevent allocation failures during forward or backward,
 or later in the run. It does not release NCCL host shared memory.
 

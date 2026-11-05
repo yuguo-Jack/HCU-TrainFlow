@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/internals/code_structure.md
-raw_sha256: a4d4093b9593f950f82bdb830b6de52a7b6f6f5d4c04899656d0528422ae023d
+raw_sha256: 016b1fe2d8b00dfaca4b622b3ac52b0cfc834a14d5267ad7c95279bc3261a900
 sources: []
-generated_body_sha256: 630c43dc5ed551090b9df76061bc8e207aa127206a8b7052707a892fea80dc35
+generated_body_sha256: 5a5551ede5b8693ca2a06a590f5a73ddfc1b35db84abd7cf928effda36cb744d
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/internals/code_structure.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/internals/code_structure.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/internals/code_structure.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -47,7 +47,7 @@ The implementation lives under `src/megatron/energon`. Its main layers are:
 | `flavors` | Detect prepared dataset formats and construct their readers and runtime datasets. |
 | `wrappers` | Compose iteration behavior such as mapping, batching, blending, packing, and epochizing. |
 | `task_encoder` | Build the user-facing loading pipeline and invoke application-specific encoding hooks. |
-| `epathlib` | Provide local and remote path access. |
+| `epathlib` | Provide local and remote path access plus mapped-array helpers. |
 | `cache` | Store generated indexes and cache metadata. |
 | `media`, `decoders`, `transforms` | Decode and transform sample payloads. |
 | `cli`, `tools` | Prepare datasets and expose operational utilities. |
@@ -111,7 +111,7 @@ declare and restore that progress. See {ref}`savability` before adding a wrapper
 
 Dataset partitioning, random number generation, and saved worker state use global worker identities.
 
-Readers and open files belong to worker processes. Keep resource handles out of serialized
+Readers, open files, and mapped arrays belong to worker processes. Keep resource handles out of serialized
 checkpoint state and close readers that own handles. Path and storage rules are described in
 {ref}`epath-storage`.
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/speculative_decoding.mdx
-raw_sha256: 6a01cf3bdab19e276a1276bb1474547685b5c40280b5647427be88625d67046b
+raw_sha256: 47ce07e02b223b628cfdddfe27de565fd168922a0f67ce91d5115f85d23cfb9d
 sources: []
-generated_body_sha256: 4a257fb2442352086b34ed39d32d65516f1477b773d91968cf0bac383452da0c
+generated_body_sha256: 9359c5e178ec98ee4b3cc591dc7153e10d1e677eb7f416b14b19ab0bad1211eb
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/speculative_decoding.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/speculative_decoding.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/speculative_decoding.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -129,7 +129,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFlash draft model (linear block verification)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No DP attention (<code>--attn-dp-size</code> &gt; 1); <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA DP attention requires <code>--enable-dp-lm-head</code> and <code>attn_cp_size == 1</code>; <code>pp_size == 1</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -575,7 +575,7 @@ print(response.choices[0].message.content)
 - Grammar decoding, returned logprobs or hidden states, sampling penalties, `min_p`, logit bias, custom logit processors, strict thinking, and deterministic inference are not yet supported.
 - In tree mode, both speculative acceptance thresholds must remain at 1.0, `V` must be at least `B` and at most 128, and `V * K` must not exceed 2048. SGLang validates the remaining tree-capacity and EAGLE parent-representation constraints at startup.
 - Mixed chunked prefill is disabled for UNO.
-- Ordinary overlap scheduling is supported. Tree mode does not yet support PDMux or the separate `--enable-two-batch-overlap` feature.
+- Ordinary overlap scheduling is supported. Tree mode does not yet support the separate `--enable-two-batch-overlap` feature.
 
 ---
 
@@ -647,6 +647,37 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+### DFlash and DFlash2 with DP attention
+
+On NVIDIA CUDA, you can use attention DP with plain DFlash drafts and DFlash2
+candidate-selector checkpoints. Both use `--speculative-algorithm DFLASH`.
+Set `--enable-dp-lm-head` so the target head has the same vocabulary shards as
+its local draft replica. Pipeline parallelism and DP combined with context
+parallelism are not supported. Domino and LiLiCorr heads are not supported
+with CUDA DP attention.
+
+For example, on four NVIDIA GPUs, use TP4 with attention DP2 / TP2:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-4B \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path z-lab/Qwen3-4B-DFlash-b16 \
+    --tp-size 4 \
+    --attn-dp-size 2 \
+    --enable-dp-lm-head \
+    --attention-backend flashinfer \
+    --speculative-draft-attention-backend flashinfer \
+    --cuda-graph-backend-prefill disabled
+```
+
+For DFlash2, use a matching target and selector checkpoint, such as
+`Qwen/Qwen3.8-27B` and `incoai/Qwen3.8-27B-DFlash2`.
+Each attention-DP group runs its draft within the local attention-TP group.
+Draft execution stays eager; eligible target verify batches can use CUDA graphs.
+The scheduler separates prefill and verify rounds across DP ranks. Keep the
+experimental `SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION` setting disabled.
 
 ### LiLiCorr: reranked DFlash drafts
 

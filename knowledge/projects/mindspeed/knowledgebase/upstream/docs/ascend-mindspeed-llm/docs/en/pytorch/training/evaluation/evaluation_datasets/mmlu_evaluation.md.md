@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/evaluation/evaluation_datasets/mmlu_evaluation.md
-raw_sha256: abe18e34e84c7a68cd9c79aa168e43cf4352a8c39b0ea6b4c6100bad2850ce2f
+raw_sha256: e4ae60e5182986d87f4b72026f8c55621d93e6f69c031f231ed7ed469d241313
 sources: []
-generated_body_sha256: 527d6f9e14aa485d83862fd5c03db3f005c43641aeda6931154807c96798a98b
+generated_body_sha256: e818b8f63b77fbc26c39f096eb7b7f134a650d8a567c01b32f003b1ff6c04b30
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/evaluation/evaluation_datasets/mmlu_evaluation.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/evaluation/evaluation_datasets/mmlu_evaluation.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/evaluation/evaluation_datasets/mmlu_evaluation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -41,7 +41,7 @@ Massive Multitask Language Understanding (MMLU) evaluation includes a wide range
 
 Each domain also contains multiple specific tasks and questions. Through these diverse tasks, MMLU can evaluate mastery of knowledge and cross-domain generalization ability of a model.
 
-The subject sets included in [STEM](#STEM), [Humanities](#人文学科), and [Social Sciences](#社会科学) are listed at the end of this document.
+The subject sets included in [STEM](#STEM), [Humanities](#humanities), and [Social Sciences](#social-sciences) are listed at the end of this document.
 
 The MindSpeed LLM repository currently provides four evaluation modes for MMLU evaluation.
 
@@ -140,7 +140,7 @@ Set this to `mmlu_ppl`.
 17. `high_school_statistics` (high school statistics)
 18. `machine_learning` (machine learning)
 
-<a name="人文学科"></a>
+<a name="humanities"></a>
 
 ### Humanities Question Sets
 
@@ -158,7 +158,7 @@ Set this to `mmlu_ppl`.
 12. `professional_law` (professional law)
 13. `world_religions` (world religions)
 
-<a name="社会科学"></a>
+<a name="social-sciences"></a>
 
 ### Social Sciences Question Sets
 

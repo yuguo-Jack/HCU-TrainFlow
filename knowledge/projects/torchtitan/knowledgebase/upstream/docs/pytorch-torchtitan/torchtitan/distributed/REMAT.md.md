@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/distributed/REMAT.md
-raw_sha256: 7b419c4cb3e396ad1f6015130afdacf229264b214a18e0610b7bc9ac91097f99
+raw_sha256: 6693c808dafbc202f526f366fe25dd60dc03453966230be810f6907f7b84cff0
 sources: []
-generated_body_sha256: c905f5c8e7bc5509a2e5f9026f6a6b593402d8197f54cc27bf13f599eb921dbf
+generated_body_sha256: b2372ff23afa1384108550a522f83cd51365f5fdd95323da29a7587aca2b0fc8
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/distributed/REMAT.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/REMAT.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/REMAT.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -322,10 +322,11 @@ communication regions:
   and the expert-major permute; `combine` covers the unpermute, the combine
   all-to-all and the score-weighted scatter-add. The DeepEP and HybridEP
   dispatchers instead declare `ep_communication.dispatch` and
-  `ep_communication.combine` around their kernels. DeepEP saves or replays
-  both together, following `ep_communication`. A replay must receive tokens
-  in the forward's order, so DeepEP then uses a deterministic buffer, which
-  adds a sort to every dispatch. `FullActivationRematConfig` replays them.
+  `ep_communication.combine` around their kernels. Both save or replay
+  dispatch and combine together, following `ep_communication`. A replay must
+  receive tokens in the forward's order, so DeepEP uses a deterministic buffer, which
+  adds a sort to every dispatch. HybridEP derives token positions from prefix
+  scans. `FullActivationRematConfig` replays both backends' communication.
 - Shared-expert linear regions. The shared `w2.tp_reduce` region is the
   `Partial -> Shard(0)` reduce-scatter when sequence parallelism is enabled;
   save it together with `w2.linear`.

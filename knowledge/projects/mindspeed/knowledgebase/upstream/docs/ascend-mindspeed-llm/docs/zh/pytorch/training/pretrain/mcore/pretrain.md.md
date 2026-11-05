@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/pretrain/mcore/pretrain.md
-raw_sha256: f41d8131340459a5a0bf88d6f6767377f4826777ef6ab7030d136243a5b9fc13
+raw_sha256: 14ced0ad3dd138e96c34e305b3b6a3b2de63fa49405e4a21c9f80ef21223c884
 sources: []
-generated_body_sha256: 73c145496bc903e3d96abd52230edd0c891fdfb2c3e3a6a9596980614fa19b01
+generated_body_sha256: cab3d30e6f3df15559b6a4e78508827fd3c61ca63f3161e1af947f06a081c4f2
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/pretrain/mcore/pretrain.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/pretrain/mcore/pretrain.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/pretrain/mcore/pretrain.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -42,7 +42,7 @@ Upstream source document; original commands, claims and links require their stat
 
 ## 使用说明
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 数据预处理时如果需要使用数据集Pack模式，请参考[多样本Pack模式预训练](./pretrain_eod.md)。
 > - 预训练时可以不加载初始权重，此时模型权重采用随机初始化。如果需要加载权重，则需提前进行权重转换，具体请参考[权重转换](../../../tools/checkpoint_convert_hf_mcore_large_params.md)。
@@ -167,7 +167,7 @@ Upstream source document; original commands, claims and links require their stat
         --tokenizer-model ${TOKENIZER_MODEL} \
         ```
 
-    > [!NOTE]
+    > [!NOTE] 说明
     >
     > - 提供的路径需要加双引号。
     > - 多机训练中请确保每台机器上的模型路径和数据集路径等无误，如果没有设置数据共享，需要在训练启动脚本中增加`no-shared-storage`参数。设置此参数之后将会根据分布式参数判断非主节点是否需要load数据，并检查相应缓存和生成数据。

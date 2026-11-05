@@ -61,6 +61,31 @@ def test_bracketed_pr_titles_do_not_hide_broken_links(tmp_path):
     assert any('missing heading anchor: docs/guide.md#missing' in issue for issue in issues)
 
 
+def test_generated_catalog_keeps_link_syntax_in_pr_title_literal(tmp_path):
+    from hcu_trainflow import official, wiki
+    from hcu_trainflow.core import write_json
+
+    fixture(tmp_path)
+    write_json(tmp_path/'knowledge/sources.json', [
+        {'id': 'engine', 'repository': 'org/engine', 'engine': 'engine'}])
+    write(tmp_path, 'THIRD_PARTY_NOTICES.md', '[Engine](https://github.com/org/engine)\n')
+    write(tmp_path, 'docs/knowledge-architecture.md', '# Architecture\n## HCU 仓库知识的分工\n')
+    write(tmp_path, 'README.md', '# Example\n[Guide](docs/guide.md#使用)\n[Notices](THIRD_PARTY_NOTICES.md)\n')
+    (tmp_path/'knowledge/evidence/prs').mkdir(parents=True)
+    title = '[dev](perf): tune [pipeline] scheduling'
+    page = official.layout.pr_root(tmp_path, 'org/engine')/'PR-1.md'
+    official.generated_page(page, {'id': 'pr-org--engine-1', 'kind': 'source-pr',
+                                  'title': title, 'pr_number': 1}, 'Original body')
+
+    official.catalog(tmp_path)
+
+    report = checker.check_documentation(tmp_path)
+    assert report['status'] == 'current', report['issues']
+    _, body = wiki.parse_page(tmp_path/'knowledge/catalog/README.md')
+    assert checker.links(body) == [f'../{page.relative_to(tmp_path/"knowledge").as_posix()}']
+    assert wiki.parse_page(page)[0]['title'] == title
+
+
 def test_clickable_images_keep_image_destination_checks(tmp_path):
     fixture(tmp_path)
     write(tmp_path, 'target.bin', 'data')

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: docs/evaluation.md
-raw_sha256: 01c96cc92985701cc7f3e64bdcff5180d454b5fb1c972d7e2684ae57017b4510
+raw_sha256: 13fa165a8139e5b47054bbf46f99b11ec62387985366297b036cb99e373fcb20
 sources: []
-generated_body_sha256: 6f325b86396a44cc527d9fd4ac9e24a897445a5f1d7848330ec6a57c25691e0d
+generated_body_sha256: 37509210d1fd4aa4d8577078e443d2922c5a488cbbedc876e1b32eeaa78e3786
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / docs/evaluation.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/docs/evaluation.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/docs/evaluation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -57,8 +57,8 @@ validator=Validator.Config(
 
 Omitting `dataloader` uses this configuration by default.
 
-Validation follows `training.disable_cuda_graphs` and shares the training graph pool.
-See [CUDA graphs](../torchtitan/distributed/CUDA_GRAPH.md) for capture order and tensor lifetimes.
+Validation follows `training.disable_accelerator_graphs` and shares the training graph pool.
+See [accelerator graphs](../torchtitan/distributed/ACCELERATOR_GRAPH.md) for capture order and tensor lifetimes.
 
 ## Third-Party Evaluation
 With `./scripts/checkpoint_conversion/convert_to_hf.py`, `torchtitan` offers support for converting checkpoints from DCP to safetensors format. Using this script, users can perform efficient evaluation separate from their training using external libraries that support HuggingFace e.g. `lm_eval` with `vllm` backend.
@@ -70,7 +70,7 @@ Note that pip installing `lm-eval` may result in breaking `torchtitan` dev envir
 ```bash
 pip install "lm-eval[vllm]"
 lm_eval --model vllm \
-    --model_args pretrained=./outputs/checkpoint/step-1000,tensor_parallel_size=8,dtype=auto,gpu_memory_utilization=0.8, \
+    --model_args pretrained=./outputs/checkpoint/exports/step-1000,tensor_parallel_size=8,dtype=auto,gpu_memory_utilization=0.8, \
     --tasks mmlu \
     --batch_size auto
 ```

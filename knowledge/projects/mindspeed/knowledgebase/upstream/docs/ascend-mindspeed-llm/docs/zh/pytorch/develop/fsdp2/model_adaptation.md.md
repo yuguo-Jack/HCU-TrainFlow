@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 5a8ea03b12066067f39b1771782d12db236267ef
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/develop/fsdp2/model_adaptation.md
-raw_sha256: 23fce04730fc8b128eaf2fa6cdd267ea9a576720ad74ada20c1558e845744cef
+raw_sha256: bd0e87f902f88269709f13fba8d9f000a7f1398d43767dac2687f150cf7f98ce
 sources: []
-generated_body_sha256: 333d749d1cf0ed8c155d281105282b09fe7430e14f67b4f1bb77121b01f95a82
+generated_body_sha256: 15f320c1373ed540130807a59a94dfc8e9699ced8e1c98bd29364fafa4b0189e
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/develop/fsdp2/model_adaptation.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/zh/pytorch/develop/fsdp2/model_adaptation.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/develop/fsdp2/model_adaptation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -219,7 +219,7 @@ GPT-OSS在MindSpeed LLM中通过自定义注册方式接入。推荐从Transform
     | 适配点 | 说明 |
     | --- | --- |
     | 模型类 | 需要导出`GptOssForCausalLM`，用于注册到`ModelRegistry`。 |
-    | Attention | 如需FlashAttention、长序列CP或NPU融合算子，需要替换对应`forward`。 |
+    | Attention | 如需Flash Attention、长序列CP或NPU融合算子，需要替换对应`forward`。 |
     | MLP/Expert | MoE模型通常需要适配专家并行、token dispatch、grouped GEMM。 |
     | Norm/RoPE | 如果要使用融合RMSNorm、融合RoPE，需要在模型实现中接入对应算子。 |
     | 权重名 | 保持和HuggingFace权重文件中的key对齐，避免加载权重时缺失或unexpected key。 |
@@ -283,7 +283,7 @@ tests/poc/gpt_oss/
 
 下面示例使用“路径二：自定义注册适配GPT-OSS”，因此需要配置`model.model_id: gpt_oss`。如果使用“路径一：原生Transformers适配”，不要配置`model_id`，框架会根据`config.json`通过`AutoModelForCausalLM`自动加载模型。
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 启动训练前建议先用较小的`max_steps`和`max_samples`验证链路，再放大训练规模。
 
@@ -418,7 +418,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 bash tests/poc/gpt_oss/pretrain_gpt_oss_20b_4k_fsdp2_A3.sh
 ```
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > FSDP2示例脚本会先加载公共环境变量：
 >

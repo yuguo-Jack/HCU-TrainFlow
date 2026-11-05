@@ -333,6 +333,62 @@ def test_document_discovery_retry_delete_and_restore(tmp_path,monkeypatch):
     assert wiki.parse_page(page)[0]['source_state']=='current-scan'
 
 
+def test_document_symlink_reloads_referent_when_fixed_commit_changes(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'private')
+    tree=root/'knowledge/catalog/repositories/engine.json'
+    entries={'docs/link.md':{'type':'blob','mode':'120000','sha':'b'*40},
+             'docs/plain.md':{'type':'blob','mode':'100644','sha':'c'*40}}
+    write_json(tree,{'commit':'a'*40,'entries':entries})
+    monkeypatch.setattr(official,'api',lambda *a:({'private':False},''))
+    calls=[]
+    def code(s,r,c,p,t=None,max_chars=None):
+        calls.append((c,p))
+        raw=b'# First target\n' if c=='a'*40 else b'# Updated target\n'
+        return {'artifact':s.put(raw),'url':'https://github.com/org/engine/blob/'+c+'/'+p}
+    monkeypatch.setattr(official,'read_code',code)
+    assert official.sync_documents(store,root,'engine')['pending']==0
+    calls.clear()
+    write_json(tree,{'commit':'d'*40,'entries':entries})
+    result=official.sync_documents(store,root,'engine')
+    assert calls==[('d'*40,'docs/link.md')]
+    assert result['processed']==['docs/link.md'] and result['pending']==0
+    ledger=read_json(root/'knowledge/catalog/document-ledgers/engine.json')
+    assert ledger['records']['docs/link.md']['commit']=='d'*40
+    assert ledger['records']['docs/link.md']['blob']=='b'*40
+    assert ledger['records']['docs/plain.md']['commit']=='a'*40
+    page=root/ledger['records']['docs/link.md']['page']
+    meta,body=wiki.parse_page(page)
+    assert meta['commit']=='d'*40 and meta['raw_sha256']==digest(b'# Updated target\n')
+    assert '# Updated target' in body and '# First target' not in body
+    calls.clear()
+    assert official.sync_documents(store,root,'engine')['processed']==[]
+    assert calls==[]
+
+
+def test_document_symlink_failed_referent_refresh_remains_pending(tmp_path,monkeypatch):
+    root=project(tmp_path);store=Store(tmp_path/'private')
+    tree=root/'knowledge/catalog/repositories/engine.json'
+    entries={'docs/link.md':{'type':'blob','mode':'120000','sha':'b'*40}}
+    write_json(tree,{'commit':'a'*40,'entries':entries})
+    monkeypatch.setattr(official,'api',lambda *a:({'private':False},''))
+    def code(s,r,c,p,t=None,max_chars=None):
+        return {'artifact':s.put(b'# Target\n'),'url':'https://github.com/org/engine/blob/'+c+'/'+p}
+    monkeypatch.setattr(official,'read_code',code)
+    official.sync_documents(store,root,'engine')
+    write_json(tree,{'commit':'d'*40,'entries':entries})
+    def unavailable(*args,**kwargs):raise FlowError('target unavailable')
+    monkeypatch.setattr(official,'read_code',unavailable)
+    result=official.sync_documents(store,root,'engine')
+    assert result['pending']==1 and result['errors']==[{'path':'docs/link.md','error':'target unavailable'}]
+    ledger=read_json(root/'knowledge/catalog/document-ledgers/engine.json')
+    assert ledger['records']['docs/link.md']['commit']=='a'*40
+    page=root/ledger['records']['docs/link.md']['page']
+    assert wiki.parse_page(page)[0]['source_state']=='pending-newer-content'
+    monkeypatch.setattr(official,'read_code',code)
+    assert official.sync_documents(store,root,'engine')['pending']==0
+    assert wiki.parse_page(page)[0]['source_state']=='current-scan'
+
+
 def test_document_scope_survives_sync_and_reindex(tmp_path, monkeypatch):
     root=project(tmp_path);store=Store(tmp_path/'private')
     registry=read_json(root/'knowledge/sources.json')

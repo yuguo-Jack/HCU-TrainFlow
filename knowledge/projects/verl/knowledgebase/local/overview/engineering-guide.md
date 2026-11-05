@@ -10,85 +10,101 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: volcengine-verl
   path: README.md
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: ddf49da56b709047d7641c6885c00bb43a68944aa458f03965008978d75a019d
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 9979fcb77c09dbeef48325ef3a0506fcbe88b709a0efdceb210e44571856b2ad
 - source: volcengine-verl
   path: pyproject.toml
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 41b9ee003cf1eb4478101ceefc7e6345e4c22b93554927b0438c24eb455bb388
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 232cab4b8129a99253ea61b42f565ce19e7136df8dfe0d0b5db14639d767501b
 - source: volcengine-verl
   path: setup.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: f1e4766854206b20afab7cf9c3b6fc3949dbe900cc1a2314e1a04e5d289e94bb
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: d9ac3d954517d6feaf050b931e76717953dac02e52f6bb00522efd9304d4ede5
 - source: volcengine-verl
   path: verl/trainer/main_ppo.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 8f5166336c11fc84f0144d93cc9412d446854820c0b4135ab902be6173e40a08
 - source: volcengine-verl
   path: verl/trainer/ppo/ray_trainer.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: eb41f99ccc66976eab14ebe35aa1aa5b7318e02469240ef1569ac4c884c94312
 - source: volcengine-verl
   path: verl/trainer/ppo/core_algos.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 369b614f239f237a04a38a40b1877cd6fd14aa7bd5f9ff4fe4d7758b682a6948
 - source: volcengine-verl
   path: verl/workers/engine_workers.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 301323b0a8665d236189c3438b835ee4b2ba8bc8cfced1890684070d403ef7a8
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 23c8053c2b3c555de5b37fbe27b7be664cf5b884e6c64ea7be1cd85402b30dfe
 - source: volcengine-verl
   path: verl/workers/config/actor.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: d7631944b186f162b897022c9fac8b2f0ede7f8bb6cba4276d98e5d5033fd60b
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: ce9e30df3dd6deb500bdc896b24038ee137ed0770ccce5a876cdcd1b575876c3
 - source: volcengine-verl
   path: verl/workers/config/rollout.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: f62e366c906a152a2fc61328afb33c711125f036e05d82b82189333c4ffc47b4
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 6364128a35597a6c84cb2f93bede7d84cb80ad123df5ccf96904fb7f2d111684
 - source: volcengine-verl
   path: verl/workers/engine/base.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 58057882c03110cdcf846fd833085e01e3f517a17dd9400f3c0d0e4bdba6500a
 - source: volcengine-verl
   path: verl/workers/engine/megatron/transformer_impl.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: a7c2de9049ebbb20d6da480dd078be0ecc6e7fcf2eb91d9e270c7c0367e9dc09
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 405dcf1962348a774efa006a08fe13176199fd5fcae1cf4e98b3cfb507b62cff
 - source: volcengine-verl
   path: verl/workers/engine/fsdp/transformer_impl.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 717b595c729469bde375234710b967e5b4a8d39ba93419f7b2a380f080483842
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 49bac0d824b5af3cd5f43e939a8f042eddeb002ed94cd721fd6f05c8e52c6bce
 - source: volcengine-verl
   path: verl/utils/seqlen_balancing.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: f0536d757a8c8eb1a15d63e7174a8995ebbf180481845576f1817ee6020b4902
 - source: volcengine-verl
   path: docs/start/install.rst
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 9c02bd24568ebf1c285bdcac45a472f60d7641c7cc658e5d40686457aa5a8eec
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 9a86c39520c84cff4fc46252bf4c65ef1bc323840a149268889cdc5c7c0774ea
 - source: volcengine-verl
   path: docs/perf/best_practices.rst
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: ce40babc9a9c45b9a80926509ffacc0697b753aae393e4c8bd00aa5e3f781af3
 - source: volcengine-verl
   path: docs/perf/perf_tuning.rst
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 4c64e886e6acff66fd48c82e68d7289f572ebc5dedad9bb8da44ab9cef21c7b3
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: eb81a625cc9c5481ca58a4d77d36e4fa5e29e48103d595e41ee22973a715f020
 - source: volcengine-verl
   path: docs/perf/torch_profiling.md
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: c1925e1edfba630c25a048f219365d6aed183eab4eb9befc84baab86a857263f
 - source: volcengine-verl
   path: tests/utils/test_seqlen_balancing.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 658fb094f2edb2fe6914ded167e4b18aba3543d5b5410a93a2816622a7b9c48d
 - source: volcengine-verl
   path: tests/trainer/ppo/test_rollout_corr_integration.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 3d8c1a1471043a5cbe03cf010c0b2e3dff293370c79b2273aa70a02261bdd759
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: a4b17336744e243baa5b8c9c9d5f0ea55dc4ef10240f44f6213a62eb3c097e5e
+- source: volcengine-verl
+  path: verl/models/mcore/util.py
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: e89b4dbb79122d851c46b07247a8c6ab24f2c346b5bc4be2e762112e488302f6
+- source: volcengine-verl
+  path: verl/utils/qat/compressed_tensors.py
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: a59fb2be3b8d6d96b9a573e17d073178a58ba67fd17b9587cbac04ec873edc30
+- source: volcengine-verl
+  path: verl/utils/real_nvfp4/megatron.py
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: d2c51b072bdfdbcdffa6c8cb77e57f97a4de5f7f867832764c6efc8d45825829
+- source: volcengine-verl
+  path: verl/utils/megatron/low_precision.py
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: e2dfe5523dd731f2baddc04d5a8bf60560592e41d977e24f51f33bbab361aa08
 ---
 
 # verl：RL 数据流、训练后端、动态批次与权重同步指南
@@ -97,13 +113,13 @@ sources:
 
 verl 将 rollout、reward、reference/value、advantage 与 actor 更新表达成分布式数据流，并接入 FSDP/FSDP2、Megatron 等训练和 vLLM/SGLang 等生成后端。优化对象是整个 RL 迭代的关键路径，训练 kernel 高效不代表生成、调度和权重发布同样高效。
 
-本页固定官方 `verl-project/verl` main；旧 `volcengine` 的来源 ID 为兼容保留。HCU 的 verl-das 可能采用 **父补丁仓 + third_party/verl 固定子模块**，以 HCU-Knowledge 确认实际 gitlink、注入入口和依赖版本，不能把本页 main 直接替换当前主体，也不套用顶层 `pip install -e .`。本轮没有 HCU 训练运行。
+2026-11-04 固定官方 `verl-project/verl` main `31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe`；旧 `volcengine` 的来源 ID 为兼容保留。HCU 的 verl-das 可能采用 **父补丁仓 + third_party/verl 固定子模块**，以 HCU-Knowledge 确认实际 gitlink、注入入口和依赖版本，不能把本页 main 直接替换当前主体，也不套用顶层 `pip install -e .`。本轮没有 HCU 训练运行。
 
 ## 2. 工程地图
 
 | 入口 | 职责、下一层 |
 | --- | --- |
-| [`verl/trainer/main_ppo.py`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/trainer/main_ppo.py) | Hydra 配置、Ray driver、TaskRunner、资源/角色选择 |
+| [`verl/trainer/main_ppo.py`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/trainer/main_ppo.py) | Hydra 配置、Ray driver、TaskRunner、资源/角色选择 |
 | `trainer/ppo/ray_trainer.py` | `RayPPOTrainer.fit`、rollout/训练编排、负载平衡、save/load |
 | `trainer/ppo/core_algos.py` | advantage/policy loss 注册、GRPO、聚合分母；从算法名继续到函数 |
 | `trainer/config/`、`workers/config/` | YAML 组合与 dataclass 校验；实际解析值比脚本覆盖项更可靠 |
@@ -118,13 +134,15 @@ verl 将 rollout、reward、reference/value、advantage 与 actor 更新表达�
 
 ## 3. 安装和依赖
 
-[官方安装](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/start/install.rst)和当前 [`pyproject.toml`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/pyproject.toml)一起读。Python 范围为 `>=3.10,<3.13`，构建使用 setuptools；GPU 后端 extras 对 Torch、推理引擎、TE/Apex、FlashAttention 等有各自组合约束。当前 main 的统一依赖方案包含 CUDA 导向的软件包/轮子，不应直接安装来覆盖 HCU 镜像已有栈。
+[官方安装](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/docs/start/install.rst)和当前 [`pyproject.toml`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/pyproject.toml)一起读。Python 范围为 `>=3.10,<3.13`，构建使用 setuptools；GPU 后端 extras 对 Torch、推理引擎、TE/Apex、FlashAttention 等有各自组合约束。当前 main 的统一依赖方案包含 CUDA 导向的软件包/轮子，不应直接安装来覆盖 HCU 镜像已有栈。
 
 在官方匹配环境中可按所选 backend 安装源码及所需 extra；HCU 中先确认 HCU 仓是否完整 Python 包、是否通过子模块和 patch 注入、镜像里已有的包，以及实际 import 路径。记录 model checkpoint、tokenizer、Torch/DTK、Megatron/Bridge、rollout 引擎、通信库和 gitlink。`requirements` 中的浮动 Git main 仍需记录解析 SHA。
 
 README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `git submodule update --init --recursive recipe`；不是自动把所有 recipe 安装到 Python 环境。TaskRunner 的 Ray runtime_env 与本地 shell 不必相同，核对 worker 内的最终变量、依赖路径和可见卡。
 
 当前依赖层把 VeOmni 单独列为训练 backend，CI 的 veomni-sft 附加项不是完整的用户环境；Megatron/FSDP 等 Liger pin 也固定到0.8.4。这里是官方 CUDA/Torch 配对和安装元数据，不能自动装入活动 HCU 镜像。顶层脚本、模型 backend、extras 与实际 worker import 继续成组核对。
+
+当前官方统一pin推进到 vLLM0.32.0、Transformers5.16.1、tokenizers0.23.2、TE2.20.2、ModelOpt0.47.0，Megatron extra新增native DeepEP1.2.1；安装教程要求单独提供NVSHMEM3.4.5及loader配置。wheelhouse仍面向cu130/Torch2.13/CPython3.12，不提供FlashComm import重定向或任意GB200跨节点资格。包存在、import成功和互联/dispatcher实际可用分别核对，不能据此升级HCU依赖。
 
 ## 4. 启动、配置和测试
 
@@ -151,11 +169,15 @@ README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `g
 - [动态 micro batch、负载平衡与 loss 分母](../topics/dynamic-batch-and-loss.md)：硬 token budget、DP/VPP 调度、GRPO grouping、统计/梯度一致性。
 - [训练到 rollout 的权重、缓存与恢复](../topics/weight-cache-and-checkpoint.md)：naive/分离 backend、LoRA、权重/KV 内存峰值和持久化 checkpoint。
 
-先按[性能教程](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/perf/perf_tuning.rst)分开测 actor、old/ref logprob、critic、rollout prefill/decode、reward、权重传输和保存。动态批次/去 padding、并行重切、重算/offload、融合实现、推理缓存分别有约束；教程中的 NVIDIA 测量或建议不是 HCU 标称。
+先按[性能教程](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/docs/perf/perf_tuning.rst)分开测 actor、old/ref logprob、critic、rollout prefill/decode、reward、权重传输和保存。动态批次/去 padding、并行重切、重算/offload、融合实现、推理缓存分别有约束；教程中的 NVIDIA 测量或建议不是 HCU 标称。
 
-[`MegatronEngine`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/workers/engine/megatron/transformer_impl.py)的 dynamic CP 目前要求 DP×CP 为至少2的偶数、remove-padding；不支持 pad_to_length、多模态/value model、VPP、FP8/蒸馏等所列组合。fused linear-CE 要 uniform finite temperature。不能为减少显存把这些支持门控跳过。当前 actor schema 也包含 TorchTitan/VeOmni 等后端，不表示本页已读完每个 backend。
+[`MegatronEngine`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/workers/engine/megatron/transformer_impl.py)的 dynamic CP 目前要求 DP×CP 为至少2的偶数、remove-padding；不支持 pad_to_length、多模态/value model、VPP、FP8/蒸馏等所列组合。fused linear-CE 要 uniform finite temperature。不能为减少显存把这些支持门控跳过。当前 actor schema 也包含 TorchTitan/VeOmni 等后端，不表示本页已读完每个 backend。
 
 本轮新增两项跨阶段契约：rollout 量化采用结构化配置，并把真实 weight/scale 导出统一移到 trainer 端；Megatron Liger output-head 则在最早 consumer 初始化前预留 actor/ref 共用容量，由 Liger 管 native runtime 和 dispatch。[传权专题](../topics/weight-cache-and-checkpoint.md)与[loss 专题](../topics/dynamic-batch-and-loss.md)分别说明精度、容量和资源所有权。它们不是 HCU 已支持的证明，也不允许绕过不兼容 backend 的明确拒绝。
+
+量化路径现已重新划界：旧FSDP `QATConfig/apply_qat` 接入从actor schema、QAT公开导出和FSDP engine移除；Megatron保留ModelOpt QAT，并拒绝它与TE FP8训练同时开启。NVFP4 routed-expert训练则使用独立per-module recipe与runtime attestation，保留BF16参数给Adam/refit；rollout只允许vLLM的per-token NVFP4输入量化，并核对BF16层carve-out一致。原static input scale观察器叙述不再适用，见[权重专题](../topics/weight-cache-and-checkpoint.md)。
+
+THD padding由真实低精度recipe给出 `quant_align_size`，input/labels与蒸馏teacher top-k使用同样CP布局和局部组；旧use_fp8_padding布尔不能表达NVFP4。官方另新增VeOmni同节点低精度reduce-scatter选项，默认关闭且只适用CUDA FSDP2/混精与固定VeOmni版本；临时buffer与小bucket代价要独立测量，不把文档入口当作HCU通信已支持。
 
 ## 8. 精度、排障与恢复
 
@@ -168,7 +190,9 @@ README 说明 `recipe` 已迁到独立 `verl-project/verl-recipe`，需要时 `g
 | HCU patch 未生效 | 父仓/子提交、注入文件、目标对象 identity、worker真实导入模块 |
 | 保存目录存在但恢复找不到 | async_save完成协议、latest tracker、actor/critic分片与data.pt |
 
-[Torch profiling](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/docs/perf/torch_profiling.md)应记录 rank/role/step；当前 TrainingWorker 在 mini batch 内推进 profiler schedule，不能把调度单位无条件当成整个 RL outer iteration。各并行域选择代表 rank，联查真实后端代码和 TraceLens。
+[Torch profiling](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/docs/perf/torch_profiling.md)应记录 rank/role/step；当前 TrainingWorker 在 mini batch 内推进 profiler schedule，不能把调度单位无条件当成整个 RL outer iteration。各并行域选择代表 rank，联查真实后端代码和 TraceLens。
+
+Megatron checkpoint加载现在会先把offload optimizer搬回设备，再让HybridDeviceOptimizer的load_state_dict按真实参数设备重建子optimizer，随后按配置卸载；只onload模型会误把master归为CPU参数。权重更新的RLInsight trace装饰只增加观测状态，不替代receiver确认。
 
 ## 9. 官方教程、PR 和维护范围
 

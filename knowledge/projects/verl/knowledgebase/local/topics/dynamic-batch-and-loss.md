@@ -10,65 +10,73 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: volcengine-verl
   path: verl/utils/seqlen_balancing.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: f0536d757a8c8eb1a15d63e7174a8995ebbf180481845576f1817ee6020b4902
 - source: volcengine-verl
   path: verl/trainer/ppo/core_algos.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 369b614f239f237a04a38a40b1877cd6fd14aa7bd5f9ff4fe4d7758b682a6948
 - source: volcengine-verl
   path: verl/trainer/ppo/ray_trainer.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: eb41f99ccc66976eab14ebe35aa1aa5b7318e02469240ef1569ac4c884c94312
 - source: volcengine-verl
   path: verl/workers/engine_workers.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 301323b0a8665d236189c3438b835ee4b2ba8bc8cfced1890684070d403ef7a8
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 23c8053c2b3c555de5b37fbe27b7be664cf5b884e6c64ea7be1cd85402b30dfe
 - source: volcengine-verl
   path: verl/workers/config/actor.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: d7631944b186f162b897022c9fac8b2f0ede7f8bb6cba4276d98e5d5033fd60b
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: ce9e30df3dd6deb500bdc896b24038ee137ed0770ccce5a876cdcd1b575876c3
 - source: volcengine-verl
   path: tests/utils/test_seqlen_balancing.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 658fb094f2edb2fe6914ded167e4b18aba3543d5b5410a93a2816622a7b9c48d
 - source: volcengine-verl
   path: tests/trainer/ppo/test_loss_aggregation_on_cpu.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: b22649fdfcfc1fabcebd3cc8ba4c08e88eacb12722fee41e67b785e15a6cae0f
 - source: volcengine-verl
   path: tests/trainer/ppo/test_core_algos_on_cpu.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: 0a60e917589ab91646989f0a8616f810fea0dc70047d2b8c13914f4977f5569c
 - source: volcengine-verl
   path: tests/trainer/ppo/test_rollout_corr_integration.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 3d8c1a1471043a5cbe03cf010c0b2e3dff293370c79b2273aa70a02261bdd759
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: a4b17336744e243baa5b8c9c9d5f0ea55dc4ef10240f44f6213a62eb3c097e5e
 - source: volcengine-verl
   path: verl/models/mcore/model_forward_fused.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 52ca25fc8ef6721f65e8ed26758f5ca083e37e1364f38e1e72d209869e27de67
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 45fded724d9501f2bb48c8e9024213d2e9f24026f9733cf5a231e042d9de0ecf
 - source: volcengine-verl
   path: verl/utils/kernel/linear_cross_entropy.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 15dfe6d168640ae817f4558f187e9fd515231e910ba42935b7a3969e268b07f6
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: c4da1f643471f6623bba761ba1fca0bf2475a4ae49aac3201c4d5bcc79b9672e
 - source: volcengine-verl
   path: tests/models/test_model_forward_fused.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: 39856c176a8bac1aa03d338eae10bb40ef6d2d7d3a2455c54e73b76de4d82f1b
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 4cc831eb41eb1fd903bde0a7aaebb7ca1b11c740e952bbf0787fea0bf0e320fe
 - source: volcengine-verl
   path: tests/workers/test_megatron_liger_fused_kernels_on_cpu.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
   sha256: be3b7b19adaf53a007a33a18a7142fed6aa7736e8e482788c99f10c3c8ddca27
 - source: volcengine-verl
   path: verl/workers/config/rollout.py
-  commit: 8f016846e3010e225072a947270dc0c1b98c1cd0
-  sha256: f62e366c906a152a2fc61328afb33c711125f036e05d82b82189333c4ffc47b4
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 6364128a35597a6c84cb2f93bede7d84cb80ad123df5ccf96904fb7f2d111684
+- source: volcengine-verl
+  path: verl/models/mcore/util.py
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: e89b4dbb79122d851c46b07247a8c6ab24f2c346b5bc4be2e762112e488302f6
+- source: volcengine-verl
+  path: verl/workers/engine/megatron/transformer_impl.py
+  commit: 31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe
+  sha256: 405dcf1962348a774efa006a08fe13176199fd5fcae1cf4e98b3cfb507b62cff
 ---
 
 # verl：动态批次的硬 token 上限、GRPO 分组与 loss 聚合
@@ -77,11 +85,11 @@ sources:
 
 RL response 长度变化大，固定样本数 micro batch 容易因长序列 OOM，或让不同 DP rank 的计算时间差别很大。按 token budget 切分和负载重排能改善效率，但必须保持样本、group、loss 与同步次数契约。
 
-配置从 actor 的 `use_dynamic_bsz`、`ppo_max_token_len_per_gpu` 与 rollout/ref logprob 对应预算进入 engine；这些是各阶段不同预算，不是同一个 universal batch size。[`ActorConfig`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/workers/config/actor.py)对固定 micro batch、模式和 SP/remove-padding 做校验，不能靠删 assert 接受不支持组合。
+配置从 actor 的 `use_dynamic_bsz`、`ppo_max_token_len_per_gpu` 与 rollout/ref logprob 对应预算进入 engine；这些是各阶段不同预算，不是同一个 universal batch size。[`ActorConfig`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/workers/config/actor.py)对固定 micro batch、模式和 SP/remove-padding 做校验，不能靠删 assert 接受不支持组合。
 
 ## `rearrange_micro_batches` 的真实上限
 
-[`seqlen_balancing.py`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/utils/seqlen_balancing.py)先得到有效序列长：nested 用 offsets 差，普通 tensor 用 attention mask，但普通输入的初始单序列上限校验还使用 padded shape 的 S。`max_token_len` 必须足够容纳最长输入；不能误解为仅 response token 数。
+[`seqlen_balancing.py`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/utils/seqlen_balancing.py)先得到有效序列长：nested 用 offsets 差，普通 tensor 用 attention mask，但普通输入的初始单序列上限校验还使用 padded shape 的 S。`max_token_len` 必须足够容纳最长输入；不能误解为仅 response token 数。
 
 1. `force_group_size` 将连续样本作为不可分割组，先检查 batch 整除，并汇总各组 token 数/工作量。
 2. `ceil(total tokens / budget)` 只是初始下界，不保证不可分样本可放入这些桶。
@@ -98,13 +106,13 @@ RL response 长度变化大，固定样本数 micro batch 容易因长序列 OOM
 
 ## GRPO grouping 与概率来源
 
-[`compute_grpo_outcome_advantage`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/trainer/ppo/core_algos.py)沿 response token 求总reward，按 prompt index求组内mean/std，再把每sample优势广播回response并乘response mask。单样本组特殊mean=0/std=1，`norm_adv_by_std_in_grpo`控制是否除std。重排不能把group index重新编号为每row或丢掉prompt身份。
+[`compute_grpo_outcome_advantage`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/trainer/ppo/core_algos.py)沿 response token 求总reward，按 prompt index求组内mean/std，再把每sample优势广播回response并乘response mask。单样本组特殊mean=0/std=1，`norm_adv_by_std_in_grpo`控制是否除std。重排不能把group index重新编号为每row或丢掉prompt身份。
 
 `RayPPOTrainer.fit` 的 decoupled 路径重算 π_old，bypass用rollout概率作为old；rollout correction有自己的重要性权重/拒绝统计。省掉一次前向可能改变数值目标；对比同一response的behavior、proximal和current logprob，比只比较最终scalarloss更易定位。
 
 ## 聚合分母必须与全 batch 匹配
 
-[`agg_loss`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/trainer/ppo/core_algos.py)用 global batch 计数维持分片/切microbatch后的语义：
+[`agg_loss`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/trainer/ppo/core_algos.py)用 global batch 计数维持分片/切microbatch后的语义：
 
 | 模式 | 聚合与含义 |
 | --- | --- |
@@ -128,17 +136,25 @@ native 初始化成功时，legacy DeepEP V1 的 dispatch/combine RDMA allocatio
 
 rollout 的 top-k logprob 预算也与执行 batch 分开：当前 schema 不再强制采样 top_p=1/top_k=-1，但仍要求 vLLM、processed_logprobs 与 calculate_log_probs，返回 head 小于采样 top_k 会告警。是否覆盖真实 sampling support 决定后续近似，不能把 topk_log_probs 参数值当作完整分布或修改训练目标的许可。
 
+## 低精度 THD、teacher top-k 与量化对齐
+
+固定 `31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe` 的 fused forward把 `use_fp8_padding` 改为 `quant_align_size`。`get_thd_quant_align_size` 根据实际TransformerConfig查询FP8 recipe对齐（MXFP8与其他recipe可不同），NVFP4要求16，未定义的FP4 recipe明确拒绝；普通精度为None。每序列按并行布局与量化块的LCM补齐，总长度还满足TE约束，**有效loss token数和补齐后的计算行数不能混为一个预算**。
+
+Megatron的top-k distillation processor现显式收到同样的quant_align_size、cp_layout和local_cp_size，使teacher target沿student的THD/CP排列，不能只按张量长度碰巧相同来对齐。`test_model_forward_fused.py` 已相应检查传给preprocess的数值16；本轮未执行设备/蒸馏回归。
+
+`linear_cross_entropy` 的范围标记改由platform.nvtx_range提供，数学分支及Liger固定容量owner没有随之改变；`seqlen_balancing.py`、core_algos聚合和原loss/预算测试的文件哈希也未变。因此保留本页硬token上限、forced group和全batch分母合同，重新测量新增padding/量化workspace，不能把框架标记接口更换当成计算性能改进。
+
 ## 验证、失败和更新
 
-[`test_seqlen_balancing.py`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/tests/utils/test_seqlen_balancing.py)检查分组/预算/重排；[`test_loss_aggregation_on_cpu.py`](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/tests/trainer/ppo/test_loss_aggregation_on_cpu.py)针对token-sum检查mask、1/2/4microbatch不变性和DP均值模拟。它们不是所有mode的HCU分布式验证。
+[`test_seqlen_balancing.py`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/tests/utils/test_seqlen_balancing.py)检查分组/预算/重排；[`test_loss_aggregation_on_cpu.py`](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/tests/trainer/ppo/test_loss_aggregation_on_cpu.py)针对token-sum检查mask、1/2/4microbatch不变性和DP均值模拟。它们不是所有mode的HCU分布式验证。
 
 回归应覆盖变长、全mask、n=1/n>1、forced组超过预算、DP组样本数不同、VPP整除、还原index与loss/梯度一致性。失败优先回退固定保守microbatch或原聚合，不改训练目标来掩盖错误。本页未执行设备测试。更新切分算法、engine normalization、lossmode或driver平衡时联动[总览](../overview/engineering-guide.md)和权重/恢复专题。
 
 
 ## 本轮补充固定证据
 
-- [verl/models/mcore/model_forward_fused.py](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/models/mcore/model_forward_fused.py)
-- [verl/utils/kernel/linear_cross_entropy.py](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/utils/kernel/linear_cross_entropy.py)
-- [tests/models/test_model_forward_fused.py](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/tests/models/test_model_forward_fused.py)
-- [tests/workers/test_megatron_liger_fused_kernels_on_cpu.py](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/tests/workers/test_megatron_liger_fused_kernels_on_cpu.py)
-- [verl/workers/config/rollout.py](https://github.com/verl-project/verl/blob/8f016846e3010e225072a947270dc0c1b98c1cd0/verl/workers/config/rollout.py)
+- [verl/models/mcore/model_forward_fused.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/models/mcore/model_forward_fused.py)
+- [verl/utils/kernel/linear_cross_entropy.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/utils/kernel/linear_cross_entropy.py)
+- [tests/models/test_model_forward_fused.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/tests/models/test_model_forward_fused.py)
+- [tests/workers/test_megatron_liger_fused_kernels_on_cpu.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/tests/workers/test_megatron_liger_fused_kernels_on_cpu.py)
+- [verl/workers/config/rollout.py](https://github.com/verl-project/verl/blob/31cfccb4dbad8f1f4aa41a34eb589afbe283e8fe/verl/workers/config/rollout.py)

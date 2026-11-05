@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source_zh/embodied_tutorial/quick_start_index.md
-raw_sha256: c1e5db6f2fca31d0024f7be374a541946454a2a6d9be614437b0387414177710
+raw_sha256: dcbff205d456c4e44a68635b517ac9d267ee4b4c6e265aca847390b31c99cc33
 sources: []
-generated_body_sha256: 15d27f42a151c2ac5ab8b13bcb23d3767f84db9a8b13a96dc0e1d586e78ca879
+generated_body_sha256: 60260e62d9b0991c92ea7cc77d41d0bbc8fd34cb55548f472bf466b5214649fa
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source_zh/embodied_tutorial/quick_start_index.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source_zh/embodied_tutorial/quick_start_index.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source_zh/embodied_tutorial/quick_start_index.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -38,8 +38,8 @@ Upstream source document; original commands, claims and links require their stat
 :maxdepth: 1
 
 quick_start_pi05
-quick_start_groot_n1_6
-quick_start_groot_n1_7
+quick_start_gr00t_n1_6
+quick_start_gr00t_n1_7
 quick_start_xvla
 ```
 

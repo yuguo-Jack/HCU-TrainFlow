@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/experiments/graph_trainer/README.md
-raw_sha256: ac6e1d723cec7e2de987f504c26b7a24cae27c48a5bb9a6991e6b3ec4e3cd89d
+raw_sha256: 07a1d1b4186e5da6b36aee368898fdbb9c05a430c8446d9987402838be5af5bb
 sources: []
-generated_body_sha256: 586a54b207586030daa47b15c49225e5f8b90bcb4f54369553d0a36d24c01565
+generated_body_sha256: 91e63d3c72f339f2f02260c52450fb3682fcafc26b5cc79b4d28156b1b835aba
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/experiments/graph_trainer/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/experiments/graph_trainer/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/experiments/graph_trainer/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -105,7 +105,7 @@ Design references:
 - CUDA-graph-compatible GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3820
 
 ```python
-config.training.disable_cuda_graphs = True
+config.training.disable_accelerator_graphs = True
 config.parallelism.pipeline_parallel_degree = 2
 config.parallelism.num_pp_microbatches = 8
 config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
@@ -158,7 +158,7 @@ The graph-level CUDA graph and kernel annotation passes remain available in
 can apply them explicitly with `construct_cuda_graph_passes`. By default, CUDA
 graph capture is owned by the client around the complete forward/backward
 execution. Users can disable CUDA graphs with
-`config.training.disable_cuda_graphs = True`.
+`config.training.disable_accelerator_graphs = True`.
 
 ### Expert Parallel Overlap
 

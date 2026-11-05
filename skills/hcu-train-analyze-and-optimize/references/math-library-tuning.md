@@ -51,6 +51,8 @@ export HIPBLASLT_LOG_FILE="${diagnostic_dir}/hipblaslt.rank${RANK}.%i.log"
 2. **确认命中，再看模型收益。** 隔离加载选优配置，按教程核对实际库、配置及 code object；干净环境做独立正确性、单测和模型性能对照，稳定阶段验 loss。工具自身的“选优成功”或 GFLOPS 比值不能代替这些验收，配置也不能跨库版本直接复用。
 3. **按结果交接。** 有效结果保留配置、比较 CSV、硬件/CU 和模型收益，按当前说明提交到适用的 `blas-tuning-results` 分支；接收版本要求随发布核对。仍无收益先查配置是否命中、是否被模型并发拖慢；仍有库内性能缺口则带完整日志、次数和已尝试结果交用户协调数学库。
 
+工具选项与比较列也须查原文和实际脚本。当前教程的清理选项可能删除过程/配置，更新目标配置选项会覆盖测试包；在任务副本中执行，保留原配置用于回退。CSV 按列名读，不按两种示例中的位置猜 M/N/K/B；TF32 的输入来源支持不同，不能由一种日志支持外推全部格式。逐项用原始 old/new 时间或吞吐检查退化，某些汇总 ratio 会将慢例钳成 1；空结果、缺 kernel 选择文件或测试未执行均保留失败，不据该 ratio 宣称全部不退化。
+
 hipBLASLt/grouped GEMM 当前仍按真实复现交接，不套用 rocBLAS 自行选优方法。调优工具的设备选择、校验及写入副作用按当前源码检查，沿用任务隔离与回退规则；本节不要求另建一套调优流程。
 
 ## 5. MIOpen：size、布局与选优缓存
@@ -62,7 +64,11 @@ hipBLASLt/grouped GEMM 当前仍按真实复现交接，不套用 rocBLAS 自行
 3. **评估先选优、后复用。** 适用路径先覆盖代表性 shape 进行搜索，再新起进程复用兼容的选优记录/编译缓存。已查 HCU DTK 26.10 手册与固定源码中，可验证 `MIOPEN_FIND_MODE=1`（全面搜索）→ `3`（默认 Hybrid）这一路径；`4` 为快速匹配，不保证最快。执行时以实际 HCU 版本与消费者为准，不能照搬 AMD 编号/默认值，也不能混淆 Find、ENFORCE、Fusion 或框架 benchmark 控制。先确认缓存落盘与命中，再分别比较启动和稳态；仅跑过几步不等于所有形状完成 tune，也不保证生成了新 kernel。
 4. **仍有差距就提需求。** 将 Driver/最小复现、原日志、布局/模式/缓存状态、workspace、版本及可靠性能差距交用户协调数学库；收到优化结果后回到局部正确性、模型整步及阶段 loss 验证。不要求先重写 MIOpen 才能报需求。
 
-模式查证基点：[HCU MIOpen Find 控制](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen/-/blob/66f318c40eebc72b5812590239451fbe28bbc99d/src/include/miopen/find_controls.hpp)，配合相同提交的消费者和 DTK 26.10 手册 §4.1。这里保留处理经验，不复制 HCU 仓 Wiki；具体命令/缓存路径随部署查证，读写范围沿用任务规则。本轮为资料与源码核对，未新增硬件调优实测。
+新增 handle 策略或 cached solution 接入时，再检查框架实际调用：当前 `c8f09a6b704e39a7a937268b81d259b82e446903` 中默认 `miopenTuningPolicyNone=1` 沿用环境 FindMode，`Search=3` 在已读卷积/BatchNorm 路径强制 Normal Find。其他策略枚举存在不证明已经实现同名清库/写库动作；环境值有静态缓存，进程内修改后须确认实际状态。`MIOPEN_FIND_KERNEL_TIMES` 改的是选优测量重复数，正式步时须计入真实启动成本并单列稳态，不能解释为训练算子永久执行多遍。
+
+`GetCachedSolution` 查询 FDB，`CacheMiss` 不自动执行 Find；`RunCachedSolution` 精确选择 solver、不自动换解，但仍可能准备或编译 kernel。调用方明确 miss/错误的重新选优策略，核对确定性、problem、workspace、solver 与库/设备身份；跨进程重新创建 handle、descriptor 和 buffer，只复用无指针 metadata。它不是跨 DTK/硬件的稳定 ABI 保证。先用原策略作对照，验实际执行与数值/性能后再保留，不能以缓存查询成功代替模型验收。
+
+Find 模式的既有查证基点为 [66f318c4](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen/-/blob/66f318c40eebc72b5812590239451fbe28bbc99d/src/include/miopen/find_controls.hpp) 和 DTK 26.10 手册 §4.1；当前增量另对照 [c8f09a6b 的消费者](http://42.228.13.241:20080/dcutoolkit/deeplearing/miopen/-/blob/c8f09a6b704e39a7a937268b81d259b82e446903/src/convolution_descriptor.cpp)，通过大库 `miopen-tuning-and-cached-solution` 追 API、测试和边界。这里保留处理方法，不复制 HCU 仓 Wiki；具体命令/缓存路径随部署查证，读写范围沿用任务规则。本轮为资料与源码核对，未新增硬件调优实测。
 
 ## 6. 工单与回归
 

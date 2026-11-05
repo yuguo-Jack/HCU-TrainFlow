@@ -24,8 +24,15 @@
 | 原地输出与回退 | 先看准入和真实输出所有权。当前 AITER 的低层 RS 成功写 out 仍返回 None，不支持时也可能返回 None；不能按返回值再调用一次 collective。框架封装返回新 tensor 与底层原地接口分别检查，失败须在修改数据前安全回退或明确报错。 |
 | rocSHMEM 的 host collective 路由 | 按当前消费者固定版本检查策略。新 develop 分节点内/间和 collective 读取 `ROCSHMEM_RCCL_MIN_SIZE_INTRA` / `_INTER`，旧单一变量不再读取，等于阈值也可进入 RCCL；alltoallv 的 device counts 使 size 阈值不适用。team capability、symbol 和组内配置一致性仍有门禁；不要把一套默认阈值固化到所有拓扑或旧消费者。 |
 | EP async、plan 与工作区视图 | 返回 event 不自动取消 host planning、跨 rank 校验或单 in-flight 限制。MoonEP 当前 async 返回完成 event，消费 stream 需要 join；zero-copy 视图仍受 generation/工作区寿命约束。UltraEP 专家副本梯度归并会消费并清零源缓冲，异常后直接重跑并非幂等；优化器前的 grad join、新权重消费前的 weight join 及迭代 flush 分别验收。 |
+| rocSHMEM 注册内存与 on-stream collective | 新版 VMM 对称注册返回管理的 VA alias，RMA 目标与注销使用返回值；原地址、导出 handle 和 alias 的释放分别核对。不能继续用旧单 heap 偏移解释所有指针。执行依赖与存储寿命分别保证，注销前等待全部相关 stream/context；SDMA NBI 在发起操作的同 context `quiet`，不能以另一 context 的空状态证明完成。同 team 的跨 stream 排序仍要求各 PE 逻辑 collective 顺序一致；独立库的新接口不自动进入旧 DeepEP/UltraEP 父锁。 |
 
 能力依据从大库 `aiter-int8-fp8-collective-contract`、`rocshmem-hcu-engineering`、`moonep-g1-contributor-capacity` 和 `ultraep-replica-gradient-lifecycle` 进入。以上说明对应版本的检查点，不能当成任意已安装库都支持的能力表。微基准含 copy-in、host 直接绑定或 Graph event 的口径须明确；某 dtype/拓扑的局部收益不推导成模型整步收益。
+
+状态读取优化也要保留失败协议。MoonEP 当前源码的 error-only、predicated segment、deferred retire 与 native chain 是不同路径；部分 launch 已入队后失败，不能回退重跑并重复写入。其独立 skip-readback 实验会生成 synthetic 成功状态，已有非零副本偏置的反例，不能推荐为训练提速配置。正常路径 host read 变少不证明首错、跨 rank 读退休或 zero-copy 寿命已消除；按 `moonep-release-contract` 核对全部 rank 的有效配置、故障传播和多 generation。
+
+新增融合接口优先核对消费者输出。当前 DeepEP `dispatch_scatter` 仅支持非 cached 节点内路径，旧返回形式保留但 token-order `recv_x` 载荷不再是融合结果；调用者须消费 expert-major scatter 目标。`combine_gather` 的适用范围更窄，不能仅以同名 API 接入跨节点或 MNVL。测试有效 token、padding、空专家、量化 scale、输出所有权与回退，再比较省下的 layout kernel 和完整 MoE 时间。
+
+UltraEP 内部 HIP placement 的 final-plan 慢路径会退回当前 domain 的 master-only，早期 fast/precheck 成功仍可使用副本。这是保护性回退，不能继续假定副本负载均衡收益或将未再挂住写成根因已修复。记录实际 placement、fallback 频率、token/概率与 master quota 守恒及最慢 rank 时间；梯度消费/清零和 weight/grad join 继续按原合同验证。上述新增契约均为固定源码审阅，未新增多卡或训练实测。
 
 ## 2. 先调调度与粒度，再判断融合
 

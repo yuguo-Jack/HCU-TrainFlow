@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: 0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/autotp-training.md
-raw_sha256: ab9b2481c0dc8e039e3231c5692b871e177bfdbcd1bd3a0e72a773c5969886b0
+raw_sha256: 0717e6f05aa3f65e267057547ef99c1bc351fccac0769ff597f8c28c6343bafe
 sources: []
-generated_body_sha256: 783e52f4cfa09ab1b1fe2183cbaac272f43866ab450d456579d47a2c69a03854
+generated_body_sha256: 4a1194d3bd0719d5141a13792b0a24d4ce4394487561d7db88df9560af9a25f6
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/autotp-training.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/0eb3a8bcc6d9a8775478e5377482c4bf2dd23c1c/docs/_tutorials/autotp-training.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/autotp-training.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -225,6 +225,10 @@ materialized. Liger supports one first-order backward per forward; retained-grap
 second backward and higher-order gradients raise an error rather than reusing
 its overwritten gradient buffer. Select `"torch"` for those workloads.
 
+To avoid materializing the local logits as well, select `"fused_linear"`, which
+fuses the head projection into the loss; see
+[Fused Projection and Loss](#fused-projection-and-loss).
+
 Only an `nn.Linear` whose final name segment is `lm_head` or `embed_out` is
 supported. With `vocab_parallel_lm_head: true`, if no such head exists,
 initialization fails instead of quietly falling back to an ordinary gathered
@@ -323,11 +327,75 @@ loss = vocab_parallel_linear_cross_entropy(hidden,
 
 The call replaces both `head(hidden)` and the loss: it all-reduces the hidden
 gradient over the TP group in backward, as the column-parallel head would. It
-supports `none`, `sum` and `mean` reductions. `chunk_size` (tokens per forward
-chunk; backward uses vocabulary blocks of the same size) trades peak memory for
-speed; by default each FP32 logits block is about the size of the hidden states.
-This API is not yet wired into the HuggingFace forward or
-the `vocab_parallel_lm_head` configuration.
+supports `none`, `sum` and `mean` reductions. Tokens whose target is
+`ignore_index` (prompt and padding positions) are dropped before the
+projection, so they cost neither GEMMs nor collectives. `chunk_size` (tokens per
+forward chunk; backward uses vocabulary blocks of the same size) trades peak
+memory for speed; by default each FP32 logits block is about the size of the
+hidden states, but at least 256 tokens so that the projection GEMMs stay efficient.
+
+#### Using the fused loss from a HuggingFace forward
+
+Set `vocab_parallel_ce_backend` to `"fused_linear"` to use this loss for the
+HuggingFace causal-LM forward:
+
+```json
+{
+    "bf16": { "enabled": true },
+    "zero_optimization": { "stage": 1 },
+    "tensor_parallel": {
+        "autotp_size": 2,
+        "vocab_parallel_lm_head": true,
+        "vocab_parallel_ce_backend": "fused_linear"
+    }
+}
+```
+
+When the model is called in training mode with `labels`, the vocabulary-parallel
+head hands its input to the installed `loss_function` instead of projecting it,
+and the loss runs the fused projection. `outputs.loss` is unchanged
+(`num_items_in_batch` is honored), but `outputs.logits` has a last dimension of
+0 because no logits are materialized. In eval mode, or without `labels`, the
+head returns the rank-local logits as with the `"torch"` backend.
+
+The HuggingFace `Trainer` needs no code changes: it reads
+`tensor_parallel.autotp_size` from the DeepSpeed config passed as
+`TrainingArguments(deepspeed=...)` and calls `deepspeed.tp_model_init` before
+`deepspeed.initialize`, so the vocabulary-parallel options above apply. For
+Qwen2.5-0.5B (151,936-token vocabulary, tied embeddings) with `Trainer`, TP=2,
+ZeRO-1, BF16, gradient checkpointing, 4 x 2,048 tokens per micro-batch with
+half of each sequence masked as prompt, on two GPUs:
+
+| `tensor_parallel` setting | Peak memory per rank | Step time (2x NVIDIA L20) | Step time (2x Intel Arc Pro B70) |
+| --- | --- | --- | --- |
+| `vocab_parallel_lm_head: false` (gathered logits) | 18,860 MiB | 558 ms | 715 ms |
+| `vocab_parallel_ce_backend: "torch"` | 13,201 MiB | 514 ms | 653 ms |
+| `vocab_parallel_ce_backend: "liger"` | 8,456 MiB | 477 ms | - |
+| `vocab_parallel_ce_backend: "fused_linear"` | 5,200 MiB | 467 ms | 590 ms |
+
+Peak memory is from the L20 runs; the B70 runs are within 20 MiB. Loss and
+gradient norms match across all settings.
+
+Limitations of the `"fused_linear"` backend:
+
+* Code that reads `outputs.logits` from a training forward with `labels`
+  receives an empty tensor. Compute such metrics in eval mode, or use the
+  `"torch"` backend.
+* Models that soft-cap or rescale the logits after the head (for example
+  `final_logit_softcapping`, `logit_scale` or `logits_scaling` in the config)
+  are rejected, because the fused loss never sees those logits.
+* ZeRO stage 3 and the DeepCompile AutoTP pass are rejected.
+* Under DeepSpeed Ulysses / ALST, the model is called with `shift_labels`
+  instead of `labels`, so the forward returns local logits and the
+  sequence-parallel loss path applies.
+
+With any vocabulary-parallel backend, `outputs.logits` (when present) holds only
+this rank's vocabulary shard. Callers that compute their own loss from the
+logits or from `lm_head.weight` therefore see partial vocabularies. This
+includes `Trainer` with `label_smoothing_factor`, and TRL trainers that patch
+the forward with their own fused LM head (`SFTTrainer` and `GRPOTrainer` since
+TRL 1.15). Use the vocabulary-parallel ops below, or keep
+`vocab_parallel_lm_head: false`, for those workloads.
 
 
 ### Log-probabilities, Entropy, and KL on Sharded Logits
@@ -371,6 +439,12 @@ Each op saves only its inputs and per-token statistics, and recomputes the
 softmax in bounded row chunks during backward. Its peak activation memory is
 therefore a small multiple of the local logits shard instead of the several
 fp32 copies that an equivalent composition of PyTorch ops keeps alive.
+When Triton supports the logits' device, each pass over the logits runs in a
+fused Triton kernel that keeps no fp32 copy of the shard; other devices, or
+`deepspeed.HAS_TRITON = False`, use an eager implementation with the same
+semantics. The entropy and KL forward passes read each logit once, and a slice
+along the sequence, such as the next-token shift `logits[:, :-1]`, is read in
+place rather than copied.
 
 ## Custom Patterns
 

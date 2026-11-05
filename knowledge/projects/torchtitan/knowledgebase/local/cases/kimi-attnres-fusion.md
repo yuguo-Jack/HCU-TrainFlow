@@ -9,30 +9,36 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan_recipes/overrides/kimi_attention_residual.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 3782d82d0a72504e572969d3cdf3310dae6b29949910f131d7a9c4cda1a2ea3a
 - source: pytorch-torchtitan
   path: torchtitan/models/kimi_k3/model.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: db90b766b464791aead8f8d5c39c9c2f94c6bce327b2a4b818fe533dd9e04e1d
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 2b08c9a6e05dcc63fd14a5525300f7c63274ee4b08bcee86bd5377d0fa6ecb73
 - source: pytorch-torchtitan
   path: torchtitan/models/kimi_k3/flavors.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0c21c1c2d65bb5e02721a07e5912e6081569487c3e66fa8d95ec5f4ed768f14a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 1d7238bde8c8868ab66a26cff532adab4600056103167ea9c9ca2362c61e7a77
 - source: pytorch-torchtitan
   path: tests/unit_tests/gpu/recipes/test_kimi_attention_residual_override.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 606950a04de407e9aba9fae1f437f3f885976e4effb5f82b0f9610dec29c0ce2
 - source: pytorch-torchtitan
   path: tests/unit_tests/gpu/models/kimi_k3/test_kimi_k3_attention_residual.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: a4e05aeade29b718bf179df8dea3ac14133a5cdff8fe60846852cc30931ad5f6
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 8ae33627d41c4de0bb04fdb56e53c15fe979ba1fcd6b49ddb977b2ab5b2c9c41
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/local_compile.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 258d7980f3a28c310d0fb1a31319c4124677de921de573d6fd22878879a96f93
+
 pr_sources:
 - pr-pytorch--torchtitan-5033
 ---
@@ -82,14 +88,19 @@ PR 作者报告 H100、BF16、`T_local=2048, N=8, D=7168`、包含 partial 的�
 
 Kimi构造器的默认attention backend改为varlen，DistMuon compute layout显式BF16；复现实验须固定这些新条件和重算策略，历史Flex/SelectiveAC窗口与当前默认不再可直接混比。只有确认实际override仍命中、所需residual-bank布局与梯度合同未变，才复用该案例；本次未重复上游性能或训练实验。
 
+## 当前调用者复核
+
+Attention Residual override 的算法/核函数与直接 override 测试内容未变；原先独立 kernel 对比端到端的结论保留为历史实验。模型侧 `local_compile` 现在由 `LocalCompileConfig(regions=["attention_residual"]).apply()` 绑定，GPU local-compile 测试也使用该配置对象，清理时以空配置重新绑定。外围 Kimi MLA、CP/loss kwargs 和精度配置已有变化，不能由局部 kernel 未变推断当前整模型性能或 HCU 兼容已验证。
+
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan_recipes/overrides/kimi_attention_residual.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan_recipes/overrides/kimi_attention_residual.py)
-- [torchtitan/models/kimi_k3/model.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/kimi_k3/model.py)
-- [torchtitan/models/kimi_k3/flavors.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/kimi_k3/flavors.py)
-- [tests/unit_tests/gpu/recipes/test_kimi_attention_residual_override.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/unit_tests/gpu/recipes/test_kimi_attention_residual_override.py)
-- [tests/unit_tests/gpu/models/kimi_k3/test_kimi_k3_attention_residual.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/unit_tests/gpu/models/kimi_k3/test_kimi_k3_attention_residual.py)
+- [torchtitan_recipes/overrides/kimi_attention_residual.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan_recipes/overrides/kimi_attention_residual.py)
+- [torchtitan/models/kimi_k3/model.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/kimi_k3/model.py)
+- [torchtitan/models/kimi_k3/flavors.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/kimi_k3/flavors.py)
+- [tests/unit_tests/gpu/recipes/test_kimi_attention_residual_override.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/unit_tests/gpu/recipes/test_kimi_attention_residual_override.py)
+- [tests/unit_tests/gpu/models/kimi_k3/test_kimi_k3_attention_residual.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/unit_tests/gpu/models/kimi_k3/test_kimi_k3_attention_residual.py)
 
 - [PR #5033：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5033.md)
+- [torchtitan/distributed/local_compile.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/local_compile.py)

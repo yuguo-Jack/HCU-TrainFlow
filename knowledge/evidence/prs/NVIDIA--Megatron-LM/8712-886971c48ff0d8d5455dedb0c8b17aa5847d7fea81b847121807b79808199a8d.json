@@ -1,0 +1,571 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "7d6a837350ff4d32d9f4191aa605a630c22913d48631f71f161699b577ca09a2",
+      "isPrivate": false,
+      "numbers": [
+        8718,
+        8717,
+        8716,
+        8715,
+        8714,
+        8713,
+        8712,
+        8711
+      ],
+      "observed_at": "2026-11-04T15:29:50.317629+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4917,
+        "resetAt": "2026-11-04T15:50:00Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "1ac85e91abe858f61f097fca9a27e9d0ec648e4e",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nMakes the fused reduce-scatter + add + rms-norm + all-gather of `inference_fuse_tp_communication` read the next layer's norm weights and epsilon from that layer at every forward, instead of a tensor taken from the weights at construction. Before, the fused kernel crashed on models built on the CPU or on the meta device and moved to the GPU, and silently used wrong norm weights when the parameters were cast or moved into DDP's buffer after construction.\n\n**Bug.** `TransformerBlock.__init__` calls `_setup_fused_tp_communication`, which gives each `InferenceRowParallelLinear` (every `linear_proj` and `linear_fc2`) the weights of the norm that its fused kernel applies: the same layer's `linear_fc1` norm, or the next layer's `linear_qkv` norm. `TransformerLayer.get_mlp_layer_norm_weights()` and `get_qkv_layer_norm_weights()` returned `layer_norm_weight.data`, a separate tensor bound to the parameter's storage at that moment, and the last layer's `linear_fc2` got a `torch.empty_like()` placeholder. Anything after construction that rebinds a parameter's storage or replaces the Parameter leaves the kernel reading the old tensor, while the unfused path reads the live parameter. Every case needs TP > 1 with NVLS, where the kernel runs:\n\n| After construction | Who does it | Effect on main | With this PR |\n|---|---|---|---|\n| `.cuda()` after `use_cpu_initialization=True` | `get_model` with `--use-cpu-initialization` (training, RL's separate inference model, `run_text_generation_server.py`, ModelOpt examples), unit tests | Host pointers reach the kernel. Triton types a small address as i32 and the compile fails (`'tt.int_to_ptr' op operand #0 must be 64-bit ... but got 'i32'`, fused_collectives.py:195); a large one compiles and the GPU dereferences a host address | Fixed |\n| FP32 parameters cast to BF16 | `Float16Module` / `.bfloat16()` on a model built with the default `params_dtype` | Silent: the kernel reads the stale FP32 bytes as BF16 norm weights | Fixed |\n| Parameters moved into a contiguous buffer | DDP wrapping (`get_model(wrap_with_ddp=True)`), i.e. inference on the training model, as in RL without a separate inference model | Silent: the kernel keeps the initial norm weights (ones); the checkpoint load and optimizer steps that follow update only the buffer | Fixed |\n| Meta-device materialization, which installs new Parameter objects | `--init-model-with-meta-device` (`to_empty_if_meta_device`); Megatron-FSDP's meta init, where TE `reset_parameters` replaces the Parameters again | The kernel gets a null pointer from the stale meta tensor | Fixed |\n| Any move or cast under `torch.__future__.set_overwrite_module_params_on_conversion(True)`, which installs new Parameter objects | Processes that set the flag | Same as the move or cast above, on the old Parameter | Fixed |\n\nIn-place updates reach the old storage, so they were not affected: `load_state_dict`, distributed checkpoint loads, RL refit (`copy_` into the parameters), torch_memory_saver and UVM offload (same addresses), and DDP's `offload_to_cpu` (storage resize). That is why the usual inference path, `get_model_for_inference` (built on the GPU in BF16, no DDP, checkpoint loaded in place), and the fused-TP functional test work on main. Models without `inference_fuse_tp_communication`, or at TP=1, never run the fused kernel.\n\n## Fix\n\n- Each `InferenceRowParallelLinear` holds the column-parallel layer whose input norm its fused kernel applies, `next_layer_norm_linear`, and reads that layer's `layer_norm_weight` and `eps` on every forward. Module objects outlive every transform above, and the layer resolves its current Parameter. `next_layer_norm_weights` remains as a read-only property over it. `_set_next_layer_norm_linear` stores the layer with `object.__setattr__`: a plain assignment would register it as a submodule of the row-parallel layer and duplicate its parameters and state-dict keys.\n- `TransformerLayer.get_mlp_layer_norm_linear()` and `get_qkv_layer_norm_linear()` replace the weight getters, and `TransformerBlock` passes the next layer's QKV linear to `configure_fused_tp_inference(fc2_next_layer_norm_linear=...)`.\n- The last layer's `linear_fc2` has no next norm but still runs the fused kernel for its residual add, and nothing reads its normalized output. It now takes its own layer's `linear_fc1` instead of an `empty_like` placeholder allocated at construction, which stayed on the construction device.\n\nThe per-forward cost is two attribute lookups; no allocation or host sync is added. Under CUDA graphs, the address read at capture is replayed, as for every other weight: in-place updates such as checkpoint loads and refit reach it, and rebinding parameters after capture requires capturing again.\n\n## Tests\n\n`tests/unit_tests/transformer/test_fused_tp_norm_weights.py`, for each row of the table: `.cuda()` after CPU initialization, `.bfloat16()` from FP32, a DDP-style storage move (`param.data = param.detach().clone()`), a block built under `torch.device(\"meta\")` with `init_model_with_meta_device` and materialized on the GPU with `to_empty_if_meta_device`, and `.bfloat16()` under overwrite-on-conversion.\n\n- `test_row_parallel_layers_hold_the_norm_parameters` (1 GPU, TP=1): every `linear_proj` and `linear_fc2` reads the current device, dtype and storage of the norm parameter it fuses (the last `linear_fc2`, if it holds one, its layer's device and dtype), and the fused block has the same state-dict keys, parameter names and module names as the unfused one.\n- `test_fused_matches_unfused` (TP=2 with NVLS multicast; skips on all ranks without it): after the same weights are loaded in place into both blocks, with norm gains drawn from [0.5, 1.5], the fused block's output matches the unfused block's, and the fused kernel ran.\n\nH100, CI image (dfw 21012189), first commit: the six cases of the first three rows fail on main and pass with the fix. Neighbor `test_dynamic_engine_parallel_and_chunked_prefill.py::TestDynamicInferenceEngineParallel::test_mtp_kv_cache_inference_optimized_sequence_parallel` passes. At this head (dfw 21013289), all 10 cases pass with this PR and all 10 fail on `main`: `.cuda()` after CPU init, FP32 to BF16, a DDP-style storage move, meta-device materialization and overwrite-on-conversion, each for the stored-reference check and the TP=2 fused-vs-unfused output check. The neighbors pass: `test_transformer_layer.py` (45 cases) and `test_transformer_block.py` (56) on 8 GPUs, and the engine test.\n\nThe kernel determinism gate passes without a label (`inference_layers.py` is registered with an exemption; no kernel or dispatch change).\n\n**Related PRs.**\n- #8561 (fused-TP residual on fallback) and #8704 (MLA fused TP, stacked on #8561) rewrite the same wiring. Both conflict with this PR in adjacent lines of `inference_layers.py` (`InferenceRowParallelLinear.__init__`), `transformer_block.py` (the `configure_fused_tp_inference` call) and `transformer_layer.py` (`configure_fused_tp_inference` and its helpers). Resolution: keep both sides. That means #8561's `qkv_fused_tp_handoff` argument and handoff lines, `residual` and `fused_tp_handoff` attributes, `get_fc2_fused_tp_handoff` and `_using_fused_tp_inference`, together with this PR's `next_layer_norm_linear`, `fc2_next_layer_norm_linear` and `_set_*_next_layer_norm_linear`. #8561's `_matmul_reduce_scatter` merges cleanly: its `next_layer_norm_weights is None` check goes through the property. #8561's `_FakeLayer` in `test_inference_layers.py` merges without a textual conflict, but must rename `get_qkv_layer_norm_weights` to `get_qkv_layer_norm_linear` and `fc2_next_layer_norm_weights` to `fc2_next_layer_norm_linear`.\n- With #8704 also:\n  - `get_qkv_layer_norm_linear()` returns #8704's `_get_fusable_linear_qkv()` (None for MLA).\n  - `_set_fc2_next_layer_norm_linear` drops the placeholder and passes None through, so #8561 reduce-scatters and adds the residual.\n  - The setter docstring keeps #8704's \"None when no next layer takes its input from the fused all-gather\".\n  - #8704's `test_block_wiring` checks `layer.get_qkv_layer_norm_linear() is qkv` / `is None` instead of the weight getter. Its `next_layer_norm_weights` checks work unchanged.\n  - Both resolutions were checked in trial merges: the modules import, the tests collect, and #8561's fake-layer wiring test passes on CPU.\n  - The new tests need no change on top of either: the last-`linear_fc2` check allows None, and the fused-call count allows the last layer not to fuse.\n- #8709 (inference all-gather barriers) merges cleanly. Its `test_text_generation_controller.py::TestTextGenerationController::test_inference_optimized_steps_barrier_once_per_forward[gpt_fused_tp]` case is skipped, citing this bug. Whichever of the two PRs lands second removes that skip.\n\n## Issue tracking\n\nLinked issue: none. Found when #8709's new decode test ran a GPT model with fused TP communication, built with `use_cpu_initialization=True`, on H100.\n\n## Code provenance\n\nNo code was copied from external sources.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [ ] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+            "createdAt": "2026-10-29T20:39:52Z",
+            "databaseId": 6507805181,
+            "updatedAt": "2026-10-29T20:39:52Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8712#issuecomment-6507805181"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYPlOf0=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "0de32e8e2326892b1906163c588e095bdb86f506",
+      "headRepository": {
+        "nameWithOwner": "lmcafee-nvidia/Megatron-LM"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 8712,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[Inference] Keep fused TP communication on the norm weights after the model is moved or cast",
+      "updatedAt": "2026-11-03T17:19:25Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/8712"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8712/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8712/commits"
+      },
+      "html": {
+        "href": "https://github.com/NVIDIA/Megatron-LM/pull/8712"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8712"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8712/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8712"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/0de32e8e2326892b1906163c588e095bdb86f506"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 302,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "NVIDIA:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/NVIDIA/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contributors",
+        "created_at": "2019-03-21T16:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/events",
+        "fork": false,
+        "forks": 4700,
+        "forks_count": 4700,
+        "forks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/forks",
+        "full_name": "NVIDIA/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/NVIDIA/Megatron-LM.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/hooks",
+        "html_url": "https://github.com/NVIDIA/Megatron-LM",
+        "id": 176982014,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "MDEwOlJlcG9zaXRvcnkxNzY5ODIwMTQ=",
+        "notifications_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 1937,
+        "open_issues_count": 1937,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+          "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NVIDIA/followers",
+          "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NVIDIA",
+          "id": 1728152,
+          "login": "NVIDIA",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+          "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+          "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+          "repos_url": "https://api.github.com/users/NVIDIA/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/NVIDIA",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T15:22:16Z",
+        "releases_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/releases{/id}",
+        "size": 178037,
+        "ssh_url": "git@github.com:NVIDIA/Megatron-LM.git",
+        "stargazers_count": 18328,
+        "stargazers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscription",
+        "svn_url": "https://github.com/NVIDIA/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/teams",
+        "topics": [
+          "large-language-models",
+          "model-para",
+          "transformers"
+        ],
+        "trees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-11-04T13:28:01Z",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM",
+        "visibility": "public",
+        "watchers": 18328,
+        "watchers_count": 18328,
+        "web_commit_signoff_required": false
+      },
+      "sha": "1ac85e91abe858f61f097fca9a27e9d0ec648e4e",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+        "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NVIDIA/followers",
+        "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NVIDIA",
+        "id": 1728152,
+        "login": "NVIDIA",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+        "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+        "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+        "repos_url": "https://api.github.com/users/NVIDIA/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/NVIDIA",
+        "user_view_type": "public"
+      }
+    },
+    "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nMakes the fused reduce-scatter + add + rms-norm + all-gather of `inference_fuse_tp_communication` read the next layer's norm weights and epsilon from that layer at every forward, instead of a tensor taken from the weights at construction. Before, the fused kernel crashed on models built on the CPU or on the meta device and moved to the GPU, and silently used wrong norm weights when the parameters were cast or moved into DDP's buffer after construction.\n\n**Bug.** `TransformerBlock.__init__` calls `_setup_fused_tp_communication`, which gives each `InferenceRowParallelLinear` (every `linear_proj` and `linear_fc2`) the weights of the norm that its fused kernel applies: the same layer's `linear_fc1` norm, or the next layer's `linear_qkv` norm. `TransformerLayer.get_mlp_layer_norm_weights()` and `get_qkv_layer_norm_weights()` returned `layer_norm_weight.data`, a separate tensor bound to the parameter's storage at that moment, and the last layer's `linear_fc2` got a `torch.empty_like()` placeholder. Anything after construction that rebinds a parameter's storage or replaces the Parameter leaves the kernel reading the old tensor, while the unfused path reads the live parameter. Every case needs TP > 1 with NVLS, where the kernel runs:\n\n| After construction | Who does it | Effect on main | With this PR |\n|---|---|---|---|\n| `.cuda()` after `use_cpu_initialization=True` | `get_model` with `--use-cpu-initialization` (training, RL's separate inference model, `run_text_generation_server.py`, ModelOpt examples), unit tests | Host pointers reach the kernel. Triton types a small address as i32 and the compile fails (`'tt.int_to_ptr' op operand #0 must be 64-bit ... but got 'i32'`, fused_collectives.py:195); a large one compiles and the GPU dereferences a host address | Fixed |\n| FP32 parameters cast to BF16 | `Float16Module` / `.bfloat16()` on a model built with the default `params_dtype` | Silent: the kernel reads the stale FP32 bytes as BF16 norm weights | Fixed |\n| Parameters moved into a contiguous buffer | DDP wrapping (`get_model(wrap_with_ddp=True)`), i.e. inference on the training model, as in RL without a separate inference model | Silent: the kernel keeps the initial norm weights (ones); the checkpoint load and optimizer steps that follow update only the buffer | Fixed |\n| Meta-device materialization, which installs new Parameter objects | `--init-model-with-meta-device` (`to_empty_if_meta_device`); Megatron-FSDP's meta init, where TE `reset_parameters` replaces the Parameters again | The kernel gets a null pointer from the stale meta tensor | Fixed |\n| Any move or cast under `torch.__future__.set_overwrite_module_params_on_conversion(True)`, which installs new Parameter objects | Processes that set the flag | Same as the move or cast above, on the old Parameter | Fixed |\n\nIn-place updates reach the old storage, so they were not affected: `load_state_dict`, distributed checkpoint loads, RL refit (`copy_` into the parameters), torch_memory_saver and UVM offload (same addresses), and DDP's `offload_to_cpu` (storage resize). That is why the usual inference path, `get_model_for_inference` (built on the GPU in BF16, no DDP, checkpoint loaded in place), and the fused-TP functional test work on main. Models without `inference_fuse_tp_communication`, or at TP=1, never run the fused kernel.\n\n## Fix\n\n- Each `InferenceRowParallelLinear` holds the column-parallel layer whose input norm its fused kernel applies, `next_layer_norm_linear`, and reads that layer's `layer_norm_weight` and `eps` on every forward. Module objects outlive every transform above, and the layer resolves its current Parameter. `next_layer_norm_weights` remains as a read-only property over it. `_set_next_layer_norm_linear` stores the layer with `object.__setattr__`: a plain assignment would register it as a submodule of the row-parallel layer and duplicate its parameters and state-dict keys.\n- `TransformerLayer.get_mlp_layer_norm_linear()` and `get_qkv_layer_norm_linear()` replace the weight getters, and `TransformerBlock` passes the next layer's QKV linear to `configure_fused_tp_inference(fc2_next_layer_norm_linear=...)`.\n- The last layer's `linear_fc2` has no next norm but still runs the fused kernel for its residual add, and nothing reads its normalized output. It now takes its own layer's `linear_fc1` instead of an `empty_like` placeholder allocated at construction, which stayed on the construction device.\n\nThe per-forward cost is two attribute lookups; no allocation or host sync is added. Under CUDA graphs, the address read at capture is replayed, as for every other weight: in-place updates such as checkpoint loads and refit reach it, and rebinding parameters after capture requires capturing again.\n\n## Tests\n\n`tests/unit_tests/transformer/test_fused_tp_norm_weights.py`, for each row of the table: `.cuda()` after CPU initialization, `.bfloat16()` from FP32, a DDP-style storage move (`param.data = param.detach().clone()`), a block built under `torch.device(\"meta\")` with `init_model_with_meta_device` and materialized on the GPU with `to_empty_if_meta_device`, and `.bfloat16()` under overwrite-on-conversion.\n\n- `test_row_parallel_layers_hold_the_norm_parameters` (1 GPU, TP=1): every `linear_proj` and `linear_fc2` reads the current device, dtype and storage of the norm parameter it fuses (the last `linear_fc2`, if it holds one, its layer's device and dtype), and the fused block has the same state-dict keys, parameter names and module names as the unfused one.\n- `test_fused_matches_unfused` (TP=2 with NVLS multicast; skips on all ranks without it): after the same weights are loaded in place into both blocks, with norm gains drawn from [0.5, 1.5], the fused block's output matches the unfused block's, and the fused kernel ran.\n\nH100, CI image (dfw 21012189), first commit: the six cases of the first three rows fail on main and pass with the fix. Neighbor `test_dynamic_engine_parallel_and_chunked_prefill.py::TestDynamicInferenceEngineParallel::test_mtp_kv_cache_inference_optimized_sequence_parallel` passes. At this head (dfw 21013289), all 10 cases pass with this PR and all 10 fail on `main`: `.cuda()` after CPU init, FP32 to BF16, a DDP-style storage move, meta-device materialization and overwrite-on-conversion, each for the stored-reference check and the TP=2 fused-vs-unfused output check. The neighbors pass: `test_transformer_layer.py` (45 cases) and `test_transformer_block.py` (56) on 8 GPUs, and the engine test.\n\nThe kernel determinism gate passes without a label (`inference_layers.py` is registered with an exemption; no kernel or dispatch change).\n\n**Related PRs.**\n- #8561 (fused-TP residual on fallback) and #8704 (MLA fused TP, stacked on #8561) rewrite the same wiring. Both conflict with this PR in adjacent lines of `inference_layers.py` (`InferenceRowParallelLinear.__init__`), `transformer_block.py` (the `configure_fused_tp_inference` call) and `transformer_layer.py` (`configure_fused_tp_inference` and its helpers). Resolution: keep both sides. That means #8561's `qkv_fused_tp_handoff` argument and handoff lines, `residual` and `fused_tp_handoff` attributes, `get_fc2_fused_tp_handoff` and `_using_fused_tp_inference`, together with this PR's `next_layer_norm_linear`, `fc2_next_layer_norm_linear` and `_set_*_next_layer_norm_linear`. #8561's `_matmul_reduce_scatter` merges cleanly: its `next_layer_norm_weights is None` check goes through the property. #8561's `_FakeLayer` in `test_inference_layers.py` merges without a textual conflict, but must rename `get_qkv_layer_norm_weights` to `get_qkv_layer_norm_linear` and `fc2_next_layer_norm_weights` to `fc2_next_layer_norm_linear`.\n- With #8704 also:\n  - `get_qkv_layer_norm_linear()` returns #8704's `_get_fusable_linear_qkv()` (None for MLA).\n  - `_set_fc2_next_layer_norm_linear` drops the placeholder and passes None through, so #8561 reduce-scatters and adds the residual.\n  - The setter docstring keeps #8704's \"None when no next layer takes its input from the fused all-gather\".\n  - #8704's `test_block_wiring` checks `layer.get_qkv_layer_norm_linear() is qkv` / `is None` instead of the weight getter. Its `next_layer_norm_weights` checks work unchanged.\n  - Both resolutions were checked in trial merges: the modules import, the tests collect, and #8561's fake-layer wiring test passes on CPU.\n  - The new tests need no change on top of either: the last-`linear_fc2` check allows None, and the fused-call count allows the last layer not to fuse.\n- #8709 (inference all-gather barriers) merges cleanly. Its `test_text_generation_controller.py::TestTextGenerationController::test_inference_optimized_steps_barrier_once_per_forward[gpt_fused_tp]` case is skipped, citing this bug. Whichever of the two PRs lands second removes that skip.\n\n## Issue tracking\n\nLinked issue: none. Found when #8709's new decode test ran a GPT model with fused TP communication, built with `use_cpu_initialization=True`, on H100.\n\n## Code provenance\n\nNo code was copied from external sources.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [ ] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 4,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8712/comments",
+    "commits": 2,
+    "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8712/commits",
+    "created_at": "2026-10-29T20:39:47Z",
+    "deletions": 39,
+    "diff_url": "https://github.com/NVIDIA/Megatron-LM/pull/8712.diff",
+    "draft": true,
+    "head": {
+      "label": "lmcafee-nvidia:fix/n16-fused-tp-norm-weight-references",
+      "ref": "fix/n16-fused-tp-norm-weight-references",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contributors",
+        "created_at": "2025-10-27T15:58:06Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/forks",
+        "full_name": "lmcafee-nvidia/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/index.html#quick-start",
+        "hooks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/hooks",
+        "html_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "id": 1084385341,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "R_kgDOQKJoPQ",
+        "notifications_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 82,
+        "open_issues_count": 82,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+          "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+          "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+          "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+          "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/lmcafee-nvidia",
+          "id": 85179052,
+          "login": "lmcafee-nvidia",
+          "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+          "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+          "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+          "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/lmcafee-nvidia",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T14:49:01Z",
+        "releases_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/releases{/id}",
+        "size": 115739,
+        "ssh_url": "git@github.com:lmcafee-nvidia/Megatron-LM.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscription",
+        "svn_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-08-25T16:48:34Z",
+        "url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "0de32e8e2326892b1906163c588e095bdb86f506",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+        "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+        "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+        "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+        "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/lmcafee-nvidia",
+        "id": 85179052,
+        "login": "lmcafee-nvidia",
+        "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+        "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+        "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+        "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/lmcafee-nvidia",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8712",
+    "id": 5075201473,
+    "issue_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8712",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "FBCA04",
+        "default": false,
+        "description": "Material: constrained correctness failure or a substantial demonstrated coverage gap.",
+        "id": 12756649659,
+        "name": "P2",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsGuw",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/P2"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D73A4A",
+        "default": false,
+        "description": "Production correction with focused regressions; includes historical aggregates containing fixes.",
+        "id": 12756651122,
+        "name": "Production Fix",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsMcg",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/Production%20Fix"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "3151739274424d99bc132e9d3fc6c6f335b91d23",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOCoyH_s8AAAABLoFtwQ",
+    "number": 8712,
+    "patch_url": "https://github.com/NVIDIA/Megatron-LM/pull/8712.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8712/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/0de32e8e2326892b1906163c588e095bdb86f506",
+    "title": "[Inference] Keep fused TP communication on the norm weights after the model is moved or cast",
+    "updated_at": "2026-11-03T17:19:25Z",
+    "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8712",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+      "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+      "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+      "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+      "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/lmcafee-nvidia",
+      "id": 85179052,
+      "login": "lmcafee-nvidia",
+      "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+      "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+      "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+      "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/lmcafee-nvidia",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 25,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/0de32e8e2326892b1906163c588e095bdb86f506/megatron%2Fcore%2Ftensor_parallel%2Finference_layers.py",
+      "changes": 32,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftensor_parallel%2Finference_layers.py?ref=0de32e8e2326892b1906163c588e095bdb86f506",
+      "deletions": 7,
+      "filename": "megatron/core/tensor_parallel/inference_layers.py",
+      "patch": "@@ -453,9 +453,9 @@ def __init__(\n             config, 'inference_disable_triton_nvls_kernels', False\n         )\n \n-        # Placeholder for next layer norm weights for fused\n-        # reduce-scatter + add + rms-norm + all-gather\n-        self.next_layer_norm_weights = None\n+        # Column-parallel layer whose input rms-norm the fused\n+        # reduce-scatter + add + rms-norm + all-gather applies (see _set_next_layer_norm_linear)\n+        self.next_layer_norm_linear = None\n         self.config = config\n \n     def _matmul_reduce_scatter(self, x, residual=None):\n@@ -511,7 +511,7 @@ def _matmul_reduce_scatter(self, x, residual=None):\n                     symm_mem_buffer[\"handle\"],\n                     residual,\n                     self.next_layer_norm_weights,\n-                    self.config.layernorm_epsilon,\n+                    self.next_layer_norm_linear.eps,\n                 )\n                 # 1. Residual has the output of the reduce-scatter + residual add\n                 #    Care must be taken in the model definition, so as to not apply the\n@@ -525,11 +525,29 @@ def _matmul_reduce_scatter(self, x, residual=None):\n             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)\n         return x\n \n-    def _set_next_layer_norm_weights(self, weights: torch.Tensor):\n+    @property\n+    def next_layer_norm_weights(self) -> Optional[torch.Tensor]:\n+        \"\"\"Norm weights the fused kernel applies: next_layer_norm_linear's, as they are now.\"\"\"\n+        if self.next_layer_norm_linear is None:\n+            return None\n+        return self.next_layer_norm_linear.layer_norm_weight\n+\n+    def _set_next_layer_norm_linear(\n+        self, linear: Optional[\"InferenceLayerNormColumnParallelLinear\"]\n+    ):\n         \"\"\"\n-        Set next layer norm weights for fused reduce-scatter + add + rms-norm + all-gather.\n+        Set the column-parallel layer whose input rms-norm this layer's fused\n+        reduce-scatter + add + rms-norm + all-gather applies.\n+\n+        Its norm weights and epsilon are read on every forward, not taken here: moving or\n+        casting the model, DDP's parameter buffer and meta-device materialization rebind or\n+        replace parameters after the model is built. A CUDA graph replays the address read\n+        at capture, as for every other weight: in-place updates such as checkpoint loads\n+        reach it, and rebinding the parameters after capture requires capturing again.\n         \"\"\"\n-        self.next_layer_norm_weights = weights\n+        # The layer belongs to another part of the model. Bypass nn.Module.__setattr__,\n+        # which would also register it as a submodule of this layer.\n+        object.__setattr__(self, \"next_layer_norm_linear\", linear)\n \n     def _set_residual(self, residual: torch.Tensor):\n         \"\"\"",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/0de32e8e2326892b1906163c588e095bdb86f506/megatron%2Fcore%2Ftensor_parallel%2Finference_layers.py",
+      "sha": "26ba0461b499d3ebffe869a58e58c9aa7fbd791f",
+      "status": "modified"
+    },
+    {
+      "additions": 6,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/0de32e8e2326892b1906163c588e095bdb86f506/megatron%2Fcore%2Ftransformer%2Ftransformer_block.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftransformer%2Ftransformer_block.py?ref=0de32e8e2326892b1906163c588e095bdb86f506",
+      "deletions": 5,
+      "filename": "megatron/core/transformer/transformer_block.py",
+      "patch": "@@ -456,22 +456,23 @@ def _setup_fused_tp_communication(self):\n         We call this kernel from within row parallel linear layers.\n         But layer-norm needs the layer norm weights from the\n         successive column parallel linear layer.\n-        This function is used to pass those weights to the respective layers.\n+        This function gives each row parallel linear layer that successive layer, whose\n+        norm weights it reads on every forward.\n         \"\"\"\n \n         for i in range(len(self.layers)):\n             current_layer = self.layers[i]\n \n-            # Get next layer's QKV norm weights (None for last layer)\n+            # Get next layer's QKV linear, which applies its input norm (None for last layer)\n             if i < len(self.layers) - 1:\n-                next_qkv_norm_weights = self.layers[i + 1].get_qkv_layer_norm_weights()\n+                next_qkv_layer_norm_linear = self.layers[i + 1].get_qkv_layer_norm_linear()\n             else:\n-                next_qkv_norm_weights = None\n+                next_qkv_layer_norm_linear = None\n \n             # Configure all fused TP communication settings in one call\n             current_layer.configure_fused_tp_inference(\n                 skip_qkv_norm_and_all_gather=(i > 0),\n-                fc2_next_layer_norm_weights=next_qkv_norm_weights,\n+                fc2_next_layer_norm_linear=next_qkv_layer_norm_linear,\n             )\n \n     def _get_layer(self, layer_number: int):",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/0de32e8e2326892b1906163c588e095bdb86f506/megatron%2Fcore%2Ftransformer%2Ftransformer_block.py",
+      "sha": "6c90fe79cee80d03df28b807baf59303b0baee88",
+      "status": "modified"
+    },
+    {
+      "additions": 31,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/0de32e8e2326892b1906163c588e095bdb86f506/megatron%2Fcore%2Ftransformer%2Ftransformer_layer.py",
+      "changes": 58,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Ftransformer%2Ftransformer_layer.py?ref=0de32e8e2326892b1906163c588e095bdb86f506",
+      "deletions": 27,
+      "filename": "megatron/core/transformer/transformer_layer.py",
+      "patch": "@@ -1675,36 +1675,38 @@ def sharded_state_dict(\n     def configure_fused_tp_inference(\n         self,\n         skip_qkv_norm_and_all_gather: bool = False,\n-        fc2_next_layer_norm_weights: Optional[Tensor] = None,\n+        fc2_next_layer_norm_linear: Optional[torch.nn.Module] = None,\n     ):\n         \"\"\"\n         Configure settings for fused TP communication in inference mode.\n \n         Args:\n             skip_qkv_norm (bool): Whether to skip norm and all-gather for linear_qkv.\n-            fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights\n-                for current layer's MLP FC2.\n+            fc2_next_layer_norm_linear (Optional[torch.nn.Module]): Next layer's QKV linear,\n+                whose input norm the current layer's MLP FC2 applies.\n         \"\"\"\n         self.self_attention.linear_qkv.skip_norm_and_all_gather = skip_qkv_norm_and_all_gather\n \n-        # Use current layer's own MLP FC1 norm weights for attention's/mixer's out_proj\n-        mlp_fc1_weights = self.get_mlp_layer_norm_weights()\n-        self._set_proj_next_layer_norm_weights(mlp_fc1_weights)\n+        # Use current layer's own MLP FC1 norm for attention's/mixer's out_proj\n+        mlp_fc1 = self.get_mlp_layer_norm_linear()\n+        self._set_proj_next_layer_norm_linear(mlp_fc1)\n \n         self.mlp.linear_fc1.skip_norm_and_all_gather = True\n-        # Use next layer's attention norm weights for current layer's MLP FC2\n-        self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)\n-\n-    def _set_proj_next_layer_norm_weights(self, weights: Tensor):\n-        \"\"\"Set next layer norm weights for attention/mixer's linear_proj.\"\"\"\n-        self.self_attention.linear_proj._set_next_layer_norm_weights(weights)\n-\n-    def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):\n-        \"\"\"Set next layer norm weights for MLP FC2.\"\"\"\n-        if weights is None:\n-            # Create dummy tensor for last layer (same shape as fc1 norm weights)\n-            weights = torch.empty_like(self.get_mlp_layer_norm_weights())\n-        self.mlp.linear_fc2._set_next_layer_norm_weights(weights)\n+        # Use next layer's attention norm for current layer's MLP FC2\n+        self._set_fc2_next_layer_norm_linear(fc2_next_layer_norm_linear)\n+\n+    def _set_proj_next_layer_norm_linear(self, linear: torch.nn.Module):\n+        \"\"\"Set the layer whose input norm attention/mixer's linear_proj applies.\"\"\"\n+        self.self_attention.linear_proj._set_next_layer_norm_linear(linear)\n+\n+    def _set_fc2_next_layer_norm_linear(self, linear: Optional[torch.nn.Module]):\n+        \"\"\"Set the layer whose input norm MLP FC2 applies.\"\"\"\n+        if linear is None:\n+            # The last layer has no next norm, but its FC2 still runs the fused kernel for the\n+            # residual add, and nothing reads the normalized output. Any norm of the right\n+            # size will do: use this layer's FC1 norm.\n+            linear = self.get_mlp_layer_norm_linear()\n+        self.mlp.linear_fc2._set_next_layer_norm_linear(linear)\n \n     def _set_proj_residual(self, residual: Tensor):\n         \"\"\"Set residual for attention's/mixer's out_proj (linear_proj).\"\"\"\n@@ -1714,23 +1716,25 @@ def _set_fc2_residual(self, residual: Tensor):\n         \"\"\"Set residual for MLP FC2.\"\"\"\n         self.mlp.linear_fc2._set_residual(residual)\n \n-    def get_mlp_layer_norm_weights(self) -> Tensor:\n+    def get_mlp_layer_norm_linear(self) -> torch.nn.Module:\n         \"\"\"\n-        Get the MLP FC1 layer norm weights.\n+        Get the MLP FC1, which applies the pre-MLP layer norm.\n \n         Returns:\n-            Tensor: The layer norm weight data.\n+            torch.nn.Module: linear_fc1. Fused TP communication holds this layer, not its norm\n+                weights, and reads them on every forward, since moving, casting or\n+                materializing the model after it is built rebinds or replaces parameters.\n         \"\"\"\n-        return self.mlp.linear_fc1.layer_norm_weight.data\n+        return self.mlp.linear_fc1\n \n-    def get_qkv_layer_norm_weights(self) -> Tensor:\n+    def get_qkv_layer_norm_linear(self) -> torch.nn.Module:\n         \"\"\"\n-        Get the QKV layer norm weights.\n+        Get the attention's QKV linear, which applies the input layer norm.\n \n         Returns:\n-            Tensor: The layer norm weight data.\n+            torch.nn.Module: linear_qkv (see get_mlp_layer_norm_linear).\n         \"\"\"\n-        return self.self_attention.linear_qkv.layer_norm_weight.data\n+        return self.self_attention.linear_qkv\n \n     def get_layer_static_inputs(self, seq_length, micro_batch_size):\n         \"\"\"",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/0de32e8e2326892b1906163c588e095bdb86f506/megatron%2Fcore%2Ftransformer%2Ftransformer_layer.py",
+      "sha": "16c809836a36d7092a1358d45926e1b6b9818d5b",
+      "status": "modified"
+    },
+    {
+      "additions": 240,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/0de32e8e2326892b1906163c588e095bdb86f506/tests%2Funit_tests%2Ftransformer%2Ftest_fused_tp_norm_weights.py",
+      "changes": 240,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Ftransformer%2Ftest_fused_tp_norm_weights.py?ref=0de32e8e2326892b1906163c588e095bdb86f506",
+      "deletions": 0,
+      "filename": "tests/unit_tests/transformer/test_fused_tp_norm_weights.py",
+      "patch": "@@ -0,0 +1,240 @@\n+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.\n+\"\"\"Fused TP communication reads the next layer's norm weights as they are at forward time.\n+\n+With ``inference_fuse_tp_communication``, TransformerBlock gives each\n+``InferenceRowParallelLinear`` the column-parallel layer that takes its output, whose norm the\n+fused NVLS reduce-scatter + add + rms-norm + all-gather kernel applies. After that wiring is set\n+up, moving the model to the GPU after CPU initialization, casting it (as Float16Module does) and\n+DDP's parameter buffer rebind the parameters to new storage, and meta-device materialization\n+and casts under torch.__future__'s overwrite-on-conversion replace them with new Parameters.\n+\"\"\"\n+\n+import contextlib\n+from unittest import mock\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+import megatron.core.tensor_parallel.inference_layers as inference_layers\n+from megatron.core import parallel_state\n+from megatron.core.inference.communication.torch_symm_triton.utils import is_device_nvls_capable\n+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager\n+from megatron.core.inference.utils import InferenceMode\n+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec\n+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed\n+from megatron.core.transformer.transformer_block import TransformerBlock\n+from megatron.core.transformer.transformer_config import TransformerConfig\n+from megatron.training.utils.common_utils import to_empty_if_meta_device\n+from tests.unit_tests.test_utilities import Utils\n+\n+requires_te = pytest.mark.skipif(\n+    not inference_layers.HAVE_TE, reason=\"inference_optimized requires Transformer Engine\"\n+)\n+\n+_S, _B, _H = 64, 2, 128\n+_FFN = 512\n+_HEADS = 4\n+_NUM_LAYERS = 2\n+\n+# Covers bf16 rounding at |x| ~ 4. Norm gains in [0.5, 1.5] applied as 1.0 (their initial\n+# value) or misread from stale storage change the output far beyond it.\n+_ATOL = 2e-2\n+_RTOL = 2e-2\n+\n+\n+def _rebind_storage(block: TransformerBlock) -> TransformerBlock:\n+    \"\"\"Point every parameter at new storage with the same values, as DDP does.\"\"\"\n+    for param in block.parameters():\n+        param.data = param.detach().clone()\n+    return block\n+\n+\n+def _materialize_meta(block: TransformerBlock) -> TransformerBlock:\n+    \"\"\"Materialize a block built on the meta device on the GPU, as get_model does.\"\"\"\n+    return to_empty_if_meta_device(block, device=torch.device(\"cuda\", torch.cuda.current_device()))\n+\n+\n+def _cast_overwriting_parameters(block: TransformerBlock) -> TransformerBlock:\n+    \"\"\"Cast to BF16 with overwrite-on-conversion, under which _apply installs new Parameters.\"\"\"\n+    previous = torch.__future__.get_overwrite_module_params_on_conversion()\n+    torch.__future__.set_overwrite_module_params_on_conversion(True)\n+    try:\n+        return block.bfloat16()\n+    finally:\n+        torch.__future__.set_overwrite_module_params_on_conversion(previous)\n+\n+\n+# What happens to the parameters after construction: (config overrides, transform).\n+_REBINDS = {\n+    # Built on the CPU and moved to the GPU, as get_model does with --use-cpu-initialization.\n+    \"cuda\": (dict(use_cpu_initialization=True, params_dtype=torch.bfloat16), lambda b: b.cuda()),\n+    # Built in FP32 and cast to BF16, as Float16Module does.\n+    \"bfloat16\": (dict(params_dtype=torch.float32), lambda b: b.bfloat16()),\n+    # Built in BF16 and moved into another buffer, as DDP does.\n+    \"storage\": (dict(params_dtype=torch.bfloat16), _rebind_storage),\n+    # Built on the meta device and materialized, as with --init-model-with-meta-device.\n+    \"meta\": (\n+        dict(init_model_with_meta_device=True, params_dtype=torch.bfloat16),\n+        _materialize_meta,\n+    ),\n+    # Built in FP32 and cast to BF16 with new Parameter objects.\n+    \"overwrite\": (dict(params_dtype=torch.float32), _cast_overwriting_parameters),\n+}\n+\n+\n+def _build(tp: int, rebind: str, *, fuse: bool) -> TransformerBlock:\n+    \"\"\"Smallest inference-optimized GPT block, without a final norm, on the GPU.\"\"\"\n+    overrides, transform = _REBINDS[rebind]\n+    config = TransformerConfig(\n+        num_layers=_NUM_LAYERS,\n+        hidden_size=_H,\n+        ffn_hidden_size=_FFN,\n+        num_attention_heads=_HEADS,\n+        tensor_model_parallel_size=tp,\n+        sequence_parallel=tp > 1,\n+        transformer_impl=\"inference_optimized\",\n+        normalization=\"RMSNorm\",\n+        add_bias_linear=False,\n+        hidden_dropout=0.0,\n+        attention_dropout=0.0,\n+        bf16=True,\n+        init_method_std=0.05,\n+        inference_fuse_tp_communication=fuse,\n+        **overrides,\n+    )\n+    model_parallel_cuda_manual_seed(123)\n+    device = (\n+        torch.device(\"meta\") if config.init_model_with_meta_device else contextlib.nullcontext()\n+    )\n+    with device:\n+        block = TransformerBlock(config, get_gpt_layer_with_inference_spec(), post_layer_norm=False)\n+    return transform(block).eval()\n+\n+\n+def _assert_same_storage(held: torch.Tensor, param: torch.Tensor, what: str):\n+    \"\"\"The fused kernel would read ``param``'s current storage through ``held``.\"\"\"\n+    held_at = (held.device, held.dtype, held.data_ptr())\n+    param_at = (param.device, param.dtype, param.data_ptr())\n+    assert held_at == param_at, f\"{what} holds {held_at}, the parameter is at {param_at}\"\n+\n+\n+def _all_ranks_agree(value: bool) -> bool:\n+    flag = torch.tensor([float(value)], device=\"cuda\")\n+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)\n+    return flag.item() == 1.0\n+\n+\n+def _require_nvls():\n+    buf = SymmetricMemoryManager.get_buffer(  # collective: create on every rank before any skip\n+        \"tp\", process_group=parallel_state.get_tensor_model_parallel_group()\n+    )\n+    hdl = buf.symm_mem_hdl\n+    capable = is_device_nvls_capable(torch.device(\"cuda\", torch.cuda.current_device()))\n+    if not _all_ranks_agree(capable and hdl is not None and bool(hdl.multicast_ptr)):\n+        pytest.skip(\"NVLS multicast unavailable\")\n+\n+\n+def _set_same_weights(unfused: TransformerBlock, fused: TransformerBlock):\n+    \"\"\"Load the same weights into both blocks in place, as a checkpoint load does.\"\"\"\n+    gen = torch.Generator(device=\"cpu\").manual_seed(4321)\n+    fused_params = dict(fused.named_parameters())\n+    with torch.no_grad():\n+        for name, param in unfused.named_parameters():\n+            if name.endswith(\"layer_norm_weight\"):\n+                value = 0.5 + torch.rand(param.shape, generator=gen)\n+            else:\n+                value = 0.03 * torch.randn(param.shape, generator=gen)\n+            param.copy_(value)\n+            fused_params.pop(name).copy_(value)\n+    assert not fused_params, f\"parameters only in the fused block: {sorted(fused_params)}\"\n+\n+\n+def _input_shard(tp: int) -> torch.Tensor:\n+    \"\"\"This rank's sequence-parallel shard of a fixed N(0, 1) [S, B, H] input.\"\"\"\n+    gen = torch.Generator(device=\"cpu\").manual_seed(1234)\n+    x = torch.randn(_S, _B, _H, generator=gen).to(torch.bfloat16)\n+    rank = parallel_state.get_tensor_model_parallel_rank()\n+    return x.chunk(tp, dim=0)[rank].contiguous().cuda()\n+\n+\n+def _forward(block: TransformerBlock, x: torch.Tensor) -> torch.Tensor:\n+    # The fused kernel updates the residual, here the block's input, in place.\n+    with torch.no_grad(), InferenceMode.active():\n+        out = block(hidden_states=x.clone(), attention_mask=None).float()\n+    torch.cuda.synchronize()\n+    dist.barrier()\n+    return out\n+\n+\n+@requires_te\n+class TestFusedTPNormWeights:\n+\n+    def teardown_method(self, method):\n+        torch.cuda.synchronize()\n+        SymmetricMemoryManager.destroy()\n+        Utils.destroy_model_parallel()\n+\n+    @pytest.mark.parametrize(\"rebind\", list(_REBINDS))\n+    def test_row_parallel_layers_hold_the_norm_parameters(self, rebind):\n+        \"\"\"After the parameters change, each layer still reads the next norm's parameter.\"\"\"\n+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)\n+        block = _build(1, rebind, fuse=True)\n+        layers = block.layers\n+        for i, layer in enumerate(layers):\n+            _assert_same_storage(\n+                layer.self_attention.linear_proj.next_layer_norm_weights,\n+                layer.mlp.linear_fc1.layer_norm_weight,\n+                f\"layer {i} linear_proj\",\n+            )\n+            fc2_weights = layer.mlp.linear_fc2.next_layer_norm_weights\n+            if i + 1 < len(layers):\n+                _assert_same_storage(\n+                    fc2_weights,\n+                    layers[i + 1].self_attention.linear_qkv.layer_norm_weight,\n+                    f\"layer {i} linear_fc2\",\n+                )\n+            elif fc2_weights is not None:\n+                # The last layer has no next norm, but the kernel still reads these.\n+                param = layer.mlp.linear_fc1.layer_norm_weight\n+                assert (fc2_weights.device, fc2_weights.dtype, fc2_weights.shape) == (\n+                    param.device,\n+                    param.dtype,\n+                    param.shape,\n+                ), f\"last linear_fc2 holds {fc2_weights.dtype} on {fc2_weights.device}\"\n+\n+        # The references add no submodules, parameters or state to the row-parallel layers.\n+        unfused = _build(1, rebind, fuse=False)\n+        assert list(block.state_dict()) == list(unfused.state_dict())\n+        for names in (\"named_parameters\", \"named_modules\"):\n+            assert [n for n, _ in getattr(block, names)()] == [\n+                n for n, _ in getattr(unfused, names)()\n+            ]\n+\n+    @pytest.mark.parametrize(\"rebind\", list(_REBINDS))\n+    def test_fused_matches_unfused(self, rebind):\n+        \"\"\"The fused kernel normalizes with the current norm weights.\"\"\"\n+        tp = 2\n+        if Utils.world_size % tp != 0:\n+            pytest.skip(f\"requires a world size divisible by TP={tp}\")\n+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)\n+        SymmetricMemoryManager.destroy()\n+        _require_nvls()\n+\n+        unfused = _build(tp, rebind, fuse=False)\n+        fused = _build(tp, rebind, fuse=True)\n+        _set_same_weights(unfused, fused)\n+        x = _input_shard(tp)\n+        expected = _forward(unfused, x)\n+        fused_kernel = inference_layers.fused_multimem_rs_add_norm_ag\n+        with mock.patch.object(\n+            inference_layers, \"fused_multimem_rs_add_norm_ag\", wraps=fused_kernel\n+        ) as spy:\n+            actual = _forward(fused, x)\n+        # Every linear_proj, and every linear_fc2 with a next layer, fused.\n+        assert spy.call_count >= 2 * _NUM_LAYERS - 1\n+\n+        max_diff = (actual - expected).abs().max().reshape(1)\n+        dist.all_reduce(max_diff, op=dist.ReduceOp.MAX)\n+        ok = _all_ranks_agree(torch.allclose(actual, expected, atol=_ATOL, rtol=_RTOL))\n+        assert ok, f\"fused vs unfused: max |diff| = {max_diff.item():.4f}\"",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/0de32e8e2326892b1906163c588e095bdb86f506/tests%2Funit_tests%2Ftransformer%2Ftest_fused_tp_norm_weights.py",
+      "sha": "fbd10c8f825acaa96cdfee4dc55121c30879df3f",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+      "created_at": "2026-10-29T20:39:52Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8712#issuecomment-6507805181",
+      "id": 6507805181,
+      "updated_at": "2026-10-29T20:39:52Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    }
+  ],
+  "number": 8712,
+  "refs": {
+    "base": {
+      "commit": "1ac85e91abe858f61f097fca9a27e9d0ec648e4e",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "0de32e8e2326892b1906163c588e095bdb86f506",
+      "repository": "lmcafee-nvidia/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": []
+}

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/evaluation/models_evaluation.md
-raw_sha256: ff652f1e1342d520792f222198813cce7a0f9c2fecf3930a1e3eb0d66eb3821b
+raw_sha256: 699eb7621a88b4a58c88743c2ad4ac544039d52902de3363c2f78042fcc784b5
 sources: []
-generated_body_sha256: 0a38d804d782a58e4b1e01df725645f08260497114fdfbf38d16ee96357f7030
+generated_body_sha256: f209b918a06145e5266709495b64fcfbaa0e7938934a468001139b01ffdcbe37
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/evaluation/models_evaluation.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/evaluation/models_evaluation.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/evaluation/models_evaluation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -54,7 +54,7 @@ The following table lists the supported model evaluation statistics for MindSpee
 | Baichuan-13B           | BoolQ       | 74.7%     | [73.6%](https://hub.opencompass.org.cn/dataset-detail/BoolQ)          | Baichuan2-7B             | BoolQ       | 70.0%     | [63.2%](https://hub.opencompass.org.cn/dataset-detail/BoolQ)                       |
 | Baichuan2-13B          | BoolQ       | 78.0%     | [67.0%](https://hub.opencompass.org.cn/dataset-detail/BoolQ)          | Bloom-7B                 | MMLU        | 25.1%     | --                                                                                 |
 | Bloom-176B             | BoolQ       | 64.5%     | --                                                                    | ChatGLM3-6B              | MMLU        | 61.5%     | --                                                                                 |
-| GLM4-9B                | MMLU        | 74.5%     | [74.7%](https://huggingface.co/THUDM/glm-4-9b)                        | CodeQwen1.5-7B           | HumanEval   | 54.8%     | [51.8%](https://qwenlm.github.io/zh/blog/codeqwen1.5)                             |
+| GLM-4-9B               | MMLU        | 74.5%     | [74.7%](https://huggingface.co/THUDM/glm-4-9b)                        | CodeQwen1.5-7B           | HumanEval   | 54.8%     | [51.8%](https://qwenlm.github.io/zh/blog/codeqwen1.5)                             |
 | CodeLlama-34B          | HumanEval   | 48.8%     | [48.8%](https://paperswithcode.com/sota/code-generation-on-humaneval) | Gemma-2B                 | MMLU        | 39.6%     | --                                                                                 |
 | Gemma-7B               | MMLU        | 52.2%     | --                                                                    | InternLM-7B              | MMLU        | 48.7%     | [51.0%](https://huggingface.co/internlm/internlm-7b)                               |
 | Gemma2-9B              | MMLU        | 70.7%     | [71.3%](https://huggingface.co/google/gemma-2-9b)                     | Gemma2-27B               | MMLU        | 75.5%     | [75.2%](https://huggingface.co/google/gemma-2-27b)                                 |

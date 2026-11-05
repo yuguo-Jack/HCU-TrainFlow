@@ -1,0 +1,208 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "f73114cc606cb14ba6adadbbb783c8d2a76ea2f16856064c4357c13f09b7241d",
+      "isPrivate": false,
+      "numbers": [
+        47829,
+        47828,
+        47826,
+        47825,
+        47824,
+        47823,
+        47822,
+        47821
+      ],
+      "observed_at": "2026-11-04T16:35:21.207058+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4772,
+        "resetAt": "2026-11-04T16:50:04Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "cec4554871f67c3252c5f2d6347a4192c510d9bb",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "## Summary\r\n\r\nQ tensor was always forced to do `q.contiguous().view(-1, H, D)`  before `unified_attention` (**extend/prefill** path), which isn't necessary when applying fused RoPE + KV write because q is already a **column slice**.  That is unnecessary copy.\r\n\r\nThis PR replaces the unconditional copy with a small layout helper `_unified_extend_q`. It returns a zero-copy\r\n`view(-1, H, D)` **only when** the result already has unit dim stride and head stride = `head_dim` (what\r\n`unified_attention` / the gfx1250 gluon 2D TDM Q descriptor need). Any other layout still takes the old\r\n`.contiguous().view(...)` path. The fp8-KV extend path is unchanged (its q quantization already materializes a\r\nfresh contiguous tensor).\r\n\r\n## Motivation\r\n\r\nCall chain (gpt-oss-120b + aiter, `use_triton_unified_attention`):\r\n\r\n1. QKV GEMM writes a fused buffer of width `3 · H · D` (TP1: 5120 = 64·64 + K + V; TP2: 2560).\r\n2. Fused RoPE + KV cache write runs with `q_out` pointing at the Q columns of that buffer, so after RoPE, `q` is\r\n   still a **non-contiguous column slice**: shape `(T, H·D)`, token stride 5120 (TP1) or 2560 (TP2), but\r\n   **within each token** the `H × D` elements are dense (dim stride 1, head stride `D`).\r\n3. `_forward_extend_unified` must hand `unified_attention` a 3-D q `(T, H, D)`. Old code always did\r\n   `q.contiguous().view(...)`, which copies even when a view would already be dense per token.\r\n4. AITER's `unified_attention` (and the gfx1250 gluon 2D kernel) address q with `query_stride_0` between tokens and\r\n   require only that heads × head_dim be contiguous inside a token (`stride(2)==1`, `stride(1)==head_dim`). The\r\n   QKV-slice layout already satisfies that; the copy was pure waste.\r\n\r\nTrace role: ATen bf16 direct-copy in the prefill attention-prep path (~56 / 119 µs at 8k / 16k per full layer;\r\n~2.0 / 4.3 ms per step over 36 layers). Microbench of `q.contiguous()` alone: 58.8 µs @ 7,500 tokens, 121.8 µs @\r\n16,384.\r\n\r\n## Modifications\r\n\r\nOne helper + one call-site change in `python/sglang/srt/layers/attention/aiter_backend.py`:\r\n\r\n```python\r\ndef _unified_extend_q(q, num_heads, head_dim):\r\n    try:\r\n        q_v = q.view(-1, num_heads, head_dim)\r\n        if q_v.stride(2) == 1 and q_v.stride(1) == head_dim:\r\n            return q_v          # zero-copy when per-token layout is already dense\r\n    except RuntimeError:\r\n        pass\r\n    return q.contiguous().view(-1, num_heads, head_dim)  # old behavior\r\n```\r\n\r\n`_forward_extend_unified` now uses `_unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)` instead of\r\n`q.contiguous().view(...)`. No other extend/decode arm is touched.\r\n\r\n## Accuracy Tests\r\n\r\nOffline gfx1250 probe (`check_p6b_strided_q.py` / `probe_strided_q.py`); **no new in-tree SGLang unit test**. These\r\nchecks are what the title must match: the helper is a **guard**, not an unconditional “always strided, never copy”.\r\n\r\n**1. Layout selection** (`_unified_extend_q` vs old `q.contiguous().view`):\r\n\r\n| Input layout | Expect | Result strides (H=64, D=64) |\r\n|---|---|---|\r\n| gpt-oss QKV column slice, TP1 (token stride 5120) | **zero-copy view** | (5120, 64, 1) |\r\n| gpt-oss QKV column slice, TP2 (token stride 2560) | **zero-copy view** | (2560, 64, 1) |\r\n| already-contiguous q | view of itself | (4096, 64, 1) |\r\n| `view()` OK but dim stride 2 (`q[:, ::2]`) | **copy** (guard rejects) | (4096, 64, 1) |\r\n| transposed q (`view()` OK, inner stride ≠ 1) | **copy** (guard rejects) | (4096, 64, 1) |\r\n\r\nValues always equal the old contiguous reshape; wrong layouts still copy.\r\n\r\n**2. Attention equality** — gfx1250 gluon unified-attention **2D extend**, bf16 KV, sinks on:\r\n- Heads: TP1 64/8 and TP2 32/4; full attention and window-128.\r\n- Batches: 4-seq prefill/prefix (7,548 query tokens) and 2-seq chunked-with-prefix (8,192 query tokens).\r\n- Output with `_unified_extend_q(q_slice)` vs old contiguous q: **bitwise equal**, all finite (8/8 cases).\r\n\r\n**3. CUDA-graph replay** — capture 10 calls into 10 outputs, replay 20×: **0 mismatches** (200 calls per case).\r\n\r\n**4. End-to-end sanity** — gpt-oss-120b W4A8 on gfx1250, controlled A-B-A (A = contiguous path, B = this change):\r\n8192/1024 c64 **1.007**, 70000/300 c4 **1.007**; GSM8K strict **0.9598**.\r\n\r\nNot covered here: an in-repo `test/registered/...` unit test (layout guard is pure PyTorch; attention equality needs\r\ngfx1250 + aiter gluon). Closest existing sibling is `test_aiter_fp8_q_unified_attention.py` (decode / fp8-q routing),\r\nwhich this PR does not change.\r\n\r\n## Speed Tests and Profiling\r\n\r\nWhole op = old (`q.contiguous()` + attention) vs new (attention on the view), CUDA-graph median, µs:\r\n\r\n| Case | old | new | new/old |\r\n|---|---|---|---|\r\n| TP1 7,548 tok, full | 527.5 | 475.2 | 0.90 |\r\n| TP1 7,548 tok, window | 252.5 | 196.9 | 0.78 |\r\n| TP2 7,548 tok, window | 72.7 | 44.2 | 0.61 |\r\n\r\n(Serving gain is small — about the ~2 ms/step the Q copy cost at 8k — matching the ×1.007 e2e above.)\r\n\r\n## Checklist\r\n\r\n- [x] Format with pre-commit (passed)\r\n- [ ] Unit test (none added in-tree; covered by the layout + attention-equality probe above)\r\n\r\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #41378336594](https://github.com/sgl-project/sglang/actions/runs/41378336594)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #41378336622](https://github.com/sgl-project/sglang/actions/runs/41378336622)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #41378336729](https://github.com/sgl-project/sglang/actions/runs/41378336729)<!-- slot:pr-test-amd:end -->\n\n> [!TIP]\n> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:\n>\n> ```text\n> Find the registered tests this PR affects and run them with /rerun-test, following https://github.com/sgl-project/sglang/blob/main/.agents/skills/rerun-test/SKILL.md\n> ```\n<!-- pr-states:end -->",
+      "changedFiles": 1,
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "headRefOid": "5b4e0e500c850b83f54f28dd0348df59803b7360",
+      "headRepository": {
+        "nameWithOwner": "akao-amd/sglang"
+      },
+      "mergeCommit": {
+        "oid": "27aedf7f93cc7ac3bff43e7150e42a3c0baa6957"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-04T09:49:35Z",
+      "number": 47822,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5731517780,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-02T02:31:29Z",
+            "url": "https://github.com/sgl-project/sglang/pull/47822#pullrequestreview-5731517780"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "HaiShaw"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5766458736,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-04T09:49:09Z",
+            "url": "https://github.com/sgl-project/sglang/pull/47822#pullrequestreview-5766458736"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wNFQwOTo0OTowOVq0MjAyNi0xMS0wNFQwOTo0OTowOVrPAAAAAVe1LXA=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "state": "MERGED",
+      "title": "[Perf] [AMD] aiter: Skip q.contiguous() in unified extend when the per-token layout is dense",
+      "updatedAt": "2026-11-04T09:49:36Z",
+      "url": "https://github.com/sgl-project/sglang/pull/47822"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "sgl-project/sglang"
+      },
+      "sha": "cec4554871f67c3252c5f2d6347a4192c510d9bb"
+    },
+    "body": "## Summary\r\n\r\nQ tensor was always forced to do `q.contiguous().view(-1, H, D)`  before `unified_attention` (**extend/prefill** path), which isn't necessary when applying fused RoPE + KV write because q is already a **column slice**.  That is unnecessary copy.\r\n\r\nThis PR replaces the unconditional copy with a small layout helper `_unified_extend_q`. It returns a zero-copy\r\n`view(-1, H, D)` **only when** the result already has unit dim stride and head stride = `head_dim` (what\r\n`unified_attention` / the gfx1250 gluon 2D TDM Q descriptor need). Any other layout still takes the old\r\n`.contiguous().view(...)` path. The fp8-KV extend path is unchanged (its q quantization already materializes a\r\nfresh contiguous tensor).\r\n\r\n## Motivation\r\n\r\nCall chain (gpt-oss-120b + aiter, `use_triton_unified_attention`):\r\n\r\n1. QKV GEMM writes a fused buffer of width `3 · H · D` (TP1: 5120 = 64·64 + K + V; TP2: 2560).\r\n2. Fused RoPE + KV cache write runs with `q_out` pointing at the Q columns of that buffer, so after RoPE, `q` is\r\n   still a **non-contiguous column slice**: shape `(T, H·D)`, token stride 5120 (TP1) or 2560 (TP2), but\r\n   **within each token** the `H × D` elements are dense (dim stride 1, head stride `D`).\r\n3. `_forward_extend_unified` must hand `unified_attention` a 3-D q `(T, H, D)`. Old code always did\r\n   `q.contiguous().view(...)`, which copies even when a view would already be dense per token.\r\n4. AITER's `unified_attention` (and the gfx1250 gluon 2D kernel) address q with `query_stride_0` between tokens and\r\n   require only that heads × head_dim be contiguous inside a token (`stride(2)==1`, `stride(1)==head_dim`). The\r\n   QKV-slice layout already satisfies that; the copy was pure waste.\r\n\r\nTrace role: ATen bf16 direct-copy in the prefill attention-prep path (~56 / 119 µs at 8k / 16k per full layer;\r\n~2.0 / 4.3 ms per step over 36 layers). Microbench of `q.contiguous()` alone: 58.8 µs @ 7,500 tokens, 121.8 µs @\r\n16,384.\r\n\r\n## Modifications\r\n\r\nOne helper + one call-site change in `python/sglang/srt/layers/attention/aiter_backend.py`:\r\n\r\n```python\r\ndef _unified_extend_q(q, num_heads, head_dim):\r\n    try:\r\n        q_v = q.view(-1, num_heads, head_dim)\r\n        if q_v.stride(2) == 1 and q_v.stride(1) == head_dim:\r\n            return q_v          # zero-copy when per-token layout is already dense\r\n    except RuntimeError:\r\n        pass\r\n    return q.contiguous().view(-1, num_heads, head_dim)  # old behavior\r\n```\r\n\r\n`_forward_extend_unified` now uses `_unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)` instead of\r\n`q.contiguous().view(...)`. No other extend/decode arm is touched.\r\n\r\n## Accuracy Tests\r\n\r\nOffline gfx1250 probe (`check_p6b_strided_q.py` / `probe_strided_q.py`); **no new in-tree SGLang unit test**. These\r\nchecks are what the title must match: the helper is a **guard**, not an unconditional “always strided, never copy”.\r\n\r\n**1. Layout selection** (`_unified_extend_q` vs old `q.contiguous().view`):\r\n\r\n| Input layout | Expect | Result strides (H=64, D=64) |\r\n|---|---|---|\r\n| gpt-oss QKV column slice, TP1 (token stride 5120) | **zero-copy view** | (5120, 64, 1) |\r\n| gpt-oss QKV column slice, TP2 (token stride 2560) | **zero-copy view** | (2560, 64, 1) |\r\n| already-contiguous q | view of itself | (4096, 64, 1) |\r\n| `view()` OK but dim stride 2 (`q[:, ::2]`) | **copy** (guard rejects) | (4096, 64, 1) |\r\n| transposed q (`view()` OK, inner stride ≠ 1) | **copy** (guard rejects) | (4096, 64, 1) |\r\n\r\nValues always equal the old contiguous reshape; wrong layouts still copy.\r\n\r\n**2. Attention equality** — gfx1250 gluon unified-attention **2D extend**, bf16 KV, sinks on:\r\n- Heads: TP1 64/8 and TP2 32/4; full attention and window-128.\r\n- Batches: 4-seq prefill/prefix (7,548 query tokens) and 2-seq chunked-with-prefix (8,192 query tokens).\r\n- Output with `_unified_extend_q(q_slice)` vs old contiguous q: **bitwise equal**, all finite (8/8 cases).\r\n\r\n**3. CUDA-graph replay** — capture 10 calls into 10 outputs, replay 20×: **0 mismatches** (200 calls per case).\r\n\r\n**4. End-to-end sanity** — gpt-oss-120b W4A8 on gfx1250, controlled A-B-A (A = contiguous path, B = this change):\r\n8192/1024 c64 **1.007**, 70000/300 c4 **1.007**; GSM8K strict **0.9598**.\r\n\r\nNot covered here: an in-repo `test/registered/...` unit test (layout guard is pure PyTorch; attention equality needs\r\ngfx1250 + aiter gluon). Closest existing sibling is `test_aiter_fp8_q_unified_attention.py` (decode / fp8-q routing),\r\nwhich this PR does not change.\r\n\r\n## Speed Tests and Profiling\r\n\r\nWhole op = old (`q.contiguous()` + attention) vs new (attention on the view), CUDA-graph median, µs:\r\n\r\n| Case | old | new | new/old |\r\n|---|---|---|---|\r\n| TP1 7,548 tok, full | 527.5 | 475.2 | 0.90 |\r\n| TP1 7,548 tok, window | 252.5 | 196.9 | 0.78 |\r\n| TP2 7,548 tok, window | 72.7 | 44.2 | 0.61 |\r\n\r\n(Serving gain is small — about the ~2 ms/step the Q copy cost at 8k — matching the ×1.007 e2e above.)\r\n\r\n## Checklist\r\n\r\n- [x] Format with pre-commit (passed)\r\n- [ ] Unit test (none added in-tree; covered by the layout + attention-equality probe above)\r\n\r\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:x: [Run #41378336594](https://github.com/sgl-project/sglang/actions/runs/41378336594)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #41378336622](https://github.com/sgl-project/sglang/actions/runs/41378336622)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #41378336729](https://github.com/sgl-project/sglang/actions/runs/41378336729)<!-- slot:pr-test-amd:end -->\n\n> [!TIP]\n> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:\n>\n> ```text\n> Find the registered tests this PR affects and run them with /rerun-test, following https://github.com/sgl-project/sglang/blob/main/.agents/skills/rerun-test/SKILL.md\n> ```\n<!-- pr-states:end -->",
+    "changed_files": 1,
+    "head": {
+      "repo": {
+        "full_name": "akao-amd/sglang"
+      },
+      "sha": "5b4e0e500c850b83f54f28dd0348df59803b7360"
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/47822",
+    "merge_commit_sha": "27aedf7f93cc7ac3bff43e7150e42a3c0baa6957",
+    "merged": true,
+    "merged_at": "2026-11-04T09:49:35Z",
+    "number": 47822,
+    "state": "closed",
+    "title": "[Perf] [AMD] aiter: Skip q.contiguous() in unified extend when the per-token layout is dense",
+    "updated_at": "2026-11-04T09:49:36Z"
+  },
+  "files": [
+    {
+      "additions": 19,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/5b4e0e500c850b83f54f28dd0348df59803b7360/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Faiter_backend.py",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Faiter_backend.py?ref=5b4e0e500c850b83f54f28dd0348df59803b7360",
+      "deletions": 1,
+      "filename": "python/sglang/srt/layers/attention/aiter_backend.py",
+      "patch": "@@ -376,6 +376,24 @@ def _asm_context_prefill_gather_indices(\n     return tok_idx, cu_k\n \n \n+def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:\n+    \"\"\"q as unified_attention's (tokens, heads, head_dim) input, without a copy when possible.\n+\n+    unified_attention reads q through its token stride (query_stride_0) and needs the heads x\n+    head_dim of a token dense (unit dim stride, head stride = head_dim). A q that is a column\n+    slice of the fused QKV output (RoPE writes it in place) is such a view and is returned as\n+    is; q.contiguous() copied the whole q of every prefill/extend batch. Any other layout,\n+    or one view() rejects, is made contiguous as before.\n+    \"\"\"\n+    try:\n+        q_v = q.view(-1, num_heads, head_dim)\n+        if q_v.stride(2) == 1 and q_v.stride(1) == head_dim:\n+            return q_v\n+    except RuntimeError:\n+        pass\n+    return q.contiguous().view(-1, num_heads, head_dim)\n+\n+\n class AiterAttnBackend(AttentionBackend):\n     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch\n     # can never carry more seqs than the pool.\n@@ -1265,7 +1283,7 @@ def _forward_extend_unified(\n                 pt = swa_page_table\n \n         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()\n-        q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)\n+        q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)\n         o = q_u.new_empty(\n             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),\n             dtype=self.input_dtype,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/5b4e0e500c850b83f54f28dd0348df59803b7360/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Faiter_backend.py",
+      "sha": "6aaec1d84d7f1e5c2887d4f38c31e77badccb3d7",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [],
+  "number": 47822,
+  "refs": {
+    "base": {
+      "commit": "cec4554871f67c3252c5f2d6347a4192c510d9bb",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "5b4e0e500c850b83f54f28dd0348df59803b7360",
+      "repository": "akao-amd/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/47822#pullrequestreview-5731517780",
+      "id": 5731517780,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-02T02:31:29Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/47822#pullrequestreview-5766458736",
+      "id": 5766458736,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-04T09:49:09Z",
+      "user": {
+        "login": "HaiShaw"
+      }
+    }
+  ]
+}

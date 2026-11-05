@@ -10,41 +10,45 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: modelscope-ms-swift
   path: swift/pipelines/train/sft.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 744ceb388ae51f3f50f95f9ceb208980696ba95eaa1f01aaabb0584bd78515b6
 - source: modelscope-ms-swift
   path: swift/template/base.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: a2d14012e37058ad392c1f242e220fd69bb654f29887baffb04aa552f3dfbc16
 - source: modelscope-ms-swift
   path: swift/trainers/seq2seq_trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 4bb65c60321cd619dd44a530e1b228ce470c625a9134666758c21d1337f79163
 - source: modelscope-ms-swift
   path: swift/sequence_parallel/utils.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: 478090138ad600795de0eebd0b6d660d47eeee3aea6434a7e688129eb2197b51
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 563dfd316288ae135054d67169f87c8435bd0244199fd8f9e19d417039fc5115
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: b7efa15ead7a4f049495c4a0639c27edf6b99bddf9795c47c178a555cbcbf6dc
 - source: modelscope-ms-swift
   path: tests/train/test_chunked_cross_entropy.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: dfca2f2e3787ecbdaa555129d59dc2cb03e70c0f704432fa34f4af86fd8288a5
 - source: modelscope-ms-swift
   path: tests/train/test_trainer_partial_accumulation.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: dfeaa1943e3d70e1ffe458b547b11ce8d92d1fab2a08e033cde47f825ceccbe4
 - source: modelscope-ms-swift
   path: examples/train/packing/llm.sh
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 083d2d8ec9e7a8e6746335040b70b8cb01855f9ff1f72e54935f8039ea6da087
+- source: modelscope-ms-swift
+  path: swift/trainers/mixin.py
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 83a76c73a27300aa76861d78be4d7f24ab03120d3105fa16272ff4f7fbf86903
 ---
 
 # ms-swift SFT：packing、序列并行与 loss 归一化
@@ -53,7 +57,7 @@ sources:
 
 短样本 padding 比例大或长序列激活超出单卡容量时，可考虑 packing、padding-free 与 SP。它们改变 tensor 排列、通信和分批方式，目标是保留原有训练 token/权重/样本隔离后减少浪费。本文精读普通 SFT、模板及 Megatron loss 的相关代码；两类 backend 的归一化位置不同。
 
-入口为 [工程总览](../overview/engineering-guide.md)。固定代码 `2efb43ffe61294735be6816abca991fb2ca16011`；本页是代码契约解释，没有 HCU 性能或阶段 loss 实测。
+入口为 [工程总览](../overview/engineering-guide.md)。固定代码 `9853e4672d014e35e2b6ba1bfd26d8204100adbb`；本页是代码契约解释，没有 HCU 性能或阶段 loss 实测。
 
 ## 数据到 trainer 的真实调用链
 
@@ -64,7 +68,15 @@ sources:
 5. `Template._data_collator` 的 padding-free 路径再合并 batch；Megatron/SP 的非 padding-free 路径要求 right padding。实际 attention 如何接收分段信息继续追模型/template hook 和 backend，position reset 本身不是所有 attention 实现都自动隔离的保证。
 6. `Seq2SeqTrainer._prepare_inputs/compute_loss` 或 `MegatronTrainer.forward_step/loss_func` 消费这些字段，形成训练与日志的分子/分母。
 
-源码：[SwiftSft](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/pipelines/train/sft.py)、[Template](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/template/base.py)、[Seq2SeqTrainer](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/trainers/seq2seq_trainer.py)。
+源码：[SwiftSft](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/pipelines/train/sft.py)、[Template](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/template/base.py)、[Seq2SeqTrainer](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/trainers/seq2seq_trainer.py)。
+
+### SP 采样的完整覆盖与尾部舍弃
+
+当前 [`SequenceParallelSampler`](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/sequence_parallel/utils.py)要求调用方显式传 keyword-only `round_up`。它按 DP group 分片，样本在 SP group 内复制；`round_up=True` 以 DP 数向上补齐并重复索引，`False` 则把总量向下截到 `DP×SP` 的整数倍，再分给 DP ranks。shuffle 在 False 路径只对这段截断范围置乱，不是每轮从全数据随机挑掉任意尾部。
+
+实际消费者 [`DataLoaderMixin.get_sp_dataloader`](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/trainers/mixin.py) 的 `round_up` 默认 False：当前训练入口在 SP>1 时不覆盖它，eval 入口则明确传 True。这里针对 map-style dataset 构造该 sampler；`drop_last` 仍由 DataLoader 配置控制，恢复 skip 通过 `SkipBatchSampler` 按 `skip_batches×batch_size` 跳过，不能把 sampler 的截断/补齐与 drop-last、恢复偏移混为一层。
+
+因此对照 SP 开关时还要固定实际训练索引、尾部样本与每 step 集合；仅比相同 seed 或数据集长度不能保证同一任务。评价使用补齐策略时要去除重复计数；外部 Trainer 接入仍核对自己的构造参数。`GatherLoss` 与 chunked CE 的数学分支在该固定提交未变，保留下述 sum/count、shift 和 retained-graph 验收。此次只读源码，没有执行 SP 采样或训练回归。
 
 ## 普通 SFT 的分母与梯度累积
 
@@ -84,7 +96,7 @@ SP 下 `GatherLoss.forward` 将本 shard 的 loss/labels 收集；backward 再 s
 
 ## Chunked CE 能减少什么、不能减少什么
 
-[ChunkedCrossEntropyLoss](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/sequence_parallel/utils.py)在 token 维分块，forward 逐块执行 CE 后拼 loss，保存实际 `loss_dtype`；backward 现直接使用 softmax−onehot 的闭式梯度并乘外部逐 token grad_output，写入独立 `grad_logits`。它保存完整 logits/labels，**不是** fused linear+CE，也不自动消除 `T×V` logits 张量；收益主要是限制 CE 中间工作空间，代价仍有分块循环、softmax 和额外 launch；当前闭式 backward 已去掉旧版逐块重建 CE autograd 的开销。
+[ChunkedCrossEntropyLoss](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/sequence_parallel/utils.py)在 token 维分块，forward 逐块执行 CE 后拼 loss，保存实际 `loss_dtype`；backward 现直接使用 softmax−onehot 的闭式梯度并乘外部逐 token grad_output，写入独立 `grad_logits`。它保存完整 logits/labels，**不是** fused linear+CE，也不自动消除 `T×V` logits 张量；收益主要是限制 CE 中间工作空间，代价仍有分块循环、softmax 和额外 launch；当前闭式 backward 已去掉旧版逐块重建 CE autograd 的开销。
 
 当前实现不把梯度写回输入 logits，避免 logits 被 aux loss 或 retained graph 再使用时遭破坏。不能为了减一次分配改成就地覆盖。大 vocabulary、长序列或 SP gather 场景应实际比较工作空间和 kernel 时间，模型融合后可考虑更下层的 linear-CE 实现，但需保留输出/反向契约。
 
@@ -103,7 +115,7 @@ SP 下 `GatherLoss.forward` 将本 shard 的 loss/labels 收集；backward 再 s
 | CE forward、加权反向、aux loss 及重复 backward | 别名、输入覆盖、反向只部分正确 |
 | step 吞吐、有效 token、峰值显存和通信 | 减 padding 的收益是否超过新同步与 launch |
 
-官方 [chunked CE 测试](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/tests/train/test_chunked_cross_entropy.py)覆盖多 chunk size、FP32/FP64、leaf/non-leaf、ignore index、任意外部权重、共享 logits 的 aux loss 和 retained-graph 二次反向。[部分累积测试](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/tests/train/test_trainer_partial_accumulation.py)针对 trainer/reranker，以窗口 1/2/4 和合并 batch 比较梯度。测试设计是参考证据，本轮未执行这些上游测试。
+官方 [chunked CE 测试](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/tests/train/test_chunked_cross_entropy.py)覆盖多 chunk size、FP32/FP64、leaf/non-leaf、ignore index、任意外部权重、共享 logits 的 aux loss 和 retained-graph 二次反向。[部分累积测试](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/tests/train/test_trainer_partial_accumulation.py)针对 trainer/reranker，以窗口 1/2/4 和合并 batch 比较梯度。测试设计是参考证据，本轮未执行这些上游测试。
 
 发现数值差异时保留原样本与配置，先回退 packing/SP/chunk-loss 对照到已验基线，定位分段/分母后再重开。真实 HCU backend 不能执行支持的 varlen attention 时，不仅改 flag，还要确认实际 fallback 和内存/吞吐影响。
 

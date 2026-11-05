@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source/embodied_tutorial/eval_docs/benchmark_envs.md
-raw_sha256: a458532ab2e0e18476d7b1099ea08d7ee53481aeca3f6c1a7fa703a540fbe7c5
+raw_sha256: e3351533741970faf226386ce6d453022433553719bcd13e637fc9e756ea3635
 sources: []
-generated_body_sha256: 7caff4813953503404f83e8498652fe8bf7012c2b3f7feb2804703ee825b7321
+generated_body_sha256: cfc007f95aad6804bf9115c05d9eec943117c910d520c27a88917f9c7319d591
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/embodied_tutorial/eval_docs/benchmark_envs.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/embodied_tutorial/eval_docs/benchmark_envs.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/embodied_tutorial/eval_docs/benchmark_envs.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -138,7 +138,7 @@ GR00T-N1.6 status:     task success (open_drawer 10/10, close_drawer 9/10,
                        spoon 7/10, eggplant 6/10, carrot 16/30, stack_cube 2/10;
                        official prepackaged_config)
                        uses the stock upstream delta controller, no env change
-                       configs: examples/embodied/groot_n1_6/eval/configs/simplerenv/*
+                       configs: examples/embodied/gr00t_n1_6/eval/configs/simplerenv/*
 pi05 configs:          only widowx_stack_cube_smoke.yaml
                        server.random_init: true (connectivity only, not task success)
                        other Bridge tasks: edit task_name in-file comments

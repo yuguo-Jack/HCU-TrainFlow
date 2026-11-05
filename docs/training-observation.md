@@ -149,6 +149,8 @@ python3 scripts/manage_training_observer.py stop "${observer_args[@]}"
 
 一些引擎由 rank0 输出进度，另一些分支用全局最后 rank 或专用 logger。先检查固定版本的打印调用者及真实日志，再把实际来源写入进度配置。把它作为训练进展来源时，应明确采集覆盖范围，并另核对全部必需 member 的 launcher/容器进程身份、观察器 ready 与心跳、异常日志和真实退出结果。指定来源有进展不能证明其余观察器正常；没有 iteration 的非主 rank 也不能被强行伪造进度。当前单个 watcher 的 `completion_verified` 只验证其 manifest/log/receipt 范围，主控还需要集合所有必需成员结果及 checkpoint/阶段契约，才能判整体完成。
 
+记录训练 global rank、MPI rank、节点顺序和各层 launcher 的关系：MPI 每节点启动一次 torchrun 时，PRTE 的 rank 不是 GPU worker rank。故障节点归属、栈聚合和成员退出必须用各自真实映射；无法映射保留未知，不能因控制器日志写了 RUNNING 或 STARTING 就合成 iteration/退出回执。Cluster Manager 预检 PASS、设备事实、训练控制状态与保存日志也各有独立语义，不能送入 Megatron parser 冒充训练进度；接入或格式变化先核对实际消费者及 fixture。
+
 独立 sentinel 按各成员的具体 workspace/launch/精确身份监测，不能只检查一个节点能 ping 通。context 或观察 Store 更换后，先使新观察器实际完成首轮采集并验证心跳，再替换 sentinel 目标；保留旧 incident 的解除/替代依据与交接缺口。独立节点、进程存活、心跳新鲜、真实训练推进和最终告警投递分别留证，不能互相代替。
 
 CLI 一次性采集、Python `observe_once`、底层日志采集与 daemon 共用 `observer.lock`；daemon 在整个循环期间持锁，一次性接口在解析、导出和 monitor 入库全部结束后释放。管理操作另有控制锁，避免同时 start/stop。不要删除锁文件绕过锁，也不要通过另建 state 目录启动第二个写者。同一路 task 的 monitor 输入路径固定，更换观察目录需要明确迁移。

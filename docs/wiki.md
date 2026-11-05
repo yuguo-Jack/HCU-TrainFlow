@@ -11,6 +11,7 @@
 | `projects/<project>/knowledgebase/upstream/docs/<source>/` | 固定提交中的官方文档全文，source-document，不自动成为 HCU 配方 |
 | `projects/<project>/knowledgebase/upstream/prs/<owner--repo>/` | PR 描述、普通/行内评论、独立 review、固定文件入口，source-pr |
 | `evidence/prs/` | 原始 JSON、patch 和分页 coverage，随公共知识提交 |
+| `evidence/pr-file-lists/` | 接口文件清单受限时补充的固定 Git 全路径、状态及对象 ID；原始响应和缺 patch 标记保留 |
 | 项目内 `upstream/source-map/`、全库 `catalog/repositories/` | 全仓路径、blob SHA、gitlink；目录覆盖不等于正文精读 |
 | `catalog/external/`、`catalog/external-knowledge.json` | HCU-Knowledge 联查与工具用法维护关联，不保存另一份 HCU 仓库知识 |
 | `catalog/*-ledgers/` | 文档/PR 更新游标，新环境可继续增量维护 |
@@ -68,6 +69,8 @@ hcu-trainflow wiki-code OWNER/REPO FULL_40_CHARACTER_SHA path/to/source.py
 
 `wiki-pr` 采集描述、普通评论、行内评论、review 顶层状态/正文、文件及 patch，未完成分页、权限或限流保留 partial，不能解释为没有答案。大 diff、binary 和缺 patch 需补源码。head 可能来自 fork；重命名/删除文件读 base old_path。继续检查完整函数、调用者、底层库对应依赖 SHA 与测试，必要时在独立参考 checkout 读固定源码；开发和提 PR 使用独立最新工作 checkout。
 
+[GitHub 的 PR 文件接口](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files)最多返回 3,000 个文件，分页结束仍可能少于 PR 声明的改动数。遇到此限制时，按原 PR 的完整仓库/提交身份，核对实际 merge-base、完整 Git 树和重命名差异；无父提交的根提交应按已证明的空树比较，不能臆造共同祖先。经过逐路径、状态和对象 ID 验证的完整清单可另存到 `evidence/pr-file-lists/`，由来源页的 `file_list_supplement` 及补证入口绑定内容哈希。原始 JSON、接口清单及 `diff_complete=false` 保持原样；补齐路径不等于补齐 patch、精读全部文件或完成运行验证。
+
 普通 search/read/code 只写私有缓存。正式保留公开 PR 使用显式选项：
 
 ```bash
@@ -102,7 +105,7 @@ hcu-trainflow wiki-update PROJECT nvidia-megatron-lm --max-documents 40 --max-pr
 
 decision 为 knowledge-added（必须链接知识页）、not-relevant 或 deferred，均需理由和当前 commit。
 
-`document_globs` 在全树上发现新/改文档，`wiki-sync-docs` 按 blob SHA 增量处理，缺失输出可恢复。未匹配新文件仍可通过树发现并扩大模式。删除文档保留历史页、source_state 和 ledger 标记（区分已从树删除与不在当前扫描模式）；相对链接从原始固定文件解析。扫描文本不等于解读所有图表/Notebook。
+`document_globs` 在全树上发现新/改文档，`wiki-sync-docs` 对普通文件按 blob SHA 增量处理，缺失输出可恢复。Git 符号链接（mode `120000`）的链接 blob 不变时，目标正文仍可能改变；跨固定提交会重新读取目标内容。同一固定提交的成功结果可复用，失败则保留此前原文及 pending，并标记 `pending-newer-content`。ledger 的 `blob` 记录链接对象，`sha256` 与来源页的 `raw_sha256` 记录实际读取的目标正文，不能把两者当作同一对象。未匹配新文件仍可通过树发现并扩大模式。删除文档保留历史页、source_state 和 ledger 标记（区分已从树删除与不在当前扫描模式）；相对链接从原始固定文件解析。扫描文本不等于解读所有图表/Notebook。
 
 收录范围先按[知识筛选规则](knowledge-architecture.md#自动更新时的内容筛选)审查。`document_scope` 说明训练用途；`document_exclusions` 是“上游路径 glob → 排除理由”的映射，优先于 `document_globs`。例如 `{"docs/_tutorials/azure.md":"云账号与平台部署教程，当前无训练优化专题引用"}`。同步输出及文档 ledger 的 `excluded_paths` 明示命中路径和理由，既不下载也不恢复这些生成页；完整源码树与在线按问题查代码功能保留。
 

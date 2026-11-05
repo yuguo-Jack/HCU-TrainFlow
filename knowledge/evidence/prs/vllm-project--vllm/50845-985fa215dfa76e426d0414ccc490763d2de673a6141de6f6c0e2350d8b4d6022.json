@@ -1,0 +1,953 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "d880418755517cfef0a98302f0078495457e7d7c2b479e5efa36ff7070009f7d",
+      "isPrivate": false,
+      "numbers": [
+        50887,
+        50884,
+        50878,
+        50872,
+        50871,
+        50848,
+        50845,
+        50844
+      ],
+      "observed_at": "2026-11-04T22:40:49.306595+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4887,
+        "resetAt": "2026-11-04T22:47:37Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "e2d2680417432b80986a36d456e3d79173ee1a45",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Summary\n\nFour MoE kernels index `expert_map` with an expert id taken from `topk_ids`,\nguarding the gather with a sign check only (`expert_id >= 0` / `expert_id < 0`).\n`topk_ids` is data, not a loop bound: the routers allocate it with\n`torch.empty` and do not always overwrite every slot, so a stale slot can hold\nan arbitrary positive value. When that happens the gather reads far past the\nend of `expert_map` and the context dies with a Warp MMU fault on **every** rank.\n\n`get_local_expert_id()` in `csrc/libtorch_stable/moe/moe_align_sum_kernels.cu`\nalready applies exactly the missing bound:\n\n```cpp\nint expert_id = topk_ids[idx];\nif (expert_id >= num_experts || expert_id < 0) {\n  return -1;\n}\n```\n\nThis PR bounds the other four consumers the same way. **Updated after review:**\nan id at or past `expert_map`'s length is a producer bug, so instead of\nskipping the slot the kernels stop with a clear message (CUDA `printf` +\ntrap; the Triton kernels use a predicated PTX trap, since `tl.device_assert`\nis compiled out outside Triton debug mode, and fall back to\n`tl.device_assert` on other platforms). `-1` remains the not-routed sentinel,\nand the loads stay bounded, so the map is never read out of bounds even\nbefore the trap fires.\n\n## Relationship to the root cause\n\nThese gathers were the *victims*, not the cause. The garbage expert ids\noriginated upstream: the sampler could emit a token id equal to `vocab_size`,\nand DeepSeek-V4's hash-MoE router turned that into a garbage expert id by\ngathering past its lookup table. Both are fixed separately in #50843 (sampler) and #50844 (DSv4 hash router). This PR is the\ndefence-in-depth layer: a producer bug anywhere upstream now fails loudly at\nthe first consumer with the offending id, instead of an anonymous Warp MMU\nfault (or silently routing on whatever memory follows the map), and it fixes\none gather that was unguarded outright.\n\n## Evidence\n\nHit in production on DeepSeek-V4-Flash (TP2 + `--enable-expert-parallel`,\nso `expert_map` is non-null), reproducible under bursty concurrency in\n90 s – 5 min. CUDA core dump, both TP ranks:\n\n```\nCUDA Exception: Warp MMU Fault\nerrorpc  _swiglu_limit_pad_aware_kernel\n         vllm/model_executor/layers/fused_moe/utils.py:545\n```\n\nSASS at `errorpc` is the `expert_map` gather, and the index register holds the\nbad id:\n\n```\nIMAD.SHL.U32 R6,R4,0x4,RZ     ; expert_id * 4\nIADD.64      R6,R6,R8         ; expert_map_ptr + expert_id*4\n@!P0 BRA ...                  ; skip if !(expert_id >= 0)\n*> LDG.E R8,desc[UR10][R6.64] ; <-- FAULT\n\nR4 = 0x66E65F78 = 1726373752\nR4 = 0x3F988A43 = 1066961475   (as float32: 1.1917)\n```\n\nThe model has 256 experts. Both observed ids are float bit patterns — the\nallocation's previous tenant — which is what an unwritten `torch.empty` slot\nlooks like.\n\nBounding only the Triton kernel moved the fault to `moe_sum_vec_kernel`\n(`moe_sum_pad_aware_skip`, same unguarded pattern), which is why all four\nsites are fixed together.\n\nNote `moe_fused_mul_sum_kernel`'s gather was not merely missing an upper\nbound — it was entirely unmasked, with no sign check either, so it would also\nfault on the ordinary `-1` unrouted sentinel on any model taking that path.\n\n## Changes\n\n- `csrc/libtorch_stable/moe/moe_align_sum_kernels.cu` — `moe_sum_pad_aware_skip()`\n  bounds `expert_id` against `num_experts`, threaded through the vec / dynamic /\n  scalar `moe_sum` kernels from `expert_map->numel()`.\n- `vllm/model_executor/layers/fused_moe/utils.py` — `_swiglu_limit_pad_aware_kernel()`\n  and `_count_expert_num_tokens()` bound the gather.\n- `vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py` —\n  `moe_fused_mul_sum_kernel()` bounds the gather (it was previously entirely\n  unmasked).\n\nNo legitimate id is rejected: valid ids live in `[0, expert_map.numel())` by\nconstruction, which is the new bound.\n\n`gpt_oss_triton_kernels_moe.py` already clamps its gather and is unchanged.\n\n## Test\n\nFour regression tests feed the observed `0x3F988A43` bit pattern or the first\nid past the map through each consumer and check, in a subprocess (a trap\npoisons the CUDA context), that the kernel traps; in-process they check that\n`-1` slots are skipped and in-range results are exact:\n\n- `tests/kernels/moe/test_moe.py::test_moe_sum_pad_aware_traps_on_expert_id_outside_map`\n- `tests/kernels/core/test_activation.py::test_swiglu_limit_pad_aware_traps_on_expert_id_outside_map`\n- `tests/kernels/moe/test_count_expert_num_tokens.py::test_count_expert_num_tokens_traps_on_expert_id_outside_map`\n- `tests/kernels/moe/test_moe_fused_mul_sum.py::test_expert_id_outside_map_traps`\n\nValidated on 2× RTX PRO 6000 (SM120): the affected test files pass (moe_sum 172,\ncount 150, fused_mul_sum 116, activation 523), and DeepSeek-V4-Flash (TP2 + EP)\nand Qwen3.8-Flash-Next-FP8 (TP2 + EP) served 20/10-minute randomized-concurrency\nstress runs (601K/251K tokens) with no trap.\n\n",
+      "changedFiles": 9,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @alexbi29.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-08-25T20:59:58Z",
+            "databaseId": 5416714522,
+            "updatedAt": "2026-08-25T20:59:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-5416714522"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "bnellnm"
+            },
+            "body": "I feel like this should be an assertion rather than ignoring out of bounds ids in the expert_map.  Otherwise, buggy expert_maps might silently be used and we won't be aware of the problem.",
+            "createdAt": "2026-10-20T20:06:53Z",
+            "databaseId": 6300350952,
+            "updatedAt": "2026-10-20T20:06:53Z",
+            "url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6300350952"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "alexbi29"
+            },
+            "body": "Thanks @bnellnm, agreed that a broken `expert_map` shouldn't go unnoticed. Today an out-of-range id is already ignored in the worst way: the gather reads past the map, and the token is routed with whatever happens to be in that memory. We hit this from a stale `torch.empty` slot. The bound stops that read; the question is what to do instead of silently skipping. Two options:\n\n1. Keep the bound, so the kernels never read out of bounds, and add a debug-only device assert (off by default) so a buggy map fails loudly in tests and CI.\n2. Replace the masking with an unconditional device-side assert, so a buggy map kills the engine with a clear error in production too.\n\nI'm happy to do either. If you'd rather have loud failures everywhere, I'll switch to (2). #50844 (DSv4 `tid2eid`) would follow the same choice. Which do you prefer?\n",
+            "createdAt": "2026-10-20T20:55:52Z",
+            "databaseId": 6301290601,
+            "updatedAt": "2026-10-20T20:55:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6301290601"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "bnellnm"
+            },
+            "body": "> Thanks @bnellnm, agreed that a broken `expert_map` shouldn't go unnoticed. Today an out-of-range id is already ignored in the worst way: the gather reads past the map, and the token is routed with whatever happens to be in that memory. We hit this from a stale `torch.empty` slot. The bound stops that read; the question is what to do instead of silently skipping. Two options:\r\n> \r\n> 1. Keep the bound, so the kernels never read out of bounds, and add a debug-only device assert (off by default) so a buggy map fails loudly in tests and CI.\r\n> 2. Replace the masking with an unconditional device-side assert, so a buggy map kills the engine with a clear error in production too.\r\n> \r\n> I'm happy to do either. If you'd rather have loud failures everywhere, I'll switch to (2). #50844 (DSv4 `tid2eid`) would follow the same choice. Which do you prefer?\r\n\r\nI think option #2 (device-side assert) would be best, since CI might not cover all the possibilities.  Thanks for looking into this bug.",
+            "createdAt": "2026-10-20T21:56:21Z",
+            "databaseId": 6302578011,
+            "updatedAt": "2026-10-20T21:56:54Z",
+            "url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6302578011"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "alexbi29"
+            },
+            "body": "@bnellnm done in `1f762e6d6e`, going with option 2:\n\n- An id at or past `expert_map`'s length now stops the kernel with the offending id instead of skipping the slot. `-1` is still the not-routed sentinel.\n- CUDA (`moe_sum`): `printf` + `__trap()`, the same pattern as `hisparse_kernels.cu`.\n- Triton (count / swiglu-limit / fused-mul-sum): `tl.device_assert` is compiled out unless Triton runs in debug mode, and enabling `debug=True` per kernel also turns on integer-overflow sanitizing for every add/mul. So this uses a small predicated PTX `trap` helper on CUDA, with a `tl.device_assert` fallback on other platforms.\n- The loads stay bounded, so nothing reads past the map even before the trap fires.\n- Side fix: the pad-aware `moe_sum` without an `expert_map` no longer applies a bound of 0, which would have skipped every slot. No in-tree caller hits that combination today.\n\nThe out-of-range tests now check the trap in a subprocess, since a trapped kernel poisons the CUDA context. #50844 got the same treatment (`94ac10393a`). Validation on SM120 is in the description.\n",
+            "createdAt": "2026-10-23T02:16:35Z",
+            "databaseId": 6355784923,
+            "updatedAt": "2026-10-23T02:16:35Z",
+            "url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6355784923"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXrVlNs=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "headRefOid": "1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "headRepository": {
+        "nameWithOwner": "alexbi29/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 50845,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 4842765147,
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-03T09:43:49Z",
+            "url": "https://github.com/vllm-project/vllm/pull/50845#pullrequestreview-4842765147"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wOC0wM1QwOTo0Mzo0OVq0MjAyNi0wOC0wM1QwOTo0Mzo0OVrPAAAAASCmu1s=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "OPEN",
+      "title": "[Bugfix][MoE] Bound expert_map gathers on data-derived expert ids",
+      "updatedAt": "2026-10-23T02:16:35Z",
+      "url": "https://github.com/vllm-project/vllm/pull/50845"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/50845/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/50845/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/50845"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/50845"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/50845/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/50845"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/1f762e6d6e5669dbd6cd582b99bf50d340a4a485"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 262,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 24409,
+        "forks_count": 24409,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9867,
+        "open_issues_count": 9867,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T22:02:06Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 344310,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 96323,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-04T22:07:51Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 96323,
+        "watchers_count": 96323,
+        "web_commit_signoff_required": true
+      },
+      "sha": "e2d2680417432b80986a36d456e3d79173ee1a45",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Summary\n\nFour MoE kernels index `expert_map` with an expert id taken from `topk_ids`,\nguarding the gather with a sign check only (`expert_id >= 0` / `expert_id < 0`).\n`topk_ids` is data, not a loop bound: the routers allocate it with\n`torch.empty` and do not always overwrite every slot, so a stale slot can hold\nan arbitrary positive value. When that happens the gather reads far past the\nend of `expert_map` and the context dies with a Warp MMU fault on **every** rank.\n\n`get_local_expert_id()` in `csrc/libtorch_stable/moe/moe_align_sum_kernels.cu`\nalready applies exactly the missing bound:\n\n```cpp\nint expert_id = topk_ids[idx];\nif (expert_id >= num_experts || expert_id < 0) {\n  return -1;\n}\n```\n\nThis PR bounds the other four consumers the same way. **Updated after review:**\nan id at or past `expert_map`'s length is a producer bug, so instead of\nskipping the slot the kernels stop with a clear message (CUDA `printf` +\ntrap; the Triton kernels use a predicated PTX trap, since `tl.device_assert`\nis compiled out outside Triton debug mode, and fall back to\n`tl.device_assert` on other platforms). `-1` remains the not-routed sentinel,\nand the loads stay bounded, so the map is never read out of bounds even\nbefore the trap fires.\n\n## Relationship to the root cause\n\nThese gathers were the *victims*, not the cause. The garbage expert ids\noriginated upstream: the sampler could emit a token id equal to `vocab_size`,\nand DeepSeek-V4's hash-MoE router turned that into a garbage expert id by\ngathering past its lookup table. Both are fixed separately in #50843 (sampler) and #50844 (DSv4 hash router). This PR is the\ndefence-in-depth layer: a producer bug anywhere upstream now fails loudly at\nthe first consumer with the offending id, instead of an anonymous Warp MMU\nfault (or silently routing on whatever memory follows the map), and it fixes\none gather that was unguarded outright.\n\n## Evidence\n\nHit in production on DeepSeek-V4-Flash (TP2 + `--enable-expert-parallel`,\nso `expert_map` is non-null), reproducible under bursty concurrency in\n90 s – 5 min. CUDA core dump, both TP ranks:\n\n```\nCUDA Exception: Warp MMU Fault\nerrorpc  _swiglu_limit_pad_aware_kernel\n         vllm/model_executor/layers/fused_moe/utils.py:545\n```\n\nSASS at `errorpc` is the `expert_map` gather, and the index register holds the\nbad id:\n\n```\nIMAD.SHL.U32 R6,R4,0x4,RZ     ; expert_id * 4\nIADD.64      R6,R6,R8         ; expert_map_ptr + expert_id*4\n@!P0 BRA ...                  ; skip if !(expert_id >= 0)\n*> LDG.E R8,desc[UR10][R6.64] ; <-- FAULT\n\nR4 = 0x66E65F78 = 1726373752\nR4 = 0x3F988A43 = 1066961475   (as float32: 1.1917)\n```\n\nThe model has 256 experts. Both observed ids are float bit patterns — the\nallocation's previous tenant — which is what an unwritten `torch.empty` slot\nlooks like.\n\nBounding only the Triton kernel moved the fault to `moe_sum_vec_kernel`\n(`moe_sum_pad_aware_skip`, same unguarded pattern), which is why all four\nsites are fixed together.\n\nNote `moe_fused_mul_sum_kernel`'s gather was not merely missing an upper\nbound — it was entirely unmasked, with no sign check either, so it would also\nfault on the ordinary `-1` unrouted sentinel on any model taking that path.\n\n## Changes\n\n- `csrc/libtorch_stable/moe/moe_align_sum_kernels.cu` — `moe_sum_pad_aware_skip()`\n  bounds `expert_id` against `num_experts`, threaded through the vec / dynamic /\n  scalar `moe_sum` kernels from `expert_map->numel()`.\n- `vllm/model_executor/layers/fused_moe/utils.py` — `_swiglu_limit_pad_aware_kernel()`\n  and `_count_expert_num_tokens()` bound the gather.\n- `vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py` —\n  `moe_fused_mul_sum_kernel()` bounds the gather (it was previously entirely\n  unmasked).\n\nNo legitimate id is rejected: valid ids live in `[0, expert_map.numel())` by\nconstruction, which is the new bound.\n\n`gpt_oss_triton_kernels_moe.py` already clamps its gather and is unchanged.\n\n## Test\n\nFour regression tests feed the observed `0x3F988A43` bit pattern or the first\nid past the map through each consumer and check, in a subprocess (a trap\npoisons the CUDA context), that the kernel traps; in-process they check that\n`-1` slots are skipped and in-range results are exact:\n\n- `tests/kernels/moe/test_moe.py::test_moe_sum_pad_aware_traps_on_expert_id_outside_map`\n- `tests/kernels/core/test_activation.py::test_swiglu_limit_pad_aware_traps_on_expert_id_outside_map`\n- `tests/kernels/moe/test_count_expert_num_tokens.py::test_count_expert_num_tokens_traps_on_expert_id_outside_map`\n- `tests/kernels/moe/test_moe_fused_mul_sum.py::test_expert_id_outside_map_traps`\n\nValidated on 2× RTX PRO 6000 (SM120): the affected test files pass (moe_sum 172,\ncount 150, fused_mul_sum 116, activation 523), and DeepSeek-V4-Flash (TP2 + EP)\nand Qwen3.8-Flash-Next-FP8 (TP2 + EP) served 20/10-minute randomized-concurrency\nstress runs (601K/251K tokens) with no trap.\n\n",
+    "changed_files": 9,
+    "closed_at": null,
+    "comments": 5,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/50845/comments",
+    "commits": 2,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/50845/commits",
+    "created_at": "2026-08-03T09:43:46Z",
+    "deletions": 26,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/50845.diff",
+    "draft": false,
+    "head": {
+      "label": "alexbi29:fix/bound-expert-map-gathers",
+      "ref": "fix/bound-expert-map-gathers",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/alexbi29/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/alexbi29/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/alexbi29/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/alexbi29/vllm/branches{/branch}",
+        "clone_url": "https://github.com/alexbi29/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/alexbi29/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/alexbi29/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/alexbi29/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/alexbi29/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/alexbi29/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/alexbi29/vllm/contributors",
+        "created_at": "2026-02-01T20:21:53Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/alexbi29/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/alexbi29/vllm/downloads",
+        "events_url": "https://api.github.com/repos/alexbi29/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/alexbi29/vllm/forks",
+        "full_name": "alexbi29/vllm",
+        "git_commits_url": "https://api.github.com/repos/alexbi29/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/alexbi29/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/alexbi29/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/alexbi29/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/alexbi29/vllm/hooks",
+        "html_url": "https://github.com/alexbi29/vllm",
+        "id": 1147486120,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/alexbi29/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/alexbi29/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/alexbi29/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/alexbi29/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/alexbi29/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/alexbi29/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/alexbi29/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/alexbi29/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDORGU_qA",
+        "notifications_url": "https://api.github.com/repos/alexbi29/vllm/notifications{?since,all,participating}",
+        "open_issues": 10,
+        "open_issues_count": 10,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/32223381?v=4",
+          "events_url": "https://api.github.com/users/alexbi29/events{/privacy}",
+          "followers_url": "https://api.github.com/users/alexbi29/followers",
+          "following_url": "https://api.github.com/users/alexbi29/following{/other_user}",
+          "gists_url": "https://api.github.com/users/alexbi29/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/alexbi29",
+          "id": 32223381,
+          "login": "alexbi29",
+          "node_id": "MDQ6VXNlcjMyMjIzMzgx",
+          "organizations_url": "https://api.github.com/users/alexbi29/orgs",
+          "received_events_url": "https://api.github.com/users/alexbi29/received_events",
+          "repos_url": "https://api.github.com/users/alexbi29/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/alexbi29/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/alexbi29/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/alexbi29",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/alexbi29/vllm/pulls{/number}",
+        "pushed_at": "2026-11-03T03:22:54Z",
+        "releases_url": "https://api.github.com/repos/alexbi29/vllm/releases{/id}",
+        "size": 327382,
+        "ssh_url": "git@github.com:alexbi29/vllm.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/alexbi29/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/alexbi29/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/alexbi29/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/alexbi29/vllm/subscription",
+        "svn_url": "https://github.com/alexbi29/vllm",
+        "tags_url": "https://api.github.com/repos/alexbi29/vllm/tags",
+        "teams_url": "https://api.github.com/repos/alexbi29/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/alexbi29/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-02T05:05:57Z",
+        "url": "https://api.github.com/repos/alexbi29/vllm",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": true
+      },
+      "sha": "1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/32223381?v=4",
+        "events_url": "https://api.github.com/users/alexbi29/events{/privacy}",
+        "followers_url": "https://api.github.com/users/alexbi29/followers",
+        "following_url": "https://api.github.com/users/alexbi29/following{/other_user}",
+        "gists_url": "https://api.github.com/users/alexbi29/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/alexbi29",
+        "id": 32223381,
+        "login": "alexbi29",
+        "node_id": "MDQ6VXNlcjMyMjIzMzgx",
+        "organizations_url": "https://api.github.com/users/alexbi29/orgs",
+        "received_events_url": "https://api.github.com/users/alexbi29/received_events",
+        "repos_url": "https://api.github.com/users/alexbi29/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/alexbi29/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/alexbi29/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/alexbi29",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/50845",
+    "id": 4193150377,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/50845",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d73a4a",
+        "default": true,
+        "description": "Something isn't working",
+        "id": 5135047172,
+        "name": "bug",
+        "node_id": "LA_kwDOI7xefs8AAAABMhKaBA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/bug"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "76B900",
+        "default": false,
+        "description": "",
+        "id": 9543357705,
+        "name": "nvidia",
+        "node_id": "LA_kwDOI7xefs8AAAACONQVCQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/nvidia"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "d7fc2e80e367fb5ab435313c1f5cae893c7c7fbc",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs757mWp",
+    "number": 50845,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/50845.patch",
+    "rebaseable": false,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1236979?v=4",
+        "events_url": "https://api.github.com/users/tlrmchlsmth/events{/privacy}",
+        "followers_url": "https://api.github.com/users/tlrmchlsmth/followers",
+        "following_url": "https://api.github.com/users/tlrmchlsmth/following{/other_user}",
+        "gists_url": "https://api.github.com/users/tlrmchlsmth/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/tlrmchlsmth",
+        "id": 1236979,
+        "login": "tlrmchlsmth",
+        "node_id": "MDQ6VXNlcjEyMzY5Nzk=",
+        "organizations_url": "https://api.github.com/users/tlrmchlsmth/orgs",
+        "received_events_url": "https://api.github.com/users/tlrmchlsmth/received_events",
+        "repos_url": "https://api.github.com/users/tlrmchlsmth/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/tlrmchlsmth/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/tlrmchlsmth/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/tlrmchlsmth",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/3195154?v=4",
+        "events_url": "https://api.github.com/users/mgoin/events{/privacy}",
+        "followers_url": "https://api.github.com/users/mgoin/followers",
+        "following_url": "https://api.github.com/users/mgoin/following{/other_user}",
+        "gists_url": "https://api.github.com/users/mgoin/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/mgoin",
+        "id": 3195154,
+        "login": "mgoin",
+        "node_id": "MDQ6VXNlcjMxOTUxNTQ=",
+        "organizations_url": "https://api.github.com/users/mgoin/orgs",
+        "received_events_url": "https://api.github.com/users/mgoin/received_events",
+        "repos_url": "https://api.github.com/users/mgoin/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/mgoin/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/mgoin/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/mgoin",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/33809857?v=4",
+        "events_url": "https://api.github.com/users/pavanimajety/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pavanimajety/followers",
+        "following_url": "https://api.github.com/users/pavanimajety/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pavanimajety/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pavanimajety",
+        "id": 33809857,
+        "login": "pavanimajety",
+        "node_id": "MDQ6VXNlcjMzODA5ODU3",
+        "organizations_url": "https://api.github.com/users/pavanimajety/orgs",
+        "received_events_url": "https://api.github.com/users/pavanimajety/received_events",
+        "repos_url": "https://api.github.com/users/pavanimajety/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pavanimajety/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pavanimajety/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/pavanimajety",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42426329?v=4",
+        "events_url": "https://api.github.com/users/zyongye/events{/privacy}",
+        "followers_url": "https://api.github.com/users/zyongye/followers",
+        "following_url": "https://api.github.com/users/zyongye/following{/other_user}",
+        "gists_url": "https://api.github.com/users/zyongye/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/zyongye",
+        "id": 42426329,
+        "login": "zyongye",
+        "node_id": "MDQ6VXNlcjQyNDI2MzI5",
+        "organizations_url": "https://api.github.com/users/zyongye/orgs",
+        "received_events_url": "https://api.github.com/users/zyongye/received_events",
+        "repos_url": "https://api.github.com/users/zyongye/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/zyongye/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/zyongye/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/zyongye",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42451412?v=4",
+        "events_url": "https://api.github.com/users/AndreasKaratzas/events{/privacy}",
+        "followers_url": "https://api.github.com/users/AndreasKaratzas/followers",
+        "following_url": "https://api.github.com/users/AndreasKaratzas/following{/other_user}",
+        "gists_url": "https://api.github.com/users/AndreasKaratzas/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/AndreasKaratzas",
+        "id": 42451412,
+        "login": "AndreasKaratzas",
+        "node_id": "MDQ6VXNlcjQyNDUxNDEy",
+        "organizations_url": "https://api.github.com/users/AndreasKaratzas/orgs",
+        "received_events_url": "https://api.github.com/users/AndreasKaratzas/received_events",
+        "repos_url": "https://api.github.com/users/AndreasKaratzas/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/AndreasKaratzas/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/AndreasKaratzas/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/AndreasKaratzas",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/44945378?v=4",
+        "events_url": "https://api.github.com/users/yewentao256/events{/privacy}",
+        "followers_url": "https://api.github.com/users/yewentao256/followers",
+        "following_url": "https://api.github.com/users/yewentao256/following{/other_user}",
+        "gists_url": "https://api.github.com/users/yewentao256/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/yewentao256",
+        "id": 44945378,
+        "login": "yewentao256",
+        "node_id": "MDQ6VXNlcjQ0OTQ1Mzc4",
+        "organizations_url": "https://api.github.com/users/yewentao256/orgs",
+        "received_events_url": "https://api.github.com/users/yewentao256/received_events",
+        "repos_url": "https://api.github.com/users/yewentao256/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/yewentao256/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/yewentao256/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/yewentao256",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/46394894?v=4",
+        "events_url": "https://api.github.com/users/WoosukKwon/events{/privacy}",
+        "followers_url": "https://api.github.com/users/WoosukKwon/followers",
+        "following_url": "https://api.github.com/users/WoosukKwon/following{/other_user}",
+        "gists_url": "https://api.github.com/users/WoosukKwon/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/WoosukKwon",
+        "id": 46394894,
+        "login": "WoosukKwon",
+        "node_id": "MDQ6VXNlcjQ2Mzk0ODk0",
+        "organizations_url": "https://api.github.com/users/WoosukKwon/orgs",
+        "received_events_url": "https://api.github.com/users/WoosukKwon/received_events",
+        "repos_url": "https://api.github.com/users/WoosukKwon/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/WoosukKwon/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/WoosukKwon/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/WoosukKwon",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/49004751?v=4",
+        "events_url": "https://api.github.com/users/bnellnm/events{/privacy}",
+        "followers_url": "https://api.github.com/users/bnellnm/followers",
+        "following_url": "https://api.github.com/users/bnellnm/following{/other_user}",
+        "gists_url": "https://api.github.com/users/bnellnm/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/bnellnm",
+        "id": 49004751,
+        "login": "bnellnm",
+        "node_id": "MDQ6VXNlcjQ5MDA0NzUx",
+        "organizations_url": "https://api.github.com/users/bnellnm/orgs",
+        "received_events_url": "https://api.github.com/users/bnellnm/received_events",
+        "repos_url": "https://api.github.com/users/bnellnm/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/bnellnm/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/bnellnm/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/bnellnm",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/51183510?v=4",
+        "events_url": "https://api.github.com/users/wzhao18/events{/privacy}",
+        "followers_url": "https://api.github.com/users/wzhao18/followers",
+        "following_url": "https://api.github.com/users/wzhao18/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wzhao18/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/wzhao18",
+        "id": 51183510,
+        "login": "wzhao18",
+        "node_id": "MDQ6VXNlcjUxMTgzNTEw",
+        "organizations_url": "https://api.github.com/users/wzhao18/orgs",
+        "received_events_url": "https://api.github.com/users/wzhao18/received_events",
+        "repos_url": "https://api.github.com/users/wzhao18/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/wzhao18/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wzhao18/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/wzhao18",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/50845/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+    "title": "[Bugfix][MoE] Bound expert_map gathers on data-derived expert ids",
+    "updated_at": "2026-10-23T02:16:35Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/50845",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/32223381?v=4",
+      "events_url": "https://api.github.com/users/alexbi29/events{/privacy}",
+      "followers_url": "https://api.github.com/users/alexbi29/followers",
+      "following_url": "https://api.github.com/users/alexbi29/following{/other_user}",
+      "gists_url": "https://api.github.com/users/alexbi29/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/alexbi29",
+      "id": 32223381,
+      "login": "alexbi29",
+      "node_id": "MDQ6VXNlcjMyMjIzMzgx",
+      "organizations_url": "https://api.github.com/users/alexbi29/orgs",
+      "received_events_url": "https://api.github.com/users/alexbi29/received_events",
+      "repos_url": "https://api.github.com/users/alexbi29/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/alexbi29/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/alexbi29/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/alexbi29",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/csrc%2Fcore%2Fcuda_compat.h",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/csrc%2Fcore%2Fcuda_compat.h?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 0,
+      "filename": "csrc/core/cuda_compat.h",
+      "patch": "@@ -43,6 +43,13 @@ struct Utils {\n   #define VLLM_LDG(arg) *(arg)\n #endif\n \n+// Abort the kernel; the context is unusable afterwards.\n+#ifndef USE_ROCM\n+  #define VLLM_DEVICE_TRAP() __trap()\n+#else\n+  #define VLLM_DEVICE_TRAP() abort()\n+#endif\n+\n #ifndef USE_ROCM\n   #define VLLM_SHFL_XOR_SYNC(var, lane_mask) \\\n     __shfl_xor_sync(uint32_t(-1), var, lane_mask)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/csrc%2Fcore%2Fcuda_compat.h",
+      "sha": "772774e00666028a370f5add53185c562796da28",
+      "status": "modified"
+    },
+    {
+      "additions": 38,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/csrc%2Fmoe%2Fmoe_align_sum_kernels.cu",
+      "changes": 57,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/csrc%2Fmoe%2Fmoe_align_sum_kernels.cu?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 19,
+      "filename": "csrc/moe/moe_align_sum_kernels.cu",
+      "patch": "@@ -409,11 +409,20 @@ constexpr int MOE_SUM_VEC = 16 / sizeof(scalar_t);\n template <typename idx_t>\n __device__ __forceinline__ bool moe_sum_pad_aware_skip(\n     const idx_t* __restrict__ topk_ids, const int32_t* __restrict__ expert_map,\n-    int64_t idx) {\n+    int64_t idx, int32_t num_experts) {\n   int64_t expert_id = static_cast<int64_t>(topk_ids[idx]);\n+  // -1 marks a slot that is not routed.\n   if (expert_id < 0) return true;\n-  if (expert_map != nullptr && expert_map[expert_id] < 0) return true;\n-  return false;\n+  if (expert_map == nullptr) return false;\n+  // Any other id must index expert_map. A larger one is a producer bug (it\n+  // was a garbage id from an out-of-bounds router gather); gathering with it\n+  // reads past the map, so stop here with a clear message instead.\n+  if (expert_id >= static_cast<int64_t>(num_experts)) {\n+    printf(\"moe_sum: expert id %lld is outside expert_map [0, %d)\\n\",\n+           static_cast<long long>(expert_id), num_experts);\n+    VLLM_DEVICE_TRAP();\n+  }\n+  return expert_map[expert_id] < 0;\n }\n \n template <typename scalar_t, typename idx_t, int TOPK, bool PAD_AWARE>\n@@ -423,7 +432,7 @@ __global__ void moe_sum_vec_kernel(\n     const int64_t num_tokens, const int d, const int64_t stride_token,\n     const int64_t stride_topk, const idx_t* __restrict__ topk_ids,\n     const int32_t* __restrict__ expert_map, const int64_t stride_tk_token,\n-    const int64_t stride_tk_k) {\n+    const int64_t stride_tk_k, const int32_t num_experts) {\n   using vec_t = vllm::vec_n_t<scalar_t, MOE_SUM_VEC<scalar_t>>;  // 16-byte pack\n   constexpr int VEC = MOE_SUM_VEC<scalar_t>;\n   const int64_t n_vec = d / VEC;\n@@ -445,7 +454,8 @@ __global__ void moe_sum_vec_kernel(\n #pragma unroll\n     for (int k = 0; k < TOPK; ++k) {\n       if constexpr (PAD_AWARE) {\n-        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k)) {\n+        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k,\n+                                   num_experts)) {\n           continue;\n         }\n       }\n@@ -470,7 +480,8 @@ __global__ void moe_sum_vec_dynamic_kernel(\n     const int64_t num_tokens, const int d, const int topk,\n     const int64_t stride_token, const int64_t stride_topk,\n     const idx_t* __restrict__ topk_ids, const int32_t* __restrict__ expert_map,\n-    const int64_t stride_tk_token, const int64_t stride_tk_k) {\n+    const int64_t stride_tk_token, const int64_t stride_tk_k,\n+    const int32_t num_experts) {\n   using vec_t = vllm::vec_n_t<scalar_t, MOE_SUM_VEC<scalar_t>>;\n   constexpr int VEC = MOE_SUM_VEC<scalar_t>;\n   const int64_t n_vec = d / VEC;\n@@ -491,7 +502,8 @@ __global__ void moe_sum_vec_dynamic_kernel(\n \n     for (int k = 0; k < topk; ++k) {\n       if constexpr (PAD_AWARE) {\n-        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k)) {\n+        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k,\n+                                   num_experts)) {\n           continue;\n         }\n       }\n@@ -516,7 +528,8 @@ __global__ void moe_sum_scalar_kernel(\n     const int d, const int topk, const int64_t stride_token,\n     const int64_t stride_topk, const int64_t stride_hidden,\n     const idx_t* __restrict__ topk_ids, const int32_t* __restrict__ expert_map,\n-    const int64_t stride_tk_token, const int64_t stride_tk_k) {\n+    const int64_t stride_tk_token, const int64_t stride_tk_k,\n+    const int32_t num_experts) {\n   const int64_t token_idx = blockIdx.x;\n   const scalar_t* in_tok = input + token_idx * stride_token;\n   const idx_t* tk_tok = nullptr;\n@@ -527,7 +540,8 @@ __global__ void moe_sum_scalar_kernel(\n     float x = 0.f;\n     for (int k = 0; k < topk; ++k) {\n       if constexpr (PAD_AWARE) {\n-        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k)) {\n+        if (moe_sum_pad_aware_skip(tk_tok, expert_map, k * stride_tk_k,\n+                                   num_experts)) {\n           continue;\n         }\n       }\n@@ -857,19 +871,22 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]\n     const int64_t stride_tk_k = tk.stride(1);\n \n     const int32_t* expert_map_ptr = nullptr;\n+    int32_t num_experts = 0;\n     if (expert_map.has_value()) {\n       STD_TORCH_CHECK(\n           expert_map->scalar_type() == torch::headeronly::ScalarType::Int,\n           \"moe_sum: expert_map must be int32\");\n       expert_map_ptr =\n           reinterpret_cast<const int32_t*>(expert_map->const_data_ptr());\n+      num_experts = static_cast<int32_t>(expert_map->numel());\n     }\n \n #define LAUNCH_MOE_SUM_PAD_AWARE_VEC(TOPK)                                     \\\n   vllm::moe::moe_sum_vec_kernel<scalar_t, idx_t, TOPK, true>                   \\\n       <<<grid, dim3(block), 0, stream>>>(                                      \\\n           out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk, \\\n-          topk_ids_ptr, expert_map_ptr, stride_tk_token, stride_tk_k)\n+          topk_ids_ptr, expert_map_ptr, stride_tk_token, stride_tk_k,          \\\n+          num_experts)\n \n     VLLM_STABLE_DISPATCH_FLOATING_TYPES(\n         input.scalar_type(), \"moe_sum_pad_aware\", [&] {\n@@ -921,7 +938,8 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]\n                           <<<grid, dim3(block), 0, stream>>>(\n                               out_ptr, in_ptr, num_tokens, hidden_size, topk,\n                               stride_token, stride_topk, topk_ids_ptr,\n-                              expert_map_ptr, stride_tk_token, stride_tk_k);\n+                              expert_map_ptr, stride_tk_token, stride_tk_k,\n+                              num_experts);\n                       break;\n                   }\n                 } else {\n@@ -931,19 +949,20 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]\n                       <<<grid, block, 0, stream>>>(\n                           out_ptr, in_ptr, hidden_size, topk, stride_token,\n                           stride_topk, stride_hidden, topk_ids_ptr,\n-                          expert_map_ptr, stride_tk_token, stride_tk_k);\n+                          expert_map_ptr, stride_tk_token, stride_tk_k,\n+                          num_experts);\n                 }\n               });\n         });\n #undef LAUNCH_MOE_SUM_PAD_AWARE_VEC\n     return;\n   }\n \n-#define LAUNCH_MOE_SUM_VEC(TOPK)                                      \\\n-  vllm::moe::moe_sum_vec_kernel<scalar_t, int32_t, TOPK, false>       \\\n-      <<<grid, dim3(block), 0, stream>>>(out_ptr, in_ptr, num_tokens, \\\n-                                         hidden_size, stride_token,   \\\n-                                         stride_topk, nullptr, nullptr, 0, 0)\n+#define LAUNCH_MOE_SUM_VEC(TOPK)                                               \\\n+  vllm::moe::moe_sum_vec_kernel<scalar_t, int32_t, TOPK, false>                \\\n+      <<<grid, dim3(block), 0, stream>>>(                                      \\\n+          out_ptr, in_ptr, num_tokens, hidden_size, stride_token, stride_topk, \\\n+          nullptr, nullptr, 0, 0, 0)\n \n   VLLM_STABLE_DISPATCH_FLOATING_TYPES(input.scalar_type(), \"moe_sum\", [&] {\n     constexpr int VEC = vllm::moe::MOE_SUM_VEC<scalar_t>;\n@@ -986,7 +1005,7 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]\n           vllm::moe::moe_sum_vec_dynamic_kernel<scalar_t, int32_t, false>\n               <<<grid, dim3(block), 0, stream>>>(\n                   out_ptr, in_ptr, num_tokens, hidden_size, topk, stride_token,\n-                  stride_topk, nullptr, nullptr, 0, 0);\n+                  stride_topk, nullptr, nullptr, 0, 0, 0);\n           break;\n       }\n     } else {\n@@ -995,7 +1014,7 @@ void moe_sum(torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]\n       vllm::moe::moe_sum_scalar_kernel<scalar_t, int32_t, false>\n           <<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size, topk,\n                                        stride_token, stride_topk, stride_hidden,\n-                                       nullptr, nullptr, 0, 0);\n+                                       nullptr, nullptr, 0, 0, 0);\n     }\n   });\n #undef LAUNCH_MOE_SUM_VEC",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/csrc%2Fmoe%2Fmoe_align_sum_kernels.cu",
+      "sha": "af4b7136a54b46f30798db1aa97df5a1f0ea62b5",
+      "status": "modified"
+    },
+    {
+      "additions": 27,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fcore%2Ftest_activation.py",
+      "changes": 28,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fcore%2Ftest_activation.py?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 1,
+      "filename": "tests/kernels/core/test_activation.py",
+      "patch": "@@ -8,7 +8,7 @@\n import torch\n \n from tests.kernels.allclose_default import get_default_atol, get_default_rtol\n-from tests.kernels.utils import opcheck\n+from tests.kernels.utils import assert_kernel_traps, opcheck\n from vllm.model_executor.layers.activation import (\n     FastGELU,\n     FatreluAndMul,\n@@ -392,6 +392,32 @@ def test_silu_and_mul_with_clamp(\n ]\n \n \n+@torch.inference_mode()\n+def test_swiglu_limit_pad_aware_traps_on_expert_id_outside_map():\n+    \"\"\"-1 rows are skipped; an id outside expert_map is a producer bug and traps.\"\"\"\n+    from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func\n+\n+    d, rows = 64, 4\n+    x = torch.randn((rows, 2 * d), device=\"cuda\", dtype=torch.bfloat16)\n+    out = torch.zeros((rows, d), device=\"cuda\", dtype=torch.bfloat16)\n+    topk_ids = torch.tensor([0, 1, 2, -1], device=\"cuda\", dtype=torch.int32)\n+    expert_map = torch.tensor([0, -1, 1, -1], device=\"cuda\", dtype=torch.int32)\n+\n+    swiglu_limit_func(out, x, 0.0, topk_ids, expert_map)\n+\n+    computed = out.abs().sum(dim=-1) > 0\n+    assert computed.tolist() == [True, False, True, False]\n+\n+    assert_kernel_traps(\"\"\"\n+        from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func\n+        x = torch.randn((2, 128), device=\"cuda\", dtype=torch.bfloat16)\n+        out = torch.zeros((2, 64), device=\"cuda\", dtype=torch.bfloat16)\n+        ids = torch.tensor([0, 0x3F988A43], device=\"cuda\", dtype=torch.int32)\n+        expert_map = torch.tensor([0, -1, 1, -1], device=\"cuda\", dtype=torch.int32)\n+        swiglu_limit_func(out, x, 0.0, ids, expert_map)\n+    \"\"\")\n+\n+\n @pytest.mark.parametrize((\"activation\", \"activation_config\"), MOE_ACTIVATION_CASES)\n @torch.inference_mode()\n def test_masked_moe_activation_dispatch(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fcore%2Ftest_activation.py",
+      "sha": "d73eb15c1b783e24b468a67cb75da30627e2b6a5",
+      "status": "modified"
+    },
+    {
+      "additions": 45,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fmoe%2Ftest_count_expert_num_tokens.py",
+      "changes": 45,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fmoe%2Ftest_count_expert_num_tokens.py?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 0,
+      "filename": "tests/kernels/moe/test_count_expert_num_tokens.py",
+      "patch": "@@ -7,6 +7,7 @@\n import pytest\n import torch\n \n+from tests.kernels.utils import assert_kernel_traps\n from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens\n from vllm.platforms import current_platform\n \n@@ -147,3 +148,47 @@ def test_compute_expert_num_tokens_from_numel(\n         ep_size=ep_size,\n         topk_ids_dtype=topk_ids_dtype,\n     )\n+\n+\n+@pytest.mark.parametrize(\n+    (\"topk_ids_dtype\", \"bad_id\"), [(torch.int32, 4), (torch.int64, 0x3F988A43)]\n+)\n+def test_count_expert_num_tokens_traps_on_expert_id_outside_map(\n+    topk_ids_dtype: torch.dtype, bad_id: int\n+):\n+    \"\"\"An id at or past expert_map's length (the GLOBAL expert count) traps.\"\"\"\n+    assert_kernel_traps(f\"\"\"\n+        from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens\n+        expert_map = torch.full((4,), -1, dtype=torch.int32, device=\"cuda\")\n+        expert_map[:2] = torch.arange(2, dtype=torch.int32, device=\"cuda\")\n+        ids = torch.zeros((4, 2), dtype={topk_ids_dtype}, device=\"cuda\")\n+        ids[1, 1] = {bad_id}\n+        count_expert_num_tokens(ids, 2, expert_map)\n+    \"\"\")\n+\n+\n+@pytest.mark.parametrize(\"topk_ids_dtype\", [torch.int32, torch.int64])\n+def test_count_expert_num_tokens_bound_is_global_expert_count(\n+    topk_ids_dtype: torch.dtype,\n+):\n+    \"\"\"The gather bound must be expert_map's length, not the local count.\n+\n+    On a non-zero EP shard every routed global id is >= num_local_experts, so\n+    bounding against the local count would drop all of them.\n+    \"\"\"\n+    num_experts, num_local = 32, 16\n+    expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device=\"cuda\")\n+    expert_map[num_local:] = torch.arange(num_local, dtype=torch.int32, device=\"cuda\")\n+\n+    topk_ids = torch.randint(\n+        num_local, num_experts, (16, 2), dtype=topk_ids_dtype, device=\"cuda\"\n+    )\n+\n+    actual = count_expert_num_tokens(topk_ids, num_local, expert_map)\n+\n+    local = expert_map[topk_ids.long()]\n+    expected = torch.zeros(num_local, dtype=actual.dtype, device=\"cuda\")\n+    for e in range(num_local):\n+        expected[e] = ((local == e) & (local >= 0)).sum()\n+\n+    torch.testing.assert_close(actual, expected)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fmoe%2Ftest_count_expert_num_tokens.py",
+      "sha": "ccd7bdcf5bc49c6a275040c88cad0e7ee8d0ebbe",
+      "status": "modified"
+    },
+    {
+      "additions": 43,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fmoe%2Ftest_moe.py",
+      "changes": 44,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fmoe%2Ftest_moe.py?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 1,
+      "filename": "tests/kernels/moe/test_moe.py",
+      "patch": "@@ -22,7 +22,13 @@\n     make_dummy_moe_config,\n     modular_triton_fused_moe,\n )\n-from tests.kernels.utils import opcheck, stack_and_dev, torch_experts, torch_moe\n+from tests.kernels.utils import (\n+    assert_kernel_traps,\n+    opcheck,\n+    stack_and_dev,\n+    torch_experts,\n+    torch_moe,\n+)\n from vllm.config import VllmConfig, set_current_vllm_config\n from vllm.model_executor.layers.fused_moe import (\n     MoEActivation,\n@@ -1885,6 +1891,42 @@ def test_moe_sum_pad_aware(topk: int, dtype: torch.dtype, topk_ids_dtype: torch.\n     opcheck(torch.ops._moe_C.moe_sum, (input, actual, topk_ids, expert_map))\n \n \n+@pytest.mark.parametrize(\n+    (\"topk_ids_dtype\", \"bad_id\"), [(torch.int32, 4), (torch.int64, 0x3F988A43)]\n+)\n+def test_moe_sum_pad_aware_traps_on_expert_id_outside_map(\n+    topk_ids_dtype: torch.dtype, bad_id: int\n+):\n+    \"\"\"-1 slots are skipped; an id outside expert_map is a producer bug and traps.\n+\n+    Such ids were seen in production as garbage from an out-of-bounds router\n+    gather (0x3F988A43 is one); gathering expert_map with them read past the\n+    map and faulted every rank. 4 is the first id past this map.\n+    \"\"\"\n+    m, topk, k = 8, 4, 128\n+    dtype = torch.bfloat16\n+    input = torch.randn((m, topk, k), device=\"cuda\", dtype=dtype)\n+    topk_ids = torch.randint(0, 4, (m, topk), device=\"cuda\", dtype=topk_ids_dtype)\n+    topk_ids[2, 2] = -1\n+    expert_map = torch.tensor([0, -1, 1, -1], device=\"cuda\", dtype=torch.int32)\n+\n+    actual = torch.empty((m, k), device=\"cuda\", dtype=dtype)\n+    torch.ops._moe_C.moe_sum(input, actual, topk_ids, expert_map)\n+    routed = (topk_ids >= 0) & (expert_map[topk_ids.clamp(min=0).long()] >= 0)\n+    expected = (input.float() * routed.unsqueeze(-1)).sum(dim=1).to(dtype)\n+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)\n+\n+    assert_kernel_traps(f\"\"\"\n+        import vllm._custom_ops  # noqa: F401\n+        x = torch.randn((2, 2, 128), device=\"cuda\", dtype=torch.bfloat16)\n+        ids = torch.zeros((2, 2), device=\"cuda\", dtype={topk_ids_dtype})\n+        ids[1, 0] = {bad_id}\n+        expert_map = torch.tensor([0, -1, 1, -1], device=\"cuda\", dtype=torch.int32)\n+        out = torch.empty((2, 128), device=\"cuda\", dtype=torch.bfloat16)\n+        torch.ops._moe_C.moe_sum(x, out, ids, expert_map)\n+    \"\"\")\n+\n+\n def _batched_fused_marlin_moe_cases() -> list[Any]:\n     cases = [\n         pytest.param(",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fmoe%2Ftest_moe.py",
+      "sha": "c4ca3e24b89ed2b1a10c4fed06883f78ae5d8b39",
+      "status": "modified"
+    },
+    {
+      "additions": 22,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fmoe%2Ftest_moe_fused_mul_sum.py",
+      "changes": 22,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Fmoe%2Ftest_moe_fused_mul_sum.py?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 0,
+      "filename": "tests/kernels/moe/test_moe_fused_mul_sum.py",
+      "patch": "@@ -8,6 +8,7 @@\n import pytest\n import torch\n \n+from tests.kernels.utils import assert_kernel_traps\n from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (\n     moe_fused_mul_sum,\n )\n@@ -406,3 +407,24 @@ def test_num_valid_tokens_bounds_stale_padding(dtype: torch.dtype):\n         topk_ids=topk_ids,\n     )\n     assert unbounded[num_recv:].isnan().any(), \"num_valid_tokens bound is load-bearing\"\n+\n+\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+@pytest.mark.parametrize(\"bad_id\", [NUM_EXPERTS, 0x3F988A43])\n+def test_expert_id_outside_map_traps(bad_id: int):\n+    \"\"\"-1 marks an unrouted slot; an id outside expert_map is a producer bug.\"\"\"\n+    assert_kernel_traps(f\"\"\"\n+        from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (\n+            moe_fused_mul_sum,\n+        )\n+        inputs = torch.randn((2, 2, {HIDDEN_SIZE}), device=\"cuda\", dtype=torch.bfloat16)\n+        weights = torch.ones((2, 2), device=\"cuda\", dtype=torch.float32)\n+        ids = torch.zeros((2, 2), device=\"cuda\", dtype=torch.int32)\n+        ids[1, 0] = {bad_id}\n+        expert_map = torch.arange({NUM_EXPERTS}, device=\"cuda\", dtype=torch.int32)\n+        outputs = torch.zeros((2, {HIDDEN_SIZE}), device=\"cuda\", dtype=torch.bfloat16)\n+        moe_fused_mul_sum(\n+            inputs=inputs, topk_weights=weights, outputs=outputs,\n+            topk_ids=ids, expert_map=expert_map,\n+        )\n+    \"\"\")",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Fmoe%2Ftest_moe_fused_mul_sum.py",
+      "sha": "288e7dd1f7e9a1a46a37a0d16a4dd10caec798a5",
+      "status": "modified"
+    },
+    {
+      "additions": 25,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Futils.py",
+      "changes": 25,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Futils.py?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 0,
+      "filename": "tests/kernels/utils.py",
+      "patch": "@@ -2,10 +2,14 @@\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n \"\"\"Kernel test utils.\"\"\"\n \n+import subprocess\n+import sys\n+import textwrap\n from collections.abc import Sequence\n from typing import Any\n from unittest.mock import patch\n \n+import regex as re\n import torch\n from torch._prims_common import TensorLikeType\n \n@@ -413,3 +417,24 @@ def group_broadcast(t, shape):\n         output = output + bias\n \n     return output\n+\n+\n+def assert_kernel_traps(code: str) -> None:\n+    \"\"\"Run `code` in a fresh process and assert a device-side trap killed it.\n+\n+    A trapped kernel poisons the CUDA context, so the check cannot run in the\n+    test process itself. `torch` is imported for `code`.\n+    \"\"\"\n+    script = (\n+        \"import torch\\n\"\n+        + textwrap.dedent(code)\n+        + \"\\ntorch.accelerator.synchronize()\\nprint('NO TRAP')\\n\"\n+    )\n+    proc = subprocess.run(\n+        [sys.executable, \"-c\", script], capture_output=True, text=True, timeout=600\n+    )\n+    output = proc.stdout + proc.stderr\n+    assert proc.returncode != 0 and \"NO TRAP\" not in proc.stdout, output\n+    assert re.search(\n+        r\"illegal instruction|unspecified launch failure|device-side assert\", output\n+    ), output",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/tests%2Fkernels%2Futils.py",
+      "sha": "1c19a806509ef223f13c4ab9726c8dbcfb64974a",
+      "status": "modified"
+    },
+    {
+      "additions": 36,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fmoe_fused_mul_sum.py",
+      "changes": 38,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fmoe_fused_mul_sum.py?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 2,
+      "filename": "vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py",
+      "patch": "@@ -6,6 +6,29 @@\n from vllm.platforms import current_platform\n from vllm.triton_utils import tl, triton\n \n+_TRAP_WITH_PTX = tl.constexpr(current_platform.is_cuda())\n+\n+\n+@triton.jit\n+def trap_if(cond):\n+    \"\"\"Abort the kernel where `cond` is true.\n+\n+    Unlike tl.device_assert this also fires outside Triton debug mode, so a\n+    broken invariant fails loudly instead of being skipped. Platforms without\n+    a PTX trap fall back to tl.device_assert.\n+    \"\"\"\n+    if _TRAP_WITH_PTX:\n+        tl.inline_asm_elementwise(\n+            \"{ .reg .pred p; setp.ne.s32 p, $1, 0; @p trap; mov.u32 $0, $1; }\",\n+            \"=r,r\",\n+            [cond.to(tl.int32)],\n+            dtype=tl.int32,\n+            is_pure=False,\n+            pack=1,\n+        )\n+    else:\n+        tl.device_assert(cond == 0, \"trap_if condition is true\")\n+\n \n @triton.jit\n def moe_fused_mul_sum_kernel(\n@@ -14,6 +37,7 @@ def moe_fused_mul_sum_kernel(\n     outputs_ptr,\n     top_ids_ptr,\n     expert_map_ptr,\n+    num_experts,\n     num_valid_tokens_ptr,\n     stride_m,\n     has_topk_ids: tl.constexpr,\n@@ -46,8 +70,17 @@ def moe_fused_mul_sum_kernel(\n             any_valid += valid.to(tl.int32)\n             take = valid\n             if has_expert_map:\n-                local_id = tl.load(expert_map_ptr + tl.where(valid, id_val, 0))\n-                take = valid & (local_id >= 0)\n+                # -1 marks an unrouted slot; any other id must index expert_map.\n+                # A larger one is a producer bug, so fail loudly. The load stays\n+                # masked so it never reads past the map.\n+                trap_if(id_val >= num_experts)\n+                in_map = valid & (id_val < num_experts)\n+                local_id = tl.load(\n+                    expert_map_ptr + tl.where(in_map, id_val, 0),\n+                    mask=in_map,\n+                    other=-1,\n+                )\n+                take = in_map & (local_id >= 0)\n             takes += (take,)  # type: ignore[assignment]\n             weights += (tl.load(w_row + n).to(tl.float32),)  # type: ignore[assignment]\n         # All-padding rows early-return untouched (decode contract past num_recv).\n@@ -166,6 +199,7 @@ def moe_fused_mul_sum(\n             outputs,\n             topk_ids,\n             expert_map,\n+            expert_map.numel() if expert_map is not None else 0,\n             num_valid_tokens,\n             top_k * hidden_size,\n             topk_ids is not None,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Fmoe_fused_mul_sum.py",
+      "sha": "2f7971bb54aa6263935c0352453a73246ba2bd0c",
+      "status": "modified"
+    },
+    {
+      "additions": 19,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Futils.py",
+      "changes": 22,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Futils.py?ref=1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "deletions": 3,
+      "filename": "vllm/model_executor/layers/fused_moe/utils.py",
+      "patch": "@@ -13,6 +13,7 @@\n from vllm import _custom_ops as ops\n from vllm._aiter_ops import rocm_aiter_ops\n from vllm.logger import init_logger\n+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import trap_if\n from vllm.model_executor.layers.quantization.utils.config_utils import (\n     is_shared_expert_quant_fse_compatible,\n )\n@@ -172,6 +173,7 @@ def _count_expert_num_tokens(\n     topk_ids_ptr,\n     expert_num_tokens_ptr,\n     num_experts,\n+    num_global_experts,\n     topk_numel,\n     expert_map,\n     HAS_EXPERT_MAP: tl.constexpr,\n@@ -187,8 +189,13 @@ def _count_expert_num_tokens(\n         mask = offsets < (topk_numel - x * BLOCK_SIZE)\n         expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)\n         if HAS_EXPERT_MAP:\n+            # -1 marks an unrouted slot; any other id must index expert_map,\n+            # whose length is the GLOBAL expert count (num_experts is this\n+            # rank's local count). A larger id is a producer bug: fail loudly,\n+            # and keep the gather masked so it never reads past the map.\n+            trap_if(expert_ids >= num_global_experts)\n             expert_map_ptrs = expert_map + expert_ids\n-            expert_map_mask = expert_ids >= 0\n+            expert_map_mask = (expert_ids >= 0) & (expert_ids < num_global_experts)\n             expert_ids = tl.load(expert_map_ptrs, mask=expert_map_mask, other=-1)\n \n         has_curr_expert = tl.where(expert_ids == curr_expert, 1, 0)\n@@ -229,6 +236,7 @@ def count_expert_num_tokens(\n         topk_ids,\n         expert_num_tokens,\n         num_local_experts,\n+        expert_map.numel() if expert_map is not None else 0,\n         topk_ids.numel(),\n         expert_map,\n         HAS_EXPERT_MAP=expert_map is not None,\n@@ -608,6 +616,7 @@ def _swiglu_limit_pad_aware_kernel(\n     input_row_stride,\n     num_tokens,\n     swiglu_limit,\n+    num_experts,\n     HAS_LIMIT: tl.constexpr,\n     HAS_EXPERT_MAP: tl.constexpr,\n     BLOCK_SIZE: tl.constexpr,\n@@ -623,12 +632,18 @@ def _swiglu_limit_pad_aware_kernel(\n         expert_id = tl.load(topk_ids_ptr + row)\n         should_compute = expert_id != -1\n         if HAS_EXPERT_MAP:\n+            # -1 marks an unrouted row; any other id must index expert_map. A\n+            # larger one is a producer bug (observed as garbage ids from an\n+            # out-of-bounds router gather), so fail loudly. The load stays\n+            # masked so it never reads past the map.\n+            trap_if(expert_id >= num_experts)\n+            in_range = (expert_id >= 0) & (expert_id < num_experts)\n             local_expert_id = tl.load(\n                 expert_map_ptr + expert_id,\n-                mask=expert_id >= 0,\n+                mask=in_range,\n                 other=-1,\n             )\n-            should_compute = should_compute & (local_expert_id != -1)\n+            should_compute = should_compute & in_range & (local_expert_id != -1)\n \n         if should_compute:\n             gate_offsets = row.to(tl.int64) * input_row_stride + column_tile\n@@ -677,6 +692,7 @@ def _swiglu_limit_pad_aware(\n         gate_up_size,\n         num_tokens,\n         swiglu_limit,\n+        expert_map.numel() if expert_map is not None else 0,\n         HAS_LIMIT=swiglu_limit > 0,\n         HAS_EXPERT_MAP=expert_map is not None,\n         BLOCK_SIZE=BLOCK_SIZE,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/1f762e6d6e5669dbd6cd582b99bf50d340a4a485/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Futils.py",
+      "sha": "b0e51bf09d8674985610276e46487a2fa7407608",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @alexbi29.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-08-25T20:59:58Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-5416714522",
+      "id": 5416714522,
+      "updated_at": "2026-08-25T20:59:58Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "I feel like this should be an assertion rather than ignoring out of bounds ids in the expert_map.  Otherwise, buggy expert_maps might silently be used and we won't be aware of the problem.",
+      "created_at": "2026-10-20T20:06:53Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6300350952",
+      "id": 6300350952,
+      "updated_at": "2026-10-20T20:06:53Z",
+      "user": {
+        "login": "bnellnm"
+      }
+    },
+    {
+      "body": "Thanks @bnellnm, agreed that a broken `expert_map` shouldn't go unnoticed. Today an out-of-range id is already ignored in the worst way: the gather reads past the map, and the token is routed with whatever happens to be in that memory. We hit this from a stale `torch.empty` slot. The bound stops that read; the question is what to do instead of silently skipping. Two options:\n\n1. Keep the bound, so the kernels never read out of bounds, and add a debug-only device assert (off by default) so a buggy map fails loudly in tests and CI.\n2. Replace the masking with an unconditional device-side assert, so a buggy map kills the engine with a clear error in production too.\n\nI'm happy to do either. If you'd rather have loud failures everywhere, I'll switch to (2). #50844 (DSv4 `tid2eid`) would follow the same choice. Which do you prefer?\n",
+      "created_at": "2026-10-20T20:55:52Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6301290601",
+      "id": 6301290601,
+      "updated_at": "2026-10-20T20:55:52Z",
+      "user": {
+        "login": "alexbi29"
+      }
+    },
+    {
+      "body": "> Thanks @bnellnm, agreed that a broken `expert_map` shouldn't go unnoticed. Today an out-of-range id is already ignored in the worst way: the gather reads past the map, and the token is routed with whatever happens to be in that memory. We hit this from a stale `torch.empty` slot. The bound stops that read; the question is what to do instead of silently skipping. Two options:\r\n> \r\n> 1. Keep the bound, so the kernels never read out of bounds, and add a debug-only device assert (off by default) so a buggy map fails loudly in tests and CI.\r\n> 2. Replace the masking with an unconditional device-side assert, so a buggy map kills the engine with a clear error in production too.\r\n> \r\n> I'm happy to do either. If you'd rather have loud failures everywhere, I'll switch to (2). #50844 (DSv4 `tid2eid`) would follow the same choice. Which do you prefer?\r\n\r\nI think option #2 (device-side assert) would be best, since CI might not cover all the possibilities.  Thanks for looking into this bug.",
+      "created_at": "2026-10-20T21:56:21Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6302578011",
+      "id": 6302578011,
+      "updated_at": "2026-10-20T21:56:54Z",
+      "user": {
+        "login": "bnellnm"
+      }
+    },
+    {
+      "body": "@bnellnm done in `1f762e6d6e`, going with option 2:\n\n- An id at or past `expert_map`'s length now stops the kernel with the offending id instead of skipping the slot. `-1` is still the not-routed sentinel.\n- CUDA (`moe_sum`): `printf` + `__trap()`, the same pattern as `hisparse_kernels.cu`.\n- Triton (count / swiglu-limit / fused-mul-sum): `tl.device_assert` is compiled out unless Triton runs in debug mode, and enabling `debug=True` per kernel also turns on integer-overflow sanitizing for every add/mul. So this uses a small predicated PTX `trap` helper on CUDA, with a `tl.device_assert` fallback on other platforms.\n- The loads stay bounded, so nothing reads past the map even before the trap fires.\n- Side fix: the pad-aware `moe_sum` without an `expert_map` no longer applies a bound of 0, which would have skipped every slot. No in-tree caller hits that combination today.\n\nThe out-of-range tests now check the trap in a subprocess, since a trapped kernel poisons the CUDA context. #50844 got the same treatment (`94ac10393a`). Validation on SM120 is in the description.\n",
+      "created_at": "2026-10-23T02:16:35Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/50845#issuecomment-6355784923",
+      "id": 6355784923,
+      "updated_at": "2026-10-23T02:16:35Z",
+      "user": {
+        "login": "alexbi29"
+      }
+    }
+  ],
+  "number": 50845,
+  "refs": {
+    "base": {
+      "commit": "e2d2680417432b80986a36d456e3d79173ee1a45",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "1f762e6d6e5669dbd6cd582b99bf50d340a4a485",
+      "repository": "alexbi29/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/50845#pullrequestreview-4842765147",
+      "id": 4842765147,
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-03T09:43:49Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ]
+}

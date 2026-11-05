@@ -1,0 +1,502 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "7200ba75f8c03185561a021ba13f95d0dc598f01b574fc43427e68371966ad32",
+      "isPrivate": false,
+      "numbers": [
+        8385,
+        8384,
+        8383,
+        8382,
+        8381,
+        8380,
+        8379,
+        8378
+      ],
+      "observed_at": "2026-11-04T15:37:51.523947+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4889,
+        "resetAt": "2026-11-04T15:50:00Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "fce1e2051f8ad37de5473ae103074748a8948ea5",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nBatch-invariant (BI) inference with MXFP8 routed experts does work proportional to `max_tokens` on every decode step, whatever the number of live tokens. This PR bounds that work by the live rows, which the kernels already read on device. CUDA graphs keep their static shapes, and the quantized and reduced rows are bitwise unchanged.\n\nIt also removes an illegal memory access. The MXFP8 quantize kernel indexes rows in int32, so a worst-case buffer of 2^31 elements or more faults (see Problem).\n\n## Problem (file:line on main, fce1e2051)\n\nThe fused-MoE buffers are sized `max_tokens x EP x topk` rows for CUDA graphs. Under BI, several steps then walk all of them:\n- `fused_moe.py:268`: the fc2 input (activation output) is quantized with `MXFP8Tensor.from_bf16` over every row. BI turns off the fused activation+quantize (`fused_moe.py:169`).\n- `permute.py:774-781`: `permute_and_quantize_mxfp8(zero_padding=True)` memsets the whole fp8 buffer (`torch.zeros`) only to zero the alignment padding.\n- `batch_invariant.py:468`: `unpermute_tokens_in_expert_order` launches one CTA per worst-case token.\n- `batch_invariant.py:88,139`, `permute.py:286,327,645`: grid-stride loops run to `max_rows`/`max_pairs` and skip the dead rows inside the loop.\n- `mxfp8_quantize.py`: `row = tl.program_id(0)` is int32, so `row * K` overflows once rows x K reaches 2^31. Example: max_tokens 73728 x EP4 x topk 6 = 1.77M rows x 1856.\n\nProfile (eager, EP4, 8 live rows, max_tokens 73728, the tree before #7660): `_mxfp8_quant_swizzle_kernel` took 80.7 ms per decode step over 46 calls. Next were BI unpermute 10.7 ms, zero padding 4.0 ms, permute 4.4 ms and BI relu^2 4.1 ms.\n\n## The change\n\n- `mxfp8_quantize_rows(x, n_rows)`: a persistent kernel with a fixed grid that quantizes rows `[0, n_rows)`, with `n_rows` read on device. It indexes rows in int64. The per-row code is factored out of `_mxfp8_quant_swizzle_kernel` (`_mxfp8_quant_swizzle_row`), so both paths emit the same bits. `fused_moe` uses it in BI mode for the unfused quantizations.\n- `permute_and_quantize_mxfp8(zero_padding=True)`: `torch.empty` plus zeroing of only the padding rows below `n_used`, after the permute (`_zero_permutation_padding_kernel` on the byte view).\n- `unpermute_tokens_in_expert_order`: a persistent grid over the valid tokens, with the same fp64 accumulation in expert order.\n- BI activation, zero-padding and permute loops are bounded by the device counts they already checked.\n\n## Results\n\nSetup: Nemotron-3.5-Nano shapes (52 layers, 128 experts, topk 6, hidden 2688), random weights. MXFP8 routed experts, inference_optimized, NVLS dispatcher, EP4 on 4x GB200, local CUDA graphs, async scheduling, `batch_invariant_collective=ordered`. The engine settings follow an RLVR recipe that showed the slowdown: buffer 20 GB, block 256, max_tokens 73728, 40 requests. Numbers are decode ms per step, median of 60 steps.\n\n| rows : context | main | this PR | main, BI off |\n|---|---|---|---|\n| 1 : 1k | crashes (illegal memory access) | 9.5 | 17.9 |\n| 40 : 1k | crashes | 12.5 | 21.5 |\n| 1 : 32k | crashes | 11.2 | – |\n| 40 : 16k | crashes | 13.3 | – |\n| 40 : 32k | crashes | 14.2 | 23.2 |\n\nAt max_tokens 8192, where main runs, main vs this PR: 16.6 -> 7.9 ms (1 row), 19.4 -> 10.8 ms (40 rows), 19.9 -> 11.3 ms (40 rows at 8k context).\n\nThe same change on the older tree the recipe pins (before #7660) took the BI decode step from 111-117 ms to 9.6-15.7 ms at max_tokens 73728.\n\n## Bitwise evidence\n\n- Kernel level: `mxfp8_quantize_rows` vs `mxfp8_quantize` has equal data and scale bytes on the live rows. This held for K 1856/2688/4096, n_rows 0..M, and under CUDA-graph replay with the device count changed between replays. The unpermute output matches the fp64 expert-order reference, and rows past the valid count stay untouched.\n- Model level, EP4 BI, graphs on, greedy, 48 tokens from 4 prompts (500 to 33k tokens): generated tokens and log-probs are bitwise equal before vs after. That covers the older tree at max_tokens 73728 and main at max_tokens 8192.\n- `tests/unit_tests/inference/test_mxfp8_utils.py` (including the BI fused/unfused equality tests) and the new `tests/unit_tests/inference/test_batch_invariant_live_rows.py`: 162 passed on GB200.\n\n## Limitations\n\n- Training is unaffected: `InferenceGroupedMLP.forward` uses the TE path outside `InferenceMode`.\n- Rows at or past `n_used` in the quantized buffers are no longer initialized. Nothing reads them: the grouped GEMMs stop at the expert offsets and the activation is bounded.\n- #8357 (contiguous inputs in `mxfp8_quantize_into`) touches the same file but does not conflict functionally. The fused-MoE callers here pass contiguous buffers.\n- Not changed: the remaining full-size scale `torch.zeros` and inverse-map fill (MBs, not GBs).\n",
+      "changedFiles": 6,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+            "createdAt": "2026-10-20T23:40:33Z",
+            "databaseId": 6304282675,
+            "updatedAt": "2026-10-20T23:40:33Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6304282675"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "wdykas"
+            },
+            "body": "/ok to test [b7305f3](https://github.com/NVIDIA/Megatron-LM/pull/8385/commits/b7305f3329a9732c715147c5b5de8930873dc282)",
+            "createdAt": "2026-10-21T00:11:53Z",
+            "databaseId": 6304704411,
+            "updatedAt": "2026-10-21T00:11:53Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6304704411"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "wdykas"
+            },
+            "body": "/ok to test 1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+            "createdAt": "2026-10-21T13:33:52Z",
+            "databaseId": 6317396566,
+            "updatedAt": "2026-10-21T13:33:52Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6317396566"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "nemo-automation-bot"
+            },
+            "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39735487352",
+            "createdAt": "2026-10-22T06:41:14Z",
+            "databaseId": 6334512994,
+            "updatedAt": "2026-10-22T06:41:14Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6334512994"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXmQ_2I=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "headRepository": {
+        "nameWithOwner": "wdykas/Megatron-LM"
+      },
+      "mergeCommit": {
+        "oid": "77232c387ad51e3e0724cf9da9bf50306db98015"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-22T10:34:33Z",
+      "number": 8385,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "kvareddy"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5597967935,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-21T09:57:35Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5597967935"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "YigongQin"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "YigongQin"
+                  },
+                  "body": "would out_scale also need such bound?",
+                  "createdAt": "2026-10-21T17:18:48Z",
+                  "databaseId": 4339782231,
+                  "diffHunk": "@@ -771,14 +771,10 @@ def permute_and_quantize_mxfp8(\n     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)\n     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK\n \n-    if zero_padding:\n-        out_fp8 = torch.zeros(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n-    else:\n-        out_fp8 = torch.empty(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n+    # Only rows [0, n_used) are read by the grouped GEMMs. With zero_padding, the\n+    # alignment-padding rows among them are zeroed after the permute (below) instead of\n+    # memsetting the whole worst-case buffer every step.\n+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)\n     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)",
+                  "line": 778,
+                  "originalLine": 778,
+                  "path": "megatron/core/inference/moe/permute.py",
+                  "updatedAt": "2026-10-21T17:18:48Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#discussion_r4339782231"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yMVQxNzoxODo0OFrPAAAAAQKr0lc=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5603518424,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-21T17:18:47Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5603518424"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "YigongQin"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5603588074,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-21T17:24:33Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5603588074"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "wdykas"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "wdykas"
+                  },
+                  "body": "good catch we can do a follow up if it matters. I just took a benchmark and it doesn't save much of anything at realistic sizes",
+                  "createdAt": "2026-10-21T17:33:20Z",
+                  "databaseId": 4339927335,
+                  "diffHunk": "@@ -771,14 +771,10 @@ def permute_and_quantize_mxfp8(\n     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)\n     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK\n \n-    if zero_padding:\n-        out_fp8 = torch.zeros(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n-    else:\n-        out_fp8 = torch.empty(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n+    # Only rows [0, n_used) are read by the grouped GEMMs. With zero_padding, the\n+    # alignment-padding rows among them are zeroed after the permute (below) instead of\n+    # memsetting the whole worst-case buffer every step.\n+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)\n     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)",
+                  "line": 778,
+                  "originalLine": 778,
+                  "path": "megatron/core/inference/moe/permute.py",
+                  "updatedAt": "2026-10-21T17:33:20Z",
+                  "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#discussion_r4339927335"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yMVQxNzozMzoyMFrPAAAAAQKuCSc=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5603698573,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-21T17:33:20Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5603698573"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "cspades"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5605510856,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-21T20:02:33Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5605510856"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yMVQyMDowMjozM1q0MjAyNi0xMC0yMVQyMDowMjozM1rPAAAAAU4dTsg=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "MERGED",
+      "title": "fix(inference): bound batch-invariant MoE work by live rows, not worst-case buffers",
+      "updatedAt": "2026-10-22T10:34:35Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/8385"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "NVIDIA/Megatron-LM"
+      },
+      "sha": "fce1e2051f8ad37de5473ae103074748a8948ea5"
+    },
+    "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nBatch-invariant (BI) inference with MXFP8 routed experts does work proportional to `max_tokens` on every decode step, whatever the number of live tokens. This PR bounds that work by the live rows, which the kernels already read on device. CUDA graphs keep their static shapes, and the quantized and reduced rows are bitwise unchanged.\n\nIt also removes an illegal memory access. The MXFP8 quantize kernel indexes rows in int32, so a worst-case buffer of 2^31 elements or more faults (see Problem).\n\n## Problem (file:line on main, fce1e2051)\n\nThe fused-MoE buffers are sized `max_tokens x EP x topk` rows for CUDA graphs. Under BI, several steps then walk all of them:\n- `fused_moe.py:268`: the fc2 input (activation output) is quantized with `MXFP8Tensor.from_bf16` over every row. BI turns off the fused activation+quantize (`fused_moe.py:169`).\n- `permute.py:774-781`: `permute_and_quantize_mxfp8(zero_padding=True)` memsets the whole fp8 buffer (`torch.zeros`) only to zero the alignment padding.\n- `batch_invariant.py:468`: `unpermute_tokens_in_expert_order` launches one CTA per worst-case token.\n- `batch_invariant.py:88,139`, `permute.py:286,327,645`: grid-stride loops run to `max_rows`/`max_pairs` and skip the dead rows inside the loop.\n- `mxfp8_quantize.py`: `row = tl.program_id(0)` is int32, so `row * K` overflows once rows x K reaches 2^31. Example: max_tokens 73728 x EP4 x topk 6 = 1.77M rows x 1856.\n\nProfile (eager, EP4, 8 live rows, max_tokens 73728, the tree before #7660): `_mxfp8_quant_swizzle_kernel` took 80.7 ms per decode step over 46 calls. Next were BI unpermute 10.7 ms, zero padding 4.0 ms, permute 4.4 ms and BI relu^2 4.1 ms.\n\n## The change\n\n- `mxfp8_quantize_rows(x, n_rows)`: a persistent kernel with a fixed grid that quantizes rows `[0, n_rows)`, with `n_rows` read on device. It indexes rows in int64. The per-row code is factored out of `_mxfp8_quant_swizzle_kernel` (`_mxfp8_quant_swizzle_row`), so both paths emit the same bits. `fused_moe` uses it in BI mode for the unfused quantizations.\n- `permute_and_quantize_mxfp8(zero_padding=True)`: `torch.empty` plus zeroing of only the padding rows below `n_used`, after the permute (`_zero_permutation_padding_kernel` on the byte view).\n- `unpermute_tokens_in_expert_order`: a persistent grid over the valid tokens, with the same fp64 accumulation in expert order.\n- BI activation, zero-padding and permute loops are bounded by the device counts they already checked.\n\n## Results\n\nSetup: Nemotron-3.5-Nano shapes (52 layers, 128 experts, topk 6, hidden 2688), random weights. MXFP8 routed experts, inference_optimized, NVLS dispatcher, EP4 on 4x GB200, local CUDA graphs, async scheduling, `batch_invariant_collective=ordered`. The engine settings follow an RLVR recipe that showed the slowdown: buffer 20 GB, block 256, max_tokens 73728, 40 requests. Numbers are decode ms per step, median of 60 steps.\n\n| rows : context | main | this PR | main, BI off |\n|---|---|---|---|\n| 1 : 1k | crashes (illegal memory access) | 9.5 | 17.9 |\n| 40 : 1k | crashes | 12.5 | 21.5 |\n| 1 : 32k | crashes | 11.2 | – |\n| 40 : 16k | crashes | 13.3 | – |\n| 40 : 32k | crashes | 14.2 | 23.2 |\n\nAt max_tokens 8192, where main runs, main vs this PR: 16.6 -> 7.9 ms (1 row), 19.4 -> 10.8 ms (40 rows), 19.9 -> 11.3 ms (40 rows at 8k context).\n\nThe same change on the older tree the recipe pins (before #7660) took the BI decode step from 111-117 ms to 9.6-15.7 ms at max_tokens 73728.\n\n## Bitwise evidence\n\n- Kernel level: `mxfp8_quantize_rows` vs `mxfp8_quantize` has equal data and scale bytes on the live rows. This held for K 1856/2688/4096, n_rows 0..M, and under CUDA-graph replay with the device count changed between replays. The unpermute output matches the fp64 expert-order reference, and rows past the valid count stay untouched.\n- Model level, EP4 BI, graphs on, greedy, 48 tokens from 4 prompts (500 to 33k tokens): generated tokens and log-probs are bitwise equal before vs after. That covers the older tree at max_tokens 73728 and main at max_tokens 8192.\n- `tests/unit_tests/inference/test_mxfp8_utils.py` (including the BI fused/unfused equality tests) and the new `tests/unit_tests/inference/test_batch_invariant_live_rows.py`: 162 passed on GB200.\n\n## Limitations\n\n- Training is unaffected: `InferenceGroupedMLP.forward` uses the TE path outside `InferenceMode`.\n- Rows at or past `n_used` in the quantized buffers are no longer initialized. Nothing reads them: the grouped GEMMs stop at the expert offsets and the activation is bounded.\n- #8357 (contiguous inputs in `mxfp8_quantize_into`) touches the same file but does not conflict functionally. The fused-MoE callers here pass contiguous buffers.\n- Not changed: the remaining full-size scale `torch.zeros` and inverse-map fill (MBs, not GBs).\n",
+    "changed_files": 6,
+    "head": {
+      "repo": {
+        "full_name": "wdykas/Megatron-LM"
+      },
+      "sha": "1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84"
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385",
+    "merge_commit_sha": "77232c387ad51e3e0724cf9da9bf50306db98015",
+    "merged": true,
+    "merged_at": "2026-10-22T10:34:33Z",
+    "number": 8385,
+    "state": "closed",
+    "title": "fix(inference): bound batch-invariant MoE work by live rows, not worst-case buffers",
+    "updated_at": "2026-10-22T10:34:35Z"
+  },
+  "files": [
+    {
+      "additions": 17,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fmoe%2Fbatch_invariant.py",
+      "changes": 25,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Finference%2Fmoe%2Fbatch_invariant.py?ref=1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "deletions": 8,
+      "filename": "megatron/core/inference/moe/batch_invariant.py",
+      "patch": "@@ -85,7 +85,8 @@ def _squared_relu_with_probs_kernel(\n     if pid >= n_used:\n         return\n \n-    for row in tl.range(pid, max_rows, NUM_BLOCKS):\n+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).\n+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):\n         if row < n_used:\n             row_i64 = row.to(tl.int64)\n             if tl.load(permutation_map_ptr + row_i64) >= 0:\n@@ -136,7 +137,8 @@ def _swiglu_with_probs_kernel(\n         return\n     two_n = 2 * ffn_size\n \n-    for row in tl.range(pid, max_rows, NUM_BLOCKS):\n+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).\n+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):\n         if row < n_used:\n             row_i64 = row.to(tl.int64)\n             if tl.load(permutation_map_ptr + row_i64) >= 0:\n@@ -422,25 +424,29 @@ def _unpermute_tokens_in_expert_order_kernel(\n     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens\n     output_ptr,  # [num_tokens, hidden_dim] fp32 output buffer\n     hidden_dim,\n+    num_tokens,\n     num_local_experts: tl.constexpr,\n     BLOCK_H: tl.constexpr,\n+    NUM_PROGRAMS: tl.constexpr,\n ):\n     \"\"\"Token-local batch-invariant unpermute.\n \n-    Each program owns one output token and one hidden tile. Contributions are\n-    accumulated by increasing local expert id, avoiding atomic-add order, in fp64\n+    Each program owns a strided set of output tokens and one hidden tile. Contributions\n+    are accumulated by increasing local expert id, avoiding atomic-add order, in fp64\n     and rounded once to the fp32 rank partial, as training's batch-invariant\n     unpermute does. An fp32 accumulator drops small contributions next to a large one.\n+    The fixed grid walks only the valid tokens (read on device), so the work scales with\n+    the live tokens rather than the worst-case buffer while staying CUDA-graph safe.\n     \"\"\"\n-    tok = tl.program_id(0)\n+    pid = tl.program_id(0)\n     block_h = tl.program_id(1)\n     valid_tokens = tl.load(valid_tokens_ptr)\n     offsets = block_h * BLOCK_H + tl.arange(0, BLOCK_H)\n     mask_h = offsets < hidden_dim\n \n-    acc = tl.zeros([BLOCK_H], dtype=tl.float64)\n-    if tok < valid_tokens:\n+    for tok in tl.range(pid, tl.minimum(valid_tokens, num_tokens), NUM_PROGRAMS):\n         tok_i64 = tok.to(tl.int64)\n+        acc = tl.zeros([BLOCK_H], dtype=tl.float64)\n         for lid in tl.range(0, num_local_experts):\n             pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)\n             if pos >= 0:\n@@ -465,14 +471,17 @@ def unpermute_tokens_in_expert_order(\n         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)\n \n     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)\n-    grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_H))\n+    num_programs = max(1, min(num_tokens, 1024))\n+    grid = (num_programs, triton.cdiv(hidden_dim, BLOCK_H))\n     _unpermute_tokens_in_expert_order_kernel[grid](\n         expert_output,\n         inverse_map,\n         valid_tokens,\n         out,\n         hidden_dim,\n+        num_tokens,\n         num_local_experts,\n         BLOCK_H=BLOCK_H,\n+        NUM_PROGRAMS=num_programs,\n     )\n     return out",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fmoe%2Fbatch_invariant.py",
+      "sha": "305b8602d071dc665461620c6283d17b67ce41fd",
+      "status": "modified"
+    },
+    {
+      "additions": 28,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fmoe%2Ffused_moe.py",
+      "changes": 32,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Finference%2Fmoe%2Ffused_moe.py?ref=1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "deletions": 4,
+      "filename": "megatron/core/inference/moe/fused_moe.py",
+      "patch": "@@ -21,8 +21,11 @@\n     permute_tokens,\n     unpermute_tokens,\n )\n-from megatron.core.inference.quantization.mxfp8_quantize import MXFP8_SCALE_ROW_BLOCK\n-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor\n+from megatron.core.inference.quantization.mxfp8_quantize import (\n+    MXFP8_SCALE_ROW_BLOCK,\n+    mxfp8_quantize_rows,\n+)\n+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype\n \n from . import batch_invariant\n \n@@ -108,6 +111,23 @@ def _get_activation_func(\n         raise ValueError(f\"Unsupported activation type: {activation_type}\")\n \n \n+def _quantize_mxfp8_used_rows(x: torch.Tensor, n_used: Optional[torch.Tensor]) -> MXFP8Tensor:\n+    \"\"\"MXFP8-quantize the expert-grouped buffer, only its first ``n_used`` rows if given.\n+\n+    The permuted buffers are sized for the worst case (max_tokens x EP x topk rows) so\n+    that CUDA graphs see static shapes, but only rows ``[0, n_used)`` (``n_used`` =\n+    inclusive_expert_offsets[-1], read on device) feed the grouped GEMMs. Quantizing the\n+    whole buffer made the batch-invariant MXFP8 path cost O(max_tokens) per step. The\n+    quantized rows are bitwise identical to ``MXFP8Tensor.from_bf16``.\n+    \"\"\"\n+    if n_used is None:\n+        return MXFP8Tensor.from_bf16(x, backend=\"triton\")\n+    data, scale = mxfp8_quantize_rows(x, n_used)\n+    return MXFP8Tensor(\n+        data=data, scale=ensure_mxfp8_scale_dtype(scale), backend=\"triton\", dtype=x.dtype\n+    )\n+\n+\n def mcore_fused_moe(\n     hidden_states: torch.Tensor,\n     probs: torch.Tensor,\n@@ -235,7 +255,9 @@ def mcore_fused_moe(\n     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant\n     # produces MXFP8Tensor directly).\n     if use_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):\n-        hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend=\"triton\")\n+        hidden_states = _quantize_mxfp8_used_rows(\n+            hidden_states, offs[-1:] if batch_invariant_mode else None\n+        )\n     fc1_output = mm_fn(hidden_states, fc1_weight, offs)\n \n     # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total\n@@ -265,7 +287,9 @@ def mcore_fused_moe(\n         activation_out = activation_func(fc1_output, permutation_map, n_used)\n     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.\n     if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):\n-        activation_out = MXFP8Tensor.from_bf16(activation_out, backend=\"triton\")\n+        activation_out = _quantize_mxfp8_used_rows(\n+            activation_out, n_used if batch_invariant_mode else None\n+        )\n     fc2_output = mm_fn(activation_out, fc2_weight, offs)\n \n     # --- Post-processing: unpermute ---",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fmoe%2Ffused_moe.py",
+      "sha": "e42e7cb4894e4ce22ab191bd156c2038ae690c0b",
+      "status": "modified"
+    },
+    {
+      "additions": 19,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fmoe%2Fpermute.py",
+      "changes": 30,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Finference%2Fmoe%2Fpermute.py?ref=1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "deletions": 11,
+      "filename": "megatron/core/inference/moe/permute.py",
+      "patch": "@@ -283,7 +283,7 @@ def _permute_tokens_kernel(\n     valid_pairs = valid_tokens * topk\n     if pid >= valid_pairs:\n         return\n-    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):\n+    for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):\n         tok = pair // topk\n         if tok < valid_tokens:\n             k = pair % topk\n@@ -324,7 +324,7 @@ def _zero_permutation_padding_kernel(\n     n_used = tl.load(n_used_ptr)\n     if pid >= n_used:\n         return\n-    for row in tl.range(pid, max_rows, NUM_BLOCKS):\n+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):\n         if row < n_used:\n             if tl.load(permutation_map_ptr + row) < 0:\n                 for h in tl.range(0, hidden_dim, BLOCK_H):\n@@ -642,7 +642,7 @@ def _permute_quantize_mxfp8_kernel(\n     if pid >= valid_pairs:\n         return\n \n-    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):\n+    for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):\n         tok = pair // topk\n         if tok < valid_tokens:\n             k = pair % topk\n@@ -771,14 +771,10 @@ def permute_and_quantize_mxfp8(\n     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)\n     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK\n \n-    if zero_padding:\n-        out_fp8 = torch.zeros(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n-    else:\n-        out_fp8 = torch.empty(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n+    # Only rows [0, n_used) are read by the grouped GEMMs. With zero_padding, the\n+    # alignment-padding rows among them are zeroed after the permute (below) instead of\n+    # memsetting the whole worst-case buffer every step.\n+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)\n     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)\n     permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)\n     permutation_map = torch.empty(output_size, dtype=torch.int32, device=probs.device)\n@@ -819,6 +815,18 @@ def permute_and_quantize_mxfp8(\n         NUM_BLOCKS=NUM_BLOCKS,\n         HAS_INVERSE=batch_invariant_inverse_map is not None,\n     )\n+    if zero_padding:\n+        # MXFP8 zero is the all-zero byte; padding rows keep their zero scales.\n+        zero_blocks = min(output_size, 512)\n+        _zero_permutation_padding_kernel[(zero_blocks,)](\n+            out_fp8.view(torch.uint8),\n+            permutation_map,\n+            inclusive_expert_offsets[-1:],\n+            K,\n+            output_size,\n+            BLOCK_H=min(triton.next_power_of_2(K), 1024),\n+            NUM_BLOCKS=zero_blocks,\n+        )\n \n     permuted_mxfp8 = MXFP8Tensor(\n         data=out_fp8,",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fmoe%2Fpermute.py",
+      "sha": "51deb466312282fe9905b6f41dbee9cfa49946da",
+      "status": "modified"
+    },
+    {
+      "additions": 150,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fquantization%2Fmxfp8_quantize.py",
+      "changes": 209,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Finference%2Fquantization%2Fmxfp8_quantize.py?ref=1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "deletions": 59,
+      "filename": "megatron/core/inference/quantization/mxfp8_quantize.py",
+      "patch": "@@ -38,6 +38,79 @@ def _ceil_div(a, b):\n     return (a + b - 1) // b\n \n \n+@triton.jit\n+def _mxfp8_quant_swizzle_row(\n+    row,\n+    out_ptr,\n+    scale_ptr,\n+    src_ptr,\n+    K,\n+    n_col_blocks,\n+    REAL_GROUPS: tl.constexpr,\n+    BLOCK_K: tl.constexpr,\n+    BLOCK_GROUPS: tl.constexpr,\n+):\n+    \"\"\"Quantize one row (int64 index) to FP8 e4m3 and store its swizzled scales.\"\"\"\n+    src_row = src_ptr + row * K\n+    out_row = out_ptr + row * K\n+\n+    offs = tl.arange(0, BLOCK_K)\n+    mask = offs < K\n+\n+    # Load full row\n+    x = tl.load(src_row + offs, mask=mask, other=0.0).to(tl.float32)\n+\n+    # Per-group-of-32 max\n+    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])\n+    abs_grouped = tl.abs(x_grouped)\n+    max_vals = tl.max(abs_grouped, axis=1)\n+\n+    # 448 is the max representable value in FP8 e4m3.\n+    # dequant_scale = min scale s.t. max_val / scale <= 448.\n+    dequant_scale = max_vals / 448.0\n+    # Round up to next power of 2 via integer bit manipulation:\n+    # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000\n+    # (exponent-only mask) bumps the exponent if any mantissa bits are set.\n+    # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.\n+    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000\n+    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.\n+    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)\n+    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.\n+    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)\n+\n+    # Quantize\n+    quantized = x_grouped * quant_scale[:, None]\n+    quantized_flat = tl.reshape(quantized, [BLOCK_K])\n+    out_fp8 = quantized_flat.to(tl.float8e4nv)\n+\n+    # Store FP8 data\n+    tl.store(out_row + offs, out_fp8, mask=mask)\n+\n+    # Store swizzled scales\n+    scale_exp = (dequant_exp >> 23).to(tl.uint8)\n+    col_offs = tl.arange(0, BLOCK_GROUPS)\n+    col_mask = col_offs < REAL_GROUPS\n+\n+    # Compute swizzled offsets for each scale element.\n+    #\n+    # The scale matrix [M, K//32] is divided into 128×4 macro-tiles.\n+    # Within each tile, rows are split into 4 groups of 32 (group = local_row // 32).\n+    # Rather than flattening row-major, the layout interleaves groups so that\n+    # rows 32 apart are adjacent in memory:\n+    #\n+    #   offset = tile_idx * 512 + sub_row * 16 + group * 4 + local_col\n+    macro_row_block = row // 128\n+    macro_col_block = col_offs // 4\n+    local_row = row % 128\n+    local_col = col_offs % 4\n+    group = local_row // 32\n+    sub_row = local_row % 32\n+    tile_idx = macro_row_block * n_col_blocks + macro_col_block\n+    swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col\n+\n+    tl.store(scale_ptr + swizzled_offs, scale_exp, mask=col_mask)\n+\n+\n @triton.jit\n def _mxfp8_quant_swizzle_kernel(\n     out_ptr,  # [M, K] output buffer for float8_e4m3fn quantized data\n@@ -100,65 +173,10 @@ def _mxfp8_quant_swizzle_kernel(\n             offset   = tile_idx * 512 + sub_row * 16 + group * 4 + local_col\n \n     \"\"\"\n-    row = tl.program_id(0)\n-    src_row = src_ptr + row * K\n-    out_row = out_ptr + row * K\n-\n-    offs = tl.arange(0, BLOCK_K)\n-    mask = offs < K\n-\n-    # Load full row\n-    x = tl.load(src_row + offs, mask=mask, other=0.0).to(tl.float32)\n-\n-    # Per-group-of-32 max\n-    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])\n-    abs_grouped = tl.abs(x_grouped)\n-    max_vals = tl.max(abs_grouped, axis=1)\n-\n-    # 448 is the max representable value in FP8 e4m3.\n-    # dequant_scale = min scale s.t. max_val / scale <= 448.\n-    dequant_scale = max_vals / 448.0\n-    # Round up to next power of 2 via integer bit manipulation:\n-    # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000\n-    # (exponent-only mask) bumps the exponent if any mantissa bits are set.\n-    # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.\n-    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000\n-    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.\n-    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)\n-    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.\n-    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)\n-\n-    # Quantize\n-    quantized = x_grouped * quant_scale[:, None]\n-    quantized_flat = tl.reshape(quantized, [BLOCK_K])\n-    out_fp8 = quantized_flat.to(tl.float8e4nv)\n-\n-    # Store FP8 data\n-    tl.store(out_row + offs, out_fp8, mask=mask)\n-\n-    # Store swizzled scales\n-    scale_exp = (dequant_exp >> 23).to(tl.uint8)\n-    col_offs = tl.arange(0, BLOCK_GROUPS)\n-    col_mask = col_offs < REAL_GROUPS\n-\n-    # Compute swizzled offsets for each scale element.\n-    #\n-    # The scale matrix [M, K//32] is divided into 128×4 macro-tiles.\n-    # Within each tile, rows are split into 4 groups of 32 (group = local_row // 32).\n-    # Rather than flattening row-major, the layout interleaves groups so that\n-    # rows 32 apart are adjacent in memory:\n-    #\n-    #   offset = tile_idx * 512 + sub_row * 16 + group * 4 + local_col\n-    macro_row_block = row // 128\n-    macro_col_block = col_offs // 4\n-    local_row = row % 128\n-    local_col = col_offs % 4\n-    group = local_row // 32\n-    sub_row = local_row % 32\n-    tile_idx = macro_row_block * n_col_blocks + macro_col_block\n-    swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col\n-\n-    tl.store(scale_ptr + swizzled_offs, scale_exp, mask=col_mask)\n+    row = tl.program_id(0).to(tl.int64)\n+    _mxfp8_quant_swizzle_row(\n+        row, out_ptr, scale_ptr, src_ptr, K, n_col_blocks, REAL_GROUPS, BLOCK_K, BLOCK_GROUPS\n+    )\n \n \n def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torch.Tensor) -> None:\n@@ -207,6 +225,79 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc\n     )\n \n \n+@triton.jit\n+def _mxfp8_quant_swizzle_rows_kernel(\n+    out_ptr,\n+    scale_ptr,\n+    src_ptr,\n+    n_rows_ptr,  # scalar int32/int64 CUDA tensor: rows [0, n_rows) are quantized\n+    K,\n+    n_col_blocks,\n+    REAL_GROUPS: tl.constexpr,\n+    BLOCK_K: tl.constexpr,\n+    BLOCK_GROUPS: tl.constexpr,\n+    NUM_PROGRAMS: tl.constexpr,\n+):\n+    \"\"\"Persistent variant: a fixed grid quantizes only the first ``n_rows`` rows.\n+\n+    The row count is read on device, so the launch is CUDA-graph safe while the work\n+    scales with the live rows instead of the worst-case buffer. Each row runs the same\n+    code as ``_mxfp8_quant_swizzle_kernel``, so the quantized rows are bitwise equal.\n+    \"\"\"\n+    pid = tl.program_id(0)\n+    n_rows = tl.load(n_rows_ptr).to(tl.int64)\n+    for row in tl.range(pid, n_rows, NUM_PROGRAMS):\n+        _mxfp8_quant_swizzle_row(\n+            row.to(tl.int64),\n+            out_ptr,\n+            scale_ptr,\n+            src_ptr,\n+            K,\n+            n_col_blocks,\n+            REAL_GROUPS,\n+            BLOCK_K,\n+            BLOCK_GROUPS,\n+        )\n+\n+\n+def mxfp8_quantize_rows(\n+    x: torch.Tensor, n_rows: torch.Tensor, max_programs: int = 4096\n+) -> tuple[torch.Tensor, torch.Tensor]:\n+    \"\"\"Like ``mxfp8_quantize`` but only rows ``[0, n_rows)`` are quantized.\n+\n+    ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe). Data rows\n+    at or beyond ``n_rows`` are left uninitialized and their scales are zero; callers\n+    must not read them (grouped GEMMs bounded by expert offsets ending at ``n_rows``).\n+    Quantized rows are bitwise identical to ``mxfp8_quantize``.\n+    \"\"\"\n+    assert x.is_cuda and x.dim() == 2\n+    assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)\n+    assert n_rows.is_cuda and n_rows.numel() == 1\n+    M, K = x.shape\n+    assert K % MXFP8_BLOCK_SIZE == 0, f\"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}\"\n+    scale_cols = K // MXFP8_BLOCK_SIZE\n+    n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)\n+    n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)\n+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK\n+    out_data = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)\n+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)\n+    BLOCK_K = triton.next_power_of_2(K)\n+    num_programs = max(1, min(M, max_programs))\n+    _mxfp8_quant_swizzle_rows_kernel[(num_programs,)](\n+        out_data,\n+        out_scale,\n+        x,\n+        n_rows,\n+        K,\n+        n_col_blocks,\n+        REAL_GROUPS=scale_cols,\n+        BLOCK_K=BLOCK_K,\n+        BLOCK_GROUPS=BLOCK_K // MXFP8_BLOCK_SIZE,\n+        NUM_PROGRAMS=num_programs,\n+    )\n+    return out_data, out_scale.view(torch.float8_e8m0fnu)\n+\n+\n def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:\n     \"\"\"Quantize a 2D tensor to MXFP8 with fused scale swizzle.\n ",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/megatron%2Fcore%2Finference%2Fquantization%2Fmxfp8_quantize.py",
+      "sha": "808eea1aa00810724afeccced887b106474edd17",
+      "status": "modified"
+    },
+    {
+      "additions": 59,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_inference_kernels.py",
+      "changes": 59,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_inference_kernels.py?ref=1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "deletions": 0,
+      "filename": "tests/unit_tests/determinism/kernels/test_inference_kernels.py",
+      "patch": "@@ -258,6 +258,31 @@ def fn(x):\n     assert_replays_bit_exact(fn, (x,), backward=False, what=\"mxfp8_quantize\")\n \n \n+@pytest.mark.skipif(not hasattr(torch, \"float8_e8m0fnu\"), reason=\"needs torch float8 e8m0 dtype\")\n+def test_mxfp8_quantize_rows_replays():\n+    \"\"\"Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows.\"\"\"\n+    from megatron.core.inference.quantization.mxfp8_quantize import (\n+        mxfp8_quantize,\n+        mxfp8_quantize_rows,\n+    )\n+\n+    seeded()\n+    rows, K, n_rows = 16384, 2688, 4992  # 39 full 128-row scale tiles\n+    x = torch.randn(rows, K, device=\"cuda\", dtype=torch.bfloat16)\n+    n_rows_t = _dev_scalar(n_rows)\n+    n_scale_bytes = n_rows // 128 * ((K // 32 + 3) // 4) * 512\n+\n+    def fn(x):\n+        data, scale = mxfp8_quantize_rows(x, n_rows_t)\n+        return data[:n_rows].view(torch.uint8), scale.view(torch.uint8)[:n_scale_bytes]\n+\n+    assert_replays_bit_exact(fn, (x,), backward=False, what=\"mxfp8_quantize_rows\")\n+    data, scale = fn(x)\n+    ref_data, ref_scale = mxfp8_quantize(x)\n+    assert torch.equal(data, ref_data[:n_rows].view(torch.uint8))\n+    assert torch.equal(scale, ref_scale.view(torch.uint8)[:n_scale_bytes])\n+\n+\n @pytest.mark.skipif(\n     not hasattr(torch, \"float8_e8m0fnu\") or torch.cuda.get_device_capability()[0] < 10,\n     reason=\"MXFP8 parameter storage needs Blackwell\",\n@@ -435,6 +460,9 @@ def logical_rows(hidden_states, probs):\n         backward=False,\n         what=\"batch_invariant permute_and_quantize_mxfp8\",\n     )\n+    # Padding rows are zeroed by a kernel over the live rows, not a whole-buffer memset.\n+    _, _, _, padding_data, padding_scales = logical_rows(hidden_states, probs)\n+    assert not padding_data.any() and not padding_scales.any()\n \n \n def _unpermute_case():\n@@ -472,6 +500,37 @@ def bi(expert_output):\n     )\n \n \n+def test_inference_unpermute_batch_invariant_live_tokens_replay():\n+    \"\"\"The fixed grid strides over only the live tokens; tokens past the count stay untouched.\"\"\"\n+    from megatron.core.inference.moe import batch_invariant\n+\n+    seeded()\n+    num_tokens, hidden, num_local, topk = 8192, 1024, 16, 4\n+    valid = 3000  # more live tokens than the 1024-program grid, so programs stride\n+    rows = valid * topk + 128 * num_local\n+    expert_output = torch.randn(rows, hidden, device=\"cuda\", dtype=torch.bfloat16)\n+    inverse_map = torch.full((num_tokens, num_local), -1, device=\"cuda\", dtype=torch.int32)\n+    positions = torch.randperm(rows, device=\"cuda\")[: valid * topk].view(valid, topk).int()\n+    experts = torch.stack([torch.randperm(num_local, device=\"cuda\")[:topk] for _ in range(valid)])\n+    inverse_map[torch.arange(valid, device=\"cuda\")[:, None], experts] = positions\n+    valid_t = _dev_scalar(valid)\n+\n+    def bi(expert_output):\n+        out = torch.full((num_tokens, hidden), 7.0, device=\"cuda\", dtype=torch.float32)\n+        return batch_invariant.unpermute_tokens_in_expert_order(\n+            expert_output, inverse_map, valid_t, out\n+        )\n+\n+    assert_replays_bit_exact(\n+        bi,\n+        (expert_output,),\n+        replays=4,\n+        backward=False,\n+        what=\"unpermute_tokens_in_expert_order (live tokens)\",\n+    )\n+    assert torch.all(bi(expert_output)[valid:] == 7.0)\n+\n+\n def test_inference_unpermute_batch_invariant_path_accumulates_in_fp64():\n     \"\"\"The combine must equal an fp64 sum rounded once to fp32, as training's batch-invariant\n     unpermute does; an fp32 accumulator drops small contributions next to a large one.\"\"\"",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_inference_kernels.py",
+      "sha": "ab13ee96806d62057cfc05a1dfbf2e7e071948e3",
+      "status": "modified"
+    },
+    {
+      "additions": 92,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/tests%2Funit_tests%2Finference%2Ftest_batch_invariant_live_rows.py",
+      "changes": 92,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Finference%2Ftest_batch_invariant_live_rows.py?ref=1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "deletions": 0,
+      "filename": "tests/unit_tests/inference/test_batch_invariant_live_rows.py",
+      "patch": "@@ -0,0 +1,92 @@\n+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.\n+\n+\"\"\"Batch-invariant MoE inference kernels bounded by the live row count.\n+\n+The permuted expert buffers are sized for the worst case (max_tokens x EP x topk rows) so CUDA\n+graphs see static shapes. These tests check that the row-bounded kernels touch only the live\n+rows and produce exactly the bits of the whole-buffer kernels on those rows, eagerly and under\n+CUDA-graph replay with a changing device-side count.\n+\"\"\"\n+\n+import pytest\n+import torch\n+\n+from megatron.core.inference.quantization.mxfp8_quantize import (\n+    MXFP8_SCALE_ROW_BLOCK,\n+    mxfp8_quantize,\n+    mxfp8_quantize_rows,\n+)\n+\n+pytestmark = [\n+    pytest.mark.skipif(not torch.cuda.is_available(), reason=\"CUDA required\"),\n+    pytest.mark.internal,\n+]\n+\n+\n+def _scale_bytes(n_rows: int, K: int) -> int:\n+    n_col_blocks = (K // 32 + 3) // 4\n+    return n_rows // MXFP8_SCALE_ROW_BLOCK * n_col_blocks * 512\n+\n+\n+def _check_rows(x, n, data, scale):\n+    ref_data, ref_scale = mxfp8_quantize(x)\n+    assert torch.equal(ref_data[:n].view(torch.uint8), data[:n].view(torch.uint8))\n+    nb = _scale_bytes(n, x.shape[1])\n+    assert torch.equal(ref_scale.view(torch.uint8)[:nb], scale.view(torch.uint8)[:nb])\n+\n+\n+class TestMxfp8QuantizeRows:\n+    @pytest.mark.parametrize(\"K\", [1856, 2688, 4096])\n+    @pytest.mark.parametrize(\"n\", [0, 128, 1280, 8192])\n+    def test_live_rows_bitwise_equal(self, K, n):\n+        torch.manual_seed(0)\n+        x = torch.randn(8192, K, device=\"cuda\", dtype=torch.bfloat16) * 4\n+        n_t = torch.tensor([n], device=\"cuda\", dtype=torch.int32)\n+        data, scale = mxfp8_quantize_rows(x, n_t)\n+        _check_rows(x, n, data, scale)\n+        # Rows past n are never quantized: their scales stay zero.\n+        assert not scale.view(torch.uint8)[_scale_bytes(n, K) :].any()\n+\n+    def test_cuda_graph_replay_with_changing_count(self):\n+        torch.manual_seed(1)\n+        x = torch.randn(4096, 2688, device=\"cuda\", dtype=torch.bfloat16)\n+        n_t = torch.tensor([256], device=\"cuda\", dtype=torch.int32)\n+        stream = torch.cuda.Stream()\n+        stream.wait_stream(torch.cuda.current_stream())\n+        with torch.cuda.stream(stream):\n+            mxfp8_quantize_rows(x, n_t)\n+        torch.cuda.current_stream().wait_stream(stream)\n+        graph = torch.cuda.CUDAGraph()\n+        with torch.cuda.graph(graph):\n+            data, scale = mxfp8_quantize_rows(x, n_t)\n+        for n in (256, 3840, 128):\n+            n_t.fill_(n)\n+            graph.replay()\n+            _check_rows(x, n, data, scale)\n+\n+\n+class TestUnpermuteInExpertOrderLiveTokens:\n+    @pytest.mark.parametrize(\"valid\", [1, 40, 1000])\n+    def test_matches_dense_reference(self, valid):\n+        from megatron.core.inference.moe.batch_invariant import unpermute_tokens_in_expert_order\n+\n+        torch.manual_seed(2)\n+        hidden, experts, topk, num_tokens = 512, 16, 4, 4096\n+        rows = valid * topk + 128 * experts\n+        expert_out = torch.randn(rows, hidden, device=\"cuda\", dtype=torch.bfloat16)\n+        inverse = torch.full((num_tokens, experts), -1, device=\"cuda\", dtype=torch.int32)\n+        pos = torch.randperm(rows, device=\"cuda\")[: valid * topk].view(valid, topk).int()\n+        eid = torch.stack([torch.randperm(experts, device=\"cuda\")[:topk] for _ in range(valid)])\n+        inverse[torch.arange(valid, device=\"cuda\")[:, None], eid] = pos\n+        out = torch.full((num_tokens, hidden), 7.0, device=\"cuda\", dtype=torch.float32)\n+        valid_t = torch.tensor([valid], device=\"cuda\", dtype=torch.int32)\n+        unpermute_tokens_in_expert_order(expert_out, inverse, valid_t, out)\n+        # Reference: fp64 sum in increasing local-expert order, rounded once to fp32.\n+        ref = torch.zeros(valid, hidden, device=\"cuda\", dtype=torch.float64)\n+        for lid in range(experts):\n+            p = inverse[:valid, lid].long()\n+            m = p >= 0\n+            ref[m] += expert_out[p[m]].double()\n+        assert torch.equal(out[:valid], ref.float())\n+        # Tokens past the live count are not written.\n+        assert torch.all(out[valid:] == 7.0)",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84/tests%2Funit_tests%2Finference%2Ftest_batch_invariant_live_rows.py",
+      "sha": "d4804e9fbfcc6c6e34e449174627a48b66dd4676",
+      "status": "added"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "would out_scale also need such bound?",
+      "created_at": "2026-10-21T17:18:48Z",
+      "diff_hunk": "@@ -771,14 +771,10 @@ def permute_and_quantize_mxfp8(\n     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)\n     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK\n \n-    if zero_padding:\n-        out_fp8 = torch.zeros(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n-    else:\n-        out_fp8 = torch.empty(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n+    # Only rows [0, n_used) are read by the grouped GEMMs. With zero_padding, the\n+    # alignment-padding rows among them are zeroed after the permute (below) instead of\n+    # memsetting the whole worst-case buffer every step.\n+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)\n     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#discussion_r4339782231",
+      "id": 4339782231,
+      "line": 778,
+      "original_line": 778,
+      "path": "megatron/core/inference/moe/permute.py",
+      "updated_at": "2026-10-21T17:18:48Z",
+      "user": {
+        "login": "YigongQin"
+      }
+    },
+    {
+      "body": "good catch we can do a follow up if it matters. I just took a benchmark and it doesn't save much of anything at realistic sizes",
+      "created_at": "2026-10-21T17:33:20Z",
+      "diff_hunk": "@@ -771,14 +771,10 @@ def permute_and_quantize_mxfp8(\n     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)\n     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK\n \n-    if zero_padding:\n-        out_fp8 = torch.zeros(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n-    else:\n-        out_fp8 = torch.empty(\n-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device\n-        )\n+    # Only rows [0, n_used) are read by the grouped GEMMs. With zero_padding, the\n+    # alignment-padding rows among them are zeroed after the permute (below) instead of\n+    # memsetting the whole worst-case buffer every step.\n+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)\n     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#discussion_r4339927335",
+      "id": 4339927335,
+      "line": 778,
+      "original_line": 778,
+      "path": "megatron/core/inference/moe/permute.py",
+      "updated_at": "2026-10-21T17:33:20Z",
+      "user": {
+        "login": "wdykas"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "This pull request requires additional validation before any workflows can run on NVIDIA's runners.\n\nPull request vetters can view their responsibilities [here](https://docs.gha-runners.nvidia.com/cpr/vetters).\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/contributors).\n",
+      "created_at": "2026-10-20T23:40:33Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6304282675",
+      "id": 6304282675,
+      "updated_at": "2026-10-20T23:40:33Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    },
+    {
+      "body": "/ok to test [b7305f3](https://github.com/NVIDIA/Megatron-LM/pull/8385/commits/b7305f3329a9732c715147c5b5de8930873dc282)",
+      "created_at": "2026-10-21T00:11:53Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6304704411",
+      "id": 6304704411,
+      "updated_at": "2026-10-21T00:11:53Z",
+      "user": {
+        "login": "wdykas"
+      }
+    },
+    {
+      "body": "/ok to test 1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "created_at": "2026-10-21T13:33:52Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6317396566",
+      "id": 6317396566,
+      "updated_at": "2026-10-21T13:33:52Z",
+      "user": {
+        "login": "wdykas"
+      }
+    },
+    {
+      "body": "🔄 Merge queue validation started!\n\nYou can track the progress here: https://github.com/NVIDIA/Megatron-LM/actions/runs/39735487352",
+      "created_at": "2026-10-22T06:41:14Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#issuecomment-6334512994",
+      "id": 6334512994,
+      "updated_at": "2026-10-22T06:41:14Z",
+      "user": {
+        "login": "nemo-automation-bot[bot]"
+      }
+    }
+  ],
+  "number": 8385,
+  "refs": {
+    "base": {
+      "commit": "fce1e2051f8ad37de5473ae103074748a8948ea5",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "1ae4a7c9b14853d1ff6d16099ce1e7e7a4301b84",
+      "repository": "wdykas/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5597967935",
+      "id": 5597967935,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-21T09:57:35Z",
+      "user": {
+        "login": "kvareddy"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5603518424",
+      "id": 5603518424,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-21T17:18:47Z",
+      "user": {
+        "login": "YigongQin"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5603588074",
+      "id": 5603588074,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-21T17:24:33Z",
+      "user": {
+        "login": "YigongQin"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5603698573",
+      "id": 5603698573,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-21T17:33:20Z",
+      "user": {
+        "login": "wdykas"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8385#pullrequestreview-5605510856",
+      "id": 5605510856,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-21T20:02:33Z",
+      "user": {
+        "login": "cspades"
+      }
+    }
+  ]
+}

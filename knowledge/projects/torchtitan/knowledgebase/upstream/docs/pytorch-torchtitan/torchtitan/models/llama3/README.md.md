@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: b663c1673c00d97864bb32f18029ce5ec40442e2
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/models/llama3/README.md
-raw_sha256: 7399af448d81366eb3b759d23f58dac99e4873d255ab8415b58ee5ab6059d74d
+raw_sha256: 4ef2c3f19fa7ca10b134e226025835be7ad89e465c5b1a4e38cc5e5b007760a3
 sources: []
-generated_body_sha256: 41e587bacb55da78d0b752540a2a6b458aefd53e32297a48c9663ab6260b3c64
+generated_body_sha256: 4d1dbf5bc0e4afab25a270cadcff6d93916e9671489480af80dc7b9e93a51292
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/llama3/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/b663c1673c00d97864bb32f18029ce5ec40442e2/torchtitan/models/llama3/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/llama3/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -28,8 +28,9 @@ Upstream source document; original commands, claims and links require their stat
 
 # Llama 3
 
-Llama 3 is the reference decoder model in torchtitan. Training recipes cover
-Llama 3.1 8B, 70B, and 405B, plus a small debug model used by CI.
+Llama 3 is the reference decoder model in torchtitan. Shipped training recipes
+are Llama 3.1 8B and 70B, plus a small debug model used by CI. 405B is a model
+flavor in `flavors.py` and has no shipped recipe.
 
 ## Download the tokenizer
 
@@ -40,8 +41,8 @@ Follow the access instructions on the official
 python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer
 ```
 
-The 8B, 70B, and 405B recipes expect tokenizer assets under
-`./assets/hf/Llama-3.1-8B` (and the matching 70B / 405B paths).
+The shipped 8B and 70B recipes expect tokenizer assets at
+`./assets/hf/Llama-3.1-8B` and `./assets/hf/Llama-3.1-70B`.
 
 ## Training
 

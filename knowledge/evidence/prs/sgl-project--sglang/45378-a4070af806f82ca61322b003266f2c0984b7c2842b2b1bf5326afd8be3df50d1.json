@@ -1,0 +1,1069 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "f59ad85952ac832c838e819097eeb7a39ea88db70113c6452e0abde45ae7bb63",
+      "isPrivate": false,
+      "numbers": [
+        45385,
+        45384,
+        45383,
+        45382,
+        45381,
+        45380,
+        45379,
+        45378
+      ],
+      "observed_at": "2026-11-04T18:37:54.448050+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4795,
+        "resetAt": "2026-11-04T18:59:40Z"
+      },
+      "repository": "sgl-project/sglang"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "1e894eb92d403062cf21e2910dba888cad7adb9e",
+      "baseRepository": {
+        "nameWithOwner": "sgl-project/sglang"
+      },
+      "body": "[by Claude Code]\n\n## Motivation\n\n**What this PR does.** An MTP verify step checks several draft tokens per request (4 with the cookbook flags). In every DeepSeek-V4 model, the C4 indexer scores each token against its request's compressed index keys to choose which keys to attend to. Today the indexer passes DeepGEMM's scoring kernel each draft token as if it were a separate request. Since all 4 draft tokens of a request share the same keys, the kernel reads that request's keys from memory 4 times. This PR passes each request once with all of its draft tokens (DeepGEMM's `next_n` mode). The kernel then reads each key once and scores all 4 tokens against it. The scores are bit-identical; only the memory traffic changes. #45251 made the same change for the DSv4.1 ratio-1/2 indexers.\n\n**Impact** (B200, DeepGEMM 0.2.2, 4 draft tokens):\n- **Accuracy:** the scores match the current path bit for bit in all 48 shapes tested (FP8 and FP4, 2 and 4 draft tokens, 8-128 requests, 8K-128K context), so model outputs do not change.\n- **Kernel speed:** 1.28x faster at 32 requests × 64K context (42.0 → 32.9 us), and 2.07x at 128 × 64K (186.3 → 90.2 us). At 16 or more requests it is never more than 1% slower in any of the 48 shapes.\n- **End to end (estimate, not measured):** about 1% faster verify steps for DeepSeek-V4-Flash at 32 requests × 64K context. On main this kernel takes 4.3% of a verify step's GPU time, and this PR cuts its time by 22% at that shape.\n\n## Modifications\n\n**+47 / −16 runtime code (3 files), +45 tests (1 file).** No kernel changes.\n\n- `group_verify_rows` (`dsv4/indexer.py`) reshapes the kernel inputs from one row per draft token to one row per request with `n` tokens: `q` to `[requests, n, ...]`, the lengths to `[requests, n]`, and the page table to one row per request. #45251's `paged_logits_args` (`v41_indexer/scoring.py`) now calls it too, so the reshaping lives in one place.\n- The C4 indexer metadata gets `rows_per_request` (`deepseek_v4_backend.py`), which reuses #45251's scheduling path unchanged.\n- The grouped path runs only for a static verify (fixed number of draft tokens per request) on the SM100 DeepGEMM kernels, with at least 16 requests. Below 16 requests at short context it was up to 1.2x slower than one row per token, so those batches keep the current path.\n\n## Accuracy Tests\n\nFor every shape it times, the script below checks that the grouped call's scores equal the per-token call's bit for bit in each token's valid range. This held for all 48 shapes on B200. Since top-k receives identical scores, I did not run an end-to-end accuracy test.\n\nCPU unit tests check that the reshaped inputs keep each token's query, length and page-table row, for FP8 and for an FP4 query/scale pair over a chunk of requests.\n\n## Speed Tests and Profiling\n\nPer-call time of the scoring kernel (`fp8_paged_mqa_logits`) from the script below (B200, DeepGEMM 0.2.2, FP8 cache, 4 draft tokens, 512 MB L2 flush before every call, median of 20 calls):\n\n| requests | context | one row per token (us) | grouped (us) |\n|---:|---:|---:|---:|\n| 16 | 8K | 10.3 | 10.3 |\n| 32 | 64K | 42.0 | 32.9 |\n| 32 | 128K | 77.7 | 55.4 |\n| 128 | 64K | 186.3 | 90.2 |\n\nFP4 is 0.62-0.90x at 64K and 128K. CUDA-event timing has a floor of about 10 us, so the short-context cells sit at that floor.\n\n```\npython bench_c4_grouped_verify.py --next-n 2 4 --requests 8 16 32 128 --context 8192 65536 131072\npython bench_c4_grouped_verify.py --fp4 --next-n 2 4 --requests 8 16 32 128 --context 8192 65536 131072\n```\n\n<details><summary><code>bench_c4_grouped_verify.py</code></summary>\n\n```python\n\"\"\"DeepSeek-V4 C4 indexer logits for a static verify, per row vs grouped (sglang #45378).\n\nChecks the grouped call's logits equal the per-row call's bit for bit in every row's\nvalid range, then times both (CUDA events, 512 MB L2 flush before every call). B200\nwith DeepGEMM and SGLang installed.\n\n  python bench_c4_grouped_verify.py --next-n 4 --requests 16 32 128 --context 8192 65536 131072\n  python bench_c4_grouped_verify.py --fp4 ...\n\"\"\"\n\nimport argparse\n\nimport deep_gemm\nimport torch\n\nfrom sglang.srt.layers.attention.dsv4.indexer import group_verify_rows\n\nBLOCK_KV, HEAD_DIM, HEADS = 64, 128, 64\n\n\ndef verify_inputs(fp4, requests, next_n, context):\n    \"\"\"C4 indexer inputs of a static verify: request-major rows, compressed lengths\n    (position + 1) // 4, a shuffled page table repeated per row.\"\"\"\n    torch.manual_seed(0)\n    rows, dev = requests * next_n, \"cuda\"\n    pages_per_seq = -(-(context // 4) // BLOCK_KV)\n    num_pages = requests * pages_per_seq\n    jitter = torch.randint(0, 64, (requests, 1))\n    positions = context - next_n - jitter + torch.arange(next_n)\n    lens = ((positions + 1) // 4).reshape(-1).to(torch.int32).to(dev)\n    table = torch.randperm(num_pages, device=dev, dtype=torch.int32).view(requests, -1)\n    q = torch.randn(rows, HEADS, HEAD_DIM, device=dev)\n    k = torch.randn(num_pages * BLOCK_KV, HEAD_DIM, device=dev)\n    weights = torch.randn(rows, HEADS, device=dev) / HEADS\n    if fp4:\n        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (\n            store_fp4_index_k_cache,\n        )\n        from sglang.kernels.ops.quantization.fp4_indexer_quant import (\n            quantize_fp4_indexer_tensor,\n        )\n\n        cache = torch.empty(num_pages, BLOCK_KV * 68, dtype=torch.uint8, device=dev)\n        store_fp4_index_k_cache(\n            k, cache, torch.arange(k.shape[0], device=dev), page_size=BLOCK_KV\n        )\n        q_fp4, q_sf = quantize_fp4_indexer_tensor(q)\n        q = (q_fp4.view(rows, 1, HEADS, 64), q_sf.view(rows, 1, HEADS))\n        cache = cache.view(num_pages, BLOCK_KV, 1, 68)\n    else:\n        scale = k.abs().amax(-1, keepdim=True) / 448.0\n        k_fp8 = (k / scale).to(torch.float8_e4m3fn)\n        cache = torch.cat(\n            (\n                k_fp8.view(torch.uint8).view(num_pages, -1),\n                scale.view(num_pages, -1).contiguous().view(torch.uint8),\n            ),\n            dim=1,\n        ).view(num_pages, BLOCK_KV, 1, HEAD_DIM + 4)\n        q = q.to(torch.float8_e4m3fn).unsqueeze(1)\n    return q, cache, weights, lens, table.repeat_interleave(next_n, dim=0)\n\n\ndef logits_call(fp4, q, cache, weights, lens, table, n):\n    \"\"\"The call run_paged_indexer makes with rows_per_request = n.\"\"\"\n    fn = deep_gemm.fp8_fp4_paged_mqa_logits if fp4 else deep_gemm.fp8_paged_mqa_logits\n    q, glens, gtable = group_verify_rows(q, lens.unsqueeze(-1), table, n)\n    schedule = deep_gemm.get_paged_mqa_logits_metadata(\n        lens.view(-1, n), BLOCK_KV, deep_gemm.get_num_sms()\n    )\n    max_len = table.shape[1] * BLOCK_KV\n    return lambda: fn(q, cache, weights, glens, gtable, schedule, max_len, False)\n\n\ndef cold_us(call, flush, iters=20):\n    times = []\n    for _ in range(iters + 3):\n        flush.zero_()\n        start, end = torch.cuda.Event(True), torch.cuda.Event(True)\n        start.record()\n        call()\n        end.record()\n        times.append((start, end))\n    torch.cuda.synchronize()\n    return sorted(s.elapsed_time(e) for s, e in times[3:])[iters // 2] * 1e3\n\n\ndef main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--fp4\", action=\"store_true\")\n    ap.add_argument(\"--next-n\", type=int, nargs=\"+\", default=[4])\n    ap.add_argument(\"--requests\", type=int, nargs=\"+\", default=[16, 32, 128])\n    ap.add_argument(\"--context\", type=int, nargs=\"+\", default=[8192, 65536, 131072])\n    args = ap.parse_args()\n    flush = torch.empty(512 << 20, dtype=torch.uint8, device=\"cuda\")\n    print(f\"{torch.cuda.get_device_name()}, DeepGEMM {deep_gemm.__version__}\")\n    print(\"| cache | next_n | requests | context | per row (us) | grouped (us) | ratio |\")\n    print(\"|---|---:|---:|---:|---:|---:|---:|\")\n    for n in args.next_n:\n        for requests in args.requests:\n            for context in args.context:\n                inputs = verify_inputs(args.fp4, requests, n, context)\n                per_row = logits_call(args.fp4, *inputs, 1)\n                grouped = logits_call(args.fp4, *inputs, n)\n                lens = inputs[3]\n                a, b = per_row(), grouped()\n                valid = torch.arange(a.shape[1], device=\"cuda\")[None] < lens[:, None]\n                assert torch.isfinite(a[valid]).all()\n                torch.testing.assert_close(b[valid], a[valid], atol=0, rtol=0)\n                t1, tn = cold_us(per_row, flush), cold_us(grouped, flush)\n                print(\n                    f\"| {'fp4' if args.fp4 else 'fp8'} | {n} | {requests} | {context} \"\n                    f\"| {t1:.1f} | {tn:.1f} | {tn / t1:.2f} |\",\n                    flush=True,\n                )\n                del inputs, a, b\n                torch.cuda.empty_cache()\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n</details>\n\n**End-to-end estimate (not measured).** The scoring kernel takes 4.3% of a verify step's GPU time in this profile, taken on main before this PR (DeepSeek-V4-Flash, B200 cookbook low-latency flags):\n\n```\npython -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4-Flash --trust-remote-code --tp 4 \\\n  --moe-runner-backend flashinfer_mxfp4 --speculative-algorithm EAGLE --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --disable-flashinfer-autotune \\\n  --swa-full-tokens-ratio 0.1\n```\n\nTo take the profile, send 32 streaming `/generate` requests with 65,536 random input ids each (`max_new_tokens` 2048, `ignore_eos`). Once every request has its first token, so the batch is in steady-state decode, POST `/start_profile` with `{\"num_steps\": 8, \"activities\": [\"GPU\"]}`. Over those 8 steps, `fp8_paged_mqa_logits` takes 4.3% of the GPU time. At 32 requests × 64K the grouped kernel takes 22% less time (42.0 → 32.9 us), so the estimate is 4.3% × 22% ≈ 1% of a verify step. I did not run an end-to-end benchmark.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #40008190095](https://github.com/sgl-project/sglang/actions/runs/40008190095)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #40008188982](https://github.com/sgl-project/sglang/actions/runs/40008188982)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #40008189135](https://github.com/sgl-project/sglang/actions/runs/40008189135)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "/tag-run-ci-label\n[by Claude Code] Triggering CI after trimming the tests to the CPU layout checks.",
+            "createdAt": "2026-10-20T22:14:53Z",
+            "databaseId": 6302978869,
+            "updatedAt": "2026-10-20T22:14:53Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6302978869"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "[by Claude Code] Addressed the review: the description now includes `bench_c4_grouped_verify.py` (inline, in a collapsed block), which checks bit-exactness and times both calls for every shape. The speed table comes from that script's run. The description also has the server launch and `/start_profile` steps behind the 4.3% share.",
+            "createdAt": "2026-10-21T14:29:35Z",
+            "databaseId": 6318572921,
+            "updatedAt": "2026-10-21T14:29:35Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6318572921"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "/rerun-failed-ci\n[by Claude Code] All three failures are outside this change: an NPU host pin-memory OOM (test_npu_expert_distribution_recorder_mode), an MI35x disaggregation CUDA OOM, and the Xeon CPU test_server_args failing while multimodal_gen's vsa import calls torch.cuda.",
+            "createdAt": "2026-10-21T15:10:44Z",
+            "databaseId": 6319387051,
+            "updatedAt": "2026-10-21T15:10:44Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6319387051"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "/rerun-failed-ci\n[by Claude Code] The AMD failures were the `_check` ImportError from main, fixed by #45676 (merged). The Xeon `test_server_args` failure is also from main and fails on other PRs.",
+            "createdAt": "2026-10-22T23:34:55Z",
+            "databaseId": 6353682755,
+            "updatedAt": "2026-10-22T23:34:55Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6353682755"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "/rerun-failed-ci\n[by Claude Code] base-b-test-1-gpu-large (0) hit the 60-minute step timeout on a slow runner: every test in the shard ran over its estimate (test_awq.py 1199 s vs 220 s estimated). None of its models use the DSv4 backend this PR touches.",
+            "createdAt": "2026-10-23T22:02:55Z",
+            "databaseId": 6375632240,
+            "updatedAt": "2026-10-23T22:02:55Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6375632240"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "/rerun-failed-ci\n[by Claude Code] Retrying now that the pr-test run has completed (the previous request arrived while it was still in progress). The only real failure is the base-b-test-1-gpu-large (0) step timeout on a slow runner; the other base-b shards were fail-fast skips.",
+            "createdAt": "2026-10-23T23:13:54Z",
+            "databaseId": 6376608090,
+            "updatedAt": "2026-10-23T23:13:54Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6376608090"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "/rerun-failed-ci\n[by Claude Code] base-b-test-1-gpu-large (0) timed out again, on h100-computable-c-gpu-1. The timeouts follow the runner pool, not this change: test_awq.py takes about 1050-1200 s on h100-computable-* runners (both attempts here, plus another PR on computable-a-gpu-7) against about 210-235 s on h100-novita runners (this PR on Oct 21, plus another PR today), which pushes the shard past 60 minutes.",
+            "createdAt": "2026-10-24T01:01:19Z",
+            "databaseId": 6377881355,
+            "updatedAt": "2026-10-24T01:01:19Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6377881355"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "/rerun-failed-ci\n[by Claude Code]",
+            "createdAt": "2026-10-24T02:12:09Z",
+            "databaseId": 6378604177,
+            "updatedAt": "2026-10-24T02:12:09Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6378604177"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXwxxpE=",
+          "hasNextPage": false
+        },
+        "totalCount": 8
+      },
+      "headRefOid": "7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+      "headRepository": {
+        "nameWithOwner": "akhilg-nv/sglang"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 45378,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "nvpohanh"
+            },
+            "body": "[by Claude Code] This review is done by agents. Please feel free to disagree if they do not make sense.\n\n[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe Accuracy Tests and Speed Tests sections give results, but others cannot rerun them. The description does not include:\n- the script and command for the per-call timing table (how the inputs are built, how L2 is flushed, and how time is measured);\n- the script for the B200 check that grouped and per-row logits are bit-identical (FP8 and FP4, `next_n` 2-4, 32 requests);\n- the server launch and profiling commands for the DeepSeek-V4-Flash TP4 profile (32 requests, 64K context) behind the 4.3% figure.\n\n**Fix**\n\nPlease link the two scripts (a gist is fine) and add the commands to the description.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "nvpohanh"
+                  },
+                  "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe new comments are longer than `.claude/rules/comment-style.md` allows (one or two lines, and no docstrings on internal helpers). This 4-line comment, the 3-line docstring on `_c4_indexer_groups_verify_rows` (line 1418), and the 5-line docstring on `group_verify_rows` (`dsv4/indexer.py` line 522) repeat what the PR description already says. They make the code harder to read.\n\n**Fix**\n\nKeep one short sentence for each, for example:\n\n```python\n# Measured on B200: below 16 requests, the grouped call is up to 1.2x slower\n# at short context.\n```\n\nUse `\"\"\"View rows_per_request consecutive rows as one next_n request for DeepGEMM.\"\"\"` for `group_verify_rows`. Drop the docstring on `_c4_indexer_groups_verify_rows`, or cut it to one line.",
+                  "createdAt": "2026-10-21T08:33:20Z",
+                  "databaseId": 4334669170,
+                  "diffHunk": "@@ -156,6 +156,11 @@\n SWA_WINDOW = 128\n DEFAULT_INDEX_TOPK = 512\n PAGE_INDEX_ALIGNED_SIZE = 64\n+# Fewest requests at which the C4 indexer scores a static verify per request.",
+                  "line": null,
+                  "originalLine": 159,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-21T08:33:20Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4334669170"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "nvpohanh"
+                  },
+                  "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\n`group_verify_rows` repeats the reshape in `DeepGEMMDecodeData.paged_logits_args` (`dsv4/v41_indexer/scoring.py` line 44). Both view `q` as `[requests, n, ...]`, view the lengths as `[requests, n]`, and take `table[::n]`. Both copies encode the same DeepGEMM `next_n` layout, so a later fix to one can miss the other.\n\n**Fix**\n\nMake `paged_logits_args` call this helper:\n\n```python\nreturn group_verify_rows(\n    (self.q_fp4[rows], self.q_sf[rows]),\n    metadata.compressed_seq_lens[rows],\n    metadata.page_table[rows],\n    metadata.rows_per_request,\n)\n```\n\n`v41_indexer` already imports from `dsv4/indexer.py`, so this adds no import cycle.",
+                  "createdAt": "2026-10-21T08:33:20Z",
+                  "databaseId": 4334669178,
+                  "diffHunk": "@@ -516,6 +516,24 @@ def topk_transform_paged_from_metadata(\n         )\n \n \n+def group_verify_rows(",
+                  "line": 519,
+                  "originalLine": 519,
+                  "path": "python/sglang/srt/layers/attention/dsv4/indexer.py",
+                  "updatedAt": "2026-10-21T08:33:20Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4334669178"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yMVQwODozMzoyMFrPAAAAAQJdzXo=",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5596988980,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-21T08:33:20Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#pullrequestreview-5596988980"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "akhilg-nv"
+                  },
+                  "body": "[by Claude Code] Done in e40a55d: the constant's comment is now two lines, and the docstring on `_c4_indexer_groups_verify_rows` is gone. `group_verify_rows` has the one-line docstring you suggested.",
+                  "createdAt": "2026-10-21T14:29:29Z",
+                  "databaseId": 4338087015,
+                  "diffHunk": "@@ -156,6 +156,11 @@\n SWA_WINDOW = 128\n DEFAULT_INDEX_TOPK = 512\n PAGE_INDEX_ALIGNED_SIZE = 64\n+# Fewest requests at which the C4 indexer scores a static verify per request.",
+                  "line": null,
+                  "originalLine": 159,
+                  "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+                  "updatedAt": "2026-10-21T14:29:29Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4338087015"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yMVQxNDoyOToyOVrPAAAAAQKR9Gc=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5601343770,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-21T14:29:29Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#pullrequestreview-5601343770"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "akhilg-nv"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "akhilg-nv"
+                  },
+                  "body": "[by Claude Code] Done in e40a55d: `paged_logits_args` now returns `group_verify_rows(...)`. The existing `TestGroupedVerifyRows` tests pass unchanged on B200.",
+                  "createdAt": "2026-10-21T14:29:31Z",
+                  "databaseId": 4338087443,
+                  "diffHunk": "@@ -516,6 +516,24 @@ def topk_transform_paged_from_metadata(\n         )\n \n \n+def group_verify_rows(",
+                  "line": 519,
+                  "originalLine": 519,
+                  "path": "python/sglang/srt/layers/attention/dsv4/indexer.py",
+                  "updatedAt": "2026-10-21T14:29:32Z",
+                  "url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4338087443"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yMVQxNDoyOTozMVrPAAAAAQKR9hM=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5601344289,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-21T14:29:31Z",
+            "url": "https://github.com/sgl-project/sglang/pull/45378#pullrequestreview-5601344289"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yMVQxNDoyOTozMVq0MjAyNi0xMC0yMVQxNDoyOTozMVrPAAAAAU3duyE=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "OPEN",
+      "title": "[Perf] deepseek-v4: Score a request's verify rows as one request in the C4 indexer",
+      "updatedAt": "2026-10-26T03:50:26Z",
+      "url": "https://github.com/sgl-project/sglang/pull/45378"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/45378/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/45378/commits"
+      },
+      "html": {
+        "href": "https://github.com/sgl-project/sglang/pull/45378"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/issues/45378"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/45378/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/pulls/45378"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/sgl-project/sglang/statuses/7b11e353c28b43d82f9f8e26eac7b28aff6fed91"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 92,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "sgl-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/sgl-project/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/sgl-project/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/sgl-project/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/sgl-project/sglang/branches{/branch}",
+        "clone_url": "https://github.com/sgl-project/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/sgl-project/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/sgl-project/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/sgl-project/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/sgl-project/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/sgl-project/sglang/contributors",
+        "created_at": "2024-01-08T04:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/sgl-project/sglang/deployments",
+        "description": "SGLang is a high-performance serving framework for large language models and multimodal models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/sgl-project/sglang/downloads",
+        "events_url": "https://api.github.com/repos/sgl-project/sglang/events",
+        "fork": false,
+        "forks": 10143,
+        "forks_count": 10143,
+        "forks_url": "https://api.github.com/repos/sgl-project/sglang/forks",
+        "full_name": "sgl-project/sglang",
+        "git_commits_url": "https://api.github.com/repos/sgl-project/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/sgl-project/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/sgl-project/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/sgl-project/sglang.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": false,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://sglang.io",
+        "hooks_url": "https://api.github.com/repos/sgl-project/sglang/hooks",
+        "html_url": "https://github.com/sgl-project/sglang",
+        "id": 740303686,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/sgl-project/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/sgl-project/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/sgl-project/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/sgl-project/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/sgl-project/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/sgl-project/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/sgl-project/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/sgl-project/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOLCAjRg",
+        "notifications_url": "https://api.github.com/repos/sgl-project/sglang/notifications{?since,all,participating}",
+        "open_issues": 6460,
+        "open_issues_count": 6460,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+          "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/sgl-project/followers",
+          "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/sgl-project",
+          "id": 147780389,
+          "login": "sgl-project",
+          "node_id": "O_kgDOCM7zJQ",
+          "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+          "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+          "repos_url": "https://api.github.com/users/sgl-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/sgl-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/sgl-project/sglang/pulls{/number}",
+        "pushed_at": "2026-11-04T18:35:55Z",
+        "releases_url": "https://api.github.com/repos/sgl-project/sglang/releases{/id}",
+        "size": 502396,
+        "ssh_url": "git@github.com:sgl-project/sglang.git",
+        "stargazers_count": 38457,
+        "stargazers_url": "https://api.github.com/repos/sgl-project/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/sgl-project/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/sgl-project/sglang/subscription",
+        "svn_url": "https://github.com/sgl-project/sglang",
+        "tags_url": "https://api.github.com/repos/sgl-project/sglang/tags",
+        "teams_url": "https://api.github.com/repos/sgl-project/sglang/teams",
+        "topics": [
+          "attention",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "diffusion",
+          "glm",
+          "gpt-oss",
+          "inference",
+          "llama",
+          "llm",
+          "minimax",
+          "moe",
+          "qwen",
+          "qwen-image",
+          "reinforcement-learning",
+          "transformer",
+          "vlm",
+          "wan"
+        ],
+        "trees_url": "https://api.github.com/repos/sgl-project/sglang/git/trees{/sha}",
+        "updated_at": "2026-11-04T18:33:27Z",
+        "url": "https://api.github.com/repos/sgl-project/sglang",
+        "visibility": "public",
+        "watchers": 38457,
+        "watchers_count": 38457,
+        "web_commit_signoff_required": false
+      },
+      "sha": "1e894eb92d403062cf21e2910dba888cad7adb9e",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/147780389?v=4",
+        "events_url": "https://api.github.com/users/sgl-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/sgl-project/followers",
+        "following_url": "https://api.github.com/users/sgl-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/sgl-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/sgl-project",
+        "id": 147780389,
+        "login": "sgl-project",
+        "node_id": "O_kgDOCM7zJQ",
+        "organizations_url": "https://api.github.com/users/sgl-project/orgs",
+        "received_events_url": "https://api.github.com/users/sgl-project/received_events",
+        "repos_url": "https://api.github.com/users/sgl-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/sgl-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/sgl-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/sgl-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "[by Claude Code]\n\n## Motivation\n\n**What this PR does.** An MTP verify step checks several draft tokens per request (4 with the cookbook flags). In every DeepSeek-V4 model, the C4 indexer scores each token against its request's compressed index keys to choose which keys to attend to. Today the indexer passes DeepGEMM's scoring kernel each draft token as if it were a separate request. Since all 4 draft tokens of a request share the same keys, the kernel reads that request's keys from memory 4 times. This PR passes each request once with all of its draft tokens (DeepGEMM's `next_n` mode). The kernel then reads each key once and scores all 4 tokens against it. The scores are bit-identical; only the memory traffic changes. #45251 made the same change for the DSv4.1 ratio-1/2 indexers.\n\n**Impact** (B200, DeepGEMM 0.2.2, 4 draft tokens):\n- **Accuracy:** the scores match the current path bit for bit in all 48 shapes tested (FP8 and FP4, 2 and 4 draft tokens, 8-128 requests, 8K-128K context), so model outputs do not change.\n- **Kernel speed:** 1.28x faster at 32 requests × 64K context (42.0 → 32.9 us), and 2.07x at 128 × 64K (186.3 → 90.2 us). At 16 or more requests it is never more than 1% slower in any of the 48 shapes.\n- **End to end (estimate, not measured):** about 1% faster verify steps for DeepSeek-V4-Flash at 32 requests × 64K context. On main this kernel takes 4.3% of a verify step's GPU time, and this PR cuts its time by 22% at that shape.\n\n## Modifications\n\n**+47 / −16 runtime code (3 files), +45 tests (1 file).** No kernel changes.\n\n- `group_verify_rows` (`dsv4/indexer.py`) reshapes the kernel inputs from one row per draft token to one row per request with `n` tokens: `q` to `[requests, n, ...]`, the lengths to `[requests, n]`, and the page table to one row per request. #45251's `paged_logits_args` (`v41_indexer/scoring.py`) now calls it too, so the reshaping lives in one place.\n- The C4 indexer metadata gets `rows_per_request` (`deepseek_v4_backend.py`), which reuses #45251's scheduling path unchanged.\n- The grouped path runs only for a static verify (fixed number of draft tokens per request) on the SM100 DeepGEMM kernels, with at least 16 requests. Below 16 requests at short context it was up to 1.2x slower than one row per token, so those batches keep the current path.\n\n## Accuracy Tests\n\nFor every shape it times, the script below checks that the grouped call's scores equal the per-token call's bit for bit in each token's valid range. This held for all 48 shapes on B200. Since top-k receives identical scores, I did not run an end-to-end accuracy test.\n\nCPU unit tests check that the reshaped inputs keep each token's query, length and page-table row, for FP8 and for an FP4 query/scale pair over a chunk of requests.\n\n## Speed Tests and Profiling\n\nPer-call time of the scoring kernel (`fp8_paged_mqa_logits`) from the script below (B200, DeepGEMM 0.2.2, FP8 cache, 4 draft tokens, 512 MB L2 flush before every call, median of 20 calls):\n\n| requests | context | one row per token (us) | grouped (us) |\n|---:|---:|---:|---:|\n| 16 | 8K | 10.3 | 10.3 |\n| 32 | 64K | 42.0 | 32.9 |\n| 32 | 128K | 77.7 | 55.4 |\n| 128 | 64K | 186.3 | 90.2 |\n\nFP4 is 0.62-0.90x at 64K and 128K. CUDA-event timing has a floor of about 10 us, so the short-context cells sit at that floor.\n\n```\npython bench_c4_grouped_verify.py --next-n 2 4 --requests 8 16 32 128 --context 8192 65536 131072\npython bench_c4_grouped_verify.py --fp4 --next-n 2 4 --requests 8 16 32 128 --context 8192 65536 131072\n```\n\n<details><summary><code>bench_c4_grouped_verify.py</code></summary>\n\n```python\n\"\"\"DeepSeek-V4 C4 indexer logits for a static verify, per row vs grouped (sglang #45378).\n\nChecks the grouped call's logits equal the per-row call's bit for bit in every row's\nvalid range, then times both (CUDA events, 512 MB L2 flush before every call). B200\nwith DeepGEMM and SGLang installed.\n\n  python bench_c4_grouped_verify.py --next-n 4 --requests 16 32 128 --context 8192 65536 131072\n  python bench_c4_grouped_verify.py --fp4 ...\n\"\"\"\n\nimport argparse\n\nimport deep_gemm\nimport torch\n\nfrom sglang.srt.layers.attention.dsv4.indexer import group_verify_rows\n\nBLOCK_KV, HEAD_DIM, HEADS = 64, 128, 64\n\n\ndef verify_inputs(fp4, requests, next_n, context):\n    \"\"\"C4 indexer inputs of a static verify: request-major rows, compressed lengths\n    (position + 1) // 4, a shuffled page table repeated per row.\"\"\"\n    torch.manual_seed(0)\n    rows, dev = requests * next_n, \"cuda\"\n    pages_per_seq = -(-(context // 4) // BLOCK_KV)\n    num_pages = requests * pages_per_seq\n    jitter = torch.randint(0, 64, (requests, 1))\n    positions = context - next_n - jitter + torch.arange(next_n)\n    lens = ((positions + 1) // 4).reshape(-1).to(torch.int32).to(dev)\n    table = torch.randperm(num_pages, device=dev, dtype=torch.int32).view(requests, -1)\n    q = torch.randn(rows, HEADS, HEAD_DIM, device=dev)\n    k = torch.randn(num_pages * BLOCK_KV, HEAD_DIM, device=dev)\n    weights = torch.randn(rows, HEADS, device=dev) / HEADS\n    if fp4:\n        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (\n            store_fp4_index_k_cache,\n        )\n        from sglang.kernels.ops.quantization.fp4_indexer_quant import (\n            quantize_fp4_indexer_tensor,\n        )\n\n        cache = torch.empty(num_pages, BLOCK_KV * 68, dtype=torch.uint8, device=dev)\n        store_fp4_index_k_cache(\n            k, cache, torch.arange(k.shape[0], device=dev), page_size=BLOCK_KV\n        )\n        q_fp4, q_sf = quantize_fp4_indexer_tensor(q)\n        q = (q_fp4.view(rows, 1, HEADS, 64), q_sf.view(rows, 1, HEADS))\n        cache = cache.view(num_pages, BLOCK_KV, 1, 68)\n    else:\n        scale = k.abs().amax(-1, keepdim=True) / 448.0\n        k_fp8 = (k / scale).to(torch.float8_e4m3fn)\n        cache = torch.cat(\n            (\n                k_fp8.view(torch.uint8).view(num_pages, -1),\n                scale.view(num_pages, -1).contiguous().view(torch.uint8),\n            ),\n            dim=1,\n        ).view(num_pages, BLOCK_KV, 1, HEAD_DIM + 4)\n        q = q.to(torch.float8_e4m3fn).unsqueeze(1)\n    return q, cache, weights, lens, table.repeat_interleave(next_n, dim=0)\n\n\ndef logits_call(fp4, q, cache, weights, lens, table, n):\n    \"\"\"The call run_paged_indexer makes with rows_per_request = n.\"\"\"\n    fn = deep_gemm.fp8_fp4_paged_mqa_logits if fp4 else deep_gemm.fp8_paged_mqa_logits\n    q, glens, gtable = group_verify_rows(q, lens.unsqueeze(-1), table, n)\n    schedule = deep_gemm.get_paged_mqa_logits_metadata(\n        lens.view(-1, n), BLOCK_KV, deep_gemm.get_num_sms()\n    )\n    max_len = table.shape[1] * BLOCK_KV\n    return lambda: fn(q, cache, weights, glens, gtable, schedule, max_len, False)\n\n\ndef cold_us(call, flush, iters=20):\n    times = []\n    for _ in range(iters + 3):\n        flush.zero_()\n        start, end = torch.cuda.Event(True), torch.cuda.Event(True)\n        start.record()\n        call()\n        end.record()\n        times.append((start, end))\n    torch.cuda.synchronize()\n    return sorted(s.elapsed_time(e) for s, e in times[3:])[iters // 2] * 1e3\n\n\ndef main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--fp4\", action=\"store_true\")\n    ap.add_argument(\"--next-n\", type=int, nargs=\"+\", default=[4])\n    ap.add_argument(\"--requests\", type=int, nargs=\"+\", default=[16, 32, 128])\n    ap.add_argument(\"--context\", type=int, nargs=\"+\", default=[8192, 65536, 131072])\n    args = ap.parse_args()\n    flush = torch.empty(512 << 20, dtype=torch.uint8, device=\"cuda\")\n    print(f\"{torch.cuda.get_device_name()}, DeepGEMM {deep_gemm.__version__}\")\n    print(\"| cache | next_n | requests | context | per row (us) | grouped (us) | ratio |\")\n    print(\"|---|---:|---:|---:|---:|---:|---:|\")\n    for n in args.next_n:\n        for requests in args.requests:\n            for context in args.context:\n                inputs = verify_inputs(args.fp4, requests, n, context)\n                per_row = logits_call(args.fp4, *inputs, 1)\n                grouped = logits_call(args.fp4, *inputs, n)\n                lens = inputs[3]\n                a, b = per_row(), grouped()\n                valid = torch.arange(a.shape[1], device=\"cuda\")[None] < lens[:, None]\n                assert torch.isfinite(a[valid]).all()\n                torch.testing.assert_close(b[valid], a[valid], atol=0, rtol=0)\n                t1, tn = cold_us(per_row, flush), cold_us(grouped, flush)\n                print(\n                    f\"| {'fp4' if args.fp4 else 'fp8'} | {n} | {requests} | {context} \"\n                    f\"| {t1:.1f} | {tn:.1f} | {tn / t1:.2f} |\",\n                    flush=True,\n                )\n                del inputs, a, b\n                torch.cuda.empty_cache()\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n</details>\n\n**End-to-end estimate (not measured).** The scoring kernel takes 4.3% of a verify step's GPU time in this profile, taken on main before this PR (DeepSeek-V4-Flash, B200 cookbook low-latency flags):\n\n```\npython -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4-Flash --trust-remote-code --tp 4 \\\n  --moe-runner-backend flashinfer_mxfp4 --speculative-algorithm EAGLE --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --disable-flashinfer-autotune \\\n  --swa-full-tokens-ratio 0.1\n```\n\nTo take the profile, send 32 streaming `/generate` requests with 65,536 random input ids each (`max_new_tokens` 2048, `ignore_eos`). Once every request has its first token, so the batch is in steady-state decode, POST `/start_profile` with `{\"num_steps\": 8, \"activities\": [\"GPU\"]}`. Over those 8 steps, `fp8_paged_mqa_logits` takes 4.3% of the GPU time. At 32 requests × 64K the grouped kernel takes 22% less time (42.0 → 32.9 us), so the estimate is 4.3% × 22% ≈ 1% of a verify step. I did not run an end-to-end benchmark.\n\n## Checklist\n\n- [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).\n- [x] Add unit tests according to the [Run and add unit tests](https://docs.sglang.io/developer_guide/contribution_guide.html#run-and-add-unit-tests).\n- [ ] Update documentation according to [Write documentations](https://docs.sglang.io/developer_guide/contribution_guide.html#write-documentations).\n- [x] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.io/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.io/developer_guide/contribution_guide.html#benchmark-the-speed).\n- [x] Follow the SGLang code style [guidance](https://docs.sglang.io/developer_guide/contribution_guide.html#code-style-guidance).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- pr-states:start -->\n---\n### CI States\n\nLatest PR Test (Base): <!-- slot:pr-test:start -->:white_check_mark: [Run #40008190095](https://github.com/sgl-project/sglang/actions/runs/40008190095)<!-- slot:pr-test:end -->\nLatest PR Test (Extra): <!-- slot:pr-test-extra:start -->:x: [Run #40008188982](https://github.com/sgl-project/sglang/actions/runs/40008188982)<!-- slot:pr-test-extra:end -->\nLatest PR Test (AMD ROCm 10): <!-- slot:pr-test-amd:start -->:x: [Run #40008189135](https://github.com/sgl-project/sglang/actions/runs/40008189135)<!-- slot:pr-test-amd:end -->\n<!-- pr-states:end -->\n",
+    "changed_files": 4,
+    "closed_at": null,
+    "comments": 8,
+    "comments_url": "https://api.github.com/repos/sgl-project/sglang/issues/45378/comments",
+    "commits": 3,
+    "commits_url": "https://api.github.com/repos/sgl-project/sglang/pulls/45378/commits",
+    "created_at": "2026-10-20T10:47:36Z",
+    "deletions": 16,
+    "diff_url": "https://github.com/sgl-project/sglang/pull/45378.diff",
+    "draft": false,
+    "head": {
+      "label": "akhilg-nv:dsv4-native-verify-indexer",
+      "ref": "dsv4-native-verify-indexer",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/akhilg-nv/sglang/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/akhilg-nv/sglang/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/akhilg-nv/sglang/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/akhilg-nv/sglang/branches{/branch}",
+        "clone_url": "https://github.com/akhilg-nv/sglang.git",
+        "collaborators_url": "https://api.github.com/repos/akhilg-nv/sglang/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/akhilg-nv/sglang/comments{/number}",
+        "commits_url": "https://api.github.com/repos/akhilg-nv/sglang/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/akhilg-nv/sglang/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/akhilg-nv/sglang/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/akhilg-nv/sglang/contributors",
+        "created_at": "2025-10-15T23:06:31Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/akhilg-nv/sglang/deployments",
+        "description": "SGLang is a fast serving framework for large language models and vision language models.",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/akhilg-nv/sglang/downloads",
+        "events_url": "https://api.github.com/repos/akhilg-nv/sglang/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/akhilg-nv/sglang/forks",
+        "full_name": "akhilg-nv/sglang",
+        "git_commits_url": "https://api.github.com/repos/akhilg-nv/sglang/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/akhilg-nv/sglang/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/akhilg-nv/sglang/git/tags{/sha}",
+        "git_url": "git://github.com/akhilg-nv/sglang.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.sglang.ai/",
+        "hooks_url": "https://api.github.com/repos/akhilg-nv/sglang/hooks",
+        "html_url": "https://github.com/akhilg-nv/sglang",
+        "id": 1077193045,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/akhilg-nv/sglang/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/akhilg-nv/sglang/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/akhilg-nv/sglang/issues{/number}",
+        "keys_url": "https://api.github.com/repos/akhilg-nv/sglang/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/akhilg-nv/sglang/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/akhilg-nv/sglang/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/akhilg-nv/sglang/merges",
+        "milestones_url": "https://api.github.com/repos/akhilg-nv/sglang/milestones{/number}",
+        "mirror_url": null,
+        "name": "sglang",
+        "node_id": "R_kgDOQDSpVQ",
+        "notifications_url": "https://api.github.com/repos/akhilg-nv/sglang/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/165961486?v=4",
+          "events_url": "https://api.github.com/users/akhilg-nv/events{/privacy}",
+          "followers_url": "https://api.github.com/users/akhilg-nv/followers",
+          "following_url": "https://api.github.com/users/akhilg-nv/following{/other_user}",
+          "gists_url": "https://api.github.com/users/akhilg-nv/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/akhilg-nv",
+          "id": 165961486,
+          "login": "akhilg-nv",
+          "node_id": "U_kgDOCeRfDg",
+          "organizations_url": "https://api.github.com/users/akhilg-nv/orgs",
+          "received_events_url": "https://api.github.com/users/akhilg-nv/received_events",
+          "repos_url": "https://api.github.com/users/akhilg-nv/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/akhilg-nv/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/akhilg-nv/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/akhilg-nv",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/akhilg-nv/sglang/pulls{/number}",
+        "pushed_at": "2026-11-04T14:04:41Z",
+        "releases_url": "https://api.github.com/repos/akhilg-nv/sglang/releases{/id}",
+        "size": 332288,
+        "ssh_url": "git@github.com:akhilg-nv/sglang.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/akhilg-nv/sglang/stargazers",
+        "statuses_url": "https://api.github.com/repos/akhilg-nv/sglang/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/akhilg-nv/sglang/subscribers",
+        "subscription_url": "https://api.github.com/repos/akhilg-nv/sglang/subscription",
+        "svn_url": "https://github.com/akhilg-nv/sglang",
+        "tags_url": "https://api.github.com/repos/akhilg-nv/sglang/tags",
+        "teams_url": "https://api.github.com/repos/akhilg-nv/sglang/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/akhilg-nv/sglang/git/trees{/sha}",
+        "updated_at": "2026-09-22T19:23:10Z",
+        "url": "https://api.github.com/repos/akhilg-nv/sglang",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/165961486?v=4",
+        "events_url": "https://api.github.com/users/akhilg-nv/events{/privacy}",
+        "followers_url": "https://api.github.com/users/akhilg-nv/followers",
+        "following_url": "https://api.github.com/users/akhilg-nv/following{/other_user}",
+        "gists_url": "https://api.github.com/users/akhilg-nv/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/akhilg-nv",
+        "id": 165961486,
+        "login": "akhilg-nv",
+        "node_id": "U_kgDOCeRfDg",
+        "organizations_url": "https://api.github.com/users/akhilg-nv/orgs",
+        "received_events_url": "https://api.github.com/users/akhilg-nv/received_events",
+        "repos_url": "https://api.github.com/users/akhilg-nv/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/akhilg-nv/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/akhilg-nv/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/akhilg-nv",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/sgl-project/sglang/pull/45378",
+    "id": 4934629605,
+    "issue_url": "https://api.github.com/repos/sgl-project/sglang/issues/45378",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "c2e0c6",
+        "default": false,
+        "description": "",
+        "id": 8072782154,
+        "name": "deepseek",
+        "node_id": "LA_kwDOLCAjRs8AAAAB4SzhSg",
+        "url": "https://api.github.com/repos/sgl-project/sglang/labels/deepseek"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "9FE30D",
+        "default": false,
+        "description": "CI: run the baseline test suite on this PR",
+        "id": 9283445059,
+        "name": "run-ci",
+        "node_id": "LA_kwDOLCAjRs8AAAACKVYhQw",
+        "url": "https://api.github.com/repos/sgl-project/sglang/labels/run-ci"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOLCAjRs8AAAABJiB45Q",
+    "number": 45378,
+    "patch_url": "https://github.com/sgl-project/sglang/pull/45378.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/3349073?v=4",
+        "events_url": "https://api.github.com/users/HaiShaw/events{/privacy}",
+        "followers_url": "https://api.github.com/users/HaiShaw/followers",
+        "following_url": "https://api.github.com/users/HaiShaw/following{/other_user}",
+        "gists_url": "https://api.github.com/users/HaiShaw/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/HaiShaw",
+        "id": 3349073,
+        "login": "HaiShaw",
+        "node_id": "MDQ6VXNlcjMzNDkwNzM=",
+        "organizations_url": "https://api.github.com/users/HaiShaw/orgs",
+        "received_events_url": "https://api.github.com/users/HaiShaw/received_events",
+        "repos_url": "https://api.github.com/users/HaiShaw/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/HaiShaw/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/HaiShaw/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/HaiShaw",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/11166516?v=4",
+        "events_url": "https://api.github.com/users/hebiao064/events{/privacy}",
+        "followers_url": "https://api.github.com/users/hebiao064/followers",
+        "following_url": "https://api.github.com/users/hebiao064/following{/other_user}",
+        "gists_url": "https://api.github.com/users/hebiao064/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/hebiao064",
+        "id": 11166516,
+        "login": "hebiao064",
+        "node_id": "MDQ6VXNlcjExMTY2NTE2",
+        "organizations_url": "https://api.github.com/users/hebiao064/orgs",
+        "received_events_url": "https://api.github.com/users/hebiao064/received_events",
+        "repos_url": "https://api.github.com/users/hebiao064/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/hebiao064/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/hebiao064/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/hebiao064",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/15100009?v=4",
+        "events_url": "https://api.github.com/users/merrymercy/events{/privacy}",
+        "followers_url": "https://api.github.com/users/merrymercy/followers",
+        "following_url": "https://api.github.com/users/merrymercy/following{/other_user}",
+        "gists_url": "https://api.github.com/users/merrymercy/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/merrymercy",
+        "id": 15100009,
+        "login": "merrymercy",
+        "node_id": "MDQ6VXNlcjE1MTAwMDA5",
+        "organizations_url": "https://api.github.com/users/merrymercy/orgs",
+        "received_events_url": "https://api.github.com/users/merrymercy/received_events",
+        "repos_url": "https://api.github.com/users/merrymercy/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/merrymercy/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/merrymercy/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/merrymercy",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/26454835?v=4",
+        "events_url": "https://api.github.com/users/ispobock/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ispobock/followers",
+        "following_url": "https://api.github.com/users/ispobock/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ispobock/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ispobock",
+        "id": 26454835,
+        "login": "ispobock",
+        "node_id": "MDQ6VXNlcjI2NDU0ODM1",
+        "organizations_url": "https://api.github.com/users/ispobock/orgs",
+        "received_events_url": "https://api.github.com/users/ispobock/received_events",
+        "repos_url": "https://api.github.com/users/ispobock/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ispobock/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ispobock/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ispobock",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/56809903?v=4",
+        "events_url": "https://api.github.com/users/Fridge003/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Fridge003/followers",
+        "following_url": "https://api.github.com/users/Fridge003/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Fridge003/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Fridge003",
+        "id": 56809903,
+        "login": "Fridge003",
+        "node_id": "MDQ6VXNlcjU2ODA5OTAz",
+        "organizations_url": "https://api.github.com/users/Fridge003/orgs",
+        "received_events_url": "https://api.github.com/users/Fridge003/received_events",
+        "repos_url": "https://api.github.com/users/Fridge003/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Fridge003/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Fridge003/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Fridge003",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/90088090?v=4",
+        "events_url": "https://api.github.com/users/Qiaolin-Yu/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Qiaolin-Yu/followers",
+        "following_url": "https://api.github.com/users/Qiaolin-Yu/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Qiaolin-Yu/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Qiaolin-Yu",
+        "id": 90088090,
+        "login": "Qiaolin-Yu",
+        "node_id": "MDQ6VXNlcjkwMDg4MDkw",
+        "organizations_url": "https://api.github.com/users/Qiaolin-Yu/orgs",
+        "received_events_url": "https://api.github.com/users/Qiaolin-Yu/received_events",
+        "repos_url": "https://api.github.com/users/Qiaolin-Yu/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Qiaolin-Yu/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Qiaolin-Yu/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Qiaolin-Yu",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/sgl-project/sglang/pulls/comments{/number}",
+    "review_comments": 4,
+    "review_comments_url": "https://api.github.com/repos/sgl-project/sglang/pulls/45378/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/sgl-project/sglang/statuses/7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+    "title": "[Perf] deepseek-v4: Score a request's verify rows as one request in the C4 indexer",
+    "updated_at": "2026-10-26T03:50:26Z",
+    "url": "https://api.github.com/repos/sgl-project/sglang/pulls/45378",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/165961486?v=4",
+      "events_url": "https://api.github.com/users/akhilg-nv/events{/privacy}",
+      "followers_url": "https://api.github.com/users/akhilg-nv/followers",
+      "following_url": "https://api.github.com/users/akhilg-nv/following{/other_user}",
+      "gists_url": "https://api.github.com/users/akhilg-nv/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/akhilg-nv",
+      "id": 165961486,
+      "login": "akhilg-nv",
+      "node_id": "U_kgDOCeRfDg",
+      "organizations_url": "https://api.github.com/users/akhilg-nv/orgs",
+      "received_events_url": "https://api.github.com/users/akhilg-nv/received_events",
+      "repos_url": "https://api.github.com/users/akhilg-nv/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/akhilg-nv/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/akhilg-nv/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/akhilg-nv",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 18,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py",
+      "changes": 20,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py?ref=7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+      "deletions": 2,
+      "filename": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "patch": "@@ -160,6 +160,9 @@\n SWA_WINDOW = 128\n DEFAULT_INDEX_TOPK = 512\n PAGE_INDEX_ALIGNED_SIZE = 64\n+# Measured on B200: below 16 requests, the grouped C4 verify call is up to 1.2x\n+# slower at short context.\n+C4_GROUPED_VERIFY_MIN_REQUESTS = 16\n \n \n def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:\n@@ -1474,6 +1477,15 @@ def _make_target_verify_c128_metadata(\n             online_state_slot_offset=online_c128_state_slot_offset,\n         )\n \n+    def _c4_indexer_groups_verify_rows(self, bs: int) -> bool:\n+        return (\n+            bs >= C4_GROUPED_VERIFY_MIN_REQUESTS\n+            and get_platform().is_sm100\n+            and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()\n+            and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()\n+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()\n+        )\n+\n     def init_forward_metadata_indexer(\n         self,\n         core_attn_metadata: DSV4AttnMetadata,\n@@ -2256,9 +2268,14 @@ def make_forward_metadata_from_raw_verify(\n             need_compress=True,\n             num_groups=bs,\n         )\n+        rows_per_request = 1 if is_ragged else num_draft_tokens\n         indexer_metadata = (\n             self.init_forward_metadata_indexer(\n-                core_attn_metadata, use_prefill_cuda_graph=graph_backed\n+                core_attn_metadata,\n+                use_prefill_cuda_graph=graph_backed,\n+                rows_per_request=(\n+                    rows_per_request if self._c4_indexer_groups_verify_rows(bs) else 1\n+                ),\n             )\n             if self.has_c4\n             else None\n@@ -2281,7 +2298,6 @@ def make_forward_metadata_from_raw_verify(\n         if c128_compress_metadata is None and self.has_c128:\n             c128_compress_metadata = create(compress_ratio=128)\n         low = core_attn_metadata.low_ratios\n-        rows_per_request = 1 if is_ragged else num_draft_tokens\n         return DSV4Metadata(\n             core_attn_metadata,\n             indexer_metadata,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdeepseek_v4_backend.py",
+      "sha": "dc8385607dd7b26ca5d1debdc3bf9f4fd43a38ae",
+      "status": "modified"
+    },
+    {
+      "additions": 22,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Findexer.py",
+      "changes": 25,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Findexer.py?ref=7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+      "deletions": 3,
+      "filename": "python/sglang/srt/layers/attention/dsv4/indexer.py",
+      "patch": "@@ -516,6 +516,20 @@ def topk_transform_paged_from_metadata(\n         )\n \n \n+def group_verify_rows(\n+    q, lens: torch.Tensor, table: torch.Tensor, rows_per_request: int\n+):\n+    \"\"\"View rows_per_request consecutive rows as one next_n request for DeepGEMM.\"\"\"\n+    n = rows_per_request\n+    if n == 1:\n+        return q, lens, table\n+    if isinstance(q, tuple):\n+        q = tuple(t.view(-1, n, *t.shape[2:]) for t in q)\n+    else:\n+        q = q.view(-1, n, *q.shape[2:])\n+    return q, lens.view(-1, n), table[::n]\n+\n+\n class C4IndexerBackendMixin:\n     def __init__(self):\n         super().__init__()\n@@ -1085,13 +1099,18 @@ def run_paged_indexer(\n                 metadata: torch.Tensor,\n                 topk_plan: Optional[torch.Tensor] = None,\n             ) -> None:\n-                row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]\n+                row_q, lens, table = group_verify_rows(\n+                    (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows],\n+                    _c4sl[rows],\n+                    page_table[rows],\n+                    indexer_metadata.rows_per_request,\n+                )\n                 logits = fn(\n                     row_q,\n                     c4_indexer_kv_cache,\n                     weights[rows],\n-                    _c4sl[rows],\n-                    page_table[rows],\n+                    lens,\n+                    table,\n                     metadata,\n                     indexer_metadata.max_compressed_seq_len,\n                     False,",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Findexer.py",
+      "sha": "8c564467acb2d0d5a8c2c12f304b52d773a74d95",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fscoring.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fscoring.py?ref=7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+      "deletions": 11,
+      "filename": "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py",
+      "patch": "@@ -22,6 +22,7 @@\n     plan_topk_v2,\n     topk_transform_paged_v2,\n )\n+from sglang.srt.layers.attention.dsv4.indexer import group_verify_rows\n from sglang.srt.runtime_context import get_platform\n from sglang.srt.utils.common import async_h2d\n \n@@ -45,17 +46,12 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):\n     def paged_logits_args(self, metadata, rows=slice(None)):\n         \"\"\"``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over\n         ``rows``, ``metadata.rows_per_request`` consecutive rows per request.\"\"\"\n-        n = metadata.rows_per_request\n-        q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]\n-        lens = metadata.compressed_seq_lens[rows]\n-        table = metadata.page_table[rows]\n-        if n > 1:\n-            heads = q_fp4.shape[2]\n-            q_fp4 = q_fp4.view(-1, n, heads, 64)\n-            q_sf = q_sf.view(-1, n, heads)\n-            lens = lens.view(-1, n)\n-            table = table[::n]\n-        return (q_fp4, q_sf), lens, table\n+        return group_verify_rows(\n+            (self.q_fp4[rows], self.q_sf[rows]),\n+            metadata.compressed_seq_lens[rows],\n+            metadata.page_table[rows],\n+            metadata.rows_per_request,\n+        )\n \n \n class DeepGEMMPrefillData(msgspec.Struct, frozen=True):",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/python%2Fsglang%2Fsrt%2Flayers%2Fattention%2Fdsv4%2Fv41_indexer%2Fscoring.py",
+      "sha": "042d1c1a77716989a249b069d100b922be428ad5",
+      "status": "modified"
+    },
+    {
+      "additions": 45,
+      "blob_url": "https://github.com/sgl-project/sglang/blob/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/test%2Fregistered%2Funit%2Flayers%2Ftest_dsv4_nonpaged_indexer.py",
+      "changes": 45,
+      "contents_url": "https://api.github.com/repos/sgl-project/sglang/contents/test%2Fregistered%2Funit%2Flayers%2Ftest_dsv4_nonpaged_indexer.py?ref=7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+      "deletions": 0,
+      "filename": "test/registered/unit/layers/test_dsv4_nonpaged_indexer.py",
+      "patch": "@@ -11,6 +11,7 @@\n from sglang.srt.layers.attention.dsv4.indexer import (\n     FP8_DTYPE,\n     C4IndexerBackendMixin,\n+    group_verify_rows,\n     topk_transform_pytorch_vectorized,\n )\n from sglang.srt.layers.attention.dsv4.metadata import (\n@@ -1154,6 +1155,50 @@ def test_row_chunk_groups_its_own_rows(self):\n         self.assertTrue(torch.equal(table, per_request_table[1:]))\n \n \n+class TestC4GroupedVerifyRows(CustomTestCase):\n+    \"\"\"The C4 indexer's static verify rows reach DeepGEMM as one request per group.\"\"\"\n+\n+    requests, n, heads, pages = 3, 4, 2, 5\n+\n+    def _inputs(self):\n+        rows = self.requests * self.n\n+        table = torch.arange(self.requests * self.pages, dtype=torch.int32).view(\n+            self.requests, self.pages\n+        )\n+        return (\n+            torch.arange(rows * self.heads * 128, dtype=torch.int32).view(\n+                rows, 1, self.heads, 128\n+            ),\n+            (torch.arange(rows, dtype=torch.int32) + 100).unsqueeze(-1),\n+            table.repeat_interleave(self.n, dim=0),\n+            table,\n+        )\n+\n+    def test_fp8_rows_become_one_request(self):\n+        q, lens, rows_table, table = self._inputs()\n+        out_q, out_lens, out_table = group_verify_rows(q, lens, rows_table, self.n)\n+        self.assertEqual(tuple(out_q.shape), (self.requests, self.n, self.heads, 128))\n+        self.assertTrue(torch.equal(out_q.reshape(q.shape), q))\n+        self.assertTrue(torch.equal(out_lens, lens.view(self.requests, self.n)))\n+        self.assertTrue(torch.equal(out_table, table))\n+        self.assertEqual(out_table.stride(1), 1)\n+\n+    def test_fp4_pair_and_row_chunk(self):\n+        q, lens, rows_table, table = self._inputs()\n+        sf = torch.arange(q.shape[0] * self.heads, dtype=torch.int32).view(\n+            -1, 1, self.heads\n+        )\n+        rows = slice(self.n, 3 * self.n)\n+        (out_q, out_sf), out_lens, out_table = group_verify_rows(\n+            (q[rows], sf[rows]), lens[rows], rows_table[rows], self.n\n+        )\n+        self.assertEqual(tuple(out_q.shape), (2, self.n, self.heads, 128))\n+        self.assertEqual(tuple(out_sf.shape), (2, self.n, self.heads))\n+        self.assertTrue(torch.equal(out_sf.reshape(-1, 1, self.heads), sf[rows]))\n+        self.assertTrue(torch.equal(out_lens, lens[rows].view(2, self.n)))\n+        self.assertTrue(torch.equal(out_table, table[1:]))\n+\n+\n class TestCandidateIndexerGating(CustomTestCase):\n     def test_candidate_indexer_gating(self):\n         from sglang.srt.layers.attention.dsv4 import v41_indexer",
+      "raw_url": "https://github.com/sgl-project/sglang/raw/7b11e353c28b43d82f9f8e26eac7b28aff6fed91/test%2Fregistered%2Funit%2Flayers%2Ftest_dsv4_nonpaged_indexer.py",
+      "sha": "14fa85e663d420a5ff50de81874f627ae3d75736",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe new comments are longer than `.claude/rules/comment-style.md` allows (one or two lines, and no docstrings on internal helpers). This 4-line comment, the 3-line docstring on `_c4_indexer_groups_verify_rows` (line 1418), and the 5-line docstring on `group_verify_rows` (`dsv4/indexer.py` line 522) repeat what the PR description already says. They make the code harder to read.\n\n**Fix**\n\nKeep one short sentence for each, for example:\n\n```python\n# Measured on B200: below 16 requests, the grouped call is up to 1.2x slower\n# at short context.\n```\n\nUse `\"\"\"View rows_per_request consecutive rows as one next_n request for DeepGEMM.\"\"\"` for `group_verify_rows`. Drop the docstring on `_c4_indexer_groups_verify_rows`, or cut it to one line.",
+      "created_at": "2026-10-21T08:33:20Z",
+      "diff_hunk": "@@ -156,6 +156,11 @@\n SWA_WINDOW = 128\n DEFAULT_INDEX_TOPK = 512\n PAGE_INDEX_ALIGNED_SIZE = 64\n+# Fewest requests at which the C4 indexer scores a static verify per request.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4334669170",
+      "id": 4334669170,
+      "line": null,
+      "original_line": 159,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-21T08:33:20Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\n`group_verify_rows` repeats the reshape in `DeepGEMMDecodeData.paged_logits_args` (`dsv4/v41_indexer/scoring.py` line 44). Both view `q` as `[requests, n, ...]`, view the lengths as `[requests, n]`, and take `table[::n]`. Both copies encode the same DeepGEMM `next_n` layout, so a later fix to one can miss the other.\n\n**Fix**\n\nMake `paged_logits_args` call this helper:\n\n```python\nreturn group_verify_rows(\n    (self.q_fp4[rows], self.q_sf[rows]),\n    metadata.compressed_seq_lens[rows],\n    metadata.page_table[rows],\n    metadata.rows_per_request,\n)\n```\n\n`v41_indexer` already imports from `dsv4/indexer.py`, so this adds no import cycle.",
+      "created_at": "2026-10-21T08:33:20Z",
+      "diff_hunk": "@@ -516,6 +516,24 @@ def topk_transform_paged_from_metadata(\n         )\n \n \n+def group_verify_rows(",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4334669178",
+      "id": 4334669178,
+      "line": 519,
+      "original_line": 519,
+      "path": "python/sglang/srt/layers/attention/dsv4/indexer.py",
+      "updated_at": "2026-10-21T08:33:20Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "[by Claude Code] Done in e40a55d: the constant's comment is now two lines, and the docstring on `_c4_indexer_groups_verify_rows` is gone. `group_verify_rows` has the one-line docstring you suggested.",
+      "created_at": "2026-10-21T14:29:29Z",
+      "diff_hunk": "@@ -156,6 +156,11 @@\n SWA_WINDOW = 128\n DEFAULT_INDEX_TOPK = 512\n PAGE_INDEX_ALIGNED_SIZE = 64\n+# Fewest requests at which the C4 indexer scores a static verify per request.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4338087015",
+      "id": 4338087015,
+      "line": null,
+      "original_line": 159,
+      "path": "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+      "updated_at": "2026-10-21T14:29:29Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "[by Claude Code] Done in e40a55d: `paged_logits_args` now returns `group_verify_rows(...)`. The existing `TestGroupedVerifyRows` tests pass unchanged on B200.",
+      "created_at": "2026-10-21T14:29:31Z",
+      "diff_hunk": "@@ -516,6 +516,24 @@ def topk_transform_paged_from_metadata(\n         )\n \n \n+def group_verify_rows(",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#discussion_r4338087443",
+      "id": 4338087443,
+      "line": 519,
+      "original_line": 519,
+      "path": "python/sglang/srt/layers/attention/dsv4/indexer.py",
+      "updated_at": "2026-10-21T14:29:32Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "/tag-run-ci-label\n[by Claude Code] Triggering CI after trimming the tests to the CPU layout checks.",
+      "created_at": "2026-10-20T22:14:53Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6302978869",
+      "id": 6302978869,
+      "updated_at": "2026-10-20T22:14:53Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "[by Claude Code] Addressed the review: the description now includes `bench_c4_grouped_verify.py` (inline, in a collapsed block), which checks bit-exactness and times both calls for every shape. The speed table comes from that script's run. The description also has the server launch and `/start_profile` steps behind the 4.3% share.",
+      "created_at": "2026-10-21T14:29:35Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6318572921",
+      "id": 6318572921,
+      "updated_at": "2026-10-21T14:29:35Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci\n[by Claude Code] All three failures are outside this change: an NPU host pin-memory OOM (test_npu_expert_distribution_recorder_mode), an MI35x disaggregation CUDA OOM, and the Xeon CPU test_server_args failing while multimodal_gen's vsa import calls torch.cuda.",
+      "created_at": "2026-10-21T15:10:44Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6319387051",
+      "id": 6319387051,
+      "updated_at": "2026-10-21T15:10:44Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci\n[by Claude Code] The AMD failures were the `_check` ImportError from main, fixed by #45676 (merged). The Xeon `test_server_args` failure is also from main and fails on other PRs.",
+      "created_at": "2026-10-22T23:34:55Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6353682755",
+      "id": 6353682755,
+      "updated_at": "2026-10-22T23:34:55Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci\n[by Claude Code] base-b-test-1-gpu-large (0) hit the 60-minute step timeout on a slow runner: every test in the shard ran over its estimate (test_awq.py 1199 s vs 220 s estimated). None of its models use the DSv4 backend this PR touches.",
+      "created_at": "2026-10-23T22:02:55Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6375632240",
+      "id": 6375632240,
+      "updated_at": "2026-10-23T22:02:55Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci\n[by Claude Code] Retrying now that the pr-test run has completed (the previous request arrived while it was still in progress). The only real failure is the base-b-test-1-gpu-large (0) step timeout on a slow runner; the other base-b shards were fail-fast skips.",
+      "created_at": "2026-10-23T23:13:54Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6376608090",
+      "id": 6376608090,
+      "updated_at": "2026-10-23T23:13:54Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci\n[by Claude Code] base-b-test-1-gpu-large (0) timed out again, on h100-computable-c-gpu-1. The timeouts follow the runner pool, not this change: test_awq.py takes about 1050-1200 s on h100-computable-* runners (both attempts here, plus another PR on computable-a-gpu-7) against about 210-235 s on h100-novita runners (this PR on Oct 21, plus another PR today), which pushes the shard past 60 minutes.",
+      "created_at": "2026-10-24T01:01:19Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6377881355",
+      "id": 6377881355,
+      "updated_at": "2026-10-24T01:01:19Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "/rerun-failed-ci\n[by Claude Code]",
+      "created_at": "2026-10-24T02:12:09Z",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#issuecomment-6378604177",
+      "id": 6378604177,
+      "updated_at": "2026-10-24T02:12:09Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    }
+  ],
+  "number": 45378,
+  "refs": {
+    "base": {
+      "commit": "1e894eb92d403062cf21e2910dba888cad7adb9e",
+      "repository": "sgl-project/sglang"
+    },
+    "head": {
+      "commit": "7b11e353c28b43d82f9f8e26eac7b28aff6fed91",
+      "repository": "akhilg-nv/sglang"
+    }
+  },
+  "repository": "sgl-project/sglang",
+  "reviews": [
+    {
+      "body": "[by Claude Code] This review is done by agents. Please feel free to disagree if they do not make sense.\n\n[by Claude Code] **Severity: style | Confidence: High**\n\n**Issue**\n\nThe Accuracy Tests and Speed Tests sections give results, but others cannot rerun them. The description does not include:\n- the script and command for the per-call timing table (how the inputs are built, how L2 is flushed, and how time is measured);\n- the script for the B200 check that grouped and per-row logits are bit-identical (FP8 and FP4, `next_n` 2-4, 32 requests);\n- the server launch and profiling commands for the DeepSeek-V4-Flash TP4 profile (32 requests, 64K context) behind the 4.3% figure.\n\n**Fix**\n\nPlease link the two scripts (a gist is fine) and add the commands to the description.",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#pullrequestreview-5596988980",
+      "id": 5596988980,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-21T08:33:20Z",
+      "user": {
+        "login": "nvpohanh"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#pullrequestreview-5601343770",
+      "id": 5601343770,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-21T14:29:29Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/sgl-project/sglang/pull/45378#pullrequestreview-5601344289",
+      "id": 5601344289,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-21T14:29:31Z",
+      "user": {
+        "login": "akhilg-nv"
+      }
+    }
+  ]
+}

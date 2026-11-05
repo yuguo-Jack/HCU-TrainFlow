@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/models/deepseek_v4/README.md
-raw_sha256: 557281c23bf8da30455f5fd72d26ee8f747ef6ce9a21258d10c451f1ef39a349
+raw_sha256: ae1fd5ee8ec394dc9e7dbe3bc5a039f416a4cddf3ee59fc8a8885e385b54953f
 sources: []
-generated_body_sha256: 219b7674e428d8a9fb5d583df1e93355fe607833d6dc28511a50d1d1b27feae7
+generated_body_sha256: 0c896913f61b5226f7a51822369190c53cdbf3188f202e10a1ba550c0ecc0e6c
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/deepseek_v4/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/deepseek_v4/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/deepseek_v4/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -56,17 +56,17 @@ shipped for them.
 
 ## Smoke Test
 
-Run the debug model on 4 GPUs with FSDP2, TP2, and EP2:
+Run the DistMuon + AdamW debug model on 4 GPUs with FSDP4 and EP4:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 NGPU=4 \
-  MODULE=torchtitan_recipes.tests.models.deepseek_v4 CONFIG=deepseek_v4_debugmodel_fsdp2_tp2_ep2 \
+  MODULE=torchtitan_recipes.tests.models.deepseek_v4 CONFIG=deepseek_v4_debugmodel_fsdp4_ep4 \
   ./run_train.sh
 ```
 
 ## Status
 
-The debug model has been smoke-tested with 4 GPUs using FSDP2, TP2, EP2, and the
-`spmd_types` backend. The optional MTP path is available through
+The AdamW debug model has been smoke-tested with 4 GPUs using FSDP2, TP2, EP2,
+and the `spmd_types` backend. The optional MTP path is available through
 `deepseek_v4_mtp_debugmodel`. Checkpoint compatibility and larger-scale
 convergence validation should be completed before adding production recipes.

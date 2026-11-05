@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/ds4sci_evoformerattention.md
-raw_sha256: f08936251a9aed6f0db781e846f4cb9217f24e51b3e490f6411149938f15ad7c
+raw_sha256: 3db1b5e45d4a37a7a23a21be87f00c788ef958e72e8f6dfdbe5adbeff0cefab1
 sources: []
-generated_body_sha256: 4013fdd17a1a9296c73048d24cce95c298dc7471bf1ef0d73f54018b703daade
+generated_body_sha256: fd2245f556b164167c637f84d8af0181f4c491312d1ef4b9a736dccd4adb621e
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/ds4sci_evoformerattention.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/ds4sci_evoformerattention.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/ds4sci_evoformerattention.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -135,6 +135,6 @@ out = DS4Sci_EvoformerAttention(Q, K, V, [res_mask, right_edges])
 
 ### 4.1 DS4Sci_EvoformerAttention eliminates memory explosion problems for scaling Evoformer-centric structural biology models in OpenFold
 
-[OpenFold](https://github.com/aqlaboratory/openfold) is a community reproduction of DeepMind's AlphaFold2 that makes it possible to train or finetune AlphaFold2 on new datasets. Training AlphaFold2 incurs a memory explosion problem because it contains several custom Evoformer attention variants that manifest unusually large activations. By leveraging DeepSpeed4Science's DS4Sci_EvoformerAttention kernels, OpenFold team is able to reduce the peak memory requirement by 13x without accuracy loss. Detailed information about the methodology can be found at [our website](https://deepspeed4science.ai/2023/09/18/model-showcase-openfold/).
+[OpenFold](https://github.com/aqlaboratory/openfold) is a community reproduction of DeepMind's AlphaFold2 that makes it possible to train or finetune AlphaFold2 on new datasets. Training AlphaFold2 incurs a memory explosion problem because it contains several custom Evoformer attention variants that manifest unusually large activations. By leveraging DeepSpeed4Science's DS4Sci_EvoformerAttention kernels, OpenFold team is able to reduce the peak memory requirement by 13x without accuracy loss. Detailed information about the methodology can be found in our [white paper](https://arxiv.org/abs/2310.04610).
 
 <!-- OpenFold team also hosts an [example](https://github.com/aqlaboratory/openfold/blob/main/tests/test_deepspeed_evo_attention.py) about how to use DS4Sci_EvoformerAttention in the OpenFold repo. -->

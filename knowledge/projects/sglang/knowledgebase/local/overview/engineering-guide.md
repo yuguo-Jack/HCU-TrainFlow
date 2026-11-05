@@ -10,57 +10,73 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: reviewed implementation chains and official guides; not all models, backends or HCU runtime qualification
 sources:
 - source: sgl-project-sglang
   path: README.md
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 7c99b50fa5ef9f4a666a2f73860f746d3fc259e7e7912d4bff88dffdc1dc4c5e
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: a7654a48a8cd08c824e4445cb906405704148a3c55fb84362c7071d27397303c
 - source: sgl-project-sglang
   path: python/pyproject.toml
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: ed2c898e3a733cbd86d25654ef4669e0ed17257685bc615677b2b74756ea6ef4
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 53aa6decc9cdb9e86240b9747810e153f5cdfc477dcd1be37de97fabe14d18ef
 - source: sgl-project-sglang
   path: docs/docs/get-started/install.mdx
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 5a9e0f79fc68b684d264009b3567df1cae6566d616cfd7f4cb0898e32de3c11d
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: bac06371373c1ab6d53d7075a4cfd894ca93a26d2ed220defb22e58065aa1cf4
 - source: sgl-project-sglang
   path: docs/docs/advanced_features/sglang_for_rl.mdx
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 751d2c54c7cc87780a7e9005a76930f73a562c6cf4d9db1574bef4eafaeecd76
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 68ed10e2b44ce57413380df288feb3dc0b1f8a6b650589cf6ba97a340566b20f
 - source: sgl-project-sglang
   path: python/sglang/srt/entrypoints/engine.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 059c29dabd318a2766024ae8cd62d82e4f4c95bd67ebd9aa346ee8ddd6ad5423
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: cc13ef61843629907135f3258ac3efceca1da95e1e959cba77c72e1e0b405033
 - source: sgl-project-sglang
   path: python/sglang/srt/managers/tokenizer_manager.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 8ec0f948dfa68fa545616f34c28c7f9fc9d120c1c1d2ebf300cba506ddef1986
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 5a34747dfc5592c45b4e8a82c1ad767e4e57cade786eedc9ddf94bd37926ef30
 - source: sgl-project-sglang
   path: python/sglang/srt/managers/scheduler.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: fc96ed4b680fdf55621a5397f844cfd4cbd30213f44eec8a888b7cce75cafe60
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: d6158d7d4271ef93991e69965f101a183b63f33baa041468cf83355a24d474f0
 - source: sgl-project-sglang
   path: python/sglang/srt/server_args.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: d1b9ffc79edcbc857efd02a47d47eed9b414f8ac44bc4e3214d78a7922e90e03
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: b4c2b1799eb900a1576c6a5b561aa5684927752c53bd251d2d0a78e1448e7a81
 - source: sgl-project-sglang
   path: test/registered/rl/test_update_weights_from_distributed.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 0c06da440fd0de2b7250cd17ff6f47506eb22e4341d651fb8d49fdd9d1a2643e
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: a76b527b0aeb9397288bcb7f1d653934d248e077031ba03c636cd0e792ce1e1e
 - source: sgl-project-sglang
   path: test/registered/rl/test_multi_instance_release_memory_occupation.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 3f746be087e1ee08cdb7287ed12cb3e3016dec9551f321c382bc2a4de4aabbc8
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: af97eca5bb9d28fc5cbe5312054c6f6f90fd3928317e8c06b3bb594849cb4a9d
 - source: sgl-project-sglang
   path: python/sglang/srt/model_executor/model_runner_components/weight_updater.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: 01f96bb8bf1f62558c0329a853c1b047633a9f6a333796ab509dbec8bea41868
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: ff30b299cc3672fff0970fee1afd9fb85c31db3fb990d9132f7f7a8e7d4f5c00
 - source: sgl-project-sglang
   path: python/sglang/srt/model_executor/model_runner_components/weight_exporter.py
-  commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
-  sha256: c864b58cb1877eee2413a5c4959e2fc8137e0bced599e34c620f830876d20c77
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 36ded4febd1682e387f537103ec8c099efd9a2df6c464c61b4226295ac88bf2a
+- source: sgl-project-sglang
+  path: docs/docs/developer_guide/release_process.mdx
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 3777014aaba84367903f92c52f7898a34185fab20ee3ff9069ae8a6521f3c1cb
+- source: sgl-project-sglang
+  path: python/sglang/srt/managers/scheduler_components/weight_updater.py
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 2e65bb16c08c45f126666e2109d8fdf3139e37fccc9b889a6e4f4692bd8b1032
+- source: sgl-project-sglang
+  path: python/sglang/srt/mem_cache/kv/router.py
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 4ae69633da6f617a676c0d25c53a3d7ead01d77cf697e40ee4379f377ca883b5
+- source: sgl-project-sglang
+  path: python/sglang/srt/mem_cache/kv_weight_version_tracker.py
+  commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
+  sha256: 43688f519119233fe8c3f56d4ff658a70340fb3145a45e4b8f73c109791add05
 pr_sources:
 - pr-sgl-project--sglang-42561
 - pr-sgl-project--sglang-43758
@@ -99,7 +115,9 @@ SGLang 为 RL 提供 rollout、evaluation 和训练后权重 refit，并管理�
 
 官方教程提供 pip/wheel、源码和容器路线；源码包入口位于 `python/`。只查 `sglang.__version__` 不能证明实际 kernel 与 fork 对应，需保存源码 SHA、wheel 标识和候选 backend 选择日志。内存 saver 启用后还需确认其实际 adapter，而不是只检查 flag 出现在 argv。安装不是本次 Wiki 阅读的前置要求。
 
-本轮 Python 下限已提高到 3.11，官方 CUDA 主干的 FlashInfer/sglang-kernel 等 pin 也已推进；不能只更新 Python 包版本而复用旧扩展。`ServerArgs` 的 launch command、repr 与对外配置输出对 watermark secrets 做脱敏，保存 effective config 时区分可复现的非敏感字段与需按部署管理的密钥，不能把日志打印完整参数当成验证要求。
+当前包声明 Python ≥3.11、Torch 2.14.1、Transformers 5.19.0、FlashInfer 0.7.2 和 sglang-kernel 0.4.10；本轮改动还涉及 humming-kernels 0.1.18、sgl-deep-gemm 0.2.5.post3 等依赖。它们描述官方固定树，不是 HCU 安装配方；不能只更新 Python 包而复用不匹配的扩展。`ServerArgs` 的 launch command、repr 与对外配置输出对 watermark secrets 做脱敏，保存 effective config 时区分可复现的非敏感字段与需按部署管理的密钥，不能把日志打印完整参数当成验证要求。
+
+`ServerArgs` 不再重导出 `Arg/NS/A`、`LoRARef`、`CudaGraphConfig` 等内部配置类型；外部 adapter 应从实际定义模块导入，不能依赖旧的偶然 re-export。旧 `--monokernel-backend amd|msa` 已弃用并映射到专用 AMD/NVIDIA 开关；kernel plugin 的实际设备路径仍需核对，不能将其名称直接改成 HCU 通用参数。
 
 ## 运行与分层验收
 
@@ -115,9 +133,13 @@ SGLang 为 RL 提供 rollout、evaluation 和训练后权重 refit，并管理�
 
 从消费者的模型 export/转换代码追到 SGLang model loader：名字、分片、tied embedding、量化权重与 scale 都要一致。HF config 支持并不等于任意 HCU 后端支持；MoE、MLA、混合 attention、MTP/draft 的真实路径分别核对。
 
-当前 runner 会拒绝无法随在线参数写入刷新的派生缓存，包括补偿 mHC splits、HPC-Ops bf16xfp32 GEMM 缓存和模块自行声明的限制；共享 daemon 权重也有独立的修改/sleep 门禁。能正常生成、能导出或能冷加载，并不自动证明可用于反复 refit 的 RL。两篇专题给出实际 guard、收尾和失败边界，不把关闭某优化的上游提示变成 HCU 通用默认。
+当前 Scheduler 在 begin 前先检查所选全部 runner 的派生缓存，具体 runner 加载入口也会拒绝无法随在线参数写入刷新的派生缓存，包括补偿 mHC splits、HPC-Ops bf16xfp32 GEMM 缓存和模块自行声明的限制；共享 daemon 权重也有独立的修改/sleep 门禁。能正常生成、能导出或能冷加载，并不自动证明可用于反复 refit 的 RL。两篇专题给出实际 guard、收尾和失败边界，不把关闭某优化的上游提示变成 HCU 通用默认。
 
 RL 样本关联 prompt/tokenizer、生成参数、stop/truncation、response mask、policy/weight version 与 logprob 的计算定义。采样可导致合法的 token 差异；优先固定输入对照 logits/teacher-forcing logprob，然后再比较随机 rollout 分布。不能把 speculative draft、旧 KV 或过期权重产生的概率直接用于当前策略 loss。
+
+当前 KV 路线把请求 state storage、模型层到子池的 router 和虚拟到物理 slot 的 `IdSpace` 分开。自定义 attention、host-cache 或 PD adapter 要沿新的 typed view/route 读取，不能按旧 pool 类型或 `layer_id` 偶然相等推断布局。暂停后能否 refit/sleep 还取决于 overlap、PD、HiCache 和 offload 是否真正排空，见显存专题。
+
+`--enable-prefill-weight-versions` 为目标模型的 prompt KV 提供权重版本区间，便于发现跨版本 prefix；它不清理旧 KV、不隔离请求，也不替代训练端的采样/权重版本合同。当前实现只支持 generation、非 encoder-decoder 且 PP=1。
 
 ## 性能机制和诊断入口
 
@@ -129,11 +151,11 @@ profile 分开排队、tokenization/CPU 调度、prefill、decode、传权和 sl
 
 ## 发布、PR 与更新路线
 
-2026-10-20 观测的官方主干为 `8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043`，最近可见正式 release 为 [v0.5.22](https://github.com/sgl-project/sglang/releases/tag/v0.5.22)（2026-10-19 发布）；主干新接口不自动等于该 release 或 HCU 分支包含。
+2026-11-04 阅读的官方主干固定为 `fd19cfb660f42bd3ceb6df7598bd343572e30d2c`。本轮最近 10 条 release 元数据快照中，最新可见正式版为 [v0.5.23](https://github.com/sgl-project/sglang/releases/tag/v0.5.23)（2026-11-02 发布）；该快照不是全历史扫描，主干接口也不自动等于 release wheel 或 HCU 分支的能力。
 
 [发布流程](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/developer_guide/release_process.mdx)、[Releases](https://github.com/sgl-project/sglang/releases)、[官方 Issues](https://github.com/sgl-project/sglang/issues)和 [PR](https://github.com/sgl-project/sglang/pulls)共同查证。路线规划无统一自动全量抓取承诺，按实际问题查讨论、目标分支与最终代码。
 
-[PR #43758](https://github.com/sgl-project/sglang/pull/43758) 已合入本页固定 main，说明 flush 失败与已加载权重不是原子回滚；[PR #42561](https://github.com/sgl-project/sglang/pull/42561)截至本轮仍 open，讨论 per-runner 部分更新，不能当已修复能力。原有 [#39265](../../upstream/prs/sgl-project--sglang/PR-39265.md)保留历史 packed-buffer 讨论入口。
+[PR #43758](https://github.com/sgl-project/sglang/pull/43758) 已合入本页固定 main，说明 flush 失败与已加载权重不是原子回滚；[PR #42561](https://github.com/sgl-project/sglang/pull/42561) 在 2026-11-01 关闭且未合入；关闭说明是作者闲置 PR 数量超过软上限，并非部分更新问题已修复。本页固定实现仍使用会话级 `loaded_weights`，应继续核对 per-runner 结果。原有 [#39265](../../upstream/prs/sgl-project--sglang/PR-39265.md)保留历史 packed-buffer 讨论入口。
 
 更新使用 `wiki-update PROJECT sgl-project-sglang`；[全仓目录](../../upstream/source-map/sgl-project-sglang.md)、[原文](../../upstream/docs/sgl-project-sglang)和 `wiki-search-pr "weight update cache" --engine sglang`用于继续追查。同步阅读 release 与当前代码，联动 RL 消费者的调用协议；不能因仓库升级只修本页标题而保留旧专题。
 
@@ -143,18 +165,23 @@ profile 分开排队、tokenization/CPU 调度、prefill、decode、传权和 sl
 
 ## 固定证据与验证范围
 
-- [README.md](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/README.md)
-- [python/pyproject.toml](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/python/pyproject.toml)
-- [docs/docs/get-started/install.mdx](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/get-started/install.mdx)
-- [docs/docs/advanced_features/sglang_for_rl.mdx](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/advanced_features/sglang_for_rl.mdx)
-- [python/sglang/srt/entrypoints/engine.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/python/sglang/srt/entrypoints/engine.py)
-- [python/sglang/srt/managers/tokenizer_manager.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/python/sglang/srt/managers/tokenizer_manager.py)
-- [python/sglang/srt/managers/scheduler.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/python/sglang/srt/managers/scheduler.py)
-- [python/sglang/srt/server_args.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/python/sglang/srt/server_args.py)
-- [test/registered/rl/test_update_weights_from_distributed.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/test/registered/rl/test_update_weights_from_distributed.py)
-- [test/registered/rl/test_multi_instance_release_memory_occupation.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/test/registered/rl/test_multi_instance_release_memory_occupation.py)
+- [README.md](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/README.md)
+- [python/pyproject.toml](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/pyproject.toml)
+- [docs/docs/get-started/install.mdx](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/get-started/install.mdx)
+- [docs/docs/advanced_features/sglang_for_rl.mdx](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/sglang_for_rl.mdx)
+- [python/sglang/srt/entrypoints/engine.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/entrypoints/engine.py)
+- [python/sglang/srt/managers/tokenizer_manager.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/managers/tokenizer_manager.py)
+- [python/sglang/srt/managers/scheduler.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/managers/scheduler.py)
+- [python/sglang/srt/server_args.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/server_args.py)
+- [test/registered/rl/test_update_weights_from_distributed.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/test/registered/rl/test_update_weights_from_distributed.py)
+- [test/registered/rl/test_multi_instance_release_memory_occupation.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/test/registered/rl/test_multi_instance_release_memory_occupation.py)
 
-- [python/sglang/srt/model_executor/model_runner_components/weight_updater.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/python/sglang/srt/model_executor/model_runner_components/weight_updater.py)
-- [python/sglang/srt/model_executor/model_runner_components/weight_exporter.py](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/python/sglang/srt/model_executor/model_runner_components/weight_exporter.py)
+- [python/sglang/srt/model_executor/model_runner_components/weight_updater.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/model_executor/model_runner_components/weight_updater.py)
+- [python/sglang/srt/model_executor/model_runner_components/weight_exporter.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/model_executor/model_runner_components/weight_exporter.py)
 
-本页在 2026-10-20 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+- [docs/docs/developer_guide/release_process.mdx](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/developer_guide/release_process.mdx)
+- [python/sglang/srt/mem_cache/kv/router.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/mem_cache/kv/router.py)
+- [python/sglang/srt/mem_cache/kv_weight_version_tracker.py](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/python/sglang/srt/mem_cache/kv_weight_version_tracker.py)
+
+
+本页在 2026-11-04 复核上述固定源码、教程及最近 10 条 release 元数据；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/features/README.md
-raw_sha256: fa2e4158a3c4d974b64bbc8d49ba78a2136235b0ff75375499b0be2fdd541c21
+raw_sha256: c2ad94cae440123eddac4756110c7e7f4312c4fa7aad46c4bb4aec4c209d3eca
 sources: []
-generated_body_sha256: d6596a0f59a4e7b8b496a5c81d80795c122cad383d75b86bf11899dc0558f8fe
+generated_body_sha256: 8e1cc748dbd6fcc8ad190cb39c7e422f2eef91451e6fc20a07ed37430c4f800a
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/features/README.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/features/README.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/features/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -32,7 +32,7 @@ Upstream source document; original commands, claims and links require their stat
 
 MindSpeed LLM包含分布式预训练、分布式微调等训练方案。
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 文档表格中的“Released”代表商用版本已发布，“✅”代表支持，“❌”代表不支持。
 

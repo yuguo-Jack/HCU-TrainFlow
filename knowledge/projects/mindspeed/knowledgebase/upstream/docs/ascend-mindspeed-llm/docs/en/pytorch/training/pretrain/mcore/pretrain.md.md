@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/pretrain/mcore/pretrain.md
-raw_sha256: 44d8818e3c5f75921f0a3fc571fe9a6b92faf2e0d98f9c0ddae9676e1f6846a4
+raw_sha256: 58308c4507ba9b9c3e99dd62572671a53cf277a85262bafc01de782b35eb4004
 sources: []
-generated_body_sha256: 94984da44754dac1b77f887743a50dc5d0b7ce73daa4c2fd45c3c9b1a741a204
+generated_body_sha256: 1849f8416c7856ea63d6b8b6053b8df178877402617e47b07135a58558707b8e
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/pretrain/mcore/pretrain.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/pretrain/mcore/pretrain.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/pretrain/mcore/pretrain.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -42,7 +42,7 @@ Pretraining data is usually plain text and is not task-oriented. For example:
 
 ## Usage Instructions
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > - If you need to use Pack mode during data preprocessing, refer to [Pack Mode for Distributed LLM Pretraining](./pretrain_eod.md).
 > - During pretraining, you can skip loading initial weights. In this case, the model weights are randomly initialized. If you need to load weights, convert them in advance. For details, refer to [Weight Conversion](../../../tools/checkpoint_convert_hf_mcore_large_params.md).
@@ -167,7 +167,7 @@ The following example uses the Qwen3-8B model to show how to start pretraining. 
         --tokenizer-model ${TOKENIZER_MODEL} \
         ```
 
-   > [!NOTE]
+   > [!NOTE] Note
    >
    > - Enclose the provided paths in double quotation marks.
    > - For multi-node training, ensure that the model path and dataset path on each machine are correct. If data sharing is not configured, add the `no-shared-storage` parameter to the training launch script. After you set this parameter, the system determines whether a non-master node needs to load data based on the distributed parameters and checks the corresponding cache and generated data.

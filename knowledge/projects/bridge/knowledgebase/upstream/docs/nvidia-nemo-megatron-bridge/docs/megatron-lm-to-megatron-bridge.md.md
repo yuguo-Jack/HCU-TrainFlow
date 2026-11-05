@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA-NeMo/Megatron-Bridge
-commit: 34ddd53b0e023d93f107f29b7dc61f9c5dd76a57
+commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
 path: docs/megatron-lm-to-megatron-bridge.md
-raw_sha256: 1aca86a97805ba39ffe7b2efc5d5aa446df93e6e436abe6c5dee41a1b5244541
+raw_sha256: 0bc3c6ebb00cfc0f3bf05730a2e25cc8201da6dd8b4db2842f85ba6013d8a207
 sources: []
-generated_body_sha256: e573339c0acd2ec4fb2e810acfe7c5ad0ad267f8d6e82c6e7038b6564ea41acb
+generated_body_sha256: 69cf2891ec65bf9d8a048e671fa06d15974b7565ac3d6f3107a0aa2d2e859194
 source_state: current-scan
 ---
 
 # NVIDIA-NeMo/Megatron-Bridge / docs/megatron-lm-to-megatron-bridge.md
 
-[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/34ddd53b0e023d93f107f29b7dc61f9c5dd76a57/docs/megatron-lm-to-megatron-bridge.md)
+[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/megatron-lm-to-megatron-bridge.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -126,9 +126,9 @@ uv run python scripts/translate_mlm_to_bridge.py --reverse \
 | `--mtp-hybrid-override-pattern P` | `model.mtp_hybrid_override_pattern=P` | Separate MLM MTP pattern |
 | `--mtp-use-repeated-layer` | `model.mtp_use_repeated_layer=true` | One physical MTP layer reused across prediction depths |
 | `--sft-tokenizer-prompt-format P` | `tokenizer.tokenizer_prompt_format=P` | Bridge exposes the MCore SFT compatibility alias at load time |
-| `--mock-data` | `dataset.mock=true` | Use synthetic data (no files needed) |
+| `--mock-data` | *(omitted)* | Bridge uses synthetic data whenever no data path or blend is set |
 
-Flags not present in Bridge (e.g., `--use-mcore-models`, `--use-flash-attn`) are omitted and listed in a comment. `--mock-data` translates to `dataset.mock=true`. Unknown flags are listed separately so you can handle them manually.
+Flags not present in Bridge (e.g., `--use-mcore-models`, `--use-flash-attn`) are omitted and listed in a comment. `--mock-data` is omitted too, because Bridge uses synthetic data whenever no data path or blend is set. Unknown flags are listed separately so you can handle them manually.
 
 Megatron-LM `--spec` values are intentionally not copied into generated configuration as arbitrary import targets. A recognized Mamba or Hybrid spec helps the translator identify the provider family, but a standalone Hybrid recipe still requires an explicit layer pattern. Review and select any Bridge stack specification in trusted Python code.
 

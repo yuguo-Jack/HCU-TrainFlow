@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
 path: docs/en/tutorial/megatron.md
-raw_sha256: b00eb42c86193d18d60e0ae58ca7dff9a81e0a9417aeca7aba7042e3bc3a0e73
+raw_sha256: c0728d6313cc6f41c519355a4f6b92c0194f773fbbd54f3a02f8daf19cbca4ca
 sources: []
-generated_body_sha256: dc1af96e49311d347af821a3aed7f9f4bebac99a6d1a82053b477c01c2baceae
+generated_body_sha256: 5711bf754bdb3544e6a465f57d6abd9374be98a1e008426182fc7ca8f48c65ce
 source_state: current-scan
 ---
 
 # areal-project/AReaL / docs/en/tutorial/megatron.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/docs/en/tutorial/megatron.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/docs/en/tutorial/megatron.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -56,6 +56,34 @@ Set `bridge_type: megatron-bridge` to use the new backend.
 
 For trade-offs and migration guidance, see the
 [Megatron Bridge Backend Reference](../reference/bridge_backend.md).
+
+## Freezing Vision Parameters
+
+Qwen3-VL and Qwen3.5 (including Qwen3.8-27B) using `megatron-bridge` freeze the vision
+encoder and its projector/merger by default. No environment variable or CLI override is
+needed. The explicit equivalent is:
+
+```yaml
+actor:
+  megatron:
+    bridge_type: megatron-bridge
+    freeze_vision_model: true
+    freeze_vision_projection: true
+```
+
+The equivalent CLI overrides are `actor.megatron.freeze_vision_model=true` and
+`actor.megatron.freeze_vision_projection=true`. These settings reach the native model
+provider before DDP and optimizer construction. To freeze only the encoder while keeping
+the merger trainable, set `freeze_vision_model: true` and
+`freeze_vision_projection: false`. Freeze both components to keep cached visual
+embeddings valid across language-model updates, assuming the image preprocessing is
+unchanged.
+
+Both options default to `null`: Qwen3-VL/Qwen3.5 resolve this to `true`, while other
+models preserve their provider's freezing policy. Set either option to `false` to train
+that component. Explicit settings with an unsupported bridge or provider raise an error.
+Qwen4-Exp (Qwen3.8 Flash Next) uses a separate `mcore-bridge` adapter that already
+freezes its entire `visual` module, including its merger, without these options.
 
 ## MoE Parallel Strategy
 

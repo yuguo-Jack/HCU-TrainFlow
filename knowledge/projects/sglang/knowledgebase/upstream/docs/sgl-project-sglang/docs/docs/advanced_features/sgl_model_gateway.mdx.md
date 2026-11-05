@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/sgl_model_gateway.mdx
-raw_sha256: b8a324692ee4e6df4bca2dad7d37eb5a0b59e0562c8ae5ab967ccc279843301e
+raw_sha256: 1b1e5980dffff417b493795f590d56dce11157f70f56c54f1e731bd01a2143ad
 sources: []
-generated_body_sha256: ab47a82dc8663fa552d611a49b59e4eb416ca6d02822773aa46adea8cd210325
+generated_body_sha256: 3918cfc23101b4c53277bb579f3c3d91031707fa651fca34030896ea476fd513
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/sgl_model_gateway.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/sgl_model_gateway.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/sgl_model_gateway.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -2697,6 +2697,12 @@ groups:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>None</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override policy for decode nodes</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decode-dispatch-limit`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>None</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requests per prefill worker sent to decode before decode answers or prefill finishes; the rest pick their decode worker when sent. Needs prefill `--optimistic-prefill-attempts` above 0</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--worker-startup-timeout-secs`</td>

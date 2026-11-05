@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/internals/epath_storage.md
-raw_sha256: e95ce4f79b2264ececa5e6efa4cce47850113a1fe8979df2673e0767c2405198
+raw_sha256: c66636bff3c6e40c828d4f167cc9489a369e8e68b16cd15e5f7f7c0fd8b92ce0
 sources: []
-generated_body_sha256: a351bd1bd05bcfa3e3cfa6b32376dcf4dd8e63d0441b5aa4c993158bf6fb4855
+generated_body_sha256: ec9571192b1fdbf37d5e262960d1c787875d01647144b10f2bdaa7a777cde76d
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/internals/epath_storage.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/internals/epath_storage.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/internals/epath_storage.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -31,7 +31,7 @@ SPDX-License-Identifier: BSD-3-Clause -->
 
 (epath-storage)=
 
-# EPath and Storage
+# EPath, Mapped Arrays, and Storage
 
 Energon uses `EPath` so dataset code can work with local files and supported remote protocols through a
 common path interface. Readers should preserve that abstraction until an operation specifically requires a
@@ -47,10 +47,24 @@ Protocol handlers may also compose an auxiliary path with a primary path, as use
 datasets. Keep the original dataset path in configuration and provenance even when bytes are served from a
 cache or auxiliary location.
 
-## Resource handles
+## Mapped numeric arrays
 
-Readers are context managers and must be closed when the owner is finished. Do not put an open file,
-stream, or memory map into dataset configuration or checkpoint state.
+`map_epath` exposes one-dimensional typed arrays used by indexes. Its backend depends on the path and
+options:
+
+- a local path with memory mapping enabled uses `EPathNumpyMappedArray`;
+- a remote path, or a request without memory mapping, uses seek/read access;
+- `copy_to_local` first creates or reuses a local copy and then memory maps it.
+
+The shape is inferred from file size, byte offset, and dtype. Validate that the remaining byte count is
+divisible by the dtype size. The abstraction is one-dimensional; multidimensional interpretation belongs
+to the caller.
+
+A stepped slice may read the full byte span between its first and last element and apply the step afterward.
+Avoid sparse, extremely wide slices on remote storage when a narrower access pattern is possible.
+
+Mapped arrays and readers are context managers and must be closed when the owner is finished. Do not put an
+open file, stream, or memory map into dataset configuration or checkpoint state.
 
 ## Worker and cache ownership
 

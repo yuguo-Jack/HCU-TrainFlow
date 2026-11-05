@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/how-to/origami-integration.md
-raw_sha256: 857fdad62e107a09f583bcf064e541c93a99eba4a40d4dd5e2ce955e4be63251
+raw_sha256: 54a8488764276cbf0733f51d0303d9950dfa478e10e12c881d37993155c68b42
 sources: []
-generated_body_sha256: 5c4418e5b4ffdc0cc953256f02db8f39ec31afdfa875cc19335fa324945f3514
+generated_body_sha256: 20edf24c8baa6d6d37132fe462a83f17dbd65b6a9607d489efc5ac1621bb0ca0
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/how-to/origami-integration.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/how-to/origami-integration.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/how-to/origami-integration.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -47,8 +47,8 @@ doesn't install Origami.
 
 Origami integrates into TraceLens in the following ways.
 
-- GEMM and SDPA perf models call Origami's Python bindings to predict a duration in microseconds for forward (and SDPA backward where applicable).
-- Results show up in perf reports under columns such as `Origami Time (µs)`, `Origami TFLOPS/s`, `Origami TB/s`, and `Pct Origami` (relative to measured kernel busy time), when simulation uses Origami.
+- With `--enable-origami-gemm`, GEMMs call Origami's Python bindings to predict a duration in microseconds. Results show up under columns such as `Origami Time (µs)`, `Origami TFLOPS/s`, `Origami TB/s`, and `Pct Origami` (relative to measured kernel busy time).
+- Origami models GEMMs only. With `--enable-origami-sdpa-tile`, TraceLens's SDPA tile model times its per-tile GEMMs with Origami and reports forward and backward attention under `SDPA Tile Origami` columns.
 - Roofline metrics from `--gpu_arch_json_path` are separate; they don't require Origami. Origami adds *simulated* timing on top when enabled.
 
 ## Installation
@@ -84,16 +84,18 @@ If `import origami` fails after `pip install`, check:
 
 ## When TraceLens uses Origami
 
-Simulation is implemented in `TraceLens/PerfModel/perf_model.py`
-(`GEMM.get_simulation_time_func`):
-
-- If `enable_origami` is true and the perf model has the needed architecture and parameters, TraceLens uses Origami.
-- If `enable_origami` is false, TraceLens doesn't call Origami; simulated times are omitted for that path.
+Origami runs as an op projection, in `TraceLens/PerfModel/op_projections.py`. Both the
+GEMM model and the SDPA tile model in `TraceLens/PerfModel/perf_model.py` time
+GEMMs with `gemm_time_us` in `TraceLens/PerfModel/origami_helper.py`, which
+also maps TraceLens dtypes to Origami's. TraceLens calls Origami only when you
+turn it on and the op has the needed architecture and parameters; otherwise
+the Origami columns are left empty.
 
 So you need both:
 
 - A valid GPU architecture (see below), and
-- `enable_origami=True` (CLI flag or Python API).
+- `--enable-origami-gemm` or `--enable-origami-sdpa-tile` (or
+  `enable_origami_gemm=True` or `enable_origami_sdpa_tile=True` from Python).
 
 ## GPU architecture JSON
 
@@ -108,7 +110,7 @@ analysis.
 
 ## Command-line usage
 
-Pass `--enable-origami` alongside `--gpu_arch_json_path` to any TraceLens report command to activate Origami simulation.
+Pass `--enable-origami-gemm` alongside `--gpu_arch_json_path` to any TraceLens report command to activate Origami simulation. The PyTorch reports also take `--enable-origami-sdpa-tile` for attention.
 
 ### PyTorch perf report
 
@@ -118,7 +120,8 @@ Run the following command to generate a PyTorch performance report with Origami 
 TraceLens_generate_perf_report_pytorch \
   --profile_json_path path/to/profile.json.gz \
   --gpu_arch_json_path path/to/gpu_arch.json \
-  --enable-origami \
+  --enable-origami-gemm \
+  --enable-origami-sdpa-tile \
   --output_csvs_dir ./out_csvs
 ```
 
@@ -128,13 +131,13 @@ Or:
 python -m TraceLens.Reporting.generate_perf_report_pytorch \
   --profile_json_path path/to/profile.json.gz \
   --gpu_arch_json_path path/to/gpu_arch.json \
-  --enable-origami \
+  --enable-origami-gemm \
   --output_csvs_dir ./out_csvs
 ```
 
 ### vLLM-oriented PyTorch report
 
-Same pattern; the entry point mirrors the PyTorch script (`--enable-origami`).
+Same pattern; the entry point mirrors the PyTorch script (`--enable-origami-gemm`, `--enable-origami-sdpa-tile`).
 
 ### JAX perf report
 
@@ -144,17 +147,25 @@ Run the following command to generate a JAX performance report with Origami simu
 TraceLens_generate_perf_report_jax \
   --profile_path path/to/trace.xplane.pb \
   --gpu_arch_json_path path/to/gpu_arch.json \
-  --enable-origami \
+  --enable-origami-gemm \
   --output_csvs_dir ./out_csvs
 ```
 
-### Standalone GEMM/SDPA simulator helper
+### Time a shape without a trace
 
-Use `TraceLens/PerfModel/run_perf_model.py` to run the GEMM or SDPA simulator directly from the command line.
+Call Origami's GEMM timer directly with the shape:
 
-```bash
-python -m TraceLens.PerfModel.run_perf_model --op gemm ... --enable_origami
+```python
+from TraceLens.PerfModel.origami_helper import gemm_time_us
+
+arch = {"name": "MI300X", "freq_mhz": 2100}
+print(gemm_time_us(arch, M=4096, N=4096, K=4096, B=1, dtype="bf16"))  # time in µs
 ```
+
+For attention, `sdpa_fwd_time_us` and `sdpa_bwd_time_us` in
+`TraceLens.PerfModel.sdpa_tile` take the shape directly and run the SDPA tile
+model. Pass `gemm_time=origami_helper.gemm_time_us` to time the tiles with
+Origami.
 
 ## Python API
 
@@ -164,12 +175,13 @@ When building a `TreePerfAnalyzer` (or `JaxTreePerfAnalyzer`) in code, pass:
 TreePerfAnalyzer.from_file(
     profile_filepath="profile.json.gz",
     arch=gpu_arch_dict,          # or load JSON
-    enable_origami=True,
+    enable_origami_gemm=True,
+    enable_origami_sdpa_tile=True,
 )
 ```
 
-Reporting helpers such as `generate_perf_report_pytorch` accept
-`enable_origami=True` and forward it to the analyzer.
+Reporting helpers such as `generate_perf_report_pytorch` accept the same
+keywords and forward them to the analyzer.
 
 ## Troubleshooting
 
@@ -177,7 +189,7 @@ Use the following table to diagnose common problems when enabling Origami in Tra
 
 | Symptom | What to check |
 |---------|---------------|
-| No Origami columns in CSVs | Confirm `--enable-origami` (or API `enable_origami=True`) and `--gpu_arch_json_path`. |
+| No Origami columns in CSVs | Confirm `--enable-origami-gemm` (or API `enable_origami_gemm=True`) and `--gpu_arch_json_path`. |
 | Message on stderr about `origami` import | Install `rocm-origami` and fix ROCm/library paths. |
 | Unsupported dtype warning | The Origami path supports a fixed set of dtypes (for example fp16, bf16, fp32, fp64, fp8); others skip simulation. |
 

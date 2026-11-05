@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/pretrain/mcore/train_from_hf.md
-raw_sha256: fe455fb2cf8db0eed71a24ea80f146d3dcfd5cbedd53e303ee78e1810e9c480e
+raw_sha256: a69aef3d26128413c0c2906f628883f96bbfcbf938c27f466a810471d7ade659
 sources: []
-generated_body_sha256: bf287afc176d4b4a28b3edb67df4789e96d8b8f5375ee1bc2b1e48e92947e1bb
+generated_body_sha256: 1297862e2863bc500ec27dd00edba3d9d29b1e74b26c5e890f8625f1a6e7f12c
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/pretrain/mcore/train_from_hf.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/pretrain/mcore/train_from_hf.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/pretrain/mcore/train_from_hf.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -119,7 +119,7 @@ Upstream source document; original commands, claims and links require their stat
 | `--hf-save-dir` | string | None | 否 |  Megatron→HF权重转换时，HuggingFace权重保存目录 |
 | `--hf-cfg-dir` | string | None | 否 | HuggingFace配置文件目录 |
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 对于Mamba等特殊模型，必须手动指定 `--model-type-hf`。
 > - 由于Megatron→HF权重转换仅生成权重以及`model.safetensors.index.json`，不会生成配置文件，因此需要通过指定`--hf-cfg-dir`参数，将原HuggingFace模型的配置文件复制到权重转换所生成的HuggingFace权重目录中。
@@ -157,7 +157,7 @@ Upstream source document; original commands, claims and links require their stat
     - 如果未指定，则默认保存至`{save}/mg2hf_iteration{iteration}`目录。
     - 配置文件处理：指定`--hf-cfg-dir`时，从该目录复制配置文件至转换后的HuggingFace权重目录；未指定但启用双向转换时，从`{load}`目录复制配置文件。
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > MG→HF转换本身不会生成配置文件，必须从现有配置文件复制。
 
@@ -195,7 +195,7 @@ Upstream source document; original commands, claims and links require their stat
 | `--reasoning-effort` | string | None | 否 | 用于DeepSeek-V4模型微调数据处理，可选max/high。<ul><li>max：在prompt中插入最大努力的指令前缀</li><li>high：预留，当前为空操作</li></ul> |
 | `--drop-thinking` | bool | True | 否 | DeepSeek-V4微调场景，是否丢弃多轮对话中的历史思维链。默认仅保留最后一轮assistant的reasoning作为loss目标；设为False则保留所有轮次的reasoning |
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 若未指定`--output-prefix`，处理后的数据文件将默认生成在原始数据集所在的目录下。
 > - `--handler-name`为数据处理 handler 名称：
@@ -222,7 +222,7 @@ bash examples/mcore/qwen3/tune_qwen3_8b_4K_full_ptd.sh \
 
 ## 使用约束
 
-- 当前支持的HuggingFace模型类型：`qwen3`、`qwen3-moe`、`deepseek3`、`glm45-air`、`bailing_mini`、`qwen3-next`、`seed-oss`、`deepseek32`、`magistral`以及`deepseek2-lite`。
+- 当前支持的HuggingFace模型类型：`qwen3`、`qwen3-moe`、`deepseek3`、`deepseek4`、`deepseek4_base`、`longcat`、`glm45-air`、`bailing_mini`、`qwen3-next`、`seed-oss`、`deepseek32`、`magistral`以及`deepseek2-lite`。
 
 - 当前数据集自动转换功能仅支持以下原始数据格式：`parquet`、`arrow`、`csv`、`json`、`jsonl`以及`txt`，暂不支持其他的格式。
 

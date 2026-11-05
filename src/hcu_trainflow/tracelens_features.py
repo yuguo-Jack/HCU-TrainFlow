@@ -29,6 +29,27 @@ FIELDS = {
 }
 
 
+def qualify_native_warnings(worker):
+    """Keep usable native output without calling skipped samples complete."""
+    native_warnings = worker.get('native_warnings', [])
+    if not isinstance(native_warnings, list) or any(not isinstance(row, dict) for row in native_warnings):
+        raise FlowError('Invalid native warning summary')
+    if not any(row.get('code') == 'native-kernel-detail-samples-skipped' for row in native_warnings):
+        return worker
+    gaps = worker.get('gaps', [])
+    if not isinstance(gaps, list) or any(not isinstance(gap, str) for gap in gaps):
+        raise FlowError('Invalid native analysis gaps')
+    result = dict(worker)
+    result['gaps'] = list(gaps)
+    gap = 'Native kernel-detail summaries skipped variable-length samples; inspect warnings and use exact events for coverage'
+    if gap not in result['gaps']:
+        result['gaps'].append(gap)
+    result['native_report_status'] = 'incomplete'
+    if result.get('status') == 'generated':
+        result['status'] = 'incomplete'
+    return result
+
+
 def run_bounded(argv, *, timeout, **kwargs):
     """Reap the whole offline analysis tree, including native converters."""
     options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
@@ -162,6 +183,8 @@ def run_feature(store, project, request_path, timeout=1800):
             worker = read_json(output / 'worker.json')
             if not isinstance(worker, dict) or worker.get('status') not in {'generated', 'incomplete', 'needs-agent-review'}:
                 failure = failure or 'Invalid native worker receipt'
+            else:
+                worker = qualify_native_warnings(worker)
         except (ValueError, OSError):
             failure = failure or 'Unreadable native worker receipt'
     else:
@@ -176,6 +199,8 @@ def run_feature(store, project, request_path, timeout=1800):
               'created_at': utc(), 'output_directory': str(output), 'returncode': code,
               'inputs': [{'path': path, 'sha256': digest} for path, digest in inputs.items()],
               'artifacts': artifacts, 'worker': worker, 'failure': failure,
+              'native_warnings': worker.get('native_warnings', []) if isinstance(worker, dict) else [],
+              'gaps': worker.get('gaps', []) if isinstance(worker, dict) else [],
               'training_assessment': 'unassessed; artifact generation is not a workflow gate, loss validation or end-to-end speedup',
               'execution_scope': 'offline CPU analysis; no GPU admission or training launch'}
     write_json(output / 'report.json', result)

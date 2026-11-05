@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/how-to/perf-model-without-trace.md
-raw_sha256: 97e3daf88fd24b0c4f21da0d79f65a372d11f6fdadfc5dfb7edd09d54707cbe7
+raw_sha256: 4f54992387cf30886cbdc2ff00c76e1cffd3e85b9a01ed26babee709aa8ee2ab
 sources: []
-generated_body_sha256: 086aad99a1da009292b9e243c57fa5f8b49658216854e2ad21411979d57daa7f
+generated_body_sha256: c33968173d75456b7135986c73f52d1b6b19f0f48820f86b6e8a2dd0e11b3ee0
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/how-to/perf-model-without-trace.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/how-to/perf-model-without-trace.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/how-to/perf-model-without-trace.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -129,6 +129,7 @@ decode, bf16, AMD Instinct™ MI300X) — all without a single trace.
 
 ## Related topics
 
+- [Project a model's roofline from its checkpoint alone](./generate-model-roofline-projection.md)
 - [Analyze traces with the TraceLens SDK](./sdk-analysis.md)
 - [GEMM analysis in TraceLens](../conceptual/gemm-analysis.md)
 - [Performance report columns](../reference/perf-report-columns.md)

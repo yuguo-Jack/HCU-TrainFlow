@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/autotuning.md
-raw_sha256: 106cc46fccd725377cb4470a62e825792fa4f5f84094d9ef7f5bcbab709e07b8
+raw_sha256: 4dc008c6c4cf465015a832342d08595508f6c9f9d2e871a5f5ec4ebc492b300d
 sources: []
-generated_body_sha256: 031a44cca2363ab092191172e0d6892db8a8765eb1bc391082ae72b9b5baf1cc
+generated_body_sha256: a8f91889bb2aef511d22e25bc636171a300f39709e3b5096a4a3805453eed433
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/autotuning.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/autotuning.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/autotuning.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -52,7 +52,7 @@ Compared to the original training script (`deepspeed your_program.py <normal cl 
 
 ## Example
 
-We demonstrate the usage and benefit of autotuning using the training of a 0.77 billion parameter [GPT2-large model](https://huggingface.co/gpt2-large) from Hugging Face on 16 Nvidia V100 GPUs. For more examples, refer to [autotuning](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/autotuning) in the DeepSpeedExamples repo. Note that autotuning works with any DeepSpeed-accelerated model training, not limited to Hugging Face models.
+We demonstrate the usage and benefit of autotuning using the training of a 0.77 billion parameter [GPT2-large model](https://huggingface.co/gpt2-large) from Hugging Face on 16 Nvidia V100 GPUs. For more examples, refer to [autotuning](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/autotuning) in the DeepSpeedExamples repo. Note that autotuning works with any DeepSpeed-accelerated model training, not limited to Hugging Face models.
 
 The model has:
 
@@ -147,7 +147,7 @@ Note that the performance metric used in autotuning is calculated using the timi
 
 Tuning completed in 0:27:33.988447. Total number of experiments: 13.
 
-As we can see the DeepSpeed Autotuner can select a better than hand-tuned configuration with a reasonable number of experiments. Examples in [Autotuning Hugging Face Examples](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/autotuning/hf#autotuning-hugging-face-examples) would demonstrate the effectiveness of autotuning across different models.
+As we can see the DeepSpeed Autotuner can select a better than hand-tuned configuration with a reasonable number of experiments. Examples in [Autotuning Hugging Face Examples](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/autotuning/hf#autotuning-hugging-face-examples) would demonstrate the effectiveness of autotuning across different models.
 
 ### DeepSpeed Autotuning with AzureML
 

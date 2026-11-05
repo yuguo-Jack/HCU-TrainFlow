@@ -10,23 +10,23 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
 path: docs/en/tutorial/installation_npu.md
-raw_sha256: 99c065baa5c764f3d6b7f1d57507d1a5fdc15e1691e17eca83232f07bc2a1c77
+raw_sha256: fe9b59adb20a1aea3ffcfd25d13d72b620af03af677d4df1402b700d502cf74b
 sources: []
-generated_body_sha256: d0473c60e140e10e1eb1dcf2a50120ac476ae928db31ea861bddd78280dc34f7
+generated_body_sha256: 0a2ca2dd916a516e3e18d7cfe20667aa2ef78289a7259abe7f60b256ce9fc37e
 source_state: current-scan
 ---
 
 # areal-project/AReaL / docs/en/tutorial/installation_npu.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/docs/en/tutorial/installation_npu.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/docs/en/tutorial/installation_npu.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
 ---
 
-# Installation (Ascend NPU)
+# Installation (Huawei Ascend NPU)
 
 **Note**: Ascend NPU support is maintained on the
 [`ascend-v1.0.5`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.5) branch

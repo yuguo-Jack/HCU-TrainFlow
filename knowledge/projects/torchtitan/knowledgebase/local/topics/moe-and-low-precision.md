@@ -9,58 +9,59 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/models/common/dist_moe/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 03d47172e2c7e13a7eda28d210745f5c8da680e3dee2f9f5c2bbab97af3ad897
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 8a08b2adb05e081feaf3116b7acebe509a6e731d66d80f5e3f6333c5231673cf
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/dist_moe.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 09ab34b0cf9e425d8dcd0494edf009fb247f5a254a219b9359057d89b38758c6
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 5e773f089e1be7df5ad2d99b5342a7eed21981c196052902fe9ebe6c2d4e54b0
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/token_dispatcher.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: b98f1e2f7ac8a53d65be2dd5d232a3422a70e273e4404cd8907a58170fa158cd
 - source: pytorch-torchtitan
   path: torchtitan/quantization/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: c83d0b237d478207891164a49972280f065b7bbd9026ad8fc91cf8aa91d587c9
 - source: pytorch-torchtitan
   path: torchtitan/quantization/mxfp8/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 629ffa3730098c8b956e5da4e693e9ce4639fb9f9b544befd201427a0b69b9c7
 - source: pytorch-torchtitan
   path: torchtitan/quantization/nvfp4/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 64d5f937a3bc2a280cb7249592fe31521c7dba37d364aa4870b9430f359b8680
 - source: pytorch-torchtitan
   path: torchtitan/distributed/REMAT.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 7b419c4cb3e396ad1f6015130afdacf229264b214a18e0610b7bc9ac91097f99
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 6693c808dafbc202f526f366fe25dd60dc03453966230be810f6907f7b84cff0
 - source: pytorch-torchtitan
   path: torchtitan/models/common/moe/moe.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 624dec01425b93538969ddea2d68e1f9a3465bd77076ea1746c55d6f7fcb0315
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: c2a09e0beffb5298917cf26d866371520c947f12f40ef7a52ddd157c15e5ecdf
 - source: pytorch-torchtitan
   path: torchtitan/models/common/aux_loss.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 470459e21209b934f1181a8713d98ce9fc890e1abff7a67f39ff12323d812b97
 - source: pytorch-torchtitan
   path: torchtitan/models/common/moe/token_dispatcher.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: a7f41110ce8db1e414ce1952872b5dd5bf447aeecda4dceee445a46024c8395a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 1565face09bffc7246f1d9ddc1a1304fe814ade500605df2f66517fd8a270dfa
 - source: pytorch-torchtitan
   path: torchtitan/config/transform/freeze_moe_routing.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 985eee889df806f156a8545a93baff4450c0fde0980786a6cdf7ecfcc4c1faa8
 - source: pytorch-torchtitan
   path: tests/rl/unit_tests/cpu/test_model_defaults.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: ca915722651a4aed4548ff74bf7f272b691c0753943bea56613d48b949798db3
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 44bf357ff2ddfa185feca23384b2152168c25c0727dcc253f14616e36c6e2427
 pr_sources:
 - pr-pytorch--torchtitan-5263
 - pr-pytorch--torchtitan-5250
@@ -111,17 +112,23 @@ HybridEP 的 `non_blocking_capacity_factor=None` 是有host同步的精确容量
 
 RL的 `build_rl_model_configs` 新默认同时作用于trainer和generator：FP32-output LM head，以及冻结MoE router gate、expert bias和移除load-balancing aux loss。`freeze_moe_routing=False` 才保留原router训练；freeze不保证hidden states变化后专家选择不变。此处是RL配方的训练语义，不能传播为预训练的默认或用来掩盖数值不一致；SoftCappedLinear等配方保留明确例外。
 
+## Dispatcher 输入与重算消费者的迁移
+
+当前 dispatcher 接收 bool `routing_map_TE(T,E)`；local/A2A 路径在内部求专家 token counts，DeepEP/HybridEP 则使用各自返回的全局路由量。EP process group 从当前 sparse SPMD mesh 获取，不再依赖旧实例 `ep_mesh`。不能把旧计数 tensor 作为同位置实参传入新接口。
+
+DeepEP/HybridEP 的 dispatch 与 combine 共用 `ep_communication` remat policy，forward handle 与 backward 相配；DeepEP 依赖确定性排序 buffer，HybridEP 依赖保持顺序的 prefix scans。保存/重放选择影响通信次数与生命周期，需连同量化 padding、score dtype、gradients 和专家顺序验证。Dist-MoE 仍要求根 `precision.param_dtype="bfloat16"`；源码中的 backend/硬件限制不会因字段迁移而消失。
+
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/models/common/dist_moe/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/dist_moe/README.md)
-- [torchtitan/config/transform/dist_moe.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/transform/dist_moe.py)
-- [torchtitan/config/transform/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/transform/token_dispatcher.py)
-- [torchtitan/quantization/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/quantization/README.md)
-- [torchtitan/quantization/mxfp8/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/quantization/mxfp8/README.md)
-- [torchtitan/quantization/nvfp4/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/quantization/nvfp4/README.md)
-- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/REMAT.md)
+- [torchtitan/models/common/dist_moe/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/dist_moe/README.md)
+- [torchtitan/config/transform/dist_moe.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/transform/dist_moe.py)
+- [torchtitan/config/transform/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/transform/token_dispatcher.py)
+- [torchtitan/quantization/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/quantization/README.md)
+- [torchtitan/quantization/mxfp8/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/quantization/mxfp8/README.md)
+- [torchtitan/quantization/nvfp4/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/quantization/nvfp4/README.md)
+- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/REMAT.md)
 
 - [PR #5263：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5263.md)
 - [PR #5250：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5250.md)
@@ -134,11 +141,11 @@ RL的 `build_rl_model_configs` 新默认同时作用于trainer和generator：FP3
 
 调整 gradient accumulation、PP、CP/EP 或重算时，需要同时核对 routed-token 分母、aux coefficient、主 loss 和梯度，不把统计口径变化当性能回归或收敛改善。global-batch、microbatch-wise 与 aux-loss-free bias 更新是不同机制；模型配方选哪条就验证哪条，不能随意替换。
 
-- [torchtitan/models/common/moe/moe.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/moe/moe.py)
-- [torchtitan/models/common/aux_loss.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/aux_loss.py)
+- [torchtitan/models/common/moe/moe.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/moe/moe.py)
+- [torchtitan/models/common/aux_loss.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/aux_loss.py)
 
 ## 本次补充的实现与测试依据
 
-- [torchtitan/models/common/moe/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/moe/token_dispatcher.py)
-- [torchtitan/config/transform/freeze_moe_routing.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/transform/freeze_moe_routing.py)
-- [tests/rl/unit_tests/cpu/test_model_defaults.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/rl/unit_tests/cpu/test_model_defaults.py)
+- [torchtitan/models/common/moe/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/moe/token_dispatcher.py)
+- [torchtitan/config/transform/freeze_moe_routing.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/transform/freeze_moe_routing.py)
+- [tests/rl/unit_tests/cpu/test_model_defaults.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/rl/unit_tests/cpu/test_model_defaults.py)

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA-NeMo/Megatron-Bridge
-commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
 path: docs/models/README.md
-raw_sha256: c05df7a3e1528c6faebb24f8ee65ea61cfa47c89a419113244a9488912e34111
+raw_sha256: a6c9cc3373e95b54ccb92d61baecb603ce62082289b91652d0b28150b6f215b2
 sources: []
-generated_body_sha256: 880e780d9ef1885b96e6bf95ba94fb30bac903bbc79820bd627fbfa65c019359
+generated_body_sha256: 85f514c85ce47d54409a72984735b2599a37887d1c88b1192f0d1abd7f4b279b
 source_state: current-scan
 ---
 
 # NVIDIA-NeMo/Megatron-Bridge / docs/models/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/models/README.md)
+[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/models/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -32,7 +32,7 @@ Upstream source document; original commands, claims and links require their stat
 
 Choose a model to open its interactive import/export and training configurations. Every option comes directly from an authoritative YAML verification card; independent fields are never combined into synthetic commands.
 
-Current inventory: **30 model cards** and **425 concrete configurations**.
+Current inventory: **30 model cards** and **432 concrete configurations**.
 
 Each model page lets you select import/export, pretraining, benchmarking, SFT, LoRA, or long-context SFT and immediately see the exact command and expected result for the recorded precision and GPU.
 

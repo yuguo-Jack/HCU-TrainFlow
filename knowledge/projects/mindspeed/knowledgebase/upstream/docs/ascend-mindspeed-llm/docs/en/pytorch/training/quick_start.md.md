@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/quick_start.md
-raw_sha256: a5c202268aab66c1b2479adabd7009d088bb43ab96d0aba0839d4e5e3afd2bf0
+raw_sha256: 92be5836debdf5e0c37d16355d25145326d06f31484f8e79782f81f82722373c
 sources: []
-generated_body_sha256: 508a3cc7584b2cc74129c3267c383306ff7813465973796a527bd4d6fa3e3dd7
+generated_body_sha256: d942558a8ea3436f87a4c4a9a913d1bfe580ca2d3a37c978bdf847b637a0d694
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/quick_start.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/quick_start.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/quick_start.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -37,9 +37,9 @@ Using Qwen3-8B as an example, this document guides you through the pretraining a
 - Prepare weights and datasets: Download the Qwen3-8B open-source model weights from Hugging Face and obtain the Alpaca dataset.
 - Start training tasks: Run pretraining and fine-tuning on Ascend NPUs.
 
-> [!NOTE]
+> [!NOTE] Note
 >
-> MindSpeed LLM supports <term>Ascend 950 products</term>, <term>Atlas A3 training products</term>, and <term>Atlas A2 training products</term>. Single-NPU on-chip memory of 64 GB or more is required. For details, see [Supported Models in the PyTorch Framework](../models/supported_models.md).
+> MindSpeed LLM supports <term>Ascend 950PR&950DT products</term>, <term>Atlas A3 training products</term>, and <term>Atlas A2 training products</term>. Single-NPU on-chip memory of 64 GB or more is required. For details, see [Supported Models in the PyTorch Framework](../models/supported_models.md).
 >
 > The current Qwen3-8B example script uses `NPUS_PER_NODE=8`, which requires 8 NPUs. If your actual configuration is lower than this, you may encounter OOM (Out of Memory) issues.
 
@@ -190,7 +190,7 @@ At this stage, we modify the pretraining example script and launch model pretrai
     | `--untie-embeddings-and-output-weights` | Untie the weights of the output layer and the embedding layer as required by the original model. |
     | `--bf16` | Ascend chips support the `bf16` precision type well, which can significantly improve training speed. |
 
-> [!NOTE]
+> [!NOTE] Note
 >
 > - For multi-node training, start the pretraining script in multiple terminals at the same time. The pretraining script in each terminal differs only in the `NODE_RANK` parameter. `MASTER_ADDR` is the IP address of the master node for all terminals. All other parameters stay the same.
 > - If you use multi-node training and have not configured shared storage such as NFS between the nodes, you must add the `--no-shared-storage` parameter to the training launch script. After you set this parameter, non-master nodes will automatically generate and cache data preprocessing results locally to avoid errors when reading data across nodes.

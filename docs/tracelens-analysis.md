@@ -2,6 +2,8 @@
 
 本页是性能 Skill 的条件阅读入口。先按 [性能采集](profiling.md) 冻结 trace、训练窗口、rank/并行域、版本和调用契约，再选择工具。使用 `thirdparty/manifest.json` 锁定的 HCU fork；原始 trace、张量、计数器文件留在任务 workspace。
 
+当前集成核对基点是 HCU fork `22786b16d429783927981bd592a47ad0f79db3ba`，上游基准 `493f7508505f36e6ac850aaa29a252bef51e23fc`。HCU-Knowledge 的工具资料不替代这个 fork 的 API；本页与 TrainFlow worker、固定 `training_graph`、`hcu_roofline`、`hcu_analysis`、hipprof/XCompute reader 和 split/merge/compare 源码一起核对。文档更新不自动推进锁、安装依赖或扩大下述历史硬件验证范围。
+
 ## 选择入口
 
 按当前问题选用表中路径，不将全功能资格测试作为每个模型的必做清单。相同 trace/窗口/工具身份的有效报告直接复用；调用归属不清才补 Graph，模型与独立性能有疑问才回放，需要解释硬件瓶颈才采相应计数器。已有充分分析时无需再启动原生 Agent 重复一遍。原生 Agent 的适用推理/复核可纳入同一候选审查并引用其回执，避免多轮相同内容的独立审核；各自的证据契约仍需通过。
@@ -67,6 +69,8 @@ hcu-trainflow --workspace /private/task/analysis tracelens-analyze request.json 
 
 `iterations` 是检测到的迭代序列的零基序号，结束位置不包含在内；不必等于训练日志的全局 step ID。缺步骤或范围被原生工具截短时标为 incomplete。合并的 rank ID 必须来自实际采集，不把抽样 rank 重新编号为完整 world；未采样 rank 仍是覆盖缺口。
 
+比较和高级报告也要查原生日志与 warning。非空 op/kernel 聚合表不保证逐调用细表完整；遇到 kernel-list 长度不一致、未关联调用或跳样，保留受影响范围并回查原 trace，不能用自比较成功证明当前模型映射完整。worker 会把原生 warning 保留在日志和回执中；已知逐调用跳样使 compare/Graph 的 `generated` 降为 `incomplete`，Agent 仍为 `needs-agent-review` 并注明原生报告不完整，普通提示不自动改判失败。比较请求的形状、phase、精度、rank 和窗口仍由调用方匹配，工具不自动建立训练配方等价。
+
 每次生成独立目录，保留请求、输入/输出 SHA256、锁定源码提交、原生表、日志和 `report.json`。`generated` 仅表示该范围产物完成；`incomplete` 保留未知项；`needs-agent-review` 表示指标已准备、推理复核尚未完成，后两者返回退出码 2。残留 CSV 不能将失败/超时改判成功。这些状态都不替代训练阶段的数值、性能或独立 review 门槛。
 
 ## Roofline 与优化队列
@@ -110,6 +114,8 @@ python -m TraceLens.EventReplay.hcu_replay --bundle /private/task/replay.json --
 ```
 
 执行层还须外部进程 deadline；Python 时间预算不能中断已经卡死的 GPU kernel。随机输入只记 synthetic。变异、别名、随机数、通信和训练状态调用缺少完整专用契约时拒绝通用回放；一次 ATen 成功不证明完整 backward/optimizer 等价。
+
+当前通用 EventReplay 会 detach 输入并在 `no_grad` 下执行。支持某个函数式 backward overload 只表示可以复现该独立算子，不会替调用方生成 autograd 图、累积 Parameter 梯度或恢复 optimizer 状态；真实输入与期望输出须取自同一次调用。需要这些训练语义时使用专用调用 adapter，并与模型集成验证分开记录。
 
 同步 device-event 计时可能包括 launch/dispatch 间隙，与 trace 单个 kernel interval 不同。对照要同调用、同范围、多样本和同环境，不能拿不同范围的两列直接算“拖慢倍数”。每轮局部正确性和 profiler-off 性能，稳定阶段才长窗口验 loss。
 

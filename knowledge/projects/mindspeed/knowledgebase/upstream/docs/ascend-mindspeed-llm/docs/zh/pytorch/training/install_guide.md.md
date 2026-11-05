@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/install_guide.md
-raw_sha256: d22ed424e8b64ac60f9c3482c882cedb0634458fd416c39bd669dd565a63d567
+raw_sha256: 6ce2a12af123ba737509a98206ec64f086f0f2856a69356d5c78d05843949896
 sources: []
-generated_body_sha256: de442b643fb1fcd9a0a499b0a4a643a6fde80ea1cae66489b2e51f38383afeb4
+generated_body_sha256: 61a219a75d1f7570e1c7540e079af2887b75ca97d2ae8b84d62561c5539018f1
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/install_guide.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/install_guide.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/install_guide.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -45,7 +45,7 @@ Upstream source document; original commands, claims and links require their stat
 |<term>Atlas推理系列产品</term>|x|
 |<term>Atlas训练系列产品</term>|x|
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 本节表格中“√”代表支持，“x”代表不支持。
 
@@ -58,7 +58,7 @@ Upstream source document; original commands, claims and links require their stat
 
 请单击[固件与驱动](https://www.hiascend.com/hardware/firmware-drivers)，并根据引导完成固件与驱动的安装。
 
-> [!NOTICE]
+> [!TIP] 须知
 >
 > 安装运行程序建议使用非root用户，且建议对安装程序的目录文件做好权限管控：文件夹权限设置为750，文件权限设置为640。可以通过设置umask控制安装后文件的权限，如设置umask为0027。
 >
@@ -78,7 +78,7 @@ MindSpeed LLM支持镜像安装和源码安装。
 
 ### 方式一：镜像安装
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 使用镜像前，请先确认机器型号。最新镜像支持aarch64及X86_64架构，可通过`uname -a`命令确认当前环境是否符合要求。
 > - 配套镜像已预装配套的CANN 9.1.0软件及TorchNPU 26.1.0插件，可根据需要选用。
@@ -138,7 +138,7 @@ MindSpeed LLM支持镜像安装和源码安装。
       /bin/bash
    ```
 
-   > [!NOTE]
+   > [!NOTE] 说明
    >
    > - 当前默认配置驱动和固件安装在/usr/local/Ascend，如有差异请修改指令路径。
    > - 复制启动命令前，请将-v参数内的/data、/weights两处路径，替换为宿主机本地真实目录，否则容器启动失败。
@@ -212,7 +212,7 @@ MindSpeed LLM支持镜像安装和源码安装。
 
    根据引导安装配套版本的PyTorch以及TorchNPU，具体请参考《[TorchNPU 快速安装](https://www.hiascend.com/developer/software/ai-frameworks/pytorch/download?versionId=175&ids=89dda9ba9de741349efa03687a487678%2C98%2C107%2C1%2C6%2C177%2C)》。
 
-   > [!NOTE]
+   > [!NOTE] 说明
    >
    > - 更多TorchNPU插件版本请单击[Link](https://gitcode.com/ascend/pytorch/releases)。
    > - TorchNPU相关文档请参见《[TorchNPU使用导读](https://www.hiascend.com/document/detail/zh/Pytorch/latest/index/index.html)》。
@@ -224,10 +224,10 @@ MindSpeed LLM支持镜像安装和源码安装。
    可参考如下安装命令：
 
    ```shell
-   pip install triton-ascend==3.2.2 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
+   pip install triton-ascend==3.6.0 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
    ```
 
-   > [!NOTE]
+   > [!NOTE] 说明
    >
    > Triton-Ascend 3.2.0及以下版本，Triton-Ascend和Triton不能同时存在。需先卸载社区Triton，再安装Triton-Ascend。
 
@@ -268,7 +268,7 @@ MindSpeed LLM支持镜像安装和源码安装。
 
 ### 方式三：源码安装（Submodule统一安装）
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 采用此方式后，上述[方式二：源码安装](#方式二源码安装)中的逐个依赖仓库拉取与版本切换步骤可通过一条命令完成。
 > - 若已通过方式二手动clone了相关仓库，请先删除对应目录后再使用本方式，避免目录冲突。
@@ -294,7 +294,7 @@ MindSpeed LLM支持通过Git Submodule统一管理三方依赖仓库，便于版
    git submodule update --init --remote 3rdparty/MindSpeed 3rdparty/FSDPTurbo
    ```
 
-   > [!NOTE]
+   > [!NOTE] 说明
    >
    > 如需更新Submodule，详见如下操作：
    > - MindSpeed和FSDPTurbo默认跟踪远端最新，初始化时已完成刷新，后需继续拉取最新提交可执行`git submodule update --init --remote 3rdparty/MindSpeed 3rdparty/FSDPTurbo`。(3rdparty目录下commit可不关注)
@@ -321,20 +321,29 @@ MindSpeed LLM支持通过Git Submodule统一管理三方依赖仓库，便于版
 
    # 将依赖仓库源码软链接到MindSpeed LLM根目录
    ln -s 3rdparty/MindSpeed/mindspeed mindspeed
-   ln -s 3rdparty/FSDPTurbo/fsdpturbo fsdpturbo
+   ln -s 3rdparty/FSDPTurbo/fsdp_turbo fsdp_turbo
    ln -s 3rdparty/Megatron-LM/megatron megatron
 
    # 安装MindSpeed LLM其余依赖
    pip3 install -r requirements.txt
    ```
 
-   > [!NOTE]
+   > [!NOTE] 说明
    >
    > - MindSpeed和FSDPTurbo通过软链接方式安装，无需`pip3 install -e .`，子模块代码更新后软链接自动生效，无需重新安装。
    > - Megatron-LM子模块包含完整仓库，需将`megatron/`源码目录链接至MindSpeed LLM根目录下使用。
    > - 若需使用`pip3 install -e .`方式安装MindSpeed或FSDPTurbo，可分别进入对应子模块目录执行。
 
-4. （可选）切换子模块版本<div id="checkout_submodules"/>
+4. 创建日志目录
+
+   进入MindSpeed LLM代码根目录创建日志目录。
+
+   ```shell
+   cd ../MindSpeed-LLM
+   mkdir logs
+   ```
+
+5. （可选）切换子模块版本<div id="checkout_submodules"/>
 
    如需切换某个子模块到指定分支或标签，例如将Megatron-LM切换到其他版本：
 

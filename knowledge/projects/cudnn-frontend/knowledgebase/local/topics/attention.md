@@ -9,50 +9,51 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
   path: docs/operations/Attention.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: f82cb49cc719d7d12cfafea238a793918ca2ddf713edde173555acbb6f820b64
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: d5bdab36ababaa8bd6dd58b72e6e5c1d46da70f3fbaa87902d693c75ce7d62d0
 - source: nvidia-cudnn-frontend
   path: samples/python/50_sdpa_forward.ipynb
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 5269e5e9a40a4646ec36eaaee478eef6a79cbf252f107c77af8575bc58175f93
 - source: nvidia-cudnn-frontend
   path: samples/python/51_sdpa_backward.ipynb
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: e530a489347cc811a7cf67319c48e479e100f32304abca90b6d0777f09032950
 - source: nvidia-cudnn-frontend
   path: samples/cpp/sdpa/fp16_fwd.cpp
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 9fff38ca56811b429f8cae604a922bef70a68644df8e5c40ec4bf2ea51730384
 - source: nvidia-cudnn-frontend
   path: samples/cpp/sdpa/fp16_bwd.cpp
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 62f47b922848b39b6ec9ee07f2dbac8e65b2f46cfffb1e327e9b050a4d9f6bc2
 - source: nvidia-cudnn-frontend
   path: include/cudnn_frontend/node/scaled_dot_product_flash_attention.h
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 607ff62f97714ee8b71c6f643d1d635495757084a0a8e42bf21d5c5138ca5f43
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 60c7612d76aac30412aaab47c024c1d21a5dd02b246e86ddc011886fc5ecd2d9
 - source: nvidia-cudnn-frontend-docs
   path: attention
-  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
-  sha256: 99596d620c3471579259610ef4b780d319bb7bfb235ccd2b63e2e27080c328a6
+  commit: 62596f777aca773f340569b88fbd42c5fcd807249e8a188810cd38297d19cab9
+  sha256: f768a9f63d014d2e96a65a25f01953f2d6c74e0e14dc39c751b4badbeb4ba73e
   url: https://docs.nvidia.com/cudnn/operations/Attention
   revision_kind: web-content-fingerprint
 - source: nvidia-cudnn-frontend
   path: python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 0d781196aa5c2e7989dc19a6ceb37841260f555e67ef70c850976c863de26738
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 343333d056ad6ac4716b06ee250f3ced564276bb9474091161f8eff7c365e5fd
 - source: nvidia-cudnn-frontend
   path: test/python/sdpa/frost/test_sdpa_split_combine_sm100.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 544375092f1bb909003aeeaa0db5f303b0f6d5ac11bbda610c9b24d3d57d599a
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 16c57ee9b324b8aec6348754d97a9eab1225395d7035bce5e834a4ca3869a59a
 - source: nvidia-cudnn-frontend
   path: test/python/sdpa/frost/test_sdpa_fwd_decode_d256_sm107.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: e9d19f627d964cc7a5c79a6d5d9eb25edbab7bf407d3d36eac7fabd0ade16853
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 1e0ebc2ac4d9d2a870c206c6cb75dfa3b75f4c67e6ad4cd53a196b8ceaa7c0cb
 ---
 
 # cuDNN SDPA 训练：Forward、Backward、Stats 与布局
@@ -89,28 +90,32 @@ FP8 `Amax_S` 已标为弃用，声明它为输出会排除 FROST FP8 选择；�
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: docs/operations/Attention.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/operations/Attention.md)
-- [nvidia-cudnn-frontend: samples/python/50_sdpa_forward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/python/50_sdpa_forward.ipynb)
-- [nvidia-cudnn-frontend: samples/python/51_sdpa_backward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/python/51_sdpa_backward.ipynb)
-- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_fwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/cpp/sdpa/fp16_fwd.cpp)
-- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/samples/cpp/sdpa/fp16_bwd.cpp)
-- [nvidia-cudnn-frontend: include/cudnn_frontend/node/scaled_dot_product_flash_attention.h](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/include/cudnn_frontend/node/scaled_dot_product_flash_attention.h)
+- [nvidia-cudnn-frontend: docs/operations/Attention.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/operations/Attention.md)
+- [nvidia-cudnn-frontend: samples/python/50_sdpa_forward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/samples/python/50_sdpa_forward.ipynb)
+- [nvidia-cudnn-frontend: samples/python/51_sdpa_backward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/samples/python/51_sdpa_backward.ipynb)
+- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_fwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/samples/cpp/sdpa/fp16_fwd.cpp)
+- [nvidia-cudnn-frontend: samples/cpp/sdpa/fp16_bwd.cpp](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/samples/cpp/sdpa/fp16_bwd.cpp)
+- [nvidia-cudnn-frontend: include/cudnn_frontend/node/scaled_dot_product_flash_attention.h](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/include/cudnn_frontend/node/scaled_dot_product_flash_attention.h)
 - [nvidia-cudnn-frontend-docs: attention](https://docs.nvidia.com/cudnn/operations/Attention)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。
 
 ## FROST 新实现与训练边界
 
+当前 unified forward 的 compute_data_type 独立于 Q/K/V/O 存储类型：继承图设置，均未设置时为 FLOAT。cuDNN≥9.29 的头文件与实际 backend 才接受新属性通路；当前 backend 仍在 descriptor finalization 拒绝 HALF 请求，不能把参数可传解释为已有 FP16 累加 kernel。softmax/stats 仍为 FP32，composite 和 backward 不由此改变。
+
 开发线扩充了 SM107 的 decode/PackGQA/split-KV 选择；某些 gate 融合在 split combine 的 FP32 合并值上完成一次舍入。Stats 保持独立于 gate，Amax_O 仍描述图中 gate 之前的值。这类接口/数值细节比 kernel 名相同更重要。paged、ragged、sink、动态 shape 的支持组合须以当前支持矩阵和实际 support/dispatch 为准，不能把某条 decode 路径的扩展直接用于训练 backward。
 
 SM100/SM103 half-precision sink + split 路线先生成不含 sink 的 partials，再由 combine 将 sink 折入一次。有效但 keyless 的 Q 行输出 O=0、LSE=sink；超过 `seq_len_q` 的 padded Q 行仍为 O=0、LSE=-inf。两种行的 partials 可能相同，因此 combine 还须绑定 Q lengths；不能仅靠 partial LSE 推断 padding。`test_pointer_combine_sink_keeps_padded_query_rows_dead` 覆盖 lean、serial、decode combine 形式。这不扩大 quantized、gated 或 SM107 sink+split 的支持范围。
 
-训练侧新增 opt-in 的 `sdpa_bwd_sm100_d128`；矩阵区分 dense MHA 的 accumulation 与保留的 recompute 实现。新的 accumulation 路线要求 SM100、公开 CuTeDSL≥4.8、正且可用 FP32 表示的 scale 等条件，dense Q/KV 长度须按128整除；THD 与 GQA/MQA 进一步要求 exact cc10.0，其中 grouped attention 只收 BF16，FP16 MHA 仍有自己的支持面。THD 每个端口的 ragged origins、空序列和输出容量也是契约。workspace 和 launch 数随实现、THD、分组而变，以 `get_workspace_size()` 和对应 d128 eligibility/numerics/capture 测试为准；不能把 d512/d256 的支持表或零 workspace 假设沿用到该链，也不由 opt-in admission 推导性能达标。
+训练侧 `f88a1ef2a35b` 已将 `sdpa_bwd_sm100_d128` 与 d256 列为默认候选，仍按图条件排序，不能沿用旧 opt-in 结论，也不能由默认候选推导必选。d128 的 accumulation/recompute 分别有资格；THD 的 FP16/BF16 MHA 和 BF16 GQA/MQA 当前可在 cc10.0/10.3、公开 CuTeDSL≥4.8、正且可用 FP32 表示的 scale 等条件下准入，其他形状/模式仍须查当行矩阵。THD 各端口 origins、空序列和输出容量同属合同；workspace 和 launch 数按实际实现查询，不沿用其他 head-dim 的零 scratch 假设。
+
+前向还扩展独立物理 origins 与混合 KV 存储：部分 D128 half Q/O 路线可直接读取 E4M3/E5M2 K/V，并在片上转换，不等于整段 FP8 attention；D192/V128、精确 Q/K576–V512 及 paged/split 各有单独资格。split partials 与最终 O/Stats 的布局、sink 只折入一次、自然对数与 log2 Stats 的转换均须随实际消费者核对。矩阵增加资格不自动改变所有 heuristic，也不自动扩展训练 backward。
 
 另见 [FlexAttention plan 与 autograd](flex-attention-plans.md)；它的 interval-mask API 与通用任意 score modifier 不是同一支持面。
 
 补充固定证据：
 
-- [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md)
-- [test/python/sdpa/frost/test_sdpa_split_combine_sm100.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/test/python/sdpa/frost/test_sdpa_split_combine_sm100.py)
-- [test/python/sdpa/frost/test_sdpa_fwd_decode_d256_sm107.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/test/python/sdpa/frost/test_sdpa_fwd_decode_d256_sm107.py)
+- [python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md)
+- [test/python/sdpa/frost/test_sdpa_split_combine_sm100.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/sdpa/frost/test_sdpa_split_combine_sm100.py)
+- [test/python/sdpa/frost/test_sdpa_fwd_decode_d256_sm107.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/test/python/sdpa/frost/test_sdpa_fwd_decode_d256_sm107.py)

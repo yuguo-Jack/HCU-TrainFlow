@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: f0a5f111f205b5c73bb34fbd41f8f0d9936b543f
+commit: 25e7c5728d834335288d080e1c36810fa111d4da
 path: docs/training/weight_checker.md
-raw_sha256: a7ffac8123c9782e48d55cea5a3d34132701f3026e22653ed707dffd0e532ae0
+raw_sha256: cc138369a2ff65c5f02a51361679c709b2356efc9d76bb3ba54c472ddba24e32
 sources: []
-generated_body_sha256: e30df51167381c454ae8d3454afe239604982c947c24ded01d26a178e6d7bc9c
+generated_body_sha256: f558c21eee5a72103bc7c6e561f527b341f73f952094619537ed2c12fc5d01fb
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/weight_checker.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/f0a5f111f205b5c73bb34fbd41f8f0d9936b543f/docs/training/weight_checker.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/training/weight_checker.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -31,6 +31,9 @@ Upstream source document; original commands, claims and links require their stat
 The Weight Checker verifies that an RL weight update landed on every rank. It
 hashes each model parameter with SHA-256, so a caller can save the original
 digests, reset the weights, transfer them back, and confirm they match.
+
+To also check generated outputs before and after an update, see
+[Verifying a New Model Without a Trainer](weight_transfer/README.md#verifying-a-new-model-without-a-trainer).
 
 Enable it with `VLLM_SERVER_DEV_MODE=1`. All operations use
 `POST /weight_checker`:

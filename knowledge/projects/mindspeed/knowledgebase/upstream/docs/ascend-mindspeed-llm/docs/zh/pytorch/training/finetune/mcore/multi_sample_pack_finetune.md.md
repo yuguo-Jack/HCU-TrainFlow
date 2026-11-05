@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md
-raw_sha256: 2729ad59376e7c8922f0aa691168191979c31e4ca3b9bd2ca9d9ae7b3e7f7496
+raw_sha256: 7f1bbd92bead0e415ef08e826cc946e9a38987d6cd6c8c72f31deab7b0baf6dd
 sources: []
-generated_body_sha256: 683eca8f8378cc80ff5933d1f140ddfe628ce187d6607539aacfe686a4ce7aa9
+generated_body_sha256: 3bec0d32b8fddaf7e53e72bb50e751d200b9821ef5be14c83a1ec363fcdec8cc
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -88,7 +88,7 @@ Upstream source document; original commands, claims and links require their stat
     bash examples/mcore/qwen3/tune_qwen3_32b_32K_full_pack_A3_ptd.sh
     ```
 
-> [!NOTE]
+> [!NOTE] 说明
 > [Qwen3-32B Pack微调脚本](https://gitcode.com/Ascend/MindSpeed-LLM/blob/26.1.0/examples/mcore/qwen3/tune_qwen3_32b_32K_full_pack_A3_ptd.sh)支持数据/权重在线加载训练，即集成了数据预处理、权重转换和训练于一体，单脚本即可启动训练任务。若需了解该功能的更多详情可参见[数据/权重在线加载训练](../../pretrain/mcore/train_from_hf.md)。
 >
 > - 权重转换合一训练：实现HuggingFace权重到Megatron格式的双向自动转换与训练合一，用户无需单独执行权重转换步骤，实现从HuggingFace权重到训练任务的一键式集成。

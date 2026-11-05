@@ -4,6 +4,8 @@
 
 建立参考或出现偏差时先读[模型精度诊断](practices/model-accuracy-diagnosis.md)，按有 NV/无 NV 路线定位输入、前向、梯度、更新的首差；本页负责阶段 loss 与保存恢复的验收。Probe 报告不能替代本页的同初态对照，短局部诊断也不强制长训。
 
+接管或更换启动示例后，从最终命令、有效配置与原始保存/加载日志确认 checkpoint 仍被配置。模板可能注释 save/load、改变覆盖链或移除旧导出入口；示例可启动不证明持久恢复点存在，HF 权重导出也不替代完整训练状态保存。
+
 ## 从局部验证到完整训练
 
 1. 固定模型、数据/tokenizer、软件二进制、源码快照、并行布局及随机种子。区分模型初始化、首次编译、实际 iteration、验证集计算和 checkpoint 写盘；不同阶段使用匹配的超时。
@@ -37,6 +39,20 @@
 - 固定确定性配置可要求精确相等；存在非确定性 kernel 时，先建立重复运行自身差异，再使用预先声明的容差。不得观察到差异后任意放宽阈值。记录哪些 RNG/调度器/数据状态能直接比较、哪些只有行为证据。
 
 没有覆盖的异步保存、跨拓扑 reshard、故障中断、不同优化器和持久化后端继续列为待验证。短窗口恢复通过不代表长时 loss/收敛验收通过。
+
+### 完整恢复与仅加载权重的开关
+
+`load_optimizer_states=False`、`load_module_only=True` 和“缺失 optimizer 文件”不是同一种恢复模式。逐版本核对 master weights 的真实来源、optimizer/scheduler/RNG/data 的加载条件和缺失状态的失败行为；A/B 续训对照必须使用同一模式及完整状态，主动重置 optimizer 属于另一个实验。
+
+例如 DeepSpeed 官方固定 `d8241a9ba266405e1a58fadf19e24b2370f6d7fa` 的完整 ZeRO 加载即使关闭 optimizer 状态仍强制读取保存的 FP32 master，旧 `load_from_fp32_weights` 配置已弃用并被 Engine 忽略。ZeRO-1/2 module-only 才从模型重建 master，ZeRO-3 module-only 仍需 FP32 分片；缺分片不能静默回填。native checkpoint 改 DP 数也仅允许 elastic ZeRO-1/2 的 FP32 权重且不载 optimizer，其他布局需按受支持 Universal 协议转换。实际消费者、NVMe 和模式表见[DeepSpeed checkpoint 专题](../knowledge/projects/deepspeed/knowledgebase/local/topics/pipeline-schedule-and-checkpoint.md)，这些是固定源码边界，没有 HCU 运行通过声明。
+
+### Graph、随机状态与存储恢复
+
+使用 Graph、低精度权重缓存或自定义 allocator 时，分别检查持久训练状态和运行期派生状态。加载 RNG/checkpoint 后，按引擎实际顺序重建 Graph、生成器注册、通信句柄与权重缓存，并验证恢复后的第一次和后续更新；目录中的 tensor 读回成功不能证明旧 graph 地址、seed/offset 缓冲或量化缓存仍然有效。不要把运行期的 graph/pool 对象当作已经由普通 checkpoint 自动保存和恢复。
+
+PyTorch 的分支差异需要单列：HCU 2.16 专项的当前实现会在 capture 前预留 RNG 状态，使用 Python retained 对象并在释放前同步实际 replay 流；旧维护线不能沿用同一生命周期解释。核对 generator 数量上限、capture 失败后的清理和跨流执行依赖，采集/重构后须回到原执行模式验证随机数与内存行为。
+
+expandable segments 的虚拟地址预留、物理映射、IPC 导入和“在新进程恢复指定原地址”也是不同能力。当前参考实现的 `USE_ROCM` 分支明确拒绝最后一项，相关 CUDA 恢复测试跳过 ROCm；不能把上游的序列化 Graph/storage 恢复方案写成 HCU 已支持。应采用该部署分支已支持的 checkpoint 加载及重新构图流程，并独立验收 optimizer、RNG、数据位置和下一次更新。对应固定源码与 KB 入口见[诊断证据](../skills/hcu-train-scale-and-stability/references/evidence-sources.md)；这里没有 HCU 运行通过声明。
 
 ## 恢复演练的保存预算与时序
 

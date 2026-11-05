@@ -2,6 +2,20 @@
 
 > 本文件是按任务保留的历史记录；每段计数、版本、完成状态和限制仅对应当时的检查。现行用法见 README、AGENTS.md 与对应 Skill/docs，当前任务见 task_plan.md；不将旧安装或发布计划当作当前要求。
 
+## 2026-11-05：独立知识库发布后的全面对齐
+
+- 前置 HCU-Knowledge 独立交付 v0.5.7 / c08470f7，双远端refs与新增LFS材料下载哈希已核验。本阶段仅只读使用其ec6032a6b2fe4e14b52ce88cf5258d1f索引和原件，不再次更新大库。
+- 24项官方来源、98篇作者页及三个HCU训练阶段的当前调用契约已复核。Loong-Megatron遵循父仓gitlink 9d2d6b3；TorchTitan #4760 已合并且v0.4发布，旧候选描述更新；SGLang #42561已关闭但未合并，不能据状态宣称部分runner失败已修好。
+- 沿消费者区分预测余量、FP8计算/通信与显存范围、Probe实际hook/step owner、通信provider及main_grad生命周期、恢复状态与训练质量。LoongForge TensorWise保存/加载负载错配、Megatron诊断参数空值、AReaL future-version mask和部分上游失败收尾仍是静态发现或未解决限制，没有改写为本次修复或硬件通过。
+- 常规TraceLens已有的原生跳样告警资格检查扩展到高级worker，保持诊断stderr并向外层回执传播warning/gap/incomplete；Agent仍需独立审阅。77项CPU专项回归与两次独立代码复核通过。
+- 安装器只在证明当前HEAD是目标祖先时推进已有受管checkout；较新、分叉或历史不明均保留现场。历史查询最多一次deepen=128，既有完整历史不变浅，fetch后复查身份/脏状态/HEAD；93项CPU回归含12项真实本地Git场景通过，回滚文档同步关闭旧的降锁用法。
+- 已安装Hygon Skill实际比旧f39锁更新；核对并保留7e3390b的架构探索/经验复用增强。另修复Triton工作流为实际配置读取的TORCH_COMPILE_DEBUG，并在所属仓通过110项CPU测试后发布02f0098；TrainFlow锁与受管副本对齐，固定TraceLens和可选KernelWiki保留。
+- 当前完整目录与旧未决并集22,683项：390项绑定已审作者内容，5,290项仅关闭目录元数据或当前不存在路径；17,003项未深读blob/gitlink继续deferred。独立检查全部22份路径回执，无旧待办丢失；采集、目录、内容审阅和设备验证分别记录。
+- 29份许可副本与固定Git树相符，新增cuDNN LICENSING.md和其原样引用的THIRD_PARTY_LICENSES.txt；官网正文权限未被推断为自动再许可。发现并修复文档symlink跨固定commit而link blob不变时漏读更新target的问题，失败刷新继续pending；两个新增回归及全仓1,343项CPU测试通过，4项平台跳过。受影响正文与工作流回执已原生更新，完整安装与11项必需Skill检查通过，选定本机同步/check为current，独立知识库generation和可选KernelWiki定制保留。
+- 最终全24来源审计覆盖22Git/2web、870份登记Git源码、1,251份文档与20,780条PR，未知错误和输入漂移均0。原10,493项待采队列中唯一10,474项有真实native checkpoint，精确余19条SG/vLLM原生404；保留原日期、正文、raw、记录、游标及pending。全部历史网络失败、重试耗尽与后续真实恢复分开留证，可访问范围完成不等于全部历史或未读代码已审。
+- GitHub files API终态3000条不证明完整：SG #44230、vLLM #54955、Megatron #8557已用固定Git完整树/真实diff补齐路径清单；Megatron #7906唯一null SHA以同blob的100755→100644模式变化严格解释。四份额外清单不覆盖原API数组、sha=null、diff_complete=false或缺失patch，也不猜测已不可见的head仓库身份。
+- 46项直接引用PR已通过原生review_pr绑定当前公共原件。最终目录检查发现上游标题`[dev](perf)`被嵌入Markdown链接标签后形成错误内链；生成器仅转义标签方括号为显示等价实体，保留原PR标题，旧实现精确回放失败、新72项相关回归通过。修复后22,185页最终索引efa92f2b6744的20组真实问题默认混合检索全部命中，并逐项读取同generation完整当前正文，无需kind细化；修复前f65索引及20次成功查询原样归档。最终发布独审、最终提交完整CI与Git/tag结果以实际交付回执为准；没有训练或硬件通过结论。
+
 ## 2026-10-20：独立知识库发布后的维护复核
 
 - 前置 HCU-Knowledge 已独立发布 v0.5.6 / 3829ef06。TrainFlow 只对齐依赖锁和使用契约；大库源码、数据、索引与远端不再次更新。只读 doctor 的 generation 为 f2ec7e14bb4648baae74c18f1bb404fb，索引 current、LFS 齐全。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: 8e7a2406111e1c2c3d22112ddb3a1741c619b2ea
+commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
 path: docs/04-technical-guides/specforge/runtime-image.md
-raw_sha256: 4bffc74e1eec28678ba9aa0ab2e65be1b485f10c5aa4df015ec43962731e0643
+raw_sha256: 5316927db40a04bc926a8863dade1c5391915387e8a25d9340036fea0245bde8
 sources: []
-generated_body_sha256: 7d29bc02eda970d4f4846d815894f4b092f6236ffc9e802b83b93b4e9fad4d2a
+generated_body_sha256: 4ebad308f1afd9a0b6028429ee8ac14320e826dcb4c9c81854cb79ff5088c8ad
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/04-technical-guides/specforge/runtime-image.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/04-technical-guides/specforge/runtime-image.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/04-technical-guides/specforge/runtime-image.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -52,6 +52,7 @@ installs **this Primus checkout** editable with `--no-deps`.
 | SpecForge | `pip install -e . --no-deps` at a pinned git SHA |
 | Primus | `pip install -e /opt/primus --no-deps` (this tree, not the PyPI wheel) |
 | Extra imports | Allowlist in [`install-light-deps.sh`](https://github.com/AMD-AGI/Primus/blob/main/examples/specforge/docker/install-light-deps.sh), each `--no-deps` |
+| tensorboard | Exception. The Dockerfile installs `tensorboard>=2.14,<2.21` with dependencies, constrained to versions already in the base image, so pip cannot upgrade numpy, protobuf, grpcio, setuptools, or pillow. `SummaryWriter` imports tensorboard's own tree, and a `--no-deps` copy leaves `--report-to tensorboard` broken. tensorboard 2.21 requires `protobuf>=6.31.1` and `grpcio>=1.74`; the upper bound keeps that release out so the constraint holds instead of upgrading the SGLang stack. |
 
 Do **not** run `primus-cli deps sync` in this image. That path installs Megatron /
 CUDA wheels and will clobber the ROCm stack.
@@ -78,9 +79,11 @@ The Dockerfile:
    `patches/sglang/v0.5.14/spec-capture.patch`.
 3. Installs SpecForge editable `--no-deps`.
 4. Copies this Primus tree and installs it editable `--no-deps`.
-5. Fills missing light packages (`accelerate`, `tensorboard`, …) `--no-deps`.
-6. Runs GPU-free smoke checks (`enable_spec_capture`, `import specforge`,
-   `primus-cli --help`, HIP torch).
+5. Fills missing light packages (`accelerate`, `wandb`, …) `--no-deps`.
+6. Installs `tensorboard>=2.14,<2.21` with dependencies, constrained to the
+   base image's already-installed versions.
+7. Runs GPU-free smoke checks (`enable_spec_capture`, `import specforge`,
+   a `SummaryWriter` event-file write, `primus-cli --help`, HIP torch).
 
 Validated on AMD Instinct MI355X (gfx950). Newer SGLang ROCm tags may work if
 they still ship AITER and the speculative algorithm you will serve.

@@ -1,0 +1,974 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "956ae94bef5b2cd2177f4acf248adfe2bb333bcfd186d501b0115d77a7173562",
+      "isPrivate": false,
+      "numbers": [
+        62648,
+        62647,
+        62646,
+        62644,
+        62643,
+        62642,
+        62638,
+        62637
+      ],
+      "observed_at": "2026-11-04T20:06:19.277601+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4894,
+        "resetAt": "2026-11-04T20:42:56Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "fce64bc5c2c939a4521bfb9b462c8c74c1c13893",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "\n\n## Overview\n\n`MultiConnector` never forwarded `get_kv_connector_kv_cache_events()` to its sub-connectors. Worker-side KV events from `MooncakeStoreConnector` (and LMCache) were therefore never drained when it ran inside a `MultiConnector`. With KV events enabled, the Mooncake store's per-block `BlockStored` buffer grew for the life of the worker process. This PR implements the method, aggregates events per sub-connector across workers, and routes each sub-connector its own events on the scheduler side.\n\nThis resolves the TODO left in `multi_connector.py` after #31811 and #34522, both closed unmerged.\n\n## Claims\n\n- Fixes an unbounded host-memory leak in GPU worker processes. It triggers when `MultiConnector` contains `MooncakeStoreConnector` and `--kv-events-config '{\"enable_kv_cache_events\": true, ...}'` is set. For example, the common P/D setup `MultiConnector(NixlConnector, MooncakeStoreConnector)` with KV-aware routing.\n- KV cache events from sub-connectors inside a `MultiConnector` now reach the scheduler and are published, the same as when those connectors run standalone.\n- No change for `MultiConnector` setups whose sub-connectors do not produce KV events (all return `None`), or for single connectors.\n\n## Validation\n\n**Production evidence (before the fix).** Read-only heap analysis of a live prefill `Worker_DP` process (`/proc/<pid>/mem`, nothing paused):\n- Setup: DeepSeek-V4.1-Flash, DP2/EP, `MultiConnector(NixlConnector, MooncakeStoreConnector)`, KV events on, block size 128.\n- After 12 h of traffic, the process held:\n  - one Python list of 1,377,539 `BlockStored` objects;\n  - 1,377,544 lists of exactly 128 ints, which are the events' `token_ids`;\n  - about 7 GiB in total.\n- The worker grew with prompt tokens, about 30 GiB per pod per day. It eventually ran an 8×B300 node out of host memory, and the node hung for about 3 h.\n\n**Reproducer on `main` (fce64bc5c2) vs. this PR.** Two sub-connectors whose `get_kv_connector_kv_cache_events()` returns a buffered container:\n\n| | `MultiConnector.get_kv_connector_kv_cache_events()` | sub-connector drain calls per step |\n|---|---|---|\n| `main` | `None` | 0, 0 (buffers never drained) |\n| this PR | `MultiKVConnectorKVEvents` with both containers | 1, 1 |\n\n**Unit tests** (CPU, Linux):\n```\npytest tests/v1/kv_connector/unit/test_multi_connector.py \\\n       tests/v1/kv_connector/unit/test_mooncake_store_connector.py \\\n       tests/v1/kv_connector/unit/test_lmcache_connector.py\n109 passed, 1 skipped (needs GPU), 1 deselected (gated HF model download)\n```\nNew tests:\n- `test_multi_connector_kv_cache_events_drain_every_connector`: every sub-connector is asked every step, even when another returns `None`.\n- `test_multi_connector_kv_cache_events_aggregate_per_connector`: runs the real `KVOutputAggregator`. Events merge per connector only, and each connector counts only the workers that reported it, which Mooncake's quorum logic depends on.\n- `test_multi_connector_routes_kv_cache_events_to_each_connector`: on the scheduler side, each sub-connector receives its own container, and the caller's output is restored.\n\n`get_kv_connector_kv_cache_events` is removed from `INHERITED_OK` in `test_multi_connector_overrides_all_base_methods`.\n\n**Not yet done:** an end-to-end serving run with this patch. The production lane is being rebuilt with it; I will post memory before/after here.\n\n## Details\n\n**Root cause.** The model runner calls `kv_connector.get_kv_connector_kv_cache_events()` once per step (`kv_connector_model_runner_mixin.py` for MRV1, `gpu/kv_connector.py` for MRV2). With `MultiConnector` as the top-level connector, this hit the base-class default and returned `None`.\n\n`MooncakeStoreConnector`'s send thread appends one `BlockStored` (with the block's `token_ids`) per stored block to `KVTransferThread.kv_events`. The only code that clears that list is `MooncakeStoreConnector.get_kv_connector_kv_cache_events()`, via `get_kv_events()`, which was therefore never called. The scheduler side (`take_events`) was already forwarded, but never received any events.\n\n**Flow with this PR:**\n1. Worker step: `MultiConnector.get_kv_connector_kv_cache_events()` calls every sub-connector, which drains its buffer. It returns `MultiKVConnectorKVEvents(events=[per-connector container or None, ...])`, or `None` if all are `None`.\n2. `KVOutputAggregator.aggregate` folds workers together through a new `KVConnectorKVEvents.aggregate_worker(other)` hook. The default is the previous `add_events(other.get_all_events()); increment_workers(1)`, so existing containers behave identically. `MultiKVConnectorKVEvents` overrides it to merge per index.\n3. Scheduler: `MultiConnector.update_connector_output` sets `connector_output.kv_cache_events = events[i]` for each sub-connector, exactly as it already does for `kv_connector_worker_meta`, and restores the field afterwards. Each sub-connector keeps receiving the container type it produced, so the existing `isinstance` checks in Mooncake and LMCache are unchanged.\n4. `MultiConnector.take_events()` (unchanged) yields each sub-connector's events for publishing.\n\n**Notes and tradeoffs:**\n- Deployments that use `MultiConnector` with Mooncake or LMCache and KV events enabled will now publish those connectors' events (e.g. Mooncake `BlockStored` with `medium=\"cpu\"`). Previously they were silently dropped while leaking. This matches standalone behaviour, but KV-event consumers will see new events.\n- `MultiKVConnectorKVEvents.add_events` raises, because untyped events cannot be routed to a connector. Nothing calls it: the aggregator uses `aggregate_worker`.\n- The per-step cost is one extra method call per sub-connector. There is no CPU/GPU sync.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01A9Ef2S3fbtzAiwj1cT6NR2\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "stu-cao"
+            },
+            "body": "@njhill Nick, could you please help take another look?",
+            "createdAt": "2026-11-02T03:12:40Z",
+            "databaseId": 6568140322,
+            "updatedAt": "2026-11-02T03:12:40Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62637#issuecomment-6568140322"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYd93iI=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "headRepository": {
+        "nameWithOwner": "stu-cao/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 62637,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5581906884,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-20T07:20:54Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5581906884"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "njhill"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "njhill"
+                  },
+                  "body": "```suggestion\n    def _present(self) -> Iterable[KVConnectorKVEvents]:\n        return (e for e in self.events if e is not None)\n```\ncan be generator",
+                  "createdAt": "2026-10-25T01:44:20Z",
+                  "databaseId": 4369265876,
+                  "diffHunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]",
+                  "line": null,
+                  "originalLine": 87,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+                  "updatedAt": "2026-10-25T02:06:44Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4369265876"
+                },
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "njhill"
+                  },
+                  "body": "```suggestion\n        for i, e in enumerate(self.events):\n            self.events[i] = e and e.aggregate()\n```",
+                  "createdAt": "2026-10-25T02:05:26Z",
+                  "databaseId": 4369311917,
+                  "diffHunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]\n+\n+    def add_events(self, events: list[\"KVCacheEvent\"]) -> None:\n+        raise TypeError(\n+            \"MultiKVConnectorKVEvents holds events per connector; \"\n+            \"add events to the per-connector containers instead.\"\n+        )\n+\n+    def aggregate(self) -> \"MultiKVConnectorKVEvents\":\n+        for e in self._present():\n+            e.aggregate()",
+                  "line": null,
+                  "originalLine": 97,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+                  "updatedAt": "2026-10-25T02:06:44Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4369311917"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yNVQwMjowNToyNlrPAAAAAQRuaK0=",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5640971155,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-25T02:06:44Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5640971155"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "stu-cao"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "stu-cao"
+                  },
+                  "body": "fixed in b0eced4a4c",
+                  "createdAt": "2026-10-29T00:04:21Z",
+                  "databaseId": 4407370761,
+                  "diffHunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]",
+                  "line": null,
+                  "originalLine": 87,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+                  "updatedAt": "2026-10-29T00:04:21Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4407370761"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQwMDowNDoyMVrPAAAAAQazJAk=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5691269223,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-29T00:04:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5691269223"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "stu-cao"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "stu-cao"
+                  },
+                  "body": "fixed in https://github.com/vllm-project/vllm/commit/b0eced4a4c241d35f234420704b793f0a425c6f2",
+                  "createdAt": "2026-10-29T00:04:36Z",
+                  "databaseId": 4407372523,
+                  "diffHunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]\n+\n+    def add_events(self, events: list[\"KVCacheEvent\"]) -> None:\n+        raise TypeError(\n+            \"MultiKVConnectorKVEvents holds events per connector; \"\n+            \"add events to the per-connector containers instead.\"\n+        )\n+\n+    def aggregate(self) -> \"MultiKVConnectorKVEvents\":\n+        for e in self._present():\n+            e.aggregate()",
+                  "line": null,
+                  "originalLine": 97,
+                  "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+                  "updatedAt": "2026-10-29T00:04:36Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4407372523"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQwMDowNDozNlrPAAAAAQazKus=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5691271082,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-29T00:04:36Z",
+            "url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5691271082"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yOVQwMDowNDozNlq0MjAyNi0xMC0yOVQwMDowNDozNlrPAAAAAVM556o=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "state": "OPEN",
+      "title": "[Bugfix][KV Connector] Drain sub-connector KV cache events in MultiConnector (fixes worker memory leak)",
+      "updatedAt": "2026-11-02T03:12:40Z",
+      "url": "https://github.com/vllm-project/vllm/pull/62637"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/62637/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/62637/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/62637"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/62637"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/62637/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/62637"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/b0eced4a4c241d35f234420704b793f0a425c6f2"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 220,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 24404,
+        "forks_count": 24404,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9861,
+        "open_issues_count": 9861,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T20:02:50Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 343901,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 96314,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-04T20:01:57Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 96314,
+        "watchers_count": 96314,
+        "web_commit_signoff_required": true
+      },
+      "sha": "fce64bc5c2c939a4521bfb9b462c8c74c1c13893",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "\n\n## Overview\n\n`MultiConnector` never forwarded `get_kv_connector_kv_cache_events()` to its sub-connectors. Worker-side KV events from `MooncakeStoreConnector` (and LMCache) were therefore never drained when it ran inside a `MultiConnector`. With KV events enabled, the Mooncake store's per-block `BlockStored` buffer grew for the life of the worker process. This PR implements the method, aggregates events per sub-connector across workers, and routes each sub-connector its own events on the scheduler side.\n\nThis resolves the TODO left in `multi_connector.py` after #31811 and #34522, both closed unmerged.\n\n## Claims\n\n- Fixes an unbounded host-memory leak in GPU worker processes. It triggers when `MultiConnector` contains `MooncakeStoreConnector` and `--kv-events-config '{\"enable_kv_cache_events\": true, ...}'` is set. For example, the common P/D setup `MultiConnector(NixlConnector, MooncakeStoreConnector)` with KV-aware routing.\n- KV cache events from sub-connectors inside a `MultiConnector` now reach the scheduler and are published, the same as when those connectors run standalone.\n- No change for `MultiConnector` setups whose sub-connectors do not produce KV events (all return `None`), or for single connectors.\n\n## Validation\n\n**Production evidence (before the fix).** Read-only heap analysis of a live prefill `Worker_DP` process (`/proc/<pid>/mem`, nothing paused):\n- Setup: DeepSeek-V4.1-Flash, DP2/EP, `MultiConnector(NixlConnector, MooncakeStoreConnector)`, KV events on, block size 128.\n- After 12 h of traffic, the process held:\n  - one Python list of 1,377,539 `BlockStored` objects;\n  - 1,377,544 lists of exactly 128 ints, which are the events' `token_ids`;\n  - about 7 GiB in total.\n- The worker grew with prompt tokens, about 30 GiB per pod per day. It eventually ran an 8×B300 node out of host memory, and the node hung for about 3 h.\n\n**Reproducer on `main` (fce64bc5c2) vs. this PR.** Two sub-connectors whose `get_kv_connector_kv_cache_events()` returns a buffered container:\n\n| | `MultiConnector.get_kv_connector_kv_cache_events()` | sub-connector drain calls per step |\n|---|---|---|\n| `main` | `None` | 0, 0 (buffers never drained) |\n| this PR | `MultiKVConnectorKVEvents` with both containers | 1, 1 |\n\n**Unit tests** (CPU, Linux):\n```\npytest tests/v1/kv_connector/unit/test_multi_connector.py \\\n       tests/v1/kv_connector/unit/test_mooncake_store_connector.py \\\n       tests/v1/kv_connector/unit/test_lmcache_connector.py\n109 passed, 1 skipped (needs GPU), 1 deselected (gated HF model download)\n```\nNew tests:\n- `test_multi_connector_kv_cache_events_drain_every_connector`: every sub-connector is asked every step, even when another returns `None`.\n- `test_multi_connector_kv_cache_events_aggregate_per_connector`: runs the real `KVOutputAggregator`. Events merge per connector only, and each connector counts only the workers that reported it, which Mooncake's quorum logic depends on.\n- `test_multi_connector_routes_kv_cache_events_to_each_connector`: on the scheduler side, each sub-connector receives its own container, and the caller's output is restored.\n\n`get_kv_connector_kv_cache_events` is removed from `INHERITED_OK` in `test_multi_connector_overrides_all_base_methods`.\n\n**Not yet done:** an end-to-end serving run with this patch. The production lane is being rebuilt with it; I will post memory before/after here.\n\n## Details\n\n**Root cause.** The model runner calls `kv_connector.get_kv_connector_kv_cache_events()` once per step (`kv_connector_model_runner_mixin.py` for MRV1, `gpu/kv_connector.py` for MRV2). With `MultiConnector` as the top-level connector, this hit the base-class default and returned `None`.\n\n`MooncakeStoreConnector`'s send thread appends one `BlockStored` (with the block's `token_ids`) per stored block to `KVTransferThread.kv_events`. The only code that clears that list is `MooncakeStoreConnector.get_kv_connector_kv_cache_events()`, via `get_kv_events()`, which was therefore never called. The scheduler side (`take_events`) was already forwarded, but never received any events.\n\n**Flow with this PR:**\n1. Worker step: `MultiConnector.get_kv_connector_kv_cache_events()` calls every sub-connector, which drains its buffer. It returns `MultiKVConnectorKVEvents(events=[per-connector container or None, ...])`, or `None` if all are `None`.\n2. `KVOutputAggregator.aggregate` folds workers together through a new `KVConnectorKVEvents.aggregate_worker(other)` hook. The default is the previous `add_events(other.get_all_events()); increment_workers(1)`, so existing containers behave identically. `MultiKVConnectorKVEvents` overrides it to merge per index.\n3. Scheduler: `MultiConnector.update_connector_output` sets `connector_output.kv_cache_events = events[i]` for each sub-connector, exactly as it already does for `kv_connector_worker_meta`, and restores the field afterwards. Each sub-connector keeps receiving the container type it produced, so the existing `isinstance` checks in Mooncake and LMCache are unchanged.\n4. `MultiConnector.take_events()` (unchanged) yields each sub-connector's events for publishing.\n\n**Notes and tradeoffs:**\n- Deployments that use `MultiConnector` with Mooncake or LMCache and KV events enabled will now publish those connectors' events (e.g. Mooncake `BlockStored` with `medium=\"cpu\"`). Previously they were silently dropped while leaking. This matches standalone behaviour, but KV-event consumers will see new events.\n- `MultiKVConnectorKVEvents.add_events` raises, because untyped events cannot be routed to a connector. Nothing calls it: the aggregator uses `aggregate_worker`.\n- The per-step cost is one extra method call per sub-connector. There is no CPU/GPU sync.\n\n---\n\n<details>\n<summary> Pull Request Checklist </summary>\n\n- [x] I used vLLM's `/pr-checklist` skill. (Mandatory for agents, optional for humans).\n- [x] AI assistance was used during the creation of this PR.\n\n- [x] **Design Fit:** Minimizes impact on core components, reuses existing functionality, and justifies added complexity.\n- [x] **Testing and Validation:** Validates the change and ensures any added tests are meaningful and reliable, with CI coverage or documented CI resource constraints and validation performed outside CI.\n- [x] **Code Quality and Style:** Keeps code and comments clear and concise, and updates relevant documentation and examples.\n- [x] **Pull Request Contents:** Includes a brief summary and relevant links, supports claims with evidence, explains root causes and implementation trade-offs, and follows the contributing guide.\n</details>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01A9Ef2S3fbtzAiwj1cT6NR2\n",
+    "changed_files": 4,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/62637/comments",
+    "commits": 2,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/62637/commits",
+    "created_at": "2026-10-20T07:20:50Z",
+    "deletions": 13,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/62637.diff",
+    "draft": false,
+    "head": {
+      "label": "stu-cao:fix/multiconnector-kv-cache-events",
+      "ref": "fix/multiconnector-kv-cache-events",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/stu-cao/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/stu-cao/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/stu-cao/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/stu-cao/vllm/branches{/branch}",
+        "clone_url": "https://github.com/stu-cao/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/stu-cao/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/stu-cao/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/stu-cao/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/stu-cao/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/stu-cao/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/stu-cao/vllm/contributors",
+        "created_at": "2026-09-08T03:08:03Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/stu-cao/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/stu-cao/vllm/downloads",
+        "events_url": "https://api.github.com/repos/stu-cao/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/stu-cao/vllm/forks",
+        "full_name": "stu-cao/vllm",
+        "git_commits_url": "https://api.github.com/repos/stu-cao/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/stu-cao/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/stu-cao/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/stu-cao/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/stu-cao/vllm/hooks",
+        "html_url": "https://github.com/stu-cao/vllm",
+        "id": 1360866169,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/stu-cao/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/stu-cao/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/stu-cao/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/stu-cao/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/stu-cao/vllm/labels{/name}",
+        "language": null,
+        "languages_url": "https://api.github.com/repos/stu-cao/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/stu-cao/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/stu-cao/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOUR0reQ",
+        "notifications_url": "https://api.github.com/repos/stu-cao/vllm/notifications{?since,all,participating}",
+        "open_issues": 2,
+        "open_issues_count": 2,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/309819372?v=4",
+          "events_url": "https://api.github.com/users/stu-cao/events{/privacy}",
+          "followers_url": "https://api.github.com/users/stu-cao/followers",
+          "following_url": "https://api.github.com/users/stu-cao/following{/other_user}",
+          "gists_url": "https://api.github.com/users/stu-cao/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/stu-cao",
+          "id": 309819372,
+          "login": "stu-cao",
+          "node_id": "U_kgDOEnd37A",
+          "organizations_url": "https://api.github.com/users/stu-cao/orgs",
+          "received_events_url": "https://api.github.com/users/stu-cao/received_events",
+          "repos_url": "https://api.github.com/users/stu-cao/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/stu-cao/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/stu-cao/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/stu-cao",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/stu-cao/vllm/pulls{/number}",
+        "pushed_at": "2026-11-03T22:38:07Z",
+        "releases_url": "https://api.github.com/repos/stu-cao/vllm/releases{/id}",
+        "size": 338825,
+        "ssh_url": "git@github.com:stu-cao/vllm.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/stu-cao/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/stu-cao/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/stu-cao/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/stu-cao/vllm/subscription",
+        "svn_url": "https://github.com/stu-cao/vllm",
+        "tags_url": "https://api.github.com/repos/stu-cao/vllm/tags",
+        "teams_url": "https://api.github.com/repos/stu-cao/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/stu-cao/vllm/git/trees{/sha}",
+        "updated_at": "2026-09-08T03:08:03Z",
+        "url": "https://api.github.com/repos/stu-cao/vllm",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": true
+      },
+      "sha": "b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/309819372?v=4",
+        "events_url": "https://api.github.com/users/stu-cao/events{/privacy}",
+        "followers_url": "https://api.github.com/users/stu-cao/followers",
+        "following_url": "https://api.github.com/users/stu-cao/following{/other_user}",
+        "gists_url": "https://api.github.com/users/stu-cao/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/stu-cao",
+        "id": 309819372,
+        "login": "stu-cao",
+        "node_id": "U_kgDOEnd37A",
+        "organizations_url": "https://api.github.com/users/stu-cao/orgs",
+        "received_events_url": "https://api.github.com/users/stu-cao/received_events",
+        "repos_url": "https://api.github.com/users/stu-cao/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/stu-cao/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/stu-cao/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/stu-cao",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/62637",
+    "id": 4932396553,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/62637",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d73a4a",
+        "default": true,
+        "description": "Something isn't working",
+        "id": 5135047172,
+        "name": "bug",
+        "node_id": "LA_kwDOI7xefs8AAAABMhKaBA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/bug"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "4417cb",
+        "default": false,
+        "description": "",
+        "id": 9306392211,
+        "name": "kv-connector",
+        "node_id": "LA_kwDOI7xefs8AAAACKrRGkw",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/kv-connector"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "b70ac5de16e5d3ebd12e46307152b51f4fb6abb5",
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABJf5mCQ",
+    "number": 62637,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/62637.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/4355494?v=4",
+        "events_url": "https://api.github.com/users/xuechendi/events{/privacy}",
+        "followers_url": "https://api.github.com/users/xuechendi/followers",
+        "following_url": "https://api.github.com/users/xuechendi/following{/other_user}",
+        "gists_url": "https://api.github.com/users/xuechendi/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/xuechendi",
+        "id": 4355494,
+        "login": "xuechendi",
+        "node_id": "MDQ6VXNlcjQzNTU0OTQ=",
+        "organizations_url": "https://api.github.com/users/xuechendi/orgs",
+        "received_events_url": "https://api.github.com/users/xuechendi/received_events",
+        "repos_url": "https://api.github.com/users/xuechendi/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/xuechendi/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/xuechendi/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/xuechendi",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/10706289?v=4",
+        "events_url": "https://api.github.com/users/NickLucche/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NickLucche/followers",
+        "following_url": "https://api.github.com/users/NickLucche/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NickLucche/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NickLucche",
+        "id": 10706289,
+        "login": "NickLucche",
+        "node_id": "MDQ6VXNlcjEwNzA2Mjg5",
+        "organizations_url": "https://api.github.com/users/NickLucche/orgs",
+        "received_events_url": "https://api.github.com/users/NickLucche/received_events",
+        "repos_url": "https://api.github.com/users/NickLucche/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NickLucche/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NickLucche/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/NickLucche",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/16958488?v=4",
+        "events_url": "https://api.github.com/users/njhill/events{/privacy}",
+        "followers_url": "https://api.github.com/users/njhill/followers",
+        "following_url": "https://api.github.com/users/njhill/following{/other_user}",
+        "gists_url": "https://api.github.com/users/njhill/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/njhill",
+        "id": 16958488,
+        "login": "njhill",
+        "node_id": "MDQ6VXNlcjE2OTU4NDg4",
+        "organizations_url": "https://api.github.com/users/njhill/orgs",
+        "received_events_url": "https://api.github.com/users/njhill/received_events",
+        "repos_url": "https://api.github.com/users/njhill/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/njhill/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/njhill/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/njhill",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/17067717?v=4",
+        "events_url": "https://api.github.com/users/ivanium/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ivanium/followers",
+        "following_url": "https://api.github.com/users/ivanium/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ivanium/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ivanium",
+        "id": 17067717,
+        "login": "ivanium",
+        "node_id": "MDQ6VXNlcjE3MDY3NzE3",
+        "organizations_url": "https://api.github.com/users/ivanium/orgs",
+        "received_events_url": "https://api.github.com/users/ivanium/received_events",
+        "repos_url": "https://api.github.com/users/ivanium/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ivanium/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ivanium/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ivanium",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/17771355?v=4",
+        "events_url": "https://api.github.com/users/orozery/events{/privacy}",
+        "followers_url": "https://api.github.com/users/orozery/followers",
+        "following_url": "https://api.github.com/users/orozery/following{/other_user}",
+        "gists_url": "https://api.github.com/users/orozery/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/orozery",
+        "id": 17771355,
+        "login": "orozery",
+        "node_id": "MDQ6VXNlcjE3NzcxMzU1",
+        "organizations_url": "https://api.github.com/users/orozery/orgs",
+        "received_events_url": "https://api.github.com/users/orozery/received_events",
+        "repos_url": "https://api.github.com/users/orozery/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/orozery/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/orozery/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/orozery",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/25103655?v=4",
+        "events_url": "https://api.github.com/users/ApostaC/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ApostaC/followers",
+        "following_url": "https://api.github.com/users/ApostaC/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ApostaC/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ApostaC",
+        "id": 25103655,
+        "login": "ApostaC",
+        "node_id": "MDQ6VXNlcjI1MTAzNjU1",
+        "organizations_url": "https://api.github.com/users/ApostaC/orgs",
+        "received_events_url": "https://api.github.com/users/ApostaC/received_events",
+        "repos_url": "https://api.github.com/users/ApostaC/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ApostaC/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ApostaC/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ApostaC",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/51183510?v=4",
+        "events_url": "https://api.github.com/users/wzhao18/events{/privacy}",
+        "followers_url": "https://api.github.com/users/wzhao18/followers",
+        "following_url": "https://api.github.com/users/wzhao18/following{/other_user}",
+        "gists_url": "https://api.github.com/users/wzhao18/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/wzhao18",
+        "id": 51183510,
+        "login": "wzhao18",
+        "node_id": "MDQ6VXNlcjUxMTgzNTEw",
+        "organizations_url": "https://api.github.com/users/wzhao18/orgs",
+        "received_events_url": "https://api.github.com/users/wzhao18/received_events",
+        "repos_url": "https://api.github.com/users/wzhao18/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/wzhao18/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/wzhao18/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/wzhao18",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 4,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/62637/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/b0eced4a4c241d35f234420704b793f0a425c6f2",
+    "title": "[Bugfix][KV Connector] Drain sub-connector KV cache events in MultiConnector (fixes worker memory leak)",
+    "updated_at": "2026-11-02T03:12:40Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/62637",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/309819372?v=4",
+      "events_url": "https://api.github.com/users/stu-cao/events{/privacy}",
+      "followers_url": "https://api.github.com/users/stu-cao/followers",
+      "following_url": "https://api.github.com/users/stu-cao/following{/other_user}",
+      "gists_url": "https://api.github.com/users/stu-cao/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/stu-cao",
+      "id": 309819372,
+      "login": "stu-cao",
+      "node_id": "U_kgDOEnd37A",
+      "organizations_url": "https://api.github.com/users/stu-cao/orgs",
+      "received_events_url": "https://api.github.com/users/stu-cao/received_events",
+      "repos_url": "https://api.github.com/users/stu-cao/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/stu-cao/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/stu-cao/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/stu-cao",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 132,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/b0eced4a4c241d35f234420704b793f0a425c6f2/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_multi_connector.py",
+      "changes": 136,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_multi_connector.py?ref=b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "deletions": 4,
+      "filename": "tests/v1/kv_connector/unit/test_multi_connector.py",
+      "patch": "@@ -13,6 +13,7 @@\n from tests.v1.kv_connector.unit.utils import create_vllm_config, maybe_update_block_size\n from vllm import LLM, SamplingParams\n from vllm.config import KVTransferConfig\n+from vllm.distributed.kv_events import BlockStored, KVCacheEvent, KVConnectorKVEvents\n from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory\n from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole\n from vllm.distributed.kv_transfer.kv_connector.v1.base import (\n@@ -26,6 +27,7 @@\n )\n from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (\n     MultiConnector,\n+    MultiKVConnectorKVEvents,\n     MultiKVConnectorPromMetrics,\n     MultiKVConnectorStats,\n     MultiKVConnectorWorkerMetadata,\n@@ -35,7 +37,11 @@\n )\n from vllm.v1.kv_cache_interface import KVCacheConfig\n from vllm.v1.metrics.cache_hit_source import CacheHitSource\n-from vllm.v1.outputs import KVConnectorOutput, KVConnectorWorkerMetadata\n+from vllm.v1.outputs import (\n+    KVConnectorOutput,\n+    KVConnectorWorkerMetadata,\n+    ModelRunnerOutput,\n+)\n \n MODEL_NAME = \"meta-llama/Llama-3.2-1B-Instruct\"\n \n@@ -1013,12 +1019,9 @@ def test_is_empty_with_multiple_connectors(self):\n def test_multi_connector_overrides_all_base_methods():\n     \"\"\"Ensure MultiConnector overrides all public methods from KVConnectorBase_V1.\"\"\"\n     # These are fine to inherit from KVConnectorBase_V1\n-    # TODO(https://github.com/vllm-project/vllm/pull/31811): Remove\n-    # get_kv_connector_kv_cache_events from INHERITED_OK once implemented.\n     INHERITED_OK = {\n         \"role\",\n         \"has_connector_metadata\",\n-        \"get_kv_connector_kv_cache_events\",\n     }\n \n     base_members = {\n@@ -1294,3 +1297,128 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):\n             assert mc._all_support_hma is False\n         finally:\n             llm.llm_engine.engine_core.shutdown()\n+\n+\n+class ListKVEvents(KVConnectorKVEvents):\n+    \"\"\"Minimal per-connector KV events container for MultiConnector tests.\"\"\"\n+\n+    def __init__(self, events: list[KVCacheEvent] | None = None) -> None:\n+        self.events = list(events or [])\n+        self.num_workers = 1\n+\n+    def add_events(self, events: list[KVCacheEvent]) -> None:\n+        self.events.extend(events)\n+\n+    def aggregate(self) -> \"ListKVEvents\":\n+        return self\n+\n+    def increment_workers(self, count: int = 1) -> None:\n+        self.num_workers += count\n+\n+    def get_all_events(self) -> list[KVCacheEvent]:\n+        return list(self.events)\n+\n+    def get_number_of_workers(self) -> int:\n+        return self.num_workers\n+\n+    def clear_events(self) -> None:\n+        self.events.clear()\n+        self.num_workers = 1\n+\n+\n+def _block_stored(block_hash: str) -> BlockStored:\n+    return BlockStored(\n+        block_hashes=[block_hash],\n+        parent_block_hash=None,\n+        token_ids=[1, 2, 3],\n+        block_size=16,\n+        lora_id=None,\n+        medium=\"cpu\",\n+        lora_name=None,\n+    )\n+\n+\n+def test_multi_connector_kv_cache_events_drain_every_connector(mc):\n+    first, second = mc._connectors\n+\n+    first.get_kv_connector_kv_cache_events.return_value = None\n+    second.get_kv_connector_kv_cache_events.return_value = None\n+    assert mc.get_kv_connector_kv_cache_events() is None\n+\n+    # Connectors that buffer worker-side events (e.g. MooncakeStoreConnector)\n+    # are only drained by this call, so every sub-connector must be asked on\n+    # every step, including when an earlier one has nothing to report.\n+    second_events = ListKVEvents([_block_stored(\"second\")])\n+    second.get_kv_connector_kv_cache_events.return_value = second_events\n+    events = mc.get_kv_connector_kv_cache_events()\n+    assert isinstance(events, MultiKVConnectorKVEvents)\n+    assert events.events == [None, second_events]\n+    assert first.get_kv_connector_kv_cache_events.call_count == 2\n+    assert second.get_kv_connector_kv_cache_events.call_count == 2\n+\n+\n+def test_multi_connector_kv_cache_events_aggregate_per_connector():\n+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator\n+\n+    a, b, c = _block_stored(\"a\"), _block_stored(\"b\"), _block_stored(\"c\")\n+    worker_events = [\n+        MultiKVConnectorKVEvents([ListKVEvents([a]), None]),\n+        MultiKVConnectorKVEvents([ListKVEvents([b]), ListKVEvents([c])]),\n+    ]\n+    outputs = [\n+        ModelRunnerOutput(\n+            req_ids=[f\"req_{i}\"],\n+            req_id_to_index={f\"req_{i}\": 0},\n+            sampled_token_ids=[[123]],\n+            logprobs=None,\n+            prompt_logprobs_dict={},\n+            pooler_output=[None],\n+            kv_connector_output=KVConnectorOutput(kv_cache_events=events),\n+        )\n+        for i, events in enumerate(worker_events)\n+    ]\n+\n+    output = KVOutputAggregator(expected_finished_count=2).aggregate(outputs)\n+    combined = output.kv_connector_output.kv_cache_events\n+\n+    assert isinstance(combined, MultiKVConnectorKVEvents)\n+    first, second = combined.events\n+    # Events are merged per connector, never across connectors, and each\n+    # connector counts only the workers that reported events for it.\n+    assert first.get_all_events() == [a, b]\n+    assert first.get_number_of_workers() == 2\n+    assert second.get_all_events() == [c]\n+    assert second.get_number_of_workers() == 1\n+\n+\n+def test_multi_connector_kv_cache_events_keep_aggregate_results():\n+    class CopyOnAggregateKVEvents(ListKVEvents):\n+        def aggregate(self) -> ListKVEvents:\n+            return ListKVEvents(self.events)\n+\n+    a = _block_stored(\"a\")\n+    first = CopyOnAggregateKVEvents([a])\n+    multi = MultiKVConnectorKVEvents([first, None])\n+\n+    assert multi.aggregate() is multi\n+    # Each connector's aggregate() result replaces its container.\n+    assert multi.events[0] is not first\n+    assert multi.events[0].get_all_events() == [a]\n+    assert multi.events[1] is None\n+\n+\n+def test_multi_connector_routes_kv_cache_events_to_each_connector(mc):\n+    seen: list[tuple[int, KVConnectorKVEvents | None]] = []\n+    for i, connector in enumerate(mc._connectors):\n+        connector.update_connector_output.side_effect = lambda output, i=i: seen.append(\n+            (i, output.kv_cache_events)\n+        )\n+\n+    first_events = ListKVEvents([_block_stored(\"first\")])\n+    multi_events = MultiKVConnectorKVEvents([first_events, None])\n+    output = KVConnectorOutput(kv_cache_events=multi_events)\n+    mc.update_connector_output(output)\n+\n+    assert seen == [(0, first_events), (1, None)]\n+    # The caller's output is left as it was.\n+    assert output.kv_cache_events is multi_events",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/b0eced4a4c241d35f234420704b793f0a425c6f2/tests%2Fv1%2Fkv_connector%2Funit%2Ftest_multi_connector.py",
+      "sha": "01b117e80396aea8081f570c99bb7977019cd5b9",
+      "status": "modified"
+    },
+    {
+      "additions": 11,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/b0eced4a4c241d35f234420704b793f0a425c6f2/vllm%2Fdistributed%2Fkv_events.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_events.py?ref=b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "deletions": 0,
+      "filename": "vllm/distributed/kv_events.py",
+      "patch": "@@ -257,6 +257,17 @@ def merge(self, other: \"KVConnectorKVEvents\") -> \"KVConnectorKVEvents\":\n         self.add_events(other.get_all_events())\n         return self\n \n+    def aggregate_worker(self, other: \"KVConnectorKVEvents\") -> \"KVConnectorKVEvents\":\n+        \"\"\"Fold the events one more worker reported for this step into self.\n+\n+        Used by KVOutputAggregator to combine the per-worker outputs of a step.\n+        Containers that hold events for several connectors override this to\n+        merge per connector.\n+        \"\"\"\n+        self.add_events(other.get_all_events())\n+        self.increment_workers(1)\n+        return self\n+\n \n class EventPublisher(ABC):\n     \"\"\"Lightweight publisher for EventBatch batches with data parallelism",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/b0eced4a4c241d35f234420704b793f0a425c6f2/vllm%2Fdistributed%2Fkv_events.py",
+      "sha": "421190c8f9c5aceceaaa62d17060472ab37983ad",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/b0eced4a4c241d35f234420704b793f0a425c6f2/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Futils.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Futils.py?ref=b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "deletions": 3,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/utils.py",
+      "patch": "@@ -161,9 +161,9 @@ def update_finished_set(\n                     combined_kv_cache_events,\n                     type(kv_cache_events),\n                 )\n-                worker_kv_cache_events = kv_cache_events.get_all_events()\n-                combined_kv_cache_events.add_events(worker_kv_cache_events)\n-                combined_kv_cache_events.increment_workers(1)\n+                combined_kv_cache_events = combined_kv_cache_events.aggregate_worker(\n+                    kv_cache_events\n+                )\n \n             invalid_block_ids |= kv_output.invalid_block_ids\n             self._failed_recving_pending |= kv_output.failed_recving",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/b0eced4a4c241d35f234420704b793f0a425c6f2/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Futils.py",
+      "sha": "6693c0350627fc84f8ed153b977e3879cbded637",
+      "status": "modified"
+    },
+    {
+      "additions": 74,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/b0eced4a4c241d35f234420704b793f0a425c6f2/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmulti_connector.py",
+      "changes": 80,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmulti_connector.py?ref=b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "deletions": 6,
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "patch": "@@ -10,6 +10,7 @@\n \n from vllm.config import VllmConfig\n from vllm.config.kv_transfer import KVTransferConfig\n+from vllm.distributed.kv_events import KVConnectorKVEvents\n from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType\n from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory\n from vllm.distributed.kv_transfer.kv_connector.v1.base import (\n@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> Iterable[KVConnectorKVEvents]:\n+        return (e for e in self.events if e is not None)\n+\n+    def add_events(self, events: list[\"KVCacheEvent\"]) -> None:\n+        raise TypeError(\n+            \"MultiKVConnectorKVEvents holds events per connector; \"\n+            \"add events to the per-connector containers instead.\"\n+        )\n+\n+    def aggregate(self) -> \"MultiKVConnectorKVEvents\":\n+        for i, e in enumerate(self.events):\n+            self.events[i] = e and e.aggregate()\n+        return self\n+\n+    def aggregate_worker(self, other: KVConnectorKVEvents) -> KVConnectorKVEvents:\n+        assert isinstance(other, MultiKVConnectorKVEvents)\n+        assert len(self.events) == len(other.events)\n+        for i, (mine, theirs) in enumerate(zip(self.events, other.events)):\n+            if theirs is None:\n+                continue\n+            # A connector's container counts only the workers that reported it.\n+            self.events[i] = theirs if mine is None else mine.aggregate_worker(theirs)\n+        return self\n+\n+    def increment_workers(self, count: int = 1) -> None:\n+        for e in self._present():\n+            e.increment_workers(count)\n+\n+    def get_all_events(self) -> list[\"KVCacheEvent\"]:\n+        return [event for e in self._present() for event in e.get_all_events()]\n+\n+    def get_number_of_workers(self) -> int:\n+        return max((e.get_number_of_workers() for e in self._present()), default=0)\n+\n+    def clear_events(self) -> None:\n+        for e in self._present():\n+            e.clear_events()\n+\n+    def __repr__(self) -> str:\n+        return f\"<MultiKVConnectorKVEvents events={self.events}>\"\n+\n+\n @dataclass\n class MultiKVConnectorStats(KVConnectorStats):\n     \"\"\"Maintain a dict of KVConnectorStats objects, one for each connector.\n@@ -435,11 +489,14 @@ def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:\n             return None\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n-    # TODO: Add a generic implementation of 'get_kv_connector_kv_cache_events'\n-    # method for the MultiConnector. It should be able to get events from\n-    # multiple connectors, handling the case where only a subset of the\n-    # requested connectors implements the 'get_kv_connector_kv_cache_events'\n-    # WIP: https://github.com/vllm-project/vllm/pull/31811\n+    def get_kv_connector_kv_cache_events(self) -> KVConnectorKVEvents | None:\n+        # Ask every sub-connector, even after one returns None: connectors such\n+        # as MooncakeStoreConnector buffer worker-side events until this call\n+        # drains them, so a skipped connector would grow its buffer forever.\n+        events = [c.get_kv_connector_kv_cache_events() for c in self._connectors]\n+        if all(e is None for e in events):\n+            return None\n+        return MultiKVConnectorKVEvents(events)\n \n     # ==============================\n     # Scheduler-side methods\n@@ -519,17 +576,28 @@ def update_connector_output(self, connector_output: KVConnectorOutput):\n             )\n             multi_connector_worker_meta = connector_output.kv_connector_worker_meta\n \n+        kv_cache_events = connector_output.kv_cache_events\n+        multi_kv_cache_events = (\n+            kv_cache_events\n+            if isinstance(kv_cache_events, MultiKVConnectorKVEvents)\n+            else None\n+        )\n+\n         try:\n             for i, c in enumerate(self._connectors):\n                 if multi_connector_worker_meta is not None:\n                     # set the connector-specific worker metadata\n                     connector_output.kv_connector_worker_meta = (\n                         multi_connector_worker_meta.metadata[i]\n                     )\n+                if multi_kv_cache_events is not None:\n+                    # set the connector-specific kv cache events\n+                    connector_output.kv_cache_events = multi_kv_cache_events.events[i]\n                 c.update_connector_output(connector_output)\n         finally:\n-            # restore kv_connector_worker_meta\n+            # restore kv_connector_worker_meta and kv_cache_events\n             connector_output.kv_connector_worker_meta = multi_connector_worker_meta\n+            connector_output.kv_cache_events = kv_cache_events\n \n     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:\n         \"\"\"Get the KVConnector handshake metadata from sub-connectors.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/b0eced4a4c241d35f234420704b793f0a425c6f2/vllm%2Fdistributed%2Fkv_transfer%2Fkv_connector%2Fv1%2Fmulti_connector.py",
+      "sha": "873aba4e9db89dfc862815c022698409ef6b84e1",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "```suggestion\n    def _present(self) -> Iterable[KVConnectorKVEvents]:\n        return (e for e in self.events if e is not None)\n```\ncan be generator",
+      "created_at": "2026-10-25T01:44:20Z",
+      "diff_hunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4369265876",
+      "id": 4369265876,
+      "line": null,
+      "original_line": 87,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "updated_at": "2026-10-25T02:06:44Z",
+      "user": {
+        "login": "njhill"
+      }
+    },
+    {
+      "body": "```suggestion\n        for i, e in enumerate(self.events):\n            self.events[i] = e and e.aggregate()\n```",
+      "created_at": "2026-10-25T02:05:26Z",
+      "diff_hunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]\n+\n+    def add_events(self, events: list[\"KVCacheEvent\"]) -> None:\n+        raise TypeError(\n+            \"MultiKVConnectorKVEvents holds events per connector; \"\n+            \"add events to the per-connector containers instead.\"\n+        )\n+\n+    def aggregate(self) -> \"MultiKVConnectorKVEvents\":\n+        for e in self._present():\n+            e.aggregate()",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4369311917",
+      "id": 4369311917,
+      "line": null,
+      "original_line": 97,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "updated_at": "2026-10-25T02:06:44Z",
+      "user": {
+        "login": "njhill"
+      }
+    },
+    {
+      "body": "fixed in b0eced4a4c",
+      "created_at": "2026-10-29T00:04:21Z",
+      "diff_hunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4407370761",
+      "id": 4407370761,
+      "line": null,
+      "original_line": 87,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "updated_at": "2026-10-29T00:04:21Z",
+      "user": {
+        "login": "stu-cao"
+      }
+    },
+    {
+      "body": "fixed in https://github.com/vllm-project/vllm/commit/b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "created_at": "2026-10-29T00:04:36Z",
+      "diff_hunk": "@@ -71,6 +72,59 @@ def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetada\n         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))\n \n \n+class MultiKVConnectorKVEvents(KVConnectorKVEvents):\n+    \"\"\"KV cache events reported by each sub-connector of a MultiConnector.\n+\n+    ``events[i]`` holds what the i-th sub-connector returned (or None), so the\n+    scheduler can hand each sub-connector back the container type it produced.\n+    Events are only ever merged per connector, never across connectors.\n+    \"\"\"\n+\n+    def __init__(self, events: Iterable[KVConnectorKVEvents | None]) -> None:\n+        self.events: list[KVConnectorKVEvents | None] = list(events)\n+\n+    def _present(self) -> list[KVConnectorKVEvents]:\n+        return [e for e in self.events if e is not None]\n+\n+    def add_events(self, events: list[\"KVCacheEvent\"]) -> None:\n+        raise TypeError(\n+            \"MultiKVConnectorKVEvents holds events per connector; \"\n+            \"add events to the per-connector containers instead.\"\n+        )\n+\n+    def aggregate(self) -> \"MultiKVConnectorKVEvents\":\n+        for e in self._present():\n+            e.aggregate()",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#discussion_r4407372523",
+      "id": 4407372523,
+      "line": null,
+      "original_line": 97,
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+      "updated_at": "2026-10-29T00:04:36Z",
+      "user": {
+        "login": "stu-cao"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "@njhill Nick, could you please help take another look?",
+      "created_at": "2026-11-02T03:12:40Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#issuecomment-6568140322",
+      "id": 6568140322,
+      "updated_at": "2026-11-02T03:12:40Z",
+      "user": {
+        "login": "stu-cao"
+      }
+    }
+  ],
+  "number": 62637,
+  "refs": {
+    "base": {
+      "commit": "fce64bc5c2c939a4521bfb9b462c8c74c1c13893",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "b0eced4a4c241d35f234420704b793f0a425c6f2",
+      "repository": "stu-cao/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5581906884",
+      "id": 5581906884,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-20T07:20:54Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5640971155",
+      "id": 5640971155,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-25T02:06:44Z",
+      "user": {
+        "login": "njhill"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5691269223",
+      "id": 5691269223,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-29T00:04:21Z",
+      "user": {
+        "login": "stu-cao"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/62637#pullrequestreview-5691271082",
+      "id": 5691271082,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-29T00:04:36Z",
+      "user": {
+        "login": "stu-cao"
+      }
+    }
+  ]
+}

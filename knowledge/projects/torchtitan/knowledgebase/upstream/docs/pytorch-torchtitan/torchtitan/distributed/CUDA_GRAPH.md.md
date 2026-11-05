@@ -15,7 +15,7 @@ path: torchtitan/distributed/CUDA_GRAPH.md
 raw_sha256: deeb52c10c460492c698de18418be5d7bc58a19bd7327229b8767951e18970f1
 sources: []
 generated_body_sha256: a07b9cd185b8273b232fc741e543a5b63e0466dab08d24e29da55548d85b468d
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # pytorch/torchtitan / torchtitan/distributed/CUDA_GRAPH.md

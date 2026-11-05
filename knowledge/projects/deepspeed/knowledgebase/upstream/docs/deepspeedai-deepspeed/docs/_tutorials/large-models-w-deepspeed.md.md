@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/large-models-w-deepspeed.md
-raw_sha256: fff829039232f5348d635106b84890d4c2c76dab886ed6072d366f6116199012
+raw_sha256: 100f3608a782c9c559097a7fb6efb915a0cf216496237b339e750512662d8594
 sources: []
-generated_body_sha256: a3994165823dba75e1ecfd5ff2575f507d6505ae3204616f3a4e47011599589c
+generated_body_sha256: 2e6933689a19258736817edb4d6a2a88c13d91f9f499ac67820a61f6d0c3ff2e
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/large-models-w-deepspeed.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/large-models-w-deepspeed.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/large-models-w-deepspeed.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -36,7 +36,7 @@ tags: training large-model
 DeepSpeed has been used to train or is in the process of training some of the largest dense models in existence. These include but not limited to:
 
 * [Megatron-Turing NLG 530B](https://www.microsoft.com/en-us/research/blog/using-deepspeed-and-megatron-to-train-megatron-turing-nlg-530b-the-worlds-largest-and-most-powerful-generative-language-model/) language model trained in collaboration with NVIDIA
-* [Big Science](https://bigscience.huggingface.co/) (near 200 billion parameter) model, in collaboration with Hugging Face and hundreds of researchers around the world.
+* [Big Science](https://huggingface.co/bigscience) (near 200 billion parameter) model, in collaboration with Hugging Face and hundreds of researchers around the world.
 * [Turing-NLG](https://www.microsoft.com/en-us/research/blog/turing-nlg-a-17-billion-parameter-language-model-by-microsoft/) (17.2 billion parameters) trained by Microsoft
 
 DeepSpeed offers a collection of system technologies, that has made it possible to train models at these scales. The best technology to train your large model depends on various factors such as the model architecture, batch size, inter-connect bandwidth, etc. Given the number of available choices, this can be confusing and outright daunting. This page is meant as a starting guide to help you navigate your journey towards training your large model.

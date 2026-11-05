@@ -2,7 +2,7 @@
 
 发生异常时先按 [失败分流与诊断](diagnosis.md) 定位；资料、工具、源码和现场验证范围分别记录。
 
-筛机和健康复核按 `docs/cluster-health-and-screening.md`：复用现场 `run_nhc`、`clush` 与当前 ClusterManager，核对主动负载、超时、逐节点结果、健康重入规则与精确停止范围。没有失败节点交集不等于没有组级故障；先复核原始结果再更新节点池。
+筛机和健康复核按 `docs/cluster-health-and-screening.md`：复用现场 `run_nhc`、`clush` 与当前 ClusterManager，核对主动负载、超时、逐节点结果、健康重入规则与精确停止范围。没有失败节点交集不等于没有组级故障；先复核原始结果再更新节点池。升级预检工具时检查真正公共入口、完整组/卡数、设备允许集合和结果 schema；计划、预检、载荷和清理状态不得合并为一个“通过”。
 
 安装本 Skill 会复制其 references，共享 docs/Wiki 从工程读取。按入口约定采用用户明确的工程路径、`TRAINFLOW_PROJECT` 或安装目录 `workspace.json.project_root`；按项目 `docs/skill-reading-map.md` 的当前模式进入。`TRAINFLOW_WORKSPACE` 另指向任务私有目录。
 
@@ -13,7 +13,7 @@
 - `docs/workflows.md`：三个工作流与验证门槛。
 - `docs/environment-discovery.md` 第 6 节：持续退化/扩容差距的分层排查、隔离对照与未解决事项升级。
 - `docs/profiling.md`：时间分母、热点建模和 TraceLens。
-- `docs/operations.md`：远程 watcher、事件重放与恢复边界。
+- `docs/operations.md`：远程 watcher、事件重放与恢复边界；首次接入或升级恢复器时读“衔接站点恢复器”，核对 MPI/GPU 布局、停止失败及旧作业核销。
 - `docs/training-observation.md`：真实进度、生命周期与守护的失效范围。
 - `docs/distributed-observation.md`：实际进度源与全部必需节点的独立观测、退出封存和聚合完成验证。
 - `docs/workspace-maintenance.md`：维护 policy、缓存 pin、context/epoch 观察 Store 与独立事件 peer。

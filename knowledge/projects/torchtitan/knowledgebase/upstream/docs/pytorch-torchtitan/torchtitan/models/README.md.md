@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/models/README.md
-raw_sha256: 305862c59075c4425651256a40d0fa0c04f412eec5cbdc949a4769f49a0c1f2f
+raw_sha256: 6758bb16baee18d8e992697932dbc055c6e63f290c2a8c246bb0578b5f25a514
 sources: []
-generated_body_sha256: caaf1999afb2e2c852bcb1e4a15bd683d361ec8ceda5e63cdf12e03c7944fdf2
+generated_body_sha256: 904c020b583ae02242a82dd5bce4b5b7fffcfc18ac0053269ab0636899f0b861
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -29,6 +29,8 @@ Upstream source document; original commands, claims and links require their stat
 This note outlines the process of adding a new model in the `torchtitan` repo. In most cases, new models should be added first under the `torchtitan/experiments` folder. For criteria of contributions, please see the [Contributing Guidelines](/torchtitan/experiments/README.md) therein. In general, please adhere to the [Guiding Principles](/README.md#overview) of `torchtitan`.
 
 For offline explorations, we recommend the same steps, unless otherwise noted.
+
+For MoE models, see the [expert-parallel backend selection guide](common/moe/README.md).
 
 ## Adding the model
 
@@ -43,6 +45,7 @@ The folder should be organized as follows
     - `get_nparams_and_flops()` will be used to understand model size and compute throughput.
   - `__init__()` consumes the `Config` to build the model.
   - Parameter initialization is handled by the `param_init` system on each module's `Config`. Set `param_init` (a `dict[str, Callable]` mapping parameter names to init functions) on every sub-config in the model flavor builder. `init_states()` auto-recurses into all submodules, so manual recursive calls are not needed. Override `_init_self_buffers()` for device-aware buffer initialization (e.g., RoPE, MoE).
+  - List parameters whose numerics need master precision (e.g. ones the HF checkpoint stores in float32) in `preserve_dtype_params` on their module's `Config`; FSDP mixed precision, checkpoint export and RL weight sync never lower their precision. Default it on the component's `Config` when the component always needs it (e.g. GDN `A_log`), or set it in the flavor builder for one instance of a generic module (e.g. Qwen3.5's GDN `GatedRMSNorm`).
   - Add additional files to reduce the complexity of `model.py` if it grows too large or complex, e.g. moe.py to host the `MoE`, router, grouped-linear, and expert-activation modules.
 - `state_dict_adapter.py`
   - Inherit [`BaseStateDictAdapter`](/torchtitan/models/base/state_dict_adapter.py) to implement state dict mappings between `torchtitan` model definition and other model definitions (e.g. from HuggingFace so that we can save / load model checkpoints in HF formats).

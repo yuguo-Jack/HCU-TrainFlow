@@ -15,7 +15,7 @@ path: docs/en/pytorch/training/finetune/mcore/offline_dpo.md
 raw_sha256: 3f01e05ff0ff3191a059bafd4fd4e64909e4701346042efae44ec52a6e3f0548
 sources: []
 generated_body_sha256: 31be3c137d817955c4a64151a7c3127772142d4960713daa1bc81f909c9cbdd1
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/finetune/mcore/offline_dpo.md

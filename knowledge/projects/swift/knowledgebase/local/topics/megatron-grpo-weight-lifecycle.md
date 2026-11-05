@@ -10,60 +10,60 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 coverage: selected mechanisms, recipes and tests at pinned official source; not every model/backend and no HCU runtime execution
 sources:
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/rollout_mixin.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: c77710d5f900e455a8873f2a5495bdf57d7bd6628a6c2a54bed61b798272886d
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 44fa7807a6938e39636fc0c4d004059495bf7676d011fd7342655ff02b8647be
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/grpo_trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: 34ec4b21ec0e33b2920d1b3712e86abccf594f08cce055417ec723ea7b38378b
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: a8c5a75ebfd498ef61e6b6f2cc39408125dd8debe482d404646330f5b14667ce
 - source: modelscope-ms-swift
   path: swift/megatron/trainers/base.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: a5e44bee709f375c7768f1eb864ec1cef04b06c7cb4f3dd9252b19be2427ccbd
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 6e13a1c838e9986537c72a09f9e12f434d01d39de91056dfa60b9042a79e16c1
 - source: modelscope-ms-swift
   path: swift/megatron/arguments/megatron_args.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
-  sha256: ee5b040132967d6520efea1ed2eeed92fb45fc1b552a734652d1935e5a979230
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
+  sha256: 8e9f08c9a8f7d9d072d9fd390b44ba7fe6f8bebfee057e8f591d1da2dc388161
 - source: modelscope-ms-swift
   path: docs/source_en/BestPractices/GRPO.md
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: b30430aabc0579c26cabaa79dea9e0be5c5c54898cc28c1eb63ff3a47b2a082d
 - source: modelscope-ms-swift
   path: tests/train/test_vllm_weight_sync.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: c2ea7e3e682623d839fc5eb31fee97c659ee984811a5dfaa6777be97c7afd3d2
 - source: modelscope-ms-swift
   path: swift/ray/megatron/base_trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: a33beaa54b9eb6c1fb47deab437132a3265d7ae27ecd86138854bd62332ecc78
 - source: modelscope-ms-swift
   path: swift/ray/megatron/grpo_trainer.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 3e84e0b897b3b7830b830c670d08e634f3582a66e5084bf66546e0c639a6fbf8
 - source: modelscope-ms-swift
   path: swift/ray/megatron/checkpoint_engine/base.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 12cd79a55a765da67a9e35790262eab52de4dfc8236bff4f04968b36d0f764bf
 - source: modelscope-ms-swift
   path: swift/ray/megatron/checkpoint_engine/manager.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: d25f1d84ebe9025a6710b1d13216a006be481959955b2cf1008c644acff463df
 - source: modelscope-ms-swift
   path: swift/ray/megatron/checkpoint_engine/mixin.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: b58a9c20bd590d67eff342879135076f42245956a893bb5d700eb0704123ff04
 - source: modelscope-ms-swift
   path: swift/ray/megatron/checkpoint_engine/nccl.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: 25980a6522cca5445f34611981839e2fa0189f50ad80079b2bf9026e20481163
 - source: modelscope-ms-swift
   path: swift/ray/megatron/checkpoint_engine/zmq_auth.py
-  commit: 2efb43ffe61294735be6816abca991fb2ca16011
+  commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
   sha256: d49460c04ee081526f16cca6d355c0a7de1f5cb9cee0697c3ce40ec0f024a57d
 ---
 
@@ -73,7 +73,7 @@ sources:
 
 共卡训练与 rollout 的峰值显存常由切换过程决定：训练 optimizer 尚未卸载时已经唤醒 KV，或更新后仍使用旧 prefix cache，都可能使单独可运行的两边组合失败。分离部署则更关注传输和策略版本。本文主体追非 Ray `MegatronRolloutMixin` 的 vLLM 路径；独立 `swift/ray/megatron/` 的 checkpoint engine 见下述边界。SGLang/其他 backend 的 sleep 语义还需另查。
 
-总览见 [ms-swift](../overview/engineering-guide.md)，源码固定于 `2efb43ffe61294735be6816abca991fb2ca16011`。相关配置和算法见 [GRPO 官方说明](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/docs/source_en/BestPractices/GRPO.md)。
+总览见 [ms-swift](../overview/engineering-guide.md)，源码固定于 `9853e4672d014e35e2b6ba1bfd26d8204100adbb`。相关配置和算法见 [GRPO 官方说明](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/docs/source_en/BestPractices/GRPO.md)。
 
 ## 入口、参数与状态
 
@@ -89,9 +89,13 @@ sources:
 
 `megatron_args.py` 对 generation/global batch 和每设备 rollout prompt/microbatch 做整除检查；修改吞吐参数前确认样本组/重用次数没有变成新的算法。policy version、response mask 和训练 old logprob 必须和收到的权重一致。
 
+当前 `_load_teacher_model` 先从 teacher 的 HF 配置/模型目录建立独立参数副本，令 teacher 的 MTP 深度为0、关闭共享/重复，并移除 `megatron_extra_kwargs` 中的 MTP 三项。student 默认 auto 的变化不应让蒸馏 teacher 意外创建额外头。`grpo_trainer.py` 的 RouterReplay 导入已改为必备 API，旧 Core 的 try-import 回退不再存在。
+
+其余 `_generate_completions` 的 weights wake→同步→训练 offload→KV wake→generate→sleep/finally restore 顺序未因这次 teacher 改动而改变；独立 Ray manager、认证 metadata 和 double buffer 文件与此前固定证据逐字一致，保留文末各自的异常与版本边界。
+
 ## 一次生成的顺序与显存峰值
 
-[`_generate_completions`](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/megatron/trainers/rollout_mixin.py)先 preprocess samples，计算 `needs_weight_sync = 当前 step 不等于上次装载 step 或 sleep_level==2`，再按以下顺序运行：
+[`_generate_completions`](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/megatron/trainers/rollout_mixin.py)先 preprocess samples，计算 `needs_weight_sync = 当前 step 不等于上次装载 step 或 sleep_level==2`，再按以下顺序运行：
 
 1. colocated engine 在 sleep 且需要同步时，先唤醒 weights；有 tags 接口时只恢复 weights，避免过早物化 KV。
 2. 通过 `_move_model_to_vllm` 安装当前模型/adapter，成功后更新 `_last_loaded_step`。
@@ -121,7 +125,7 @@ Rollout TP 和训练 TP/PP/EP 不同会引入 reshape/collective/CPU 导出；�
 
 共卡 OOM 先定位峰值发生的具体切换，再减 concurrency/KV 或启用合适 offload；训练/生成不一致先确认 `_last_loaded_step`、base-sync 状态、缓存与各 rank，同一份固定权重重复验证。卡住时检查 client/server、TP collective、同步导出和待完成 async future，再读实际 vLLM/bridge 依赖版本。
 
-无 sleep/offload、小批量全量同步是诊断对照，不是默认最终方案。未知 tags/sleep API 需要先核对兼容性，不能删除必要同步来提高表面速度。官方权重同步测试见 [test_vllm_weight_sync.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/tests/train/test_vllm_weight_sync.py)；本页没有在 HCU 验证这些组合。
+无 sleep/offload、小批量全量同步是诊断对照，不是默认最终方案。未知 tags/sleep API 需要先核对兼容性，不能删除必要同步来提高表面速度。官方权重同步测试见 [test_vllm_weight_sync.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/tests/train/test_vllm_weight_sync.py)；本页没有在 HCU 验证这些组合。
 
 ## Ray checkpoint engine 的独立边界
 
@@ -139,10 +143,10 @@ Ray NCCL 分支的 unmerge/finalize 位于正常 send/receive 返回之后，当
 ## 本轮补充固定证据
 
 
-- [swift/ray/megatron/base_trainer.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/base_trainer.py)
-- [swift/ray/megatron/grpo_trainer.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/grpo_trainer.py)
-- [swift/ray/megatron/checkpoint_engine/base.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/checkpoint_engine/base.py)
-- [swift/ray/megatron/checkpoint_engine/manager.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/checkpoint_engine/manager.py)
-- [swift/ray/megatron/checkpoint_engine/mixin.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/checkpoint_engine/mixin.py)
-- [swift/ray/megatron/checkpoint_engine/nccl.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/checkpoint_engine/nccl.py)
-- [swift/ray/megatron/checkpoint_engine/zmq_auth.py](https://github.com/modelscope/ms-swift/blob/2efb43ffe61294735be6816abca991fb2ca16011/swift/ray/megatron/checkpoint_engine/zmq_auth.py)
+- [swift/ray/megatron/base_trainer.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/base_trainer.py)
+- [swift/ray/megatron/grpo_trainer.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/grpo_trainer.py)
+- [swift/ray/megatron/checkpoint_engine/base.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/base.py)
+- [swift/ray/megatron/checkpoint_engine/manager.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/manager.py)
+- [swift/ray/megatron/checkpoint_engine/mixin.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/mixin.py)
+- [swift/ray/megatron/checkpoint_engine/nccl.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/nccl.py)
+- [swift/ray/megatron/checkpoint_engine/zmq_auth.py](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/swift/ray/megatron/checkpoint_engine/zmq_auth.py)

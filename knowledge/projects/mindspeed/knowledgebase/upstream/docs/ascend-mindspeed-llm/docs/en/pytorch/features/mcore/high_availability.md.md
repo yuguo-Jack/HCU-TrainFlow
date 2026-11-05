@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/features/mcore/high_availability.md
-raw_sha256: a8d47b4b928372aedc48a08798f11ccad2d6273c51166b578e93ae1f517d7fc6
+raw_sha256: 2ad824f6630415fa7dd583d09111bbd801ea5c61434392299e69c2c7e505280e
 sources: []
-generated_body_sha256: e3b2aaafdb107e46e56ff5826c8cbb4ae6772a2ed62d929ecae8b22e494ddcde
+generated_body_sha256: 5935ea8edabf0cc47a1586b3f1f52ccf9e1bb03bafd059419b863f1d399b859f
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/features/mcore/high_availability.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/features/mcore/high_availability.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/mcore/high_availability.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -55,7 +55,7 @@ The following figure shows the data flow and working principle of the native dis
 
 ![](../../figures/high_availability/grad_buffer_sharding.png)
 
-The replica optimizer backs up optimizer states by designing optimizer parameters to distribute evenly across the replica DP groups. Therefore, it provides mechanism-level support for the TTP and UCE features.
+The replica optimizer backs up optimizer states by distributing optimizer parameters evenly across the replica DP groups. Therefore, it provides mechanism-level support for the TTP and UCE features.
 
 ![](../../figures/high_availability/replica_optimizer.png)
 
@@ -72,7 +72,7 @@ Compared with the distributed optimizer, the replica optimizer increases memory 
 
 MindIO features are provided as a wheel package.
 
-`mindio_ttp` download link: [MindIO TTP package download - Ascend Community](https://gitcode.com/Ascend/mind-cluster/blob/branch_v26.1.0/docs/en/scheduling/07_references/00_fault_recovery_acceleration/02_installation_and_deployment.md#preparing-the-software-package).
+`mindio_ttp` download link: [MindIO TTP package download - Ascend Community](https://gitcode.com/Ascend/mind-cluster/blob/branch_v26.1.0/docs/en/scheduling/07_references/00_fault_recovery_acceleration/02_installation_and_deployment.md#%E5%87%86%E5%A4%87%E8%BD%AF%E4%BB%B6%E5%8C%85).
 
 ### Adding Launch Arguments to the Startup Script
 
@@ -100,7 +100,7 @@ To avoid configuring switches for multiple components when you use MindX, add en
 
 ## Usage Constraints
 
-1. Because of the fundamental limitations, ensure that the data parallel size is greater than 1 when you perform P+T+D 3D parallelism partitioning so that complete optimizer state data remains available after a failure. When you use the MoE feature, you also need the data parallel size of both the dense layers and the sparse layers to be greater than 1. When you use long-sequence parallelism, `dp_cp_size` must also be greater than 1.
+1. Because of the fundamental limitations, ensure that the data parallel size is greater than 1 when you perform 3D parallelism (P+T+D) partitioning so that complete optimizer state data remains available after a failure. When you use the MoE feature, you also need the data parallel size of both the dense layers and the sparse layers to be greater than 1. When you use long-sequence parallelism, `dp_cp_size` must also be greater than 1.
 
 2. MindSpeed-llm high-availability features are adapted only for basic models and basic training features to help users quickly experience the feature. Full training feature compatibility has not been verified yet. If you need compatibility for a specific training feature, submit an issue in the community and we will complete the adaptation promptly.
 
@@ -125,10 +125,10 @@ In addition to the usage constraints above, elastic training also requires the f
 
 4. After a scale-down, the system cannot scale down again. Scaling out supports only a direct return to the original size.
 
-See: [MindIO TTP Constraints and Limitations - Ascend Community](https://gitcode.com/Ascend/mind-cluster/blob/branch_v26.1.0/docs/en/scheduling/07_references/00_fault_recovery_acceleration/02_installation_and_deployment.md#constraints)
+See: [MindIO TTP Constraints and Limitations](https://gitcode.com/Ascend/mind-cluster/blob/branch_v26.1.0/docs/en/scheduling/07_references/00_fault_recovery_acceleration/02_installation_and_deployment.md#%E7%BA%A6%E6%9D%9F%E9%99%90%E5%88%B6)
 
 ### Checkpoint Saving and Loading Optimization
 
 When `enable-high-availability` is enabled and the MindIO ACP SDK is installed in the environment, the system uses the first-level asynchronous checkpoint saving and loading optimization from `mindio_acp`.
 
-See: [MindIO TTP Constraints and Limitations - Ascend Community](https://gitcode.com/Ascend/mind-cluster/blob/branch_v26.1.0/docs/en/scheduling/07_references/00_fault_recovery_acceleration/02_installation_and_deployment.md#constraints)
+See: [MindIO TTP Constraints and Limitations](https://gitcode.com/Ascend/mind-cluster/blob/branch_v26.1.0/docs/en/scheduling/07_references/00_fault_recovery_acceleration/02_installation_and_deployment.md#%E7%BA%A6%E6%9D%9F%E9%99%90%E5%88%B6)

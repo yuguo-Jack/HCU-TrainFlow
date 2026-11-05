@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/hicache_design.mdx
-raw_sha256: ea9e7896aeeba4f648c3484b382780ce735bba74e0a74dd5403bf7a0438305b5
+raw_sha256: ae39e8f6086a763f32d34debbf879db58cbae6397514121bbaecf200bae51e8b
 sources: []
-generated_body_sha256: c9af68d8c07415e192125eb5b1e09e3c56888462dadd875637ca9222beaf92e6
+generated_body_sha256: 1e817dd88ccde94e43d2170f8dfb2e93a17a484730c04ef9af047eea58b74fee
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/hicache_design.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/hicache_design.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/hicache_design.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -190,6 +190,8 @@ SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the
 
 HiCache encapsulates all read, write, and query operations on L3 backends within the `class HiCacheStorage(ABC)`, exposing a set of simple and consistent interfaces. This design supports a wide range of L3 storage backends and allows users to select the one that best fits their specific use cases.
 
+When a backend is attached, HiCache hands it the host memory pools in a fixed order: `register_mem_pool_host` receives the anchor pool first, then every pool of the host pool group (Mamba state, indexer, SWA, draft sidecars, ...) arrives through `register_mem_host_pool_v2`, and `on_host_pools_registered` fires exactly once when this initial burst is over. Pools attached dynamically later still arrive through `register_mem_host_pool_v2` alone. Backends that talk to an external service whose instance specification must be complete up front (e.g. a remote cache manager) should finalize it inside `on_host_pools_registered`; raising there fails the attach.
+
 - **Mooncake**: Mooncake is a high-performance caching system for LLM inference that leverages RDMA and multi-NIC resources to enable zero-copy, ultra-fast data transfers. Try Mooncake [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/mooncake_store).
 
 - **DeepSeek 3FS (HF3FS)**: HF3FS is a Kubernetes-native distributed storage solution with operator-based deployment. Try HF3FS [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/hf3fs).
@@ -200,7 +202,17 @@ HiCache encapsulates all read, write, and query operations on L3 backends within
 
 - **HiCacheFile**: A simple file-based storage backend for demonstration purposes.
 
+- **HiCacheFastFile**: A portable local-filesystem backend (`fast_file`) that keeps the `HiCacheFile` page format and adds direct page-first host-buffer I/O, parallel reads, atomic page publication, and background LRU eviction.
+
 Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
+
+### External KV Router Integration
+
+HiCache is not only consumed inside SGLang. An external KV-aware router placed in front of the engines can also query the same L3 data to route requests to the instance that can reuse the most KV cache. Such a router must rebuild the exact object keys the backend uses, which for Mooncake is `{key_prefix}_{page_hash}{suffix}`. The suffix depends on the model's pool layout, the parallelism layout, and the resolved `--page-size`, so the engine exposes its layout instead of letting each router derive the naming itself.
+
+The Mooncake backend describes the physical KV primary, SWA/Mamba components, and registered sidecars; it excludes logical KV anchors with no buffer. Suffixes come from the write-path key builders. KV uses `all_pages`; SWA uses `trailing_pages` with its component's `full_window_pages`, and Mamba uses one trailing page. Sidecars retain their own hit policy and derive a trailing window from their index-source component.
+
+The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout generator. In `/server_info`, the outer `hicache_object_layout` field contains `{enabled, backend, page_size, hicache_object_layout: {pools, key_prefix, is_mla_backend, pp_rank, pp_size}}`; pool entries contain `pool`, `suffixes`, `hit_policy`, and optionally `trailing_pages`. External lookup is enabled only for rank-replicated/MLA pools, including DeepSeek V4 compressed MLA. With pipeline parallelism each stage stores objects under its own `pp_rank` suffix, so the layout lists the pools of every stage and reports `pp_rank: null`; a layout that cannot cover all `pp_size` stages (for example when some stages run on other nodes) is unavailable. MHA or rank-sharded auxiliary pools, missing window metadata, unavailable Mooncake, and inconsistent scheduler replies also return `enabled: false` with a `reason`. Consumers must not register L3 in that case; an absent outer field indicates an older engine and permits legacy fallback. Ordinary DP and Ray startup retain and check scheduler replies rather than selecting the first layout.
 
 ## Related Parameters
 
@@ -233,7 +245,7 @@ Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM 
   - `page_first`: Optimized for I/O efficiency
   - `page_first_direct`: Groups all tokens of a given layer within a page, allowing transfers from L2 to GPU to be aggregated at the page-layer level
 
-- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
+- **`--hicache-storage-backend {file,fast_file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, fast_file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
 
 - **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution.
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/config/transform/README.md
-raw_sha256: 31ccfda7c1c338a215dc1221b34b5a850d3cf4b5b2d6317191fdf7d1768a54d3
+raw_sha256: 605a14077539325cb66eb17f52939bd35ed2d97e78f80fa547d6aec1cb53b78a
 sources: []
-generated_body_sha256: a2cbc215090fb50588c86d2c2701d03d38b46243e1335610d6896c544befb1d9
+generated_body_sha256: 11a0aa5afaea630e9d2c16dc1acee57fb2ec45eb1088cab30dded66417a9fd87
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/config/transform/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/transform/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/transform/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -135,6 +135,12 @@ A CP transform specializes the selected attention for distributed execution.
 It may change input sharding and preprocessing, but it preserves the selected
 attention algorithm and metadata format.
 
+Graph-safe varlen K/V all-gather supports contiguous and head-tail sharding.
+Set `context_parallel_load_balancer=None` for one varlen call per rank.
+Head-tail uses two calls to balance long causal documents. It also works for
+sliding-only models because it does not need attention metadata. PTRR is not
+supported by these varlen backends.
+
 ## Dependency direction
 
 This package may import other `torchtitan` packages. Those packages must not
@@ -214,7 +220,8 @@ requirements.
 
 See [Configuration validation](../README.md#validation) for where validation
 belongs. `apply_transforms` validates the final trainer config after the last
-transform. The trainer validates it again after command-line overrides.
+transform. `ConfigLoader.load` validates again after launch options, and
+`apply_overrides` validates again after registered overrides.
 
 `__post_init__` also runs when a config is constructed. Set related training
 options before calling `apply_transforms`. It can then validate the final

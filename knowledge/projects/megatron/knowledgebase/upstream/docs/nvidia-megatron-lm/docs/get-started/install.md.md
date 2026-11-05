@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: ab1a28486b92adb3702f1289ff3a332cdb74294f
+commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
 path: docs/get-started/install.md
-raw_sha256: b5e97dc226f7ff5c18c7f91d5dd0c5439dd2850bb5276b57eb528a664011317a
+raw_sha256: dea288d82bc434fe1fabb77601c676e17c6cacdd7a9cfd64c47eb16ec9ec7920
 sources: []
-generated_body_sha256: 31e3b07fb8546267c2f4e9a684518a6bed7cf4122ac4e57d2963c0090fadf9a2
+generated_body_sha256: 17d1746e063102188be7edd02232aebf5c23b961e709e18d6b5bdb9f05c74dce
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / docs/get-started/install.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/ab1a28486b92adb3702f1289ff3a332cdb74294f/docs/get-started/install.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/docs/get-started/install.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -48,9 +48,9 @@ Megatron Core can be installed from PyPI, built from source, or run inside an NG
 
 ### Software
 
-- **Python**: >= 3.10 (3.12 recommended)
+- **Python**: >= 3.12
 - **PyTorch**: >= 2.6.0
-- **CUDA Toolkit**: Latest stable version
+- **CUDA Toolkit**: A version compatible with your PyTorch and Transformer Engine builds
 
 
 ## Prerequisites
@@ -128,14 +128,14 @@ If the build runs out of memory, limit parallel compilation jobs with `MAX_JOBS=
 
 For a pre-configured environment with all dependencies pre-installed (PyTorch, CUDA, cuDNN, NCCL, and Transformer Engine), use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch).
 
-Use the **previous month's** NGC container rather than the latest one to ensure compatibility with the current Megatron Core release and testing matrix.
+For source development, use the NGC PyTorch base image pinned in [docker/.ngc_version.dev](https://github.com/NVIDIA/Megatron-LM/blob/main/docker/.ngc_version.dev), or [docker/.ngc_version.lts](https://github.com/NVIDIA/Megatron-LM/blob/main/docker/.ngc_version.lts) for LTS. For a released Megatron Core version, use the dependency versions specified for that release.
 
 ```bash
 docker run --gpus all -it --rm \
   -v /path/to/dataset:/workspace/dataset \
   -v /path/to/checkpoints:/workspace/checkpoints \
   -e PIP_CONSTRAINT= \
-  nvcr.io/nvidia/pytorch:26.01-py3
+  nvcr.io/nvidia/pytorch:26.08-py3
 ```
 
 ```{note}

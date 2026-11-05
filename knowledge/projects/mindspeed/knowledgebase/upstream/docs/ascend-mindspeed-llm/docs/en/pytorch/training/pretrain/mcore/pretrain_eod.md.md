@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/pretrain/mcore/pretrain_eod.md
-raw_sha256: c4dd39f765c86f93ebee0e7d7111a59f710d6426e9793e21db3bfbdb6065795e
+raw_sha256: c1064586da8e5a611634fb1666e6a4dde7cc68fd46307aede4f6b0679b17c054
 sources: []
-generated_body_sha256: eae2d66afe9fbce6dcc4ea5e3212f2e494d652175f66a13de93aa29508815d7d
+generated_body_sha256: 006193c2fa379cedd6e230c329fb43d69611e8590af7d17f4555ac6942bd3561
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/pretrain/mcore/pretrain_eod.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/pretrain/mcore/pretrain_eod.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/pretrain/mcore/pretrain_eod.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -168,7 +168,7 @@ The process for distributed LLM pretraining in pack mode is as follows:
         --tokenizer-model ${TOKENIZER_MODEL}
         ```
 
-    > [!NOTE]
+    > [!NOTE] Note
     >
     > - Enclose the provided paths in double quotes.
     > - In multi-node training, ensure that the model path and dataset path on each machine are correct. If you do not configure data sharing, add the `no-shared-storage` parameter to the training launch script. After you set this parameter, the system determines whether a non-master node needs to load data based on the distributed parameters, and it checks the corresponding cache and generated data.

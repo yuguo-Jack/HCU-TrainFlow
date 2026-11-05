@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md
-raw_sha256: a99b641100c79ab2d089addc7aee32f2a99f30d734c154da321fcab8cab4a968
+raw_sha256: 9b8ce8a785bebaaf280467f72743899600c7929610f255b38c0e595b3fb9f0d1
 sources: []
-generated_body_sha256: 33d4e36623d0953c5f0f2f49b009bfb5b453790d323a9f4e1cec8e368f056348
+generated_body_sha256: 20bb4bb4e408765e1170332bf7620debebf43df8bbd2141737654e2afac790d3
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/finetune/mcore/multi_sample_pack_finetune.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -88,7 +88,7 @@ Multi-sample pack fine-tuning mainly includes the following steps:
     bash examples/mcore/qwen3/tune_qwen3_32b_32K_full_pack_A3_ptd.sh
     ```
 
-> [!NOTE]
+> [!NOTE] Note
 > The [Qwen3-32B pack fine-tuning script](https://gitcode.com/Ascend/MindSpeed-LLM/blob/26.1.0/examples/mcore/qwen3/tune_qwen3_32b_32K_full_pack_A3_ptd.sh) supports online data and weight loading during training. It integrates data preprocessing, weight conversion, and training into one script. Therefore, you can start a training job with a single command. For more details, see [Training With Online Data and Weight Loading (Train_from_HF)](../../pretrain/mcore/train_from_hf.md).
 >
 > - Integrated weight conversion and training: This provides bidirectional automatic conversion between Hugging Face weights and the Megatron format, together with training. Therefore, you do not need to run the weight conversion step separately. This enables one-click integration from Hugging Face weights to the training task.

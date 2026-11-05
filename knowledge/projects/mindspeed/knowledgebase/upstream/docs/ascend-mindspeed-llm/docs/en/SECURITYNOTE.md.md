@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/SECURITYNOTE.md
-raw_sha256: b6abf873c49ec743baebd6631ade81fb4cd9cae5872832484d370ee5f4ea00f0
+raw_sha256: 3fca55a00a0eaeae59e7b22e941ae244950466b2ce081b43edc27a14b9d9336c
 sources: []
-generated_body_sha256: c6494774517e0d3cb0a715b545ce29b36b32a43034d300698132eec52ccb1027
+generated_body_sha256: ed81698dae143a32d740bacf87be5fc92ab2caab7c38633e434a11f908859658
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/SECURITYNOTE.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/SECURITYNOTE.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/SECURITYNOTE.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -77,7 +77,7 @@ For security and least-privilege reasons, you are advised not to use `root` or o
 ## Runtime Security Statement
 
 1. You are advised to write training scripts that match the available resources. If the training script does not match the resource conditions, for example, if the dataset loading memory exceeds the available memory or if the training script generates more data locally than the available disk space, errors may occur and the process may exit unexpectedly.
-2. MindSpeed LLM uses PyTorch internally, and version mismatches may cause runtime errors. For details, see the PyTorch [Security Statement](https://gitcode.com/Ascend/pytorch/blob/v2.7.1-26.1.0/docs/en/SECURITYNOTE.md).
+2. MindSpeed LLM uses PyTorch internally, and version mismatches may cause runtime errors. For details, see the PyTorch [Security Statement](https://gitcode.com/Ascend/pytorch/blob/master/SECURITYNOTE.en.md).
 3. This software uses `torch.load` from PyTorch to load models, and the code uses this interface in certain scenarios. In some scenarios, `weights_only=False` is explicitly configured, which means these loading operations inherit the potential dangers of the `pickle` module, allowing arbitrary code execution. Attackers may exploit the `pickle` deserialization vulnerability to achieve remote code execution (RCE) by constructing malicious model files. Additionally, even when `weights_only=True` is configured, a deserialization vulnerability, CVE-2025-32434, still exists for PyTorch versions `<= 2.5.1`. Please ensure the safety of the loaded weights and avoid malicious model loading that could attack the execution machine or device.
 
 ## Public Internet Address Statement
@@ -96,23 +96,23 @@ For security and least-privilege reasons, you are advised not to use `root` or o
 
 ## Public Interface Statement
 
-MindSpeed LLM has not yet released a wheel package. Therefore, it does not provide any formal public interface. All functionality is invoked through shell scripts. The five entry scripts are [pretrain_gpt.py](https://gitcode.com/ascend/MindSpeed-LLM/blob/26.1.0/pretrain_gpt.py), [inference.py](https://gitcode.com/ascend/MindSpeed-LLM/blob/26.1.0/inference.py), [evaluation.py](https://gitcode.com/ascend/MindSpeed-LLM/blob/26.1.0/evaluation.py), [preprocess_data.py](https://gitcode.com/ascend/MindSpeed-LLM/blob/26.1.0/preprocess_data.py), and [convert_ckpt.py](https://gitcode.com/ascend/MindSpeed-LLM/blob/26.1.0/convert_ckpt.py).
+MindSpeed LLM has not yet released a wheel package. Therefore, it does not provide any formal public interface. All functionality is invoked through shell scripts. The five entry scripts are [pretrain_gpt.py](../../pretrain_gpt.py), [inference.py](../../inference.py), [evaluation.py](../../evaluation.py), [preprocess_data.py](../../preprocess_data.py), and [convert_ckpt_v2.py](../../convert_ckpt_v2.py).
 
 ## Communication Security Hardening
 
-[Communication security hardening instructions](https://gitcode.com/Ascend/pytorch/blob/v2.7.1-26.1.0/docs/en/SECURITYNOTE.md#communication-security-hardening)
+[Communication security hardening instructions](https://gitcode.com/Ascend/pytorch/blob/master/SECURITYNOTE.en.md#communication-security-hardening)
 
 ## Communication Matrix
 
-[Communication matrix instructions](https://gitcode.com/Ascend/pytorch/blob/v2.7.1-26.1.0/docs/en/SECURITYNOTE.md#communication-matrix)
+[Communication matrix instructions](https://gitcode.com/Ascend/pytorch/blob/master/SECURITYNOTE.en.md#communication-matrix)
 
 ### Special Scenarios
 
 | Scenario | Usage method | Port | Possible risk |
 |-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------| ------------------------------------------------ | ---------- | ---------- |
 | When you use MindSpeed LLM for training tasks in the Megatron backend, each time it initializes the model-parallel group, it adds `(3 * NPU count)` random ports by default. When multiple distributed optimizers are enabled, it adds `(number of distributed optimizers * NPU count)` more random ports. At the same time, it configures one `master-port`, which is consistent with the `master-port` of `TorchNPU`. | MindSpeed LLM calls the native `mpu.initialize_model_parallel` function of Megatron to initialize the model-parallel group and uses PyTorch distributed training APIs to start any task. | Within [1024, 65520] | Incorrect network configuration may cause port conflicts or connection issues and affect training efficiency. |
-| The user downloads corpora through `nltk.download`. | The user uses `nltk.download` inside the code to download corpora. | Random port | If the file source is untrusted, a deserialization vulnerability may exist when the file is loaded, which can lead to file tampering. |
+| The user downloads corpora through `nltk.download`. | The user uses `nltk.download` inside the code to download corpora. | Default: 32768-60999; the actual range matches the system `/proc/sys/net/ipv4/ip_local_port_range` configuration | If the file source is untrusted, a deserialization vulnerability may exist when the file is loaded, which can lead to file tampering. |
 
 ## Vulnerability Response
 
-We place high importance on the security of the community version. The Mind open-source community receives, investigates, and discloses security vulnerabilities related to this community. <!--For details, see [Ascend Vulnerability Response](https://gitcode.com/Ascend/community/blob/master/docs/security.md).-->
+We place high importance on the security of the community version. The Mind open-source community receives, investigates, and discloses security vulnerabilities related to this community. For details, see [Ascend Vulnerability Response](https://gitcode.com/Ascend/community/blob/master/docs/security.md).

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/code-docs/source/index.rst
-raw_sha256: b35d9a37578f3c0422ca14816c6229ae31c6c5256d362fe41afd81e108230f25
+raw_sha256: 01a3dabcd327af396978b111b231841ad3a8c1f8b8b5772facc0e43ac89f782f
 sources: []
-generated_body_sha256: 772d62be4d83b8e5686cdf6ed97b3fe2c5e6ffee6e5c7bbe1591bc68480b37a2
+generated_body_sha256: 77c893f7c0a910e5b08a75fd0532cd59de4e3f2302231c7fe632ccb2aae0be71
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/code-docs/source/index.rst
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/code-docs/source/index.rst)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/code-docs/source/index.rst)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -60,6 +60,7 @@ Checkpointing API
    :maxdepth: 2
 
    model-checkpointing
+   affine-transfer
    activation-checkpointing
 
 

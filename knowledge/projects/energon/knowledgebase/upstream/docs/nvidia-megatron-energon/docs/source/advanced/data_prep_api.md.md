@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/advanced/data_prep_api.md
-raw_sha256: 2ccccab10575f303995b19e709fbd9b2a20cb3bb149051beea1d9a6c53c22f96
+raw_sha256: 539339977b6a6d60b92dc3e7ffd18cbee9d1a4bc3447df8d6817ac8860bbf8cc
 sources: []
-generated_body_sha256: 7105a419e9318341125c4bd2f989cba508f187e25a845268974c0b0436bd566b
+generated_body_sha256: cbfde47280c464c044c2183b0c61b2447cd5f823b40c45ea2fce14e413cc1fc8
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/data_prep_api.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/advanced/data_prep_api.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/advanced/data_prep_api.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -32,7 +32,7 @@ SPDX-License-Identifier: BSD-3-Clause -->
 # Programmatic Data Preparation
 
 Below, we provide an example function that shows how to prepare a dataset programmatically.
-The example uses WebDataset tar shards.
+The example uses WebDataset tar shards. Other shard-list formats, such as prepared JSONL directories, use the same `.nv-meta` manifest files but have format-specific preparation helpers.
 
 ```python
 from megatron.energon.flavors import BaseWebdatasetFactory
@@ -88,8 +88,8 @@ def prepare_one_dataset(path: Path, num_workers: int, template_dir: Path):
 
 For non-tar shard lists, use the generic manifest writer
 `megatron.energon.flavors.common.manifest.write.write_manifest_dataset_metadata`
-with `ShardInfo` entries for each shard and a `dataset_definition` that points to the corresponding factory.
-Single-file datasets such as `.jsonl` are detected directly and do not require a manifest.
+with `ShardInfo` entries for each shard and a `dataset_definition` that points to the corresponding factory, such as `DefaultCrudeJsonlShardListDatasetFactory`.
+Single-file datasets such as `.jsonl` and `.bin` are detected directly and do not require a manifest.
 
 Example usage:
 

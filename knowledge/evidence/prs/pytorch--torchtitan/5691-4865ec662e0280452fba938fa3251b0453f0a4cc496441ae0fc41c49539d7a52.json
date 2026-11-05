@@ -1,0 +1,633 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "ac1b44e75d114fcb3b4b0290d1ab0e85702897f8bd7076320e413c119f1f0fa9",
+      "isPrivate": false,
+      "numbers": [
+        5696,
+        5695,
+        5694,
+        5693,
+        5691,
+        5690,
+        5689,
+        5688
+      ],
+      "observed_at": "2026-11-04T18:25:07.194468+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4849,
+        "resetAt": "2026-11-04T18:59:40Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "b832ae41936a626ac0c8dc9ab1ae8dd556fd428b",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\n**TLDR:** The generator now holds GDN's `A_log` and `dt_bias` as float32 parameters. The float32 cast the GDN kernels need then happens once per weight load, in `load_state_dict`'s `copy_`, instead of in every GDN layer on every step. GDN layer -3.2 to -5.8 us per step (Qwen3.5-27B TP4, 35B-A3B TP2), bitwise.\n\n```python\n# this PR, VLLMModelWrapper.__init__, on the meta model before parallelize\nfor param in (module.A_log, module.dt_bias):  # every GDN module\n    param.data = param.data.float()\n    param.requires_grad_(False)\nself.model._fsdp_param_dtype_override_fn = lambda param: param.dtype\n\n# Decoder._apply_fsdp (core): forwards FSDP's existing knob; the default None is main's path\nparam_dtype_override_fn=self._fsdp_param_dtype_override_fn,\n```\n\n**Problem**\n1. The generator's GDN kernels (Attention Gym's decode, gate and chunk kernels) take `A_log` and `dt_bias` in float32 only.\n2. vLLM builds the generator model in bf16, so `VLLMInnerGDN` casts both with `.float()`: 2 casts on decode steps, 4 on packed steps, in every GDN layer, inside the CUDA graphs.\n\n**Solution**\n1. **Float32 parameters.** `VLLMModelWrapper` converts every GDN's `A_log` and `dt_bias` to float32 and freezes them: FSDP requires one dtype among the parameters that have a grad.\n2. **FSDP keeps each parameter's dtype.** FSDP casts every parameter to `mixed_precision_param` (bf16) when it unshards. `Decoder._fsdp_param_dtype_override_fn` forwards FSDP's `param_dtype_override_fn` through `apply_fsdp_to_decoder`. The generator sets it to `lambda param: param.dtype`; its other parameters are already bf16.\n3. **Receive what the trainer sends.** The trainer sends parameters in the generator's dtype and buffers in their own (`rl/trainer/trainer.py:506-514`). The pinned CPU copy that receives them is now built the same way, because torchstore's RDMA transport copies raw bytes and asserts equal dtypes. `load_state_dict` then casts `A_log` and `dt_bias` to float32.\n4. **`VLLMInnerGDN`** drops its six `.float()` calls.\n5. **Unchanged:** the trainer, the kernels, and every model that doesn't set the attribute (FSDP gets None, as on main).\n6. **Changed for non-bf16 generators:** the override applies to every generator model. With `generator.model_dtype=\"bfloat16\"` (the default, and required for batch invariance) nothing changes. With float32 or float16 (allowed outside batch-invariant mode), FSDP used to cast the unsharded weights to bf16 (`TrainingConfig().mixed_precision_param`); now they stay in `model_dtype`.\n\n**Results**\n\n```text\nNumerics: bitwise. GDN layer output, SSM and conv state equal the base in every cell below, eager and one CUDA-graph\n          replay. Trainer-vs-generator parity test: 4 passed on both ranks.\n\nGDN layer (GDN module + VLLMInnerGDN), per GPU, GB300, CUDA graphs, L2 flushed, us. Median of 20 rotated blocks of\n40 replays. base = 5/7 (bf16 + .float()). Control = the base against a second copy of itself, in the same cell.\n                          Qwen3.5-27B TP4                     Qwen3.5-35B-A3B TP2\nstep                      base    this PR  delta  control     base    this PR  delta  control\ndecode, 64 requests        66.4    62.6    -3.8   +0.4         68.5    65.2    -3.2   -0.1\ndecode, 256 requests      115.5   111.6    -4.0   -1.1        133.5   130.0    -3.4   -0.5\n1 x 2k prefill            237.6   231.8    -5.8   +0.9        232.3   227.6    -4.7   +1.4\n61 decodes + 4 chunks     242.8   237.2    -5.6   +1.2        244.2   238.6    -5.5   -0.2\n\n27B TP4 step, estimated as delta x 48 GDN layers over 5/7's measured step times (not measured end to end):\ndecode, 64 requests     -0.18 of 7.76 ms         (-2.3%)\ndecode, 256 requests    -0.19 of 12.6-15.2 ms    (-1.3 to -1.5%; 3 runs varied this much)\nmixed, 64 requests      -0.27 of 34.4 ms         (-0.8%)\n```\n\nYou may ask:\n- Why not keep a float32 copy and refresh it after each load (the first version)? It needed a per-load hook in the wrapper. Float32 parameters need none: the load's own `copy_` casts.\n- Why not float32 buffers, which FSDP leaves alone? FSDP turns parameters into DTensors but leaves buffers rank-local. The state dict would hold `A_log` as a local `[heads / TP]` tensor, and the weight sync, which reshards DTensors, breaks at TP > 1 (the parity test failed this way).\n- Why a `Decoder` attribute? The generator never calls `fully_shard` (`parallelize` -> `_apply_fsdp` is core), and a `parallelize` argument would change all 6 `_apply_fsdp` implementations. The generator sets `_skip_lm_head` the same way.\n- Why not float32 in the trainer too? The trainer would compute with its float32 master values while the generator gets bf16 ones, so trainer-vs-generator parity would stop being bitwise.\n\nNOTE: not tested: weight sync over RDMA (multi-host). The receive dtypes follow from torchstore's dtype assert (`torchstore/transport/monarch_rdma.py`). The parity test now asserts that every receive tensor has the dtype the trainer sends.\nNOTE: a generator that loads an HF checkpoint directly gets the same numbers: released Qwen3.5 checkpoints (0.8B-Base, 9B-Base, 27B, 35B-A3B-Base) store `A_log` as F32 with bf16-exact values and `dt_bias` as BF16. A non-bf16-exact float32 `A_log` would now load unrounded.\nNOTE: at FSDP degree > 1 (vLLM DP > 1), FSDP all-gathers the mixed dtypes as bytes. Checked on CPU only (FSDP 2 and 4, TP2 x FSDP2, TP4 x FSDP2: float32 after unshard and after a load); the GPU tests below run at FSDP degree 1.\n\n**Test plan**\n\n```text\nTORCHTITAN_QWEN3_5_0_8B_HF_PATH=<Qwen3.5-0.8B-Base> pytest tests/rl/unit_tests/gpu/test_gdn_cudagraph.py \\\n  tests/rl/unit_tests/gpu/test_gdn_graph_metadata.py tests/unit_tests/gpu/models/qwen3_5/test_qwen3_5_deltanet.py   # 27 passed\ntorchrun --nproc_per_node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen   # 4 passed\ntorchrun --nproc_per_node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityGptOssVarlen\n  # not in CI; float32 trainer masters: weight sync + dtype assert pass, then the trainer-only test_batch_invariance\n  # fails on rank 0 and the ranks hang; it fails the same way on the base (5/7, f334fd991)\npytest tests/unit_tests/cpu/distributed/test_fsdp.py   # 11 passed; new: float32 parameter after unshard, with and without the override\npytest tests/rl/unit_tests/cpu                         # 506 passed, 8 skipped\npytest tests/unit_tests/cpu/distributed tests/unit_tests/cpu/models tests/unit_tests/cpu/config   # same 6 failures as the base (dist-MoE x2, LoRA, mrope x3)\nFSDP degree > 1: CPU probe only (NOTE above).\n```\n\n6/7 of the GDN generator stack, on top of 5/7 (one GDN input projection); 7/7 (#5731, the split compiled per grad mode) is on top of it.\n\n\n",
+      "changedFiles": 5,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "@claude please review",
+            "createdAt": "2026-10-29T10:08:22Z",
+            "databaseId": 6493817212,
+            "updatedAt": "2026-10-29T10:08:22Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6493817212"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 1m 6s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40855157811)\n\n---\n### Review: [rl] keep float32 GDN A_log/dt_bias with the fused weights (6/6)\n\n**Verdict: LGTM. A few small non-blocking suggestions below.**\n\nI checked this against `origin/felipemello1/gdn-stack/5-fused-input-proj`.\n\n**Correctness**\n- Numerics are unchanged. Every place the kernels read these values already did `A_log.float()` / `dt_bias.float()`: the decode kernel at `gdn.py:269-270` and `gdn.py:340-341`, and `gate_transform` at `gdn.py:378-379`. A float32 copy taken once per load gives the same values, and those `.float()` calls are now no-ops. Your \"2 casts on decode, 4 on packed\" count matches the code.\n- `copy=True` is correct and needed. `_unshard_and_free_sharded_params` unshards under `torch.inference_mode()` (`model_wrapper.py:304`) but calls `refresh_fused_weights` outside it. With float32 parameters, a plain `.to(torch.float32)` would return the inference-mode parameter itself, and the next load's `copy_` into it would raise. With the copy, you get a normal tensor.\n- The new tensors are refreshed with `copy_` after the first load, the same way as `input_weight_CD` / `conv_weight_CW`, so the addresses captured in CUDA graphs stay valid. The first-load check only looks at the two older fused tensors, but all four are always set together, so that is fine.\n- The TP placement is unchanged. The copies are the local `[H_local]` shards, and they go through the same `parameter_placement` entries in `vllm_inner_gdn_sharding_config` as before. Like `input_weight_CD`, they are plain tensors.\n\n**Suggestions (non-blocking)**\n1. **The test never checks that the copies are float32.** The CPU test builds float32 parameters, so it covers the `copy=True` aliasing case but not the cast. If someone replaced `.to(torch.float32, copy=True)` with `.clone()`, the test would still pass. A one-line check next to the `torch.equal` loop (`test_vllm_wrapper.py:295-297`) would cover the PR's main promise:\n   ```python\n   assert getattr(gdn, f\"{name}_fp32_H\").dtype == torch.float32, name\n   ```\n   Making the two parameters bf16 in the fixture would also test the real cast path. [Fix this →](https://claude.ai/code?q=In%20tests%2Frl%2Funit_tests%2Fcpu%2Ftest_vllm_wrapper.py%20test_load_state_dict_refreshes_fused_gdn_weights_in_place%20(branch%20felipemello1%2Fgdn-stack%2F6-fp32-decay-params)%2C%20add%20an%20assertion%20that%20gdn.A_log_fp32_H%20and%20gdn.dt_bias_fp32_H%20have%20dtype%20torch.float32%20inside%20the%20existing%20loop%20over%20(%22A_log%22%2C%20%22dt_bias%22)%2C%20and%20set%20gdn.A_log_fp32_H%20%3D%20gdn.dt_bias_fp32_H%20%3D%20None%20alongside%20gdn.input_weight_CD%20%3D%20gdn.conv_weight_CW%20%3D%20None%20to%20mirror%20VLLMGDN.__init__.&repo=pytorch/torchtitan)\n2. **Make the test fixture match `__init__`.** `test_vllm_wrapper.py:258` sets `input_weight_CD = conv_weight_CW = None` but not the two new attributes. The test passes only because the first refresh creates them. Setting all four to `None` keeps the hand-built `VLLMGDN` in step with `VLLMGDN.__init__`.\n3. **The `.float()` calls inside `VLLMInnerGDN` are now dead code.** `VLLMGDN` is the only caller, and it always passes float32. You could drop the `.float()` calls at `gdn.py:269-270`, `340-341` and `378-379`, and state the float32 contract on `VLLMInnerGDN.forward`'s `A_log_H` / `dt_bias_H`, so readers don't assume a cast still happens there. The class docstring at `gdn.py:72-73` (\"passes fused copies of the projection and conv weights\") could also mention the float32 gate parameters. This is only a readability cleanup; it doesn't affect performance.\n4. **Optional small simplification.** After the first load, the code makes a temporary float32 copy and then copies it in. `self.A_log_fp32_H.copy_(self.A_log)` would cast directly into the existing buffer. It only runs once per load and the tensors are a few dozen floats, so this is purely a matter of taste. Matching the existing build-then-`copy_` pattern is reasonable.\n\nNo unrelated changes or callsites seem to be missed. `refresh_fused_weights` has a single caller (`model_wrapper.py:321`), and the trainer-side `GDN` is untouched.\n\nThe repo's `/pr-review` skill isn't on this branch, so I wrote this review directly into this comment instead of posting it as a PR review with inline comments. I didn't run tests: GPU tests need hardware, and I didn't run the CPU test here either.",
+            "createdAt": "2026-10-29T10:08:47Z",
+            "databaseId": 6493825336,
+            "updatedAt": "2026-10-29T10:10:11Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6493825336"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: Review addressed in 0ea522cf4 (rebased onto d78b6fd17):\n1. dtype assert added in the loop. The stand-in now runs in bf16 and float32, because on float32 alone the assert cannot fail (`.clone()` of float32 is float32); bf16 + `.clone()` now fails.\n2. The fixture sets `A_log_fp32_H` / `dt_bias_fp32_H` to None. 3. The six `.float()` calls are dropped, with float32 stated in `VLLMInnerGDN.forward` (the kernels reject other dtypes).\n4. Kept the build-then-`copy_` pattern, to match the fused weights.",
+            "createdAt": "2026-10-29T11:08:07Z",
+            "databaseId": 6495018378,
+            "updatedAt": "2026-10-29T15:14:28Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6495018378"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: @claude please review",
+            "createdAt": "2026-10-29T15:42:35Z",
+            "databaseId": 6501291386,
+            "updatedAt": "2026-10-29T15:42:35Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6501291386"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 1m 4s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40904311850)\n\n---\n**Approve**: nothing blocking, and the four items from the earlier review are handled. [Review](https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview)",
+            "createdAt": "2026-10-29T15:43:04Z",
+            "databaseId": 6501303050,
+            "updatedAt": "2026-10-29T15:44:31Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6501303050"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: Parked. The PR below this one (5/6) now shares one grouped `in_proj` between the trainer and the generator, so the per-load `refresh_fused_weights` hook this PR used to keep float32 `A_log`/`dt_bias` copies is gone. Its gain (1.5-5.0 us per GDN layer per step, bitwise) still holds, but it needs another way to cast once per weight load. I'll redo it on top of the new 5/6, or close it if that ends up not worth it.\n",
+            "createdAt": "2026-11-01T23:43:13Z",
+            "databaseId": 6565658282,
+            "updatedAt": "2026-11-01T23:43:13Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6565658282"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: Redone in 594f95da9 (6/6 of the GDN stack). The generator holds GDN's `A_log`/`dt_bias` as float32 parameters, FSDP keeps their dtype through a `Decoder._fsdp_param_dtype_override_fn` passthrough (default None = main's path), and the receive copy uses the dtypes the trainer sends. Bitwise; GDN layer -3.2 to -5.8 us per step. Details and tests in the body.\n\n@claude please review.",
+            "createdAt": "2026-11-02T03:19:00Z",
+            "databaseId": 6568218965,
+            "updatedAt": "2026-11-02T03:19:00Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6568218965"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 3m 29s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41382422364)\n\n---\n**Approve** (please add the TODO on the new `Decoder` hook before merging; a maintainer still needs to review the core change): [Review](https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview)",
+            "createdAt": "2026-11-02T03:19:20Z",
+            "databaseId": 6568223067,
+            "updatedAt": "2026-11-02T03:23:09Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6568223067"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYd_IVs=",
+          "hasNextPage": false
+        },
+        "totalCount": 8
+      },
+      "headRefOid": "1f37f3de340676dc7a19c681085dc13d6ddd5a3d",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": {
+        "oid": "c3093f782aec620fdc6887887fe366917abbc057"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-02T18:16:13Z",
+      "number": 5691,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve** -- I found nothing blocking at HEAD (53318df), and the four items from the first round are handled.\n\n**What this PR does.** `VLLMGDN.refresh_fused_weights` now keeps float32 copies of `A_log` and `dt_bias` next to the fused projection and conv weights. It copies into them in place on each load, so the addresses captured by CUDA graphs stay valid. `VLLMGDN.forward` passes these copies to `VLLMInnerGDN`, which drops its six per-step `.float()` casts and states that it expects float32 inputs.\n\n**Example.** A bf16 generator running a GDN decode step:\n```\nbefore: each step   A_log (bf16) -> .float() -> recurrent_gdn_decode   (one cast kernel per tensor, inside the graph)\nafter:  each load   A_log (bf16) -> copy_ into A_log_fp32_H\n        each step   A_log_fp32_H -> recurrent_gdn_decode               (no cast)\n```\nThe values are the same either way, because the old code already cast these same bf16 values to float32. So the outputs should be bitwise identical, as the description says.\n\n**Earlier review, checked at HEAD**\n1. The dtype assert is in the loop, and the test now runs with both bf16 and fp32. With bf16, replacing the cast with `.clone()` fails the test. With fp32, removing `copy=True` fails it (the copy would be the inference-mode parameter itself, and the second load's `copy_` would raise). Resolved.\n2. The test sets `A_log_fp32_H` and `dt_bias_fp32_H` to `None`, matching `VLLMGDN.__init__` (`gdn.py:512-513`). Resolved.\n3. The `.float()` calls are gone at `gdn.py:269-270`, `341-342` and `379-380`, and the float32 requirement is stated in the `forward` docstring at `gdn.py:431`. Resolved.\n4. You kept the build-then-`copy_` pattern to match the fused weights. That is fine.\n\n<details><summary>Details</summary>\n\n- **Callers.** No other code passes bf16 into `VLLMInnerGDN`. `VLLMGDN.forward` is the only production caller. The GPU tests that call `_forward` directly already pass float32 (`test_gdn_graph_metadata.py:486-487`, `test_gdn_cudagraph.py:200`).\n- **Refresh timing.** In `_unshard_and_free_sharded_params` (`model_wrapper.py:352-357`), the refresh runs when `in_proj_q` still has storage. `A_log` and `dt_bias` live in the same layer and the same FSDP group as the projections, so all four copies are refreshed on the same load. The first-load check only tests the two older tensors, but all four are always assigned together, so that is fine.\n- **TP.** The copies are the local `[H_local]` shards and keep the existing `parameter_placement` entries in `vllm_inner_gdn_sharding_config` (`gdn.py:464-465`).\n- **Follow-up, not this PR.** `kda.py:240` has the same per-step `A_log_H.float()` / `dt_bias_HK.float()` pattern. If KDA's generator path gets fused weights, the same change would apply there.\n\n</details>\n\nNot verified: GPU timings and bitwise parity (I don't have the hardware), and the CPU test with bf16 FSDP on gloo, which I didn't run. A maintainer still needs to review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5700630611,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-29T15:44:17Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5700630611"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "will do a refactor to introduce per-fqn dtype so that a_log and dt_bias stay fp32 is never casted to bf16\n\ncc @wwwjn ",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5700885466,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-29T16:00:50Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5700885466"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve -- please address the items below before merging.** The redesign removes the per-load hook and keeps the core change to a passthrough whose default is main's path. It now touches core `Decoder`, which tianyu-l's earlier approval (on the old design) did not cover, so a maintainer still needs to review.\n\n**What this PR does.** `VLLMModelWrapper` turns every GDN's `A_log`/`dt_bias` into frozen float32 parameters on the meta model. Through a new `Decoder._fsdp_param_dtype_override_fn` it tells FSDP to keep each parameter's own dtype. It builds the pinned receive copy in the dtypes the trainer sends: parameters in `model_dtype`, buffers in their own dtype. The bf16 -> fp32 cast then happens in `load_state_dict`'s `copy_`, and `VLLMInnerGDN` drops its six `.float()` calls.\n\n**Example.** A bf16 Qwen3.5 generator, TP2, one GDN layer:\n```\nbase:     A_log param bf16 [H/2] --FSDP unshard--> bf16 --.float() every step, in the graph--> kernel\nthis PR:  A_log param fp32 [H/2] --FSDP unshard (override keeps fp32)--> fp32 --> kernel\nweight sync: trainer sends bf16 -> pinned receive buffer bf16 (not fp32: RDMA asserts equal dtypes)\n             -> load_state_dict copy_ into the fp32 shard (the one cast per load)\n```\nThe values are the same bf16 values widened to fp32 either way, so the result is bitwise identical.\n\n### Must fix\n1. `torchtitan/models/common/decoder.py:161` -- the core hook has a single consumer and no TODO linking it to the planned per-FQN dtype refactor (inline).\n\n### Should consider\n- `torchtitan/rl/generator/vllm/model_wrapper.py:409` -- the override applies to every generator model. For `model_dtype != \"bfloat16\"` it changes the unshard dtype, from bf16 to `model_dtype`. The description's \"Unchanged\" line doesn't mention this (inline).\n\n<details><summary>Details</summary>\n\n- **Passthrough reaches Qwen3.5.** `Qwen35Model(MultimodalModel)` -> `MultimodalModel._apply_fsdp` -> `super()._apply_fsdp` -> `Decoder._apply_fsdp` forwards the attribute. The other `_apply_fsdp` overrides (deepseek_v4, flux, deepseek_v3 MTP, transformers backend) don't forward it, but none of them holds a GDN.\n- **Freezing.** FSDP2's uniform-dtype check only covers parameters with `requires_grad`, so the comment at `model_wrapper.py:401-402` is accurate. The generator never computes grads, so freezing costs nothing.\n- **Receive dtypes vs trainer.** `trainer.py:509-514` sends parameters as `_transfer_dtype` when `generator_dtype != training.dtype`, and otherwise in their own `training.dtype`. In the second case (bf16 trainer, bf16 generator), the sent dtype equals `model_dtype`, so `model_wrapper.py:468-476` matches both cases. The new assert in `test_bitwise_parity.py` checks exactly this.\n- **Quantized params.** `_ShardedFSDPTensor.fsdp_pre_all_gather` reads `mp_policy.param_dtype` directly (`_fsdp_tensor.py:381`). In the generator, that dtype equals the parameter dtype, so the override changes nothing for MXFP8/NVFP4 weights.\n- **Standalone HF load** (`checkpointer_config` set, outside the RL loop) now keeps a float32 `A_log` unrounded. The NOTE in the description covers this. In the RL loop the config is `None`, and weights arrive bf16 from the trainer.\n- **KDA** (`kda.py`) still casts `A_log_H.float()` / `dt_bias_HK.float()` every step. The same change could apply there as a follow-up.\n\n</details>\n\nNot verified: GPU timings, bitwise parity, FSDP degree > 1 on GPU, and the RDMA receive path. I could not run torch in this environment.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "This adds a hook to core `Decoder` that has one consumer, the RL generator (Principle 4). Like `_skip_lm_head` above it, it is a stopgap: tianyu-l said in the earlier approval that he plans a per-FQN param dtype refactor that keeps `A_log`/`dt_bias` in fp32 throughout. Without a TODO, nothing ties this attribute to that refactor, so it can outlive it. Please add one, e.g.:\n\n```suggestion\n    # FSDP's per-parameter dtype override (``param_dtype_override_fn``); None casts every\n    # parameter to ``training.mixed_precision_param``. The generator sets it.\n    # TODO: remove once parameters carry a per-FQN dtype, so FSDP keeps A_log/dt_bias\n    # in float32 without a model attribute.\n    _fsdp_param_dtype_override_fn: Callable[\n        [nn.Parameter], torch.dtype | None\n    ] | None = None\n```",
+                  "createdAt": "2026-11-02T03:22:30Z",
+                  "databaseId": 4438631595,
+                  "diffHunk": "@@ -156,6 +158,12 @@ def first_moe(self) -> MoE.Config | None:\n     # inputs (bool kwargs cause 'has no attribute requires_grad' errors).\n     _skip_lm_head: bool = False\n \n+    # FSDP's per-parameter dtype override (``param_dtype_override_fn``); None casts every\n+    # parameter to ``training.mixed_precision_param``. The generator sets it.\n+    _fsdp_param_dtype_override_fn: Callable[\n+        [nn.Parameter], torch.dtype | None\n+    ] | None = None",
+                  "line": 167,
+                  "originalLine": 165,
+                  "path": "torchtitan/models/common/decoder.py",
+                  "updatedAt": "2026-11-02T03:22:52Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438631595"
+                },
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "This override is set for every generator model (llama3, gpt_oss, deepseek, ...), not just GDN models, and it applies to every parameter. With `generator.model_dtype=\"bfloat16\"` nothing changes: FSDP already skips the cast when `param_dtype` matches the parameter's dtype. With `model_dtype` set to `float32`/`float16` (allowed outside batch-invariant mode, `controller.py:419`), the behavior does change. On the base, FSDP cast every unsharded weight to `TrainingConfig().mixed_precision_param` (bf16). Now the weights stay in `model_dtype`, so a float32 generator computes in float32 and its unsharded weights take twice the memory.\n\nThat is probably the more correct behavior, but the description says \"Unchanged: ... every model that doesn't set the attribute\", and that doesn't cover it. Either say in the description that the generator now honors `model_dtype` for all models, or limit the override to what this PR needs (`lambda p: torch.float32 if p.dtype == torch.float32 else None`; this still keeps a float32 generator in float32, so describing the change is the simpler fix).",
+                  "createdAt": "2026-11-02T03:22:35Z",
+                  "databaseId": 4438632186,
+                  "diffHunk": "@@ -397,6 +397,16 @@ def __init__(\n         # Build model on meta device to avoid allocating full model on every GPU\n         with self.parallelism_context.activate_spmd(), torch.device(\"meta\"):\n             self.model = self.config.build()\n+        # The GDN kernels read A_log and dt_bias in float32. Keeping them in float32\n+        # casts them once per weight load instead of in every step. Frozen: FSDP needs\n+        # one dtype among parameters with grad.\n+        for module in self.model.modules():\n+            if isinstance(module, GDN):\n+                for param in (module.A_log, module.dt_bias):\n+                    param.data = param.data.float()\n+                    param.requires_grad_(False)\n+        # FSDP keeps each parameter in its own dtype: the rest are already the model dtype.\n+        self.model._fsdp_param_dtype_override_fn = lambda param: param.dtype",
+                  "line": 409,
+                  "originalLine": 409,
+                  "path": "torchtitan/rl/generator/vllm/model_wrapper.py",
+                  "updatedAt": "2026-11-02T03:22:52Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438632186"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQwMzoyMjozNVrPAAAAAQiQJvo=",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5731760259,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-02T03:22:52Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5731760259"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: Done in cab698289, with your TODO text.",
+                  "createdAt": "2026-11-02T03:41:23Z",
+                  "databaseId": 4438724153,
+                  "diffHunk": "@@ -156,6 +158,12 @@ def first_moe(self) -> MoE.Config | None:\n     # inputs (bool kwargs cause 'has no attribute requires_grad' errors).\n     _skip_lm_head: bool = False\n \n+    # FSDP's per-parameter dtype override (``param_dtype_override_fn``); None casts every\n+    # parameter to ``training.mixed_precision_param``. The generator sets it.\n+    _fsdp_param_dtype_override_fn: Callable[\n+        [nn.Parameter], torch.dtype | None\n+    ] | None = None",
+                  "line": 167,
+                  "originalLine": 165,
+                  "path": "torchtitan/models/common/decoder.py",
+                  "updatedAt": "2026-11-02T03:41:23Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438724153"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQwMzo0MToyM1rPAAAAAQiRjjk=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5731866305,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-02T03:41:23Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5731866305"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: Described it in the body (Solution 6). A dtype-based narrower lambda would still keep a float32 generator in float32, as you note, so I kept `lambda param: param.dtype`: a generator now computes in its `model_dtype`. With the bf16 default nothing changes.",
+                  "createdAt": "2026-11-02T03:41:25Z",
+                  "databaseId": 4438724274,
+                  "diffHunk": "@@ -397,6 +397,16 @@ def __init__(\n         # Build model on meta device to avoid allocating full model on every GPU\n         with self.parallelism_context.activate_spmd(), torch.device(\"meta\"):\n             self.model = self.config.build()\n+        # The GDN kernels read A_log and dt_bias in float32. Keeping them in float32\n+        # casts them once per weight load instead of in every step. Frozen: FSDP needs\n+        # one dtype among parameters with grad.\n+        for module in self.model.modules():\n+            if isinstance(module, GDN):\n+                for param in (module.A_log, module.dt_bias):\n+                    param.data = param.data.float()\n+                    param.requires_grad_(False)\n+        # FSDP keeps each parameter in its own dtype: the rest are already the model dtype.\n+        self.model._fsdp_param_dtype_override_fn = lambda param: param.dtype",
+                  "line": 409,
+                  "originalLine": 409,
+                  "path": "torchtitan/rl/generator/vllm/model_wrapper.py",
+                  "updatedAt": "2026-11-02T03:41:25Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438724274"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQwMzo0MToyNVrPAAAAAQiRjrI=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5731866425,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-02T03:41:25Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5731866425"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wMlQwMzo0MToyNVq0MjAyNi0xMS0wMlQwMzo0MToyNVrPAAAAAVWlVzk=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "MERGED",
+      "title": "[rl] generator: keep GDN A_log/dt_bias in float32 (6/7)",
+      "updatedAt": "2026-11-02T18:16:13Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5691"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "b832ae41936a626ac0c8dc9ab1ae8dd556fd428b"
+    },
+    "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\n**TLDR:** The generator now holds GDN's `A_log` and `dt_bias` as float32 parameters. The float32 cast the GDN kernels need then happens once per weight load, in `load_state_dict`'s `copy_`, instead of in every GDN layer on every step. GDN layer -3.2 to -5.8 us per step (Qwen3.5-27B TP4, 35B-A3B TP2), bitwise.\n\n```python\n# this PR, VLLMModelWrapper.__init__, on the meta model before parallelize\nfor param in (module.A_log, module.dt_bias):  # every GDN module\n    param.data = param.data.float()\n    param.requires_grad_(False)\nself.model._fsdp_param_dtype_override_fn = lambda param: param.dtype\n\n# Decoder._apply_fsdp (core): forwards FSDP's existing knob; the default None is main's path\nparam_dtype_override_fn=self._fsdp_param_dtype_override_fn,\n```\n\n**Problem**\n1. The generator's GDN kernels (Attention Gym's decode, gate and chunk kernels) take `A_log` and `dt_bias` in float32 only.\n2. vLLM builds the generator model in bf16, so `VLLMInnerGDN` casts both with `.float()`: 2 casts on decode steps, 4 on packed steps, in every GDN layer, inside the CUDA graphs.\n\n**Solution**\n1. **Float32 parameters.** `VLLMModelWrapper` converts every GDN's `A_log` and `dt_bias` to float32 and freezes them: FSDP requires one dtype among the parameters that have a grad.\n2. **FSDP keeps each parameter's dtype.** FSDP casts every parameter to `mixed_precision_param` (bf16) when it unshards. `Decoder._fsdp_param_dtype_override_fn` forwards FSDP's `param_dtype_override_fn` through `apply_fsdp_to_decoder`. The generator sets it to `lambda param: param.dtype`; its other parameters are already bf16.\n3. **Receive what the trainer sends.** The trainer sends parameters in the generator's dtype and buffers in their own (`rl/trainer/trainer.py:506-514`). The pinned CPU copy that receives them is now built the same way, because torchstore's RDMA transport copies raw bytes and asserts equal dtypes. `load_state_dict` then casts `A_log` and `dt_bias` to float32.\n4. **`VLLMInnerGDN`** drops its six `.float()` calls.\n5. **Unchanged:** the trainer, the kernels, and every model that doesn't set the attribute (FSDP gets None, as on main).\n6. **Changed for non-bf16 generators:** the override applies to every generator model. With `generator.model_dtype=\"bfloat16\"` (the default, and required for batch invariance) nothing changes. With float32 or float16 (allowed outside batch-invariant mode), FSDP used to cast the unsharded weights to bf16 (`TrainingConfig().mixed_precision_param`); now they stay in `model_dtype`.\n\n**Results**\n\n```text\nNumerics: bitwise. GDN layer output, SSM and conv state equal the base in every cell below, eager and one CUDA-graph\n          replay. Trainer-vs-generator parity test: 4 passed on both ranks.\n\nGDN layer (GDN module + VLLMInnerGDN), per GPU, GB300, CUDA graphs, L2 flushed, us. Median of 20 rotated blocks of\n40 replays. base = 5/7 (bf16 + .float()). Control = the base against a second copy of itself, in the same cell.\n                          Qwen3.5-27B TP4                     Qwen3.5-35B-A3B TP2\nstep                      base    this PR  delta  control     base    this PR  delta  control\ndecode, 64 requests        66.4    62.6    -3.8   +0.4         68.5    65.2    -3.2   -0.1\ndecode, 256 requests      115.5   111.6    -4.0   -1.1        133.5   130.0    -3.4   -0.5\n1 x 2k prefill            237.6   231.8    -5.8   +0.9        232.3   227.6    -4.7   +1.4\n61 decodes + 4 chunks     242.8   237.2    -5.6   +1.2        244.2   238.6    -5.5   -0.2\n\n27B TP4 step, estimated as delta x 48 GDN layers over 5/7's measured step times (not measured end to end):\ndecode, 64 requests     -0.18 of 7.76 ms         (-2.3%)\ndecode, 256 requests    -0.19 of 12.6-15.2 ms    (-1.3 to -1.5%; 3 runs varied this much)\nmixed, 64 requests      -0.27 of 34.4 ms         (-0.8%)\n```\n\nYou may ask:\n- Why not keep a float32 copy and refresh it after each load (the first version)? It needed a per-load hook in the wrapper. Float32 parameters need none: the load's own `copy_` casts.\n- Why not float32 buffers, which FSDP leaves alone? FSDP turns parameters into DTensors but leaves buffers rank-local. The state dict would hold `A_log` as a local `[heads / TP]` tensor, and the weight sync, which reshards DTensors, breaks at TP > 1 (the parity test failed this way).\n- Why a `Decoder` attribute? The generator never calls `fully_shard` (`parallelize` -> `_apply_fsdp` is core), and a `parallelize` argument would change all 6 `_apply_fsdp` implementations. The generator sets `_skip_lm_head` the same way.\n- Why not float32 in the trainer too? The trainer would compute with its float32 master values while the generator gets bf16 ones, so trainer-vs-generator parity would stop being bitwise.\n\nNOTE: not tested: weight sync over RDMA (multi-host). The receive dtypes follow from torchstore's dtype assert (`torchstore/transport/monarch_rdma.py`). The parity test now asserts that every receive tensor has the dtype the trainer sends.\nNOTE: a generator that loads an HF checkpoint directly gets the same numbers: released Qwen3.5 checkpoints (0.8B-Base, 9B-Base, 27B, 35B-A3B-Base) store `A_log` as F32 with bf16-exact values and `dt_bias` as BF16. A non-bf16-exact float32 `A_log` would now load unrounded.\nNOTE: at FSDP degree > 1 (vLLM DP > 1), FSDP all-gathers the mixed dtypes as bytes. Checked on CPU only (FSDP 2 and 4, TP2 x FSDP2, TP4 x FSDP2: float32 after unshard and after a load); the GPU tests below run at FSDP degree 1.\n\n**Test plan**\n\n```text\nTORCHTITAN_QWEN3_5_0_8B_HF_PATH=<Qwen3.5-0.8B-Base> pytest tests/rl/unit_tests/gpu/test_gdn_cudagraph.py \\\n  tests/rl/unit_tests/gpu/test_gdn_graph_metadata.py tests/unit_tests/gpu/models/qwen3_5/test_qwen3_5_deltanet.py   # 27 passed\ntorchrun --nproc_per_node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen   # 4 passed\ntorchrun --nproc_per_node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityGptOssVarlen\n  # not in CI; float32 trainer masters: weight sync + dtype assert pass, then the trainer-only test_batch_invariance\n  # fails on rank 0 and the ranks hang; it fails the same way on the base (5/7, f334fd991)\npytest tests/unit_tests/cpu/distributed/test_fsdp.py   # 11 passed; new: float32 parameter after unshard, with and without the override\npytest tests/rl/unit_tests/cpu                         # 506 passed, 8 skipped\npytest tests/unit_tests/cpu/distributed tests/unit_tests/cpu/models tests/unit_tests/cpu/config   # same 6 failures as the base (dist-MoE x2, LoRA, mrope x3)\nFSDP degree > 1: CPU probe only (NOTE above).\n```\n\n6/7 of the GDN generator stack, on top of 5/7 (one GDN input projection); 7/7 (#5731, the split compiled per grad mode) is on top of it.\n\n\n",
+    "changed_files": 5,
+    "head": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "1f37f3de340676dc7a19c681085dc13d6ddd5a3d"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5691",
+    "merge_commit_sha": "c3093f782aec620fdc6887887fe366917abbc057",
+    "merged": true,
+    "merged_at": "2026-11-02T18:16:13Z",
+    "number": 5691,
+    "state": "closed",
+    "title": "[rl] generator: keep GDN A_log/dt_bias in float32 (6/7)",
+    "updated_at": "2026-11-02T18:16:13Z"
+  },
+  "files": [
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_bitwise_parity.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_bitwise_parity.py?ref=1f37f3de340676dc7a19c681085dc13d6ddd5a3d",
+      "deletions": 0,
+      "filename": "tests/rl/unit_tests/gpu/test_bitwise_parity.py",
+      "patch": "@@ -278,13 +278,20 @@ def _sync_trainer_weights_to_vllm(trainer_model, engine) -> None:\n     # As a model state dict load: fill the pinned CPU copy, then load it with load_state_dict.\n     vllm_sd = wrapper._prefetched_model_state_dict\n \n+    trainer_buffers = {name for name, _ in trainer_model.named_buffers()}\n     missing = []\n     for name, vparam in vllm_sd.items():\n         tparam = trainer_sd.get(name)\n         if tparam is None:\n             missing.append(name)\n             continue\n         full = tparam.full_tensor() if isinstance(tparam, DTensor) else tparam\n+        # Weight sync over RDMA copies bytes, so the receive dtype is what the trainer sends:\n+        # parameters in the generator dtype, buffers in their own.\n+        sent_dtype = (\n+            full.dtype if name in trainer_buffers else engine.model_config.dtype\n+        )\n+        assert vparam.dtype == sent_dtype, (name, vparam.dtype, sent_dtype)\n         with torch.inference_mode():\n             if isinstance(vparam, DTensor):\n                 vparam.copy_(",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_bitwise_parity.py",
+      "sha": "3dc44ea183b3a1ed0169a20c9c130904db1b3a15",
+      "status": "modified"
+    },
+    {
+      "additions": 42,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/tests%2Funit_tests%2Fcpu%2Fdistributed%2Ftest_fsdp.py",
+      "changes": 42,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fdistributed%2Ftest_fsdp.py?ref=1f37f3de340676dc7a19c681085dc13d6ddd5a3d",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/distributed/test_fsdp.py",
+      "patch": "@@ -8,19 +8,23 @@\n \n import pytest\n import torch\n+import torch.distributed as dist\n import torch.nn as nn\n from torch.distributed.tensor import Shard\n \n+from torchtitan.config import ParallelismConfig, TrainingConfig\n from torchtitan.config.parallelism import FSDPSymmMemScope\n from torchtitan.distributed.fsdp import (\n     apply_fsdp_to_decoder,\n     enable_fsdp_symm_mem,\n     linear_param_shard_placements,\n )\n+from torchtitan.distributed.parallelism_context import ParallelismContext\n from torchtitan.models.common.decoder import TransformerBlock\n from torchtitan.models.common.feed_forward import DenseFeedForward\n from torchtitan.models.common.linear import Linear\n from torchtitan.models.common.moe import MoE\n+from torchtitan.models.llama3.flavors import build_model_config\n \n \n class _FSDPModule(nn.Module):\n@@ -70,6 +74,44 @@ def param_dtype_override_fn(param: nn.Parameter) -> torch.dtype | None:\n     assert mp_policy.param_dtype_override_fn is param_dtype_override_fn\n \n \n+@pytest.mark.parametrize(\"keep_dtype\", [True, False])\n+@mock.patch(\"torchtitan.distributed.parallelism_context.device_type\", \"cpu\")\n+def test_decoder_fsdp_param_dtype_override_fn_keeps_float32_param(\n+    keep_dtype: bool,\n+) -> None:\n+    # As the RL generator does: a bf16 model with one frozen float32 parameter.\n+    dist.init_process_group(\"gloo\", store=dist.HashStore(), rank=0, world_size=1)\n+    try:\n+        parallelism = ParallelismConfig()\n+        model = build_model_config(\"debugmodel\", parallelism=parallelism).build()\n+        model.to(torch.bfloat16)\n+        model.norm.weight.data = model.norm.weight.data.float()\n+        model.norm.weight.requires_grad_(False)\n+        if keep_dtype:\n+            model._fsdp_param_dtype_override_fn = lambda param: param.dtype\n+        model._apply_fsdp(\n+            parallelism_context=ParallelismContext(\n+                dp_replicate=1,\n+                dp_shard=1,\n+                cp=1,\n+                tp=1,\n+                pp=1,\n+                ep=1,\n+                world_size=1,\n+                enable_sequence_parallel=False,\n+            ),\n+            training=TrainingConfig(),\n+            parallelism=parallelism,\n+        )\n+        model.norm.unshard()\n+        assert model.norm.weight.dtype == (\n+            torch.float32 if keep_dtype else torch.bfloat16\n+        )\n+        assert model.lm_head.weight.dtype == torch.bfloat16\n+    finally:\n+        dist.destroy_process_group()\n+\n+\n def test_apply_fsdp_to_decoder_shards_an_moe_held_as_mlp() -> None:\n     model = nn.Module()\n     model.enable_weight_tying = False",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/tests%2Funit_tests%2Fcpu%2Fdistributed%2Ftest_fsdp.py",
+      "sha": "7a3f98e7a8f58d757118ab6f4d0cb8682ab0c155",
+      "status": "modified"
+    },
+    {
+      "additions": 11,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/torchtitan%2Fmodels%2Fcommon%2Fdecoder.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fcommon%2Fdecoder.py?ref=1f37f3de340676dc7a19c681085dc13d6ddd5a3d",
+      "deletions": 0,
+      "filename": "torchtitan/models/common/decoder.py",
+      "patch": "@@ -5,12 +5,14 @@\n # LICENSE file in the root directory of this source tree.\n \n import logging\n+from collections.abc import Callable\n from dataclasses import dataclass\n from typing import Any\n \n import spmd_types as spmd\n import torch\n from spmd_types import SpmdType\n+from torch import nn\n \n from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig\n from torchtitan.config.parallelism import ParallelismConfig\n@@ -156,6 +158,14 @@ def first_moe(self) -> MoE.Config | None:\n     # inputs (bool kwargs cause 'has no attribute requires_grad' errors).\n     _skip_lm_head: bool = False\n \n+    # FSDP's per-parameter dtype override (``param_dtype_override_fn``); None casts every\n+    # parameter to ``training.mixed_precision_param``. The generator sets it.\n+    # TODO: remove once parameters carry a per-FQN dtype, so FSDP keeps A_log/dt_bias\n+    # in float32 without a model attribute.\n+    _fsdp_param_dtype_override_fn: Callable[\n+        [nn.Parameter], torch.dtype | None\n+    ] | None = None\n+\n     def _apply_fsdp(\n         self,\n         *,\n@@ -184,6 +194,7 @@ def _apply_fsdp(\n             dp_mesh_dims=dp_mesh_dims,\n             edp_mesh_dims=edp_mesh_dims,\n             symm_mem_scope=parallelism.fsdp_symm_mem_scope,\n+            param_dtype_override_fn=self._fsdp_param_dtype_override_fn,\n         )\n \n     def __init__(self, config: Config):",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/torchtitan%2Fmodels%2Fcommon%2Fdecoder.py",
+      "sha": "4d56d26f6e590ee6bcb4f5368cbaaf1f809c13c8",
+      "status": "modified"
+    },
+    {
+      "additions": 11,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fgdn.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fgdn.py?ref=1f37f3de340676dc7a19c681085dc13d6ddd5a3d",
+      "deletions": 7,
+      "filename": "torchtitan/rl/generator/vllm/gdn.py",
+      "patch": "@@ -257,8 +257,8 @@ def _forward(\n                     conv_output,\n                     a[:num_decode_rows].unsqueeze(0),\n                     b[:num_decode_rows].unsqueeze(0),\n-                    A_log.float(),\n-                    dt_bias.float(),\n+                    A_log,\n+                    dt_bias,\n                     self.kv_cache[1],\n                     state_indices,\n                     has_initial_state=has_initial_state,\n@@ -329,8 +329,8 @@ def _forward(\n                     conv_output[:num_decode_rows],\n                     a[:num_decode_rows].unsqueeze(0),\n                     b[:num_decode_rows].unsqueeze(0),\n-                    A_log.float(),\n-                    dt_bias.float(),\n+                    A_log,\n+                    dt_bias,\n                     self.kv_cache[1],\n                     decode_state_indices[:num_decode_rows],\n                     has_initial_state=has_initial_state[:num_decode_rows],\n@@ -367,8 +367,8 @@ def _forward_gdn(\n         # Keep the existing FP32 arithmetic while reusing the GDN gate contract.\n         decay = gate_transform(\n             a.unsqueeze(0),\n-            A_log.float(),\n-            dt_bias.float(),\n+            A_log,\n+            dt_bias,\n             kind=\"softplus\",\n             fastmath=False,\n             impl=\"fused\",\n@@ -423,7 +423,11 @@ def forward(\n         value_head_dim: int,\n         attention_metadata: LinearAttentionMetadata | None,\n     ) -> torch.Tensor:\n-        \"\"\"Run the flattened vLLM cache operation on rank-local tensors.\"\"\"\n+        \"\"\"Run the flattened vLLM cache operation on rank-local tensors.\n+\n+        ``A_log_H`` and ``dt_bias_H`` are float32 (the model wrapper keeps them so); the\n+        GDN kernels reject other dtypes.\n+        \"\"\"\n         del attention_metadata\n         assert key_head_dim == self.head_k_dim\n         assert value_head_dim == self.head_v_dim",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fgdn.py",
+      "sha": "b9fcbf29de23bdc9af7cce5ea12da83bab4f66f9",
+      "status": "modified"
+    },
+    {
+      "additions": 23,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fmodel_wrapper.py",
+      "changes": 24,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fmodel_wrapper.py?ref=1f37f3de340676dc7a19c681085dc13d6ddd5a3d",
+      "deletions": 1,
+      "filename": "torchtitan/rl/generator/vllm/model_wrapper.py",
+      "patch": "@@ -397,6 +397,16 @@ def __init__(\n         # Build model on meta device to avoid allocating full model on every GPU\n         with self.parallelism_context.activate_spmd(), torch.device(\"meta\"):\n             self.model = self.config.build()\n+        # The GDN kernels read A_log and dt_bias in float32. Keeping them in float32\n+        # casts them once per weight load instead of in every step. Frozen: FSDP needs\n+        # one dtype among parameters with grad.\n+        for module in self.model.modules():\n+            if isinstance(module, GDN):\n+                for param in (module.A_log, module.dt_bias):\n+                    param.data = param.data.float()\n+                    param.requires_grad_(False)\n+        # FSDP keeps each parameter in its own dtype: the rest are already the model dtype.\n+        self.model._fsdp_param_dtype_override_fn = lambda param: param.dtype\n         self.model._skip_lm_head = True\n         if getattr(self.model, \"vision_encoder\", None) is not None:\n             self.model.vision_encoder = None\n@@ -452,9 +462,21 @@ def __init__(\n         # is still sharded. Bind first so first-touch places them on the\n         # NUMA node local to this rank's GPU.\n         maybe_apply_numa_binding(torch.cuda.current_device(), \"cuda\")\n+        # Receive what the trainer sends: parameters in the model dtype, buffers in their own.\n+        # torchstore's RDMA transport copies bytes and asserts matching dtypes;\n+        # load_state_dict casts the float32 GDN parameters.\n+        buffer_names = {name for name, _ in self.model.named_buffers()}\n+        model_state_dict = {\n+            name: (\n+                tensor\n+                if name in buffer_names\n+                else tensor.to(vllm_config.model_config.dtype)\n+            )\n+            for name, tensor in self.model.state_dict().items()\n+        }\n         with torch.device(\"cpu\"):\n             self._prefetched_model_state_dict = _create_cpu_state_dict(\n-                self.model.state_dict(), pin_memory=True\n+                model_state_dict, pin_memory=True\n             )\n \n         # Unshard the model here so vLLM performs its GPU memory profiling",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/1f37f3de340676dc7a19c681085dc13d6ddd5a3d/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fmodel_wrapper.py",
+      "sha": "e1c7138512eabec671033340f75c4e7ded93421a",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "This adds a hook to core `Decoder` that has one consumer, the RL generator (Principle 4). Like `_skip_lm_head` above it, it is a stopgap: tianyu-l said in the earlier approval that he plans a per-FQN param dtype refactor that keeps `A_log`/`dt_bias` in fp32 throughout. Without a TODO, nothing ties this attribute to that refactor, so it can outlive it. Please add one, e.g.:\n\n```suggestion\n    # FSDP's per-parameter dtype override (``param_dtype_override_fn``); None casts every\n    # parameter to ``training.mixed_precision_param``. The generator sets it.\n    # TODO: remove once parameters carry a per-FQN dtype, so FSDP keeps A_log/dt_bias\n    # in float32 without a model attribute.\n    _fsdp_param_dtype_override_fn: Callable[\n        [nn.Parameter], torch.dtype | None\n    ] | None = None\n```",
+      "created_at": "2026-11-02T03:22:30Z",
+      "diff_hunk": "@@ -156,6 +158,12 @@ def first_moe(self) -> MoE.Config | None:\n     # inputs (bool kwargs cause 'has no attribute requires_grad' errors).\n     _skip_lm_head: bool = False\n \n+    # FSDP's per-parameter dtype override (``param_dtype_override_fn``); None casts every\n+    # parameter to ``training.mixed_precision_param``. The generator sets it.\n+    _fsdp_param_dtype_override_fn: Callable[\n+        [nn.Parameter], torch.dtype | None\n+    ] | None = None",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438631595",
+      "id": 4438631595,
+      "line": 167,
+      "original_line": 165,
+      "path": "torchtitan/models/common/decoder.py",
+      "updated_at": "2026-11-02T03:22:52Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "This override is set for every generator model (llama3, gpt_oss, deepseek, ...), not just GDN models, and it applies to every parameter. With `generator.model_dtype=\"bfloat16\"` nothing changes: FSDP already skips the cast when `param_dtype` matches the parameter's dtype. With `model_dtype` set to `float32`/`float16` (allowed outside batch-invariant mode, `controller.py:419`), the behavior does change. On the base, FSDP cast every unsharded weight to `TrainingConfig().mixed_precision_param` (bf16). Now the weights stay in `model_dtype`, so a float32 generator computes in float32 and its unsharded weights take twice the memory.\n\nThat is probably the more correct behavior, but the description says \"Unchanged: ... every model that doesn't set the attribute\", and that doesn't cover it. Either say in the description that the generator now honors `model_dtype` for all models, or limit the override to what this PR needs (`lambda p: torch.float32 if p.dtype == torch.float32 else None`; this still keeps a float32 generator in float32, so describing the change is the simpler fix).",
+      "created_at": "2026-11-02T03:22:35Z",
+      "diff_hunk": "@@ -397,6 +397,16 @@ def __init__(\n         # Build model on meta device to avoid allocating full model on every GPU\n         with self.parallelism_context.activate_spmd(), torch.device(\"meta\"):\n             self.model = self.config.build()\n+        # The GDN kernels read A_log and dt_bias in float32. Keeping them in float32\n+        # casts them once per weight load instead of in every step. Frozen: FSDP needs\n+        # one dtype among parameters with grad.\n+        for module in self.model.modules():\n+            if isinstance(module, GDN):\n+                for param in (module.A_log, module.dt_bias):\n+                    param.data = param.data.float()\n+                    param.requires_grad_(False)\n+        # FSDP keeps each parameter in its own dtype: the rest are already the model dtype.\n+        self.model._fsdp_param_dtype_override_fn = lambda param: param.dtype",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438632186",
+      "id": 4438632186,
+      "line": 409,
+      "original_line": 409,
+      "path": "torchtitan/rl/generator/vllm/model_wrapper.py",
+      "updated_at": "2026-11-02T03:22:52Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: Done in cab698289, with your TODO text.",
+      "created_at": "2026-11-02T03:41:23Z",
+      "diff_hunk": "@@ -156,6 +158,12 @@ def first_moe(self) -> MoE.Config | None:\n     # inputs (bool kwargs cause 'has no attribute requires_grad' errors).\n     _skip_lm_head: bool = False\n \n+    # FSDP's per-parameter dtype override (``param_dtype_override_fn``); None casts every\n+    # parameter to ``training.mixed_precision_param``. The generator sets it.\n+    _fsdp_param_dtype_override_fn: Callable[\n+        [nn.Parameter], torch.dtype | None\n+    ] | None = None",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438724153",
+      "id": 4438724153,
+      "line": 167,
+      "original_line": 165,
+      "path": "torchtitan/models/common/decoder.py",
+      "updated_at": "2026-11-02T03:41:23Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Reply from claude: Described it in the body (Solution 6). A dtype-based narrower lambda would still keep a float32 generator in float32, as you note, so I kept `lambda param: param.dtype`: a generator now computes in its `model_dtype`. With the bf16 default nothing changes.",
+      "created_at": "2026-11-02T03:41:25Z",
+      "diff_hunk": "@@ -397,6 +397,16 @@ def __init__(\n         # Build model on meta device to avoid allocating full model on every GPU\n         with self.parallelism_context.activate_spmd(), torch.device(\"meta\"):\n             self.model = self.config.build()\n+        # The GDN kernels read A_log and dt_bias in float32. Keeping them in float32\n+        # casts them once per weight load instead of in every step. Frozen: FSDP needs\n+        # one dtype among parameters with grad.\n+        for module in self.model.modules():\n+            if isinstance(module, GDN):\n+                for param in (module.A_log, module.dt_bias):\n+                    param.data = param.data.float()\n+                    param.requires_grad_(False)\n+        # FSDP keeps each parameter in its own dtype: the rest are already the model dtype.\n+        self.model._fsdp_param_dtype_override_fn = lambda param: param.dtype",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#discussion_r4438724274",
+      "id": 4438724274,
+      "line": 409,
+      "original_line": 409,
+      "path": "torchtitan/rl/generator/vllm/model_wrapper.py",
+      "updated_at": "2026-11-02T03:41:25Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "@claude please review",
+      "created_at": "2026-10-29T10:08:22Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6493817212",
+      "id": 6493817212,
+      "updated_at": "2026-10-29T10:08:22Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 1m 6s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40855157811)\n\n---\n### Review: [rl] keep float32 GDN A_log/dt_bias with the fused weights (6/6)\n\n**Verdict: LGTM. A few small non-blocking suggestions below.**\n\nI checked this against `origin/felipemello1/gdn-stack/5-fused-input-proj`.\n\n**Correctness**\n- Numerics are unchanged. Every place the kernels read these values already did `A_log.float()` / `dt_bias.float()`: the decode kernel at `gdn.py:269-270` and `gdn.py:340-341`, and `gate_transform` at `gdn.py:378-379`. A float32 copy taken once per load gives the same values, and those `.float()` calls are now no-ops. Your \"2 casts on decode, 4 on packed\" count matches the code.\n- `copy=True` is correct and needed. `_unshard_and_free_sharded_params` unshards under `torch.inference_mode()` (`model_wrapper.py:304`) but calls `refresh_fused_weights` outside it. With float32 parameters, a plain `.to(torch.float32)` would return the inference-mode parameter itself, and the next load's `copy_` into it would raise. With the copy, you get a normal tensor.\n- The new tensors are refreshed with `copy_` after the first load, the same way as `input_weight_CD` / `conv_weight_CW`, so the addresses captured in CUDA graphs stay valid. The first-load check only looks at the two older fused tensors, but all four are always set together, so that is fine.\n- The TP placement is unchanged. The copies are the local `[H_local]` shards, and they go through the same `parameter_placement` entries in `vllm_inner_gdn_sharding_config` as before. Like `input_weight_CD`, they are plain tensors.\n\n**Suggestions (non-blocking)**\n1. **The test never checks that the copies are float32.** The CPU test builds float32 parameters, so it covers the `copy=True` aliasing case but not the cast. If someone replaced `.to(torch.float32, copy=True)` with `.clone()`, the test would still pass. A one-line check next to the `torch.equal` loop (`test_vllm_wrapper.py:295-297`) would cover the PR's main promise:\n   ```python\n   assert getattr(gdn, f\"{name}_fp32_H\").dtype == torch.float32, name\n   ```\n   Making the two parameters bf16 in the fixture would also test the real cast path. [Fix this →](https://claude.ai/code?q=In%20tests%2Frl%2Funit_tests%2Fcpu%2Ftest_vllm_wrapper.py%20test_load_state_dict_refreshes_fused_gdn_weights_in_place%20(branch%20felipemello1%2Fgdn-stack%2F6-fp32-decay-params)%2C%20add%20an%20assertion%20that%20gdn.A_log_fp32_H%20and%20gdn.dt_bias_fp32_H%20have%20dtype%20torch.float32%20inside%20the%20existing%20loop%20over%20(%22A_log%22%2C%20%22dt_bias%22)%2C%20and%20set%20gdn.A_log_fp32_H%20%3D%20gdn.dt_bias_fp32_H%20%3D%20None%20alongside%20gdn.input_weight_CD%20%3D%20gdn.conv_weight_CW%20%3D%20None%20to%20mirror%20VLLMGDN.__init__.&repo=pytorch/torchtitan)\n2. **Make the test fixture match `__init__`.** `test_vllm_wrapper.py:258` sets `input_weight_CD = conv_weight_CW = None` but not the two new attributes. The test passes only because the first refresh creates them. Setting all four to `None` keeps the hand-built `VLLMGDN` in step with `VLLMGDN.__init__`.\n3. **The `.float()` calls inside `VLLMInnerGDN` are now dead code.** `VLLMGDN` is the only caller, and it always passes float32. You could drop the `.float()` calls at `gdn.py:269-270`, `340-341` and `378-379`, and state the float32 contract on `VLLMInnerGDN.forward`'s `A_log_H` / `dt_bias_H`, so readers don't assume a cast still happens there. The class docstring at `gdn.py:72-73` (\"passes fused copies of the projection and conv weights\") could also mention the float32 gate parameters. This is only a readability cleanup; it doesn't affect performance.\n4. **Optional small simplification.** After the first load, the code makes a temporary float32 copy and then copies it in. `self.A_log_fp32_H.copy_(self.A_log)` would cast directly into the existing buffer. It only runs once per load and the tensors are a few dozen floats, so this is purely a matter of taste. Matching the existing build-then-`copy_` pattern is reasonable.\n\nNo unrelated changes or callsites seem to be missed. `refresh_fused_weights` has a single caller (`model_wrapper.py:321`), and the trainer-side `GDN` is untouched.\n\nThe repo's `/pr-review` skill isn't on this branch, so I wrote this review directly into this comment instead of posting it as a PR review with inline comments. I didn't run tests: GPU tests need hardware, and I didn't run the CPU test here either.",
+      "created_at": "2026-10-29T10:08:47Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6493825336",
+      "id": 6493825336,
+      "updated_at": "2026-10-29T10:10:11Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: Review addressed in 0ea522cf4 (rebased onto d78b6fd17):\n1. dtype assert added in the loop. The stand-in now runs in bf16 and float32, because on float32 alone the assert cannot fail (`.clone()` of float32 is float32); bf16 + `.clone()` now fails.\n2. The fixture sets `A_log_fp32_H` / `dt_bias_fp32_H` to None. 3. The six `.float()` calls are dropped, with float32 stated in `VLLMInnerGDN.forward` (the kernels reject other dtypes).\n4. Kept the build-then-`copy_` pattern, to match the fused weights.",
+      "created_at": "2026-10-29T11:08:07Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6495018378",
+      "id": 6495018378,
+      "updated_at": "2026-10-29T15:14:28Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Reply from claude: @claude please review",
+      "created_at": "2026-10-29T15:42:35Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6501291386",
+      "id": 6501291386,
+      "updated_at": "2026-10-29T15:42:35Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 1m 4s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40904311850)\n\n---\n**Approve**: nothing blocking, and the four items from the earlier review are handled. [Review](https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview)",
+      "created_at": "2026-10-29T15:43:04Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6501303050",
+      "id": 6501303050,
+      "updated_at": "2026-10-29T15:44:31Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: Parked. The PR below this one (5/6) now shares one grouped `in_proj` between the trainer and the generator, so the per-load `refresh_fused_weights` hook this PR used to keep float32 `A_log`/`dt_bias` copies is gone. Its gain (1.5-5.0 us per GDN layer per step, bitwise) still holds, but it needs another way to cast once per weight load. I'll redo it on top of the new 5/6, or close it if that ends up not worth it.\n",
+      "created_at": "2026-11-01T23:43:13Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6565658282",
+      "id": 6565658282,
+      "updated_at": "2026-11-01T23:43:13Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Reply from claude: Redone in 594f95da9 (6/6 of the GDN stack). The generator holds GDN's `A_log`/`dt_bias` as float32 parameters, FSDP keeps their dtype through a `Decoder._fsdp_param_dtype_override_fn` passthrough (default None = main's path), and the receive copy uses the dtypes the trainer sends. Bitwise; GDN layer -3.2 to -5.8 us per step. Details and tests in the body.\n\n@claude please review.",
+      "created_at": "2026-11-02T03:19:00Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6568218965",
+      "id": 6568218965,
+      "updated_at": "2026-11-02T03:19:00Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 3m 29s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41382422364)\n\n---\n**Approve** (please add the TODO on the new `Decoder` hook before merging; a maintainer still needs to review the core change): [Review](https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview)",
+      "created_at": "2026-11-02T03:19:20Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#issuecomment-6568223067",
+      "id": 6568223067,
+      "updated_at": "2026-11-02T03:23:09Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ],
+  "number": 5691,
+  "refs": {
+    "base": {
+      "commit": "b832ae41936a626ac0c8dc9ab1ae8dd556fd428b",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "1f37f3de340676dc7a19c681085dc13d6ddd5a3d",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "**Verdict: Approve** -- I found nothing blocking at HEAD (53318df), and the four items from the first round are handled.\n\n**What this PR does.** `VLLMGDN.refresh_fused_weights` now keeps float32 copies of `A_log` and `dt_bias` next to the fused projection and conv weights. It copies into them in place on each load, so the addresses captured by CUDA graphs stay valid. `VLLMGDN.forward` passes these copies to `VLLMInnerGDN`, which drops its six per-step `.float()` casts and states that it expects float32 inputs.\n\n**Example.** A bf16 generator running a GDN decode step:\n```\nbefore: each step   A_log (bf16) -> .float() -> recurrent_gdn_decode   (one cast kernel per tensor, inside the graph)\nafter:  each load   A_log (bf16) -> copy_ into A_log_fp32_H\n        each step   A_log_fp32_H -> recurrent_gdn_decode               (no cast)\n```\nThe values are the same either way, because the old code already cast these same bf16 values to float32. So the outputs should be bitwise identical, as the description says.\n\n**Earlier review, checked at HEAD**\n1. The dtype assert is in the loop, and the test now runs with both bf16 and fp32. With bf16, replacing the cast with `.clone()` fails the test. With fp32, removing `copy=True` fails it (the copy would be the inference-mode parameter itself, and the second load's `copy_` would raise). Resolved.\n2. The test sets `A_log_fp32_H` and `dt_bias_fp32_H` to `None`, matching `VLLMGDN.__init__` (`gdn.py:512-513`). Resolved.\n3. The `.float()` calls are gone at `gdn.py:269-270`, `341-342` and `379-380`, and the float32 requirement is stated in the `forward` docstring at `gdn.py:431`. Resolved.\n4. You kept the build-then-`copy_` pattern to match the fused weights. That is fine.\n\n<details><summary>Details</summary>\n\n- **Callers.** No other code passes bf16 into `VLLMInnerGDN`. `VLLMGDN.forward` is the only production caller. The GPU tests that call `_forward` directly already pass float32 (`test_gdn_graph_metadata.py:486-487`, `test_gdn_cudagraph.py:200`).\n- **Refresh timing.** In `_unshard_and_free_sharded_params` (`model_wrapper.py:352-357`), the refresh runs when `in_proj_q` still has storage. `A_log` and `dt_bias` live in the same layer and the same FSDP group as the projections, so all four copies are refreshed on the same load. The first-load check only tests the two older tensors, but all four are always assigned together, so that is fine.\n- **TP.** The copies are the local `[H_local]` shards and keep the existing `parameter_placement` entries in `vllm_inner_gdn_sharding_config` (`gdn.py:464-465`).\n- **Follow-up, not this PR.** `kda.py:240` has the same per-step `A_log_H.float()` / `dt_bias_HK.float()` pattern. If KDA's generator path gets fused weights, the same change would apply there.\n\n</details>\n\nNot verified: GPU timings and bitwise parity (I don't have the hardware), and the CPU test with bf16 FSDP on gloo, which I didn't run. A maintainer still needs to review.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5700630611",
+      "id": 5700630611,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-29T15:44:17Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "will do a refactor to introduce per-fqn dtype so that a_log and dt_bias stay fp32 is never casted to bf16\n\ncc @wwwjn ",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5700885466",
+      "id": 5700885466,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-29T16:00:50Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    },
+    {
+      "body": "**Verdict: Approve -- please address the items below before merging.** The redesign removes the per-load hook and keeps the core change to a passthrough whose default is main's path. It now touches core `Decoder`, which tianyu-l's earlier approval (on the old design) did not cover, so a maintainer still needs to review.\n\n**What this PR does.** `VLLMModelWrapper` turns every GDN's `A_log`/`dt_bias` into frozen float32 parameters on the meta model. Through a new `Decoder._fsdp_param_dtype_override_fn` it tells FSDP to keep each parameter's own dtype. It builds the pinned receive copy in the dtypes the trainer sends: parameters in `model_dtype`, buffers in their own dtype. The bf16 -> fp32 cast then happens in `load_state_dict`'s `copy_`, and `VLLMInnerGDN` drops its six `.float()` calls.\n\n**Example.** A bf16 Qwen3.5 generator, TP2, one GDN layer:\n```\nbase:     A_log param bf16 [H/2] --FSDP unshard--> bf16 --.float() every step, in the graph--> kernel\nthis PR:  A_log param fp32 [H/2] --FSDP unshard (override keeps fp32)--> fp32 --> kernel\nweight sync: trainer sends bf16 -> pinned receive buffer bf16 (not fp32: RDMA asserts equal dtypes)\n             -> load_state_dict copy_ into the fp32 shard (the one cast per load)\n```\nThe values are the same bf16 values widened to fp32 either way, so the result is bitwise identical.\n\n### Must fix\n1. `torchtitan/models/common/decoder.py:161` -- the core hook has a single consumer and no TODO linking it to the planned per-FQN dtype refactor (inline).\n\n### Should consider\n- `torchtitan/rl/generator/vllm/model_wrapper.py:409` -- the override applies to every generator model. For `model_dtype != \"bfloat16\"` it changes the unshard dtype, from bf16 to `model_dtype`. The description's \"Unchanged\" line doesn't mention this (inline).\n\n<details><summary>Details</summary>\n\n- **Passthrough reaches Qwen3.5.** `Qwen35Model(MultimodalModel)` -> `MultimodalModel._apply_fsdp` -> `super()._apply_fsdp` -> `Decoder._apply_fsdp` forwards the attribute. The other `_apply_fsdp` overrides (deepseek_v4, flux, deepseek_v3 MTP, transformers backend) don't forward it, but none of them holds a GDN.\n- **Freezing.** FSDP2's uniform-dtype check only covers parameters with `requires_grad`, so the comment at `model_wrapper.py:401-402` is accurate. The generator never computes grads, so freezing costs nothing.\n- **Receive dtypes vs trainer.** `trainer.py:509-514` sends parameters as `_transfer_dtype` when `generator_dtype != training.dtype`, and otherwise in their own `training.dtype`. In the second case (bf16 trainer, bf16 generator), the sent dtype equals `model_dtype`, so `model_wrapper.py:468-476` matches both cases. The new assert in `test_bitwise_parity.py` checks exactly this.\n- **Quantized params.** `_ShardedFSDPTensor.fsdp_pre_all_gather` reads `mp_policy.param_dtype` directly (`_fsdp_tensor.py:381`). In the generator, that dtype equals the parameter dtype, so the override changes nothing for MXFP8/NVFP4 weights.\n- **Standalone HF load** (`checkpointer_config` set, outside the RL loop) now keeps a float32 `A_log` unrounded. The NOTE in the description covers this. In the RL loop the config is `None`, and weights arrive bf16 from the trainer.\n- **KDA** (`kda.py`) still casts `A_log_H.float()` / `dt_bias_HK.float()` every step. The same change could apply there as a follow-up.\n\n</details>\n\nNot verified: GPU timings, bitwise parity, FSDP degree > 1 on GPU, and the RDMA receive path. I could not run torch in this environment.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5731760259",
+      "id": 5731760259,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-02T03:22:52Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5731866305",
+      "id": 5731866305,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-02T03:41:23Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5691#pullrequestreview-5731866425",
+      "id": 5731866425,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-02T03:41:25Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ]
+}

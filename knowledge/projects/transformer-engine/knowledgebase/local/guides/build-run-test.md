@@ -9,31 +9,32 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
   path: docs/installation.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: e572fc6ba65d15e9092baa71c3e09e724ad344b52d7c4a28a4e854e58d36093e
 - source: nvidia-transformerengine
   path: docs/envvars.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 7d0f440d41ba1122259bbc2d5daaf7892fd0e87de1fa17a79c2f185b1c8adf2d
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 5a2bc2206a8602f90ba8ca3aa00c921f23caa5795baa3149953bad5767f4b99a
 - source: nvidia-transformerengine
   path: setup.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 7329a6981de6e6fa50a86971fd914a0a3db2f08b47287694c00e468a59a32dac
 - source: nvidia-transformerengine
   path: .gitmodules
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: f59cb931b9c260f59fdf31beaf800a8df536fa50eec9470b381d3bf7b1e62986
 - source: nvidia-transformerengine
   path: tests/pytorch/test_numerics.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 2752df5c59a5f9dd2ff5d44c8babe7d1f9bde48931311c4a0f228298c46ec35f
 - source: nvidia-transformerengine
   path: tests/pytorch/attention/test_attention_backend_selection.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 351675d17a4fa6dabca0a0540c4b6c28ec6aa67bd9d78c207fee478a98d9ad90
 - source: nvidia-transformerengine-docs
   path: installation
@@ -49,16 +50,16 @@ sources:
   revision_kind: web-content-fingerprint
 - source: nvidia-transformerengine
   path: transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 81b878962638eb81c571a5930e2b856f82299a40b6e5fb0040df97d2a6a30c9e
 - source: nvidia-transformerengine
   path: tests/cpp/operator/test_swizzle.cu
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 3d9909e1dc3729afbf6667169bf9e89a26f1a982afd822b44dd82da881c18d59
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 33b698937e4b45d4b3dbbd62b647c1b8d5f6707729221c5d5be5901865f7b2f9
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/ops/basic/grouped_linear.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: eee951ca3e44e2569e87fb093dd9bd13278af19c5b5beff680023c0e71341143
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: d8a8dacdc5c192408a93258968e96dbd178a208b5e9c95ffcc44e5f3ed9e2823
 ---
 
 # TE 安装、运行、单测与 HCU 环境接入
@@ -89,14 +90,16 @@ sources:
 
 ## 来源与版本复核
 
+2026-11-04 的源码仍保留原安装和测试入口；新增的 `te_device_type()` 路由不等于所有设备后端已可用。`NVTE_CUDNN_MXFP8_NORM_OUTPUT_IN_INPUT_DTYPE` 仅在 cuDNN≥9.25 时允许归一化的虚拟输出沿用 FP16/BF16 输入类型，以匹配该融合 engine；默认仍为 FP32。它改变中间舍入点，应随实际 norm→量化→GEMM 数值验证，不能当无精度影响的安装开关。
+
 当前 grouped fusion 的旧环境门禁已改为 ops.GroupedLinear 显式 `split_alignment` 合同，单 grouped 参数也不再由旧环境变量授权；设备/recipe/native GroupedTensor 能力仍是独立门禁。升级时同时看[融合专题](../topics/fusion-and-profiling.md)与 [attention 选择条件](../topics/attention.md)，不能因旧变量消失就推断新路径无约束。测试存在和 host monkeypatch 选择测试都不替代实际 GPU 数值回归。
 
-- [nvidia-transformerengine: docs/installation.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/installation.rst)
-- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/envvars.rst)
-- [nvidia-transformerengine: setup.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/setup.py)
-- [nvidia-transformerengine: .gitmodules](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/.gitmodules)
-- [nvidia-transformerengine: tests/pytorch/test_numerics.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/test_numerics.py)
-- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/attention/test_attention_backend_selection.py)
+- [nvidia-transformerengine: docs/installation.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/installation.rst)
+- [nvidia-transformerengine: docs/envvars.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/envvars.rst)
+- [nvidia-transformerengine: setup.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/setup.py)
+- [nvidia-transformerengine: .gitmodules](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/.gitmodules)
+- [nvidia-transformerengine: tests/pytorch/test_numerics.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/tests/pytorch/test_numerics.py)
+- [nvidia-transformerengine: tests/pytorch/attention/test_attention_backend_selection.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/tests/pytorch/attention/test_attention_backend_selection.py)
 - [nvidia-transformerengine-docs: installation](https://docs.nvidia.com/deeplearning/transformer-engine/installation.html)
 - [nvidia-transformerengine-docs: environment-variables](https://docs.nvidia.com/deeplearning/transformer-engine/envvars.html)
 
@@ -108,9 +111,9 @@ sources:
 
 补充固定证据：
 
-- [transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh)
-- [tests/cpp/operator/test_swizzle.cu](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/cpp/operator/test_swizzle.cu)
+- [transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/common/cast/mxfp8/group_quantize_mxfp8.cuh)
+- [tests/cpp/operator/test_swizzle.cu](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/tests/cpp/operator/test_swizzle.cu)
 
 ## 本次补充的实现与测试依据
 
-- [nvidia-transformerengine: transformer_engine/pytorch/ops/basic/grouped_linear.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/ops/basic/grouped_linear.py)
+- [nvidia-transformerengine: transformer_engine/pytorch/ops/basic/grouped_linear.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/ops/basic/grouped_linear.py)

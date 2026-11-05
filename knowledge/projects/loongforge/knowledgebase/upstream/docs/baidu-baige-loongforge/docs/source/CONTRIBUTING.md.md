@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source/CONTRIBUTING.md
-raw_sha256: e63930dcedc409d94bf464bcce7cf398956297ee3af732ae291dfdac29b6c009
+raw_sha256: c19f67ca52e40b7008f13fea68b8a5fe0158c19287bb680e33cb4ffb531224fe
 sources: []
-generated_body_sha256: 294d6c08cd9fd2120adb3d41f2cf2a6425aa7a0c81c918217881ff22495c9a77
+generated_body_sha256: f871b20cf304c2e9a6b00640f453ea12ec4dcaa44fbebefaa94b6e23ececce49
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/CONTRIBUTING.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/CONTRIBUTING.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/CONTRIBUTING.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -65,7 +65,7 @@ LoongForge manages its dependencies using two strategies:
 |---|---|---|
 | **LoongForge** (this repo) | fork → PR | `baidu-baige/LoongForge` |
 | **Loong-Megatron** | fork → PR | `baidu-baige/Loong-Megatron` |
-| **TransformerEngine** | patch files | `patches/TransformerEngine_<tag>/` in LoongForge |
+| **TransformerEngine** | patch files | `third_party/patches/TransformerEngine_<tag>/` in LoongForge |
 
 ### Step 0 — Fork the repositories
 

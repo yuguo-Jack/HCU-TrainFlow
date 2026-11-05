@@ -9,41 +9,42 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source, official documentation and related PR reading; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/features_manager/memory/chunk_loss.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: 9e16aa4684213d3ef289d4662bad1123a08caae279e8052da4885f3d3755ab41
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/core/models/common/chunk_loss.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: bb31c1acb4fdd86af74798775ab902cdb179c23750f923797c8b14f41be0767c
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/features/chunkloss.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: c76c9ad4916cb19cde3ed2582a4919f3d4f4f23ed771aee455ec4ed46731dff1
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/train/trainer.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: 067ffa6493ca77d8d6252bff364d05becfd6d72feba7f8d0ebd49b7acdd17a67
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/models/common/modules.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: 722d3b3a59dd67e86477e15229557df0d682f3a358e7165ff9cea1adb742101b
 - source: ascend-mindspeed-llm
   path: mindspeed_llm/fsdp2/models/qwen3/qwen3.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: 6ef04e7c376283c2d85b22dd02a800f2af2e9287538cb23624452f0d1a8bc578
 - source: ascend-mindspeed-llm
   path: tests/mindspeed_llm/core/models/common/chunk_loss.py
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: bb31c1acb4fdd86af74798775ab902cdb179c23750f923797c8b14f41be0767c
 - source: ascend-mindspeed-llm
   path: docs/en/pytorch/features/mcore/chunk_loss.md
-  commit: 5a8ea03b12066067f39b1771782d12db236267ef
+  commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
   sha256: 26acb0165f63a2f1e2ceba20489ce5a87c716dd2243ee53e2b0634c0fc3f4d3e
+retrieved_on: '2026-11-04'
 ---
 
 # MindSpeed-LLM：ChunkLoss 的 Logit 显存、梯度与入口区别
@@ -76,15 +77,17 @@ FSDP2 trainer `_build_chunk_loss` 将预训练已 shift 的 labels 保持原位�
 
 回退普通 LMHead+CE 并保留数值基线/峰值代价；不能残留 loss_ctx 后又让 trainer 再计算一次 loss。修改两份ChunkLoss、model消费者、trainer normalization或feature参数时，同步复核[总览](../overview/engineering-guide.md)及对应单测，不把更新 MCore 文件算作 FSDP2已同步。
 
+2026-11-04 检索 LLM `f5f84bbbac05be79f883b30629d7f637e6f4649e`：两份 ChunkLoss、MCore feature、FSDP2 trainer / LMHead / Qwen3 与所引测试、文档字节均未变，保留两个入口的契约。特别复核 `_build_chunk_loss` 的共享有效 token 分母、`ChunkLoss.forward/backward` 的预计算梯度与 `LMHead.forward(loss_ctx)` 消费者；全忽略标签时 alpha 可为 0，现有除法未提供该边界的自动安全保证，调用方须拒绝或按既定零有效 token 契约处理。更换发布软件栈不等于这条数值链已重新验证。
+
 ## 固定证据与复核范围
 
-- [mindspeed_llm/features_manager/memory/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/features_manager/memory/chunk_loss.py)
-- [mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/core/models/common/chunk_loss.py)
-- [mindspeed_llm/fsdp2/features/chunkloss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/features/chunkloss.py)
-- [mindspeed_llm/fsdp2/train/trainer.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/train/trainer.py)
-- [mindspeed_llm/fsdp2/models/common/modules.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/models/common/modules.py)
-- [mindspeed_llm/fsdp2/models/qwen3/qwen3.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/mindspeed_llm/fsdp2/models/qwen3/qwen3.py)
-- [tests/mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/tests/mindspeed_llm/core/models/common/chunk_loss.py)
-- [docs/en/pytorch/features/mcore/chunk_loss.md](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/en/pytorch/features/mcore/chunk_loss.md)
+- [mindspeed_llm/features_manager/memory/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/features_manager/memory/chunk_loss.py)
+- [mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/core/models/common/chunk_loss.py)
+- [mindspeed_llm/fsdp2/features/chunkloss.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/fsdp2/features/chunkloss.py)
+- [mindspeed_llm/fsdp2/train/trainer.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/fsdp2/train/trainer.py)
+- [mindspeed_llm/fsdp2/models/common/modules.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/fsdp2/models/common/modules.py)
+- [mindspeed_llm/fsdp2/models/qwen3/qwen3.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/mindspeed_llm/fsdp2/models/qwen3/qwen3.py)
+- [tests/mindspeed_llm/core/models/common/chunk_loss.py](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/tests/mindspeed_llm/core/models/common/chunk_loss.py)
+- [docs/en/pytorch/features/mcore/chunk_loss.md](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/features/mcore/chunk_loss.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

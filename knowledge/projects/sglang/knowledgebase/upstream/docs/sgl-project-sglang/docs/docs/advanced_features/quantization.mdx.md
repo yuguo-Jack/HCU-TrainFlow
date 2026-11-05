@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/quantization.mdx
-raw_sha256: 5a441ededacf53981d794a3f164768e39770641459431e5370c4b071fa101b1e
+raw_sha256: 140b8ab1f46278836b8d55cd065880a5ad94608fc2432606791755681eb9027d
 sources: []
-generated_body_sha256: 32716f67d9084d6b646109440b6b85c28bc1e87138bd0022113ff054c8a8c05e
+generated_body_sha256: 3e524f341eb7a459da59a9f73059499f70b1c371a8ca9dba16b36e63de6825d6
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/quantization.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/quantization.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/quantization.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -288,6 +288,17 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 **`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM120); 4) AITER (AMD); 5) Triton (fallback).
 
 **MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
+
+**MXFP8 dense linear, HALOps (opt-in):** `--fp8-gemm-backend halops` routes MXFP8 (group-32) dense linear GEMM through [HALOps](https://github.com/PaddlePaddle/HALOps) w8a8 kernels on SM100. The package is published on PaddlePaddle's CUDA 13.2 package page rather than PyPI; the official Docker image installs it, and outside Docker install it explicitly:
+
+```bash Command
+uv pip install halops==0.1.0 \
+  -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+```
+
+The wheel is cp312 Linux only (x86_64 and aarch64); selecting the backend without it raises an install hint.
+
+Both quantization paths work: `--quantization mxfp8` on a BF16 checkpoint (quantized at load), and a pre-quantized MXFP8 checkpoint, whose uint8 UE8M0 weight scales are used as they are.
 
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 

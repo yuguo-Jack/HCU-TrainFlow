@@ -1,0 +1,513 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "bc660225219162a72116ce8b0aaf89665392d76b944d6a2b29b176344805e2e5",
+      "isPrivate": false,
+      "numbers": [
+        5733,
+        5732,
+        5731,
+        5730,
+        5729,
+        5728,
+        5727,
+        5726
+      ],
+      "observed_at": "2026-11-04T18:24:40.599750+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4851,
+        "resetAt": "2026-11-04T18:59:40Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "c3093f782aec620fdc6887887fe366917abbc057",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\n**TLDR:** `gdn_split_in_proj` now compiles twice under the same region name, with Inductor options picked by whether a backward runs. Training: the backward writes each gradient into its slice instead of one masked kernel, GDN layer fwd+bwd -3.7% (Qwen3.5-27B TP2, 16k and 32k tokens). Inference: the four output copies become one kernel, generator GDN layer -3.5 to -4.3 us at decode. Bitwise.\n\n```text\n                 stack today (one compile)              this PR\ntraining fwd     4 kernels, runs twice (remat)          2 kernels, runs twice (remat)\ntraining bwd     1 masked kernel: 6-input cat           1 kernel, one copy per gradient slice\ninference        4 kernels: q|k|v cat, a, b, gate       1 combo kernel\n```\n\n**Problem**\n1. **The split.** `_split_in_proj` (5/7) copies `in_proj`'s output, grouped by key head, into `mixed_qkv_TC`, `a_TH`, `b_TH` and `gate_THV`, inside the `gdn_split_in_proj` region.\n2. **Backward.** Autograd cats six gradients (q, k, v, z, a, b) back into the grouped layout. Inductor lowers that cat as one kernel that picks a source per element: 237 us at 27B TP2 16k.\n3. **Remat.** The split is bare ops outside any remat region, so its forward runs again in backward.\n4. **Forward cat.** Its masked q|k|v cat is slow at large T too.\n5. **Generator.** At decode the four copies are four launches of ~1.5-2 us each.\n6. **Cost.** 571 us of a 6190 us 27B TP2 GDN layer at 16k (9.2%); 7.1 us of a 47.1 us 27B TP4 decode-64 layer.\n\n**Solution**\n1. **Two compiles, one region name.** `_split_in_proj_with_grad` and `_split_in_proj_no_grad` wrap the unchanged body, renamed `_split_grouped_in_proj` (a mechanical rename). Two functions, so each gets its own graph cache and recompile limit.\n2. **Training options.** `max_pointwise_cat_inputs=0` and `max_complex_pointwise_cat_inputs=0` make Inductor copy each piece into its slice (the knobs `fused_binary_activation` already sets for its backward stack); `combo_kernels=True` launches the remaining copies together.\n3. **Inference options.** `combo_kernels=True` only: per-input cat copies would add launches, which dominate at decode sizes.\n4. **The pick.** `_split_in_proj` (still the `local_map` boundary) calls the training compile when `projected_TC.requires_grad`. Remat's recompute runs with grad, so it reuses the training compile.\n5. **Unchanged:** the region name, the Qwen3.5 configs that enable it, outputs and gradients (the split only moves data).\n\n**Results**\n```text\nNumerics: bitwise identical. Trainer: x grad and all 9 parameter grads equal the stack's region at every T, in every\n          process. Generator: layer output, SSM and conv state equal, eager call and one CUDA-graph replay, every cell.\n\nOne GDN layer at per-GPU dims (GDN module, no TP collectives), GB300, median of 3 fresh processes; before = this\nstack's region (6/7), after = this PR, paired in the same process.\ntrainer fwd+bwd, FullActivationRematConfig (the 27B and 35B-A3B RL recipes), 4k-token documents, us\nmodel          T     before     after      delta (median of per-process paired deltas)\n27B TP2        16k   6190.3     5963.5     -226.8 (-3.7%)   CUDA graphs\n               32k   12113.5    11663.4    -444.4 (-3.7%)   CUDA graphs\n               4k    3345.5     3263.3     -82.2  (-2.5%)   kernel sum (graph capture failed in this harness at 4k)\n35B-A3B TP2    16k   2902.8     2828.3     -76.0  (-2.6%)   CUDA graphs\n               32k   5041.7     4922.4     -115.7 (-2.3%)   CUDA graphs\n               4k    2281.7     2248.8     -36.3  (-1.6%)   kernel sum\nnormal launch (host-bound in this one-layer harness): 27B 16k / 32k -499 / -452 us, 35B -437 / -239 us\n\ngenerator (VLLMInnerGDN), vLLM capture order, CUDA graphs, L2 flushed, 20 rotated blocks of 40 replays, us\nmodel          shape                       before   after    delta (median of paired deltas)\n27B TP4        decode 64                   47.08    43.19    -3.92\n               decode 256                  96.00    92.01    -4.04\n               prefill 1 x 2048            219.68   208.28   -11.24  (split kernels alone: -4.9)\n               mixed 61 decodes + 4 chunks 216.63   212.51   -4.04\n35B-A3B TP2    decode 64                   47.28    43.95    -3.48\n               decode 256                  113.07   108.80   -4.30\n               prefill 1 x 2048            202.78   190.00   -12.77  (split kernels alone: -6.2)\n               mixed 61 decodes + 4 chunks 215.00   208.51   -6.58\n\nper step (from the layer numbers, not run end to end):\n27B: 48 GDN layers -> -10.9 ms per 16k microbatch fwd+bwd, -21.3 ms per 32k\n27B TP4 decode 64: 48 x 3.9 us = -0.19 ms of a 7.76 ms step (2.4%; that step measured on an earlier 5/7 head)\n\ngraphs per compile (limit 8): generator, capture sizes 2048 then 1024 .. 1: no_grad 3 (stack today: 3)\ntrainer, 4k + 16k + 32k + a no_grad pass at each: with_grad 2 + no_grad 2 (stack today: 3 in one compile)\npeak memory: same within 1 MB\n\nbaselines, 27B TP2 trainer layer at 16k / 32k (CUDA graphs): eager 7692.5 / 15089.7 us, per-layer torch.compile 6179.0 / 12197.5 us\nthe split alone, 27B TP2 16k: 571 -> 349 us (ideal ~228 us at HBM bandwidth)\n```\n\nYou may ask:\n- Why not one option dict for both? It keeps the whole trainer win in a 3-line diff. But the cat limits make the inference split 2 kernels instead of 1: 1.5-2 us/layer slower at decode than `combo_kernels` alone (27B decode 64 split kernels: 3.84 vs 1.99 us, 1 process), ~0.09 ms (1.1%) of the 7.76 ms decode-64 step; at 35B prefill the two tie. The second compile buys that 1.1%.\n- Why not `combo_kernels` alone? Training is unchanged with it (27B 16k 6164 vs 6166 us, 1 process): the backward cat stays one masked kernel.\n- Why not compile one function twice? It works, but both option sets would share one 8-graph limit and the dynamic-shape state, with a recompile (`BACKEND_MATCH`) on each set's first call. Two thin wrappers keep them apart, as the `rope` region already does (`rope.py:197`, `:390`).\n- Why not cat limits at 3 (the forward's 3-input cat stays masked, the backward's 6-input cat becomes copies)? The masked forward cat is the slow one at large T; it would give up ~130 of the 227 us at 27B 16k (estimate from the per-kernel split, not run).\n\nNOTE: of the GPU tests below, only the new test and the regions-on engine run compile the split (the others clear the regions). Not run: an RL step end to end, the trainer at 64k tokens, TP > 1 timing (per-GPU shapes at TP1), CP. Cold compile time is not measured at model scale; the test compiles both copies in 7.0 s cold vs 4.6 s warm. At prefill 1 x 2048 the layer delta is about twice the split kernels' delta; the rest is unattributed. TP2 smokes (3 steps, regions on, and with spmd typechecking) exit 0. Who reaches it: every Qwen3.5 / 3.6 config that keeps the model's regions (alphabet_sort 9B varlen and 27B perf, terminal-bench 9B and 35B-A3B); batch-invariant recipes clear the regions.\n\n**Test plan**\n- New `tests/unit_tests/gpu/models/common/test_gdn.py::test_split_in_proj_compiles_per_grad_mode` (27B layout and one value head per key head; T = 64, 37, 1: the static, dynamic and specialized graphs): no_grad builds 1 Triton kernel; the training backward builds only per-slice copy (`triton_for_*`) kernels; outputs and the input grad equal the eager body. With combo removed from the no_grad copy it fails; an adapted copy also failed on 6/7 (`[4] == [1]`) and with the cat limits removed or the requires_grad pick inverted.\n- GB300, Qwen3.5-0.8B-Base: GDN GPU tests 33 passed; 2-GPU parity 4 passed on both ranks (a batch-invariant config, so regions are off: it covers the eager path only); the eager/FULL vLLM engine test (`test_gdn_cudagraph.py`) with `gdn_split_in_proj` on instead of `regions = []`: 4 passed (FULL capture, eager vs FULL bitwise); RL CPU suite 504 passed, 2 failed (the known dapo_math env failures); core CPU tests next to the module: same 6 failures as the stack. pre-commit (pyrefly included) clean.\n\n```bash\nTORCHTITAN_QWEN3_5_0_8B_HF_PATH=<Qwen3.5-0.8B-Base> pytest tests/unit_tests/gpu/models/common/test_gdn.py \\\n  tests/rl/unit_tests/gpu/test_gdn_graph_metadata.py tests/rl/unit_tests/gpu/test_gdn_cudagraph.py \\\n  tests/unit_tests/gpu/models/qwen3_5/test_qwen3_5_deltanet.py\ntorchrun --nproc_per_node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen\n```\n\n**Stack** (land in order): 1/7 fused gate -> 2/7 metadata reuse -> 3/7 no output memset/copy -> 4/7 decode routing -> 5/7 fused input projections -> 6/7 float32 gate parameters -> 7/7 split compiled per grad mode.\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: 7/7 of the GDN stack, on #5691: `gdn_split_in_proj` compiled per grad mode (cat limits 0 + combo kernels with a backward, combo kernels without). Trainer GDN layer -2.3 to -3.7%, generator GDN layer -3.5 to -12.8 us per layer, bitwise. Followed our local-compile method (3 fresh processes, with and without CUDA graphs, graph budget, eager parity); two internal reviews applied.\n\n@claude please review.",
+            "createdAt": "2026-11-02T04:36:34Z",
+            "databaseId": 6569170606,
+            "updatedAt": "2026-11-02T04:36:34Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6569170606"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 2m 7s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41389426016)\n\n---\n**Approve -- please address the items before merging** (human-written summary is empty; minor test hardening). See the [review](https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview). A maintainer still needs to review.",
+            "createdAt": "2026-11-02T04:36:55Z",
+            "databaseId": 6569175003,
+            "updatedAt": "2026-11-02T04:39:25Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6569175003"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: Addressed the review in 373ff98a7 (merged up as 63138b462 after 1/7 and 2/7 landed).\n\n- Must fix 1, human-written summary: that section is for the author; I do not fill it.\n- test_gdn.py:58 and :12: done (replies inline). The same commit fixes the CI failure on this PR: the torch nightly writes Triton kernels as plain `def triton_...(`, so the kernel regex now matches that form too. It also makes the 37-token case compile the dynamic graph it claims to test (`run_and_get_code` reset Dynamo every call).\n- test_gdn.py:76 (codegen-detail patterns): agreed. That is what just happened with the regex; it was fixed, not dropped.\n\n@claude please re-review.",
+            "createdAt": "2026-11-02T05:54:36Z",
+            "databaseId": 6570177909,
+            "updatedAt": "2026-11-02T05:54:36Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6570177909"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 1m 46s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41396735936)\n\n---\n**Approve -- please address the item before merging.** Both test findings are fixed; the human-written summary, which only the PR author can write, is still empty. See the [review](https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview). A maintainer still needs to review.",
+            "createdAt": "2026-11-02T05:55:00Z",
+            "databaseId": 6570182987,
+            "updatedAt": "2026-11-02T05:57:07Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6570182987"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYedCUs=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "ea0d887369a366bee556173ab05a6a0ef593efba",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": {
+        "oid": "cfef1691d0a68b7e9ec7b84bf37ef637c27fbd22"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-03T03:19:36Z",
+      "number": 5731,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve -- please address the items below before merging.** The design is a small, local Inductor tuning of one data-movement region, and the measurements back it up. The one thing that blocks merging is the empty human-written summary. A maintainer still needs to review, since this touches `models/common/`.\n\n**What this PR does.** The `gdn_split_in_proj` region was one `local_compile` with default options. It becomes two thin wrappers under the same region name, and `_split_in_proj` (still the `local_map` boundary) chooses between them with `projected_TC.requires_grad`. The training copy turns off Inductor's pointwise-cat fusion and turns on `combo_kernels`, so the backward's six-gradient cat becomes per-slice copies instead of one masked kernel. The no-grad copy turns on `combo_kernels` only, so the generator's four outputs come from one launch. The split body is renamed to `_split_grouped_in_proj` without other changes.\n\n**Example.**\n```text\ntrainer, in_proj requires grad:  projected_TC.requires_grad=True  -> _split_in_proj_with_grad\n  bwd before: 1 masked kernel choosing among the dq|dk|dv|dz|da|db sources per element\n  bwd after:  triton_for_* kernels, one copy per gradient slice\nremat recompute (runs with grad) -> same with_grad compile, no extra graphs\ngenerator / no_grad / frozen in_proj: requires_grad=False -> _split_in_proj_no_grad\n  before: 4 kernels (q|k|v cat, a, b, gate)    after: 1 combo kernel\n```\nI picked `requires_grad` as the predicate over `torch.is_grad_enabled()` on purpose. With grad enabled but a frozen `in_proj` and an input that doesn't require grad, no backward runs through the split, so the no-grad options are the right choice there.\n\n### Must fix\n1. PR description -- the \"Summary (human-written)\" section is empty. Per `CONTRIBUTING.md`, the author has to fill it in before merge.\n\n### Should consider\n- `tests/unit_tests/gpu/models/common/test_gdn.py:58` -- if nothing compiles in a call (a cache hit), `codes` is empty and both kernel-structure assertions pass while checking nothing. Assert on the number of returned codes (inline comment).\n- `tests/unit_tests/gpu/models/common/test_gdn.py:12` -- `importorskip(\"attn_gym\")` guards a package that `requirements.txt` already pins. Delete it (inline comment).\n- `tests/unit_tests/gpu/models/common/test_gdn.py:76` -- the `triton_for_` prefix and the `async_compile.triton` line format are Inductor codegen details. A PyTorch bump that renames them would fail this test with no real regression behind it. That cost is probably acceptable, because the test is the only thing guarding the kernel structure the perf win depends on. If it does break, fix the pattern; don't drop the test.\n\n<details><summary>Details</summary>\n\n- **Gate.** The problem is real and measured: 571 us of a 6190 us 27B TP2 GDN layer, plus 4 decode launches. Inductor options are the right layer. The same cat limits are already used in `activation.py:37`, `rope.py:202` and `deepseek_v3/attention.py:164`, so this follows an existing pattern rather than working around an upstream bug. This is the first use of `combo_kernels` in the repo, so I'd want a maintainer to take a look at that. The split is pure data movement, so `batch_invariant=True` and the bitwise claim are both plausible.\n- **Two wrappers vs one option dict.** The description explains why: a separate graph cache and recompile limit per mode, and about 1.1% of a decode-64 step. Adding per-grad-mode options to `local_compile` would mean bending shared code for one consumer, so the ~20 lines of duplicated decorator are the better trade.\n- **Parallelism.** The `local_map` boundary and its in/out types are unchanged, and the branch runs on rank-local tensors. `requires_grad` is the same on every TP/CP rank, so ranks can't take different compiles. Under remat, `remat.recompute_needs_tensor(projected_TC)` (`gdn.py:640`) keeps the recompute on a grad-requiring input, which sends it to the training compile.\n- **Callers.** `gdn.py:642` and the CPU test `tests/unit_tests/cpu/models/common/test_gdn.py:24` still call `_split_in_proj`. The CPU test exercises the eager path through the new dispatch.\n\n</details>\n\nNot verified: the timings, the bitwise parity and the kernel counts (needs a GPU run). Also not verified: whether `run_and_get_code` returns code on an Inductor FX-graph cache hit; I couldn't run Python in this environment.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "These kernel assertions pass trivially if nothing compiles. `run_and_get_code` and `run_fw_bw_and_get_code` only return code for graphs that are actually compiled during the call. On a cache hit (say a later Dynamo change stops recompiling at T=37 or T=1), `codes` is empty: `all(...)` over an empty list is `True`, and `codes[1:]` at line 74 is empty too, so the loop never runs. Both kernel-structure checks would still pass while checking nothing. Asserting the count makes the test fail loudly instead:\n\n```suggestion\n        assert codes and all(len(_triton_kernels(code)) == 1 for code in codes), num_tokens\n```\nand before the backward loop: `assert len(codes) >= 2, num_tokens`.",
+                  "createdAt": "2026-11-02T04:38:46Z",
+                  "databaseId": 4438952834,
+                  "diffHunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")\n+\n+from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention.gdn import (\n+    _split_grouped_in_proj,\n+    _split_in_proj,\n+)\n+\n+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+\n+# Per key head: [q | k | v | z | a | b]. 27B at TP4: 3 value heads per key head;\n+# 0.8B / 2B: 1 value head per key head. Both with 4 key heads.\n+SPLIT_SIZES = {\n+    \"three_value_heads\": [128, 128, 384, 384, 3, 3],\n+    \"one_value_head\": [128, 128, 128, 128, 1, 1],\n+}\n+\n+\n+def _triton_kernels(code: str) -> list[str]:\n+    return re.findall(r\"^(triton_\\w+) = async_compile\\.triton\", code, re.MULTILINE)\n+\n+\n+@pytest.fixture\n+def split_region():\n+    LocalCompileConfig(regions=[\"gdn_split_in_proj\"]).apply()\n+    yield\n+    LocalCompileConfig().apply()\n+    torch._dynamo.reset()\n+\n+\n+@pytest.mark.parametrize(\"split_sizes\", SPLIT_SIZES.values(), ids=SPLIT_SIZES.keys())\n+def test_split_in_proj_compiles_per_grad_mode(split_region, split_sizes) -> None:\n+    # 64 compiles a static graph, 37 the dynamic one, 1 a specialized one.\n+    for num_tokens in (64, 37, 1):\n+        projected_TC = torch.randn(\n+            num_tokens, 4 * sum(split_sizes), device=\"cuda\", dtype=torch.bfloat16\n+        )\n+        expected = _split_grouped_in_proj(projected_TC, split_sizes, 128)\n+\n+        # Inference: one combo kernel writes all four outputs.\n+        with torch.no_grad():\n+            outputs, codes = run_and_get_code(\n+                _split_in_proj, projected_TC, split_sizes, 128\n+            )\n+        assert all(len(_triton_kernels(code)) == 1 for code in codes), num_tokens",
+                  "line": null,
+                  "originalLine": 58,
+                  "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+                  "updatedAt": "2026-11-02T04:39:09Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4438952834"
+                },
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "`attn-gym[linear,cudnn]==0.0.17` is pinned in `requirements.txt`, so this skip should never fire. If it ever did, it would hide a broken install instead of failing (`rules/tests.md`: don't guard tests on packages the repo already requires). The CPU sibling at `tests/unit_tests/cpu/models/common/test_gdn.py:10` does the same thing, but this file is new, so it doesn't need to copy that. Suggest deleting this line.",
+                  "createdAt": "2026-11-02T04:38:50Z",
+                  "databaseId": 4438953098,
+                  "diffHunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")",
+                  "line": null,
+                  "originalLine": 12,
+                  "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+                  "updatedAt": "2026-11-02T04:39:09Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4438953098"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQwNDozODo1MFrPAAAAAQiVDIo=",
+                "hasNextPage": false
+              },
+              "totalCount": 2
+            },
+            "databaseId": 5732138367,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-02T04:39:09Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732138367"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: Done in 373ff98a7. The checks are now exact: `[len(_triton_kernels(code)) for code in codes] == [1]` for inference and `len(codes) == 2` (forward, backward) for training. A cache hit would not have emptied `codes` (the FX-graph cache path still calls `save_output_code`, torch/_inductor/codecache.py:2205), but a Dynamo guard hit would have, so the asserts stay.\n\nTwo more fixes in the same commit:\n1. `run_and_get_code` calls `torch._dynamo.reset()` before every call, which also clears automatic-dynamic state. So the 37-token case compiled a static graph, not the dynamic one the comment claimed. The test now captures code without the reset (`_run_and_get_code_no_reset`); 37 tokens now compile a symbolic graph in no_grad, forward and backward.\n2. CI's torch nightly (2.16.0.dev20261101) writes each Triton kernel as a plain `def triton_...(` instead of `X = async_compile.triton(`, so the old regex found no kernels and \"1 GPU Unit Tests\" failed (run 41389352593). The regex is now `^def (triton_\\w+)\\(`, which matches both forms.\n\nGPU check, caches off: 2 passed in each codegen form; turning off `combo_kernels` for no_grad, or setting `max_pointwise_cat_inputs=8` for the training copy, fails both cases.",
+                  "createdAt": "2026-11-02T05:54:27Z",
+                  "databaseId": 4439311164,
+                  "diffHunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")\n+\n+from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention.gdn import (\n+    _split_grouped_in_proj,\n+    _split_in_proj,\n+)\n+\n+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+\n+# Per key head: [q | k | v | z | a | b]. 27B at TP4: 3 value heads per key head;\n+# 0.8B / 2B: 1 value head per key head. Both with 4 key heads.\n+SPLIT_SIZES = {\n+    \"three_value_heads\": [128, 128, 384, 384, 3, 3],\n+    \"one_value_head\": [128, 128, 128, 128, 1, 1],\n+}\n+\n+\n+def _triton_kernels(code: str) -> list[str]:\n+    return re.findall(r\"^(triton_\\w+) = async_compile\\.triton\", code, re.MULTILINE)\n+\n+\n+@pytest.fixture\n+def split_region():\n+    LocalCompileConfig(regions=[\"gdn_split_in_proj\"]).apply()\n+    yield\n+    LocalCompileConfig().apply()\n+    torch._dynamo.reset()\n+\n+\n+@pytest.mark.parametrize(\"split_sizes\", SPLIT_SIZES.values(), ids=SPLIT_SIZES.keys())\n+def test_split_in_proj_compiles_per_grad_mode(split_region, split_sizes) -> None:\n+    # 64 compiles a static graph, 37 the dynamic one, 1 a specialized one.\n+    for num_tokens in (64, 37, 1):\n+        projected_TC = torch.randn(\n+            num_tokens, 4 * sum(split_sizes), device=\"cuda\", dtype=torch.bfloat16\n+        )\n+        expected = _split_grouped_in_proj(projected_TC, split_sizes, 128)\n+\n+        # Inference: one combo kernel writes all four outputs.\n+        with torch.no_grad():\n+            outputs, codes = run_and_get_code(\n+                _split_in_proj, projected_TC, split_sizes, 128\n+            )\n+        assert all(len(_triton_kernels(code)) == 1 for code in codes), num_tokens",
+                  "line": null,
+                  "originalLine": 58,
+                  "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+                  "updatedAt": "2026-11-02T05:54:27Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4439311164"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQwNTo1NDoyN1rPAAAAAQiagzw=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5732588186,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-02T05:54:27Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732588186"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: Done in 373ff98a7: removed. `attn-gym` is pinned in requirements.txt:13, and the split path never calls it.",
+                  "createdAt": "2026-11-02T05:54:29Z",
+                  "databaseId": 4439311357,
+                  "diffHunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")",
+                  "line": null,
+                  "originalLine": 12,
+                  "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+                  "updatedAt": "2026-11-02T05:54:29Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4439311357"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQwNTo1NDoyOVrPAAAAAQiag_0=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5732588438,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-02T05:54:29Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732588438"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve -- please address the item below before merging.** Both test findings from the last review are fixed at HEAD, and the new commit doesn't add any problems. The only open item is the human-written summary. A maintainer still needs to review, since this touches `models/common/`.\n\n**What changed since the last review (373ff98, merged up as 63138b4).** The `gdn.py` code is unchanged. The test now captures the generated code without resetting Dynamo, and the kernel regex matches the `def triton_...(` form that the nightly emits.\n\n**Example.**\n```text\nbefore: run_and_get_code -> torch._dynamo.reset() before each call\n        T=37 -> compiles a fresh static graph (the comment said \"dynamic\")\nafter:  _run_and_get_code_no_reset patches GraphLowering.save_output_code only\n        T=64 static -> T=37 sees the earlier compile -> symbolic graph -> T=1 specialized\n        no_grad: [1 kernel] exactly;  training: exactly 2 codes (fwd, bwd), bwd all triton_for_*\n```\n\n### Earlier items\n- Resolved: `test_gdn.py:58`, the empty-`codes` pass. Inference now asserts `== [1]` and training asserts `len(codes) == 2`, so a Dynamo guard hit can't pass silently.\n- Resolved: `test_gdn.py:12`, the `importorskip(\"attn_gym\")` call. It's removed.\n- Resolved: the codegen-pattern fragility point. The regex was fixed for the nightly format, not dropped.\n\n### Must fix\n1. PR description -- the \"Summary (human-written)\" section is **still open**. The reply is right that an agent shouldn't fill it in. It is the PR author's job (@felipemello1), and it still has to be written before merge (`CONTRIBUTING.md`, \"AI-assisted contributions\").\n\n<details><summary>Details</summary>\n\n- `_run_and_get_code_no_reset` patches `GraphLowering.save_output_code`, a private Inductor method. Upstream `run_and_get_code` patches the same hook, so this adds no new private surface beyond what the test already relied on. It's test-only, so it needs no TODO.\n- The fixture now calls `torch._dynamo.reset()` before setting up the region too. That keeps the two parametrized cases independent: the second case's T=64 compiles a static graph instead of picking up the first case's automatic-dynamic state.\n- Minor: with `len(codes) == 2` asserted, `for backward_code in codes[1:]` always runs exactly once on `codes[1]`. Indexing directly would be slightly clearer. Not blocking.\n- No changes to `gdn.py` since the last review. The earlier analysis still applies: `requires_grad` is the same on every TP/CP rank, remat recompute goes to the training compile, and the `local_map` types are unchanged.\n\n</details>\n\nNot verified: the GPU test results, and that the 37-token call now compiles a symbolic graph. Torch isn't installed in this environment.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5732601193,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-02T05:56:54Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732601193"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "tianyu-l"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5732637997,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-02T06:02:22Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732637997"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wMlQwNjowMjoyMlq0MjAyNi0xMS0wMlQwNjowMjoyMlrPAAAAAVWxHS0=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "MERGED",
+      "title": "[rl][models] GDN: compile the in_proj split per grad mode (7/7)",
+      "updatedAt": "2026-11-03T03:19:37Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5731"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "c3093f782aec620fdc6887887fe366917abbc057"
+    },
+    "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\n**TLDR:** `gdn_split_in_proj` now compiles twice under the same region name, with Inductor options picked by whether a backward runs. Training: the backward writes each gradient into its slice instead of one masked kernel, GDN layer fwd+bwd -3.7% (Qwen3.5-27B TP2, 16k and 32k tokens). Inference: the four output copies become one kernel, generator GDN layer -3.5 to -4.3 us at decode. Bitwise.\n\n```text\n                 stack today (one compile)              this PR\ntraining fwd     4 kernels, runs twice (remat)          2 kernels, runs twice (remat)\ntraining bwd     1 masked kernel: 6-input cat           1 kernel, one copy per gradient slice\ninference        4 kernels: q|k|v cat, a, b, gate       1 combo kernel\n```\n\n**Problem**\n1. **The split.** `_split_in_proj` (5/7) copies `in_proj`'s output, grouped by key head, into `mixed_qkv_TC`, `a_TH`, `b_TH` and `gate_THV`, inside the `gdn_split_in_proj` region.\n2. **Backward.** Autograd cats six gradients (q, k, v, z, a, b) back into the grouped layout. Inductor lowers that cat as one kernel that picks a source per element: 237 us at 27B TP2 16k.\n3. **Remat.** The split is bare ops outside any remat region, so its forward runs again in backward.\n4. **Forward cat.** Its masked q|k|v cat is slow at large T too.\n5. **Generator.** At decode the four copies are four launches of ~1.5-2 us each.\n6. **Cost.** 571 us of a 6190 us 27B TP2 GDN layer at 16k (9.2%); 7.1 us of a 47.1 us 27B TP4 decode-64 layer.\n\n**Solution**\n1. **Two compiles, one region name.** `_split_in_proj_with_grad` and `_split_in_proj_no_grad` wrap the unchanged body, renamed `_split_grouped_in_proj` (a mechanical rename). Two functions, so each gets its own graph cache and recompile limit.\n2. **Training options.** `max_pointwise_cat_inputs=0` and `max_complex_pointwise_cat_inputs=0` make Inductor copy each piece into its slice (the knobs `fused_binary_activation` already sets for its backward stack); `combo_kernels=True` launches the remaining copies together.\n3. **Inference options.** `combo_kernels=True` only: per-input cat copies would add launches, which dominate at decode sizes.\n4. **The pick.** `_split_in_proj` (still the `local_map` boundary) calls the training compile when `projected_TC.requires_grad`. Remat's recompute runs with grad, so it reuses the training compile.\n5. **Unchanged:** the region name, the Qwen3.5 configs that enable it, outputs and gradients (the split only moves data).\n\n**Results**\n```text\nNumerics: bitwise identical. Trainer: x grad and all 9 parameter grads equal the stack's region at every T, in every\n          process. Generator: layer output, SSM and conv state equal, eager call and one CUDA-graph replay, every cell.\n\nOne GDN layer at per-GPU dims (GDN module, no TP collectives), GB300, median of 3 fresh processes; before = this\nstack's region (6/7), after = this PR, paired in the same process.\ntrainer fwd+bwd, FullActivationRematConfig (the 27B and 35B-A3B RL recipes), 4k-token documents, us\nmodel          T     before     after      delta (median of per-process paired deltas)\n27B TP2        16k   6190.3     5963.5     -226.8 (-3.7%)   CUDA graphs\n               32k   12113.5    11663.4    -444.4 (-3.7%)   CUDA graphs\n               4k    3345.5     3263.3     -82.2  (-2.5%)   kernel sum (graph capture failed in this harness at 4k)\n35B-A3B TP2    16k   2902.8     2828.3     -76.0  (-2.6%)   CUDA graphs\n               32k   5041.7     4922.4     -115.7 (-2.3%)   CUDA graphs\n               4k    2281.7     2248.8     -36.3  (-1.6%)   kernel sum\nnormal launch (host-bound in this one-layer harness): 27B 16k / 32k -499 / -452 us, 35B -437 / -239 us\n\ngenerator (VLLMInnerGDN), vLLM capture order, CUDA graphs, L2 flushed, 20 rotated blocks of 40 replays, us\nmodel          shape                       before   after    delta (median of paired deltas)\n27B TP4        decode 64                   47.08    43.19    -3.92\n               decode 256                  96.00    92.01    -4.04\n               prefill 1 x 2048            219.68   208.28   -11.24  (split kernels alone: -4.9)\n               mixed 61 decodes + 4 chunks 216.63   212.51   -4.04\n35B-A3B TP2    decode 64                   47.28    43.95    -3.48\n               decode 256                  113.07   108.80   -4.30\n               prefill 1 x 2048            202.78   190.00   -12.77  (split kernels alone: -6.2)\n               mixed 61 decodes + 4 chunks 215.00   208.51   -6.58\n\nper step (from the layer numbers, not run end to end):\n27B: 48 GDN layers -> -10.9 ms per 16k microbatch fwd+bwd, -21.3 ms per 32k\n27B TP4 decode 64: 48 x 3.9 us = -0.19 ms of a 7.76 ms step (2.4%; that step measured on an earlier 5/7 head)\n\ngraphs per compile (limit 8): generator, capture sizes 2048 then 1024 .. 1: no_grad 3 (stack today: 3)\ntrainer, 4k + 16k + 32k + a no_grad pass at each: with_grad 2 + no_grad 2 (stack today: 3 in one compile)\npeak memory: same within 1 MB\n\nbaselines, 27B TP2 trainer layer at 16k / 32k (CUDA graphs): eager 7692.5 / 15089.7 us, per-layer torch.compile 6179.0 / 12197.5 us\nthe split alone, 27B TP2 16k: 571 -> 349 us (ideal ~228 us at HBM bandwidth)\n```\n\nYou may ask:\n- Why not one option dict for both? It keeps the whole trainer win in a 3-line diff. But the cat limits make the inference split 2 kernels instead of 1: 1.5-2 us/layer slower at decode than `combo_kernels` alone (27B decode 64 split kernels: 3.84 vs 1.99 us, 1 process), ~0.09 ms (1.1%) of the 7.76 ms decode-64 step; at 35B prefill the two tie. The second compile buys that 1.1%.\n- Why not `combo_kernels` alone? Training is unchanged with it (27B 16k 6164 vs 6166 us, 1 process): the backward cat stays one masked kernel.\n- Why not compile one function twice? It works, but both option sets would share one 8-graph limit and the dynamic-shape state, with a recompile (`BACKEND_MATCH`) on each set's first call. Two thin wrappers keep them apart, as the `rope` region already does (`rope.py:197`, `:390`).\n- Why not cat limits at 3 (the forward's 3-input cat stays masked, the backward's 6-input cat becomes copies)? The masked forward cat is the slow one at large T; it would give up ~130 of the 227 us at 27B 16k (estimate from the per-kernel split, not run).\n\nNOTE: of the GPU tests below, only the new test and the regions-on engine run compile the split (the others clear the regions). Not run: an RL step end to end, the trainer at 64k tokens, TP > 1 timing (per-GPU shapes at TP1), CP. Cold compile time is not measured at model scale; the test compiles both copies in 7.0 s cold vs 4.6 s warm. At prefill 1 x 2048 the layer delta is about twice the split kernels' delta; the rest is unattributed. TP2 smokes (3 steps, regions on, and with spmd typechecking) exit 0. Who reaches it: every Qwen3.5 / 3.6 config that keeps the model's regions (alphabet_sort 9B varlen and 27B perf, terminal-bench 9B and 35B-A3B); batch-invariant recipes clear the regions.\n\n**Test plan**\n- New `tests/unit_tests/gpu/models/common/test_gdn.py::test_split_in_proj_compiles_per_grad_mode` (27B layout and one value head per key head; T = 64, 37, 1: the static, dynamic and specialized graphs): no_grad builds 1 Triton kernel; the training backward builds only per-slice copy (`triton_for_*`) kernels; outputs and the input grad equal the eager body. With combo removed from the no_grad copy it fails; an adapted copy also failed on 6/7 (`[4] == [1]`) and with the cat limits removed or the requires_grad pick inverted.\n- GB300, Qwen3.5-0.8B-Base: GDN GPU tests 33 passed; 2-GPU parity 4 passed on both ranks (a batch-invariant config, so regions are off: it covers the eager path only); the eager/FULL vLLM engine test (`test_gdn_cudagraph.py`) with `gdn_split_in_proj` on instead of `regions = []`: 4 passed (FULL capture, eager vs FULL bitwise); RL CPU suite 504 passed, 2 failed (the known dapo_math env failures); core CPU tests next to the module: same 6 failures as the stack. pre-commit (pyrefly included) clean.\n\n```bash\nTORCHTITAN_QWEN3_5_0_8B_HF_PATH=<Qwen3.5-0.8B-Base> pytest tests/unit_tests/gpu/models/common/test_gdn.py \\\n  tests/rl/unit_tests/gpu/test_gdn_graph_metadata.py tests/rl/unit_tests/gpu/test_gdn_cudagraph.py \\\n  tests/unit_tests/gpu/models/qwen3_5/test_qwen3_5_deltanet.py\ntorchrun --nproc_per_node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen\n```\n\n**Stack** (land in order): 1/7 fused gate -> 2/7 metadata reuse -> 3/7 no output memset/copy -> 4/7 decode routing -> 5/7 fused input projections -> 6/7 float32 gate parameters -> 7/7 split compiled per grad mode.\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "ea0d887369a366bee556173ab05a6a0ef593efba"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5731",
+    "merge_commit_sha": "cfef1691d0a68b7e9ec7b84bf37ef637c27fbd22",
+    "merged": true,
+    "merged_at": "2026-11-03T03:19:36Z",
+    "number": 5731,
+    "state": "closed",
+    "title": "[rl][models] GDN: compile the in_proj split per grad mode (7/7)",
+    "updated_at": "2026-11-03T03:19:37Z"
+  },
+  "files": [
+    {
+      "additions": 91,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ea0d887369a366bee556173ab05a6a0ef593efba/tests%2Funit_tests%2Fgpu%2Fmodels%2Fcommon%2Ftest_gdn.py",
+      "changes": 91,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fgpu%2Fmodels%2Fcommon%2Ftest_gdn.py?ref=ea0d887369a366bee556173ab05a6a0ef593efba",
+      "deletions": 0,
+      "filename": "tests/unit_tests/gpu/models/common/test_gdn.py",
+      "patch": "@@ -0,0 +1,91 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+from unittest import mock\n+\n+import pytest\n+import torch\n+from torch._inductor.graph import GraphLowering\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention.gdn import (\n+    _split_grouped_in_proj,\n+    _split_in_proj,\n+)\n+\n+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+\n+# Per key head: [q | k | v | z | a | b]. 27B at TP4: 3 value heads per key head;\n+# 0.8B / 2B: 1 value head per key head. Both with 4 key heads.\n+SPLIT_SIZES = {\n+    \"three_value_heads\": [128, 128, 384, 384, 3, 3],\n+    \"one_value_head\": [128, 128, 128, 128, 1, 1],\n+}\n+\n+\n+def _triton_kernels(code: str) -> list[str]:\n+    return re.findall(r\"^def (triton_\\w+)\\(\", code, re.MULTILINE)\n+\n+\n+def _run_and_get_code_no_reset(fn):\n+    # run_and_get_code resets Dynamo first. Without the reset, the 37-token call sees\n+    # the 64-token compile and recompiles as the dynamic graph.\n+    codes: list[str] = []\n+    with mock.patch.object(GraphLowering, \"save_output_code\", codes.append):\n+        result = fn()\n+    return result, codes\n+\n+\n+@pytest.fixture\n+def split_region():\n+    torch._dynamo.reset()\n+    LocalCompileConfig(regions=[\"gdn_split_in_proj\"]).apply()\n+    yield\n+    LocalCompileConfig().apply()\n+    torch._dynamo.reset()\n+\n+\n+@pytest.mark.parametrize(\"split_sizes\", SPLIT_SIZES.values(), ids=SPLIT_SIZES.keys())\n+def test_split_in_proj_compiles_per_grad_mode(split_region, split_sizes) -> None:\n+    # 64 compiles a static graph, 37 the dynamic one, 1 a specialized one.\n+    for num_tokens in (64, 37, 1):\n+        projected_TC = torch.randn(\n+            num_tokens, 4 * sum(split_sizes), device=\"cuda\", dtype=torch.bfloat16\n+        )\n+        expected = _split_grouped_in_proj(projected_TC, split_sizes, 128)\n+\n+        # Inference: one combo kernel writes all four outputs.\n+        with torch.no_grad():\n+            outputs, codes = _run_and_get_code_no_reset(\n+                lambda: _split_in_proj(projected_TC, split_sizes, 128)\n+            )\n+        assert [len(_triton_kernels(code)) for code in codes] == [1], num_tokens\n+        assert all(torch.equal(o, e) for o, e in zip(outputs, expected))\n+\n+        # Training: the backward copies each gradient into its slice (a foreach\n+        # kernel), not one kernel that picks a source per element.\n+        weights = [torch.randn(o.shape, device=\"cuda\") for o in expected]\n+        outputs = []\n+\n+        def loss_fn(split_fn, projected_TC):\n+            outputs[:] = split_fn(projected_TC, split_sizes, 128)\n+            return sum((o.float() * w).sum() for o, w in zip(outputs, weights))\n+\n+        reference_TC = projected_TC.clone().requires_grad_()\n+        loss_fn(_split_grouped_in_proj, reference_TC).backward()\n+        projected_TC.requires_grad_()\n+        _, codes = _run_and_get_code_no_reset(\n+            lambda: loss_fn(_split_in_proj, projected_TC).backward()\n+        )\n+        assert len(codes) == 2, num_tokens\n+        for backward_code in codes[1:]:\n+            backward_kernels = _triton_kernels(backward_code)\n+            assert backward_kernels and all(\n+                name.startswith(\"triton_for_\") for name in backward_kernels\n+            ), backward_kernels\n+        assert all(torch.equal(o, e) for o, e in zip(outputs, expected))\n+        assert torch.equal(projected_TC.grad, reference_TC.grad)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ea0d887369a366bee556173ab05a6a0ef593efba/tests%2Funit_tests%2Fgpu%2Fmodels%2Fcommon%2Ftest_gdn.py",
+      "sha": "db64ef0944789d1e4b6efea5471eeaf471ce3aa4",
+      "status": "added"
+    },
+    {
+      "additions": 54,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/ea0d887369a366bee556173ab05a6a0ef593efba/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fgdn.py",
+      "changes": 67,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fgdn.py?ref=ea0d887369a366bee556173ab05a6a0ef593efba",
+      "deletions": 13,
+      "filename": "torchtitan/models/common/attention/gdn.py",
+      "patch": "@@ -204,19 +204,7 @@ def _recurrent_gdn_backward(ctx, grad_output):\n )\n \n \n-@spmd.local_map(\n-    # split_sizes is a list of six ints.\n-    in_types=(spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"), [None] * 6, None),\n-    out_types=(\n-        # Nominal tp S(1): each rank holds its own [q | k | v]; never redistribute or gather it.\n-        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"),  # mixed_qkv_TC\n-        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"),  # a_TH\n-        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"),  # b_TH\n-        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\", None),  # gate_THV\n-    ),\n-)\n-@local_compile(\"gdn_split_in_proj\", batch_invariant=True)\n-def _split_in_proj(\n+def _split_grouped_in_proj(\n     projected_TC: torch.Tensor,\n     split_sizes: list[int],\n     value_head_dim: int,\n@@ -249,6 +237,59 @@ def _split_in_proj(\n     )\n \n \n+# Two compiles of the same split under one region name, with different Inductor options;\n+# separate functions, so each gets its own graph cache and recompile limit.\n+# Training: the backward cats six gradients (q, k, v, z, a, b) into the grouped layout.\n+# Both cat limits at 0 make Inductor copy each piece into its slice, not one kernel that\n+# picks a source per element; combo_kernels launches the remaining copies as one kernel.\n+@local_compile(\n+    \"gdn_split_in_proj\",\n+    batch_invariant=True,\n+    options={\n+        \"max_pointwise_cat_inputs\": 0,\n+        \"max_complex_pointwise_cat_inputs\": 0,\n+        \"combo_kernels\": True,\n+    },\n+)\n+def _split_in_proj_with_grad(\n+    projected_TC: torch.Tensor, split_sizes: list[int], value_head_dim: int\n+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n+    return _split_grouped_in_proj(projected_TC, split_sizes, value_head_dim)\n+\n+\n+# No backward (generator, no_grad): the q|k|v cat and the a, b, gate copies run as one\n+# combo kernel. Per-input cat copies would add launches, which dominate at decode sizes.\n+@local_compile(\n+    \"gdn_split_in_proj\", batch_invariant=True, options={\"combo_kernels\": True}\n+)\n+def _split_in_proj_no_grad(\n+    projected_TC: torch.Tensor, split_sizes: list[int], value_head_dim: int\n+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n+    return _split_grouped_in_proj(projected_TC, split_sizes, value_head_dim)\n+\n+\n+@spmd.local_map(\n+    # split_sizes is a list of six ints.\n+    in_types=(spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"), [None] * 6, None),\n+    out_types=(\n+        # Nominal tp S(1): each rank holds its own [q | k | v]; never redistribute or gather it.\n+        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"),  # mixed_qkv_TC\n+        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"),  # a_TH\n+        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\"),  # b_TH\n+        spmd.PartitionSpec((\"dp\", \"cp\"), \"tp\", None),  # gate_THV\n+    ),\n+)\n+def _split_in_proj(\n+    projected_TC: torch.Tensor,\n+    split_sizes: list[int],\n+    value_head_dim: int,\n+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n+    \"\"\"Run ``_split_grouped_in_proj`` compiled for training if a backward will run.\"\"\"\n+    if projected_TC.requires_grad:\n+        return _split_in_proj_with_grad(projected_TC, split_sizes, value_head_dim)\n+    return _split_in_proj_no_grad(projected_TC, split_sizes, value_head_dim)\n+\n+\n class GDNKernel(Module):\n     \"\"\"Run GDN on rank-local tensors.\n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/ea0d887369a366bee556173ab05a6a0ef593efba/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fgdn.py",
+      "sha": "09e8fbf4e0e4ff0ed5fefcc270e4ae6f4fa4e546",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "These kernel assertions pass trivially if nothing compiles. `run_and_get_code` and `run_fw_bw_and_get_code` only return code for graphs that are actually compiled during the call. On a cache hit (say a later Dynamo change stops recompiling at T=37 or T=1), `codes` is empty: `all(...)` over an empty list is `True`, and `codes[1:]` at line 74 is empty too, so the loop never runs. Both kernel-structure checks would still pass while checking nothing. Asserting the count makes the test fail loudly instead:\n\n```suggestion\n        assert codes and all(len(_triton_kernels(code)) == 1 for code in codes), num_tokens\n```\nand before the backward loop: `assert len(codes) >= 2, num_tokens`.",
+      "created_at": "2026-11-02T04:38:46Z",
+      "diff_hunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")\n+\n+from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention.gdn import (\n+    _split_grouped_in_proj,\n+    _split_in_proj,\n+)\n+\n+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+\n+# Per key head: [q | k | v | z | a | b]. 27B at TP4: 3 value heads per key head;\n+# 0.8B / 2B: 1 value head per key head. Both with 4 key heads.\n+SPLIT_SIZES = {\n+    \"three_value_heads\": [128, 128, 384, 384, 3, 3],\n+    \"one_value_head\": [128, 128, 128, 128, 1, 1],\n+}\n+\n+\n+def _triton_kernels(code: str) -> list[str]:\n+    return re.findall(r\"^(triton_\\w+) = async_compile\\.triton\", code, re.MULTILINE)\n+\n+\n+@pytest.fixture\n+def split_region():\n+    LocalCompileConfig(regions=[\"gdn_split_in_proj\"]).apply()\n+    yield\n+    LocalCompileConfig().apply()\n+    torch._dynamo.reset()\n+\n+\n+@pytest.mark.parametrize(\"split_sizes\", SPLIT_SIZES.values(), ids=SPLIT_SIZES.keys())\n+def test_split_in_proj_compiles_per_grad_mode(split_region, split_sizes) -> None:\n+    # 64 compiles a static graph, 37 the dynamic one, 1 a specialized one.\n+    for num_tokens in (64, 37, 1):\n+        projected_TC = torch.randn(\n+            num_tokens, 4 * sum(split_sizes), device=\"cuda\", dtype=torch.bfloat16\n+        )\n+        expected = _split_grouped_in_proj(projected_TC, split_sizes, 128)\n+\n+        # Inference: one combo kernel writes all four outputs.\n+        with torch.no_grad():\n+            outputs, codes = run_and_get_code(\n+                _split_in_proj, projected_TC, split_sizes, 128\n+            )\n+        assert all(len(_triton_kernels(code)) == 1 for code in codes), num_tokens",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4438952834",
+      "id": 4438952834,
+      "line": null,
+      "original_line": 58,
+      "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+      "updated_at": "2026-11-02T04:39:09Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "`attn-gym[linear,cudnn]==0.0.17` is pinned in `requirements.txt`, so this skip should never fire. If it ever did, it would hide a broken install instead of failing (`rules/tests.md`: don't guard tests on packages the repo already requires). The CPU sibling at `tests/unit_tests/cpu/models/common/test_gdn.py:10` does the same thing, but this file is new, so it doesn't need to copy that. Suggest deleting this line.",
+      "created_at": "2026-11-02T04:38:50Z",
+      "diff_hunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4438953098",
+      "id": 4438953098,
+      "line": null,
+      "original_line": 12,
+      "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+      "updated_at": "2026-11-02T04:39:09Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: Done in 373ff98a7. The checks are now exact: `[len(_triton_kernels(code)) for code in codes] == [1]` for inference and `len(codes) == 2` (forward, backward) for training. A cache hit would not have emptied `codes` (the FX-graph cache path still calls `save_output_code`, torch/_inductor/codecache.py:2205), but a Dynamo guard hit would have, so the asserts stay.\n\nTwo more fixes in the same commit:\n1. `run_and_get_code` calls `torch._dynamo.reset()` before every call, which also clears automatic-dynamic state. So the 37-token case compiled a static graph, not the dynamic one the comment claimed. The test now captures code without the reset (`_run_and_get_code_no_reset`); 37 tokens now compile a symbolic graph in no_grad, forward and backward.\n2. CI's torch nightly (2.16.0.dev20261101) writes each Triton kernel as a plain `def triton_...(` instead of `X = async_compile.triton(`, so the old regex found no kernels and \"1 GPU Unit Tests\" failed (run 41389352593). The regex is now `^def (triton_\\w+)\\(`, which matches both forms.\n\nGPU check, caches off: 2 passed in each codegen form; turning off `combo_kernels` for no_grad, or setting `max_pointwise_cat_inputs=8` for the training copy, fails both cases.",
+      "created_at": "2026-11-02T05:54:27Z",
+      "diff_hunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")\n+\n+from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention.gdn import (\n+    _split_grouped_in_proj,\n+    _split_in_proj,\n+)\n+\n+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=\"requires CUDA\")\n+\n+# Per key head: [q | k | v | z | a | b]. 27B at TP4: 3 value heads per key head;\n+# 0.8B / 2B: 1 value head per key head. Both with 4 key heads.\n+SPLIT_SIZES = {\n+    \"three_value_heads\": [128, 128, 384, 384, 3, 3],\n+    \"one_value_head\": [128, 128, 128, 128, 1, 1],\n+}\n+\n+\n+def _triton_kernels(code: str) -> list[str]:\n+    return re.findall(r\"^(triton_\\w+) = async_compile\\.triton\", code, re.MULTILINE)\n+\n+\n+@pytest.fixture\n+def split_region():\n+    LocalCompileConfig(regions=[\"gdn_split_in_proj\"]).apply()\n+    yield\n+    LocalCompileConfig().apply()\n+    torch._dynamo.reset()\n+\n+\n+@pytest.mark.parametrize(\"split_sizes\", SPLIT_SIZES.values(), ids=SPLIT_SIZES.keys())\n+def test_split_in_proj_compiles_per_grad_mode(split_region, split_sizes) -> None:\n+    # 64 compiles a static graph, 37 the dynamic one, 1 a specialized one.\n+    for num_tokens in (64, 37, 1):\n+        projected_TC = torch.randn(\n+            num_tokens, 4 * sum(split_sizes), device=\"cuda\", dtype=torch.bfloat16\n+        )\n+        expected = _split_grouped_in_proj(projected_TC, split_sizes, 128)\n+\n+        # Inference: one combo kernel writes all four outputs.\n+        with torch.no_grad():\n+            outputs, codes = run_and_get_code(\n+                _split_in_proj, projected_TC, split_sizes, 128\n+            )\n+        assert all(len(_triton_kernels(code)) == 1 for code in codes), num_tokens",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4439311164",
+      "id": 4439311164,
+      "line": null,
+      "original_line": 58,
+      "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+      "updated_at": "2026-11-02T05:54:27Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Reply from claude: Done in 373ff98a7: removed. `attn-gym` is pinned in requirements.txt:13, and the split path never calls it.",
+      "created_at": "2026-11-02T05:54:29Z",
+      "diff_hunk": "@@ -0,0 +1,80 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import re\n+\n+import pytest\n+import torch\n+\n+pytest.importorskip(\"attn_gym\")",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#discussion_r4439311357",
+      "id": 4439311357,
+      "line": null,
+      "original_line": 12,
+      "path": "tests/unit_tests/gpu/models/common/test_gdn.py",
+      "updated_at": "2026-11-02T05:54:29Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Reply from claude: 7/7 of the GDN stack, on #5691: `gdn_split_in_proj` compiled per grad mode (cat limits 0 + combo kernels with a backward, combo kernels without). Trainer GDN layer -2.3 to -3.7%, generator GDN layer -3.5 to -12.8 us per layer, bitwise. Followed our local-compile method (3 fresh processes, with and without CUDA graphs, graph budget, eager parity); two internal reviews applied.\n\n@claude please review.",
+      "created_at": "2026-11-02T04:36:34Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6569170606",
+      "id": 6569170606,
+      "updated_at": "2026-11-02T04:36:34Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 2m 7s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41389426016)\n\n---\n**Approve -- please address the items before merging** (human-written summary is empty; minor test hardening). See the [review](https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview). A maintainer still needs to review.",
+      "created_at": "2026-11-02T04:36:55Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6569175003",
+      "id": 6569175003,
+      "updated_at": "2026-11-02T04:39:25Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: Addressed the review in 373ff98a7 (merged up as 63138b462 after 1/7 and 2/7 landed).\n\n- Must fix 1, human-written summary: that section is for the author; I do not fill it.\n- test_gdn.py:58 and :12: done (replies inline). The same commit fixes the CI failure on this PR: the torch nightly writes Triton kernels as plain `def triton_...(`, so the kernel regex now matches that form too. It also makes the 37-token case compile the dynamic graph it claims to test (`run_and_get_code` reset Dynamo every call).\n- test_gdn.py:76 (codegen-detail patterns): agreed. That is what just happened with the regex; it was fixed, not dropped.\n\n@claude please re-review.",
+      "created_at": "2026-11-02T05:54:36Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6570177909",
+      "id": 6570177909,
+      "updated_at": "2026-11-02T05:54:36Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 1m 46s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41396735936)\n\n---\n**Approve -- please address the item before merging.** Both test findings are fixed; the human-written summary, which only the PR author can write, is still empty. See the [review](https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview). A maintainer still needs to review.",
+      "created_at": "2026-11-02T05:55:00Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#issuecomment-6570182987",
+      "id": 6570182987,
+      "updated_at": "2026-11-02T05:57:07Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ],
+  "number": 5731,
+  "refs": {
+    "base": {
+      "commit": "c3093f782aec620fdc6887887fe366917abbc057",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "ea0d887369a366bee556173ab05a6a0ef593efba",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "**Verdict: Approve -- please address the items below before merging.** The design is a small, local Inductor tuning of one data-movement region, and the measurements back it up. The one thing that blocks merging is the empty human-written summary. A maintainer still needs to review, since this touches `models/common/`.\n\n**What this PR does.** The `gdn_split_in_proj` region was one `local_compile` with default options. It becomes two thin wrappers under the same region name, and `_split_in_proj` (still the `local_map` boundary) chooses between them with `projected_TC.requires_grad`. The training copy turns off Inductor's pointwise-cat fusion and turns on `combo_kernels`, so the backward's six-gradient cat becomes per-slice copies instead of one masked kernel. The no-grad copy turns on `combo_kernels` only, so the generator's four outputs come from one launch. The split body is renamed to `_split_grouped_in_proj` without other changes.\n\n**Example.**\n```text\ntrainer, in_proj requires grad:  projected_TC.requires_grad=True  -> _split_in_proj_with_grad\n  bwd before: 1 masked kernel choosing among the dq|dk|dv|dz|da|db sources per element\n  bwd after:  triton_for_* kernels, one copy per gradient slice\nremat recompute (runs with grad) -> same with_grad compile, no extra graphs\ngenerator / no_grad / frozen in_proj: requires_grad=False -> _split_in_proj_no_grad\n  before: 4 kernels (q|k|v cat, a, b, gate)    after: 1 combo kernel\n```\nI picked `requires_grad` as the predicate over `torch.is_grad_enabled()` on purpose. With grad enabled but a frozen `in_proj` and an input that doesn't require grad, no backward runs through the split, so the no-grad options are the right choice there.\n\n### Must fix\n1. PR description -- the \"Summary (human-written)\" section is empty. Per `CONTRIBUTING.md`, the author has to fill it in before merge.\n\n### Should consider\n- `tests/unit_tests/gpu/models/common/test_gdn.py:58` -- if nothing compiles in a call (a cache hit), `codes` is empty and both kernel-structure assertions pass while checking nothing. Assert on the number of returned codes (inline comment).\n- `tests/unit_tests/gpu/models/common/test_gdn.py:12` -- `importorskip(\"attn_gym\")` guards a package that `requirements.txt` already pins. Delete it (inline comment).\n- `tests/unit_tests/gpu/models/common/test_gdn.py:76` -- the `triton_for_` prefix and the `async_compile.triton` line format are Inductor codegen details. A PyTorch bump that renames them would fail this test with no real regression behind it. That cost is probably acceptable, because the test is the only thing guarding the kernel structure the perf win depends on. If it does break, fix the pattern; don't drop the test.\n\n<details><summary>Details</summary>\n\n- **Gate.** The problem is real and measured: 571 us of a 6190 us 27B TP2 GDN layer, plus 4 decode launches. Inductor options are the right layer. The same cat limits are already used in `activation.py:37`, `rope.py:202` and `deepseek_v3/attention.py:164`, so this follows an existing pattern rather than working around an upstream bug. This is the first use of `combo_kernels` in the repo, so I'd want a maintainer to take a look at that. The split is pure data movement, so `batch_invariant=True` and the bitwise claim are both plausible.\n- **Two wrappers vs one option dict.** The description explains why: a separate graph cache and recompile limit per mode, and about 1.1% of a decode-64 step. Adding per-grad-mode options to `local_compile` would mean bending shared code for one consumer, so the ~20 lines of duplicated decorator are the better trade.\n- **Parallelism.** The `local_map` boundary and its in/out types are unchanged, and the branch runs on rank-local tensors. `requires_grad` is the same on every TP/CP rank, so ranks can't take different compiles. Under remat, `remat.recompute_needs_tensor(projected_TC)` (`gdn.py:640`) keeps the recompute on a grad-requiring input, which sends it to the training compile.\n- **Callers.** `gdn.py:642` and the CPU test `tests/unit_tests/cpu/models/common/test_gdn.py:24` still call `_split_in_proj`. The CPU test exercises the eager path through the new dispatch.\n\n</details>\n\nNot verified: the timings, the bitwise parity and the kernel counts (needs a GPU run). Also not verified: whether `run_and_get_code` returns code on an Inductor FX-graph cache hit; I couldn't run Python in this environment.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732138367",
+      "id": 5732138367,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-02T04:39:09Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732588186",
+      "id": 5732588186,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-02T05:54:27Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732588438",
+      "id": 5732588438,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-02T05:54:29Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Verdict: Approve -- please address the item below before merging.** Both test findings from the last review are fixed at HEAD, and the new commit doesn't add any problems. The only open item is the human-written summary. A maintainer still needs to review, since this touches `models/common/`.\n\n**What changed since the last review (373ff98, merged up as 63138b4).** The `gdn.py` code is unchanged. The test now captures the generated code without resetting Dynamo, and the kernel regex matches the `def triton_...(` form that the nightly emits.\n\n**Example.**\n```text\nbefore: run_and_get_code -> torch._dynamo.reset() before each call\n        T=37 -> compiles a fresh static graph (the comment said \"dynamic\")\nafter:  _run_and_get_code_no_reset patches GraphLowering.save_output_code only\n        T=64 static -> T=37 sees the earlier compile -> symbolic graph -> T=1 specialized\n        no_grad: [1 kernel] exactly;  training: exactly 2 codes (fwd, bwd), bwd all triton_for_*\n```\n\n### Earlier items\n- Resolved: `test_gdn.py:58`, the empty-`codes` pass. Inference now asserts `== [1]` and training asserts `len(codes) == 2`, so a Dynamo guard hit can't pass silently.\n- Resolved: `test_gdn.py:12`, the `importorskip(\"attn_gym\")` call. It's removed.\n- Resolved: the codegen-pattern fragility point. The regex was fixed for the nightly format, not dropped.\n\n### Must fix\n1. PR description -- the \"Summary (human-written)\" section is **still open**. The reply is right that an agent shouldn't fill it in. It is the PR author's job (@felipemello1), and it still has to be written before merge (`CONTRIBUTING.md`, \"AI-assisted contributions\").\n\n<details><summary>Details</summary>\n\n- `_run_and_get_code_no_reset` patches `GraphLowering.save_output_code`, a private Inductor method. Upstream `run_and_get_code` patches the same hook, so this adds no new private surface beyond what the test already relied on. It's test-only, so it needs no TODO.\n- The fixture now calls `torch._dynamo.reset()` before setting up the region too. That keeps the two parametrized cases independent: the second case's T=64 compiles a static graph instead of picking up the first case's automatic-dynamic state.\n- Minor: with `len(codes) == 2` asserted, `for backward_code in codes[1:]` always runs exactly once on `codes[1]`. Indexing directly would be slightly clearer. Not blocking.\n- No changes to `gdn.py` since the last review. The earlier analysis still applies: `requires_grad` is the same on every TP/CP rank, remat recompute goes to the training compile, and the `local_map` types are unchanged.\n\n</details>\n\nNot verified: the GPU test results, and that the 37-token call now compiles a symbolic graph. Torch isn't installed in this environment.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732601193",
+      "id": 5732601193,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-02T05:56:54Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5731#pullrequestreview-5732637997",
+      "id": 5732637997,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-02T06:02:22Z",
+      "user": {
+        "login": "tianyu-l"
+      }
+    }
+  ]
+}

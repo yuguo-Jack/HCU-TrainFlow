@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
 path: docs/user-guide/features/cuda_graph.md
-raw_sha256: e4e71b59211a7b5babcac8a1dc3af053ee7b6d573ac559d2d20b15d0fe6a0fef
+raw_sha256: ce56c2276caa396d76b10c6ddc1e49a048e275f1ebffa8a8e803bfc84b5bfd36
 sources: []
-generated_body_sha256: 05107c17f2998d93da764304470268fbf6209541d6b7702b53f5f51ddb459de6
+generated_body_sha256: 72cdbcda4e425c7b828d5cafd00e08f0ff4e7019d596be6c1916d1da55c8d1d3
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / docs/user-guide/features/cuda_graph.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/docs/user-guide/features/cuda_graph.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/docs/user-guide/features/cuda_graph.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -127,6 +127,21 @@ wired into custom training loops. The trade-off is that it requires more manual 
 Megatron-LM's stock training loop already wires these calls in `megatron/training/training.py`,
 but custom training scripts must do the same work themselves.
 
+For scheduler-produced THD batches, use `--use-varlen-dataset`,
+`--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
+`--pad-packed-seq-alignment max`, and an explicit `--cuda-graph-thd-max-packed-sequences`. The metadata capacity includes one
+reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
+fixed local token capacity; the source global batch size and micro-batch size 1
+must stay fixed. PP/VPP automatically keeps graph inputs alive until their
+corresponding backward even when packing reduces the number of microbatches.
+Source-batch ramp-up is unsupported: `--step-batch-size-schedule`
+is rejected for this path, and the deprecated `--rampup-batch-size` is ignored by
+the microbatch calculator. Increasing the source batch would require recapturing
+the graphs with a new capacity. Dynamic CP, EP communication overlap, delayed
+wgrad, and paged stash are outside this path. mHC wrappers and attention graph
+splitting require their separate graph integrations; these packing options do
+not enable mHC capture by themselves.
+
 ### Usage
 
 ```bash
@@ -144,6 +159,17 @@ whole-layer training capture when the flag is omitted.
 Captures the entire training iteration (excluding optimizer) as a single CUDA graph. The same
 wrapper is also used for training-loop validation/eval in forward-only mode. This provides the
 largest training/validation latency reduction.
+
+With an eager optimizer, full-iteration training captures model-to-optimizer gradient conversion
+in the forward/backward graph's memory pool. The distributed optimizer and the layer-wise
+mixed-precision optimizer can reuse completed forward/backward scratch for FP32 gradients.
+Replay order must remain forward/backward, gradient conversion, then optimizer update.
+The converted values are valid until the next forward/backward replay; gradient addresses must
+remain stable. Resetting the training graph also invalidates the conversion graph.
+
+This conversion graph is disabled with `--optimizer-cuda-graph`, which captures the optimizer
+step itself. CPU-offloaded and Megatron-FSDP optimizer paths are unchanged, as is the distributed
+precision-aware optimizer path that already aliases model gradients.
 
 This implementation does not create inference CUDA graphs. For inference, use
 `--cuda-graph-impl local --inference-cuda-graph-scope layer|block`.

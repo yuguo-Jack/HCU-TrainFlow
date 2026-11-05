@@ -1,0 +1,1018 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "0a25b64a7fb1f1d1f1cc17debd7b0e58fc68de8d6fbdbfd3798e0af8d0972ed7",
+      "isPrivate": false,
+      "numbers": [
+        58883,
+        58881,
+        58873,
+        58872,
+        58871,
+        58868,
+        58866,
+        58863
+      ],
+      "observed_at": "2026-11-04T22:01:35.836752+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4874,
+        "resetAt": "2026-11-04T22:47:37Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "a11d3a15f6f04ae426a0a5162f293e95163103cc",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\nAddresses #58726.\n\nOn integrated GPUs (DGX Spark / GB10), the shared weight loaders copy each checkpoint tensor to the GPU with `param.copy_(loaded_weight)` straight from the safetensors mmap view. For a contiguous, same-dtype source, PyTorch passes that pageable pointer directly to the driver copy, so the page faults happen inside the copy. On GB10 that is several times slower than faulting the same pages on the CPU first: 1.7–3.0 ms vs 0.08–0.64 ms per 800 KiB tensor in #58726. `nvidia/Qwen3.8-Flash-Next-NVFP4` has at least 140k such tensors, and its main weight load takes 452 s from NFS and 475 s from local NVMe.\n\nThis adds `copy_weight_(dst, src)` to `vllm/model_executor/utils.py`. On an integrated GPU it touches one byte per page of `src`, then runs `dst.copy_(src)`. It is used at the 26 copy sites of the shared loaders: `linear.py` (8), `parameter.py` (6), `routed_experts.py` (8), `vocab_parallel_embedding.py` (2) and `default_weight_loader` (2).\n\n- **Gate:** `current_platform.is_integrated_gpu()` for a CUDA destination, cached per device. On a discrete Ada Lovelace GPU the same micro-benchmark shows the plain copy is fastest in every cache state, and the touch adds 0.022–0.028 ms per tensor, so it stays off there. When off, the extra checks cost ~0.46 µs per call (0.91 vs 0.45 µs for a 16-byte CPU copy), about 0.14 s per 300k tensors.\n- **Only contiguous, same-dtype CPU sources are touched.** Non-contiguous or dtype-converting copies already go through a CPU temporary in PyTorch (`copy_requires_temporaries` in `aten/src/ATen/native/cuda/Copy.cu`), which faults the pages on the CPU.\n- **Why at the copy site rather than in `safetensors_weights_iterator`** (discussed with @gitbisector in #58726):\n  - Under TP each rank touches only the slice it copies. A prefault in the iterator read whole tensors: ~287 GiB per rank on DeepSeek-V4.1 TP4, and a slower load at the default `read_ahead_kb=128`.\n  - The touch runs right before the copy, so a consumer that buffers the weight stream can't have the pages evicted in between.\n  - Tensors a model serves from the mapping (#58439) are never copied, so they are never touched, and no size cap is needed.\n- **Not covered:** model-specific loaders that call `.copy_()` or `.to(device)` themselves keep today's behaviour until they call the helper. Its docstring says to. @stecasta routed one such out-of-tree expert loader through it: ~55 GiB of copies moved onto the touch path, and its weight loading took about 70% less time. @JimmyToluene found an in-tree one, the Qwen4Exp PLE shard copy in `vllm/models/qwen4_exp/common/ple.py`; routing it through the helper is a follow-up.\n- **Measured only on GB10** (TP=1 below, TP=4 by @gitbisector). Other integrated devices, such as Jetson Orin / Thor, will take the touch path but are untested. I haven't checked what GH200 reports as `is_integrated`; if it reports 0, nothing changes there.\n\n## Test Plan\n\n- New tests in `tests/model_executor/test_utils.py`:\n  - `test_copy_weight_prefault_copies_exact_bytes`: with the gate forced on, the helper accepts 0-d, empty, bf16, fp8 and dim-1-narrowed sources and copies them byte for byte. CI has no integrated GPU, so this is the only coverage of that path.\n  - `test_copy_weight_prefault_maps_the_mmap_view`: after the call, every page of a safetensors view is mapped (`/proc/self/smaps` Rss of the file mapping). With the touch disabled it fails: 64 KiB mapped vs 4 MiB.\n- Existing CPU-runnable loader tests, before and after the change.\n- `pre-commit` on the changed files, including `mypy-3.12 --hook-stage manual`.\n- Boot A/B on a DGX Spark.\n\n```bash\n# CPU only, repo on PYTHONPATH inside vllm/vllm-openai:v0.30.0 (torch 2.13.0+cu130), no GPU\ndocker run --rm -v $PWD:/w:ro -e PYTHONPATH=/w -w /w --entrypoint bash vllm/vllm-openai:v0.30.0 -c \\\n  \"uv pip install --system -q tblib pytest && python3 -m pytest -q \\\n   tests/model_executor/test_utils.py \\\n   tests/kernels/moe/test_moe_weight_loading_padded.py tests/kernels/moe/test_fp8_tp_loading.py \\\n   tests/model_executor/model_loader/test_weight_tying.py \\\n   tests/model_executor/model_loader/test_gpt_oss_weight_loading.py \\\n   tests/model_executor/model_loader/test_ep_weight_filter.py \\\n   tests/model_executor/model_loader/test_reload.py tests/model_executor/test_weight_utils.py\"\n\npre-commit run --files <changed files>\npre-commit run mypy-3.12 --hook-stage manual --files <changed files>\n```\n\n## Test Result\n\n- `tests/model_executor/test_utils.py`: 18 passed (12 existing, 6 new).\n- Loader tests: 216 passed, 5 skipped. 38 tests fail with and without the change, the same set on both, all because the container has no GPU:\n  - 18 error at setup with `Failed to infer device type`.\n  - 18 `test_reload` cases fail because `current_platform.device_count` is `None`.\n  - 2 `test_fp8_tp_default_keeps_refined_layout[*-triton]` cases can't confirm the Triton kernel, so the layer pads its TP shard instead of refining the block shape.\n- `pre-commit` and `mypy-3.12` passed.\n\n### Boot A/B, DGX Spark (GB10), TP=1\n\nNine full server boots of `nvidia/Qwen3.8-Flash-Next-NVFP4`, interleaved, with the client page cache for the checkpoint dropped before each one.\n\n- **Build:** the image is vLLM v0.30.0 plus out-of-tree patches, not `main`. The helper is copied from this branch and applied to v0.30.0's copies of the same files (25 sites; v0.30.0's `_load_w2` has no chunk loop). It predates a cleanup that renamed the gate function and dropped a redundant `numel() > 0` check, which doesn't change behaviour here. A counting wrapper, not part of this PR, logged the gate and how many copies were touched.\n- **Out-of-tree patches on in every arm:** the expert-name index (= #58720, merged), an MTP name prefilter, and the PLE table served from the mapping (never copied).\n- **Storage:** NFS with the client's `read_ahead_kb` at 16384, or local NVMe at the default 128.\n\n| loader | storage | main load (s) | MTP load (s) | start → `/health` (s) | swapped out, start → KV profile (GiB) |\n|---|---|---:|---:|---:|---:|\n| stock | NFS | 451.8 | 36.1 | 584 | 4.4 |\n| this PR (3 boots) | NFS | 25.9 / 27.0 / 28.0 | 0.8 | 124–129 | 3.6–4.3 |\n| stock | NVMe | 475.2 | 31.7 | 609 | 4.2 |\n| this PR (2 boots) | NVMe | 46.4 / 54.5 | 2.6–2.9 | 149–153 | 3.2–4.0 |\n| *out-of-tree, for reference: `pread` tensors ≤ 64 MiB in the iterator, clone / chunked copy above that* | NFS / NVMe | 21.0 / 88.5 | 1.2 / 1.3 | 113 / 179 | 0 / 0 |\n\n- The gate logged `cuda:0 = True` in every boot with this PR. By the counter's last line (140,000 calls), 139,965 copies (63.4 GiB) had been touched. The other 35 were copies PyTorch stages through a CPU temporary anyway.\n- Greedy outputs (5 prompts × 400 tokens, temperature 0) and first-token logprobs are identical in all nine boots, and decode speed is unchanged. No accuracy eval was run here: the touch only reads the source, so the loaded weights are byte-identical (unit test above). @stecasta's GSM8K run is below.\n- Swap: loading from mmap views pushes 3.2–4.4 GiB of other memory to swap on this 128 GB machine, and stock loading does it as much as this PR. The pread variant doesn't map the files and doesn't swap. vLLM counts the swapped-out memory as free when it sizes the KV cache. I haven't looked into why the kernel swaps here.\n\n### TP=1, warm cache (from @hclsys, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5919067348))\n\n`Qwen3-1.7B` on one GB10, `load_format=safetensors`, `enforce_eager`, page cache warm, fresh process per run, this branch vs its merge-base `77871126f9`.\n\n| | `Loading weights took` | `LLM()` init |\n|---|---:|---:|\n| merge-base (3 runs) | 20.2–23.7 s | 44.4–54.8 s |\n| this PR (2 runs) | 0.50 / 0.69 s | 26.3 / 29.4 s |\n\nThe third base run came after the PR runs, so the difference isn't cache order. With the cache warm the time isn't disk reads but the faults taken through a fresh mapping during the copy. On a discrete RTX PRO 6000 the touch makes no difference, ~0.1 ms per tensor either way (@gitbisector, [comment](https://github.com/vllm-project/vllm/issues/58726#issuecomment-5918595410)).\n\n### TP=1, cold cache (from @stecasta, [review](https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5496877797))\n\n`nvidia/Qwen3.8-27B-NVFP4` with a DFlash2 drafter on one GB10, v0.31.0 plus internal patches with this PR applied as a Python overlay. Checkpoint on local disk (`read_ahead_kb=128`), page cache dropped before every boot, two boots per arm.\n\n| | `Loading weights took`, main model | `Model loading took` | start → `/health` |\n|---|---:|---:|---:|\n| stock | 96.5 / 96.7 s | 122 / 122 s | 595 / 591 s |\n| this PR | 9.5 / 9.8 s | 16 / 16 s | 486 / 486 s |\n\nGSM8K-256 with this PR: 244/256, in line with stock. Minimum `MemAvailable` (~38.5 GiB) and peak swap (0.5 GiB) during load were the same in both arms.\n\n### TP=1 on a `main`-based nightly (from @jschmied, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5865989952))\n\nRadixArk's ModelOpt NVFP4/FP8 Qwen3.8-Flash-Next (120 GB, 206 files) on local NVMe at `read_ahead_kb` 128, nightly `1ea7c63f4` with this PR's diff (all 26 sites), 2 cold starts per arm, alternating. Main weight load 504.9 / 534.0 s stock, 65.9 / 64.9 s with this PR. With the expert-name index from #58720 (merged after `1ea7c63f4`) as well, 41.6 / 41.9 s ([data](https://github.com/jschmied/qwen38-flash-next-gb10/blob/1313d7b4b458f9e0462f0d79c02323663cbacdfd/notes/data/fastload/fastload.txt)). Greedy output identical in every start.\n\n### TP=1, cold cache, current head (from @JimmyToluene, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-6349449742))\n\nQwen3.8-Flash-Next NVFP4 (103 GiB, 299,817 tensors) on one GB10, nightly `21d93d0d8c0e` with this PR at `f66f2108c`. Local NVMe at `read_ahead_kb=128`, page cache dropped before each boot, one boot per arm. In stock, py-spy put 97.7% of load samples on the two expert `copy_` lines in `routed_experts.py`, with no I/O wait.\n\n| | stock | this PR |\n|---|---:|---:|\n| main `Loading weights took` | 660.7 s | 71.3 s |\n|  routed experts, 70.6 GB | 435 s | 52 s |\n|  dense, 10.3 GB | 63 s | 5 s |\n|  PLE n-gram table, 28.8 GB | 160 s | 14 s\\* |\n| MTP drafter load | 82.8 s | 55.5 s |\n| start → `/health` | 969 s | 345 s |\n\n\\* With one more call site, the PLE shard copy in `vllm/models/qwen4_exp/common/ple.py`, routed through `copy_weight_`. This PR doesn't change that file, so on its own the PLE table stays on the stock path.\n\nTeacher-forced logprobs of 16 fixed generations (3,761 tokens) differ from stock by mean |Δlogprob| 0.034 (p99 0.37), the same as stock against itself.\n\n### TP=4 (from @gitbisector, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5852543296))\n\n`DeepSeek-V4.1-Flash` on four GB10s, this PR ported to a v0.28.1-based build (25 of the 26 sites), load-only boots, page cache dropped before each, arms interleaved. Times are `Model loading took` on the slowest rank.\n\n| `read_ahead_kb` | boots | stock | this PR | read per rank vs stock |\n|---|---|---:|---:|---:|\n| 1024 | 3 + 3 | 192–195 s | 156–161 s (−18%) | +0–8 GiB |\n| 128 | 3 + 3 | 205–207 s | 149–151 s (−27%) | +0–8 GiB |\n| 1024, consumer that sorts the stream | 1 + 1 | 248 s | 225 s | +2–10 GiB |\n\nAt 128 the iterator-level prefault made this load slower (202 → 241 s) because every rank read whole tensors (~287 GiB); at the copy site each rank reads about what stock reads. Most of the gain is the slowest rank catching up: in stock, the ranks holding slices 0 and 2 lag by 25–60 s on small same-dtype slices (expert scales, FP8 attention rows). The routed experts there are `I8` loaded into `uint8` params, a converting copy that PyTorch already stages on the CPU, so the helper touches 5.6 of 72.3 GiB per rank.\n\n## Duplicate-work check\n\n- No open PR references #58726; searches for \"prefault\", \"integrated gpu weight loading\" and \"mmap page fault copy\" found none that change these copy sites.\n- #49991 (ROCm, clones in the iterator behind an env flag, for a KFD copy-on-write issue) and #50794 (Ascend, clones before the H2D copy to avoid a DMA hang) handle the same copies on other platforms, for different causes.\n- #57973 (safetensors prefetch loader) and #55985 (fastsafetensors fit planner) are alternative load paths.\n- #58857 / #58782 remove the `sorted()` buffering in the DeepSeek-V4 VL wrappers; complementary to this.\n\n## AI assistance\n\nAI-assisted (Claude Opus 5.5): implementation, tests, the boot A/B scripts, and a draft of this description. I reviewed every changed line and ran the tests and boots above on my own machines.\n",
+      "changedFiles": 7,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "gitbisector"
+            },
+            "body": "As promised, we ran #58868 on DeepSeek-V4.1-Flash at TP4 across four GB10s. It's ported onto our 0.28.1-based build: 25 of the 26 sites, since the chunked `_load_w2` branch isn't in that version. These were load-only boots with the page cache dropped before each, arms interleaved.\n\n| `read_ahead_kb` | boots | stock | #58868 | read per rank vs stock |\n|---|---|---|---|---|\n| 1024 | 3 + 3 | 192–195 s | 156–161 s (−18%) | +0–8 GiB |\n| 128 | 3 + 3 | 205–207 s | 149–151 s (−27%) | +0–8 GiB |\n| 1024, consumer that sorts the stream | 1 + 1 | 248 s | 225 s | +2–10 GiB |\n\nTimes are `Model loading took` on the slowest rank. The copy site keeps the gain without the iterator version's TP over-read (~287 GiB per rank here), and it holds up under a consumer that buffers the stream.\n\nMost of that gain comes from TP slice position, which fits the PR. In stock, ranks 0 and 2 finish 25–60 s after ranks 1 and 3. A per-slice benchmark on all four nodes shows the lag follows the slice, not the node: slices 0 and 2 load 1.3–2.2 s slower per two shards on every node. The slow part is the small same-dtype slices (the expert scales and FP8 attention rows) that the driver faults in from a cold cache. With the touch, all four slices take the same time, so the slowest rank catches up. The direct saving on ranks 1 and 3 is about 10 s.\n\nCoverage: on this checkpoint the helper touches 5.6 of 72.3 GiB per rank. The 64.7 GiB of routed experts are stored as `I8` and loaded into `uint8` params, so the dtype gate skips them. That's correct: the converting copy already faults on the CPU, and at 128 it was faster in a micro-benchmark than touch-then-copy.\n\nFor comparison, `--load-format fastsafetensors` reads with O_DIRECT, so neither readahead nor these page faults apply to it. On the same model and nodes it loads in ~88 s against 156–161 s here. On unified memory it needs #55985 (ours) plus some fastsafetensors fixes that aren't upstream yet.\n",
+            "createdAt": "2026-09-27T04:14:16Z",
+            "databaseId": 5852543296,
+            "updatedAt": "2026-09-27T04:14:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5852543296"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "Thanks for running this. The 128 KiB row is the one I couldn't test: it goes from slower with the iterator prefault (202 → 241 s) to 27% faster with the copy-site touch, with the per-rank read back to stock plus 0–8 GiB.\n\nThe slice-position finding also explains why the direct saving is small on your ranks 1 and 3: most of your bytes are the `I8` → `uint8` experts, which take PyTorch's converting path and already fault on the CPU. On Qwen3.8 the experts are same-dtype, so nearly everything goes through the touch.\n\nI've added your numbers to the description, linked to this comment.\n",
+            "createdAt": "2026-09-27T09:37:29Z",
+            "databaseId": 5854710164,
+            "updatedAt": "2026-09-27T09:37:29Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5854710164"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "jschmied"
+            },
+            "body": "We ran #58868 at TP1 on a single GB10, which adds a TP1 data point at `read_ahead_kb` 128. The main weight load drops from 505–534 s to 65–66 s (−87 %), with the same greedy output.\n\n| cold start, 2 per arm, alternating | main model weights | MTP drafter weights | model loading total |\n|---|---|---|---|\n| stock | 504.9 / 534.0 s | 62.6 / 54.4 s | 575 / 599 s |\n| #58868 | **65.9 / 64.9 s** | 41.4 / 32.5 s | **121 / 111 s** |\n\n- **Setup:** DGX Spark, GB10 (sm_121), TP1. Checkpoint: RadixArk's ModelOpt mixed NVFP4/FP8 Qwen3.8-Flash-Next (120 GB, 206 safetensors files) on local NVMe, `read_ahead_kb` 128.\n- **Cache:** the page cache was dropped before every start.\n- **Patch:** vLLM nightly `1ea7c63f4` plus our model patches. We used your head `857f70df` diff without the test file. It applies with offsets, all 26 sites.\n- **Metric:** vLLM's own \"Loading weights took\" lines.\n- **Output:** the greedy output hash is identical across all four starts.\n- **Not measured:** discrete GPUs, TP>1, NFS.\n\nThe drafter's remaining 32–41 s isn't the copy: our MTP loader iterates all ~300k checkpoint tensors to keep ~3k. In our first start, a name filter before the read took it to 3.75 s. That is separate from this PR.\n\nData: [ld58868.txt](https://github.com/jschmied/qwen38-flash-next-gb10/blob/10d2b9df7c2bb2178039393abe5e4211a8cc4f27/notes/data/ld58868/ld58868.txt), write-up [§5w](https://github.com/jschmied/qwen38-flash-next-gb10/blob/10d2b9df7c2bb2178039393abe5e4211a8cc4f27/notes/speed-of-light.md#5w-weight-loading-vllm58868-cuts-the-main-load-87--505534-s--6566-s-model-loading-575599-s--111121-s).\n\nWritten with AI assistance (Claude Code).\n",
+            "createdAt": "2026-09-28T08:09:01Z",
+            "databaseId": 5865989952,
+            "updatedAt": "2026-09-28T08:09:01Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5865989952"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "hclsys"
+            },
+            "body": "Ran this end-to-end on a GB10 (DGX Spark, sm_121, CUDA 13). Qwen3-1.7B, `load_format=safetensors`, TP1, `enforce_eager`, page cache warm, fresh process per run, your branch vs its own merge-base so the patch is the only difference:\n\n```\n                           Loading weights took     LLM() init\nbase 77871126f9            23.48 / 20.18 / 23.66 s  54.8 / 44.4 / 46.7 s\n+ this PR 857f70df4b        0.50 / 0.69 s            26.3 / 29.4 s\n```\n\n~30x on the load itself, ~1.6x on total engine init for a 3.4 GB model.\n\nI ran base twice, then the PR, then base a third time — that last one is still 23.66 s, so it isn't cache ordering.\n\nSeparately, @gitbisector ran the standalone `mmap -> copy_` A/B on a discrete sm_120 and the touch makes no difference there (~0.1 ms/tensor either way), while on this card it's 4.9 ms vs 0.12. I'd taken the other side of that on #58726 and was wrong — the `is_integrated_gpu()` gate is doing real work, not narrowing a general win.\n\nVerified `copy_weight_ present = True/False` per run before trusting either leg.\n",
+            "createdAt": "2026-09-30T20:24:06Z",
+            "databaseId": 5919067348,
+            "updatedAt": "2026-09-30T20:24:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5919067348"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "gitbisector"
+            },
+            "body": "@Willian-Zhang here are the TP4 numbers I promised on #58726. Setup: `DeepSeek-V4.1-Flash`, TP4 + DCP2 across four GB10s, weights on local NVMe ext4, page cache dropped on every node before every boot. One boot per cell.\n\nThe image is a vLLM fork at `8a728663c`, so I ported #58868 by hand. Two hunks didn't apply: the `_load_w2` tail copy (the pre-chunking version) and the `utils.py` imports. In this model, all weight copies go through `copy_weight_` except the `attn_sink` scalars.\n\nTarget weights pass, \"Loading weights took\", per rank:\n\n| `--load-format auto` | `read_ahead_kb=1024` | `read_ahead_kb=128` |\n|---|---|---|\n| stock | 130–160 s (mean 146) | 114–168 s (mean 140) |\n| + #58868 | 106–132 s (mean 122) | 104–119 s (mean 112) |\n\nSo #58868 is about 20% faster here, against the ~30× hclsys measured on Qwen3-1.7B. Readahead makes little difference either way at TP4. I haven't looked into where the rest of the `auto` time goes. Ranks within a cell spread by up to ±25 s, so read 20% as approximate.\n\nFor comparison, `--load-format fastsafetensors` took 52–58 s on the same model and nodes when I measured it earlier (read with O_DIRECT, so readahead doesn't apply). Our production config adds per-rank slice reads and comes in at 43–45 s, but that's an out-of-tree change, not something you'd get from upstream.\n\nNone of this argues against the PR. It fixes the GB10 fault cost and is clearly a win. It just doesn't close most of the gap for large TP-sharded MoE checkpoints.\n",
+            "createdAt": "2026-10-01T00:04:57Z",
+            "databaseId": 5921946576,
+            "updatedAt": "2026-10-01T00:04:57Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5921946576"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "Thanks @gitbisector. These don't line up with your [09-27 numbers](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5852543296), which are the ones the description cites now:\n\n| | 09-27 | today |\n|---|---|---|\n| build | 0.28.1-based, 25 of 26 sites | fork at `8a728663c`, 2 hunks not applied |\n| metric | `Model loading took`, slowest rank | `Loading weights took`, per rank |\n| boots | 3 + 3, interleaved | 1 per cell |\n| stock → this PR, `read_ahead_kb=1024` | 192–195 → 156–161 s (−18%) | 130–160 → 106–132 s |\n| stock → this PR, `read_ahead_kb=128` | 205–207 → 149–151 s (−27%) | 114–168 → 104–119 s |\n| `fastsafetensors` | ~88 s | 52–58 s |\n\nThe change of metric probably explains the lower absolute times. It doesn't explain two other differences. On 09-27, 128 was slower than 1024 in stock and gained more from the touch, while today readahead makes little difference. And `fastsafetensors` went from ~88 s to 52–58 s. Did something else change between the two runs, like the nodes, kernel, readahead on all four nodes, or the image? Which set should the description use? I'll update it once I know.\n\nOn the size of the gain, I think the gap to hclsys's ~30× comes from coverage. In your 09-27 run the helper touched 5.6 of 72.3 GiB per rank. The `I8` routed experts do go through `copy_weight_`, but the same-dtype check skips the touch for them, since the converting copy already reads the source on the CPU. hclsys's Qwen3-1.7B run is TP1, all bf16 and warm, so every byte takes the touch. So I agree with your conclusion: this fixes the GB10 fault cost and isn't aimed at the rest of a cold TP-sharded MoE load.\n\n@hclsys thanks for the TP1 run, I've added it to the description.\n",
+            "createdAt": "2026-10-01T10:56:39Z",
+            "databaseId": 5929920240,
+            "updatedAt": "2026-10-01T10:56:39Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5929920240"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "gitbisector"
+            },
+            "body": "@Willian-Zhang you're right, and nothing changed between the runs. I changed the metric and then compared across it, which is my mistake. Use the 09-27 set: 3+3 interleaved boots, slowest rank, `Model loading took`.\n\nBoth runs used the same build and nodes. \"0.28.1-based\" in the 09-27 comment and \"fork at `8a728663c`\" are the same image (`0.28.1rc1.dev388+g8a728663c`). The two hunks that didn't apply this time I ported by hand, so coverage matches 09-27's 25 of 26 sites. The chunked `_load_w2` branch doesn't exist in that version. Readahead was set explicitly on all four nodes for every boot.\n\nHere are last night's single boots on the 09-27 metric:\n\n| `Model loading took`, slowest rank | 09-27 (3+3 boots) | 09-30 (1 boot) |\n|---|---|---|\n| stock, `read_ahead_kb=1024` | 192–195 s | 197 s |\n| #58868, `read_ahead_kb=1024` | 156–161 s | 166 s (−16%) |\n| stock, `read_ahead_kb=128` | 205–207 s | 206 s |\n| #58868, `read_ahead_kb=128` | 149–151 s | 155 s (−25%) |\n\nThey agree. So does the readahead effect: at 128, stock is slower and #58868 gains more. My \"readahead makes little difference\" came from averaging per-rank times, which hides the slow ranks (slices 0 and 2) that 09-27 explained. Please disregard that sentence.\n\n`fastsafetensors` is also one measurement under two metrics. ~88 s is `Model loading took`, and 52–58 s is the target `Loading weights took` from the same runs. I should have labelled which one I quoted.\n\nAgreed on coverage. That matches the 5.6 of 72.3 GiB in the 09-27 comment.\n",
+            "createdAt": "2026-10-01T15:15:55Z",
+            "databaseId": 5934398842,
+            "updatedAt": "2026-10-01T15:15:55Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5934398842"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "Thanks for going back and re-running these on the same metric, that clears it up. The description already uses the 09-27 numbers, so I'll leave it as is.\n",
+            "createdAt": "2026-10-05T21:15:50Z",
+            "databaseId": 6003073167,
+            "updatedAt": "2026-10-05T21:15:50Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6003073167"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "Thanks @stecasta for the cold-cache run and the GSM8K check. I've added both to the description.\n\nAgreed on the docstring. 66d42b06d adds a line saying model-specific loaders should call `copy_weight_` instead of `.copy_()` when they copy a checkpoint tensor to the device, and that off integrated GPUs it's a plain `copy_`, so it's safe to call everywhere. I've also put your out-of-tree loader result under \"Not covered\" as an example.\n",
+            "createdAt": "2026-10-13T00:27:40Z",
+            "databaseId": 6135259485,
+            "updatedAt": "2026-10-13T00:27:40Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6135259485"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Willian-Zhang.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-20T06:45:56Z",
+            "databaseId": 6285109977,
+            "updatedAt": "2026-10-20T06:45:56Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6285109977"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "JimmyToluene"
+            },
+            "body": "Independent data from a third DGX Spark (kernel 6.17.0-1026-nvidia, driver 580.159.03, CUDA 13.0, torch 2.13.0+cu130): Qwen3.8-Flash-Next NVFP4 (103 GiB, 299,817 tensors), local NVMe, `read_ahead_kb=128`, stock nightly `21d93d0d8c0e`.\n\nStock load: py-spy (non-blocking, 20 s on an expert shard) puts 97.7% of samples on the two `expert_data.copy_(loaded_weight)` lines (`_load_w13` 62.8%, `_load_w2` 34.9%), 0.3% in `safetensors_weights_iterator`; main thread at 100% user CPU, no I/O wait. Main load 629–661 s, every shard type at 160–180 MB/s (routed experts 70.6 GB in 435 s, dense 10.3 GB in 63 s, PLE n-gram table 28.8 GB in 160 s).\n\nThis PR's diff applies cleanly to that nightly (apart from `tests/`). GPU check, page cache dropped: 800 KiB expert tensors from a safetensors mmap went from 9.35 to 1.06 ms per tensor through `copy_weight_`, byte-identical. Full-boot numbers after our next maintenance window.\n\nOne copy site this doesn't reach: the PLE shard copy in `vllm/models/qwen4_exp/common/ple.py` (`_copy_embedding_shard_` on main) still does `target.copy_(source.to(device=target.device, dtype=target.dtype))`. Without #58439 that copies the whole ~28 GiB PLE table from mmap views. Casting on the CPU only when dtypes differ and then calling `copy_weight_(target, source)` took that path from 0.12 to 0.47 GB/s in the same test, byte-identical. Happy to send it as a follow-up once this lands, or it can go in here.\n\nAI assistance (Claude) was used for the profiling, benchmarks and this write-up; I reviewed it.\n",
+            "createdAt": "2026-10-22T18:14:24Z",
+            "databaseId": 6347924199,
+            "updatedAt": "2026-10-22T18:14:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6347924199"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "JimmyToluene"
+            },
+            "body": "@Willian-Zhang full-boot numbers from the Spark in my comment above, with this PR at `f66f2108c774` (the current head) applied to the same nightly. Weights on local NVMe, page cache dropped before each boot, one boot per arm.\n\n| | stock | this PR (+ PLE line below) |\n|---|---:|---:|\n| main `Loading weights took` | 660.7 s | 71.3 s |\n| &nbsp;&nbsp;routed experts, 70.6 GB | 435 s | 52 s |\n| &nbsp;&nbsp;dense, 10.3 GB | 63 s | 5 s |\n| &nbsp;&nbsp;PLE n-gram table, 28.8 GB | 160 s | 14 s |\n| MTP drafter load | 82.8 s | 55.5 s |\n| start → `/health` | 969 s | 345 s |\n\nOutputs: teacher-forced logprobs of 16 fixed generations (3,761 tokens) differ from stock by mean |Δlogprob| 0.034, p99 0.37, the same as stock against itself (0.034, 0.37). Greedy decoding isn't run-to-run deterministic on this setup, so I compared logprobs rather than text. 7.7 GB was swapped out during the boot with this PR; I didn't measure stock.\n\nThe PLE row needs one more call site. This is the whole change against main (packed-NVFP4 table from #56273, device-resident with `cpu_offload: false`):\n\n```diff\n--- a/vllm/models/qwen4_exp/common/ple.py\n+++ b/vllm/models/qwen4_exp/common/ple.py\n+from vllm.model_executor.utils import copy_weight_\n ...\n         with torch.no_grad():\n-            target.copy_(source.to(device=target.device, dtype=target.dtype))\n+            copy_weight_(target, source)\n```\n\nOn a GB10 it is byte-identical to the line it replaces for uint8, float64→float32 and float32→bfloat16 shards, and the existing `test_ple_shard_*` tests pass. Happy for it to go in here, or I can open it as a follow-up once this lands.\n\nThe remaining 55 s MTP load is the drafter re-reading the whole checkpoint to pick out `mtp.*` tensors, i.e. the name prefilter you mentioned keeping out of tree.\n\n(The image also carries an unrelated MTP draft-head patch that doesn't touch weight loading. AI assistance (Claude) was used for the measurements and this write-up; I reviewed it.)\n",
+            "createdAt": "2026-10-22T19:29:21Z",
+            "databaseId": 6349449742,
+            "updatedAt": "2026-10-22T19:29:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6349449742"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "Thanks @JimmyToluene for running the full boot on the current head, and for the logprob comparison. Measuring against stock-vs-stock noise is a better check than greedy text here. The py-spy profile on stock is also the clearest picture of #58726 so far: 97.7% of samples in the two expert `copy_` lines, with no I/O wait.\n\nI've added your run to the description, linked to your second comment. I marked that the PLE row includes your `ple.py` line.\n\nOn the PLE copy, I'd keep it as a follow-up. This PR is limited to the shared loaders, and `ple.py` is the model-specific case its docstring now covers. Please open it once this lands and link it here.\n\nOn swap: in my boots and in stecasta's, stock swapped about as much as this PR, so I'd expect your stock arm to as well, if you get a chance to measure it.\n\nThe drafter time left is the `mtp.*` re-read, as you say. That's the name prefilter, which stays out of this PR.\n",
+            "createdAt": "2026-10-23T13:42:01Z",
+            "databaseId": 6366276998,
+            "updatedAt": "2026-10-23T13:47:45Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6366276998"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "Thanks @jschmied for [this TP1 run](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5865989952), and sorry it took me a few weeks to get back to it. It's the first run on a `main`-based build with all 26 sites (mine was v0.30 with 25), and on RadixArk's checkpoint. Your stock 505–534 s at 128 KiB matches my 475 s on local NVMe.\n\nYour [addendum](https://github.com/jschmied/qwen38-flash-next-gb10/blob/1313d7b4b458f9e0462f0d79c02323663cbacdfd/notes/data/fastload/fastload.txt) is the closer match to current `main`: `1ea7c63f4` predates #58720, and with that expert-name index added the main load is 41.6 / 41.9 s. My NVMe boots had it in every arm: 475 s stock, 46.4 / 54.5 s with this PR. So the index alone doesn't fix the stall; the two stack.\n\nThe drafter fits too. With the name prefilter in both arms, this PR took my drafter from 31.7 s to 2.6–2.9 s. Once the iteration is gone, the copy is most of what's left.\n\nI've added your run to the description, linked to this comment.\n",
+            "createdAt": "2026-10-23T13:42:03Z",
+            "databaseId": 6366277509,
+            "updatedAt": "2026-10-23T13:47:46Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6366277509"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "JimmyToluene"
+            },
+            "body": "@Willian-Zhang measured the stock arm: same Spark and nightly, both boots back to back, page cache dropped before each. \r\n\r\nSwapped out from start to KV profile: stock 9.7 GiB, this PR (+ `ple.py`) 5.2 GiB, so no extra swap from the PR. \r\nBoth are above your 3.2–4.4 GiB because the 28.8 GB PLE table is copied to the GPU here (`cpu_offload: false`) instead of mapped. \r\n\r\nOne boot per arm, so I wouldn't read into stock being higher.\r\n",
+            "createdAt": "2026-10-23T14:20:51Z",
+            "databaseId": 6367079656,
+            "updatedAt": "2026-10-23T14:22:48Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6367079656"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Willian-Zhang.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-10-28T21:38:02Z",
+            "databaseId": 6481304872,
+            "updatedAt": "2026-10-28T21:38:02Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6481304872"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ @Willian-Zhang, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+            "createdAt": "2026-11-02T16:28:20Z",
+            "databaseId": 6582389588,
+            "updatedAt": "2026-11-02T16:28:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582389588"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "stecasta"
+            },
+            "body": "Hi @Willian-Zhang, `ready` is on now, so a `/ci run` from you should start CI.",
+            "createdAt": "2026-11-02T16:31:15Z",
+            "databaseId": 6582455200,
+            "updatedAt": "2026-11-02T16:31:15Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582455200"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-11-02T16:53:19Z",
+            "databaseId": 6582946744,
+            "updatedAt": "2026-11-02T16:53:19Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582946744"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #99263](https://buildkite.com/vllm/ci/builds/99263) for commit `a5dcab3b1891`.\n\nℹ️ This PR is 288 commits behind upstream `main`. Merged upstream `main` into this branch as `a5dcab3b1891` before starting CI. Pull the branch before pushing more changes.",
+            "createdAt": "2026-11-02T16:53:51Z",
+            "databaseId": 6582958567,
+            "updatedAt": "2026-11-02T16:53:51Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582958567"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "Thanks @stecasta for getting `ready` on and for the nudge. `/ci run` started [Buildkite #99263](https://buildkite.com/vllm/ci/builds/99263).\n\nThanks @JimmyToluene, that closes the swap question. On the same node and nightly it's 5.2 GiB with this PR vs 9.7 GiB stock, so no extra swap from the PR. The gap to my 3.2–4.4 GiB fits the 28.8 GB PLE table being copied to the GPU on your setup instead of mapped. Agreed that with one boot per arm, stock being higher doesn't say much.\n",
+            "createdAt": "2026-11-02T16:56:15Z",
+            "databaseId": 6583010687,
+            "updatedAt": "2026-11-02T16:56:15Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6583010687"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "@22quinn @mgoin, could one of you take a look when you have time? This PR touches two paths with code owners: `model_loader/weight_utils.py` (22quinn) and `fused_moe/routed_experts.py` (mgoin and the fused_moe owners).\n\nThe change in both files is mechanical: `x.copy_(w)` becomes `copy_weight_(x, w)`, at the 2 sites in `default_weight_loader` and the 8 in `routed_experts.py`. The helper is in `vllm/model_executor/utils.py`. Off integrated GPUs it's a plain `copy_`.\n\n- Full CI is green on [Buildkite #99263](https://buildkite.com/vllm/ci/builds/99263). Two jobs failed once and passed on the automatic retry: `test_mtp_sharded_sampling_equivalence`, the known flake in #58644, and an H100 DeepGEMM job whose runner exited before the job started.\n- stecasta approved after reproducing the speedup on their own DGX Spark. Independent boot runs on GB10 from gitbisector (TP4), jschmied and JimmyToluene are in the thread above.\n",
+            "createdAt": "2026-11-02T19:43:06Z",
+            "databaseId": 6586757696,
+            "updatedAt": "2026-11-02T19:43:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6586757696"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Willian-Zhang.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-11-02T20:26:58Z",
+            "databaseId": 6587660376,
+            "updatedAt": "2026-11-02T20:26:58Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6587660376"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-11-02T21:24:10Z",
+            "databaseId": 6588819181,
+            "updatedAt": "2026-11-02T21:24:10Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6588819181"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #99351](https://buildkite.com/vllm/ci/builds/99351) for commit `43fe0a4f6c54`.",
+            "createdAt": "2026-11-02T21:24:33Z",
+            "databaseId": 6588826530,
+            "updatedAt": "2026-11-02T21:24:33Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6588826530"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-11-02T23:19:41Z",
+            "databaseId": 6590985877,
+            "updatedAt": "2026-11-02T23:19:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6590985877"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #99369](https://buildkite.com/vllm/ci/builds/99369) for commit `822c261a6fae`.\n\nℹ️ This PR is 4 commits behind upstream `main`. Merged upstream `main` into this branch as `822c261a6fae` before starting CI. Pull the branch before pushing more changes.",
+            "createdAt": "2026-11-02T23:20:07Z",
+            "databaseId": 6590992954,
+            "updatedAt": "2026-11-02T23:20:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6590992954"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "@JimmyToluene this is merged now (437288d18), so the `ple.py` change from [your comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-6349449742) can go in as a follow-up. `_copy_embedding_shard_` on `main` still does `target.copy_(source.to(device=target.device, dtype=target.dtype))`. Your one-line diff to `copy_weight_(target, source)` is all it needs: when the dtypes differ, the helper skips the touch and PyTorch stages the cast through a CPU temporary.\n\nWould you open it? You have the setup that copies the PLE table and the 160 s → 14 s numbers. Please put \"Fixes #58726\" in the description, since that's the last open part of the issue. Tag me and I'll review.\n",
+            "createdAt": "2026-11-03T08:01:23Z",
+            "databaseId": 6598450177,
+            "updatedAt": "2026-11-03T08:01:23Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6598450177"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYlMXAE=",
+          "hasNextPage": false
+        },
+        "totalCount": 28
+      },
+      "headRefOid": "822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "headRepository": {
+        "nameWithOwner": "Willian-Zhang/vllm"
+      },
+      "mergeCommit": {
+        "oid": "437288d18a613c5c8d0f06fbea704dd05c386435"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-03T07:14:20Z",
+      "number": 58868,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5329777284,
+            "state": "COMMENTED",
+            "submittedAt": "2026-09-27T09:41:09Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5329777284"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "stecasta"
+            },
+            "body": "Hi @Willian-Zhang, thanks for the contribution.\n\nLGTM. We reproduced it on a DGX Spark (GB10, TP1). The build is v0.31.0 plus internal patches; the PR applied cleanly as a Python overlay. Same node, page cache dropped before every boot, checkpoint already on local disk (`read_ahead_kb` 128), two boots per arm:\n\n| Model | `Loading weights took`, main model | `Model loading took` | start to `/health` |\n|---|---:|---:|---:|\n| `nvidia/Qwen3.8-27B-NVFP4` + DFlash2 drafter, stock | 96.5 / 96.7 s | 122 / 122 s | 595 / 591 s |\n| same, this PR | **9.5 / 9.8 s** | **16 / 16 s** | **486 / 486 s** |\n\nGSM8K-256 on the PR arm is 244/256, in line with stock. Minimum `MemAvailable` (~38.5 GiB) and peak swap (0.5 GiB) during load were the same with and without the PR.\n\nWe also tried a model whose routed experts are loaded by an out-of-tree loader that calls `.copy_()` itself, the \"not covered\" case in your description. Routing that one call through `copy_weight_` moved ~55 GiB of copies onto the touch path and cut its weight loading by about 70%, so the helper carries over to other loaders as soon as they call it.\n\nMinor: since `copy_weight_` is the entry point for this, a line in its docstring saying that model-specific loaders should use it instead of `.copy_()` for host-to-device weight copies would help the next loader author find it.\n",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5496877797,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-12T23:01:29Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5496877797"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "arpera"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "arpera"
+                  },
+                  "body": "Agent point to potential bug that is_contiguous check does not gurantee that view can be safely called. For example:\r\n```\r\nsrc = torch.arange(2, dtype=torch.float32)[::2]\r\n# shape=(1,), stride=(2,), is_contiguous() == True\r\n\r\nsrc.reshape(-1).view(torch.uint8)\r\n# RuntimeError: self.stride(-1) must be 1\r\n```\r\nCheck this please if it makes sense",
+                  "createdAt": "2026-11-02T22:04:32Z",
+                  "databaseId": 4448330578,
+                  "diffHunk": "@@ -68,6 +71,36 @@ def set_weight_attrs(\n         setattr(weight, key, value)\n \n \n+@functools.cache\n+def _is_integrated_gpu(device: torch.device) -> bool:\n+    return device.type == \"cuda\" and current_platform.is_integrated_gpu(device.index)\n+\n+\n+def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:\n+    \"\"\"`dst.copy_(src)` for weight loaders.\n+\n+    Model-specific weight loaders should call this instead of `.copy_()` when\n+    copying a checkpoint tensor to the device. Off integrated GPUs it is a\n+    plain `copy_`.\n+\n+    On integrated GPUs, a host-to-device copy straight from a safetensors mmap\n+    takes its page faults inside the driver copy, which is several times slower\n+    than faulting them on the CPU, so touch one byte per page of `src` first.\n+    PyTorch already stages non-contiguous and dtype-converting copies through\n+    a CPU temporary.\n+    \"\"\"\n+    if (\n+        src.device.type == \"cpu\"\n+        and src.dtype == dst.dtype\n+        and src.is_contiguous()\n+        and _is_integrated_gpu(dst.device)\n+    ):\n+        flat = src.reshape(-1).view(torch.uint8)",
+                  "line": 100,
+                  "originalLine": 98,
+                  "path": "vllm/model_executor/utils.py",
+                  "updatedAt": "2026-11-02T22:05:03Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58868#discussion_r4448330578"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQyMjowNDozMlrPAAAAAQkkI1I=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5744047302,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-02T22:04:40Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5744047302"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Willian-Zhang"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "Willian-Zhang"
+                  },
+                  "body": "Thanks @arpera, it does make sense, and it's a real bug. `is_contiguous()` ignores the stride of size-1 dims, so a source with at most one element counts as contiguous whatever its stride. `reshape(-1)` keeps that stride, and `view(torch.uint8)` needs `stride(-1) == 1` when the element size changes. On an integrated GPU, such a source raised instead of being copied.\n\nIt only affects sources with at most one element. Over 50k random contiguous layouts in fp32, bf16 and uint8, the previous head raised for some 0- and 1-element fp32 and bf16 sources and never for 2 or more elements. 1-byte dtypes never raised. None of the GB10 boots in this thread hit it, but the helper is meant for model-specific loaders too, so it shouldn't depend on that.\n\n91fe940d6 skips the touch when `src.numel() <= 1`, since such a source spans at most one page and there's nothing to fault in ahead of the copy. It also adds your example to `test_copy_weight_prefault_copies_exact_bytes`. That case fails on the previous head and passes now.\n",
+                  "createdAt": "2026-11-02T23:19:28Z",
+                  "databaseId": 4448957734,
+                  "diffHunk": "@@ -68,6 +71,36 @@ def set_weight_attrs(\n         setattr(weight, key, value)\n \n \n+@functools.cache\n+def _is_integrated_gpu(device: torch.device) -> bool:\n+    return device.type == \"cuda\" and current_platform.is_integrated_gpu(device.index)\n+\n+\n+def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:\n+    \"\"\"`dst.copy_(src)` for weight loaders.\n+\n+    Model-specific weight loaders should call this instead of `.copy_()` when\n+    copying a checkpoint tensor to the device. Off integrated GPUs it is a\n+    plain `copy_`.\n+\n+    On integrated GPUs, a host-to-device copy straight from a safetensors mmap\n+    takes its page faults inside the driver copy, which is several times slower\n+    than faulting them on the CPU, so touch one byte per page of `src` first.\n+    PyTorch already stages non-contiguous and dtype-converting copies through\n+    a CPU temporary.\n+    \"\"\"\n+    if (\n+        src.device.type == \"cpu\"\n+        and src.dtype == dst.dtype\n+        and src.is_contiguous()\n+        and _is_integrated_gpu(dst.device)\n+    ):\n+        flat = src.reshape(-1).view(torch.uint8)",
+                  "line": 100,
+                  "originalLine": 98,
+                  "path": "vllm/model_executor/utils.py",
+                  "updatedAt": "2026-11-02T23:19:28Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/58868#discussion_r4448957734"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMS0wMlQyMzoxOToyOFrPAAAAAQkttSY=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5744818513,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-02T23:19:28Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5744818513"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "arpera"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5745781727,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-03T01:17:07Z",
+            "url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5745781727"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wM1QwMToxNzowN1q0MjAyNi0xMS0wM1QwMToxNzowN1rPAAAAAVZ5q98=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "MERGED",
+      "title": "[Perf][Model Loader] Fault in mmap'd weight pages before host-to-device copies on integrated GPUs",
+      "updatedAt": "2026-11-03T08:01:23Z",
+      "url": "https://github.com/vllm-project/vllm/pull/58868"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "a11d3a15f6f04ae426a0a5162f293e95163103cc"
+    },
+    "body": "## Purpose\n\nAddresses #58726.\n\nOn integrated GPUs (DGX Spark / GB10), the shared weight loaders copy each checkpoint tensor to the GPU with `param.copy_(loaded_weight)` straight from the safetensors mmap view. For a contiguous, same-dtype source, PyTorch passes that pageable pointer directly to the driver copy, so the page faults happen inside the copy. On GB10 that is several times slower than faulting the same pages on the CPU first: 1.7–3.0 ms vs 0.08–0.64 ms per 800 KiB tensor in #58726. `nvidia/Qwen3.8-Flash-Next-NVFP4` has at least 140k such tensors, and its main weight load takes 452 s from NFS and 475 s from local NVMe.\n\nThis adds `copy_weight_(dst, src)` to `vllm/model_executor/utils.py`. On an integrated GPU it touches one byte per page of `src`, then runs `dst.copy_(src)`. It is used at the 26 copy sites of the shared loaders: `linear.py` (8), `parameter.py` (6), `routed_experts.py` (8), `vocab_parallel_embedding.py` (2) and `default_weight_loader` (2).\n\n- **Gate:** `current_platform.is_integrated_gpu()` for a CUDA destination, cached per device. On a discrete Ada Lovelace GPU the same micro-benchmark shows the plain copy is fastest in every cache state, and the touch adds 0.022–0.028 ms per tensor, so it stays off there. When off, the extra checks cost ~0.46 µs per call (0.91 vs 0.45 µs for a 16-byte CPU copy), about 0.14 s per 300k tensors.\n- **Only contiguous, same-dtype CPU sources are touched.** Non-contiguous or dtype-converting copies already go through a CPU temporary in PyTorch (`copy_requires_temporaries` in `aten/src/ATen/native/cuda/Copy.cu`), which faults the pages on the CPU.\n- **Why at the copy site rather than in `safetensors_weights_iterator`** (discussed with @gitbisector in #58726):\n  - Under TP each rank touches only the slice it copies. A prefault in the iterator read whole tensors: ~287 GiB per rank on DeepSeek-V4.1 TP4, and a slower load at the default `read_ahead_kb=128`.\n  - The touch runs right before the copy, so a consumer that buffers the weight stream can't have the pages evicted in between.\n  - Tensors a model serves from the mapping (#58439) are never copied, so they are never touched, and no size cap is needed.\n- **Not covered:** model-specific loaders that call `.copy_()` or `.to(device)` themselves keep today's behaviour until they call the helper. Its docstring says to. @stecasta routed one such out-of-tree expert loader through it: ~55 GiB of copies moved onto the touch path, and its weight loading took about 70% less time. @JimmyToluene found an in-tree one, the Qwen4Exp PLE shard copy in `vllm/models/qwen4_exp/common/ple.py`; routing it through the helper is a follow-up.\n- **Measured only on GB10** (TP=1 below, TP=4 by @gitbisector). Other integrated devices, such as Jetson Orin / Thor, will take the touch path but are untested. I haven't checked what GH200 reports as `is_integrated`; if it reports 0, nothing changes there.\n\n## Test Plan\n\n- New tests in `tests/model_executor/test_utils.py`:\n  - `test_copy_weight_prefault_copies_exact_bytes`: with the gate forced on, the helper accepts 0-d, empty, bf16, fp8 and dim-1-narrowed sources and copies them byte for byte. CI has no integrated GPU, so this is the only coverage of that path.\n  - `test_copy_weight_prefault_maps_the_mmap_view`: after the call, every page of a safetensors view is mapped (`/proc/self/smaps` Rss of the file mapping). With the touch disabled it fails: 64 KiB mapped vs 4 MiB.\n- Existing CPU-runnable loader tests, before and after the change.\n- `pre-commit` on the changed files, including `mypy-3.12 --hook-stage manual`.\n- Boot A/B on a DGX Spark.\n\n```bash\n# CPU only, repo on PYTHONPATH inside vllm/vllm-openai:v0.30.0 (torch 2.13.0+cu130), no GPU\ndocker run --rm -v $PWD:/w:ro -e PYTHONPATH=/w -w /w --entrypoint bash vllm/vllm-openai:v0.30.0 -c \\\n  \"uv pip install --system -q tblib pytest && python3 -m pytest -q \\\n   tests/model_executor/test_utils.py \\\n   tests/kernels/moe/test_moe_weight_loading_padded.py tests/kernels/moe/test_fp8_tp_loading.py \\\n   tests/model_executor/model_loader/test_weight_tying.py \\\n   tests/model_executor/model_loader/test_gpt_oss_weight_loading.py \\\n   tests/model_executor/model_loader/test_ep_weight_filter.py \\\n   tests/model_executor/model_loader/test_reload.py tests/model_executor/test_weight_utils.py\"\n\npre-commit run --files <changed files>\npre-commit run mypy-3.12 --hook-stage manual --files <changed files>\n```\n\n## Test Result\n\n- `tests/model_executor/test_utils.py`: 18 passed (12 existing, 6 new).\n- Loader tests: 216 passed, 5 skipped. 38 tests fail with and without the change, the same set on both, all because the container has no GPU:\n  - 18 error at setup with `Failed to infer device type`.\n  - 18 `test_reload` cases fail because `current_platform.device_count` is `None`.\n  - 2 `test_fp8_tp_default_keeps_refined_layout[*-triton]` cases can't confirm the Triton kernel, so the layer pads its TP shard instead of refining the block shape.\n- `pre-commit` and `mypy-3.12` passed.\n\n### Boot A/B, DGX Spark (GB10), TP=1\n\nNine full server boots of `nvidia/Qwen3.8-Flash-Next-NVFP4`, interleaved, with the client page cache for the checkpoint dropped before each one.\n\n- **Build:** the image is vLLM v0.30.0 plus out-of-tree patches, not `main`. The helper is copied from this branch and applied to v0.30.0's copies of the same files (25 sites; v0.30.0's `_load_w2` has no chunk loop). It predates a cleanup that renamed the gate function and dropped a redundant `numel() > 0` check, which doesn't change behaviour here. A counting wrapper, not part of this PR, logged the gate and how many copies were touched.\n- **Out-of-tree patches on in every arm:** the expert-name index (= #58720, merged), an MTP name prefilter, and the PLE table served from the mapping (never copied).\n- **Storage:** NFS with the client's `read_ahead_kb` at 16384, or local NVMe at the default 128.\n\n| loader | storage | main load (s) | MTP load (s) | start → `/health` (s) | swapped out, start → KV profile (GiB) |\n|---|---|---:|---:|---:|---:|\n| stock | NFS | 451.8 | 36.1 | 584 | 4.4 |\n| this PR (3 boots) | NFS | 25.9 / 27.0 / 28.0 | 0.8 | 124–129 | 3.6–4.3 |\n| stock | NVMe | 475.2 | 31.7 | 609 | 4.2 |\n| this PR (2 boots) | NVMe | 46.4 / 54.5 | 2.6–2.9 | 149–153 | 3.2–4.0 |\n| *out-of-tree, for reference: `pread` tensors ≤ 64 MiB in the iterator, clone / chunked copy above that* | NFS / NVMe | 21.0 / 88.5 | 1.2 / 1.3 | 113 / 179 | 0 / 0 |\n\n- The gate logged `cuda:0 = True` in every boot with this PR. By the counter's last line (140,000 calls), 139,965 copies (63.4 GiB) had been touched. The other 35 were copies PyTorch stages through a CPU temporary anyway.\n- Greedy outputs (5 prompts × 400 tokens, temperature 0) and first-token logprobs are identical in all nine boots, and decode speed is unchanged. No accuracy eval was run here: the touch only reads the source, so the loaded weights are byte-identical (unit test above). @stecasta's GSM8K run is below.\n- Swap: loading from mmap views pushes 3.2–4.4 GiB of other memory to swap on this 128 GB machine, and stock loading does it as much as this PR. The pread variant doesn't map the files and doesn't swap. vLLM counts the swapped-out memory as free when it sizes the KV cache. I haven't looked into why the kernel swaps here.\n\n### TP=1, warm cache (from @hclsys, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5919067348))\n\n`Qwen3-1.7B` on one GB10, `load_format=safetensors`, `enforce_eager`, page cache warm, fresh process per run, this branch vs its merge-base `77871126f9`.\n\n| | `Loading weights took` | `LLM()` init |\n|---|---:|---:|\n| merge-base (3 runs) | 20.2–23.7 s | 44.4–54.8 s |\n| this PR (2 runs) | 0.50 / 0.69 s | 26.3 / 29.4 s |\n\nThe third base run came after the PR runs, so the difference isn't cache order. With the cache warm the time isn't disk reads but the faults taken through a fresh mapping during the copy. On a discrete RTX PRO 6000 the touch makes no difference, ~0.1 ms per tensor either way (@gitbisector, [comment](https://github.com/vllm-project/vllm/issues/58726#issuecomment-5918595410)).\n\n### TP=1, cold cache (from @stecasta, [review](https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5496877797))\n\n`nvidia/Qwen3.8-27B-NVFP4` with a DFlash2 drafter on one GB10, v0.31.0 plus internal patches with this PR applied as a Python overlay. Checkpoint on local disk (`read_ahead_kb=128`), page cache dropped before every boot, two boots per arm.\n\n| | `Loading weights took`, main model | `Model loading took` | start → `/health` |\n|---|---:|---:|---:|\n| stock | 96.5 / 96.7 s | 122 / 122 s | 595 / 591 s |\n| this PR | 9.5 / 9.8 s | 16 / 16 s | 486 / 486 s |\n\nGSM8K-256 with this PR: 244/256, in line with stock. Minimum `MemAvailable` (~38.5 GiB) and peak swap (0.5 GiB) during load were the same in both arms.\n\n### TP=1 on a `main`-based nightly (from @jschmied, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5865989952))\n\nRadixArk's ModelOpt NVFP4/FP8 Qwen3.8-Flash-Next (120 GB, 206 files) on local NVMe at `read_ahead_kb` 128, nightly `1ea7c63f4` with this PR's diff (all 26 sites), 2 cold starts per arm, alternating. Main weight load 504.9 / 534.0 s stock, 65.9 / 64.9 s with this PR. With the expert-name index from #58720 (merged after `1ea7c63f4`) as well, 41.6 / 41.9 s ([data](https://github.com/jschmied/qwen38-flash-next-gb10/blob/1313d7b4b458f9e0462f0d79c02323663cbacdfd/notes/data/fastload/fastload.txt)). Greedy output identical in every start.\n\n### TP=1, cold cache, current head (from @JimmyToluene, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-6349449742))\n\nQwen3.8-Flash-Next NVFP4 (103 GiB, 299,817 tensors) on one GB10, nightly `21d93d0d8c0e` with this PR at `f66f2108c`. Local NVMe at `read_ahead_kb=128`, page cache dropped before each boot, one boot per arm. In stock, py-spy put 97.7% of load samples on the two expert `copy_` lines in `routed_experts.py`, with no I/O wait.\n\n| | stock | this PR |\n|---|---:|---:|\n| main `Loading weights took` | 660.7 s | 71.3 s |\n|  routed experts, 70.6 GB | 435 s | 52 s |\n|  dense, 10.3 GB | 63 s | 5 s |\n|  PLE n-gram table, 28.8 GB | 160 s | 14 s\\* |\n| MTP drafter load | 82.8 s | 55.5 s |\n| start → `/health` | 969 s | 345 s |\n\n\\* With one more call site, the PLE shard copy in `vllm/models/qwen4_exp/common/ple.py`, routed through `copy_weight_`. This PR doesn't change that file, so on its own the PLE table stays on the stock path.\n\nTeacher-forced logprobs of 16 fixed generations (3,761 tokens) differ from stock by mean |Δlogprob| 0.034 (p99 0.37), the same as stock against itself.\n\n### TP=4 (from @gitbisector, [comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5852543296))\n\n`DeepSeek-V4.1-Flash` on four GB10s, this PR ported to a v0.28.1-based build (25 of the 26 sites), load-only boots, page cache dropped before each, arms interleaved. Times are `Model loading took` on the slowest rank.\n\n| `read_ahead_kb` | boots | stock | this PR | read per rank vs stock |\n|---|---|---:|---:|---:|\n| 1024 | 3 + 3 | 192–195 s | 156–161 s (−18%) | +0–8 GiB |\n| 128 | 3 + 3 | 205–207 s | 149–151 s (−27%) | +0–8 GiB |\n| 1024, consumer that sorts the stream | 1 + 1 | 248 s | 225 s | +2–10 GiB |\n\nAt 128 the iterator-level prefault made this load slower (202 → 241 s) because every rank read whole tensors (~287 GiB); at the copy site each rank reads about what stock reads. Most of the gain is the slowest rank catching up: in stock, the ranks holding slices 0 and 2 lag by 25–60 s on small same-dtype slices (expert scales, FP8 attention rows). The routed experts there are `I8` loaded into `uint8` params, a converting copy that PyTorch already stages on the CPU, so the helper touches 5.6 of 72.3 GiB per rank.\n\n## Duplicate-work check\n\n- No open PR references #58726; searches for \"prefault\", \"integrated gpu weight loading\" and \"mmap page fault copy\" found none that change these copy sites.\n- #49991 (ROCm, clones in the iterator behind an env flag, for a KFD copy-on-write issue) and #50794 (Ascend, clones before the H2D copy to avoid a DMA hang) handle the same copies on other platforms, for different causes.\n- #57973 (safetensors prefetch loader) and #55985 (fastsafetensors fit planner) are alternative load paths.\n- #58857 / #58782 remove the `sorted()` buffering in the DeepSeek-V4 VL wrappers; complementary to this.\n\n## AI assistance\n\nAI-assisted (Claude Opus 5.5): implementation, tests, the boot A/B scripts, and a draft of this description. I reviewed every changed line and ran the tests and boots above on my own machines.\n",
+    "changed_files": 7,
+    "head": {
+      "repo": {
+        "full_name": "Willian-Zhang/vllm"
+      },
+      "sha": "822c261a6faed2f4c056185c04d9a9c969fe5939"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/58868",
+    "merge_commit_sha": "437288d18a613c5c8d0f06fbea704dd05c386435",
+    "merged": true,
+    "merged_at": "2026-11-03T07:14:20Z",
+    "number": 58868,
+    "state": "closed",
+    "title": "[Perf][Model Loader] Fault in mmap'd weight pages before host-to-device copies on integrated GPUs",
+    "updated_at": "2026-11-03T08:01:23Z"
+  },
+  "files": [
+    {
+      "additions": 67,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/822c261a6faed2f4c056185c04d9a9c969fe5939/tests%2Fmodel_executor%2Ftest_utils.py",
+      "changes": 67,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fmodel_executor%2Ftest_utils.py?ref=822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "deletions": 0,
+      "filename": "tests/model_executor/test_utils.py",
+      "patch": "@@ -1,9 +1,11 @@\n # SPDX-License-Identifier: Apache-2.0\n # SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n \n+from pathlib import Path\n \n import pytest\n import torch\n+from safetensors.torch import safe_open, save_file\n \n from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (\n     MPLinearKernel,\n@@ -14,6 +16,7 @@\n     permute_param_layout_,\n )\n from vllm.model_executor.utils import (\n+    copy_weight_,\n     get_live_param,\n     kernel_parameters,\n     move_parameter,\n@@ -425,6 +428,70 @@ def test_transposed_kept_param_keeps_checkpoint_dims(single_rank_tp: None) -> No\n     assert (weight.input_dim, weight.output_dim) == (1, 0)\n \n \n+@pytest.fixture\n+def prefault_on(monkeypatch: pytest.MonkeyPatch) -> None:\n+    \"\"\"Take the integrated-GPU path of `copy_weight_` without a GPU.\"\"\"\n+    monkeypatch.setattr(\n+        \"vllm.model_executor.utils._is_integrated_gpu\", lambda device: True\n+    )\n+\n+\n+@pytest.mark.parametrize(\n+    \"src\",\n+    [\n+        torch.tensor(0.5),\n+        torch.empty(0, 8),\n+        torch.randn(64, 1024).to(torch.bfloat16),\n+        torch.randint(0, 256, (64, 1024), dtype=torch.uint8).view(torch.float8_e4m3fn),\n+        torch.randn(64, 1024).narrow(1, 512, 512),\n+        torch.arange(2, dtype=torch.float32)[::2],\n+    ],\n+    ids=[\"0d\", \"empty\", \"bf16\", \"fp8\", \"dim1_narrow\", \"strided_1elem\"],\n+)\n+def test_copy_weight_prefault_copies_exact_bytes(\n+    prefault_on: None, src: torch.Tensor\n+) -> None:\n+    \"\"\"The touch only runs on integrated GPUs, which CI doesn't have. It must\n+    accept the shapes and dtypes weight loaders pass and leave the copy\n+    unchanged.\n+    \"\"\"\n+    dst = torch.empty_like(src, memory_format=torch.contiguous_format)\n+    copy_weight_(dst, src)\n+    expected = src.clone(memory_format=torch.contiguous_format)\n+    assert torch.equal(\n+        dst.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8)\n+    )\n+\n+\n+def test_copy_weight_prefault_maps_the_mmap_view(\n+    prefault_on: None, tmp_path: Path\n+) -> None:\n+    \"\"\"Every page of the safetensors view must be mapped before the copy: a\n+    host-to-device copy that takes those faults itself is the slow path on\n+    integrated GPUs (#58726). The meta destination keeps the copy itself from\n+    reading the source.\n+    \"\"\"\n+    path = str((tmp_path / \"w.safetensors\").resolve())\n+    save_file({\"w\": torch.randn(1 << 20)}, path)\n+\n+    def mapped_bytes() -> int:\n+        total, in_file = 0, False\n+        with open(\"/proc/self/smaps\") as smaps:\n+            for line in smaps:\n+                fields = line.split()\n+                if \":\" not in fields[0]:\n+                    in_file = fields[-1] == path\n+                elif in_file and fields[0] == \"Rss:\":\n+                    total += int(fields[1]) * 1024\n+        return total\n+\n+    with safe_open(path, framework=\"pt\") as f:\n+        src = f.get_tensor(\"w\")\n+        assert mapped_bytes() < src.nbytes\n+        copy_weight_(torch.empty_like(src, device=\"meta\"), src)\n+        assert mapped_bytes() >= src.nbytes\n+\n+\n @pytest.mark.parametrize(\n     \"held,shape,in_place\",\n     [(True, (2, 3), True), (True, (3, 3), False), (False, (2, 3), False)],",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/822c261a6faed2f4c056185c04d9a9c969fe5939/tests%2Fmodel_executor%2Ftest_utils.py",
+      "sha": "78bfb3caa591e885d6e1ed380cb5d37ee32ea968",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Frouted_experts.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Frouted_experts.py?ref=822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "deletions": 9,
+      "filename": "vllm/model_executor/layers/fused_moe/routed_experts.py",
+      "patch": "@@ -30,7 +30,7 @@\n     QuantizationConfig,\n     resolve_quant_method,\n )\n-from vllm.model_executor.utils import kernel_parameters\n+from vllm.model_executor.utils import copy_weight_, kernel_parameters\n from vllm.utils.math_utils import cdiv\n \n if TYPE_CHECKING:\n@@ -389,7 +389,7 @@ def _load_combined_w13_weight_scale(\n         loaded_weight = loaded_weight.narrow(\n             shard_dim, shard_size * tp_rank, shard_size\n         )\n-        param.copy_(loaded_weight)\n+        copy_weight_(param, loaded_weight)\n \n     def _load_model_weight_or_group_weight_scale(\n         self,\n@@ -471,7 +471,7 @@ def _load_per_channel_weight_scale(\n                 hidden_dim=hidden_dim,\n                 shard_dim=shard_dim,\n             )\n-            expert_data.copy_(loaded_weight)\n+            copy_weight_(expert_data, loaded_weight)\n         elif shard_id in (\"w1\", \"w3\"):\n             self._load_w13(\n                 shard_id=shard_id,\n@@ -598,7 +598,7 @@ def _load_w13(\n             hidden_dim=hidden_dim,\n             shard_dim=shard_dim,\n         )\n-        expert_data.copy_(loaded_weight)\n+        copy_weight_(expert_data, loaded_weight)\n \n     def _load_w2(\n         self,\n@@ -647,9 +647,9 @@ def _load_w2(\n                 expert_data.chunk(num_chunks, dim=0),\n                 loaded_weight.chunk(num_chunks, dim=0),\n             ):\n-                dst.copy_(src)\n+                copy_weight_(dst, src)\n             return\n-        expert_data.copy_(loaded_weight)\n+        copy_weight_(expert_data, loaded_weight)\n \n     def _load_single_value(\n         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int\n@@ -697,11 +697,11 @@ def weight_loader(\n             # (FIXME) for gpt-oss all experts are combined\n             if \"bias\" in weight_name:\n                 dim1 = loaded_weight.shape[1]\n-                param.data[:, :dim1].copy_(loaded_weight)\n+                copy_weight_(param.data[:, :dim1], loaded_weight)\n             else:\n                 dim1 = loaded_weight.shape[1]\n                 dim2 = loaded_weight.shape[2]\n-                param.data[:, :dim1, :dim2].copy_(loaded_weight)\n+                copy_weight_(param.data[:, :dim1, :dim2], loaded_weight)\n             return True if return_success else None\n \n         from vllm.model_executor.layers.quantization.online.moe_base import (\n@@ -812,7 +812,7 @@ def weight_loader(\n                     loaded_weight,\n                     hidden_dim=0,\n                 )\n-                expert_data.copy_(loaded_weight)\n+                copy_weight_(expert_data, loaded_weight)\n             else:\n                 self._load_w13(\n                     shard_id=shard_id,",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Flayers%2Ffused_moe%2Frouted_experts.py",
+      "sha": "bca5ec9c01ed7a78932e6ebe6516576faacaff8c",
+      "status": "modified"
+    },
+    {
+      "additions": 9,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Flayers%2Flinear.py",
+      "changes": 18,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Flinear.py?ref=822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "deletions": 9,
+      "filename": "vllm/model_executor/layers/linear.py",
+      "patch": "@@ -44,7 +44,7 @@\n     PerTensorScaleParameter,\n     RowvLLMParameter,\n )\n-from vllm.model_executor.utils import set_weight_attrs\n+from vllm.model_executor.utils import copy_weight_, set_weight_attrs\n from vllm.platforms import current_platform\n \n logger = init_logger(__name__)\n@@ -413,7 +413,7 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):\n             f\"Tried to load weights of size {loaded_weight.size()}\"\n             f\"to a parameter of size {param.size()}\"\n         )\n-        param.data.copy_(loaded_weight)\n+        copy_weight_(param.data, loaded_weight)\n \n     def forward(\n         self,\n@@ -607,7 +607,7 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):\n             loaded_weight = loaded_weight.reshape(1)\n \n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):\n         # Special case for loading scales off disk, which often do not\n@@ -796,7 +796,7 @@ def weight_loader(\n                     )\n \n                 assert param_data.shape == loaded_weight.shape\n-                param_data.copy_(loaded_weight)\n+                copy_weight_(param_data, loaded_weight)\n                 return\n \n             output_sizes = (\n@@ -881,7 +881,7 @@ def weight_loader(\n                 )\n \n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n     def _load_fused_module_from_checkpoint(\n         self,\n@@ -1236,7 +1236,7 @@ def weight_loader(\n                     )\n \n                 assert param_data.shape == loaded_weight.shape\n-                param_data.copy_(loaded_weight)\n+                copy_weight_(param_data, loaded_weight)\n                 return\n             shard_offsets = [\n                 # (shard_id, shard_offset, shard_size)\n@@ -1338,7 +1338,7 @@ def weight_loader(\n                 )\n \n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n     def load_weights(\n         self, weights: Iterable[tuple[str, torch.Tensor]]\n@@ -1560,7 +1560,7 @@ def weight_loader(\n             output_dim, shard_rank * shard_size, shard_size\n         )\n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n \n class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):\n@@ -1789,7 +1789,7 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):\n             loaded_weight = loaded_weight.reshape(1)\n \n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):\n         # Special case for loading scales off disk, which often do not",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Flayers%2Flinear.py",
+      "sha": "712cbd27994e6b28686d28e37b5cc820501a6bd2",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Flayers%2Fvocab_parallel_embedding.py",
+      "changes": 6,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Fvocab_parallel_embedding.py?ref=822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "deletions": 3,
+      "filename": "vllm/model_executor/layers/vocab_parallel_embedding.py",
+      "patch": "@@ -33,7 +33,7 @@\n     maybe_use_skinny_gemm,\n )\n from vllm.model_executor.parameter import BasevLLMParameter\n-from vllm.model_executor.utils import set_weight_attrs\n+from vllm.model_executor.utils import copy_weight_, set_weight_attrs\n from vllm.platforms import current_platform\n \n DEFAULT_VOCAB_PADDING_SIZE = 64\n@@ -496,7 +496,7 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):\n             ):\n                 loaded_weight = loaded_weight.reshape(1)\n             assert param.data.shape == loaded_weight.shape\n-            param.data.copy_(loaded_weight)\n+            copy_weight_(param.data, loaded_weight)\n             return\n \n         # Shard indexes for loading the weight\n@@ -521,7 +521,7 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):\n \n         # Copy the data. Select chunk corresponding to current shard.\n         loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)\n-        param[: loaded_weight.shape[0]].data.copy_(loaded_weight)\n+        copy_weight_(param[: loaded_weight.shape[0]].data, loaded_weight)\n         param[loaded_weight.shape[0] :].data.fill_(0)\n \n     def forward(self, input_):",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Flayers%2Fvocab_parallel_embedding.py",
+      "sha": "0913d7913fc8d544f3957c58bb8a4b1aaea0a74c",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Fmodel_loader%2Fweight_utils.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fmodel_loader%2Fweight_utils.py?ref=822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "deletions": 2,
+      "filename": "vllm/model_executor/model_loader/weight_utils.py",
+      "patch": "@@ -48,6 +48,7 @@\n from vllm.model_executor.model_loader.ep_weight_filter import (\n     should_skip_weight,\n )\n+from vllm.model_executor.utils import copy_weight_\n from vllm.platforms import current_platform\n from vllm.tracing import instrument\n from vllm.transformers_utils.repo_utils import hf_api, hf_fs\n@@ -1553,14 +1554,14 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N\n             # Sometimes scalar values aren't considered tensors with shapes\n             # so if both param and loaded_weight are a scalar,\n             # reshape to match before copying\n-            param.data.copy_(loaded_weight.view(param.shape))\n+            copy_weight_(param.data, loaded_weight.view(param.shape))\n         else:\n             assert param.size() == loaded_weight.size(), (\n                 f\"Attempted to load weight ({loaded_weight.size()}) \"\n                 f\"into parameter ({param.size()})\"\n             )\n \n-            param.data.copy_(loaded_weight)\n+            copy_weight_(param.data, loaded_weight)\n     except Exception:\n         # NOTE: This exception is added for the purpose of setting breakpoint to\n         # debug weight loading issues.",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Fmodel_loader%2Fweight_utils.py",
+      "sha": "11d37a3b25f9fe678fc6227794a24ccc80adffb2",
+      "status": "modified"
+    },
+    {
+      "additions": 7,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Fparameter.py",
+      "changes": 13,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fparameter.py?ref=822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "deletions": 6,
+      "filename": "vllm/model_executor/parameter.py",
+      "patch": "@@ -14,6 +14,7 @@\n     get_tensor_model_parallel_world_size,\n )\n from vllm.logger import init_logger\n+from vllm.model_executor.utils import copy_weight_\n \n __all__ = [\n     \"BasevLLMParameter\",\n@@ -92,7 +93,7 @@ def _assert_and_load(self, loaded_weight: torch.Tensor):\n         assert self.data.shape == loaded_weight.shape or self._is_1d_and_scalar(\n             loaded_weight\n         )\n-        self.data.copy_(loaded_weight)\n+        copy_weight_(self.data, loaded_weight)\n \n     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):\n         self._assert_and_load(loaded_weight)\n@@ -142,7 +143,7 @@ def load_column_parallel_weight(self, loaded_weight: torch.Tensor):\n             self.output_dim, self.tp_rank * shard_size, shard_size\n         )\n         assert self.data.shape == loaded_weight.shape\n-        self.data.copy_(loaded_weight)\n+        copy_weight_(self.data, loaded_weight)\n \n     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):\n         shard_offset: int = kwargs[\"shard_offset\"]\n@@ -164,7 +165,7 @@ def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):\n             self.output_dim, self.tp_rank * shard_size, shard_size\n         )\n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):\n         shard_offset: int = kwargs[\"shard_offset\"]\n@@ -189,7 +190,7 @@ def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):\n         )\n \n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n \n class RowvLLMParameter(BasevLLMParameter):\n@@ -217,7 +218,7 @@ def load_row_parallel_weight(self, loaded_weight: torch.Tensor):\n             loaded_weight = loaded_weight.reshape(1)\n \n         assert self.data.shape == loaded_weight.shape\n-        self.data.copy_(loaded_weight)\n+        copy_weight_(self.data, loaded_weight)\n \n \n class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):\n@@ -291,7 +292,7 @@ def _load_into_shard_id(\n \n         param_data = param_data[shard_id]\n         assert param_data.shape == loaded_weight.shape\n-        param_data.copy_(loaded_weight)\n+        copy_weight_(param_data, loaded_weight)\n \n \n class PackedColumnParameter(_ColumnvLLMParameter):",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Fparameter.py",
+      "sha": "d147bce215a59473ae995adac5de6de28f6966fb",
+      "status": "modified"
+    },
+    {
+      "additions": 35,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Futils.py",
+      "changes": 35,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Futils.py?ref=822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "deletions": 0,
+      "filename": "vllm/model_executor/utils.py",
+      "patch": "@@ -3,12 +3,15 @@\n \"\"\"Utils for model executor.\"\"\"\n \n import copy\n+import functools\n+import mmap\n from contextlib import contextmanager\n from contextvars import ContextVar\n from typing import Any, overload\n \n import torch\n \n+from vllm.platforms import current_platform\n from vllm.utils.torch_utils import is_torch_equal_or_newer\n \n _weights_pre_processed: ContextVar[bool] = ContextVar(\n@@ -68,6 +71,38 @@ def set_weight_attrs(\n         setattr(weight, key, value)\n \n \n+@functools.cache\n+def _is_integrated_gpu(device: torch.device) -> bool:\n+    return device.type == \"cuda\" and current_platform.is_integrated_gpu(device.index)\n+\n+\n+def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:\n+    \"\"\"`dst.copy_(src)` for weight loaders.\n+\n+    Model-specific weight loaders should call this instead of `.copy_()` when\n+    copying a checkpoint tensor to the device. Off integrated GPUs it is a\n+    plain `copy_`.\n+\n+    On integrated GPUs, a host-to-device copy straight from a safetensors mmap\n+    takes its page faults inside the driver copy, which is several times slower\n+    than faulting them on the CPU, so touch one byte per page of `src` first.\n+    PyTorch already stages non-contiguous and dtype-converting copies through\n+    a CPU temporary. Sources with at most one element are skipped: they count\n+    as contiguous with any stride, which `view(torch.uint8)` rejects.\n+    \"\"\"\n+    if (\n+        src.device.type == \"cpu\"\n+        and src.dtype == dst.dtype\n+        and src.numel() > 1\n+        and src.is_contiguous()\n+        and _is_integrated_gpu(dst.device)\n+    ):\n+        flat = src.reshape(-1).view(torch.uint8)\n+        flat[:: mmap.PAGESIZE].sum()\n+        flat[-1:].sum()\n+    return dst.copy_(src)\n+\n+\n def _extent(t: torch.Tensor) -> int:\n     \"\"\"Number of elements spanned by ``t`` in its storage.\"\"\"\n     if t.numel() == 0:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/822c261a6faed2f4c056185c04d9a9c969fe5939/vllm%2Fmodel_executor%2Futils.py",
+      "sha": "7c6d435bf5e379f4ce1fb493163385752fc38a22",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "Agent point to potential bug that is_contiguous check does not gurantee that view can be safely called. For example:\r\n```\r\nsrc = torch.arange(2, dtype=torch.float32)[::2]\r\n# shape=(1,), stride=(2,), is_contiguous() == True\r\n\r\nsrc.reshape(-1).view(torch.uint8)\r\n# RuntimeError: self.stride(-1) must be 1\r\n```\r\nCheck this please if it makes sense",
+      "created_at": "2026-11-02T22:04:32Z",
+      "diff_hunk": "@@ -68,6 +71,36 @@ def set_weight_attrs(\n         setattr(weight, key, value)\n \n \n+@functools.cache\n+def _is_integrated_gpu(device: torch.device) -> bool:\n+    return device.type == \"cuda\" and current_platform.is_integrated_gpu(device.index)\n+\n+\n+def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:\n+    \"\"\"`dst.copy_(src)` for weight loaders.\n+\n+    Model-specific weight loaders should call this instead of `.copy_()` when\n+    copying a checkpoint tensor to the device. Off integrated GPUs it is a\n+    plain `copy_`.\n+\n+    On integrated GPUs, a host-to-device copy straight from a safetensors mmap\n+    takes its page faults inside the driver copy, which is several times slower\n+    than faulting them on the CPU, so touch one byte per page of `src` first.\n+    PyTorch already stages non-contiguous and dtype-converting copies through\n+    a CPU temporary.\n+    \"\"\"\n+    if (\n+        src.device.type == \"cpu\"\n+        and src.dtype == dst.dtype\n+        and src.is_contiguous()\n+        and _is_integrated_gpu(dst.device)\n+    ):\n+        flat = src.reshape(-1).view(torch.uint8)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#discussion_r4448330578",
+      "id": 4448330578,
+      "line": 100,
+      "original_line": 98,
+      "path": "vllm/model_executor/utils.py",
+      "updated_at": "2026-11-02T22:05:03Z",
+      "user": {
+        "login": "arpera"
+      }
+    },
+    {
+      "body": "Thanks @arpera, it does make sense, and it's a real bug. `is_contiguous()` ignores the stride of size-1 dims, so a source with at most one element counts as contiguous whatever its stride. `reshape(-1)` keeps that stride, and `view(torch.uint8)` needs `stride(-1) == 1` when the element size changes. On an integrated GPU, such a source raised instead of being copied.\n\nIt only affects sources with at most one element. Over 50k random contiguous layouts in fp32, bf16 and uint8, the previous head raised for some 0- and 1-element fp32 and bf16 sources and never for 2 or more elements. 1-byte dtypes never raised. None of the GB10 boots in this thread hit it, but the helper is meant for model-specific loaders too, so it shouldn't depend on that.\n\n91fe940d6 skips the touch when `src.numel() <= 1`, since such a source spans at most one page and there's nothing to fault in ahead of the copy. It also adds your example to `test_copy_weight_prefault_copies_exact_bytes`. That case fails on the previous head and passes now.\n",
+      "created_at": "2026-11-02T23:19:28Z",
+      "diff_hunk": "@@ -68,6 +71,36 @@ def set_weight_attrs(\n         setattr(weight, key, value)\n \n \n+@functools.cache\n+def _is_integrated_gpu(device: torch.device) -> bool:\n+    return device.type == \"cuda\" and current_platform.is_integrated_gpu(device.index)\n+\n+\n+def copy_weight_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:\n+    \"\"\"`dst.copy_(src)` for weight loaders.\n+\n+    Model-specific weight loaders should call this instead of `.copy_()` when\n+    copying a checkpoint tensor to the device. Off integrated GPUs it is a\n+    plain `copy_`.\n+\n+    On integrated GPUs, a host-to-device copy straight from a safetensors mmap\n+    takes its page faults inside the driver copy, which is several times slower\n+    than faulting them on the CPU, so touch one byte per page of `src` first.\n+    PyTorch already stages non-contiguous and dtype-converting copies through\n+    a CPU temporary.\n+    \"\"\"\n+    if (\n+        src.device.type == \"cpu\"\n+        and src.dtype == dst.dtype\n+        and src.is_contiguous()\n+        and _is_integrated_gpu(dst.device)\n+    ):\n+        flat = src.reshape(-1).view(torch.uint8)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#discussion_r4448957734",
+      "id": 4448957734,
+      "line": 100,
+      "original_line": 98,
+      "path": "vllm/model_executor/utils.py",
+      "updated_at": "2026-11-02T23:19:28Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "As promised, we ran #58868 on DeepSeek-V4.1-Flash at TP4 across four GB10s. It's ported onto our 0.28.1-based build: 25 of the 26 sites, since the chunked `_load_w2` branch isn't in that version. These were load-only boots with the page cache dropped before each, arms interleaved.\n\n| `read_ahead_kb` | boots | stock | #58868 | read per rank vs stock |\n|---|---|---|---|---|\n| 1024 | 3 + 3 | 192–195 s | 156–161 s (−18%) | +0–8 GiB |\n| 128 | 3 + 3 | 205–207 s | 149–151 s (−27%) | +0–8 GiB |\n| 1024, consumer that sorts the stream | 1 + 1 | 248 s | 225 s | +2–10 GiB |\n\nTimes are `Model loading took` on the slowest rank. The copy site keeps the gain without the iterator version's TP over-read (~287 GiB per rank here), and it holds up under a consumer that buffers the stream.\n\nMost of that gain comes from TP slice position, which fits the PR. In stock, ranks 0 and 2 finish 25–60 s after ranks 1 and 3. A per-slice benchmark on all four nodes shows the lag follows the slice, not the node: slices 0 and 2 load 1.3–2.2 s slower per two shards on every node. The slow part is the small same-dtype slices (the expert scales and FP8 attention rows) that the driver faults in from a cold cache. With the touch, all four slices take the same time, so the slowest rank catches up. The direct saving on ranks 1 and 3 is about 10 s.\n\nCoverage: on this checkpoint the helper touches 5.6 of 72.3 GiB per rank. The 64.7 GiB of routed experts are stored as `I8` and loaded into `uint8` params, so the dtype gate skips them. That's correct: the converting copy already faults on the CPU, and at 128 it was faster in a micro-benchmark than touch-then-copy.\n\nFor comparison, `--load-format fastsafetensors` reads with O_DIRECT, so neither readahead nor these page faults apply to it. On the same model and nodes it loads in ~88 s against 156–161 s here. On unified memory it needs #55985 (ours) plus some fastsafetensors fixes that aren't upstream yet.\n",
+      "created_at": "2026-09-27T04:14:16Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5852543296",
+      "id": 5852543296,
+      "updated_at": "2026-09-27T04:14:16Z",
+      "user": {
+        "login": "gitbisector"
+      }
+    },
+    {
+      "body": "Thanks for running this. The 128 KiB row is the one I couldn't test: it goes from slower with the iterator prefault (202 → 241 s) to 27% faster with the copy-site touch, with the per-rank read back to stock plus 0–8 GiB.\n\nThe slice-position finding also explains why the direct saving is small on your ranks 1 and 3: most of your bytes are the `I8` → `uint8` experts, which take PyTorch's converting path and already fault on the CPU. On Qwen3.8 the experts are same-dtype, so nearly everything goes through the touch.\n\nI've added your numbers to the description, linked to this comment.\n",
+      "created_at": "2026-09-27T09:37:29Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5854710164",
+      "id": 5854710164,
+      "updated_at": "2026-09-27T09:37:29Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "We ran #58868 at TP1 on a single GB10, which adds a TP1 data point at `read_ahead_kb` 128. The main weight load drops from 505–534 s to 65–66 s (−87 %), with the same greedy output.\n\n| cold start, 2 per arm, alternating | main model weights | MTP drafter weights | model loading total |\n|---|---|---|---|\n| stock | 504.9 / 534.0 s | 62.6 / 54.4 s | 575 / 599 s |\n| #58868 | **65.9 / 64.9 s** | 41.4 / 32.5 s | **121 / 111 s** |\n\n- **Setup:** DGX Spark, GB10 (sm_121), TP1. Checkpoint: RadixArk's ModelOpt mixed NVFP4/FP8 Qwen3.8-Flash-Next (120 GB, 206 safetensors files) on local NVMe, `read_ahead_kb` 128.\n- **Cache:** the page cache was dropped before every start.\n- **Patch:** vLLM nightly `1ea7c63f4` plus our model patches. We used your head `857f70df` diff without the test file. It applies with offsets, all 26 sites.\n- **Metric:** vLLM's own \"Loading weights took\" lines.\n- **Output:** the greedy output hash is identical across all four starts.\n- **Not measured:** discrete GPUs, TP>1, NFS.\n\nThe drafter's remaining 32–41 s isn't the copy: our MTP loader iterates all ~300k checkpoint tensors to keep ~3k. In our first start, a name filter before the read took it to 3.75 s. That is separate from this PR.\n\nData: [ld58868.txt](https://github.com/jschmied/qwen38-flash-next-gb10/blob/10d2b9df7c2bb2178039393abe5e4211a8cc4f27/notes/data/ld58868/ld58868.txt), write-up [§5w](https://github.com/jschmied/qwen38-flash-next-gb10/blob/10d2b9df7c2bb2178039393abe5e4211a8cc4f27/notes/speed-of-light.md#5w-weight-loading-vllm58868-cuts-the-main-load-87--505534-s--6566-s-model-loading-575599-s--111121-s).\n\nWritten with AI assistance (Claude Code).\n",
+      "created_at": "2026-09-28T08:09:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5865989952",
+      "id": 5865989952,
+      "updated_at": "2026-09-28T08:09:01Z",
+      "user": {
+        "login": "jschmied"
+      }
+    },
+    {
+      "body": "Ran this end-to-end on a GB10 (DGX Spark, sm_121, CUDA 13). Qwen3-1.7B, `load_format=safetensors`, TP1, `enforce_eager`, page cache warm, fresh process per run, your branch vs its own merge-base so the patch is the only difference:\n\n```\n                           Loading weights took     LLM() init\nbase 77871126f9            23.48 / 20.18 / 23.66 s  54.8 / 44.4 / 46.7 s\n+ this PR 857f70df4b        0.50 / 0.69 s            26.3 / 29.4 s\n```\n\n~30x on the load itself, ~1.6x on total engine init for a 3.4 GB model.\n\nI ran base twice, then the PR, then base a third time — that last one is still 23.66 s, so it isn't cache ordering.\n\nSeparately, @gitbisector ran the standalone `mmap -> copy_` A/B on a discrete sm_120 and the touch makes no difference there (~0.1 ms/tensor either way), while on this card it's 4.9 ms vs 0.12. I'd taken the other side of that on #58726 and was wrong — the `is_integrated_gpu()` gate is doing real work, not narrowing a general win.\n\nVerified `copy_weight_ present = True/False` per run before trusting either leg.\n",
+      "created_at": "2026-09-30T20:24:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5919067348",
+      "id": 5919067348,
+      "updated_at": "2026-09-30T20:24:06Z",
+      "user": {
+        "login": "hclsys"
+      }
+    },
+    {
+      "body": "@Willian-Zhang here are the TP4 numbers I promised on #58726. Setup: `DeepSeek-V4.1-Flash`, TP4 + DCP2 across four GB10s, weights on local NVMe ext4, page cache dropped on every node before every boot. One boot per cell.\n\nThe image is a vLLM fork at `8a728663c`, so I ported #58868 by hand. Two hunks didn't apply: the `_load_w2` tail copy (the pre-chunking version) and the `utils.py` imports. In this model, all weight copies go through `copy_weight_` except the `attn_sink` scalars.\n\nTarget weights pass, \"Loading weights took\", per rank:\n\n| `--load-format auto` | `read_ahead_kb=1024` | `read_ahead_kb=128` |\n|---|---|---|\n| stock | 130–160 s (mean 146) | 114–168 s (mean 140) |\n| + #58868 | 106–132 s (mean 122) | 104–119 s (mean 112) |\n\nSo #58868 is about 20% faster here, against the ~30× hclsys measured on Qwen3-1.7B. Readahead makes little difference either way at TP4. I haven't looked into where the rest of the `auto` time goes. Ranks within a cell spread by up to ±25 s, so read 20% as approximate.\n\nFor comparison, `--load-format fastsafetensors` took 52–58 s on the same model and nodes when I measured it earlier (read with O_DIRECT, so readahead doesn't apply). Our production config adds per-rank slice reads and comes in at 43–45 s, but that's an out-of-tree change, not something you'd get from upstream.\n\nNone of this argues against the PR. It fixes the GB10 fault cost and is clearly a win. It just doesn't close most of the gap for large TP-sharded MoE checkpoints.\n",
+      "created_at": "2026-10-01T00:04:57Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5921946576",
+      "id": 5921946576,
+      "updated_at": "2026-10-01T00:04:57Z",
+      "user": {
+        "login": "gitbisector"
+      }
+    },
+    {
+      "body": "Thanks @gitbisector. These don't line up with your [09-27 numbers](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5852543296), which are the ones the description cites now:\n\n| | 09-27 | today |\n|---|---|---|\n| build | 0.28.1-based, 25 of 26 sites | fork at `8a728663c`, 2 hunks not applied |\n| metric | `Model loading took`, slowest rank | `Loading weights took`, per rank |\n| boots | 3 + 3, interleaved | 1 per cell |\n| stock → this PR, `read_ahead_kb=1024` | 192–195 → 156–161 s (−18%) | 130–160 → 106–132 s |\n| stock → this PR, `read_ahead_kb=128` | 205–207 → 149–151 s (−27%) | 114–168 → 104–119 s |\n| `fastsafetensors` | ~88 s | 52–58 s |\n\nThe change of metric probably explains the lower absolute times. It doesn't explain two other differences. On 09-27, 128 was slower than 1024 in stock and gained more from the touch, while today readahead makes little difference. And `fastsafetensors` went from ~88 s to 52–58 s. Did something else change between the two runs, like the nodes, kernel, readahead on all four nodes, or the image? Which set should the description use? I'll update it once I know.\n\nOn the size of the gain, I think the gap to hclsys's ~30× comes from coverage. In your 09-27 run the helper touched 5.6 of 72.3 GiB per rank. The `I8` routed experts do go through `copy_weight_`, but the same-dtype check skips the touch for them, since the converting copy already reads the source on the CPU. hclsys's Qwen3-1.7B run is TP1, all bf16 and warm, so every byte takes the touch. So I agree with your conclusion: this fixes the GB10 fault cost and isn't aimed at the rest of a cold TP-sharded MoE load.\n\n@hclsys thanks for the TP1 run, I've added it to the description.\n",
+      "created_at": "2026-10-01T10:56:39Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5929920240",
+      "id": 5929920240,
+      "updated_at": "2026-10-01T10:56:39Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "@Willian-Zhang you're right, and nothing changed between the runs. I changed the metric and then compared across it, which is my mistake. Use the 09-27 set: 3+3 interleaved boots, slowest rank, `Model loading took`.\n\nBoth runs used the same build and nodes. \"0.28.1-based\" in the 09-27 comment and \"fork at `8a728663c`\" are the same image (`0.28.1rc1.dev388+g8a728663c`). The two hunks that didn't apply this time I ported by hand, so coverage matches 09-27's 25 of 26 sites. The chunked `_load_w2` branch doesn't exist in that version. Readahead was set explicitly on all four nodes for every boot.\n\nHere are last night's single boots on the 09-27 metric:\n\n| `Model loading took`, slowest rank | 09-27 (3+3 boots) | 09-30 (1 boot) |\n|---|---|---|\n| stock, `read_ahead_kb=1024` | 192–195 s | 197 s |\n| #58868, `read_ahead_kb=1024` | 156–161 s | 166 s (−16%) |\n| stock, `read_ahead_kb=128` | 205–207 s | 206 s |\n| #58868, `read_ahead_kb=128` | 149–151 s | 155 s (−25%) |\n\nThey agree. So does the readahead effect: at 128, stock is slower and #58868 gains more. My \"readahead makes little difference\" came from averaging per-rank times, which hides the slow ranks (slices 0 and 2) that 09-27 explained. Please disregard that sentence.\n\n`fastsafetensors` is also one measurement under two metrics. ~88 s is `Model loading took`, and 52–58 s is the target `Loading weights took` from the same runs. I should have labelled which one I quoted.\n\nAgreed on coverage. That matches the 5.6 of 72.3 GiB in the 09-27 comment.\n",
+      "created_at": "2026-10-01T15:15:55Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-5934398842",
+      "id": 5934398842,
+      "updated_at": "2026-10-01T15:15:55Z",
+      "user": {
+        "login": "gitbisector"
+      }
+    },
+    {
+      "body": "Thanks for going back and re-running these on the same metric, that clears it up. The description already uses the 09-27 numbers, so I'll leave it as is.\n",
+      "created_at": "2026-10-05T21:15:50Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6003073167",
+      "id": 6003073167,
+      "updated_at": "2026-10-05T21:15:50Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "Thanks @stecasta for the cold-cache run and the GSM8K check. I've added both to the description.\n\nAgreed on the docstring. 66d42b06d adds a line saying model-specific loaders should call `copy_weight_` instead of `.copy_()` when they copy a checkpoint tensor to the device, and that off integrated GPUs it's a plain `copy_`, so it's safe to call everywhere. I've also put your out-of-tree loader result under \"Not covered\" as an example.\n",
+      "created_at": "2026-10-13T00:27:40Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6135259485",
+      "id": 6135259485,
+      "updated_at": "2026-10-13T00:27:40Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Willian-Zhang.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-20T06:45:56Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6285109977",
+      "id": 6285109977,
+      "updated_at": "2026-10-20T06:45:56Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "Independent data from a third DGX Spark (kernel 6.17.0-1026-nvidia, driver 580.159.03, CUDA 13.0, torch 2.13.0+cu130): Qwen3.8-Flash-Next NVFP4 (103 GiB, 299,817 tensors), local NVMe, `read_ahead_kb=128`, stock nightly `21d93d0d8c0e`.\n\nStock load: py-spy (non-blocking, 20 s on an expert shard) puts 97.7% of samples on the two `expert_data.copy_(loaded_weight)` lines (`_load_w13` 62.8%, `_load_w2` 34.9%), 0.3% in `safetensors_weights_iterator`; main thread at 100% user CPU, no I/O wait. Main load 629–661 s, every shard type at 160–180 MB/s (routed experts 70.6 GB in 435 s, dense 10.3 GB in 63 s, PLE n-gram table 28.8 GB in 160 s).\n\nThis PR's diff applies cleanly to that nightly (apart from `tests/`). GPU check, page cache dropped: 800 KiB expert tensors from a safetensors mmap went from 9.35 to 1.06 ms per tensor through `copy_weight_`, byte-identical. Full-boot numbers after our next maintenance window.\n\nOne copy site this doesn't reach: the PLE shard copy in `vllm/models/qwen4_exp/common/ple.py` (`_copy_embedding_shard_` on main) still does `target.copy_(source.to(device=target.device, dtype=target.dtype))`. Without #58439 that copies the whole ~28 GiB PLE table from mmap views. Casting on the CPU only when dtypes differ and then calling `copy_weight_(target, source)` took that path from 0.12 to 0.47 GB/s in the same test, byte-identical. Happy to send it as a follow-up once this lands, or it can go in here.\n\nAI assistance (Claude) was used for the profiling, benchmarks and this write-up; I reviewed it.\n",
+      "created_at": "2026-10-22T18:14:24Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6347924199",
+      "id": 6347924199,
+      "updated_at": "2026-10-22T18:14:24Z",
+      "user": {
+        "login": "JimmyToluene"
+      }
+    },
+    {
+      "body": "@Willian-Zhang full-boot numbers from the Spark in my comment above, with this PR at `f66f2108c774` (the current head) applied to the same nightly. Weights on local NVMe, page cache dropped before each boot, one boot per arm.\n\n| | stock | this PR (+ PLE line below) |\n|---|---:|---:|\n| main `Loading weights took` | 660.7 s | 71.3 s |\n| &nbsp;&nbsp;routed experts, 70.6 GB | 435 s | 52 s |\n| &nbsp;&nbsp;dense, 10.3 GB | 63 s | 5 s |\n| &nbsp;&nbsp;PLE n-gram table, 28.8 GB | 160 s | 14 s |\n| MTP drafter load | 82.8 s | 55.5 s |\n| start → `/health` | 969 s | 345 s |\n\nOutputs: teacher-forced logprobs of 16 fixed generations (3,761 tokens) differ from stock by mean |Δlogprob| 0.034, p99 0.37, the same as stock against itself (0.034, 0.37). Greedy decoding isn't run-to-run deterministic on this setup, so I compared logprobs rather than text. 7.7 GB was swapped out during the boot with this PR; I didn't measure stock.\n\nThe PLE row needs one more call site. This is the whole change against main (packed-NVFP4 table from #56273, device-resident with `cpu_offload: false`):\n\n```diff\n--- a/vllm/models/qwen4_exp/common/ple.py\n+++ b/vllm/models/qwen4_exp/common/ple.py\n+from vllm.model_executor.utils import copy_weight_\n ...\n         with torch.no_grad():\n-            target.copy_(source.to(device=target.device, dtype=target.dtype))\n+            copy_weight_(target, source)\n```\n\nOn a GB10 it is byte-identical to the line it replaces for uint8, float64→float32 and float32→bfloat16 shards, and the existing `test_ple_shard_*` tests pass. Happy for it to go in here, or I can open it as a follow-up once this lands.\n\nThe remaining 55 s MTP load is the drafter re-reading the whole checkpoint to pick out `mtp.*` tensors, i.e. the name prefilter you mentioned keeping out of tree.\n\n(The image also carries an unrelated MTP draft-head patch that doesn't touch weight loading. AI assistance (Claude) was used for the measurements and this write-up; I reviewed it.)\n",
+      "created_at": "2026-10-22T19:29:21Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6349449742",
+      "id": 6349449742,
+      "updated_at": "2026-10-22T19:29:21Z",
+      "user": {
+        "login": "JimmyToluene"
+      }
+    },
+    {
+      "body": "Thanks @JimmyToluene for running the full boot on the current head, and for the logprob comparison. Measuring against stock-vs-stock noise is a better check than greedy text here. The py-spy profile on stock is also the clearest picture of #58726 so far: 97.7% of samples in the two expert `copy_` lines, with no I/O wait.\n\nI've added your run to the description, linked to your second comment. I marked that the PLE row includes your `ple.py` line.\n\nOn the PLE copy, I'd keep it as a follow-up. This PR is limited to the shared loaders, and `ple.py` is the model-specific case its docstring now covers. Please open it once this lands and link it here.\n\nOn swap: in my boots and in stecasta's, stock swapped about as much as this PR, so I'd expect your stock arm to as well, if you get a chance to measure it.\n\nThe drafter time left is the `mtp.*` re-read, as you say. That's the name prefilter, which stays out of this PR.\n",
+      "created_at": "2026-10-23T13:42:01Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6366276998",
+      "id": 6366276998,
+      "updated_at": "2026-10-23T13:47:45Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "Thanks @jschmied for [this TP1 run](https://github.com/vllm-project/vllm/pull/58868#issuecomment-5865989952), and sorry it took me a few weeks to get back to it. It's the first run on a `main`-based build with all 26 sites (mine was v0.30 with 25), and on RadixArk's checkpoint. Your stock 505–534 s at 128 KiB matches my 475 s on local NVMe.\n\nYour [addendum](https://github.com/jschmied/qwen38-flash-next-gb10/blob/1313d7b4b458f9e0462f0d79c02323663cbacdfd/notes/data/fastload/fastload.txt) is the closer match to current `main`: `1ea7c63f4` predates #58720, and with that expert-name index added the main load is 41.6 / 41.9 s. My NVMe boots had it in every arm: 475 s stock, 46.4 / 54.5 s with this PR. So the index alone doesn't fix the stall; the two stack.\n\nThe drafter fits too. With the name prefilter in both arms, this PR took my drafter from 31.7 s to 2.6–2.9 s. Once the iteration is gone, the copy is most of what's left.\n\nI've added your run to the description, linked to this comment.\n",
+      "created_at": "2026-10-23T13:42:03Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6366277509",
+      "id": 6366277509,
+      "updated_at": "2026-10-23T13:47:46Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "@Willian-Zhang measured the stock arm: same Spark and nightly, both boots back to back, page cache dropped before each. \r\n\r\nSwapped out from start to KV profile: stock 9.7 GiB, this PR (+ `ple.py`) 5.2 GiB, so no extra swap from the PR. \r\nBoth are above your 3.2–4.4 GiB because the 28.8 GB PLE table is copied to the GPU here (`cpu_offload: false`) instead of mapped. \r\n\r\nOne boot per arm, so I wouldn't read into stock being higher.\r\n",
+      "created_at": "2026-10-23T14:20:51Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6367079656",
+      "id": 6367079656,
+      "updated_at": "2026-10-23T14:22:48Z",
+      "user": {
+        "login": "JimmyToluene"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Willian-Zhang.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-10-28T21:38:02Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6481304872",
+      "id": 6481304872,
+      "updated_at": "2026-10-28T21:38:02Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "✅ @Willian-Zhang, CI is now available for this PR.\n\n- `/ci run` starts upstream CI; `/amd-ci run` starts AMD CI only.\n- Run commands test your branch with every commit currently on its upstream target branch. If it is behind, the bot merges the target branch into it first (pull before pushing again). Append `--allow-stale` to a run command to test an outdated branch as is, at your own risk.\n- `/ci retry` retries failed jobs in the CI build for the current PR head. If the current head has no CI build, it starts a new CI build for the current head containing only jobs that failed in the latest earlier CI build for this PR.\n- `/amd-ci retry` retries failed jobs in AMD CI for the current PR head. Use `/amd-ci run` when the current head has no AMD CI build.\n- `/ci cancel` cancels scheduled or running CI builds for this PR branch; `/amd-ci cancel` does the same for AMD CI only.\n\n<!-- vllm-ci-authorized -->",
+      "created_at": "2026-11-02T16:28:20Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582389588",
+      "id": 6582389588,
+      "updated_at": "2026-11-02T16:28:20Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "Hi @Willian-Zhang, `ready` is on now, so a `/ci run` from you should start CI.",
+      "created_at": "2026-11-02T16:31:15Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582455200",
+      "id": 6582455200,
+      "updated_at": "2026-11-02T16:31:15Z",
+      "user": {
+        "login": "stecasta"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-11-02T16:53:19Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582946744",
+      "id": 6582946744,
+      "updated_at": "2026-11-02T16:53:19Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #99263](https://buildkite.com/vllm/ci/builds/99263) for commit `a5dcab3b1891`.\n\nℹ️ This PR is 288 commits behind upstream `main`. Merged upstream `main` into this branch as `a5dcab3b1891` before starting CI. Pull the branch before pushing more changes.",
+      "created_at": "2026-11-02T16:53:51Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6582958567",
+      "id": 6582958567,
+      "updated_at": "2026-11-02T16:53:51Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "Thanks @stecasta for getting `ready` on and for the nudge. `/ci run` started [Buildkite #99263](https://buildkite.com/vllm/ci/builds/99263).\n\nThanks @JimmyToluene, that closes the swap question. On the same node and nightly it's 5.2 GiB with this PR vs 9.7 GiB stock, so no extra swap from the PR. The gap to my 3.2–4.4 GiB fits the 28.8 GB PLE table being copied to the GPU on your setup instead of mapped. Agreed that with one boot per arm, stock being higher doesn't say much.\n",
+      "created_at": "2026-11-02T16:56:15Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6583010687",
+      "id": 6583010687,
+      "updated_at": "2026-11-02T16:56:15Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "@22quinn @mgoin, could one of you take a look when you have time? This PR touches two paths with code owners: `model_loader/weight_utils.py` (22quinn) and `fused_moe/routed_experts.py` (mgoin and the fused_moe owners).\n\nThe change in both files is mechanical: `x.copy_(w)` becomes `copy_weight_(x, w)`, at the 2 sites in `default_weight_loader` and the 8 in `routed_experts.py`. The helper is in `vllm/model_executor/utils.py`. Off integrated GPUs it's a plain `copy_`.\n\n- Full CI is green on [Buildkite #99263](https://buildkite.com/vllm/ci/builds/99263). Two jobs failed once and passed on the automatic retry: `test_mtp_sharded_sampling_equivalence`, the known flake in #58644, and an H100 DeepGEMM job whose runner exited before the job started.\n- stecasta approved after reproducing the speedup on their own DGX Spark. Independent boot runs on GB10 from gitbisector (TP4), jschmied and JimmyToluene are in the thread above.\n",
+      "created_at": "2026-11-02T19:43:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6586757696",
+      "id": 6586757696,
+      "updated_at": "2026-11-02T19:43:06Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Willian-Zhang.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-11-02T20:26:58Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6587660376",
+      "id": 6587660376,
+      "updated_at": "2026-11-02T20:26:58Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-11-02T21:24:10Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6588819181",
+      "id": 6588819181,
+      "updated_at": "2026-11-02T21:24:10Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #99351](https://buildkite.com/vllm/ci/builds/99351) for commit `43fe0a4f6c54`.",
+      "created_at": "2026-11-02T21:24:33Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6588826530",
+      "id": 6588826530,
+      "updated_at": "2026-11-02T21:24:33Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-11-02T23:19:41Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6590985877",
+      "id": 6590985877,
+      "updated_at": "2026-11-02T23:19:41Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #99369](https://buildkite.com/vllm/ci/builds/99369) for commit `822c261a6fae`.\n\nℹ️ This PR is 4 commits behind upstream `main`. Merged upstream `main` into this branch as `822c261a6fae` before starting CI. Pull the branch before pushing more changes.",
+      "created_at": "2026-11-02T23:20:07Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6590992954",
+      "id": 6590992954,
+      "updated_at": "2026-11-02T23:20:07Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    },
+    {
+      "body": "@JimmyToluene this is merged now (437288d18), so the `ple.py` change from [your comment](https://github.com/vllm-project/vllm/pull/58868#issuecomment-6349449742) can go in as a follow-up. `_copy_embedding_shard_` on `main` still does `target.copy_(source.to(device=target.device, dtype=target.dtype))`. Your one-line diff to `copy_weight_(target, source)` is all it needs: when the dtypes differ, the helper skips the touch and PyTorch stages the cast through a CPU temporary.\n\nWould you open it? You have the setup that copies the PLE table and the 160 s → 14 s numbers. Please put \"Fixes #58726\" in the description, since that's the last open part of the issue. Tag me and I'll review.\n",
+      "created_at": "2026-11-03T08:01:23Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#issuecomment-6598450177",
+      "id": 6598450177,
+      "updated_at": "2026-11-03T08:01:23Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    }
+  ],
+  "number": 58868,
+  "refs": {
+    "base": {
+      "commit": "a11d3a15f6f04ae426a0a5162f293e95163103cc",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "822c261a6faed2f4c056185c04d9a9c969fe5939",
+      "repository": "Willian-Zhang/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5329777284",
+      "id": 5329777284,
+      "state": "COMMENTED",
+      "submitted_at": "2026-09-27T09:41:09Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Hi @Willian-Zhang, thanks for the contribution.\n\nLGTM. We reproduced it on a DGX Spark (GB10, TP1). The build is v0.31.0 plus internal patches; the PR applied cleanly as a Python overlay. Same node, page cache dropped before every boot, checkpoint already on local disk (`read_ahead_kb` 128), two boots per arm:\n\n| Model | `Loading weights took`, main model | `Model loading took` | start to `/health` |\n|---|---:|---:|---:|\n| `nvidia/Qwen3.8-27B-NVFP4` + DFlash2 drafter, stock | 96.5 / 96.7 s | 122 / 122 s | 595 / 591 s |\n| same, this PR | **9.5 / 9.8 s** | **16 / 16 s** | **486 / 486 s** |\n\nGSM8K-256 on the PR arm is 244/256, in line with stock. Minimum `MemAvailable` (~38.5 GiB) and peak swap (0.5 GiB) during load were the same with and without the PR.\n\nWe also tried a model whose routed experts are loaded by an out-of-tree loader that calls `.copy_()` itself, the \"not covered\" case in your description. Routing that one call through `copy_weight_` moved ~55 GiB of copies onto the touch path and cut its weight loading by about 70%, so the helper carries over to other loaders as soon as they call it.\n\nMinor: since `copy_weight_` is the entry point for this, a line in its docstring saying that model-specific loaders should use it instead of `.copy_()` for host-to-device weight copies would help the next loader author find it.\n",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5496877797",
+      "id": 5496877797,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-12T23:01:29Z",
+      "user": {
+        "login": "stecasta"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5744047302",
+      "id": 5744047302,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-02T22:04:40Z",
+      "user": {
+        "login": "arpera"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5744818513",
+      "id": 5744818513,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-02T23:19:28Z",
+      "user": {
+        "login": "Willian-Zhang"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/58868#pullrequestreview-5745781727",
+      "id": 5745781727,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-03T01:17:07Z",
+      "user": {
+        "login": "arpera"
+      }
+    }
+  ]
+}

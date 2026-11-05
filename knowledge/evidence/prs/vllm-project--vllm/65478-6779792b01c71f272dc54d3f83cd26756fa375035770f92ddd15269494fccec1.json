@@ -1,0 +1,943 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "5c6da3c0ec9adbaf9cf2a25e7a2136bb52695e7e05f1612cebbb22abf99c3af5",
+      "isPrivate": false,
+      "numbers": [
+        65482,
+        65481,
+        65480,
+        65479,
+        65478,
+        65477,
+        65476,
+        65475
+      ],
+      "observed_at": "2026-11-04T16:59:22.343561+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4937,
+        "resetAt": "2026-11-04T17:50:07Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "a0d7356b98e929c17051bac44f5a086e4117974d",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "\n## Purpose\n\nOn ROCm, MiniMax-M3.1 decode runs one separate Triton `_kernel` launch (the MXFP8 activation quant, `_mxfp8_quant_triton_kernel`) in front of several MXFP8 linears. #63637 fused it into `input_layernorm` for `qkv_proj`. Two more per-layer launches remain on the FFN side:\n\n1. post-attention add+RMSNorm -> quant -> `gate_up_proj` (dense MLP, or the MoE shared expert), every layer, every N.\n2. swiglu -> quant -> `down_proj`, every layer when the GEMM does not already quantize in-kernel (decode batches with more than 2 requests, i.e. M = 8N > 16). Dense layers skip the separate quant in the same way when the in-GEMM quant applies.\n\nThis PR (two commits) turns both into epilogues of kernels that already run:\n\n- **Commit 1**: `_gemma_fused_add_rmsnorm_kernel` gets an `ALSO_BF16` mode: it writes the MXFP8 values/scales and the bf16 normed rows (the router and routed experts need bf16). New `allreduce_gemma_rms_norm_mxfp8` (all-reduce + that norm) returns `None` when a fused all-reduce+norm kernel applies, so that path is untouched. The MoE passes the quantized rows to the shared expert through `set_prequant` (checked by data pointer + shape, consumed once).\n- **Commit 2**: the dense MLP / shared expert call the existing `swiglu_oai_quantize_mxfp8` (fp32 swiglu + quant in one pass) and give `down_proj` a `QuantizedActivation`; skipped where the GEMM already quantizes in-kernel (M <= 16, K <= 1024).\n\nRelated: #63637 (same idea for input_layernorm -> qkv_proj); the fp32 swiglu kernel is from the MiniMax-M3 AMD ops. Not covered by any open PR that I could find.\n\n## What changes per decode step (main model, 60 layers)\n\nTrace evidence (torch profiler, TP4, DSpark 7-token drafts so M = 8 x requests; rank-0 profile windows at N=1, 2, 4 and 16): `_kernel.kd` per step = 145 at N=1 and N=2, 202 at N>=4 (profiled durations ~1.6x inflated).\n\n| Launch removed | Layers | N=1 (M=8) | N=2 (M=16) | N>=3 (M>=24) |\n|---|---|---|---|---|\n| post-attn quant for gate_up (commit 1) | 60 | no (aiter fused AR+norm runs) | yes | yes |\n| swiglu quant for down_proj (commit 2), shared expert | 57 | no (in-GEMM quant) | no (in-GEMM quant) | yes |\n| swiglu quant for down_proj (commit 2), dense layers | 3 | yes | yes | yes |\n\nStill unfused after this PR: the `o_proj` input quant (K=2048; in-GEMM quant did not win above M=16 in my sweep), layer 0's input norm, and the DSpark draft layers.\n\n## Kernel-level measurements (MI355X, gfx950, 1 GPU, CUDA-graph replay of 200 back-to-back launches; us per launch)\n\nBenchmark script below (collapsed), MiniMax-M3.1 TP4 shapes: hidden 6144, shared-expert intermediate 768.\n\n| M | norm + separate quant | fused norm+quant+bf16 | saved | swiglu + separate quant | fused swiglu+quant (block_m=16) | saved |\n|---|---|---|---|---|---|---|\n| 8 | 4.27 | 2.71 | 1.56 | 3.82 | 1.83 | 1.99 |\n| 16 | 4.32 | 2.77 | 1.55 | 3.96 | 1.93 | 2.03 |\n| 32 | 4.40 | 2.80 | 1.60 | 3.97 | 1.95 | 2.02 |\n| 64 | 4.79 | 2.96 | 1.83 | 4.00 | 1.94 | 2.06 |\n| 128 | 5.55 | 3.29 | 2.26 | 4.06 | 1.90 | 2.16 |\n| 192 | 6.94 | 3.65 | 3.29 | 4.04 | 1.95 | 2.09 |\n\n(second run on the production code of this branch, GPU 6; an earlier run on GPU 7 agreed within 0.1 us.)\n\n<details>\n<summary>Microbenchmark script (CUDA-graph replay of 200 back-to-back launches)</summary>\n\n```python\n\"\"\"Correctness + graph-replay microbench of the FFN quant fusions. 1 GPU.\nRun: PYTHONPATH=<overlay dir> python bench_fuse.py  (overlay dir contains vllm/)\"\"\"\nimport itertools, sys, torch\nimport vllm\nprint(\"vllm from\", vllm.__file__)\nfrom vllm.models.minimax_m3.amd.ops import (gemma_fused_add_rmsnorm, gemma_fused_add_rmsnorm_mxfp8,\n    gemma_fused_add_rmsnorm_mxfp8_and_bf16, swiglu_oai_split, swiglu_oai_quantize_mxfp8)\nfrom vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize\nfrom vllm.model_executor.kernels.linear.mxfp8 import rocm_native as rn\ndev = \"cuda\"; torch.manual_seed(0)\n\ndef graph_time(fn, iters=200, reps=20):\n    fn(); torch.cuda.synchronize()\n    g = torch.cuda.CUDAGraph()\n    with torch.cuda.graph(g):\n        for _ in range(iters): fn()\n    for _ in range(3): g.replay()\n    torch.cuda.synchronize()\n    ts = []\n    for _ in range(reps):\n        s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)\n        s.record(); g.replay(); e.record(); torch.cuda.synchronize()\n        ts.append(s.elapsed_time(e) * 1000 / iters)\n    ts.sort(); return ts[len(ts)//2]\n\nH = 6144; I = 768\nw = (torch.randn(H, device=dev) * 0.1).bfloat16()\nfor M in (8, 16, 32, 64, 128, 192):\n    x = (torch.randn(M, H, device=dev) * 3).bfloat16(); r = torch.randn(M, H, device=dev).bfloat16()\n    # A: norm+quant+bf16\n    xq, xs, nb, ro = gemma_fused_add_rmsnorm_mxfp8_and_bf16(x, r, w, 1e-6)\n    ref_n, ref_r = gemma_fused_add_rmsnorm(x, r, w, 1e-6)\n    rq, rs = mxfp8_e4m3_quantize(ref_n)\n    okA = (nb == ref_n).all().item() and (xq.view(torch.uint8) == rq.view(torch.uint8)).all().item() \\\n        and (xs.view(torch.uint8) == rs.view(torch.uint8)).all().item() and (ro == ref_r).all().item()\n    # unfused vs fused timing\n    t_un = graph_time(lambda: (lambda n, _: mxfp8_e4m3_quantize(n))(*gemma_fused_add_rmsnorm(x, r, w, 1e-6)))\n    t_norm = graph_time(lambda: gemma_fused_add_rmsnorm(x, r, w, 1e-6))\n    t_f = graph_time(lambda: gemma_fused_add_rmsnorm_mxfp8_and_bf16(x, r, w, 1e-6))\n    # B: swiglu+quant\n    gu = (torch.randn(M, 2 * I, device=dev) * 8).bfloat16()\n    aq, asc = swiglu_oai_quantize_mxfp8(gu, 1.702, 1.0, 7.0)\n    act = swiglu_oai_split(gu, 1.702, 1.0, 7.0)\n    bq, bs = mxfp8_e4m3_quantize(act)\n    nq = (aq.view(torch.uint8) != bq.view(torch.uint8)).float().mean().item()\n    ns = (asc.view(torch.uint8) != bs.view(torch.uint8)).float().mean().item()\n    t_su = graph_time(lambda: mxfp8_e4m3_quantize(swiglu_oai_split(gu, 1.702, 1.0, 7.0)))\n    t_sw = graph_time(lambda: swiglu_oai_split(gu, 1.702, 1.0, 7.0))\n    t_sf = {bm: graph_time(lambda: swiglu_oai_quantize_mxfp8(gu, 1.702, 1.0, 7.0, block_m=bm)) for bm in (4, 8, 16, 64)}\n    print(f\"M={M:4d} A bitexact={okA} norm={t_norm:.2f} norm+quant={t_un:.2f} fused={t_f:.2f} us | \"\n          f\"B mismatch q={nq:.2e} s={ns:.2e} swiglu={t_sw:.2f} swiglu+quant={t_su:.2f} fused(bm)={ {k: round(v,2) for k,v in t_sf.items()} } us\", flush=True)\n\n\n```\n</details>\n\n\nPROJECTION made before the step-level runs (NOT a measurement, and about 2x too high compared with the A+B-only arm below, which averaged -0.7% over N and about -0.1 to -0.4 ms at N>=3): A+B remove 0.22-0.32 ms/step at N>=3 (~1.8-2.3%), nothing at N=1.\n\n## Test Plan / Correctness\n\n- Fused norm output (values, scales, bf16 normed, residual): **bit-identical** to unfused norm -> `mxfp8_e4m3_quantize` at all M in the table above (edge-case rows: all-zero, tiny, dominated and partly-zero blocks in the unit test).\n- Swiglu+quant: scales identical in the microbench (0 differing blocks at M=8..192); 1.9-2.4% of E4M3 bytes differ (M=8: 2.36%, 16: 1.93%, 32: 2.22%, 64: 2.26%, 128: 2.17%, 192: 2.17%) because the fused kernel skips the bf16 rounding of the activation before quantizing; the test asserts it is at least as close to the fp32 activation as the unfused chain.\n- Unit tests added to `tests/kernels/test_minimax_m3_amd_ops.py` (norm variant bitwise, `allreduce_gemma_rms_norm_mxfp8` for TP 1/4 and deferral to a fused AR kernel, prequant hand-off, gate_up/down_proj on the fused outputs, swiglu+quant vs unfused). Run on MI355X (gfx950): `pytest tests/kernels/test_minimax_m3_amd_ops.py` -> 128 passed, 6 failed. The 6 failures are `test_mxfp8_native_moe` / `test_mxfp8_grouped_gemm_native` with `AttributeError: '_moe_C' has no attribute 'moe_align_block_size'` (the installed `_moe_C` extension of the test machine lacks the op); they fail identically on the unmodified base commit c1d8fad.\n\n## Launch counts and step-level measurements (MI355X, TP4, DSpark, 150K context)\n\nAll server settings as the AgentX recipe with DBO off and `VLLM_ROCM_USE_SKINNY_GEMM=0`; `decode_bench.py` (3 repeats per arm, p50 decode-step time; run-to-run noise about +-0.1-0.2 ms, ~2%). Torch-profiler window of 60 steps, rank 0, all streams.\n\n**Exact launch-count reduction (profile window, N=4 and N=16 identical):** `_kernel.kd` (the MXFP8 activation quant) **202 -> 82 per decode step** (-120 = 60 layers x 2). Total kernels per step in the A+B-only arm: 1348 -> 1228 on the main stream (-120). What remains of `_kernel.kd`: the `o_proj` input quant (60), layer 0's input norm quant and the draft layers (22).\n\n**A+B only (this PR's two commits on top of the installed tree), decode-step p50, ms:**\n\n| N | installed (3 reps) | A+B (3 reps) | delta |\n|---|---|---|---|\n| 1 | 9.22 9.16 9.28 | 9.22 9.20 9.19 | -0.02 (-0.2%) |\n| 2 | 10.18 10.21 10.08 | 10.20 10.24 10.26 | +0.06 (+0.6%) |\n| 3 | 11.86 11.56 11.76 | 11.73 11.39 11.34 | -0.37 (-3.1%) |\n| 4 | 11.94 11.88 11.87 | 11.87 11.76 11.90 | -0.01 (-0.1%) |\n| 5 | 13.21 12.92 12.82 | 12.81 12.78 12.79 | -0.13 (-1.0%) |\n| 6 | 13.25 13.70 13.24 | 13.27 13.27 13.30 | +0.02 (+0.2%) |\n| 8 | 14.65 14.65 14.34 | 14.74 14.70 14.77 | +0.09 (+0.6%) |\n| 12 | 16.47 16.47 16.35 | 16.28 16.35 16.32 | -0.15 (-0.9%) |\n| 16 | 18.58 18.55 18.41 | 18.19 18.12 18.07 | -0.43 (-2.3%) |\n\nAverage over N=1..16: about -0.7%. Only N=3 (-3.1%) and N=16 (-2.3%) are outside the noise band; the rest is within it, and the sign is not monotonic in N. I therefore do not claim a specific end-to-end gain for this PR; what is established is the exact launch removal and the per-launch kernel savings above (1.6-3.3 us for the norm epilogue, ~2.0 us for the swiglu fusion). At N=1 and N=2 the PR is expected to do little (see Limitations).\n\n**Full stack (this PR + two other, separate changes: folding the routed scaling into the AITER top-k, and launching the shared expert after the routed chain in the HIP graph).** Decode-step p50 improved at every N (-0.4% to -4.6%, mean -1.7%; N>=3 mean -0.17 ms); this is not attributable to this PR alone and is listed only for context. A repeat with 5 repetitions at N=1 and N=2 confirmed the stack's N=1 gain (9.22 -> 8.96 ms, -2.8%) and N=2 (10.20 -> 9.93, -2.6%); the A+B-only arm shows nothing at N=1/N=2 (-0.2%/+0.6%), and the scale-fold-only arm accounts for about -2.1% / -1.0% there. The full-stack N=1 gain is not additive across the single-change arms and I could not explain it.\n\n## Quality\n\nFull stack (not this PR alone), GSM8K, all 1319 test questions, chat mode with reasoning allowed, greedy, real (not synthetic) draft acceptance: strict match 0.9363 (installed) vs 0.9424 (stack), flexible 0.9356 vs 0.9416; binomial SE about 0.008, i.e. within the noise. Outputs are not bit-reproducible even within one tree (spec decode, batching), so only accuracy statistics are compared. \"What is 17*23?\" -> 391 on both. The fused norm output is bit-identical to norm -> quant (unit tests and microbench); the swiglu fusion changes 1.9-2.4% of FP8 bytes (see above), which this GSM8K run cannot isolate.\n\nAgentX replay: **not run**.\n\n## Limitations\n\n- No gain at N=1 for the post-attention fusion (the aiter fused all-reduce+norm kernel has no quant output); a quant-emitting variant of that kernel could plug into `allreduce_gemma_rms_norm_mxfp8`.\n- Relies on the `RocmDotScaledMxfp8LinearKernel` consuming row-major E8M0 scales (same condition as #63637).\n- Dispatch assumption: the MoE runner hands the shared expert the layer's own input tensor; otherwise the hand-off is ignored and the linear quantizes itself (correct, just not fused).\n\nAI assistance: this change was developed with Claude Code; the tests and benchmarks above were run on MI355X (gfx950).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+      "changedFiles": 5,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Fangzhou-Ai"
+            },
+            "body": "Thanks for the review, addressed in 6c4a595:\n\n- **Return annotation on `_gemma_fused_add_rmsnorm`**: restored, using `@overload` on `also_bf16` (`Literal[True]` -> 4-tuple, `Literal[False]` -> 3-tuple) so the existing 3- and 4-value unpacks type-check. The repo's mypy hook passes.\n- **Dense layers / normed output**: checked. Dense decoder layers return `ffn(qa), residual` and never read the normed bf16 output, so skipping it there is safe. MoE layers return `ffn(normed, shared_prequant=qa), residual` and do use it.\n- **swiglu numerics**: added a comment in `MiniMaxM3MLP.forward`. The fused path is intentionally not bit-identical: it quantizes the fp32 swiglu result directly and skips the bf16 rounding the unfused path applies first. About 2% of the E4M3 bytes differ, and the result is at least as close to the fp32 activation.\n- **`_SWIGLU_QUANT_BLOCK_M = 16`**: commented as tuned on gfx950 (MI355X) only.\n- **PR body \"always\" wording**: you're right, the dense path skips the separate quant when the in-GEMM quant applies. Body updated.\n- **Failing tests**: the 6 failures on my machine are `_moe_C.moe_align_block_size` extension gaps in this local build and fail identically on the base commit; CI on a gfx950 image should confirm.\n",
+            "createdAt": "2026-11-03T22:36:16Z",
+            "databaseId": 6617238681,
+            "updatedAt": "2026-11-03T22:36:16Z",
+            "url": "https://github.com/vllm-project/vllm/pull/65478#issuecomment-6617238681"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Fangzhou-Ai"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-11-03T22:55:59Z",
+            "databaseId": 6617585732,
+            "updatedAt": "2026-11-03T22:55:59Z",
+            "url": "https://github.com/vllm-project/vllm/pull/65478#issuecomment-6617585732"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #99726](https://buildkite.com/vllm/ci/builds/99726) for commit `beb2048674b2`.",
+            "createdAt": "2026-11-03T22:56:20Z",
+            "databaseId": 6617591736,
+            "updatedAt": "2026-11-03T22:56:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/65478#issuecomment-6617591736"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYpwb7g=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "headRepository": {
+        "nameWithOwner": "Fangzhou-Ai/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 65478,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5758539534,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T19:48:21Z",
+            "url": "https://github.com/vllm-project/vllm/pull/65478#pullrequestreview-5758539534"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "selimfedakar"
+            },
+            "body": "Thanks for this — it's an unusually well-documented PR, and the honesty in the\nperf section (separating the solid launch-count/per-kernel numbers from the\nend-to-end deltas that sit in the noise, and explicitly *not* claiming an e2e\ngain) makes it much easier to review. I went through the diff against `main`\nand traced the surrounding code; overall this looks correct and I'm in favor of\nmerging. No blocking issues. A few questions and nits below, plus the things I\nspecifically checked and found safe.\n\nContext: we've been working the MXFP8 *activation scheme* invariant on the\nlinear side (the native MXFP8 kernel must honor the activation scheme:\nself-quantizing kernels advertise `kMxfp8Dynamic` with row-major E8M0 scales,\nweight-only stays BF16). This PR is a producer for exactly that contract, so I\npaid most attention to whether the fused epilogues emit activations the consumer\nactually expects.\n\n## What I checked and found safe\n\n- **Norm epilogue is bit-identical to the unfused path.** The new `ALSO_BF16`\n  branch in `gemma_rmsnorm.py` stores the normed row *before* the `QUANT_MXFP8`\n  block and still re-casts through `out.to(x_ptr.dtype.element_ty)`, so the FP8\n  values and E8M0 scales are computed from the same input-dtype-rounded row as\n  `norm -> mxfp8_e4m3_quantize`. The bitwise-eq test covers bf16/fp16 and N in\n  {2048, 6144}.\n- **Scale layout / scheme contract matches the consumer.** The fused ops emit\n  row-major `[M, N//32]` E8M0 scales (not swizzled) under `kMxfp8Dynamic`, which\n  is exactly what `RocmDotScaledMxfp8LinearKernel` consumes (row-major, not\n  swizzled). The gate `_can_fuse_input_norm_mxfp8` requires that kernel +\n  `supports_quantized_input(...)`, so a FlashInfer-style consumer that wants\n  swizzled scales under the same key can never receive these — the same\n  layout-vs-key distinction matters here and it's handled correctly.\n- **`down_proj` in-GEMM-quant carve-out** reproduces the kernel's own decision\n  (`0 < M <= _FUSED_QUANT_MAX_M and _select_fused_quant_cfg(...) is not None`),\n  so no double-quant / no missed fusion; the test pins `in_gemm == (m<=16 and\n  k<=1024)`.\n- **Prequant hand-off is fail-safe:** `forward` only substitutes when the\n  incoming `x` is a tensor with matching `data_ptr()` and `shape`, consumes it\n  once, else falls back to self-quantization. DP/EP paths fall back cleanly.\n- **Batch-invariant mode is fully disabled** (`_can_fuse_input_norm_mxfp8`\n  returns False under `VLLM_BATCH_INVARIANT`), so the `down_proj` path not\n  re-checking it is harmless.\n- **`None`-deferral keeps the fused-AR / N=1 path byte-for-byte unchanged.**\n- **Perf claims appropriately scoped** (per-launch savings + exact launch-count\n  reduction are the credible core; e2e correctly not claimed).\n\n## Questions (non-blocking)\n\n1. The fused swiglu path is numerically *different* (not bit-identical) by\n   design — it quantizes the fp32 activation directly and skips the bf16\n   round-trip the unfused chain does (~1.9-2.4% of E4M3 bytes differ, and your\n   test only bounds it as *at least as close* to the fp32 ref). The op documents\n   this, but the substitution at the `MiniMaxM3MLP.forward` call site is silent —\n   a one-line comment there would save the next reader the trip.\n2. The 6 failing kernel tests (`moe_align_block_size` missing) reproduce on the\n   base commit too, i.e. a test-machine extension gap, not a regression — agreed,\n   but worth confirming they pass on a real gfx950 CI image before merge.\n3. `return_normed=self.is_moe_layer`: confirming the dense path has no consumer\n   of the post-attn normed output other than `gate_up_proj` (which takes MXFP8\n   directly), so discarding `normed` for dense is safe.\n\n## Nits\n- `_gemma_fused_add_rmsnorm`'s return-type annotation was dropped when\n  `also_bf16` was added (now a 3- or 4-tuple) — worth restoring.\n- `_SWIGLU_QUANT_BLOCK_M = 16` — note it was tuned on gfx950 specifically (the\n  MoE default is 64).\n- PR body says swiglu fusion applies to dense \"always\"; the code correctly also\n  skips it when `_down_proj_quantizes_in_gemm` — minor wording.\n\nCorrect, well-tested, and the activation-scheme/scale-layout contract lines up\nwith the native MXFP8 consumer. The guards all fail safe toward the unfused\npath. I'd approve once the swiglu-not-bit-identical comment (Q1) is added and\nthe two extension-gap failures are confirmed green on real gfx950 CI. Nice work.\n",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5759998194,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T21:52:28Z",
+            "url": "https://github.com/vllm-project/vllm/pull/65478#pullrequestreview-5759998194"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ChuanLi1101"
+            },
+            "body": "LGTM. Fusing the FFN-side MXFP8 quant into the post-attn norm / swiglu epilogues is the right producer for the native MXFP8 linears, and the dense vs MoE bf16-norm handling looks correct. Thanks for keeping the e2e claim honest. Selim’s asks look addressed.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5762023441,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-04T01:41:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/65478#pullrequestreview-5762023441"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wNFQwMTo0MTo0N1q0MjAyNi0xMS0wNFQwMTo0MTo0NlrPAAAAAVdxgBE=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "OPEN",
+      "title": "[ROCm][Perf][MiniMax-M3.1] Fuse the FFN-side MXFP8 activation quant into the post-attention norm and swiglu",
+      "updatedAt": "2026-11-04T01:41:47Z",
+      "url": "https://github.com/vllm-project/vllm/pull/65478"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/65478/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/65478/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/65478"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/65478"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/65478/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/65478"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/beb2048674b2b422f5cd661e6c6ce3604d08c8d6"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 436,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "COLLABORATOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 24399,
+        "forks_count": 24399,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9851,
+        "open_issues_count": 9851,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T16:50:54Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 343824,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 96307,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-04T16:58:18Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 96307,
+        "watchers_count": 96307,
+        "web_commit_signoff_required": true
+      },
+      "sha": "a0d7356b98e929c17051bac44f5a086e4117974d",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "\n## Purpose\n\nOn ROCm, MiniMax-M3.1 decode runs one separate Triton `_kernel` launch (the MXFP8 activation quant, `_mxfp8_quant_triton_kernel`) in front of several MXFP8 linears. #63637 fused it into `input_layernorm` for `qkv_proj`. Two more per-layer launches remain on the FFN side:\n\n1. post-attention add+RMSNorm -> quant -> `gate_up_proj` (dense MLP, or the MoE shared expert), every layer, every N.\n2. swiglu -> quant -> `down_proj`, every layer when the GEMM does not already quantize in-kernel (decode batches with more than 2 requests, i.e. M = 8N > 16). Dense layers skip the separate quant in the same way when the in-GEMM quant applies.\n\nThis PR (two commits) turns both into epilogues of kernels that already run:\n\n- **Commit 1**: `_gemma_fused_add_rmsnorm_kernel` gets an `ALSO_BF16` mode: it writes the MXFP8 values/scales and the bf16 normed rows (the router and routed experts need bf16). New `allreduce_gemma_rms_norm_mxfp8` (all-reduce + that norm) returns `None` when a fused all-reduce+norm kernel applies, so that path is untouched. The MoE passes the quantized rows to the shared expert through `set_prequant` (checked by data pointer + shape, consumed once).\n- **Commit 2**: the dense MLP / shared expert call the existing `swiglu_oai_quantize_mxfp8` (fp32 swiglu + quant in one pass) and give `down_proj` a `QuantizedActivation`; skipped where the GEMM already quantizes in-kernel (M <= 16, K <= 1024).\n\nRelated: #63637 (same idea for input_layernorm -> qkv_proj); the fp32 swiglu kernel is from the MiniMax-M3 AMD ops. Not covered by any open PR that I could find.\n\n## What changes per decode step (main model, 60 layers)\n\nTrace evidence (torch profiler, TP4, DSpark 7-token drafts so M = 8 x requests; rank-0 profile windows at N=1, 2, 4 and 16): `_kernel.kd` per step = 145 at N=1 and N=2, 202 at N>=4 (profiled durations ~1.6x inflated).\n\n| Launch removed | Layers | N=1 (M=8) | N=2 (M=16) | N>=3 (M>=24) |\n|---|---|---|---|---|\n| post-attn quant for gate_up (commit 1) | 60 | no (aiter fused AR+norm runs) | yes | yes |\n| swiglu quant for down_proj (commit 2), shared expert | 57 | no (in-GEMM quant) | no (in-GEMM quant) | yes |\n| swiglu quant for down_proj (commit 2), dense layers | 3 | yes | yes | yes |\n\nStill unfused after this PR: the `o_proj` input quant (K=2048; in-GEMM quant did not win above M=16 in my sweep), layer 0's input norm, and the DSpark draft layers.\n\n## Kernel-level measurements (MI355X, gfx950, 1 GPU, CUDA-graph replay of 200 back-to-back launches; us per launch)\n\nBenchmark script below (collapsed), MiniMax-M3.1 TP4 shapes: hidden 6144, shared-expert intermediate 768.\n\n| M | norm + separate quant | fused norm+quant+bf16 | saved | swiglu + separate quant | fused swiglu+quant (block_m=16) | saved |\n|---|---|---|---|---|---|---|\n| 8 | 4.27 | 2.71 | 1.56 | 3.82 | 1.83 | 1.99 |\n| 16 | 4.32 | 2.77 | 1.55 | 3.96 | 1.93 | 2.03 |\n| 32 | 4.40 | 2.80 | 1.60 | 3.97 | 1.95 | 2.02 |\n| 64 | 4.79 | 2.96 | 1.83 | 4.00 | 1.94 | 2.06 |\n| 128 | 5.55 | 3.29 | 2.26 | 4.06 | 1.90 | 2.16 |\n| 192 | 6.94 | 3.65 | 3.29 | 4.04 | 1.95 | 2.09 |\n\n(second run on the production code of this branch, GPU 6; an earlier run on GPU 7 agreed within 0.1 us.)\n\n<details>\n<summary>Microbenchmark script (CUDA-graph replay of 200 back-to-back launches)</summary>\n\n```python\n\"\"\"Correctness + graph-replay microbench of the FFN quant fusions. 1 GPU.\nRun: PYTHONPATH=<overlay dir> python bench_fuse.py  (overlay dir contains vllm/)\"\"\"\nimport itertools, sys, torch\nimport vllm\nprint(\"vllm from\", vllm.__file__)\nfrom vllm.models.minimax_m3.amd.ops import (gemma_fused_add_rmsnorm, gemma_fused_add_rmsnorm_mxfp8,\n    gemma_fused_add_rmsnorm_mxfp8_and_bf16, swiglu_oai_split, swiglu_oai_quantize_mxfp8)\nfrom vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize\nfrom vllm.model_executor.kernels.linear.mxfp8 import rocm_native as rn\ndev = \"cuda\"; torch.manual_seed(0)\n\ndef graph_time(fn, iters=200, reps=20):\n    fn(); torch.cuda.synchronize()\n    g = torch.cuda.CUDAGraph()\n    with torch.cuda.graph(g):\n        for _ in range(iters): fn()\n    for _ in range(3): g.replay()\n    torch.cuda.synchronize()\n    ts = []\n    for _ in range(reps):\n        s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)\n        s.record(); g.replay(); e.record(); torch.cuda.synchronize()\n        ts.append(s.elapsed_time(e) * 1000 / iters)\n    ts.sort(); return ts[len(ts)//2]\n\nH = 6144; I = 768\nw = (torch.randn(H, device=dev) * 0.1).bfloat16()\nfor M in (8, 16, 32, 64, 128, 192):\n    x = (torch.randn(M, H, device=dev) * 3).bfloat16(); r = torch.randn(M, H, device=dev).bfloat16()\n    # A: norm+quant+bf16\n    xq, xs, nb, ro = gemma_fused_add_rmsnorm_mxfp8_and_bf16(x, r, w, 1e-6)\n    ref_n, ref_r = gemma_fused_add_rmsnorm(x, r, w, 1e-6)\n    rq, rs = mxfp8_e4m3_quantize(ref_n)\n    okA = (nb == ref_n).all().item() and (xq.view(torch.uint8) == rq.view(torch.uint8)).all().item() \\\n        and (xs.view(torch.uint8) == rs.view(torch.uint8)).all().item() and (ro == ref_r).all().item()\n    # unfused vs fused timing\n    t_un = graph_time(lambda: (lambda n, _: mxfp8_e4m3_quantize(n))(*gemma_fused_add_rmsnorm(x, r, w, 1e-6)))\n    t_norm = graph_time(lambda: gemma_fused_add_rmsnorm(x, r, w, 1e-6))\n    t_f = graph_time(lambda: gemma_fused_add_rmsnorm_mxfp8_and_bf16(x, r, w, 1e-6))\n    # B: swiglu+quant\n    gu = (torch.randn(M, 2 * I, device=dev) * 8).bfloat16()\n    aq, asc = swiglu_oai_quantize_mxfp8(gu, 1.702, 1.0, 7.0)\n    act = swiglu_oai_split(gu, 1.702, 1.0, 7.0)\n    bq, bs = mxfp8_e4m3_quantize(act)\n    nq = (aq.view(torch.uint8) != bq.view(torch.uint8)).float().mean().item()\n    ns = (asc.view(torch.uint8) != bs.view(torch.uint8)).float().mean().item()\n    t_su = graph_time(lambda: mxfp8_e4m3_quantize(swiglu_oai_split(gu, 1.702, 1.0, 7.0)))\n    t_sw = graph_time(lambda: swiglu_oai_split(gu, 1.702, 1.0, 7.0))\n    t_sf = {bm: graph_time(lambda: swiglu_oai_quantize_mxfp8(gu, 1.702, 1.0, 7.0, block_m=bm)) for bm in (4, 8, 16, 64)}\n    print(f\"M={M:4d} A bitexact={okA} norm={t_norm:.2f} norm+quant={t_un:.2f} fused={t_f:.2f} us | \"\n          f\"B mismatch q={nq:.2e} s={ns:.2e} swiglu={t_sw:.2f} swiglu+quant={t_su:.2f} fused(bm)={ {k: round(v,2) for k,v in t_sf.items()} } us\", flush=True)\n\n\n```\n</details>\n\n\nPROJECTION made before the step-level runs (NOT a measurement, and about 2x too high compared with the A+B-only arm below, which averaged -0.7% over N and about -0.1 to -0.4 ms at N>=3): A+B remove 0.22-0.32 ms/step at N>=3 (~1.8-2.3%), nothing at N=1.\n\n## Test Plan / Correctness\n\n- Fused norm output (values, scales, bf16 normed, residual): **bit-identical** to unfused norm -> `mxfp8_e4m3_quantize` at all M in the table above (edge-case rows: all-zero, tiny, dominated and partly-zero blocks in the unit test).\n- Swiglu+quant: scales identical in the microbench (0 differing blocks at M=8..192); 1.9-2.4% of E4M3 bytes differ (M=8: 2.36%, 16: 1.93%, 32: 2.22%, 64: 2.26%, 128: 2.17%, 192: 2.17%) because the fused kernel skips the bf16 rounding of the activation before quantizing; the test asserts it is at least as close to the fp32 activation as the unfused chain.\n- Unit tests added to `tests/kernels/test_minimax_m3_amd_ops.py` (norm variant bitwise, `allreduce_gemma_rms_norm_mxfp8` for TP 1/4 and deferral to a fused AR kernel, prequant hand-off, gate_up/down_proj on the fused outputs, swiglu+quant vs unfused). Run on MI355X (gfx950): `pytest tests/kernels/test_minimax_m3_amd_ops.py` -> 128 passed, 6 failed. The 6 failures are `test_mxfp8_native_moe` / `test_mxfp8_grouped_gemm_native` with `AttributeError: '_moe_C' has no attribute 'moe_align_block_size'` (the installed `_moe_C` extension of the test machine lacks the op); they fail identically on the unmodified base commit c1d8fad.\n\n## Launch counts and step-level measurements (MI355X, TP4, DSpark, 150K context)\n\nAll server settings as the AgentX recipe with DBO off and `VLLM_ROCM_USE_SKINNY_GEMM=0`; `decode_bench.py` (3 repeats per arm, p50 decode-step time; run-to-run noise about +-0.1-0.2 ms, ~2%). Torch-profiler window of 60 steps, rank 0, all streams.\n\n**Exact launch-count reduction (profile window, N=4 and N=16 identical):** `_kernel.kd` (the MXFP8 activation quant) **202 -> 82 per decode step** (-120 = 60 layers x 2). Total kernels per step in the A+B-only arm: 1348 -> 1228 on the main stream (-120). What remains of `_kernel.kd`: the `o_proj` input quant (60), layer 0's input norm quant and the draft layers (22).\n\n**A+B only (this PR's two commits on top of the installed tree), decode-step p50, ms:**\n\n| N | installed (3 reps) | A+B (3 reps) | delta |\n|---|---|---|---|\n| 1 | 9.22 9.16 9.28 | 9.22 9.20 9.19 | -0.02 (-0.2%) |\n| 2 | 10.18 10.21 10.08 | 10.20 10.24 10.26 | +0.06 (+0.6%) |\n| 3 | 11.86 11.56 11.76 | 11.73 11.39 11.34 | -0.37 (-3.1%) |\n| 4 | 11.94 11.88 11.87 | 11.87 11.76 11.90 | -0.01 (-0.1%) |\n| 5 | 13.21 12.92 12.82 | 12.81 12.78 12.79 | -0.13 (-1.0%) |\n| 6 | 13.25 13.70 13.24 | 13.27 13.27 13.30 | +0.02 (+0.2%) |\n| 8 | 14.65 14.65 14.34 | 14.74 14.70 14.77 | +0.09 (+0.6%) |\n| 12 | 16.47 16.47 16.35 | 16.28 16.35 16.32 | -0.15 (-0.9%) |\n| 16 | 18.58 18.55 18.41 | 18.19 18.12 18.07 | -0.43 (-2.3%) |\n\nAverage over N=1..16: about -0.7%. Only N=3 (-3.1%) and N=16 (-2.3%) are outside the noise band; the rest is within it, and the sign is not monotonic in N. I therefore do not claim a specific end-to-end gain for this PR; what is established is the exact launch removal and the per-launch kernel savings above (1.6-3.3 us for the norm epilogue, ~2.0 us for the swiglu fusion). At N=1 and N=2 the PR is expected to do little (see Limitations).\n\n**Full stack (this PR + two other, separate changes: folding the routed scaling into the AITER top-k, and launching the shared expert after the routed chain in the HIP graph).** Decode-step p50 improved at every N (-0.4% to -4.6%, mean -1.7%; N>=3 mean -0.17 ms); this is not attributable to this PR alone and is listed only for context. A repeat with 5 repetitions at N=1 and N=2 confirmed the stack's N=1 gain (9.22 -> 8.96 ms, -2.8%) and N=2 (10.20 -> 9.93, -2.6%); the A+B-only arm shows nothing at N=1/N=2 (-0.2%/+0.6%), and the scale-fold-only arm accounts for about -2.1% / -1.0% there. The full-stack N=1 gain is not additive across the single-change arms and I could not explain it.\n\n## Quality\n\nFull stack (not this PR alone), GSM8K, all 1319 test questions, chat mode with reasoning allowed, greedy, real (not synthetic) draft acceptance: strict match 0.9363 (installed) vs 0.9424 (stack), flexible 0.9356 vs 0.9416; binomial SE about 0.008, i.e. within the noise. Outputs are not bit-reproducible even within one tree (spec decode, batching), so only accuracy statistics are compared. \"What is 17*23?\" -> 391 on both. The fused norm output is bit-identical to norm -> quant (unit tests and microbench); the swiglu fusion changes 1.9-2.4% of FP8 bytes (see above), which this GSM8K run cannot isolate.\n\nAgentX replay: **not run**.\n\n## Limitations\n\n- No gain at N=1 for the post-attention fusion (the aiter fused all-reduce+norm kernel has no quant output); a quant-emitting variant of that kernel could plug into `allreduce_gemma_rms_norm_mxfp8`.\n- Relies on the `RocmDotScaledMxfp8LinearKernel` consuming row-major E8M0 scales (same condition as #63637).\n- Dispatch assumption: the MoE runner hands the shared expert the layer's own input tensor; otherwise the hand-off is ignored and the linear quantizes itself (correct, just not fused).\n\nAI assistance: this change was developed with Claude Code; the tests and benchmarks above were run on MI355X (gfx950).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+    "changed_files": 5,
+    "closed_at": null,
+    "comments": 3,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/65478/comments",
+    "commits": 5,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/65478/commits",
+    "created_at": "2026-11-03T19:48:17Z",
+    "deletions": 10,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/65478.diff",
+    "draft": false,
+    "head": {
+      "label": "Fangzhou-Ai:rocm-m31-ffn-mxfp8-quant-fusion",
+      "ref": "rocm-m31-ffn-mxfp8-quant-fusion",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/branches{/branch}",
+        "clone_url": "https://github.com/Fangzhou-Ai/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/contributors",
+        "created_at": "2026-05-21T20:40:56Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/downloads",
+        "events_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/forks",
+        "full_name": "Fangzhou-Ai/vllm",
+        "git_commits_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/Fangzhou-Ai/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/hooks",
+        "html_url": "https://github.com/Fangzhou-Ai/vllm",
+        "id": 1246057713,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOSkVU8Q",
+        "notifications_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/notifications{?since,all,participating}",
+        "open_issues": 20,
+        "open_issues_count": 20,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/31551580?v=4",
+          "events_url": "https://api.github.com/users/Fangzhou-Ai/events{/privacy}",
+          "followers_url": "https://api.github.com/users/Fangzhou-Ai/followers",
+          "following_url": "https://api.github.com/users/Fangzhou-Ai/following{/other_user}",
+          "gists_url": "https://api.github.com/users/Fangzhou-Ai/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/Fangzhou-Ai",
+          "id": 31551580,
+          "login": "Fangzhou-Ai",
+          "node_id": "MDQ6VXNlcjMxNTUxNTgw",
+          "organizations_url": "https://api.github.com/users/Fangzhou-Ai/orgs",
+          "received_events_url": "https://api.github.com/users/Fangzhou-Ai/received_events",
+          "repos_url": "https://api.github.com/users/Fangzhou-Ai/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/Fangzhou-Ai/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/Fangzhou-Ai/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/Fangzhou-Ai",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T03:58:08Z",
+        "releases_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/releases{/id}",
+        "size": 329819,
+        "ssh_url": "git@github.com:Fangzhou-Ai/vllm.git",
+        "stargazers_count": 1,
+        "stargazers_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/subscription",
+        "svn_url": "https://github.com/Fangzhou-Ai/vllm",
+        "tags_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/tags",
+        "teams_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/Fangzhou-Ai/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-02T17:24:21Z",
+        "url": "https://api.github.com/repos/Fangzhou-Ai/vllm",
+        "visibility": "public",
+        "watchers": 1,
+        "watchers_count": 1,
+        "web_commit_signoff_required": true
+      },
+      "sha": "beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/31551580?v=4",
+        "events_url": "https://api.github.com/users/Fangzhou-Ai/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Fangzhou-Ai/followers",
+        "following_url": "https://api.github.com/users/Fangzhou-Ai/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Fangzhou-Ai/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Fangzhou-Ai",
+        "id": 31551580,
+        "login": "Fangzhou-Ai",
+        "node_id": "MDQ6VXNlcjMxNTUxNTgw",
+        "organizations_url": "https://api.github.com/users/Fangzhou-Ai/orgs",
+        "received_events_url": "https://api.github.com/users/Fangzhou-Ai/received_events",
+        "repos_url": "https://api.github.com/users/Fangzhou-Ai/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Fangzhou-Ai/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Fangzhou-Ai/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Fangzhou-Ai",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/65478",
+    "id": 5143531284,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/65478",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "B60205",
+        "default": false,
+        "description": "Related to AMD ROCm",
+        "id": 6114440385,
+        "name": "rocm",
+        "node_id": "LA_kwDOI7xefs8AAAABbHL0wQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/rocm"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": "ONLY add when PR is ready to merge/full CI is needed",
+        "id": 7197733874,
+        "name": "ready",
+        "node_id": "LA_kwDOI7xefs8AAAABrQSz8g",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/ready"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "62bfab",
+        "default": false,
+        "description": "",
+        "id": 9988761457,
+        "name": "quantization",
+        "node_id": "LA_kwDOI7xefs8AAAACU2BncQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/quantization"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "e70113",
+        "default": false,
+        "description": "",
+        "id": 11777493001,
+        "name": "minimax",
+        "node_id": "LA_kwDOI7xefs8AAAACvf5ICQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/minimax"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "870e1fe11ff82baf587e4f116e769cc47116e78a",
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABMpQPFA",
+    "number": 65478,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/65478.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1236979?v=4",
+        "events_url": "https://api.github.com/users/tlrmchlsmth/events{/privacy}",
+        "followers_url": "https://api.github.com/users/tlrmchlsmth/followers",
+        "following_url": "https://api.github.com/users/tlrmchlsmth/following{/other_user}",
+        "gists_url": "https://api.github.com/users/tlrmchlsmth/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/tlrmchlsmth",
+        "id": 1236979,
+        "login": "tlrmchlsmth",
+        "node_id": "MDQ6VXNlcjEyMzY5Nzk=",
+        "organizations_url": "https://api.github.com/users/tlrmchlsmth/orgs",
+        "received_events_url": "https://api.github.com/users/tlrmchlsmth/received_events",
+        "repos_url": "https://api.github.com/users/tlrmchlsmth/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/tlrmchlsmth/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/tlrmchlsmth/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/tlrmchlsmth",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/3195154?v=4",
+        "events_url": "https://api.github.com/users/mgoin/events{/privacy}",
+        "followers_url": "https://api.github.com/users/mgoin/followers",
+        "following_url": "https://api.github.com/users/mgoin/following{/other_user}",
+        "gists_url": "https://api.github.com/users/mgoin/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/mgoin",
+        "id": 3195154,
+        "login": "mgoin",
+        "node_id": "MDQ6VXNlcjMxOTUxNTQ=",
+        "organizations_url": "https://api.github.com/users/mgoin/orgs",
+        "received_events_url": "https://api.github.com/users/mgoin/received_events",
+        "repos_url": "https://api.github.com/users/mgoin/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/mgoin/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/mgoin/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/mgoin",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/29171856?v=4",
+        "events_url": "https://api.github.com/users/tjtanaa/events{/privacy}",
+        "followers_url": "https://api.github.com/users/tjtanaa/followers",
+        "following_url": "https://api.github.com/users/tjtanaa/following{/other_user}",
+        "gists_url": "https://api.github.com/users/tjtanaa/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/tjtanaa",
+        "id": 29171856,
+        "login": "tjtanaa",
+        "node_id": "MDQ6VXNlcjI5MTcxODU2",
+        "organizations_url": "https://api.github.com/users/tjtanaa/orgs",
+        "received_events_url": "https://api.github.com/users/tjtanaa/received_events",
+        "repos_url": "https://api.github.com/users/tjtanaa/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/tjtanaa/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/tjtanaa/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/tjtanaa",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42426329?v=4",
+        "events_url": "https://api.github.com/users/zyongye/events{/privacy}",
+        "followers_url": "https://api.github.com/users/zyongye/followers",
+        "following_url": "https://api.github.com/users/zyongye/following{/other_user}",
+        "gists_url": "https://api.github.com/users/zyongye/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/zyongye",
+        "id": 42426329,
+        "login": "zyongye",
+        "node_id": "MDQ6VXNlcjQyNDI2MzI5",
+        "organizations_url": "https://api.github.com/users/zyongye/orgs",
+        "received_events_url": "https://api.github.com/users/zyongye/received_events",
+        "repos_url": "https://api.github.com/users/zyongye/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/zyongye/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/zyongye/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/zyongye",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42451412?v=4",
+        "events_url": "https://api.github.com/users/AndreasKaratzas/events{/privacy}",
+        "followers_url": "https://api.github.com/users/AndreasKaratzas/followers",
+        "following_url": "https://api.github.com/users/AndreasKaratzas/following{/other_user}",
+        "gists_url": "https://api.github.com/users/AndreasKaratzas/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/AndreasKaratzas",
+        "id": 42451412,
+        "login": "AndreasKaratzas",
+        "node_id": "MDQ6VXNlcjQyNDUxNDEy",
+        "organizations_url": "https://api.github.com/users/AndreasKaratzas/orgs",
+        "received_events_url": "https://api.github.com/users/AndreasKaratzas/received_events",
+        "repos_url": "https://api.github.com/users/AndreasKaratzas/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/AndreasKaratzas/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/AndreasKaratzas/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/AndreasKaratzas",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/44945378?v=4",
+        "events_url": "https://api.github.com/users/yewentao256/events{/privacy}",
+        "followers_url": "https://api.github.com/users/yewentao256/followers",
+        "following_url": "https://api.github.com/users/yewentao256/following{/other_user}",
+        "gists_url": "https://api.github.com/users/yewentao256/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/yewentao256",
+        "id": 44945378,
+        "login": "yewentao256",
+        "node_id": "MDQ6VXNlcjQ0OTQ1Mzc4",
+        "organizations_url": "https://api.github.com/users/yewentao256/orgs",
+        "received_events_url": "https://api.github.com/users/yewentao256/received_events",
+        "repos_url": "https://api.github.com/users/yewentao256/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/yewentao256/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/yewentao256/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/yewentao256",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/46394894?v=4",
+        "events_url": "https://api.github.com/users/WoosukKwon/events{/privacy}",
+        "followers_url": "https://api.github.com/users/WoosukKwon/followers",
+        "following_url": "https://api.github.com/users/WoosukKwon/following{/other_user}",
+        "gists_url": "https://api.github.com/users/WoosukKwon/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/WoosukKwon",
+        "id": 46394894,
+        "login": "WoosukKwon",
+        "node_id": "MDQ6VXNlcjQ2Mzk0ODk0",
+        "organizations_url": "https://api.github.com/users/WoosukKwon/orgs",
+        "received_events_url": "https://api.github.com/users/WoosukKwon/received_events",
+        "repos_url": "https://api.github.com/users/WoosukKwon/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/WoosukKwon/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/WoosukKwon/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/WoosukKwon",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/62075498?v=4",
+        "events_url": "https://api.github.com/users/hongxiayang/events{/privacy}",
+        "followers_url": "https://api.github.com/users/hongxiayang/followers",
+        "following_url": "https://api.github.com/users/hongxiayang/following{/other_user}",
+        "gists_url": "https://api.github.com/users/hongxiayang/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/hongxiayang",
+        "id": 62075498,
+        "login": "hongxiayang",
+        "node_id": "MDQ6VXNlcjYyMDc1NDk4",
+        "organizations_url": "https://api.github.com/users/hongxiayang/orgs",
+        "received_events_url": "https://api.github.com/users/hongxiayang/received_events",
+        "repos_url": "https://api.github.com/users/hongxiayang/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/hongxiayang/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/hongxiayang/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/hongxiayang",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/91553416?v=4",
+        "events_url": "https://api.github.com/users/dllehr-amd/events{/privacy}",
+        "followers_url": "https://api.github.com/users/dllehr-amd/followers",
+        "following_url": "https://api.github.com/users/dllehr-amd/following{/other_user}",
+        "gists_url": "https://api.github.com/users/dllehr-amd/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/dllehr-amd",
+        "id": 91553416,
+        "login": "dllehr-amd",
+        "node_id": "U_kgDOBXT-iA",
+        "organizations_url": "https://api.github.com/users/dllehr-amd/orgs",
+        "received_events_url": "https://api.github.com/users/dllehr-amd/received_events",
+        "repos_url": "https://api.github.com/users/dllehr-amd/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/dllehr-amd/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/dllehr-amd/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/dllehr-amd",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/65478/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+    "title": "[ROCm][Perf][MiniMax-M3.1] Fuse the FFN-side MXFP8 activation quant into the post-attention norm and swiglu",
+    "updated_at": "2026-11-04T01:41:47Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/65478",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/31551580?v=4",
+      "events_url": "https://api.github.com/users/Fangzhou-Ai/events{/privacy}",
+      "followers_url": "https://api.github.com/users/Fangzhou-Ai/followers",
+      "following_url": "https://api.github.com/users/Fangzhou-Ai/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Fangzhou-Ai/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/Fangzhou-Ai",
+      "id": 31551580,
+      "login": "Fangzhou-Ai",
+      "node_id": "MDQ6VXNlcjMxNTUxNTgw",
+      "organizations_url": "https://api.github.com/users/Fangzhou-Ai/orgs",
+      "received_events_url": "https://api.github.com/users/Fangzhou-Ai/received_events",
+      "repos_url": "https://api.github.com/users/Fangzhou-Ai/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/Fangzhou-Ai/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Fangzhou-Ai/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/Fangzhou-Ai",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 205,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/tests%2Fkernels%2Ftest_minimax_m3_amd_ops.py",
+      "changes": 205,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fkernels%2Ftest_minimax_m3_amd_ops.py?ref=beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "deletions": 0,
+      "filename": "tests/kernels/test_minimax_m3_amd_ops.py",
+      "patch": "@@ -48,6 +48,7 @@\n )\n from vllm.models.minimax_m3.amd.model import (  # noqa: E402\n     MiniMAXGemmaRMSNorm,\n+    MiniMaxM3MLP,\n     MiniMaxM3SparseAttention,\n     _build_rotary_emb,\n     _can_fuse_input_norm_mxfp8,\n@@ -56,6 +57,7 @@\n from vllm.models.minimax_m3.amd.ops import (  # noqa: E402\n     gemma_fused_add_rmsnorm,\n     gemma_fused_add_rmsnorm_mxfp8,\n+    gemma_fused_add_rmsnorm_mxfp8_and_bf16,\n     gemma_rmsnorm,\n     swiglu_oai_quantize_mxfp8,\n     swiglu_oai_split,\n@@ -213,6 +215,147 @@ def test_gemma_fused_add_rmsnorm_mxfp8_bitwise_eq_unfused(n, dtype):\n     assert torch.equal(got_res, ref_res)\n \n \n+@pytest.mark.parametrize(\"n\", [2048, 6144])\n+@pytest.mark.parametrize(\"dtype\", [torch.bfloat16, torch.float16])\n+@torch.inference_mode()\n+def test_gemma_fused_add_rmsnorm_mxfp8_and_bf16_bitwise_eq_unfused(n, dtype):\n+    \"\"\"The variant that also stores the normed rows matches the unfused norm\n+    (bf16 output) and norm + ``mxfp8_e4m3_quantize`` (values, scales).\"\"\"\n+    x, res, w = _mxfp8_edge_case_inputs(n, dtype)\n+    m = x.shape[0]\n+\n+    got_q, got_scale, got_normed, got_res = gemma_fused_add_rmsnorm_mxfp8_and_bf16(\n+        x, res, w, EPS\n+    )\n+    normed, ref_res = gemma_fused_add_rmsnorm(x, res, w, EPS)\n+    ref_q, ref_scale = mxfp8_e4m3_quantize(normed)\n+\n+    assert got_normed.shape == x.shape and got_normed.dtype == dtype\n+    assert torch.equal(got_normed, normed)\n+    assert torch.equal(got_q.view(torch.uint8), ref_q.view(torch.uint8))\n+    assert torch.equal(got_scale, ref_scale)\n+    assert torch.equal(got_res, ref_res)\n+    assert got_q.shape == (m, n)\n+\n+\n+@pytest.mark.parametrize(\"return_normed\", [True, False])\n+@pytest.mark.parametrize(\"tp_size\", [1, 4])\n+@torch.inference_mode()\n+def test_allreduce_gemma_rms_norm_mxfp8(monkeypatch, tp_size, return_normed):\n+    \"\"\"The fused post-attention norm equals all-reduce + norm + quant, and\n+    defers (None) to a fused all-reduce + norm kernel when one applies.\"\"\"\n+    from vllm.model_executor.layers import fused_allreduce_gemma_rms_norm as far\n+\n+    reduced_inputs = []\n+\n+    def _fake_all_reduce(t):\n+        reduced_inputs.append(t)\n+        return t * 2  # distinguishable from the un-reduced partial\n+\n+    monkeypatch.setattr(far, \"get_tensor_model_parallel_world_size\", lambda: tp_size)\n+    monkeypatch.setattr(far, \"tensor_model_parallel_all_reduce\", _fake_all_reduce)\n+    monkeypatch.setattr(far, \"_can_use_flashinfer\", lambda *a: (False, 0))\n+    monkeypatch.setattr(far, \"_can_use_aiter_fused_ar_rms\", lambda *a: False)\n+\n+    n, m = 6144, 37\n+    torch.manual_seed(0)\n+    x = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)\n+    res = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)\n+    norm = MiniMAXGemmaRMSNorm(n, eps=EPS).to(DEVICE, torch.bfloat16)\n+    norm.weight.data.normal_(0, 0.1)\n+\n+    got = far.allreduce_gemma_rms_norm_mxfp8(x, res, norm, return_normed)\n+    assert got is not None\n+    x_q, x_scale, normed, res_out = got\n+    reduced = x * 2 if tp_size > 1 else x\n+    assert len(reduced_inputs) == (1 if tp_size > 1 else 0)\n+    ref_normed, ref_res = gemma_fused_add_rmsnorm(reduced, res, norm.weight, EPS)\n+    ref_q, ref_scale = mxfp8_e4m3_quantize(ref_normed)\n+    assert torch.equal(x_q.view(torch.uint8), ref_q.view(torch.uint8))\n+    assert torch.equal(x_scale, ref_scale)\n+    assert torch.equal(res_out, ref_res)\n+    if return_normed:\n+        assert normed is not None and torch.equal(normed, ref_normed)\n+    else:\n+        assert normed is None\n+\n+    # A fused all-reduce + norm kernel (no quant epilogue) keeps priority.\n+    if tp_size > 1:\n+        monkeypatch.setattr(far, \"_can_use_aiter_fused_ar_rms\", lambda *a: True)\n+        assert far.allreduce_gemma_rms_norm_mxfp8(x, res, norm, return_normed) is None\n+\n+\n+@requires_gfx950\n+@torch.inference_mode()\n+def test_shared_expert_gate_up_on_post_norm_quant(dist_init):\n+    \"\"\"gate_up_proj on the post-attention norm's MXFP8 output equals the\n+    unfused norm -> linear (shared expert gate_up shape, TP4).\"\"\"\n+    from vllm.model_executor.layers.fusion.quant_activation import (\n+        QuantizedActivation,\n+    )\n+    from vllm.model_executor.layers.quantization.utils.quant_utils import (\n+        kMxfp8Dynamic,\n+    )\n+\n+    n, k, m = 1536, 6144, 32\n+    layer, scheme = _quark_mxfp8_linear(n, k)\n+    assert _can_fuse_input_norm_mxfp8(layer)\n+    scheme.process_weights_after_loading(layer)\n+    x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)\n+    res = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)\n+    w = torch.randn(k, device=DEVICE, dtype=torch.bfloat16) * 0.1\n+    x_q, x_scale, normed, _ = gemma_fused_add_rmsnorm_mxfp8_and_bf16(x, res, w, EPS)\n+    qa = QuantizedActivation(x_q, x_scale, x.dtype, x.shape, kMxfp8Dynamic)\n+    assert torch.equal(\n+        scheme.apply_weights(layer, qa), scheme.apply_weights(layer, normed)\n+    )\n+\n+\n+@torch.inference_mode()\n+def test_mlp_prequant_handoff():\n+    \"\"\"``set_prequant`` replaces gate_up_proj's input only when the shared\n+    expert is called with the very tensor that was quantized, and only once.\"\"\"\n+    from vllm.model_executor.layers.fusion.quant_activation import (\n+        QuantizedActivation,\n+    )\n+    from vllm.model_executor.layers.quantization.utils.quant_utils import (\n+        kMxfp8Dynamic,\n+    )\n+\n+    mlp = object.__new__(MiniMaxM3MLP)\n+    torch.nn.Module.__init__(mlp)\n+    mlp.fuse_act_quant_mxfp8 = False\n+    seen = []\n+\n+    def _gate_up(x):\n+        seen.append(x)\n+        return torch.zeros(4, 16, device=DEVICE, dtype=torch.bfloat16), None\n+\n+    mlp.gate_up_proj = _gate_up\n+    mlp.down_proj = lambda x: (x, None)\n+    mlp.swiglu_alpha, mlp.swiglu_beta, mlp.swiglu_limit = 1.702, 1.0, 7.0\n+\n+    x = torch.randn(4, 8, device=DEVICE, dtype=torch.bfloat16)\n+    other = x.clone()  # a different tensor than the one that was quantized\n+    qa = QuantizedActivation(\n+        x.to(torch.float8_e4m3fn),\n+        torch.zeros(4, 1, device=DEVICE, dtype=torch.uint8),\n+        x.dtype,\n+        x.shape,\n+        kMxfp8Dynamic,\n+    )\n+    mlp.set_prequant(x, qa)\n+    mlp(x)\n+    assert seen[-1] is qa\n+    mlp(x)  # consumed by the first forward\n+    assert seen[-1] is x\n+    mlp.set_prequant(x, qa)\n+    mlp(other)\n+    assert seen[-1] is other\n+    mlp(qa)  # a quantized input passes through untouched\n+    assert seen[-1] is qa\n+\n+\n # --------------------------------------------------------------------------- #\n # SwiGLU-OAI (split layout)\n # --------------------------------------------------------------------------- #\n@@ -258,6 +401,68 @@ def test_swiglu_oai_quantize_mxfp8_uses_e4m3_range_for_scale():\n     assert torch.equal(got_q, ref_q)\n \n \n+@pytest.mark.parametrize(\"m\", [1, 8, 32, 128, 192])\n+@pytest.mark.parametrize(\"inter\", [768, 3072])\n+@pytest.mark.parametrize(\"block_m\", [8, 16, 64])\n+@torch.inference_mode()\n+def test_swiglu_oai_quantize_mxfp8_vs_unfused(m, inter, block_m):\n+    \"\"\"Fused swiglu + quant against swiglu -> bf16 -> quant. It skips the bf16\n+    rounding of the activation, so a few E4M3 codes (and, rarely, a block scale)\n+    differ; against the fp32 activation it is at least as accurate.\"\"\"\n+    torch.manual_seed(m + inter)\n+    gate_up = (torch.randn(m, 2 * inter, device=DEVICE) * 8).to(torch.bfloat16)\n+    alpha, beta, limit = 1.702, 1.0, 7.0\n+\n+    got_q, got_s = swiglu_oai_quantize_mxfp8(\n+        gate_up, alpha, beta, limit, block_m=block_m\n+    )\n+    act_bf16 = swiglu_oai_split(gate_up, alpha, beta, limit)\n+    ref_q, ref_s = mxfp8_e4m3_quantize(act_bf16)\n+    assert got_q.shape == ref_q.shape and got_s.shape == ref_s.shape\n+\n+    assert (got_s != ref_s).float().mean().item() < 1e-3\n+    assert (got_q.view(torch.uint8) != ref_q.view(torch.uint8)).float().mean() < 0.05\n+\n+    act_f32 = _ref_swiglu(gate_up.float(), alpha, beta, limit).float()\n+    got_err = _relerr(dequant_mxfp8_to_bf16(got_q, got_s), act_f32)\n+    ref_err = _relerr(dequant_mxfp8_to_bf16(ref_q, ref_s), act_f32)\n+    assert got_err <= ref_err * 1.001 + 1e-6\n+\n+\n+@requires_gfx950\n+@pytest.mark.parametrize(\"m\", [1, 8, 16, 17, 32, 128])\n+@pytest.mark.parametrize(\"n,k\", [(6144, 768), (6144, 3072)])  # shared expert, dense\n+@torch.inference_mode()\n+def test_mlp_down_proj_on_swiglu_quant(dist_init, m, n, k):\n+    \"\"\"down_proj on the fused swiglu + quant output stays within MXFP8 quant\n+    noise of the unfused swiglu -> linear, and the fused-quant GEMM keeps its\n+    own path where it already quantizes in-kernel (M <= 16, K <= 1024).\"\"\"\n+    from vllm.model_executor.layers.fusion.quant_activation import (\n+        QuantizedActivation,\n+    )\n+    from vllm.model_executor.layers.quantization.utils.quant_utils import (\n+        kMxfp8Dynamic,\n+    )\n+\n+    layer, scheme = _quark_mxfp8_linear(n, k)\n+    assert _can_fuse_input_norm_mxfp8(layer)\n+    scheme.process_weights_after_loading(layer)\n+    mlp = object.__new__(MiniMaxM3MLP)\n+    torch.nn.Module.__init__(mlp)\n+    mlp.down_proj = layer\n+    in_gemm = mlp._down_proj_quantizes_in_gemm(m)\n+    assert in_gemm == (m <= 16 and k <= 1024)\n+\n+    gate_up = (torch.randn(m, 2 * k, device=DEVICE) * 4).to(torch.bfloat16)\n+    act = swiglu_oai_split(gate_up, 1.702, 1.0, 7.0)\n+    act_q, act_s = swiglu_oai_quantize_mxfp8(gate_up, 1.702, 1.0, 7.0, block_m=16)\n+    qa = QuantizedActivation(act_q, act_s, act.dtype, act.shape, kMxfp8Dynamic)\n+    got = scheme.apply_weights(layer, qa)\n+    ref = scheme.apply_weights(layer, act)\n+    assert got.shape == ref.shape == (m, n)\n+    assert _relerr(got, ref) < 3e-2\n+\n+\n # --------------------------------------------------------------------------- #\n # Fused MXFP8 activation quant (Triton vs torch reference)\n # --------------------------------------------------------------------------- #",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/tests%2Fkernels%2Ftest_minimax_m3_amd_ops.py",
+      "sha": "a28aee73e5460dd53a83013c0985e7b23654ad8a",
+      "status": "modified"
+    },
+    {
+      "additions": 40,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodel_executor%2Flayers%2Ffused_allreduce_gemma_rms_norm.py",
+      "changes": 40,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Flayers%2Ffused_allreduce_gemma_rms_norm.py?ref=beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "deletions": 0,
+      "filename": "vllm/model_executor/layers/fused_allreduce_gemma_rms_norm.py",
+      "patch": "@@ -188,3 +188,43 @@ def fused_allreduce_gemma_rms_norm(\n     # Fallback: explicit all-reduce + GemmaRMSNorm (matches the unfused model).\n     reduced = tensor_model_parallel_all_reduce(hidden_states)\n     return norm(reduced, residual)\n+\n+\n+def allreduce_gemma_rms_norm_mxfp8(\n+    hidden_states: torch.Tensor,\n+    residual: torch.Tensor,\n+    norm: GemmaRMSNorm,\n+    return_normed: bool = False,\n+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor] | None:\n+    \"\"\"All-reduce + residual add + GemmaRMSNorm with MXFP8-quantized output.\n+\n+    ``fused_allreduce_gemma_rms_norm`` followed by an MXFP8 activation quant,\n+    with the quant as an epilogue of the Triton norm instead of its own launch.\n+    The fused all-reduce + norm kernels have no quantized output, so this only\n+    covers the plain collective + Triton norm; when one of them would run it\n+    returns ``None`` and the caller keeps the unfused path.\n+\n+    Returns ``(x_q, x_scale, normed, residual_out)``: float8_e4m3fn values\n+    ``[M, N]``, row-major E8M0 scales ``[M, N // 32]``, the bf16 normed rows\n+    (only if ``return_normed``, else ``None``) and the new residual.\n+    \"\"\"\n+    from vllm.models.minimax_m3.amd.ops import (\n+        gemma_fused_add_rmsnorm_mxfp8,\n+        gemma_fused_add_rmsnorm_mxfp8_and_bf16,\n+    )\n+\n+    tp_size = get_tensor_model_parallel_world_size()\n+    if tp_size > 1:\n+        if _can_use_flashinfer(hidden_states, tp_size)[0]:\n+            return None\n+        if _can_use_aiter_fused_ar_rms(hidden_states):\n+            return None\n+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)\n+    if return_normed:\n+        return gemma_fused_add_rmsnorm_mxfp8_and_bf16(\n+            hidden_states, residual, norm.weight, norm.variance_epsilon\n+        )\n+    x_q, x_scale, res_out = gemma_fused_add_rmsnorm_mxfp8(\n+        hidden_states, residual, norm.weight, norm.variance_epsilon\n+    )\n+    return x_q, x_scale, None, res_out",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodel_executor%2Flayers%2Ffused_allreduce_gemma_rms_norm.py",
+      "sha": "3eb100cb798e49b286b3e40b41b09be4bf2c8529",
+      "status": "modified"
+    },
+    {
+      "additions": 116,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fmodel.py",
+      "changes": 125,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fmodel.py?ref=beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "deletions": 9,
+      "filename": "vllm/models/minimax_m3/amd/model.py",
+      "patch": "@@ -37,12 +37,15 @@\n from vllm.forward_context import get_forward_context\n from vllm.logger import init_logger\n from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (\n+    _FUSED_QUANT_MAX_M,\n     RocmDotScaledMxfp8LinearKernel,\n+    _select_fused_quant_cfg,\n )\n from vllm.model_executor.layers.attention import Attention\n from vllm.model_executor.layers.attention.attention import set_default_quant_scales\n from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase\n from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (\n+    allreduce_gemma_rms_norm_mxfp8,\n     fused_allreduce_gemma_rms_norm,\n )\n from vllm.model_executor.layers.fused_moe import (\n@@ -114,6 +117,7 @@\n     gemma_fused_add_rmsnorm,\n     gemma_fused_add_rmsnorm_mxfp8,\n     gemma_rmsnorm,\n+    swiglu_oai_quantize_mxfp8,\n     swiglu_oai_split,\n )\n from vllm.models.minimax_m3.amd.ops.sparse_pa import (\n@@ -294,6 +298,11 @@ def forward(\n         return gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)\n \n \n+# Rows per program of the fused swiglu + MXFP8 quant: at decode-sized M (8-192)\n+# 16 is ~0.1 us faster than the MoE path's 64. Tuned on gfx950 (MI355X) only.\n+_SWIGLU_QUANT_BLOCK_M = 16\n+\n+\n class MiniMaxM3MLP(nn.Module):\n     \"\"\"Dense SwiGLU-OAI MLP (used by the leading dense layers).\"\"\"\n \n@@ -334,15 +343,70 @@ def __init__(\n         self.swiglu_alpha = config.swiglu_alpha\n         self.swiglu_beta = config.swiglu_beta\n         self.swiglu_limit = config.swiglu_limit\n+        # Set by the decoder layer: whether down_proj takes MXFP8 input, so the\n+        # swiglu kernel can quantize its output (no bf16 round trip, one launch\n+        # fewer than swiglu + the linear's own quant).\n+        self.fuse_act_quant_mxfp8 = False\n+        # (source tensor, its MXFP8 quantization) handed over by the decoder\n+        # layer's post-attention norm; consumed by the next forward.\n+        self._prequant: tuple[torch.Tensor, QuantizedActivation] | None = None\n+\n+    def set_prequant(self, src: torch.Tensor, qa: QuantizedActivation) -> None:\n+        \"\"\"Hand over ``src`` already quantized, for the next forward only.\n+\n+        The MoE runner calls the shared expert with the layer's own input\n+        tensor, so ``src`` is checked against it and ignored if it differs.\n+        \"\"\"\n+        self._prequant = (src, qa)\n+\n+    def _down_proj_quantizes_in_gemm(self, num_tokens: int) -> bool:\n+        \"\"\"Whether down_proj's kernel quantizes its input inside the GEMM at\n+        this token count; that is already a single launch, so keep it.\"\"\"\n+        n, k = self.down_proj.weight.shape\n+        return (\n+            0 < num_tokens <= _FUSED_QUANT_MAX_M\n+            and _select_fused_quant_cfg(num_tokens, n, k) is not None\n+        )\n \n-    def forward(self, x: torch.Tensor) -> torch.Tensor:\n+    def forward(self, x: torch.Tensor | QuantizedActivation) -> torch.Tensor:\n+        pre, self._prequant = self._prequant, None\n+        if (\n+            pre is not None\n+            and isinstance(x, torch.Tensor)\n+            and pre[0].data_ptr() == x.data_ptr()\n+            and pre[0].shape == x.shape\n+        ):\n+            x = pre[1]\n         gate_up, _ = self.gate_up_proj(x)\n-        x = swiglu_oai_split(\n-            gate_up,\n-            alpha=self.swiglu_alpha,\n-            beta=self.swiglu_beta,\n-            limit=self.swiglu_limit,\n-        )\n+        if self.fuse_act_quant_mxfp8 and not self._down_proj_quantizes_in_gemm(\n+            gate_up.shape[0]\n+        ):\n+            # Not bit-identical to the unfused chain, by design: this quantizes\n+            # the fp32 swiglu result directly and skips the bf16 rounding the\n+            # unfused path applies before the quant (about 2% of the E4M3\n+            # bytes differ; the result is at least as close to the fp32\n+            # activation).\n+            act_q, act_scale = swiglu_oai_quantize_mxfp8(\n+                gate_up,\n+                alpha=self.swiglu_alpha,\n+                beta=self.swiglu_beta,\n+                limit=self.swiglu_limit,\n+                block_m=_SWIGLU_QUANT_BLOCK_M,\n+            )\n+            x = QuantizedActivation(\n+                act_q,\n+                act_scale,\n+                gate_up.dtype,\n+                torch.Size((gate_up.shape[0], act_q.shape[1])),\n+                kMxfp8Dynamic,\n+            )\n+        else:\n+            x = swiglu_oai_split(\n+                gate_up,\n+                alpha=self.swiglu_alpha,\n+                beta=self.swiglu_beta,\n+                limit=self.swiglu_limit,\n+            )\n         x, _ = self.down_proj(x)\n         return x\n \n@@ -511,9 +575,18 @@ def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> Non\n         assert param.size() == loaded_weight.size()\n         param.data.copy_(loaded_weight.to(torch.float32))\n \n-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:\n+    def forward(\n+        self,\n+        hidden_states: torch.Tensor,\n+        shared_prequant: QuantizedActivation | None = None,\n+    ) -> torch.Tensor:\n+        \"\"\"``shared_prequant``: ``hidden_states`` already MXFP8-quantized, for\n+        the shared expert's gate_up_proj (the routed path needs the bf16 rows).\"\"\"\n         num_tokens, hidden_dim = hidden_states.shape\n         hidden_states = hidden_states.view(-1, hidden_dim)\n+        if shared_prequant is not None:\n+            assert self.shared_experts is not None\n+            self.shared_experts.set_prequant(hidden_states, shared_prequant)\n \n         # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.\n         router_logits, _ = self.gate(hidden_states)\n@@ -1559,6 +1632,21 @@ def __init__(\n         self.fuse_input_norm_mxfp8 = _can_fuse_input_norm_mxfp8(self.self_attn.qkv_proj)\n         if self.fuse_input_norm_mxfp8:\n             logger.info_once(\"Fusing input_layernorm with qkv_proj's MXFP8 input quant\")\n+        # The FFN's first projection: the dense MLP's, or the MoE shared\n+        # expert's (the routed experts take bf16).\n+        ffn_mlp = (\n+            self.block_sparse_moe.shared_experts if self.is_moe_layer else self.mlp\n+        )\n+        self.fuse_post_norm_mxfp8 = ffn_mlp is not None and _can_fuse_input_norm_mxfp8(\n+            ffn_mlp.gate_up_proj\n+        )\n+        if ffn_mlp is not None:\n+            ffn_mlp.fuse_act_quant_mxfp8 = _can_fuse_input_norm_mxfp8(ffn_mlp.down_proj)\n+        if self.fuse_post_norm_mxfp8:\n+            logger.info_once(\n+                \"Fusing post_attention_layernorm with the FFN gate_up_proj's \"\n+                \"MXFP8 input quant\"\n+            )\n \n     def forward(\n         self,\n@@ -1588,10 +1676,29 @@ def forward(\n             hidden_states=attn_input,\n         )\n \n+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp\n+        if self.fuse_post_norm_mxfp8:\n+            # None when a fused all-reduce + norm kernel applies (no quant\n+            # epilogue there): that path keeps the linear's own quant.\n+            fused = allreduce_gemma_rms_norm_mxfp8(\n+                hidden_states,\n+                residual,\n+                self.post_attention_layernorm,\n+                # MoE: the router and routed experts need the bf16 normed rows.\n+                return_normed=self.is_moe_layer,\n+            )\n+            if fused is not None:\n+                x_q, x_scale, normed, residual = fused\n+                qa = QuantizedActivation(\n+                    x_q, x_scale, hidden_states.dtype, x_q.shape, kMxfp8Dynamic\n+                )\n+                if self.is_moe_layer:\n+                    assert normed is not None\n+                    return ffn(normed, shared_prequant=qa), residual\n+                return ffn(qa), residual\n         hidden_states, residual = fused_allreduce_gemma_rms_norm(\n             hidden_states, residual, self.post_attention_layernorm\n         )\n-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp\n         hidden_states = ffn(hidden_states)\n         return hidden_states, residual\n ",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fmodel.py",
+      "sha": "44aae57929368ba5ff1bfebea46a9dff2e37adec",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fops%2F__init__.py",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fops%2F__init__.py?ref=beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "deletions": 0,
+      "filename": "vllm/models/minimax_m3/amd/ops/__init__.py",
+      "patch": "@@ -10,6 +10,7 @@\n from vllm.models.minimax_m3.amd.ops.gemma_rmsnorm import (\n     gemma_fused_add_rmsnorm,\n     gemma_fused_add_rmsnorm_mxfp8,\n+    gemma_fused_add_rmsnorm_mxfp8_and_bf16,\n     gemma_rmsnorm,\n )\n from vllm.models.minimax_m3.amd.ops.swiglu_oai import (\n@@ -21,6 +22,7 @@\n     \"gemma_rmsnorm\",\n     \"gemma_fused_add_rmsnorm\",\n     \"gemma_fused_add_rmsnorm_mxfp8\",\n+    \"gemma_fused_add_rmsnorm_mxfp8_and_bf16\",\n     \"swiglu_oai_split\",\n     \"swiglu_oai_quantize_mxfp8\",\n ]",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fops%2F__init__.py",
+      "sha": "0152beeda52dd64ca16bc7ac9b362f19ba3b4270",
+      "status": "modified"
+    },
+    {
+      "additions": 73,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fops%2Fgemma_rmsnorm.py",
+      "changes": 74,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fops%2Fgemma_rmsnorm.py?ref=beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "deletions": 1,
+      "filename": "vllm/models/minimax_m3/amd/ops/gemma_rmsnorm.py",
+      "patch": "@@ -15,6 +15,9 @@\n         -> (MXFP8 values, E8M0 scales, x + res): the fused add + norm with the\n            per-32-block MXFP8 activation quant as an epilogue, so a following\n            MXFP8 linear need not quantize its input again.\n+  * ``gemma_fused_add_rmsnorm_mxfp8_and_bf16(x, res, w, eps)``\n+        -> (MXFP8 values, E8M0 scales, normed, x + res): the same, plus the\n+           normed rows in the input dtype for consumers that cannot take MXFP8.\n \n Both normalize over the last dim and broadcast ``weight`` (shape [N]) over it,\n so they serve both the full-hidden norms (input/post-attn/final) and the\n@@ -23,6 +26,8 @@\n contiguous.\n \"\"\"\n \n+from typing import Literal, overload\n+\n import torch\n \n from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (\n@@ -69,6 +74,7 @@ def _gemma_fused_add_rmsnorm_kernel(\n     out_ptr,\n     res_out_ptr,\n     scale_ptr,\n+    bf16_out_ptr,\n     n_cols,\n     stride_xrow,\n     stride_xcol,\n@@ -77,6 +83,7 @@ def _gemma_fused_add_rmsnorm_kernel(\n     eps,\n     BLOCK_N: tl.constexpr,\n     QUANT_MXFP8: tl.constexpr,\n+    ALSO_BF16: tl.constexpr,\n     FP8_MAX: tl.constexpr,\n     TINY: tl.constexpr,\n ):\n@@ -100,6 +107,13 @@ def _gemma_fused_add_rmsnorm_kernel(\n     rstd = 1.0 / tl.sqrt(var + eps)\n     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)\n     out = s * rstd * (1.0 + w)\n+    if ALSO_BF16:\n+        # The bf16 normed row too, for consumers that cannot take MXFP8 input.\n+        tl.store(\n+            bf16_out_ptr + row * n_cols + cols,\n+            out.to(bf16_out_ptr.dtype.element_ty),\n+            mask=mask,\n+        )\n     if QUANT_MXFP8:\n         # Same math as mxfp8_e4m3_quantize on the input-dtype normed row, so\n         # the result is bit-identical to norm -> bf16 -> quant.\n@@ -196,13 +210,66 @@ def gemma_fused_add_rmsnorm_mxfp8(\n     return x_q, x_scale, res_out\n \n \n+def gemma_fused_add_rmsnorm_mxfp8_and_bf16(\n+    x: torch.Tensor,\n+    residual: torch.Tensor,\n+    weight: torch.Tensor,\n+    eps: float,\n+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n+    \"\"\"``gemma_fused_add_rmsnorm_mxfp8`` that also writes the bf16 normed row.\n+\n+    For a norm whose output feeds both an MXFP8 linear and bf16 consumers (the\n+    MoE router and routed experts next to the shared expert's gate_up_proj).\n+\n+    Returns:\n+        ``(x_q, x_scale, normed, residual_out)``; ``normed`` is bit-identical\n+        to ``gemma_fused_add_rmsnorm(...)[0]``.\n+\n+    \"\"\"\n+    n = x.shape[-1]\n+    assert n % MXFP8_BLOCK_SIZE == 0, (\n+        f\"MXFP8 needs the hidden size to be a multiple of {MXFP8_BLOCK_SIZE}, got {n}\"\n+    )\n+    x_q, x_scale, res_out, normed = _gemma_fused_add_rmsnorm(\n+        x, residual, weight, eps, True, also_bf16=True\n+    )\n+    assert x_scale is not None and normed is not None\n+    return x_q, x_scale, normed.reshape(x.shape), res_out\n+\n+\n+@overload\n+def _gemma_fused_add_rmsnorm(\n+    x: torch.Tensor,\n+    residual: torch.Tensor,\n+    weight: torch.Tensor,\n+    eps: float,\n+    quant_mxfp8: bool,\n+    also_bf16: Literal[False] = False,\n+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]: ...\n+\n+\n+@overload\n def _gemma_fused_add_rmsnorm(\n     x: torch.Tensor,\n     residual: torch.Tensor,\n     weight: torch.Tensor,\n     eps: float,\n     quant_mxfp8: bool,\n-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:\n+    also_bf16: Literal[True],\n+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]: ...\n+\n+\n+def _gemma_fused_add_rmsnorm(\n+    x: torch.Tensor,\n+    residual: torch.Tensor,\n+    weight: torch.Tensor,\n+    eps: float,\n+    quant_mxfp8: bool,\n+    also_bf16: bool = False,\n+) -> (\n+    tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]\n+    | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]\n+):\n     orig_shape = x.shape\n     n = orig_shape[-1]\n     x2 = x.reshape(-1, n)\n@@ -218,6 +285,7 @@ def _gemma_fused_add_rmsnorm(\n         else None\n     )\n     res_out = torch.empty((m, n), dtype=x.dtype, device=x.device)\n+    normed = torch.empty((m, n), dtype=x.dtype, device=x.device) if also_bf16 else None\n     block_n = triton.next_power_of_2(n)\n     _gemma_fused_add_rmsnorm_kernel[(m,)](\n         x2,\n@@ -226,6 +294,7 @@ def _gemma_fused_add_rmsnorm(\n         out,\n         res_out,\n         scale,\n+        normed,\n         n,\n         x2.stride(0),\n         x2.stride(1),\n@@ -234,8 +303,11 @@ def _gemma_fused_add_rmsnorm(\n         eps,\n         BLOCK_N=block_n,\n         QUANT_MXFP8=quant_mxfp8,\n+        ALSO_BF16=also_bf16,\n         FP8_MAX=float(torch.finfo(MXFP8_VALUE_DTYPE).max),\n         TINY=float(torch.finfo(torch.float32).tiny),\n         num_warps=_num_warps(block_n),\n     )\n+    if also_bf16:\n+        return out, scale, res_out.reshape(orig_shape), normed\n     return out, scale, res_out.reshape(orig_shape)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/beb2048674b2b422f5cd661e6c6ce3604d08c8d6/vllm%2Fmodels%2Fminimax_m3%2Famd%2Fops%2Fgemma_rmsnorm.py",
+      "sha": "d5cac160f880d69c2c93739bccc16dd159012e7f",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Thanks for the review, addressed in 6c4a595:\n\n- **Return annotation on `_gemma_fused_add_rmsnorm`**: restored, using `@overload` on `also_bf16` (`Literal[True]` -> 4-tuple, `Literal[False]` -> 3-tuple) so the existing 3- and 4-value unpacks type-check. The repo's mypy hook passes.\n- **Dense layers / normed output**: checked. Dense decoder layers return `ffn(qa), residual` and never read the normed bf16 output, so skipping it there is safe. MoE layers return `ffn(normed, shared_prequant=qa), residual` and do use it.\n- **swiglu numerics**: added a comment in `MiniMaxM3MLP.forward`. The fused path is intentionally not bit-identical: it quantizes the fp32 swiglu result directly and skips the bf16 rounding the unfused path applies first. About 2% of the E4M3 bytes differ, and the result is at least as close to the fp32 activation.\n- **`_SWIGLU_QUANT_BLOCK_M = 16`**: commented as tuned on gfx950 (MI355X) only.\n- **PR body \"always\" wording**: you're right, the dense path skips the separate quant when the in-GEMM quant applies. Body updated.\n- **Failing tests**: the 6 failures on my machine are `_moe_C.moe_align_block_size` extension gaps in this local build and fail identically on the base commit; CI on a gfx950 image should confirm.\n",
+      "created_at": "2026-11-03T22:36:16Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/65478#issuecomment-6617238681",
+      "id": 6617238681,
+      "updated_at": "2026-11-03T22:36:16Z",
+      "user": {
+        "login": "Fangzhou-Ai"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-11-03T22:55:59Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/65478#issuecomment-6617585732",
+      "id": 6617585732,
+      "updated_at": "2026-11-03T22:55:59Z",
+      "user": {
+        "login": "Fangzhou-Ai"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #99726](https://buildkite.com/vllm/ci/builds/99726) for commit `beb2048674b2`.",
+      "created_at": "2026-11-03T22:56:20Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/65478#issuecomment-6617591736",
+      "id": 6617591736,
+      "updated_at": "2026-11-03T22:56:20Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 65478,
+  "refs": {
+    "base": {
+      "commit": "a0d7356b98e929c17051bac44f5a086e4117974d",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "beb2048674b2b422f5cd661e6c6ce3604d08c8d6",
+      "repository": "Fangzhou-Ai/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/65478#pullrequestreview-5758539534",
+      "id": 5758539534,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T19:48:21Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Thanks for this — it's an unusually well-documented PR, and the honesty in the\nperf section (separating the solid launch-count/per-kernel numbers from the\nend-to-end deltas that sit in the noise, and explicitly *not* claiming an e2e\ngain) makes it much easier to review. I went through the diff against `main`\nand traced the surrounding code; overall this looks correct and I'm in favor of\nmerging. No blocking issues. A few questions and nits below, plus the things I\nspecifically checked and found safe.\n\nContext: we've been working the MXFP8 *activation scheme* invariant on the\nlinear side (the native MXFP8 kernel must honor the activation scheme:\nself-quantizing kernels advertise `kMxfp8Dynamic` with row-major E8M0 scales,\nweight-only stays BF16). This PR is a producer for exactly that contract, so I\npaid most attention to whether the fused epilogues emit activations the consumer\nactually expects.\n\n## What I checked and found safe\n\n- **Norm epilogue is bit-identical to the unfused path.** The new `ALSO_BF16`\n  branch in `gemma_rmsnorm.py` stores the normed row *before* the `QUANT_MXFP8`\n  block and still re-casts through `out.to(x_ptr.dtype.element_ty)`, so the FP8\n  values and E8M0 scales are computed from the same input-dtype-rounded row as\n  `norm -> mxfp8_e4m3_quantize`. The bitwise-eq test covers bf16/fp16 and N in\n  {2048, 6144}.\n- **Scale layout / scheme contract matches the consumer.** The fused ops emit\n  row-major `[M, N//32]` E8M0 scales (not swizzled) under `kMxfp8Dynamic`, which\n  is exactly what `RocmDotScaledMxfp8LinearKernel` consumes (row-major, not\n  swizzled). The gate `_can_fuse_input_norm_mxfp8` requires that kernel +\n  `supports_quantized_input(...)`, so a FlashInfer-style consumer that wants\n  swizzled scales under the same key can never receive these — the same\n  layout-vs-key distinction matters here and it's handled correctly.\n- **`down_proj` in-GEMM-quant carve-out** reproduces the kernel's own decision\n  (`0 < M <= _FUSED_QUANT_MAX_M and _select_fused_quant_cfg(...) is not None`),\n  so no double-quant / no missed fusion; the test pins `in_gemm == (m<=16 and\n  k<=1024)`.\n- **Prequant hand-off is fail-safe:** `forward` only substitutes when the\n  incoming `x` is a tensor with matching `data_ptr()` and `shape`, consumes it\n  once, else falls back to self-quantization. DP/EP paths fall back cleanly.\n- **Batch-invariant mode is fully disabled** (`_can_fuse_input_norm_mxfp8`\n  returns False under `VLLM_BATCH_INVARIANT`), so the `down_proj` path not\n  re-checking it is harmless.\n- **`None`-deferral keeps the fused-AR / N=1 path byte-for-byte unchanged.**\n- **Perf claims appropriately scoped** (per-launch savings + exact launch-count\n  reduction are the credible core; e2e correctly not claimed).\n\n## Questions (non-blocking)\n\n1. The fused swiglu path is numerically *different* (not bit-identical) by\n   design — it quantizes the fp32 activation directly and skips the bf16\n   round-trip the unfused chain does (~1.9-2.4% of E4M3 bytes differ, and your\n   test only bounds it as *at least as close* to the fp32 ref). The op documents\n   this, but the substitution at the `MiniMaxM3MLP.forward` call site is silent —\n   a one-line comment there would save the next reader the trip.\n2. The 6 failing kernel tests (`moe_align_block_size` missing) reproduce on the\n   base commit too, i.e. a test-machine extension gap, not a regression — agreed,\n   but worth confirming they pass on a real gfx950 CI image before merge.\n3. `return_normed=self.is_moe_layer`: confirming the dense path has no consumer\n   of the post-attn normed output other than `gate_up_proj` (which takes MXFP8\n   directly), so discarding `normed` for dense is safe.\n\n## Nits\n- `_gemma_fused_add_rmsnorm`'s return-type annotation was dropped when\n  `also_bf16` was added (now a 3- or 4-tuple) — worth restoring.\n- `_SWIGLU_QUANT_BLOCK_M = 16` — note it was tuned on gfx950 specifically (the\n  MoE default is 64).\n- PR body says swiglu fusion applies to dense \"always\"; the code correctly also\n  skips it when `_down_proj_quantizes_in_gemm` — minor wording.\n\nCorrect, well-tested, and the activation-scheme/scale-layout contract lines up\nwith the native MXFP8 consumer. The guards all fail safe toward the unfused\npath. I'd approve once the swiglu-not-bit-identical comment (Q1) is added and\nthe two extension-gap failures are confirmed green on real gfx950 CI. Nice work.\n",
+      "html_url": "https://github.com/vllm-project/vllm/pull/65478#pullrequestreview-5759998194",
+      "id": 5759998194,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T21:52:28Z",
+      "user": {
+        "login": "selimfedakar"
+      }
+    },
+    {
+      "body": "LGTM. Fusing the FFN-side MXFP8 quant into the post-attn norm / swiglu epilogues is the right producer for the native MXFP8 linears, and the dense vs MoE bf16-norm handling looks correct. Thanks for keeping the e2e claim honest. Selim’s asks look addressed.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/65478#pullrequestreview-5762023441",
+      "id": 5762023441,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-04T01:41:47Z",
+      "user": {
+        "login": "ChuanLi1101"
+      }
+    }
+  ]
+}

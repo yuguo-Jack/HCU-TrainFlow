@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: README_zh.md
-raw_sha256: 1212aaaac1c36c6a5473932ae718698cf94556c58aaf11300eee3d91cbe8139b
+raw_sha256: 22f3f9816254978209cef374cb93738828f1c9ef5685e9ad3b25cf8e7767d595
 sources: []
-generated_body_sha256: a3e6885bb9dcac39ce94f5153215ae650fc1d070b5ee6c96ff4a0409d57dc6a3
+generated_body_sha256: c97359efac2d1e634154aab6093ff4eae02dcf5121f4bb516da00ebb0fa7f8ff
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / README_zh.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/README_zh.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/README_zh.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -41,9 +41,9 @@ Upstream source document; original commands, claims and links require their stat
 <h3 align="center">更快地训练 LLM、VLM、Diffusion 与具身模型</h3>
 
 <p align="center">
-  <a href="https://loongforge.readthedocs.io/zh-cn/latest/index.html"><b>文档 &#8599;&#xFE0E;</b></a>
+  <a href="https://loongforge.readthedocs.io/zh-cn/latest/index.html"><b>文档</b></a>
   &nbsp;·&nbsp;
-  <a href="https://baidu-baige.github.io/LoongForge/blog/"><b>博客 &#8599;&#xFE0E;</b></a>
+  <a href="https://baidu-baige.github.io/LoongForge/blog/"><b>博客</b></a>
   &nbsp;·&nbsp;
   <a href="#performance"><b>性能表现</b></a>
   &nbsp;·&nbsp;
@@ -51,7 +51,7 @@ Upstream source document; original commands, claims and links require their stat
   &nbsp;·&nbsp;
   <a href="#models"><b>支持模型</b></a>
   &nbsp;·&nbsp;
-  <a href="#powered-by-loongforge"><b>优秀项目</b></a>
+  <a href="#powered-by-loongforge"><b>项目案例</b></a>
 </p>
 
 <p align="center">
@@ -78,13 +78,13 @@ Upstream source document; original commands, claims and links require their stat
 
 **LoongForge** 是百度智能云 [百舸团队](https://cloud.baidu.com/product/aihc.html) 打造的开源训练框架，旨在加速主流 **LLM、VLM、Diffusion 与具身模型**的训练。
 
-- **高性能** —— 基于多后端架构（Megatron-LM 与 torch-native），[深度优化训练速度](#performance)，同时保证**训练 loss 与基线对齐**。
-- **易用性** —— 已覆盖 40+ 个主流开源[模型](#models)，每个模型均附带开箱即用的配置与启动示例；框架另提供权重转换、数据预处理等配套工具，并支持**预训练**、**持续预训练**、**SFT** 与 **LoRA** 等训练方式。
-- **源自生产** —— 前身为 [AIAK-Training-LLM](https://cloud.baidu.com/doc/AIHC/s/Alyo476jr)，既落地于企业客户的闭源模型训练，也支撑了[不少优秀项目](#powered-by-loongforge)；在大模型训练中，最大验证规模达 **5,000+ XPU**。
+- **高性能** —— 基于 Megatron-LM 与 torch-native 后端，在[深度优化训练速度](#performance)的同时，保证**训练 loss 与基线对齐**。
+- **易用性** —— 支持 40+ 个开源[模型](#models)，并附带开箱即用的配置与启动示例，另有权重转换、数据预处理等配套工具；覆盖**预训练**、**中期训练**、**SFT** 与 **LoRA**。
+- **源自生产** —— 前身为 [AIAK-Training-LLM](https://cloud.baidu.com/doc/AIHC/s/Alyo476jr)，既落地于企业客户的闭源模型训练，也支撑了[多个开源项目](#powered-by-loongforge)；在实际生产中，最大训练规模达 **5,000+ XPU**。
 
 ---
 
-**示例**：在 LoongForge 上训练具身模型 DreamZero（Wan2.2-5B 全参微调），吞吐达开源基线的 4.38 倍，loss 曲线保持对齐
+**示例**：在 LoongForge 上训练具身模型 DreamZero，吞吐达开源基线的 4.38 倍，loss 曲线保持对齐
 
 <p align="center">
   <a href="https://baidu-baige.github.io/LoongForge/assets/video/dreamzero-comparison.mp4">
@@ -115,7 +115,8 @@ Upstream source document; original commands, claims and links require their stat
 
 ## 🔥 最新动态
 
-- **[2026/10]** 🤖 推出 **[LoongForge-VLDA](./cookbook/loongforge-vlda/)**，基于 LoongForge 训练的 Vision-Language-Delta-Action 模型：LIBERO **98.5%**，LIBERO-Plus 零样本 **84.5%**，真机实验较 π0.5 提升 **17–18 个百分点**。[[项目主页](https://baidu-baige.github.io/LoongForge/projects/vlda.html)]
+- **[2026/10]** 🤖 新增 **[LingBot-VLA-v2](./examples/embodied/lingbot_vla_v2/)** VLA 训练支持，基于新的 tensor_wise 分布式优化器与 Muon；`--optimizer muon` 也可在普通 DDP 下用于任意模型。
+- **[2026/10]** 🤖 推出 **[LoongForge-VLDA](./cookbook/loongforge-vlda/)**，基于 LoongForge 训练的 Vision-Language-Delta-Action 模型：LIBERO **98.5%**，LIBERO-Plus 零样本 **84.5%**，真机实验较 π0.5 提升 **17–18 个百分点**。[[项目主页](https://baidu-baige.github.io/LoongForge/projects/vlda.html)] [[论文](https://arxiv.org/abs/2610.25874)]
 - **[2026/10]** 🦾 开源 **[ego2robot](./tools/ego2robot/)** —— 实现第一人称人类操作视频到双臂机器人训练数据的转换管线，输出 **LeRobot v3.0** 格式，覆盖 **16 种机械臂本体**。
 - **[2026/09]** ✨ 新增 **[GLM-5.3-flash](./examples/glm5_next/)** 训练支持。
 - **[2026/09]** ✨ 新增 **[Kimi-K3](./examples/kimi_k3/)** 的 LLM 与 VLM BF16 训练支持。
@@ -125,13 +126,13 @@ Upstream source document; original commands, claims and links require their stat
 - **[2026/08]** ✨ 新增 **GLM-5.2** 训练支持，并提供 **[GLM-5.2 + MoonViT](./configs/models/glm5.2_vit/)** 自定义组合[示例](./examples/glm5.2_vit/)，可用于为 GLM 扩展多模态能力。
 - **[2026/08]** ✨ 新增 **MiniCPM-V-4.6** 与 **Qwen3.8-27B** 训练支持。
 - **[2026/08]** 🧪 新增具身模型统一[**评测模块**](./loongforge/embodied/eval/)，当前已覆盖 **Pi0.5 / xVLA / GR00T**，持续扩展中。
-- **[2026/07]** 🐳 统一**预构建 Docker 镜像** —— LLM / VLM / 具身 / Diffusion 全部模型家族共用同一镜像。
-- **[2026/07]** 🤖 发布 **[LoongForge-Embodied](./loongforge/embodied)** —— 面向具身模型（Pi0.5、GR00T-N1.6/N1.7、xVLA、LingBot-VA、FastWAM、DreamZero、Cosmos3）的 torch-native DDP/FSDP 训练子系统，实测最高 **4.38× 加速**。
-- **[2026/07]** ✨ 新增 **DeepSeek-V4-Flash / DeepSeek-V4-Pro** 训练支持。
 
 <details>
 <summary><b>📅 更多</b></summary>
 
+- **[2026/07]** 🐳 统一**预构建 Docker 镜像** —— LLM / VLM / 具身 / Diffusion 全部模型家族共用同一镜像。
+- **[2026/07]** 🤖 发布 **[LoongForge-Embodied](./loongforge/embodied)** —— 面向具身模型（Pi0.5、GR00T-N1.6/N1.7、xVLA、LingBot-VA、FastWAM、DreamZero、Cosmos3）的 torch-native DDP/FSDP 训练子系统，实测最高 **4.38× 加速**。
+- **[2026/07]** ✨ 新增 **DeepSeek-V4-Flash / DeepSeek-V4-Pro** 训练支持。
 - **[2026/07]** ✨ 新增 **Qwen-Image-Edit-2511** 训练支持。
 - **[2026/06]** 🤖 扩展 VLA 模型覆盖，新增 **GR00T N1.6**；GR00T 训练实现 **2.3× 加速**。[[blog](https://baidu-baige.github.io/LoongForge/blog/2026-06-loongforge-groot-n16-acceleration.html)]
 - **[2026/05]** ⚡ **Wan 2.2** 训练 **加速 116%**，并新增 CP（上下文并行）与数据 packing 策略支持。
@@ -305,14 +306,16 @@ bash examples/embodied/pi05/run_pi05_ddp_finetune.sh
 <td valign="top">
 <ul>
 <li><a href="examples/embodied/pi05/">Pi0.5</a></li>
-<li><a href="examples/embodied/groot_n1_6/">GR00T-N1.6</a></li>
-<li><a href="examples/embodied/groot_n1_7/">GR00T-N1.7</a></li>
+<li><a href="examples/embodied/gr00t_n1_6/">GR00T-N1.6</a></li>
+<li><a href="examples/embodied/gr00t_n1_7/">GR00T-N1.7</a></li>
 <li><a href="examples/embodied/xvla/">xVLA</a></li>
 <li><a href="examples/embodied/wall_oss_0_5/">Wall-OSS-0.5</a></li>
 <li><a href="examples/embodied/fastwam/">FastWAM</a></li>
 <li><a href="examples/embodied/lingbot_va/">LingBot-VA</a></li>
+<li><a href="examples/embodied/lingbot_vla_v2/">LingBot-VLA-v2</a></li>
 <li><a href="examples/embodied/cosmos3/">Cosmos3</a></li>
 <li><a href="examples/embodied/dreamzero/">DreamZero</a></li>
+<li><a href="cookbook/loongforge-vlda/">LoongForge-VLDA</a></li>
 </ul>
 </td>
 <td valign="top">
@@ -382,7 +385,7 @@ bash examples/embodied/pi05/run_pi05_ddp_finetune.sh
 
 ### LoongForge 团队项目
 
-- [**LoongForge-VLDA**](./cookbook/loongforge-vlda/) —— 面向机器人操作的 Vision-Language-Delta-Action 模型：LIBERO **98.5%**，零样本 LIBERO-Plus **84.5%**，真机较 π₀.₅ 提升 **17–18 个百分点**。[[项目主页](https://baidu-baige.github.io/LoongForge/projects/vlda.html)]
+- [**LoongForge-VLDA**](https://baidu-baige.github.io/LoongForge/projects/vlda.html) —— 面向机器人操作的 Vision-Language-Delta-Action 模型：LIBERO **98.5%**，零样本 LIBERO-Plus **84.5%**，真机较 π₀.₅ 提升 **17–18 个百分点**。
 
 https://github.com/user-attachments/assets/8563afca-f79a-4a45-bb4f-36e06c0ccbcb
 
@@ -437,7 +440,7 @@ LoongForge/
 
 ## 📝 引用
 
-如果您觉得 LoongForge 对您的工作有帮助，请引用本项目：
+如果您觉得 LoongForge 对您的工作有帮助，欢迎引用本项目：
 
 ```bibtex
 @software{LoongForge2026,
@@ -448,7 +451,7 @@ LoongForge/
 }
 ```
 
-如果您在 LoongForge 中使用 TAOT 进行 MoE 训练，可以引用我们的论文：
+如果您觉得 TAOT 对您的工作有帮助，欢迎引用我们的论文：
 
 ```bibtex
 @article{zhang2026taot,
@@ -457,6 +460,18 @@ LoongForge/
   journal = {arXiv preprint arXiv:2608.03676},
   year    = {2026},
   url     = {https://arxiv.org/abs/2608.03676}
+}
+```
+
+如果您觉得 LoongForge-VLDA 对您的工作有帮助，欢迎引用我们的论文：
+
+```bibtex
+@article{zhang2026vlda,
+  title   = {{Vision-Language-Delta-Action}: Learning Compact Deltas as Actionable Transition Interfaces for Robotic Manipulation},
+  author  = {Zhang, Lingsen and Li, Wei and He, Jie and Zhang, Henghua and Mo, Kai and Li, Shiyong and Wang, Yanpeng and Shao, Rui},
+  journal = {arXiv preprint arXiv:2610.25874},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2610.25874}
 }
 ```
 

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: README.md
-raw_sha256: d430843594ba4a40132b49fa856e57f10d03e2e06d0a9563fd716ee95f8c2b7b
+raw_sha256: b66e3f126c6540f87736428ee90e4317e1f1a0be6b75163651898fba552798d5
 sources: []
-generated_body_sha256: 0602ea8f17b9ab9dcc5ac7c17cd1cdcb626956a73b44fac9d7bc2d6070a83ba8
+generated_body_sha256: 2263def2cf7b42009d3336b5b4b03ff0b4dd11c71e8d665c36e01478faf70f84
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / README.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/README.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -101,7 +101,7 @@ MindSpeed LLM：基于昇腾生态的大语言模型分布式训练套件，旨�
 
 MindSpeed LLM 项目代码按照模块化设计原则进行组织，详细介绍参见 [项目导读](./docs/zh/project_guide.md)。
 
-``` shell
+``` text
 MindSpeed-LLM/
  ├── ci                        # 门禁看护
  ├── configs                   # 配置文件目录
@@ -152,7 +152,7 @@ MindSpeed-LLM/
 
 ---
 
-- 详细的安装步骤和环境配置请参考[MindSpeed LLM软件安装（基于PyTorch）](./docs/zh/pytorch/training/install_guide.md)。
+- 详细的安装步骤和环境配置请参考[MindSpeed LLM软件安装](./docs/zh/pytorch/training/install_guide.md)。
 
 # 快速上手
 
@@ -212,7 +212,7 @@ MindSpeed LLM包含分布式预训练、分布式微调等训练方案，具体�
   </tbody>
 </table>
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > 文档表格中的“Released”代表商用版本已发布，“✅”代表支持，“❌”代表不支持。
 
@@ -528,13 +528,6 @@ MindSpeed LLM仓库基本使用过程中常见问题可以参考[MindSpeed LLM F
 ---
 
 MindSpeed LLM由华为公司的下列部门以及昇腾生态合作伙伴联合贡献 ：
-
-华为公司：
-
-- 计算产品线：Ascend
-- 公共开发部：NAIE
-- 全球技术服务部：GTS
-- 华为云计算：Cloud
 
 生态合作伙伴：
 

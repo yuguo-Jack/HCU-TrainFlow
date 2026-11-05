@@ -15,7 +15,7 @@ path: docs/en/pytorch/tools/data_process_dpo_pairwise.md
 raw_sha256: ce411666f9ab6e5121e2b8b5c2099e31cb332da324c342ce480b92d68af9ab39
 sources: []
 generated_body_sha256: 1e5f2878c08584881ed4e17fd508d2a47d566296e0213d70b3aed32e04fbe5ab
-source_state: current-scan
+source_state: removed-from-latest-tree
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/tools/data_process_dpo_pairwise.md

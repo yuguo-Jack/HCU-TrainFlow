@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.4 — 2026-11-05
+
+- Align adaptation, capacity, numerical diagnosis, optimization and recovery guidance with the independently published HCU-Knowledge snapshot. Verify actual consumers, provider branches, low-precision state and completion boundaries without changing active training environments.
+- Refresh registered official source revisions and related engineering guides, topics and cases. Distinguish current implementations, historical PRs, releases and unresolved upstream limitations; preserve unread inventory and acquisition gaps separately from content review.
+- Re-read linked source documents when their fixed commit changes, so an unchanged symlink cannot hide an updated target. Failed refreshes remain pending and retain the earlier original.
+- Propagate native TraceLens warnings through advanced feature workers. Skipped kernel-detail samples leave reports incomplete instead of granting an unqualified successful result.
+- Preserve managed dependency checkouts that are ahead, diverged or of unknown ancestry. Advance only after proving a forward relationship, recheck identity and local changes, and bound history discovery.
+- Reconcile the kernel Skills with their existing newer upstream changes, correct the supported Inductor debug switch, retain the optional KernelWiki and independent knowledge binding, and verify the selected local installation. Source review and CPU regression add no hardware qualification.
+
 ## 0.7.3 — 2026-10-29
 
 - Add HCU MIOpen reproduction capture, layout comparison and version-qualified Find/cache reuse to the math-library workflow; distinguish HCU mode numbering from AMD upstream and preserve numerical/whole-step validation.

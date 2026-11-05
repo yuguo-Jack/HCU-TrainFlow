@@ -1,0 +1,354 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "cc67745cbf8119385a7f63d382c4fac29abd3b14038c868e384cef87899c47b1",
+      "isPrivate": false,
+      "numbers": [
+        5715,
+        5714,
+        5713,
+        5712,
+        5711,
+        5709,
+        5708,
+        5707
+      ],
+      "observed_at": "2026-11-04T18:24:54.164668+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4850,
+        "resetAt": "2026-11-04T18:59:40Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "1e30d69a3df2c027c7a5ea65d2fd5439bf068f69",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\nWritten with Claude Code: the analysis, measurements and test plan below.\n\n**TLDR:** The Muse Spark debug recipe as shipped fails at the first backward with `CheckpointError`. Cause: norms of different layers share one compiled region but differ in a float, `gain_center`. Compiled code now reads `gain_center` from an fp32 CPU scalar tensor. Training is bitwise identical to main wherever main runs, with the same kernel time and one fewer graph.\n\n```text\nforward:    layer 0 norm -> graph A (gain_center=0.707 baked in)\n            layer 1 norm -> guard fails -> graph B (gain_center is an input, a CPU scalar)\nrecompute:  layer 0 norm -> graph B (checked first; its guards accept any gain_center)\n            B saves [cpu scalar, rstd, ...], A saved [rstd, ...]  -> CheckpointError\n```\n\n**Problem**\n1. `post_attention_norm` (region `muse_spark_rmsnorm`) and `post_ffn_norm` (region `muse_spark_input_scaled_rmsnorm`) use `gain_center = 1/sqrt(2 (layer_id + 1))`: a different float in each layer.\n2. Dynamo bakes the first float into the graph. Layer 1's value fails that guard, so Dynamo recompiles the region with the float as a graph input.\n3. Activation remat recomputes layer 0 in backward. Dynamo checks the newest graph first, and it accepts layer 0's value.\n4. That graph saves one more tensor, the CPU scalar. `torch.utils.checkpoint` sees different saved tensors than in forward and raises.\n5. CI misses it: the Muse Spark integration tests turn on SPMD typechecking, which empties `local_compile.regions` (`torchtitan_recipes/tests/__init__.py:30`).\n\nPure PyTorch repro:\n```python\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.checkpoint import checkpoint\n\n\nclass Norm(nn.Module):\n    def __init__(self, dim, gain_center):\n        super().__init__()\n        self.weight = nn.Parameter(torch.randn(dim) * 0.1)\n        self.gain_center = gain_center  # torch.tensor(gain_center) -> OK\n\n    @torch.compile(fullgraph=True)\n    def forward(self, x):\n        return F.rms_norm((self.weight + self.gain_center) * x, (x.shape[-1],), None, 1e-6)\n\n\na, b = Norm(256, 0.7071).cuda(), Norm(256, 0.5).cuda()\nx = torch.randn(64, 256, device=\"cuda\", requires_grad=True)\ncheckpoint(lambda t: b(a(t)), x, use_reentrant=False).sum().backward()  # CheckpointError\n```\n\n**Solution**\n1. `MuseSparkRMSNorm` keeps an fp32 CPU scalar tensor copy of `gain_center`.\n2. Under `torch.compiler.is_compiling()`, `_get_effective_weight` reads the tensor. Every graph of the region then takes it as an input and saves the same tensors, so whichever graph the recompute picks matches the forward.\n3. Eager keeps the float: SPMD typechecking rejects an untyped tensor.\n4. The input-scaled norm still recompiles once when the routed-token count changes between layers. That recompile is now harmless.\n5. A TODO links the upstream PyTorch issue (closed with a clearer error; recompute still picks the newest graph).\n\n**Results**\n\nNumerics: training is bitwise identical to main wherever main runs. At op level, this PR's graph is not always bitwise with main's, and neither are main's own two graphs with each other.\n\n```text\nmuse_spark_debugmodel, 4 GB300 (FSDP=2 x TP=2 x EP=2 + SP), 10 steps, seed 42, deterministic\ncompared: losses and grad norms, all 10 steps\n\ncheck                                                   main              this PR\nrecipe as shipped (default remat, regions on)           CheckpointError   trains\nremat on vs remat off                                   -                 bitwise\nremat off, vs main                                      -                 bitwise\nCI config (typechecking on, so regions off: eager)      -                 bitwise vs main\ngraphs: muse_spark_rmsnorm / input_scaled_rmsnorm       6 / 4             6 / 3\n```\nThis PR ran at `6e9fb92e3` (the last commit adds only the TODO). Main ran at `ad7a9937b`, one commit before the PR base. That commit touches only SDC replay.\n\n```text\nThe region alone, GB300, bf16 weight, fp32 input, one run\nbitwise = output, input grad and weight grad all equal; 8 shapes = 2 regions x D 4096/8192 x T 64/16384\n\npair                                              not bitwise in\nthis PR vs main's float-input graph               3 of 8 (input_scaled at T=16384; rmsnorm at D=4096, T=64)\nmain's baked graph vs main's float-input graph    5 of 8\n```\n- Main runs both of its graphs in one forward: the baked one in layer 0, the float-input one in later layers.\n- Size of the differences: not measured.\n\n```text\nSpeed, the region alone, GB300                  main (float-input graph)   this PR\nGPU kernel time per call, T=16384, D=4096/8192  -                          within 0.3%, fwd and fwd+bwd\nforward wall time per call, T=64 (do_bench)     21-26 µs                   13-15 µs\n```\n\nYou may ask:\n- **Why not `dynamic=True` on the regions?** It fixes the error but makes the token dim symbolic too. Forward is 2.1-2.5x slower at T=16384 (rmsnorm, D=4096: 83 -> 183 µs), and 15-28 µs slower than this PR at T=64.\n- **Why not `dynamic=False`, one graph per gain_center, like eps?** The debug model's 8 gains each run in two input-scaled norms (post-FFN and MoE output): 16 graphs, against that region's limit of 8. Static shapes would also recompile for every routed-token count.\n- **Why not a buffer, or the tensor in eager too?** An untyped tensor fails SPMD typechecking in eager (`SpmdTypeError: args[1] missing axis mesh_cp`). So a buffer would not remove the branch, and it needs re-init after the meta-device build.\n- **`eps` also differs between norms. Same bug?** No. `rms_norm` takes `eps` as a Python float, so each value gets its own graph and dispatch is exact. Checked with eps 1e-5 and 1e-8 norms under checkpoint.\n\n**Test plan**\n- New GPU test `test_norm_region_under_activation_checkpoint`: two layers' post norms under `torch.utils.checkpoint`, for both regions (the input-scaled case also changes the token count). It raises `CheckpointError` on main, and passes here, bitwise equal to the run without checkpoint.\n- Bisect on main: the `muse_spark_input_scaled_rmsnorm` region alone raises `CheckpointError`; each other region alone trains.\n- Muse Spark GPU tests: 9 passed. Muse Spark + MoE CPU tests: 105 passed; 2 `test_dist_moe` topology failures also fail on main.\n- Pre-commit clean. Pyrefly: the same 2 `torch_checkpointing` errors as main.\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: @claude please review",
+            "createdAt": "2026-10-30T08:41:17Z",
+            "databaseId": 6518695049,
+            "updatedAt": "2026-10-30T08:41:17Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5713#issuecomment-6518695049"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 2m 4s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41028135189)\n\n---\n**Approve, with one item to fix before merging:** add a TODO linking an upstream PyTorch issue to the workaround. [See the review](https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview).",
+            "createdAt": "2026-10-30T08:41:38Z",
+            "databaseId": 6518700533,
+            "updatedAt": "2026-10-30T08:43:58Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5713#issuecomment-6518700533"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYSLefU=",
+          "hasNextPage": false
+        },
+        "totalCount": 2
+      },
+      "headRefOid": "a562e2616185563ff91375272644264aead1c3a1",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": {
+        "oid": "a1a408f7881cf8a93d3e9b0281fe9aee656a43be"
+      },
+      "merged": true,
+      "mergedAt": "2026-11-03T18:21:04Z",
+      "number": 5713,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve -- please address the item below before merging.** The bug is real on `main` and the fix is local to the Muse Spark norm. It only needs a TODO that points at the upstream PyTorch issue.\n\n**What this PR does.** `MuseSparkRMSNorm` keeps an extra copy of `gain_center` as an fp32 CPU scalar tensor. Inside a compiled region, `_get_effective_weight` adds that tensor to the weight; in eager it still adds the Python float. Because the value now arrives as an input, every graph of the `muse_spark_rmsnorm` and `muse_spark_input_scaled_rmsnorm` regions saves the same tensors. The PR also adds a GPU unit test: two consecutive layers' post norms run under `torch.utils.checkpoint`, with both regions covered.\n\n**Example.**\n```text\ndebugmodel, remat on, regions on: layer 0 gain_center=0.707, layer 1 gain_center=0.5\nmain:    fwd L0 -> graph A (0.707 baked in, saves [rstd, ...])\n         fwd L1 -> guard miss -> graph B (gain_center as an input, saves [cpu_scalar, rstd, ...])\n         bwd recompute L0 -> graph B is checked first and accepts 0.707 -> saved tensors differ -> CheckpointError\nthis PR: every graph reads self._gain_center_tensor -> the saved tensors match whichever graph the recompute picks\n```\n\n### Must fix\n1. `torchtitan/models/muse_spark/model.py:217` -- this is a workaround for checkpoint recompute choosing a different Dynamo cache entry than the forward did, and it has no TODO or upstream issue link (inline comment).\n\n<details><summary>Details</summary>\n\n- **Gate.** The problem reproduces with plain PyTorch, and the description includes the repro. The layer choice holds up: a per-region `dynamic=True` costs 2x on large T, and `dynamic=False` would need 16 graphs against a limit of 8. A tensor in eager as well fails SPMD typechecking, so this is close to the smallest change that works.\n- **Other regions.** I looked for other per-layer Python floats in Muse Spark's compiled regions. `MuseSparkNormPreservingResidualConnection.temperature` and `eps` are the same in every layer (`flavors.py:345`). The per-layer value there is the init of the `gate` parameter, which is a tensor. So `gain_center` looks like the only per-layer float, though production flavors could add more.\n- **Dtype and devices.** fp32 0-dim tensor + bf16 weight gives bf16, the same as with a Python float. The tensor is a plain attribute rather than a buffer, so it is not in `state_dict` and is not touched by `to_empty`/`.cuda()`. The explicit `device=\"cpu\"` takes precedence over a meta-device build context. Main's graph B already took a CPU scalar input here, so DTensor and CUDA-graph behavior is no worse than on main.\n- **Test.** It earns its cost. CI's Muse Spark integration tests turn regions off, because SPMD typechecking clears `local_compile.regions`, so nothing else runs this path. It fails on main and checks bitwise against the non-checkpointed compiled run.\n- **Numerics.** The description says the op-level output is not bitwise with main's graphs in some shapes, but training is bitwise on the debug model. That is acceptable: with remat on, main crashed, and with remat off the PR is bitwise vs main.\n</details>\n\nNot verified: the GPU results (CheckpointError on main, bitwise losses, kernel timings) come from the description; I did not run them.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "This works around a PyTorch problem, not a Muse Spark one. With non-reentrant `torch.utils.checkpoint`, the recompute can land on a different Dynamo cache entry than the original forward used, because the newest entry is checked first and automatic dynamic makes it accept earlier inputs. If that entry saves a different set of tensors, checkpoint raises. Any `local_compile` region under remat that recompiles partway through the forward is exposed to this. The comment explains the mechanism, but there's no TODO or upstream issue, so nobody will know when the tensor copy and the `is_compiling()` branch can go (CLAUDE.md principle 3).\n\nFix: file a pytorch/pytorch issue with the 15-line repro from the description, then add a line like:\n```python\n        # TODO(pytorch/pytorch#NNNN): drop the tensor copy once checkpoint recompute\n        # replays the forward's compiled graph.\n```",
+                  "createdAt": "2026-10-30T08:43:27Z",
+                  "databaseId": 4421866901,
+                  "diffHunk": "@@ -214,10 +214,19 @@ class Config(RMSNorm.Config):\n     def __init__(self, config: Config):\n         super().__init__(config)\n         self.gain_center = config.gain_center\n+        # Compiled code reads gain_center from this tensor, so every graph takes it as an\n+        # input and saves the same tensors. A float is baked into layer 0's graph, and remat\n+        # recompute of layer 0 can run layer 1's graph, which saves different tensors\n+        # (CheckpointError). Eager keeps the float: SPMD typechecking rejects untyped tensors.\n+        self._gain_center_tensor = torch.tensor(\n+            config.gain_center, dtype=torch.float32, device=\"cpu\"\n+        )",
+                  "line": 224,
+                  "originalLine": 223,
+                  "path": "torchtitan/models/muse_spark/model.py",
+                  "updatedAt": "2026-10-30T08:43:44Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5713#discussion_r4421866901"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMFQwODo0MzoyN1rPAAAAAQeQVZU=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5709941606,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-30T08:43:44Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview-5709941606"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: added in a562e2616: `# TODO(pytorch/pytorch#166926): drop the copy once recompute reuses the forward's graph.` That issue is this exact bug (AC recompute dispatching a newer Dynamo cache entry); it was closed with a clearer error message (pytorch/pytorch#177391), not a fix. The PR body now links it too.",
+                  "createdAt": "2026-10-30T08:46:34Z",
+                  "databaseId": 4421892317,
+                  "diffHunk": "@@ -214,10 +214,19 @@ class Config(RMSNorm.Config):\n     def __init__(self, config: Config):\n         super().__init__(config)\n         self.gain_center = config.gain_center\n+        # Compiled code reads gain_center from this tensor, so every graph takes it as an\n+        # input and saves the same tensors. A float is baked into layer 0's graph, and remat\n+        # recompute of layer 0 can run layer 1's graph, which saves different tensors\n+        # (CheckpointError). Eager keeps the float: SPMD typechecking rejects untyped tensors.\n+        self._gain_center_tensor = torch.tensor(\n+            config.gain_center, dtype=torch.float32, device=\"cpu\"\n+        )",
+                  "line": 224,
+                  "originalLine": 223,
+                  "path": "torchtitan/models/muse_spark/model.py",
+                  "updatedAt": "2026-10-30T08:46:35Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5713#discussion_r4421892317"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMFQwODo0NjozNFrPAAAAAQeQuN0=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5709976240,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-30T08:46:35Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview-5709976240"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "fegin"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5744170404,
+            "state": "APPROVED",
+            "submittedAt": "2026-11-02T22:15:29Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview-5744170404"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wMlQyMjoxNToyOVq0MjAyNi0xMS0wMlQyMjoxNToyOVrPAAAAAVZhFaQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "MERGED",
+      "title": "[muse_spark] Read gain_center as a tensor in compiled norm regions (fixes CheckpointError under remat)",
+      "updatedAt": "2026-11-03T18:21:04Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5713"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "1e30d69a3df2c027c7a5ea65d2fd5439bf068f69"
+    },
+    "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\nWritten with Claude Code: the analysis, measurements and test plan below.\n\n**TLDR:** The Muse Spark debug recipe as shipped fails at the first backward with `CheckpointError`. Cause: norms of different layers share one compiled region but differ in a float, `gain_center`. Compiled code now reads `gain_center` from an fp32 CPU scalar tensor. Training is bitwise identical to main wherever main runs, with the same kernel time and one fewer graph.\n\n```text\nforward:    layer 0 norm -> graph A (gain_center=0.707 baked in)\n            layer 1 norm -> guard fails -> graph B (gain_center is an input, a CPU scalar)\nrecompute:  layer 0 norm -> graph B (checked first; its guards accept any gain_center)\n            B saves [cpu scalar, rstd, ...], A saved [rstd, ...]  -> CheckpointError\n```\n\n**Problem**\n1. `post_attention_norm` (region `muse_spark_rmsnorm`) and `post_ffn_norm` (region `muse_spark_input_scaled_rmsnorm`) use `gain_center = 1/sqrt(2 (layer_id + 1))`: a different float in each layer.\n2. Dynamo bakes the first float into the graph. Layer 1's value fails that guard, so Dynamo recompiles the region with the float as a graph input.\n3. Activation remat recomputes layer 0 in backward. Dynamo checks the newest graph first, and it accepts layer 0's value.\n4. That graph saves one more tensor, the CPU scalar. `torch.utils.checkpoint` sees different saved tensors than in forward and raises.\n5. CI misses it: the Muse Spark integration tests turn on SPMD typechecking, which empties `local_compile.regions` (`torchtitan_recipes/tests/__init__.py:30`).\n\nPure PyTorch repro:\n```python\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.checkpoint import checkpoint\n\n\nclass Norm(nn.Module):\n    def __init__(self, dim, gain_center):\n        super().__init__()\n        self.weight = nn.Parameter(torch.randn(dim) * 0.1)\n        self.gain_center = gain_center  # torch.tensor(gain_center) -> OK\n\n    @torch.compile(fullgraph=True)\n    def forward(self, x):\n        return F.rms_norm((self.weight + self.gain_center) * x, (x.shape[-1],), None, 1e-6)\n\n\na, b = Norm(256, 0.7071).cuda(), Norm(256, 0.5).cuda()\nx = torch.randn(64, 256, device=\"cuda\", requires_grad=True)\ncheckpoint(lambda t: b(a(t)), x, use_reentrant=False).sum().backward()  # CheckpointError\n```\n\n**Solution**\n1. `MuseSparkRMSNorm` keeps an fp32 CPU scalar tensor copy of `gain_center`.\n2. Under `torch.compiler.is_compiling()`, `_get_effective_weight` reads the tensor. Every graph of the region then takes it as an input and saves the same tensors, so whichever graph the recompute picks matches the forward.\n3. Eager keeps the float: SPMD typechecking rejects an untyped tensor.\n4. The input-scaled norm still recompiles once when the routed-token count changes between layers. That recompile is now harmless.\n5. A TODO links the upstream PyTorch issue (closed with a clearer error; recompute still picks the newest graph).\n\n**Results**\n\nNumerics: training is bitwise identical to main wherever main runs. At op level, this PR's graph is not always bitwise with main's, and neither are main's own two graphs with each other.\n\n```text\nmuse_spark_debugmodel, 4 GB300 (FSDP=2 x TP=2 x EP=2 + SP), 10 steps, seed 42, deterministic\ncompared: losses and grad norms, all 10 steps\n\ncheck                                                   main              this PR\nrecipe as shipped (default remat, regions on)           CheckpointError   trains\nremat on vs remat off                                   -                 bitwise\nremat off, vs main                                      -                 bitwise\nCI config (typechecking on, so regions off: eager)      -                 bitwise vs main\ngraphs: muse_spark_rmsnorm / input_scaled_rmsnorm       6 / 4             6 / 3\n```\nThis PR ran at `6e9fb92e3` (the last commit adds only the TODO). Main ran at `ad7a9937b`, one commit before the PR base. That commit touches only SDC replay.\n\n```text\nThe region alone, GB300, bf16 weight, fp32 input, one run\nbitwise = output, input grad and weight grad all equal; 8 shapes = 2 regions x D 4096/8192 x T 64/16384\n\npair                                              not bitwise in\nthis PR vs main's float-input graph               3 of 8 (input_scaled at T=16384; rmsnorm at D=4096, T=64)\nmain's baked graph vs main's float-input graph    5 of 8\n```\n- Main runs both of its graphs in one forward: the baked one in layer 0, the float-input one in later layers.\n- Size of the differences: not measured.\n\n```text\nSpeed, the region alone, GB300                  main (float-input graph)   this PR\nGPU kernel time per call, T=16384, D=4096/8192  -                          within 0.3%, fwd and fwd+bwd\nforward wall time per call, T=64 (do_bench)     21-26 µs                   13-15 µs\n```\n\nYou may ask:\n- **Why not `dynamic=True` on the regions?** It fixes the error but makes the token dim symbolic too. Forward is 2.1-2.5x slower at T=16384 (rmsnorm, D=4096: 83 -> 183 µs), and 15-28 µs slower than this PR at T=64.\n- **Why not `dynamic=False`, one graph per gain_center, like eps?** The debug model's 8 gains each run in two input-scaled norms (post-FFN and MoE output): 16 graphs, against that region's limit of 8. Static shapes would also recompile for every routed-token count.\n- **Why not a buffer, or the tensor in eager too?** An untyped tensor fails SPMD typechecking in eager (`SpmdTypeError: args[1] missing axis mesh_cp`). So a buffer would not remove the branch, and it needs re-init after the meta-device build.\n- **`eps` also differs between norms. Same bug?** No. `rms_norm` takes `eps` as a Python float, so each value gets its own graph and dispatch is exact. Checked with eps 1e-5 and 1e-8 norms under checkpoint.\n\n**Test plan**\n- New GPU test `test_norm_region_under_activation_checkpoint`: two layers' post norms under `torch.utils.checkpoint`, for both regions (the input-scaled case also changes the token count). It raises `CheckpointError` on main, and passes here, bitwise equal to the run without checkpoint.\n- Bisect on main: the `muse_spark_input_scaled_rmsnorm` region alone raises `CheckpointError`; each other region alone trains.\n- Muse Spark GPU tests: 9 passed. Muse Spark + MoE CPU tests: 105 passed; 2 `test_dist_moe` topology failures also fail on main.\n- Pre-commit clean. Pyrefly: the same 2 `torch_checkpointing` errors as main.\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "pytorch/torchtitan"
+      },
+      "sha": "a562e2616185563ff91375272644264aead1c3a1"
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5713",
+    "merge_commit_sha": "a1a408f7881cf8a93d3e9b0281fe9aee656a43be",
+    "merged": true,
+    "merged_at": "2026-11-03T18:21:04Z",
+    "number": 5713,
+    "state": "closed",
+    "title": "[muse_spark] Read gain_center as a tensor in compiled norm regions (fixes CheckpointError under remat)",
+    "updated_at": "2026-11-03T18:21:04Z"
+  },
+  "files": [
+    {
+      "additions": 42,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a562e2616185563ff91375272644264aead1c3a1/tests%2Funit_tests%2Fgpu%2Fmodels%2Fmuse_spark%2Ftest_attention_compile.py",
+      "changes": 42,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fgpu%2Fmodels%2Fmuse_spark%2Ftest_attention_compile.py?ref=a562e2616185563ff91375272644264aead1c3a1",
+      "deletions": 0,
+      "filename": "tests/unit_tests/gpu/models/muse_spark/test_attention_compile.py",
+      "patch": "@@ -92,3 +92,45 @@ def norm_and_weight_grad(regions):\n \n     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):\n         torch.testing.assert_close(actual_tensor, expected_tensor, atol=2e-2, rtol=2e-2)\n+\n+\n+# The input-scaled norm also runs on routed tokens, a different count per layer.\n+@pytest.mark.parametrize(\n+    \"region, norm_name, layer1_tokens\",\n+    [\n+        (\"muse_spark_rmsnorm\", \"post_attention_norm\", 64),\n+        (\"muse_spark_input_scaled_rmsnorm\", \"post_ffn_norm\", 48),\n+    ],\n+)\n+def test_norm_region_under_activation_checkpoint(region, norm_name, layer1_tokens):\n+    # Two layers' post norms share one region and differ in gain_center.\n+    torch.manual_seed(0)\n+    layers = build_model_config(\"debugmodel\").layers[:2]\n+    norms = [getattr(layer, norm_name).build().cuda() for layer in layers]\n+    assert norms[0].gain_center != norms[1].gain_center\n+    for norm in norms:\n+        torch.nn.init.normal_(norm.weight, std=0.1)\n+    input_TD = torch.randn(64, norms[0].normalized_shape[0], device=\"cuda\")\n+\n+    def two_norms(x):\n+        return norms[1](norms[0](x)[:layer1_tokens])\n+\n+    def two_norms_checkpointed(x):\n+        return torch.utils.checkpoint.checkpoint(two_norms, x, use_reentrant=False)\n+\n+    def output_and_grads(fn):\n+        # Empty cache, so layer 0 compiles the region first, as in training.\n+        torch._dynamo.reset()\n+        for norm in norms:\n+            norm.weight.grad = None\n+        return [*_run(fn, (input_TD,)), *(norm.weight.grad for norm in norms)]\n+\n+    try:\n+        LocalCompileConfig(regions=[region]).apply()\n+        expected = output_and_grads(two_norms)\n+        actual = output_and_grads(two_norms_checkpointed)\n+    finally:\n+        LocalCompileConfig().apply()\n+\n+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):\n+        torch.testing.assert_close(actual_tensor, expected_tensor, atol=0, rtol=0)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a562e2616185563ff91375272644264aead1c3a1/tests%2Funit_tests%2Fgpu%2Fmodels%2Fmuse_spark%2Ftest_attention_compile.py",
+      "sha": "4086261e1f1963b9994d44b1bd9c5eb9bebd9722",
+      "status": "modified"
+    },
+    {
+      "additions": 10,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a562e2616185563ff91375272644264aead1c3a1/torchtitan%2Fmodels%2Fmuse_spark%2Fmodel.py",
+      "changes": 10,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fmuse_spark%2Fmodel.py?ref=a562e2616185563ff91375272644264aead1c3a1",
+      "deletions": 0,
+      "filename": "torchtitan/models/muse_spark/model.py",
+      "patch": "@@ -214,10 +214,20 @@ class Config(RMSNorm.Config):\n     def __init__(self, config: Config):\n         super().__init__(config)\n         self.gain_center = config.gain_center\n+        # Compiled code reads gain_center from this tensor, so every graph takes it as an\n+        # input and saves the same tensors. A float is baked into layer 0's graph, and remat\n+        # recompute of layer 0 can run layer 1's graph, which saves different tensors\n+        # (CheckpointError). Eager keeps the float: SPMD typechecking rejects untyped tensors.\n+        # TODO(pytorch/pytorch#166926): drop the copy once recompute reuses the forward's graph.\n+        self._gain_center_tensor = torch.tensor(\n+            config.gain_center, dtype=torch.float32, device=\"cpu\"\n+        )\n \n     def _get_effective_weight(self) -> torch.Tensor | None:\n         if self.weight is None:\n             return None\n+        if torch.compiler.is_compiling():\n+            return self.weight + self._gain_center_tensor\n         return self.weight + self.gain_center\n \n     # Limit 16, not the default 8: all residual-stream norms share this region and use 12 graphs.",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a562e2616185563ff91375272644264aead1c3a1/torchtitan%2Fmodels%2Fmuse_spark%2Fmodel.py",
+      "sha": "022cf8bbdbd6153ea73f02c546d8aee464ec2c78",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "This works around a PyTorch problem, not a Muse Spark one. With non-reentrant `torch.utils.checkpoint`, the recompute can land on a different Dynamo cache entry than the original forward used, because the newest entry is checked first and automatic dynamic makes it accept earlier inputs. If that entry saves a different set of tensors, checkpoint raises. Any `local_compile` region under remat that recompiles partway through the forward is exposed to this. The comment explains the mechanism, but there's no TODO or upstream issue, so nobody will know when the tensor copy and the `is_compiling()` branch can go (CLAUDE.md principle 3).\n\nFix: file a pytorch/pytorch issue with the 15-line repro from the description, then add a line like:\n```python\n        # TODO(pytorch/pytorch#NNNN): drop the tensor copy once checkpoint recompute\n        # replays the forward's compiled graph.\n```",
+      "created_at": "2026-10-30T08:43:27Z",
+      "diff_hunk": "@@ -214,10 +214,19 @@ class Config(RMSNorm.Config):\n     def __init__(self, config: Config):\n         super().__init__(config)\n         self.gain_center = config.gain_center\n+        # Compiled code reads gain_center from this tensor, so every graph takes it as an\n+        # input and saves the same tensors. A float is baked into layer 0's graph, and remat\n+        # recompute of layer 0 can run layer 1's graph, which saves different tensors\n+        # (CheckpointError). Eager keeps the float: SPMD typechecking rejects untyped tensors.\n+        self._gain_center_tensor = torch.tensor(\n+            config.gain_center, dtype=torch.float32, device=\"cpu\"\n+        )",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5713#discussion_r4421866901",
+      "id": 4421866901,
+      "line": 224,
+      "original_line": 223,
+      "path": "torchtitan/models/muse_spark/model.py",
+      "updated_at": "2026-10-30T08:43:44Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: added in a562e2616: `# TODO(pytorch/pytorch#166926): drop the copy once recompute reuses the forward's graph.` That issue is this exact bug (AC recompute dispatching a newer Dynamo cache entry); it was closed with a clearer error message (pytorch/pytorch#177391), not a fix. The PR body now links it too.",
+      "created_at": "2026-10-30T08:46:34Z",
+      "diff_hunk": "@@ -214,10 +214,19 @@ class Config(RMSNorm.Config):\n     def __init__(self, config: Config):\n         super().__init__(config)\n         self.gain_center = config.gain_center\n+        # Compiled code reads gain_center from this tensor, so every graph takes it as an\n+        # input and saves the same tensors. A float is baked into layer 0's graph, and remat\n+        # recompute of layer 0 can run layer 1's graph, which saves different tensors\n+        # (CheckpointError). Eager keeps the float: SPMD typechecking rejects untyped tensors.\n+        self._gain_center_tensor = torch.tensor(\n+            config.gain_center, dtype=torch.float32, device=\"cpu\"\n+        )",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5713#discussion_r4421892317",
+      "id": 4421892317,
+      "line": 224,
+      "original_line": 223,
+      "path": "torchtitan/models/muse_spark/model.py",
+      "updated_at": "2026-10-30T08:46:35Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Reply from claude: @claude please review",
+      "created_at": "2026-10-30T08:41:17Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5713#issuecomment-6518695049",
+      "id": 6518695049,
+      "updated_at": "2026-10-30T08:41:17Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 2m 4s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/41028135189)\n\n---\n**Approve, with one item to fix before merging:** add a TODO linking an upstream PyTorch issue to the workaround. [See the review](https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview).",
+      "created_at": "2026-10-30T08:41:38Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5713#issuecomment-6518700533",
+      "id": 6518700533,
+      "updated_at": "2026-10-30T08:43:58Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ],
+  "number": 5713,
+  "refs": {
+    "base": {
+      "commit": "1e30d69a3df2c027c7a5ea65d2fd5439bf068f69",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "a562e2616185563ff91375272644264aead1c3a1",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "**Verdict: Approve -- please address the item below before merging.** The bug is real on `main` and the fix is local to the Muse Spark norm. It only needs a TODO that points at the upstream PyTorch issue.\n\n**What this PR does.** `MuseSparkRMSNorm` keeps an extra copy of `gain_center` as an fp32 CPU scalar tensor. Inside a compiled region, `_get_effective_weight` adds that tensor to the weight; in eager it still adds the Python float. Because the value now arrives as an input, every graph of the `muse_spark_rmsnorm` and `muse_spark_input_scaled_rmsnorm` regions saves the same tensors. The PR also adds a GPU unit test: two consecutive layers' post norms run under `torch.utils.checkpoint`, with both regions covered.\n\n**Example.**\n```text\ndebugmodel, remat on, regions on: layer 0 gain_center=0.707, layer 1 gain_center=0.5\nmain:    fwd L0 -> graph A (0.707 baked in, saves [rstd, ...])\n         fwd L1 -> guard miss -> graph B (gain_center as an input, saves [cpu_scalar, rstd, ...])\n         bwd recompute L0 -> graph B is checked first and accepts 0.707 -> saved tensors differ -> CheckpointError\nthis PR: every graph reads self._gain_center_tensor -> the saved tensors match whichever graph the recompute picks\n```\n\n### Must fix\n1. `torchtitan/models/muse_spark/model.py:217` -- this is a workaround for checkpoint recompute choosing a different Dynamo cache entry than the forward did, and it has no TODO or upstream issue link (inline comment).\n\n<details><summary>Details</summary>\n\n- **Gate.** The problem reproduces with plain PyTorch, and the description includes the repro. The layer choice holds up: a per-region `dynamic=True` costs 2x on large T, and `dynamic=False` would need 16 graphs against a limit of 8. A tensor in eager as well fails SPMD typechecking, so this is close to the smallest change that works.\n- **Other regions.** I looked for other per-layer Python floats in Muse Spark's compiled regions. `MuseSparkNormPreservingResidualConnection.temperature` and `eps` are the same in every layer (`flavors.py:345`). The per-layer value there is the init of the `gate` parameter, which is a tensor. So `gain_center` looks like the only per-layer float, though production flavors could add more.\n- **Dtype and devices.** fp32 0-dim tensor + bf16 weight gives bf16, the same as with a Python float. The tensor is a plain attribute rather than a buffer, so it is not in `state_dict` and is not touched by `to_empty`/`.cuda()`. The explicit `device=\"cpu\"` takes precedence over a meta-device build context. Main's graph B already took a CPU scalar input here, so DTensor and CUDA-graph behavior is no worse than on main.\n- **Test.** It earns its cost. CI's Muse Spark integration tests turn regions off, because SPMD typechecking clears `local_compile.regions`, so nothing else runs this path. It fails on main and checks bitwise against the non-checkpointed compiled run.\n- **Numerics.** The description says the op-level output is not bitwise with main's graphs in some shapes, but training is bitwise on the debug model. That is acceptable: with remat on, main crashed, and with remat off the PR is bitwise vs main.\n</details>\n\nNot verified: the GPU results (CheckpointError on main, bitwise losses, kernel timings) come from the description; I did not run them.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview-5709941606",
+      "id": 5709941606,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-30T08:43:44Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview-5709976240",
+      "id": 5709976240,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-30T08:46:35Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5713#pullrequestreview-5744170404",
+      "id": 5744170404,
+      "state": "APPROVED",
+      "submitted_at": "2026-11-02T22:15:29Z",
+      "user": {
+        "login": "fegin"
+      }
+    }
+  ]
+}

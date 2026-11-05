@@ -9,16 +9,17 @@ stages:
 visibility: public
 review_level: selected-source-and-tests-reviewed
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
   path: transformer_engine/pytorch/ops/fused/grouped_mlp.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 213bc372954fe0b142ccf360476524f8389ab63749574e4560bdbd4f28c7574c
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 4d60a9a3c400a27f1f4243e8bd76fe39ec2e99da753d2b878943685e42a8ffc1
 - source: nvidia-transformerengine
   path: tests/pytorch/test_grouped_mlp.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 09685ac90c632b46ad5eafb3642ab97484b9ceddc09bd80171ea1064ae0ca6c2
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: fd23ca189afa3771c15706d8b5f52cf01955b2c0c9dadc945938afe5ab75577f
 pr_sources:
 - pr-nvidia--transformerengine-3662
 ---
@@ -34,6 +35,8 @@ pr_sources:
 在 `grouped_mlp.py` 的 `fuser_forward`，FC1 的 scale 视图使用实际 `fc1_weight_k` 而非直接套原 weight shape 的第二维。`fuser_backward` 中 FC2 dactivation 使用 columnwise 权重；NVFP4 的这份数据已经物理转置，不能再沿 MXFP8 的 reshape/permute 路线解释。
 
 新 NVFP4 路径调用 `_convert_to_cudnn_grouped_gemm_tensor_format`，显式传入 logical K、有效 M/N、数据/scale dtype 与 `sf_swizzled=True`。MXFP8 分支保留自己的数据和 scale permutation。消费者最终是 cuDNN grouped GEMM 融合入口，必须同时核对这两个工程的格式契约。
+
+当前 `720b25258be3` 为支持 `supports_canonical_layouts` 的 wrapper 增加 MXFP8 自然布局路线，兼容旧 wrapper 时才保留对应 kernel-facing view；NVFP4 的 packed data/scale 与单 group 物理转置合同没有因此消失。fwd、dGLU 与 wgrad 的能力探测各有作用域，不应只检测一个 wrapper 就改写全部反向布局。新增 BF16 融合另有准入，见[融合专题](../topics/fusion-and-profiling.md)。
 
 ## 为什么会影响优化判断
 
@@ -58,7 +61,7 @@ single-group fast path 可能在小规模验证或专家偏斜后出现。如果
 
 ## 固定源码
 
-- [transformer_engine/pytorch/ops/fused/grouped_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/transformer_engine/pytorch/ops/fused/grouped_mlp.py)
-- [tests/pytorch/test_grouped_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/tests/pytorch/test_grouped_mlp.py)
+- [transformer_engine/pytorch/ops/fused/grouped_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/transformer_engine/pytorch/ops/fused/grouped_mlp.py)
+- [tests/pytorch/test_grouped_mlp.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/tests/pytorch/test_grouped_mlp.py)
 
 本文为官方源码、接口与测试阅读，未运行这些 NVIDIA 实现，不声称 HCU 支持或获得相同性能。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 5a8ea03b12066067f39b1771782d12db236267ef
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/fsdp2_quick_start.md
-raw_sha256: e99a3859dc0c6faad6b0045aacd350248cbf15f4214579c611f657fc15807eff
+raw_sha256: 2a0a06aa83d7620217e217d3e3c509cd34064624dcf8a755481727db0a3a7fa2
 sources: []
-generated_body_sha256: 0f97565e6cfc2ffb38a48bcaa02ed604d1238cbeecc3db6e32043b11ac8517df
+generated_body_sha256: f1c45f69378088ff67f02ef7107e02ddbb2335fe68743161c58a8f509ca91c7a
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/fsdp2_quick_start.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/5a8ea03b12066067f39b1771782d12db236267ef/docs/zh/pytorch/training/fsdp2_quick_start.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/fsdp2_quick_start.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -44,7 +44,7 @@ Upstream source document; original commands, claims and links require their stat
 - 具备初级的 Python 开发经验
 - 对FSDP（Fully Sharded Data Parallel，全分片数据并行）有基本了解
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > MindSpeed LLM 支持<term>Ascend 950PR&950DT系列产品</term>、<term>Atlas A3训练系列产品</term>和<term>Atlas A2训练系列产品</term>，且要求单NPU的片上内存为64GB及以上，详见[模型支持列表](../models/supported_models.md)。
 >
@@ -238,7 +238,7 @@ Upstream source document; original commands, claims and links require their stat
     bash examples/fsdp2/qwen3/pretrain_qwen3_8b_4k_fsdp2_A2.sh
     ```
 
-    执行后一段时间可见终端显示。
+    执行后一段时间可见终端类似显示如下。
 
     ```Output
     INFO [2026-06-22 19:28:40] >>  iteration        1/    2000 | consumed samples:          8 | consumed tokens:      32768 | elapsed time per iteration (ms): 10520.60 | learning rate: 9.999994E-06 | global batch size:     8 | lm loss: 1.304194E+00 | grad norm: 8.515 | max_memory_allocated(GB): 19.07 | max_memory_reserved(GB): 20.87 |
@@ -248,7 +248,7 @@ Upstream source document; original commands, claims and links require their stat
 
     进入迭代，说明训练正常进行。
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 多机训练需在多个终端同时启动预训练脚本（每个终端的预训练脚本只有 `NODE_RANK` 参数不同，MASTER_ADDR均为主节点的IP地址，其他参数均相同）。
 > - FSDP2 后端会自动将模型参数分片到各 NPU，确保每个 NPU 只存储部分参数，从而支持超大规模模型训练。
@@ -355,7 +355,7 @@ Upstream source document; original commands, claims and links require their stat
     bash examples/fsdp2/qwen3/tune_qwen3_8b_4k_fsdp2_A2.sh
     ```
 
-    执行后一段时间可见终端显示。
+    执行后一段时间可见终端类似显示如下。
 
     ```Output
     INFO [2026-06-22 19:25:37] >>  iteration        1/    2000 | consumed samples:          8 | consumed tokens:        564 | elapsed time per iteration (ms): 7827.39 | learning rate: 1.666667E-07 | global batch size:     8 | lm loss: 3.316887E+00 | grad norm: 70.959 | max_memory_allocated(GB): 19.07 | max_memory_reserved(GB): 20.90 |
@@ -365,7 +365,7 @@ Upstream source document; original commands, claims and links require their stat
 
     进入迭代，说明训练正常进行。
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 多机微调需在多个终端同时启动微调脚本（每个终端的微调脚本只有`NODE_RANK`参数不同，MASTER_ADDR均为主节点的IP地址，其他参数均相同）。
 > - 微调默认使用Alpaca数据集格式。如需使用其他数据集，请参考[FSDP2后端微调使用指南](./finetune/fsdp2/finetune_fsdp2.md) 中的数据集配置说明，或[全量参数介绍（基于FSDP2训练后端）](../features/fsdp2/arguments.md)中的“数据参数（DataArguments）”相关介绍。
@@ -379,7 +379,7 @@ Upstream source document; original commands, claims and links require their stat
 |`model_name_or_path`|HuggingFace 权重目录路径，替换为实际模型路径|`./model_from_hf/qwen3_hf/`|
 |`trust_remote_code`|是否允许加载HuggingFace上自定义建模文件中的模型|`True` / `False`|
 |`train_from_scratch`|是否使用随机权重从头开始训练模型，不加载模型权重|`True` / `False`|
-|`dataset`|数据集：JSON 字符串指定本地路径，或使用[dataset_info.json](../../../../configs/fsdp2/data/dataset_info.json)中的名称|`'{"file_name": "..."}`'、`alpaca_full`|
+|`dataset`|数据集：JSON 字符串指定本地路径，或使用[dataset_info.json](../../../../configs/fsdp2/data/dataset_info.json)中的名称|`'{"file_name": "..."}'`、`alpaca_full`|
 |`template`|构建prompt的模板名称|`qwen3`、`gpt`|
 |`cutoff_len`|分词后输入序列的截断长度，超过该长度的序列会被截断|`2048`、`4096`、`16384`|
 |`data_manager_type`|数据管理器类型，mg表示预训练场景，微调时无需配置|预训练：`mg`，微调：不配置|
@@ -393,7 +393,7 @@ Upstream source document; original commands, claims and links require their stat
 |`gradient_accumulation_steps`|梯度累积步数|正整数，如 `1`、`8`|
 |`output_dir`|训练保存权重输出目录|`./output`|
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 完整参数说明请参见[全量参数介绍（基于FSDP2训练后端）](../features/fsdp2/arguments.md)。
 > - YAML配置与数据集注册示例请参考 [FSDP2后端微调使用指南](./finetune/fsdp2/finetune_fsdp2.md)。

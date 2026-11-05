@@ -9,39 +9,40 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-transformerengine
   path: docs/index.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
-  sha256: 5700756d8b7445529c088737a2640d20b6a33e612d916280cceaf5121660be47
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
+  sha256: 1fa7a775a3e47d1cefecca8bc3000db67aa0bd30dbf8b991a7d84bc5ffb70825
 - source: nvidia-transformerengine
   path: docs/getting_started/getting_started_pytorch.py
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: fd8a9c69dcba4a6bd8b9e126a95a4ed26de37f653e6645f6a946ac158626bb01
 - source: nvidia-transformerengine
   path: docs/examples/fp8_primer.ipynb
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 05b00252a257326ce76759dce02bf8bb5d5221d45359ea13988f3c90996c108f
 - source: nvidia-transformerengine
   path: docs/examples/advanced_optimizations.ipynb
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 0d5d703679a7d3c16773112e8879879560a945600c168a95b27b22bc44f9a22a
 - source: nvidia-transformerengine
   path: docs/examples/attention/attention.ipynb
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 055093bf03f8b79cbfc84abad66d282b4de86ab4672ffc402f1c927d2c2b065a
 - source: nvidia-transformerengine
   path: docs/examples/op_fuser/op_fuser.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 95497fc7b153ba375d9687e6ce2333bdfee40da6f3653555624c274f9cf5f71d
 - source: nvidia-transformerengine
   path: docs/examples/gemm_profiling/gemm_profiling.rst
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 31444db2fe36482719a7262091ea25ae69a95d13f898c19148b0b0efe91c52f2
 - source: nvidia-transformerengine
   path: docs/release_notes.md
-  commit: eb3c860a4d3394b7eb5e21dba3021fa10782a52e
+  commit: 720b25258be3b60f482afff8aef00d4cad88fa16
   sha256: 7e0ea32b48936420fa0d70a274917bfa15358a03b2925317a0c29872408f3824
 - source: nvidia-transformerengine-docs
   path: getting-started
@@ -83,6 +84,8 @@ sources:
 
 官网入口为 [TE 文档](https://docs.nvidia.com/deeplearning/transformer-engine/index.html)。本次核对官网展示 2.20.2；登记的 main 提交可能包含尚未发布的功能。引用时优先任务安装版本相应文档，不把滚动官网、主干和 HCU fork 混合成一个已验证环境。
 
+2026-11-04 官方 Releases API 最近10条快照中，最新一项为非预发布 [v2.20.2](https://github.com/NVIDIA/TransformerEngine/releases/tag/v2.20.2)，发布于 2026-10-05；该快照不宣称完整发布历史。它与本次 main 固定提交分别记录，不把 develop/main 新增的融合或缓存机制自动当作该 wheel 已提供的行为。
+
 ## 搜索与更新
 
 `wiki-search "FP8 权重缓存 microbatch" --engine transformer-engine` 可命中本库主题；沿页尾固定链接查看详细教程和实现。源码教程（包含 notebook）登记在 `nvidia-transformerengine`，官网 HTML 页面独立登记为 `nvidia-transformerengine-docs`，两者都用 `wiki-refresh` 更新；详情见项目 [更新协议](../../../../../../docs/wiki.md)。
@@ -93,16 +96,16 @@ sources:
 
 ## 来源与版本复核
 
-2026-10-20 复核的源码为 `eb3c860a4d33`；登记官网 HTML 本次内容指纹未变，继续保留自己的 web-content-fingerprint。源码的 FA4/GroupedLinear/融合测试差异已更新相关作者页，RMSNorm-MXFP8 案例的直接实现/测试保持原机制。低精度 helper 的局部逐字节测试、后端选择测试、完整训练质量是不同证据，不因教程或合入状态自动提升。
+2026-11-04 复核源码为 `720b25258be3b60f482afff8aef00d4cad88fa16`；docs/index 新增 MoE 专题入口，源码教程主体、安装示例与 RMSNorm-MXFP8 直接实现/测试继续复用已固定机制。官网8个节点仍展示2.20.2，本次正文原件已重新核对：安装的 CUDA/cuDNN 与 ABI 约束、权重缓存的 microbatch 合同、attention 支持表和 op-fuser channel 边界分开解释；不能由网页版本号或内容指纹推导 main 的 BF16 融合已发布到 wheel。低精度 helper 的局部测试、后端选择、完整训练质量仍是不同证据，本轮未执行 NVIDIA/HCU 示例或补称 PR 续扫已经完成。
 
-- [nvidia-transformerengine: docs/index.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/index.rst)
-- [nvidia-transformerengine: docs/getting_started/getting_started_pytorch.py](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/getting_started/getting_started_pytorch.py)
-- [nvidia-transformerengine: docs/examples/fp8_primer.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/fp8_primer.ipynb)
-- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/advanced_optimizations.ipynb)
-- [nvidia-transformerengine: docs/examples/attention/attention.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/attention/attention.ipynb)
-- [nvidia-transformerengine: docs/examples/op_fuser/op_fuser.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/op_fuser/op_fuser.rst)
-- [nvidia-transformerengine: docs/examples/gemm_profiling/gemm_profiling.rst](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/examples/gemm_profiling/gemm_profiling.rst)
-- [nvidia-transformerengine: docs/release_notes.md](https://github.com/NVIDIA/TransformerEngine/blob/eb3c860a4d3394b7eb5e21dba3021fa10782a52e/docs/release_notes.md)
+- [nvidia-transformerengine: docs/index.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/index.rst)
+- [nvidia-transformerengine: docs/getting_started/getting_started_pytorch.py](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/getting_started/getting_started_pytorch.py)
+- [nvidia-transformerengine: docs/examples/fp8_primer.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/examples/fp8_primer.ipynb)
+- [nvidia-transformerengine: docs/examples/advanced_optimizations.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/examples/advanced_optimizations.ipynb)
+- [nvidia-transformerengine: docs/examples/attention/attention.ipynb](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/examples/attention/attention.ipynb)
+- [nvidia-transformerengine: docs/examples/op_fuser/op_fuser.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/examples/op_fuser/op_fuser.rst)
+- [nvidia-transformerengine: docs/examples/gemm_profiling/gemm_profiling.rst](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/examples/gemm_profiling/gemm_profiling.rst)
+- [nvidia-transformerengine: docs/release_notes.md](https://github.com/NVIDIA/TransformerEngine/blob/720b25258be3b60f482afff8aef00d4cad88fa16/docs/release_notes.md)
 - [nvidia-transformerengine-docs: getting-started](https://docs.nvidia.com/deeplearning/transformer-engine/getting_started/index.html)
 - [nvidia-transformerengine-docs: fp8-primer](https://docs.nvidia.com/deeplearning/transformer-engine/examples/fp8_primer.html)
 - [nvidia-transformerengine-docs: advanced-optimizations](https://docs.nvidia.com/deeplearning/transformer-engine/examples/advanced_optimizations.html)

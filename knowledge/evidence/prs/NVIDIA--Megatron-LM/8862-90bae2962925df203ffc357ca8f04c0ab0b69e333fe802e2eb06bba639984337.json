@@ -1,0 +1,571 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "bcac59570fbe37fc6b1a66916c4e9cebb5df75ec2c50309b264591b275d71e86",
+      "isPrivate": false,
+      "numbers": [
+        8864,
+        8863,
+        8862,
+        8861,
+        8860,
+        8859,
+        8858,
+        8857
+      ],
+      "observed_at": "2026-11-04T15:26:46.299059+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4930,
+        "resetAt": "2026-11-04T15:50:00Z"
+      },
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "baseRepository": {
+        "nameWithOwner": "NVIDIA/Megatron-LM"
+      },
+      "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nWith `use_flashinfer_fused_rope`, dynamic inference now rotates every head shape correctly. Shapes FlashInfer's fused RoPE kernel cannot handle are rotated in fp32 instead; before, they were silently mis-rotated or crashed.\n\n## Bug\n\n`DynamicInferenceContext.apply_fused_qk_rotary_emb` sent every head shape to `flashinfer.rope.apply_rope_with_cos_sin_cache`, except NeoX with head dim 16. That one case has an fp32 fallback, added for \"FI 0.6.6 corrupts NeoX D16 heads\".\n\nFlashInfer (0.7.2.post1, the `uv.lock` pin) rotates one vector of `vec` lanes per thread. Each vector gets one sign, one partner offset and one cos/sin index, and is read and written with 16-byte loads and stores:\n- head dims 64/128/256/512 use a dedicated kernel with `vec = max(8, D/32)`;\n- every other head dim uses `RopeQuantize` with `vec = 16`.\n\nSo with head dim `D` and rotary width `R` (the cos/sin cache width, `R < D` for `rotary_percent < 1`), any shape whose NeoX half or interleaved span is not a whole number of vectors goes wrong:\n- **Silent mis-rotation:** NeoX with `R ≡ 16 (mod 32)` on the generic kernel. Lanes `R/2..R/2+7` take the first-half sign and partner. On H100: 32/16, 48/48, 80/80, 96/48 and 112/112 (`|err|` up to 2.2). Full-rotary examples are 48, 80 (GPT-3-2.7B-style, hidden 2560 with 32 heads) and 112; partial ones are 32/16, 96/48, 160/80 and 224/112.\n- **Crash:** NeoX with `R % 16 != 0` (either kernel). The partner load at `R/2` is misaligned, which raises a sticky `CUDA error: misaligned address`. On H100: 72/72, 96/24 (GPT-NeoX-20B style) and 128/40. Pythia/StableLM-style 80/20 is another example.\n- **Racy and out of bounds:** interleaved with `R ≡ 8 (mod 16)`. The last vector spills into lanes that other blocks store; when `R = D`, it writes 16 bytes past the output.\n\nThe feature is opt-in (`use_flashinfer_fused_rope` defaults to False, or None to use FlashInfer when installed). Common production shapes (head dim 64/128/256 at full, 1/2 or 1/4 rotary; 96/160/192 at full rotary) were and stay exact.\n\n## Fix\n\n- `flashinfer_fused_rope_supports(head_dim, rotary_dim, interleaved)` in `dynamic_context.py` states the rule: the NeoX half (`R/2`) or interleaved span (`R`) is a multiple of `vec`, and `D % 8 == 0`, so that 16-byte head bases are aligned.\n- `apply_fused_qk_rotary_emb` sends a shape to FlashInfer only when that holds. Every other shape is rotated in fp32 with the same cos/sin cache, by the existing NeoX D16 fallback, now generalized to any shape and to the interleaved layout. Supported shapes run the same FlashInfer kernel as before.\n- Both `use_flashinfer_fused_rope=True` and `None` route unsupported shapes this way. The fallback is exact, so there is no shape to reject.\n\nWhere the decision is made: the rule is a pure function of `(D, R, layout)`. It is evaluated from the call's shapes, as the D16 check it replaces was. It cannot run at context construction: `R` comes from `GPTModel`'s `rotary_percent`, which neither `TransformerConfig` nor `InferenceConfig` carries. The check is a few integer operations on the host, issues no GPU work and no syncs, and does not run on CUDA-graph replays. Moving the decision into the models is a follow-up (see the notes below).\n\n## Tests\n\nNew in `tests/unit_tests/inference/contexts/test_dynamic_context.py`:\n- `test_flashinfer_fused_rope_supports` (CPU): the predicate accepts the shapes FlashInfer rotates exactly and rejects the silent, crashing, racy and D16 shapes. Fails on `main` (no predicate).\n- `test_flashinfer_fused_rope_matches_fp64_rotation[...]` (1 GPU, FlashInfer). Three query and two key heads are views of one buffer, with 4 of 6 rows active, the same layout as the existing oracle in `test_coordinator_features_pairwise.py`. The test checks every lane against an fp64 complex rotation (`atol = 2 eps(bf16)`) and checks which shapes reach the FlashInfer kernel:\n  - 6 kernel shapes (controls, pass on `main`): 32/32, 96/96, 64/64, 64/16 and 128/48 NeoX, 32/16 interleaved.\n  - The 5 silent shapes: 32/16, 48/48, 80/80, 96/48 and 112/112 NeoX. They fail on `main`, on lanes `R/2..R/2+7`.\n  - 2 racy interleaved shapes, 16/8 and 96/24. Their result on `main` depends on block order.\n- `test_flashinfer_fused_rope_kernel_shapes_match_fp64_rotation` (1 GPU, FlashInfer): all 49 shapes the predicate sends to FlashInfer (head dims up to 256 in steps of 8, and 512; `rotary_percent` 1, 0.5 and 0.25; both layouts) against the same fp64 rotation, and each must reach the kernel. The predicate encodes one FlashInfer release's vector widths and dispatch; a release that changes either fails here instead of mis-rotating silently. It is a control for the predicate; on `main` it fails only because `main` has no predicate.\n- `test_flashinfer_fused_rope_fault_shapes_run` (1 GPU, FlashInfer): 72/72, 96/24 and 128/40 NeoX, plus 72/72 interleaved (`R = D`, out-of-bounds store). The fault is sticky, so the four shapes run in one child Python process, which must exit cleanly with exact rotations. On `main` the child dies with a misaligned address at the first NeoX shape. The interleaved 72/72 shape alone may pass on `main`, so three of the four are failing-on-`main` cases.\n\nThese GPU tests fail rather than skip when FlashInfer is missing, since the CI image ships it.\n\nDeterminism: `tests/unit_tests/determinism/kernels/test_inference_kernels.py::test_flashinfer_fused_rope_replays` replays `apply_fused_qk_rotary_emb` bit-exactly under side-stream contention on both of its paths: 128/128 NeoX on the FlashInfer kernel, 96/24 interleaved on the fp32 path. The kernel races on that interleaved shape, so a change that sends it back to FlashInfer can show up as a replay mismatch. A new `inference_flashinfer_fused_rope` entry in `tests/unit_tests/determinism/kernels/manifest.py` registers this dispatch in `dynamic_context.py` with that test; before, the file was registered only under the integer-bookkeeping exemption, which does not cover RoPE. As for `attention.py`, a later PR that changes `dynamic_context.py` must then touch `test_inference_kernels.py` or carry the `determinism-exempt` label. `python3 tools/check_kernel_determinism_coverage.py --base-ref origin/main` passes.\n\nThe existing `test_small_neox_rope_matches_complex_rotation` keeps passing unchanged, including its D16 NeoX fallback and its \"native kernel called\" counts.\n\nOn H100 in the CI image (`mcore_ci_dev:main`, 2026-11-02, FlashInfer 0.7.2.post1), the regression tests above pass (18 cases) and fail on `main` (12 of 18 cases):\n- The 5 silent shapes and the 2 racy interleaved shapes fail on the fp64 comparison, on lanes `R/2..R/2+7` (up to 3.76 off). The 6 kernel-shape controls pass.\n- In the fault-shape test, the child process dies with `CUDA error: misaligned address`.\n- The predicate test, the 49-shape test and both replay cases fail because `main` has no `flashinfer_fused_rope_supports`.\n\nUnder `compute-sanitizer --tool memcheck`, the same tests except the fault-shape test (a child process) pass (17 cases), with no memory errors reported. The neighbor tests (`test_coordinator_features_pairwise.py::test_small_neox_rope_matches_complex_rotation` and the `flashinfer-fused-rope` case of `test_dynamic_engine_async_sched.py::TestAsyncSchedulePairwise`) pass (9 cases).\n\n## Notes for reviewers\n\n- **Performance.** Affected shapes now run several eager elementwise ops on `[tokens, heads, R]` instead of one fused kernel. Before, those shapes produced wrong results or crashed.\n- **FlashInfer version.** The rule was derived from FlashInfer 0.7.2.post1's `pos_enc.cuh`, the `uv.lock` pin. The step-3 H100 image had 0.7.0.post1, and the repro's controls and failures matched there. The tests above ran on 0.7.2.post1. The 49-shape test checks the rule against whichever FlashInfer is installed.\n- **Upstream.** The mis-rotated and faulting shapes should be reported to FlashInfer, together with a pre-existing over-read. For interleaved layouts both kernels load `vec` floats of sine from `R/2 + tx*vec/2`, so the last thread reads `vec/2` floats (16 to 32 bytes) past the cos/sin row. The values are unused and the output stays exact. At the cache's last position, though, the read goes past the end of `rotary_pos_cos_sin`, so `compute-sanitizer memcheck` can report an interleaved kernel shape at position `max_sequence_length - 1`. The fp32 path does not over-read, and the fault-shape test calls no FlashInfer kernel. This PR does not change the over-read.\n- **Where the decision lives.** The kernel-capability check stays next to the kernel call in the context. Moving it into the models' RoPE-input helper (added by #8863) would let unsupported shapes take the standard unfused RoPE path and retire this fp32 rotation. That needs this PR, #8863 and #8864 merged first, so it is a follow-up.\n- **Attention dropping RoPE** (the review's P4-N1): attention dropped `rotary_pos_emb` whenever the context enabled fused RoPE, so GPT YaRN and multimodal RoPE, HybridModel RoPE and YaRN got no RoPE, and `no_rope_freq` layers still got the fused rotation. That is a separate root cause in the model and attention code, fixed by #8863 and #8864 below, not here.\n\n## Interaction with other open PRs\n\nThree PRs fix FlashInfer fused RoPE in dynamic inference, each at a different layer:\n- **#8862 (this PR, `fix/flashinfer-fused-rope-shapes`)**, the context: whatever cos/sin cache a model passes, `apply_fused_qk_rotary_emb` rotates every head shape exactly.\n- **#8863 (`fix/hybrid-flash-decode-rope`)**, the models: one `LanguageModule` helper owns the RoPE inputs of `GPTModel` and `HybridModel`, so RoPE hybrids also build the FlashInfer cos/sin cache and pass it through `HybridStack`.\n- **#8864 (`fix/fused-rope-model-embedding`, stacked on #8863)**, attention: fused RoPE runs only when the model passes a cache, which the helper builds for RoPE and YaRN; no-RoPE layers get none, and multimodal RoPE runs unfused.\n\nThey change different code. Together, every model with fused RoPE on gets its own RoPE, rotated exactly for every head shape. The merge order is this PR, then #8863, then #8864, and stacking enforces it: #8863 (which turns fused RoPE on for RoPE hybrids) and #8864 (which turns it on for YaRN) both contain this branch. Without this PR, FlashInfer's kernel faults on some of their head dims (e.g. 72) and silently mis-rotates others (e.g. 80). Once this PR is merged, the manifest entry added here makes the coverage gate flag their `dynamic_context.py` edits, which only add constructor checks; they need the `determinism-exempt` label.\n\nThis PR also merges cleanly with `main` and with every open fix branch that merges with `main`. Its manifest entry sits next to the other FlashInfer dispatch entry, away from the entry #8880 adds.\n\n## Issue tracking\n\nLinked issue: none; this PR's regression tests reproduce the bug.\n\n## Code provenance\n\nNo code was copied from other repositories.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "copy-pr-bot"
+            },
+            "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+            "createdAt": "2026-11-03T04:20:56Z",
+            "databaseId": 6595368001,
+            "updatedAt": "2026-11-03T04:20:56Z",
+            "url": "https://github.com/NVIDIA/Megatron-LM/pull/8862#issuecomment-6595368001"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkdVEE=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "headRefOid": "410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+      "headRepository": {
+        "nameWithOwner": "lmcafee-nvidia/Megatron-LM"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 8862,
+      "reviews": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "OPEN",
+      "title": "[Inference] Rotate head shapes FlashInfer's fused RoPE gets wrong exactly in fp32",
+      "updatedAt": "2026-11-03T17:19:37Z",
+      "url": "https://github.com/NVIDIA/Megatron-LM/pull/8862"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8862/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8862/commits"
+      },
+      "html": {
+        "href": "https://github.com/NVIDIA/Megatron-LM/pull/8862"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8862"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8862/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8862"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/410ecd7a7f6a33bdb7d871142eafef4ca47271a2"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 260,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "NVIDIA:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/NVIDIA/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contributors",
+        "created_at": "2019-03-21T16:15:52Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/events",
+        "fork": false,
+        "forks": 4700,
+        "forks_count": 4700,
+        "forks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/forks",
+        "full_name": "NVIDIA/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/NVIDIA/Megatron-LM.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html",
+        "hooks_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/hooks",
+        "html_url": "https://github.com/NVIDIA/Megatron-LM",
+        "id": 176982014,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "MDEwOlJlcG9zaXRvcnkxNzY5ODIwMTQ=",
+        "notifications_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 1937,
+        "open_issues_count": 1937,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+          "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+          "followers_url": "https://api.github.com/users/NVIDIA/followers",
+          "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+          "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/NVIDIA",
+          "id": 1728152,
+          "login": "NVIDIA",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+          "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+          "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+          "repos_url": "https://api.github.com/users/NVIDIA/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/NVIDIA",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T15:22:16Z",
+        "releases_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/releases{/id}",
+        "size": 178037,
+        "ssh_url": "git@github.com:NVIDIA/Megatron-LM.git",
+        "stargazers_count": 18328,
+        "stargazers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/subscription",
+        "svn_url": "https://github.com/NVIDIA/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/teams",
+        "topics": [
+          "large-language-models",
+          "model-para",
+          "transformers"
+        ],
+        "trees_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-11-04T13:28:01Z",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM",
+        "visibility": "public",
+        "watchers": 18328,
+        "watchers_count": 18328,
+        "web_commit_signoff_required": false
+      },
+      "sha": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/1728152?v=4",
+        "events_url": "https://api.github.com/users/NVIDIA/events{/privacy}",
+        "followers_url": "https://api.github.com/users/NVIDIA/followers",
+        "following_url": "https://api.github.com/users/NVIDIA/following{/other_user}",
+        "gists_url": "https://api.github.com/users/NVIDIA/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/NVIDIA",
+        "id": 1728152,
+        "login": "NVIDIA",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjE3MjgxNTI=",
+        "organizations_url": "https://api.github.com/users/NVIDIA/orgs",
+        "received_events_url": "https://api.github.com/users/NVIDIA/received_events",
+        "repos_url": "https://api.github.com/users/NVIDIA/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/NVIDIA/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/NVIDIA/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/NVIDIA",
+        "user_view_type": "public"
+      }
+    },
+    "body": "- [ ] I, the PR author, have personally reviewed every line of this PR.\n\n# What does this PR do?\n\nWith `use_flashinfer_fused_rope`, dynamic inference now rotates every head shape correctly. Shapes FlashInfer's fused RoPE kernel cannot handle are rotated in fp32 instead; before, they were silently mis-rotated or crashed.\n\n## Bug\n\n`DynamicInferenceContext.apply_fused_qk_rotary_emb` sent every head shape to `flashinfer.rope.apply_rope_with_cos_sin_cache`, except NeoX with head dim 16. That one case has an fp32 fallback, added for \"FI 0.6.6 corrupts NeoX D16 heads\".\n\nFlashInfer (0.7.2.post1, the `uv.lock` pin) rotates one vector of `vec` lanes per thread. Each vector gets one sign, one partner offset and one cos/sin index, and is read and written with 16-byte loads and stores:\n- head dims 64/128/256/512 use a dedicated kernel with `vec = max(8, D/32)`;\n- every other head dim uses `RopeQuantize` with `vec = 16`.\n\nSo with head dim `D` and rotary width `R` (the cos/sin cache width, `R < D` for `rotary_percent < 1`), any shape whose NeoX half or interleaved span is not a whole number of vectors goes wrong:\n- **Silent mis-rotation:** NeoX with `R ≡ 16 (mod 32)` on the generic kernel. Lanes `R/2..R/2+7` take the first-half sign and partner. On H100: 32/16, 48/48, 80/80, 96/48 and 112/112 (`|err|` up to 2.2). Full-rotary examples are 48, 80 (GPT-3-2.7B-style, hidden 2560 with 32 heads) and 112; partial ones are 32/16, 96/48, 160/80 and 224/112.\n- **Crash:** NeoX with `R % 16 != 0` (either kernel). The partner load at `R/2` is misaligned, which raises a sticky `CUDA error: misaligned address`. On H100: 72/72, 96/24 (GPT-NeoX-20B style) and 128/40. Pythia/StableLM-style 80/20 is another example.\n- **Racy and out of bounds:** interleaved with `R ≡ 8 (mod 16)`. The last vector spills into lanes that other blocks store; when `R = D`, it writes 16 bytes past the output.\n\nThe feature is opt-in (`use_flashinfer_fused_rope` defaults to False, or None to use FlashInfer when installed). Common production shapes (head dim 64/128/256 at full, 1/2 or 1/4 rotary; 96/160/192 at full rotary) were and stay exact.\n\n## Fix\n\n- `flashinfer_fused_rope_supports(head_dim, rotary_dim, interleaved)` in `dynamic_context.py` states the rule: the NeoX half (`R/2`) or interleaved span (`R`) is a multiple of `vec`, and `D % 8 == 0`, so that 16-byte head bases are aligned.\n- `apply_fused_qk_rotary_emb` sends a shape to FlashInfer only when that holds. Every other shape is rotated in fp32 with the same cos/sin cache, by the existing NeoX D16 fallback, now generalized to any shape and to the interleaved layout. Supported shapes run the same FlashInfer kernel as before.\n- Both `use_flashinfer_fused_rope=True` and `None` route unsupported shapes this way. The fallback is exact, so there is no shape to reject.\n\nWhere the decision is made: the rule is a pure function of `(D, R, layout)`. It is evaluated from the call's shapes, as the D16 check it replaces was. It cannot run at context construction: `R` comes from `GPTModel`'s `rotary_percent`, which neither `TransformerConfig` nor `InferenceConfig` carries. The check is a few integer operations on the host, issues no GPU work and no syncs, and does not run on CUDA-graph replays. Moving the decision into the models is a follow-up (see the notes below).\n\n## Tests\n\nNew in `tests/unit_tests/inference/contexts/test_dynamic_context.py`:\n- `test_flashinfer_fused_rope_supports` (CPU): the predicate accepts the shapes FlashInfer rotates exactly and rejects the silent, crashing, racy and D16 shapes. Fails on `main` (no predicate).\n- `test_flashinfer_fused_rope_matches_fp64_rotation[...]` (1 GPU, FlashInfer). Three query and two key heads are views of one buffer, with 4 of 6 rows active, the same layout as the existing oracle in `test_coordinator_features_pairwise.py`. The test checks every lane against an fp64 complex rotation (`atol = 2 eps(bf16)`) and checks which shapes reach the FlashInfer kernel:\n  - 6 kernel shapes (controls, pass on `main`): 32/32, 96/96, 64/64, 64/16 and 128/48 NeoX, 32/16 interleaved.\n  - The 5 silent shapes: 32/16, 48/48, 80/80, 96/48 and 112/112 NeoX. They fail on `main`, on lanes `R/2..R/2+7`.\n  - 2 racy interleaved shapes, 16/8 and 96/24. Their result on `main` depends on block order.\n- `test_flashinfer_fused_rope_kernel_shapes_match_fp64_rotation` (1 GPU, FlashInfer): all 49 shapes the predicate sends to FlashInfer (head dims up to 256 in steps of 8, and 512; `rotary_percent` 1, 0.5 and 0.25; both layouts) against the same fp64 rotation, and each must reach the kernel. The predicate encodes one FlashInfer release's vector widths and dispatch; a release that changes either fails here instead of mis-rotating silently. It is a control for the predicate; on `main` it fails only because `main` has no predicate.\n- `test_flashinfer_fused_rope_fault_shapes_run` (1 GPU, FlashInfer): 72/72, 96/24 and 128/40 NeoX, plus 72/72 interleaved (`R = D`, out-of-bounds store). The fault is sticky, so the four shapes run in one child Python process, which must exit cleanly with exact rotations. On `main` the child dies with a misaligned address at the first NeoX shape. The interleaved 72/72 shape alone may pass on `main`, so three of the four are failing-on-`main` cases.\n\nThese GPU tests fail rather than skip when FlashInfer is missing, since the CI image ships it.\n\nDeterminism: `tests/unit_tests/determinism/kernels/test_inference_kernels.py::test_flashinfer_fused_rope_replays` replays `apply_fused_qk_rotary_emb` bit-exactly under side-stream contention on both of its paths: 128/128 NeoX on the FlashInfer kernel, 96/24 interleaved on the fp32 path. The kernel races on that interleaved shape, so a change that sends it back to FlashInfer can show up as a replay mismatch. A new `inference_flashinfer_fused_rope` entry in `tests/unit_tests/determinism/kernels/manifest.py` registers this dispatch in `dynamic_context.py` with that test; before, the file was registered only under the integer-bookkeeping exemption, which does not cover RoPE. As for `attention.py`, a later PR that changes `dynamic_context.py` must then touch `test_inference_kernels.py` or carry the `determinism-exempt` label. `python3 tools/check_kernel_determinism_coverage.py --base-ref origin/main` passes.\n\nThe existing `test_small_neox_rope_matches_complex_rotation` keeps passing unchanged, including its D16 NeoX fallback and its \"native kernel called\" counts.\n\nOn H100 in the CI image (`mcore_ci_dev:main`, 2026-11-02, FlashInfer 0.7.2.post1), the regression tests above pass (18 cases) and fail on `main` (12 of 18 cases):\n- The 5 silent shapes and the 2 racy interleaved shapes fail on the fp64 comparison, on lanes `R/2..R/2+7` (up to 3.76 off). The 6 kernel-shape controls pass.\n- In the fault-shape test, the child process dies with `CUDA error: misaligned address`.\n- The predicate test, the 49-shape test and both replay cases fail because `main` has no `flashinfer_fused_rope_supports`.\n\nUnder `compute-sanitizer --tool memcheck`, the same tests except the fault-shape test (a child process) pass (17 cases), with no memory errors reported. The neighbor tests (`test_coordinator_features_pairwise.py::test_small_neox_rope_matches_complex_rotation` and the `flashinfer-fused-rope` case of `test_dynamic_engine_async_sched.py::TestAsyncSchedulePairwise`) pass (9 cases).\n\n## Notes for reviewers\n\n- **Performance.** Affected shapes now run several eager elementwise ops on `[tokens, heads, R]` instead of one fused kernel. Before, those shapes produced wrong results or crashed.\n- **FlashInfer version.** The rule was derived from FlashInfer 0.7.2.post1's `pos_enc.cuh`, the `uv.lock` pin. The step-3 H100 image had 0.7.0.post1, and the repro's controls and failures matched there. The tests above ran on 0.7.2.post1. The 49-shape test checks the rule against whichever FlashInfer is installed.\n- **Upstream.** The mis-rotated and faulting shapes should be reported to FlashInfer, together with a pre-existing over-read. For interleaved layouts both kernels load `vec` floats of sine from `R/2 + tx*vec/2`, so the last thread reads `vec/2` floats (16 to 32 bytes) past the cos/sin row. The values are unused and the output stays exact. At the cache's last position, though, the read goes past the end of `rotary_pos_cos_sin`, so `compute-sanitizer memcheck` can report an interleaved kernel shape at position `max_sequence_length - 1`. The fp32 path does not over-read, and the fault-shape test calls no FlashInfer kernel. This PR does not change the over-read.\n- **Where the decision lives.** The kernel-capability check stays next to the kernel call in the context. Moving it into the models' RoPE-input helper (added by #8863) would let unsupported shapes take the standard unfused RoPE path and retire this fp32 rotation. That needs this PR, #8863 and #8864 merged first, so it is a follow-up.\n- **Attention dropping RoPE** (the review's P4-N1): attention dropped `rotary_pos_emb` whenever the context enabled fused RoPE, so GPT YaRN and multimodal RoPE, HybridModel RoPE and YaRN got no RoPE, and `no_rope_freq` layers still got the fused rotation. That is a separate root cause in the model and attention code, fixed by #8863 and #8864 below, not here.\n\n## Interaction with other open PRs\n\nThree PRs fix FlashInfer fused RoPE in dynamic inference, each at a different layer:\n- **#8862 (this PR, `fix/flashinfer-fused-rope-shapes`)**, the context: whatever cos/sin cache a model passes, `apply_fused_qk_rotary_emb` rotates every head shape exactly.\n- **#8863 (`fix/hybrid-flash-decode-rope`)**, the models: one `LanguageModule` helper owns the RoPE inputs of `GPTModel` and `HybridModel`, so RoPE hybrids also build the FlashInfer cos/sin cache and pass it through `HybridStack`.\n- **#8864 (`fix/fused-rope-model-embedding`, stacked on #8863)**, attention: fused RoPE runs only when the model passes a cache, which the helper builds for RoPE and YaRN; no-RoPE layers get none, and multimodal RoPE runs unfused.\n\nThey change different code. Together, every model with fused RoPE on gets its own RoPE, rotated exactly for every head shape. The merge order is this PR, then #8863, then #8864, and stacking enforces it: #8863 (which turns fused RoPE on for RoPE hybrids) and #8864 (which turns it on for YaRN) both contain this branch. Without this PR, FlashInfer's kernel faults on some of their head dims (e.g. 72) and silently mis-rotates others (e.g. 80). Once this PR is merged, the manifest entry added here makes the coverage gate flag their `dynamic_context.py` edits, which only add constructor checks; they need the `determinism-exempt` label.\n\nThis PR also merges cleanly with `main` and with every open fix branch that merges with `main`. Its manifest entry sits next to the other FlashInfer dispatch entry, away from the entry #8880 adds.\n\n## Issue tracking\n\nLinked issue: none; this PR's regression tests reproduce the bug.\n\n## Code provenance\n\nNo code was copied from other repositories.\n\n## Contribution process\n\n### Pre-checks\n\n- [x] I have added relevant unit tests\n- [ ] I have added relevant functional tests\n- [x] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))\n- [x] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)\n- [ ] I have added relevant documentation\n- [x] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changed_files": 4,
+    "closed_at": null,
+    "comments": 1,
+    "comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8862/comments",
+    "commits": 2,
+    "commits_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8862/commits",
+    "created_at": "2026-11-03T04:20:52Z",
+    "deletions": 15,
+    "diff_url": "https://github.com/NVIDIA/Megatron-LM/pull/8862.diff",
+    "draft": true,
+    "head": {
+      "label": "lmcafee-nvidia:fix/flashinfer-fused-rope-shapes",
+      "ref": "fix/flashinfer-fused-rope-shapes",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/branches{/branch}",
+        "clone_url": "https://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "collaborators_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/comments{/number}",
+        "commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/contributors",
+        "created_at": "2025-10-27T15:58:06Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/deployments",
+        "description": "Ongoing research training transformer models at scale",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/downloads",
+        "events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/forks",
+        "full_name": "lmcafee-nvidia/Megatron-LM",
+        "git_commits_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/tags{/sha}",
+        "git_url": "git://github.com/lmcafee-nvidia/Megatron-LM.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/index.html#quick-start",
+        "hooks_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/hooks",
+        "html_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "id": 1084385341,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/issues{/number}",
+        "keys_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/languages",
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "node_id": "MDc6TGljZW5zZTA=",
+          "spdx_id": "NOASSERTION",
+          "url": null
+        },
+        "merges_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/merges",
+        "milestones_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/milestones{/number}",
+        "mirror_url": null,
+        "name": "Megatron-LM",
+        "node_id": "R_kgDOQKJoPQ",
+        "notifications_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/notifications{?since,all,participating}",
+        "open_issues": 82,
+        "open_issues_count": 82,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+          "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+          "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+          "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+          "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/lmcafee-nvidia",
+          "id": 85179052,
+          "login": "lmcafee-nvidia",
+          "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+          "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+          "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+          "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/lmcafee-nvidia",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/pulls{/number}",
+        "pushed_at": "2026-11-04T14:49:01Z",
+        "releases_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/releases{/id}",
+        "size": 115739,
+        "ssh_url": "git@github.com:lmcafee-nvidia/Megatron-LM.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/stargazers",
+        "statuses_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscribers",
+        "subscription_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/subscription",
+        "svn_url": "https://github.com/lmcafee-nvidia/Megatron-LM",
+        "tags_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/tags",
+        "teams_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM/git/trees{/sha}",
+        "updated_at": "2026-08-25T16:48:34Z",
+        "url": "https://api.github.com/repos/lmcafee-nvidia/Megatron-LM",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+        "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+        "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+        "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+        "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/lmcafee-nvidia",
+        "id": 85179052,
+        "login": "lmcafee-nvidia",
+        "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+        "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+        "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+        "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/lmcafee-nvidia",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8862",
+    "id": 5131840411,
+    "issue_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/8862",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "FBCA04",
+        "default": false,
+        "description": "Material: constrained correctness failure or a substantial demonstrated coverage gap.",
+        "id": 12756649659,
+        "name": "P2",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsGuw",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/P2"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "D73A4A",
+        "default": false,
+        "description": "Production correction with focused regressions; includes historical aggregates containing fixes.",
+        "id": 12756651122,
+        "name": "Production Fix",
+        "node_id": "LA_kwDOCoyH_s8AAAAC-FsMcg",
+        "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/labels/Production%20Fix"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "5f36836617870286e9d0aba386bc6f433027525a",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOCoyH_s8AAAABMeGrmw",
+    "number": 8862,
+    "patch_url": "https://github.com/NVIDIA/Megatron-LM/pull/8862.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8862/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/statuses/410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+    "title": "[Inference] Rotate head shapes FlashInfer's fused RoPE gets wrong exactly in fp32",
+    "updated_at": "2026-11-03T17:19:37Z",
+    "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/8862",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/85179052?v=4",
+      "events_url": "https://api.github.com/users/lmcafee-nvidia/events{/privacy}",
+      "followers_url": "https://api.github.com/users/lmcafee-nvidia/followers",
+      "following_url": "https://api.github.com/users/lmcafee-nvidia/following{/other_user}",
+      "gists_url": "https://api.github.com/users/lmcafee-nvidia/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/lmcafee-nvidia",
+      "id": 85179052,
+      "login": "lmcafee-nvidia",
+      "node_id": "MDQ6VXNlcjg1MTc5MDUy",
+      "organizations_url": "https://api.github.com/users/lmcafee-nvidia/orgs",
+      "received_events_url": "https://api.github.com/users/lmcafee-nvidia/received_events",
+      "repos_url": "https://api.github.com/users/lmcafee-nvidia/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/lmcafee-nvidia/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/lmcafee-nvidia/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/lmcafee-nvidia",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 32,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/megatron%2Fcore%2Finference%2Fcontexts%2Fdynamic_context.py",
+      "changes": 44,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/megatron%2Fcore%2Finference%2Fcontexts%2Fdynamic_context.py?ref=410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+      "deletions": 12,
+      "filename": "megatron/core/inference/contexts/dynamic_context.py",
+      "patch": "@@ -249,6 +249,21 @@ def get_mem_size_str(n_bytes: int) -> str:\n     raise Exception(f\"something went wrong, n_bytes={n_bytes}.\")\n \n \n+def flashinfer_fused_rope_supports(head_dim: int, rotary_dim: int, interleaved: bool) -> bool:\n+    \"\"\"Whether FlashInfer's fused cos/sin-cache RoPE rotates heads of this shape exactly.\n+\n+    Each FlashInfer thread rotates one vector of `vec` lanes with one sign, partner offset and\n+    cos/sin index, through 16-byte loads and stores. Head dims 64/128/256/512 use a dedicated\n+    kernel with `vec = max(8, head_dim / 32)`; every other head dim uses `vec = 16`. A NeoX half\n+    (`rotary_dim / 2`) or interleaved span (`rotary_dim`) that is not a whole number of vectors\n+    is silently mis-rotated, faults on a misaligned partner load, or spills into the lanes after\n+    it; a head dim that is not a multiple of 8 misaligns the 16-byte head bases.\n+    \"\"\"\n+    vec = max(8, head_dim // 32) if head_dim in (64, 128, 256, 512) else 16\n+    span = rotary_dim if interleaved else rotary_dim // 2\n+    return head_dim % 8 == 0 and span % vec == 0\n+\n+\n @dataclass\n class PrefixMatch:\n     \"\"\"What `_compute_prefix_match` decided for one request chunk.\n@@ -2194,6 +2209,10 @@ def apply_fused_qk_rotary_emb(\n     ) -> Tuple[Tensor, Tensor]:\n         \"\"\"\n         Apply rotary embedding to query and key tensors using flashinfer's fused rope.\n+\n+        Head shapes FlashInfer gets wrong (see `flashinfer_fused_rope_supports`) are rotated\n+        exactly in fp32 instead, with the same cos/sin cache.\n+\n         Args:\n             query (Tensor): Query tensor.\n             key (Tensor): Key tensor.\n@@ -2207,23 +2226,24 @@ def apply_fused_qk_rotary_emb(\n         n = self.padded_active_token_count\n         num_q_heads, head_size = query.shape[-2], query.shape[-1]\n         num_k_heads = key.shape[-2]\n+        rotary_dim = cos_sin_emb.shape[-1]\n \n-        if head_size == 16 and not config.rotary_interleaved:\n-            # FlashInfer's NeoX D16 vector crosses the half-head boundary and reads other heads.\n-            rotary_dim = cos_sin_emb.shape[-1]\n+        if not flashinfer_fused_rope_supports(head_size, rotary_dim, config.rotary_interleaved):\n             cos, sin = cos_sin_emb[self.gpu_view.token_to_pos_ids[:n]].float().chunk(2, dim=-1)\n             cos, sin = cos[:, None, None, :], sin[:, None, None, :]\n \n             def rotate(tensor):\n-                first, second = tensor[:n, ..., :rotary_dim].float().chunk(2, dim=-1)\n-                return torch.cat(\n-                    (\n-                        first * cos - second * sin,\n-                        second * cos + first * sin,\n-                        tensor[:n, ..., rotary_dim:],\n-                    ),\n-                    dim=-1,\n-                ).to(tensor.dtype)\n+                rotated = tensor[:n, ..., :rotary_dim].float()\n+                if config.rotary_interleaved:\n+                    first, second = rotated[..., 0::2], rotated[..., 1::2]\n+                else:\n+                    first, second = rotated.chunk(2, dim=-1)\n+                first, second = first * cos - second * sin, second * cos + first * sin\n+                if config.rotary_interleaved:\n+                    rotated = torch.stack((first, second), dim=-1).flatten(-2)\n+                else:\n+                    rotated = torch.cat((first, second), dim=-1)\n+                return torch.cat((rotated, tensor[:n, ..., rotary_dim:]), dim=-1).to(tensor.dtype)\n \n             return rotate(query), rotate(key)\n ",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/megatron%2Fcore%2Finference%2Fcontexts%2Fdynamic_context.py",
+      "sha": "cf8fe0644b172efb58ef3044bb714ad93eed6f71",
+      "status": "modified"
+    },
+    {
+      "additions": 11,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py",
+      "changes": 11,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py?ref=410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+      "deletions": 0,
+      "filename": "tests/unit_tests/determinism/kernels/manifest.py",
+      "patch": "@@ -870,6 +870,17 @@ class KernelEntry:\n         \"with deterministic=True; a seed-restore replay test needs flashinfer in the unit-test \"\n         \"container and is tracked as a follow-up.\",\n     ),\n+    KernelEntry(\n+        name=\"inference_flashinfer_fused_rope\",\n+        sources=(\"megatron/core/inference/contexts/dynamic_context.py\",),\n+        tests=(K + \"test_inference_kernels.py\",),\n+        kind=\"dispatch\",\n+        training_path=False,\n+        notes=\"DynamicInferenceContext.apply_fused_qk_rotary_emb sends the head shapes FlashInfer \"\n+        \"rotates exactly (flashinfer_fused_rope_supports) to flashinfer.rope.\"\n+        \"apply_rope_with_cos_sin_cache and rotates the others with fp32 elementwise ops; both \"\n+        \"paths are replayed in test_inference_kernels.py::test_flashinfer_fused_rope_replays.\",\n+    ),\n     KernelEntry(\n         name=\"inference_tp_layers\",\n         sources=(\"megatron/core/tensor_parallel/inference_layers.py\",),",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Fmanifest.py",
+      "sha": "2375f2ba0d5e92bcf497558a6fb1831ed860919d",
+      "status": "modified"
+    },
+    {
+      "additions": 52,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_inference_kernels.py",
+      "changes": 54,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_inference_kernels.py?ref=410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+      "deletions": 2,
+      "filename": "tests/unit_tests/determinism/kernels/test_inference_kernels.py",
+      "patch": "@@ -8,8 +8,9 @@\n permute/unpermute (batch-invariant path bit-exact; the atomic default path is the negative\n control), the FlashInfer per-token NVFP4 quantizer and MoE, the vLLM-derived fused MoE GEMM\n and top-k sum, the batch-invariant GEMM / log-softmax / mean kernels, the CUDA-graph\n-routing-map padding mask, and the zeroing of padding-token rows. Multi-rank NVLS\n-symmetric-memory collectives are exempted in the manifest (they need NVLink peers).\n+routing-map padding mask, the zeroing of padding-token rows, and the dynamic-inference\n+fused RoPE (FlashInfer's kernel and its fp32 fallback). Multi-rank NVLS symmetric-memory\n+collectives are exempted in the manifest (they need NVLink peers).\n \"\"\"\n \n import inspect\n@@ -955,6 +956,55 @@ def fn(activations):\n     assert_replays_bit_exact(fn, (activations,), backward=False, what=\"zero_padding_rows\")\n \n \n+@pytest.mark.parametrize(\n+    \"head_dim,rotary_dim,interleaved\",\n+    [(128, 128, False), (96, 24, True)],\n+    ids=[\"flashinfer-D128-R128-neox\", \"fp32-D96-R24-interleaved\"],\n+)\n+def test_flashinfer_fused_rope_replays(head_dim, rotary_dim, interleaved):\n+    \"\"\"Dynamic-inference fused RoPE replays bit-exactly on both of its paths.\n+\n+    D128-R128 NeoX runs FlashInfer's kernel. FlashInfer's interleaved kernel races on D96-R24\n+    (its last vector spills into lanes other blocks store), so that shape is rotated in fp32\n+    instead; sending it back to the kernel can show up here as a replay mismatch.\n+    \"\"\"\n+    from megatron.core.inference.contexts import dynamic_context\n+\n+    assert dynamic_context.HAVE_FLASHINFER, \"FlashInfer is not installed\"\n+    on_kernel = dynamic_context.flashinfer_fused_rope_supports(head_dim, rotary_dim, interleaved)\n+    assert on_kernel == (head_dim == 128)\n+    seeded()\n+    tokens, max_positions = 4096, 8192\n+    freqs = torch.outer(\n+        torch.arange(max_positions, device=\"cuda\", dtype=torch.float32),\n+        torch.rand(rotary_dim // 2, device=\"cuda\"),\n+    )\n+    cos_sin = torch.cat((freqs.cos(), freqs.sin()), dim=-1)\n+    context = SimpleNamespace(\n+        use_flashinfer_fused_rope=True,\n+        padded_active_token_count=tokens,\n+        gpu_view=SimpleNamespace(\n+            token_to_pos_ids=torch.randint(0, max_positions, (tokens,), device=\"cuda\")\n+        ),\n+    )\n+    config = SimpleNamespace(rotary_interleaved=interleaved)\n+    query = torch.randn(tokens, 1, 16, head_dim, device=\"cuda\", dtype=torch.bfloat16)\n+    key = torch.randn(tokens, 1, 4, head_dim, device=\"cuda\", dtype=torch.bfloat16)\n+\n+    def fn(query, key):\n+        return dynamic_context.DynamicInferenceContext.apply_fused_qk_rotary_emb(\n+            context, query, key, cos_sin, config\n+        )\n+\n+    assert_replays_bit_exact(\n+        fn,\n+        (query, key),\n+        backward=False,\n+        contention=True,\n+        what=f\"fused RoPE D{head_dim}-R{rotary_dim}-{'interleaved' if interleaved else 'neox'}\",\n+    )\n+\n+\n @pytest.mark.launch_on_gb200\n def test_mxfp8_swiglu_moe_replays():\n     \"\"\"SwiGLU must select separate MXFP8 quantization without a caller override.\"\"\"",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/tests%2Funit_tests%2Fdeterminism%2Fkernels%2Ftest_inference_kernels.py",
+      "sha": "f10f0cd42585d3ba9767ca09ebf6f53f4252ae7f",
+      "status": "modified"
+    },
+    {
+      "additions": 165,
+      "blob_url": "https://github.com/NVIDIA/Megatron-LM/blob/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/tests%2Funit_tests%2Finference%2Fcontexts%2Ftest_dynamic_context.py",
+      "changes": 166,
+      "contents_url": "https://api.github.com/repos/NVIDIA/Megatron-LM/contents/tests%2Funit_tests%2Finference%2Fcontexts%2Ftest_dynamic_context.py?ref=410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+      "deletions": 1,
+      "filename": "tests/unit_tests/inference/contexts/test_dynamic_context.py",
+      "patch": "@@ -3,7 +3,9 @@\n import contextlib\n import importlib.util\n import math\n+import subprocess\n import sys\n+from pathlib import Path\n from types import SimpleNamespace\n from unittest import mock\n \n@@ -13,7 +15,7 @@\n from megatron.core import parallel_state\n from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions\n from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig\n-from megatron.core.inference.contexts import zero_padding_rows_kernel\n+from megatron.core.inference.contexts import dynamic_context, zero_padding_rows_kernel\n from megatron.core.inference.contexts.dynamic_context import (\n     DynamicInferenceContext,\n     RequestOverflowError,\n@@ -4860,3 +4862,165 @@ def test_flashinfer_sample_kernel_dispatch(\n     }\n     for safe_arg, expected in zip(args[1:], expected_safe.get(expected_kernel, [])):\n         assert torch.equal(safe_arg, expected)\n+\n+\n+# FlashInfer fused RoPE shapes, as (head_dim, rotary_dim, interleaved).\n+# Rotated exactly by FlashInfer 0.7: whole vectors in the NeoX half / interleaved span.\n+_FUSED_ROPE_KERNEL_SHAPES = [\n+    (32, 32, False),\n+    (96, 96, False),\n+    (64, 64, False),\n+    (64, 16, False),\n+    (128, 48, False),\n+    (32, 16, True),\n+]\n+# Generic-kernel NeoX with rotary_dim % 32 == 16: FlashInfer silently mis-rotates lanes R/2..R/2+7.\n+_FUSED_ROPE_SILENT_SHAPES = [\n+    (32, 16, False),\n+    (48, 48, False),\n+    (80, 80, False),\n+    (96, 48, False),\n+    (112, 112, False),\n+]\n+# Generic-kernel interleaved with rotary_dim % 16 == 8: the last vector races with other stores.\n+_FUSED_ROPE_RACY_SHAPES = [(16, 8, True), (96, 24, True)]\n+# NeoX with rotary_dim % 16 != 0 (misaligned partner load), and interleaved with rotary_dim ==\n+# head_dim == 8 (mod 16) (16-byte store past the output) can leave a sticky CUDA error.\n+_FUSED_ROPE_FAULT_SHAPES = [(72, 72, False), (96, 24, False), (128, 40, False), (72, 72, True)]\n+\n+\n+def _rope_id(shape):\n+    head_dim, rotary_dim, interleaved = shape\n+    return f\"D{head_dim}-R{rotary_dim}-{'interleaved' if interleaved else 'neox'}\"\n+\n+\n+def _fused_rope_error(head_dim, rotary_dim, interleaved):\n+    \"\"\"Run `apply_fused_qk_rotary_emb` on one shape; None if it matches an fp64 rotation.\n+\n+    Three query and two key heads are views of one buffer, with 4 of 6 token rows active.\n+    \"\"\"\n+    dtype = torch.bfloat16\n+    positions = torch.tensor([3, 0, 3, 1], device=\"cuda\")\n+    angles = torch.arange(2 * rotary_dim, device=\"cuda\", dtype=torch.float64).view(4, -1) / 7\n+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).float()\n+    generator = torch.Generator(device=\"cuda\").manual_seed(0)\n+    storage = torch.rand(6, 1, 5, head_dim, generator=generator, device=\"cuda\") * 2 - 1\n+    storage = storage.to(dtype)\n+    query, key = storage[:, :, :3], storage[:, :, 3:]\n+    context = SimpleNamespace(\n+        use_flashinfer_fused_rope=True,\n+        padded_active_token_count=4,\n+        gpu_view=SimpleNamespace(token_to_pos_ids=positions),\n+    )\n+    config = SimpleNamespace(rotary_interleaved=interleaved)\n+    outputs = DynamicInferenceContext.apply_fused_qk_rotary_emb(\n+        context, query, key, cos_sin, config\n+    )\n+\n+    phase = torch.polar(torch.ones_like(angles), angles)[positions, None, None]\n+    lane_error = torch.zeros(head_dim, dtype=torch.float64, device=\"cuda\")\n+    for original, actual in zip((query, key), outputs):\n+        rotary, tail = original[:4, ..., :rotary_dim].double(), original[:4, ..., rotary_dim:]\n+        if interleaved:\n+            pairs = rotary.unflatten(-1, (-1, 2))\n+        else:\n+            pairs = torch.stack(rotary.chunk(2, dim=-1), dim=-1)\n+        expected = torch.view_as_real(torch.view_as_complex(pairs.contiguous()) * phase)\n+        expected = expected.flatten(-2) if interleaved else expected.transpose(-1, -2).flatten(-2)\n+        expected = torch.cat((expected, tail.double()), dim=-1)\n+        lane_error = torch.maximum(lane_error, (actual.double() - expected).abs().amax((0, 1, 2)))\n+    wrong = torch.nonzero(lane_error > 2 * torch.finfo(dtype).eps).flatten().tolist()\n+    if not wrong:\n+        return None\n+    shape = _rope_id((head_dim, rotary_dim, interleaved))\n+    return f\"{shape}: lanes {wrong} off by up to {lane_error.max():.3f}\"\n+\n+\n+def test_flashinfer_fused_rope_supports():\n+    \"\"\"The shape predicate admits the shapes FlashInfer rotates exactly and nothing else.\"\"\"\n+    supported = _FUSED_ROPE_KERNEL_SHAPES + [(160, 160, False), (80, 32, False), (256, 64, False)]\n+    unsupported = (\n+        _FUSED_ROPE_SILENT_SHAPES\n+        + _FUSED_ROPE_RACY_SHAPES\n+        + _FUSED_ROPE_FAULT_SHAPES\n+        + [(16, 16, False), (16, 8, False), (40, 40, False), (80, 40, True), (20, 20, False)]\n+    )\n+    for shape in supported:\n+        assert dynamic_context.flashinfer_fused_rope_supports(*shape), _rope_id(shape)\n+    for shape in unsupported:\n+        assert not dynamic_context.flashinfer_fused_rope_supports(*shape), _rope_id(shape)\n+\n+\n+def _flashinfer_rope_shapes():\n+    \"\"\"Every shape the predicate sends to FlashInfer: head dims up to 256 in steps of 8 and\n+    512, at rotary_percent 1, 0.5 and 0.25, in both layouts.\"\"\"\n+    shapes = []\n+    for head_dim in [*range(8, 257, 8), 512]:\n+        for rotary_dim in sorted({head_dim, head_dim // 2, head_dim // 4}):\n+            for interleaved in (False, True):\n+                shape = (head_dim, rotary_dim, interleaved)\n+                if rotary_dim % 2 == 0 and dynamic_context.flashinfer_fused_rope_supports(*shape):\n+                    shapes.append(shape)\n+    return shapes\n+\n+\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"FlashInfer fused RoPE needs CUDA\")\n+@pytest.mark.parametrize(\n+    \"shape\",\n+    _FUSED_ROPE_KERNEL_SHAPES + _FUSED_ROPE_SILENT_SHAPES + _FUSED_ROPE_RACY_SHAPES,\n+    ids=_rope_id,\n+)\n+def test_flashinfer_fused_rope_matches_fp64_rotation(shape):\n+    \"\"\"Every head shape is rotated exactly: by FlashInfer where it can, in fp32 otherwise.\"\"\"\n+    assert dynamic_context.HAVE_FLASHINFER, \"FlashInfer is not installed\"\n+    kernel = dynamic_context.flashinfer.rope.apply_rope_with_cos_sin_cache\n+    with mock.patch.object(\n+        dynamic_context.flashinfer.rope, \"apply_rope_with_cos_sin_cache\", wraps=kernel\n+    ) as spy:\n+        error = _fused_rope_error(*shape)\n+    assert error is None, error\n+    assert spy.call_count == int(shape in _FUSED_ROPE_KERNEL_SHAPES)\n+\n+\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"FlashInfer fused RoPE needs CUDA\")\n+def test_flashinfer_fused_rope_kernel_shapes_match_fp64_rotation():\n+    \"\"\"FlashInfer rotates every shape the predicate sends it exactly.\n+\n+    The predicate encodes one FlashInfer release's vector widths and kernel dispatch; a release\n+    that changes either breaks some of these shapes.\n+    \"\"\"\n+    assert dynamic_context.HAVE_FLASHINFER, \"FlashInfer is not installed\"\n+    shapes = _flashinfer_rope_shapes()\n+    kernel = dynamic_context.flashinfer.rope.apply_rope_with_cos_sin_cache\n+    with mock.patch.object(\n+        dynamic_context.flashinfer.rope, \"apply_rope_with_cos_sin_cache\", wraps=kernel\n+    ) as spy:\n+        errors = [error for shape in shapes if (error := _fused_rope_error(*shape))]\n+    assert not errors, f\"FlashInfer {dynamic_context.flashinfer.__version__}:\\n\" + \"\\n\".join(errors)\n+    assert spy.call_count == len(shapes)\n+\n+\n+@pytest.mark.skipif(not torch.cuda.is_available(), reason=\"FlashInfer fused RoPE needs CUDA\")\n+def test_flashinfer_fused_rope_fault_shapes_run():\n+    \"\"\"Shapes FlashInfer would fault on run and rotate exactly.\n+\n+    A misaligned access leaves a sticky CUDA error, so the shapes run in a child process.\n+    \"\"\"\n+    assert dynamic_context.HAVE_FLASHINFER, \"FlashInfer is not installed\"\n+    script = (\n+        \"import sys\\n\"\n+        \"from tests.unit_tests.inference.contexts.test_dynamic_context import (\\n\"\n+        \"    _FUSED_ROPE_FAULT_SHAPES,\\n\"\n+        \"    _fused_rope_error,\\n\"\n+        \")\\n\"\n+        \"errors = [_fused_rope_error(*shape) for shape in _FUSED_ROPE_FAULT_SHAPES]\\n\"\n+        \"sys.exit('\\\\n'.join(error for error in errors if error) or None)\\n\"\n+    )\n+    result = subprocess.run(\n+        [sys.executable, \"-c\", script],\n+        cwd=Path(__file__).resolve().parents[4],\n+        capture_output=True,\n+        text=True,\n+        timeout=300,\n+    )\n+    assert result.returncode == 0, result.stderr[-4000:]",
+      "raw_url": "https://github.com/NVIDIA/Megatron-LM/raw/410ecd7a7f6a33bdb7d871142eafef4ca47271a2/tests%2Funit_tests%2Finference%2Fcontexts%2Ftest_dynamic_context.py",
+      "sha": "8f47c9fb5bdec642a979780749aef0ca9303a5f9",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "body": "Auto-sync is disabled for draft pull requests in this repository. Workflows must be run manually.\n\nContributors can view more details about this message [here](https://docs.gha-runners.nvidia.com/cpr/auto-sync).\n",
+      "created_at": "2026-11-03T04:20:56Z",
+      "html_url": "https://github.com/NVIDIA/Megatron-LM/pull/8862#issuecomment-6595368001",
+      "id": 6595368001,
+      "updated_at": "2026-11-03T04:20:56Z",
+      "user": {
+        "login": "copy-pr-bot[bot]"
+      }
+    }
+  ],
+  "number": 8862,
+  "refs": {
+    "base": {
+      "commit": "a0ef64615cc3d2574ffbaac70f324ee365f5ed34",
+      "repository": "NVIDIA/Megatron-LM"
+    },
+    "head": {
+      "commit": "410ecd7a7f6a33bdb7d871142eafef4ca47271a2",
+      "repository": "lmcafee-nvidia/Megatron-LM"
+    }
+  },
+  "repository": "NVIDIA/Megatron-LM",
+  "reviews": []
+}

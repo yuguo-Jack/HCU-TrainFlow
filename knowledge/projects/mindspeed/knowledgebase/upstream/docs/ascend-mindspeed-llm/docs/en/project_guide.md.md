@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/project_guide.md
-raw_sha256: e29aee5960f41b1cae665f75d897107021585a4425023538ef2c005205879ff4
+raw_sha256: 6b05d96dfb7a75ee77848cf30e6277d294ebf9de5997fa1b08af532b2489f5d5
 sources: []
-generated_body_sha256: 226a1d29f253e7f68f548ea28c275ae3ef26b95126178941e25ffb8c57a6b2b5
+generated_body_sha256: be6e7251810a7847b44f8c32653e095623f5cee827b5d52701c6ada87e217fdf
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/project_guide.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/project_guide.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/project_guide.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -133,7 +133,6 @@ MindSpeed-LLM/
  │   │   ├── context_parallel/    # Context parallelism features
  │   │   ├── convert_checkpoint/  # Weight conversion
  │   │   ├── dataset/             # Dataset features
- │   │   ├── dpo/                 # DPO training
  │   │   ├── evaluation/          # Evaluation features
  │   │   ├── finetune/            # Fine-tuning features
  │   │   ├── fsdp2/               # FSDP2 features
@@ -232,7 +231,7 @@ The directory tree above shows the overall project structure, where `mindspeed_l
 
 - `core/`: Low-level core functionality implementation, including basic capabilities such as parallel strategies (context parallelism, tensor parallelism, pipeline parallelism), model definitions, Transformer components, dataset processing, and high availability.
 - `features_manager/`: Feature registration and management module. It injects various training features (such as Flash Attention, MoE routing, quantization-aware training, and so on) into the training process through a patching mechanism, enabling on-demand combination and activation of features.
-- `tasks/`: Training task entry points and service logic. It contains implementations of specific tasks such as evaluation, inference, fine-tuning, DPO alignment, and weight conversion. It serves as the execution layer for your training process.
+- `tasks/`: Training task entry points and service logic. It contains implementations of specific tasks such as evaluation, inference, fine-tuning, and weight conversion. It serves as the execution layer for your training process.
 - `training/`: Training framework initialization and main loop. It is responsible for training lifecycle management including parameter parsing, distributed initialization, checkpoint management, and training loop control.
 - `fsdp2/`: Independent FSDP2 backend implementation. It includes the complete training pipeline such as model definitions, data processing, distributed strategies, and inference engine, providing parallel support alongside the MCore backend.
 

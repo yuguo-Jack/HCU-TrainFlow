@@ -9,27 +9,28 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 sources:
 - source: nvidia-cudnn-frontend
   path: docs/utilities/framework_integration_performance.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 5388a0c7c13fcf6f5471fc5d05b1ddcaac7b9f7fd366cd34ab9b71da9b49c476
 - source: nvidia-cudnn-frontend
   path: docs/utilities/dynamic-kernel-cache.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: a179f7f5607256b25a7239f3a9e3954c04402d46db9a6a2953c1417c1941513a
 - source: nvidia-cudnn-frontend
   path: docs/utilities/cuda-graphs.md
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
   sha256: 60b3177f256d50028b2ca562ece2881693d9ee3f403f81c68d06b75cc2f88a42
 - source: nvidia-cudnn-frontend
   path: python/cudnn/_pygraph.py
-  commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
-  sha256: 7b033ce20a300a3a933d0ea67970a123dff21ed7c551fd5e9dfd5728d703587f
+  commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
+  sha256: 99738780798d18ea38c5870b4a60ab5aa180638e0ef4d875d4920708819e5f5c
 - source: nvidia-cudnn-frontend-docs
   path: framework-integration
-  commit: 935d19c3968895d2890a5e4c651071b2f3ec91666c8b340c44a5064fad19293c
+  commit: 62596f777aca773f340569b88fbd42c5fcd807249e8a188810cd38297d19cab9
   sha256: cd69f580a94aa1728385008ada47166fc77421373d45f7bedd0fd9b5b106ebc2
   url: https://docs.nvidia.com/cudnn/utilities/framework_integration_performance/
   revision_kind: web-content-fingerprint
@@ -60,14 +61,16 @@ sources:
 
 当前计划的 index 只有在同一已构建候选排序内才有意义；autotune 裁剪/重排后必须同时更新 workspace/notes/候选映射，不能拿旧的最优 index 继续执行。FlashInfer 已消费的 engine 名和 binder capability 也属真实接口边界，不能以“private 拼写”随意重命名。见[Graph 合同](../topics/graph-and-plans.md#当前边界指针对齐计划排序与外部消费者)。
 
+当前 Python 执行入口新增有界的 ordered-binding 元数据缓存，缓存 schema 不保留调用方 buffer；它降低 host 包装成本，不能替调用方延长 tensor 寿命。backend direct population、retention NONE 和 Python plan 序列化分别减少不同阶段成本，准入和所有权也不同；按[Graph 生命周期](../topics/graph-and-plans.md#缓存与显存所有权)分别验证后再组合，不能用单次 warm-cache replay 替代冷启动或并发正确性。
+
 新官网同样区分 eager 包装时间、captured workload 的 replay GPU interval 与 profiler 的单 kernel 时间；CUDA event 的窗口可包含 host 提交空泡，Graph replay 仍包含图内调度，不是纯 kernel 指令时间。复用输出/variant pack 仍须按实际 device/stream/参数版本和消费者寿命验证，不能从来源单次微秒数字推导 HCU 固定开销。
 
 ## 来源与版本复核
 
-- [nvidia-cudnn-frontend: docs/utilities/framework_integration_performance.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/utilities/framework_integration_performance.md)
-- [nvidia-cudnn-frontend: docs/utilities/dynamic-kernel-cache.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/utilities/dynamic-kernel-cache.md)
-- [nvidia-cudnn-frontend: docs/utilities/cuda-graphs.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/docs/utilities/cuda-graphs.md)
-- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/python/cudnn/_pygraph.py)
+- [nvidia-cudnn-frontend: docs/utilities/framework_integration_performance.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/utilities/framework_integration_performance.md)
+- [nvidia-cudnn-frontend: docs/utilities/dynamic-kernel-cache.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/utilities/dynamic-kernel-cache.md)
+- [nvidia-cudnn-frontend: docs/utilities/cuda-graphs.md](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/docs/utilities/cuda-graphs.md)
+- [nvidia-cudnn-frontend: python/cudnn/_pygraph.py](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/python/cudnn/_pygraph.py)
 - [nvidia-cudnn-frontend-docs: framework-integration](https://docs.nvidia.com/cudnn/utilities/framework_integration_performance/)
 
 本文根据列出的固定源码和教程整理。官网内容指纹与 Git 提交分别记录；官网最新、源码分支、已发布 wheel 和实际 HCU 分支不是同一个版本。以上为源码/教程阅读与 HCU 适配建议，未在 HCU 上执行这些 NVIDIA 示例或宣称性能、loss 验证通过。更新时同时复核本页、同库总览、相关案例及 Skill。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: modelscope/ms-swift
-commit: 22249748429ce7e8516640e35cbe997e572a233a
+commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
 path: docs/source_en/GetStarted/SWIFT-installation.md
-raw_sha256: 2f80ce9327d85ebe959a9883bdd435027082e3eb4abb1b76883675da7bbd7fed
+raw_sha256: 40c6c489095916148b52ca6cf7775dc06902b237495afecf52424ec7a8029fa2
 sources: []
-generated_body_sha256: b70399fdcc1e8dfd76b1cf55bd29e3e2a430624f784fd777ad27be50e3fc0b97
+generated_body_sha256: 003dcd381764cbb2d94c1f209d000b3628a69cd8b063f739a557b2b5420bec9b
 source_state: current-scan
 ---
 
 # modelscope/ms-swift / docs/source_en/GetStarted/SWIFT-installation.md
 
-[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/docs/source_en/GetStarted/SWIFT-installation.md)
+[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/docs/source_en/GetStarted/SWIFT-installation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -205,7 +205,7 @@ More images can be found [here](https://modelscope.cn/docs/intro/environment-set
 | peft         | >=0.11,<0.20 |                     |                                           |
 | flash_attn   |              | 2.8.3/4.0.0b15 |                                           |
 | trl          | >=0.15,<1.0 | 0.29.1              | RLHF                                      |
-| deepspeed    | >=0.14       | 0.18.9              | Training                                  |
+| deepspeed    | >=0.19.3,<0.20 | 0.19.7            | Training                                  |
 | vllm         | >=0.5.1      | 0.11.0/0.23.0       | Inference/Deployment                      |
 | sglang       | >=0.4.6      |          | Inference/Deployment                      |
 | evalscope    | >=1.0       |                     | Evaluation                                |

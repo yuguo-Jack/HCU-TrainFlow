@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+commit: 25e7c5728d834335288d080e1c36810fa111d4da
 path: docs/training/weight_transfer/ipc.md
-raw_sha256: 32f452e9546a50cecc1069a2457b4b3be696ca9d7e633f6f92eda58e02078f51
+raw_sha256: 67d977b79d936886c30312a48c7457202e6acaf385a8bf693f56314e3687d2fd
 sources: []
-generated_body_sha256: 248ad6c01409b9f4e48015ea50ed16c7a841fc5d96007932311468f216f23ed1
+generated_body_sha256: 65cd47cce05313f5b431aa49a18cb54352e428db0c03459fd11852735371253d
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/weight_transfer/ipc.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/weight_transfer/ipc.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/training/weight_transfer/ipc.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -36,7 +36,7 @@ The IPC weight transfer engine uses **CUDA IPC** (Inter-Process Communication) h
 
 ## How It Works
 
-1. The trainer creates CUDA tensors for each weight and generates IPC handles using `torch.multiprocessing.reductions.reduce_tensor`. In multi-GPU setups (e.g. FSDP), each trainer rank materializes the full tensor for each parameter onto its own GPU before generating the handle — which `ModuleSource` does for you.
+1. The trainer creates CUDA tensors for each weight and generates IPC handles using `torch.multiprocessing.reductions.reduce_tensor`. In multi-GPU setups (e.g. FSDP), each trainer rank materializes the full tensor for each parameter onto its own GPU before generating the handle — which `ModuleSource` does for you. Each rank serves its colocated worker, so every rank must own every parameter; a partitioned source is rejected.
 2. Every trainer rank contributes its handles to an all-gather; the sender merges them so each payload maps every GPU UUID to its args, and ships the merged handles to the inference engine through the client. Each worker reads only the handle for its own GPU.
 3. The inference worker reconstructs the tensors from the handles using `rebuild_cuda_tensor`, reading directly from the trainer's GPU memory.
 
@@ -180,6 +180,20 @@ the first `/update_weights` returns 500. Reference:
 For different parameter subsets per worker, `update_info` may be a list indexed
 by worker rank. This form is IPC-only because collective backends require every
 worker to participate.
+
+## Limitations
+
+- **Colocated only.** Each trainer rank shares memory with the inference worker
+  on its own GPU; trainer and inference on separate GPUs need another backend.
+- **Pipeline-parallel trainers are not supported yet (work in progress).** Every
+  trainer rank serves its colocated worker the whole model, so every rank must
+  own every parameter. A source whose ranks own different parameters (pipeline
+  stages, or experts held by only some ranks) is rejected at `trainer_init`.
+- **A full copy per GPU.** Each rank materializes every parameter in full on its
+  GPU. Unpacked, the whole model stays resident until the round finishes; set
+  `packed=True` to bound it to one chunk.
+- The handle all-gather runs over the default process group, which must be
+  exactly the colocated trainer ranks.
 
 ## Examples
 

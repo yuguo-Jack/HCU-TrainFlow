@@ -9,85 +9,90 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/models/gpt_provider.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 2354707c4c81b5e05c6e62e4613092c26e7271dd17aa293ace75d1bc736abd4f
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/models/conversion/auto_bridge.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: cabf1fbd8954002d4dd852e80590ff3a9bb0efe2b0615f603b498d0b049abe94
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: 1634f53dfb7f086f73c467d980553a4483663cf61f48738d2103cff5319dd465
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/recipes/qwen/qwen3.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: a3429fb9d977abdf70f77427702d8772507a951e2979464f2551e6318774d08c
 - source: nvidia-nemo-megatron-bridge
   path: tests/unit_tests/recipes/qwen/test_qwen3_recipes.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 17eb662c5f76eea64750db924ffecc880ec5812cfd3759574d69ce78bf53b2f1
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/entry-points.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: b2adf198c102593158c53b3c5dce1eb118655c54b117b41726bd77ea82d17665
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/mixed-precision.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 1eaaa5295132b8707a8188fa64b97d668ded87bf426bca03008c78dd9458c926
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/peft.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 4f5ea38bb3b03f603f0530370168ebad309238dc2b7ade8ab8cbd08ba9ef38d9
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/data/builders/dpo.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 71d0f8a0a5df6ec78a265aba09856091e1a1ea20740f20c28c9ec2bc0dfd700a
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/data/datasets/preference.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 2a65fca150e1e446860ef74cf5dee0d95c8be31f3727b0ae15f4b3a04c6621d0
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/data/datasets/preference_pair.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 9941077df8701925fa67f3e22529e63c9457b6a3e7954c715e75438d382e1aac
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/dpo.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 5dfd8b1be74bf4c640c3bcd40e2b21949911edafef4b4c66e8425fd96c56b050
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/dpo_step.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: b43ac87395326fddb286dc10263e7f4ae34ab89edc9b04914753fd28c69b2339
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/dpo_train.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 45c7e92be9a7c390efbcbaf800569987dc2e66a7877283e0de1250901ddecfb4
 - source: nvidia-nemo-megatron-bridge
   path: scripts/dpo/score_reference_logprobs.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: e5aecc44e18c2043c2b528175eb5bb68f0d53eec02c553d39356cd6b21b2e119
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/recipes/qwen/h100/qwen3_moe.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: 0336271dd142bccec0246c0798ca4fb45023fb9f807d0f952cbb4d3556824671
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: ff301c834676c0a4400d5e4d2bf5d099e78c10239b4791c6e8f985885b165835
 - source: nvidia-nemo-megatron-bridge
   path: tests/unit_tests/training/test_dpo.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 8c3ffa19734d18d5534005910de94fae9e4bcdf2bfe19ef099c612486e18514f
 - source: nvidia-nemo-megatron-bridge
   path: tests/unit_tests/training/test_dpo_step.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 9357229e0f65ee10123a5afbb362b8dd304e213b38df405c533f2728e24abf99
 - source: nvidia-nemo-megatron-bridge
   path: tests/unit_tests/training/test_dpo_train.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 65ba708c63a7f8ca505437ba48312b923009c1c21fe2c67b0a4d65f5a61e15a4
 - source: nvidia-nemo-megatron-bridge
   path: tests/unit_tests/models/test_adapter_export.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: 92f6a641b9f1980a0da1da3b878768c3ba4e5bde49ac639783e6642194be79cb
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: 1cc29a148c9e232cb0ef6b40341988cf6f00f826f4e70078942ef1626e0e633f
+- source: nvidia-nemo-megatron-bridge
+  path: src/megatron/bridge/models/conversion/modelopt_utils.py
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: ecd7a9ceeaaf9161f3348921e82b4b0a64705d74e8b2064425cf2be58620612c
+retrieved_on: '2026-11-04'
 ---
 
 # Bridge：模型配方、Pipeline Provider 与 HF 权重映射
@@ -106,7 +111,7 @@ MTP独立stage可能没有decoder layer，`mtp_block_spec`重新取得decoder sp
 
 ## AutoBridge映射与内存
 
-`AutoBridge.from_hf_pretrained/from_hf_config→to_megatron_provider→get_model`连接模型结构，load/stream/export路径连接参数mapping。核对名称、QKV排列、column/row parallel分片、gated MLP gate/up、vocab padding、embedding tying、RoPE和special tokens；转换还受当前TP/PP/EP及模型family支持限制。
+`AutoBridge.from_hf_pretrained/from_hf_config` 之后应区分 legacy `to_megatron_provider` 与 builder-backed `get_model_config→get_model/build_distributed_models`；当前 H100 Qwen3 MoE recipe 已改走后一条，不能把 provider 对象字段当作所有模型的统一接口。load/stream/export 路径连接参数 mapping。核对名称、QKV排列、column/row parallel分片、gated MLP gate/up、vocab padding、embedding tying、RoPE和special tokens；转换还受当前TP/PP/EP及模型family支持限制。
 
 流式权重转换/分rank导出可降低完整权重同时物化的主存/显存峰值，但map/reduce和I/O有代价。没有读实际导出路径就不能估计峰值，更不能为了节省内存改权重dtype后省掉数值回归。PEFT初始化frozen base与adapter的load/save分开，LoRA/DoRA结构和训练参数集合明确。
 
@@ -133,27 +138,35 @@ recipe单测核对模型配置和并行字段，真实转换还需TP/PP边界、
 
 模型初建失败先provider/spec与实际Core签名，权重错先mapping/layout，再precision初始化；loss错还要查数据/分母。退回支持的local/TE基础spec、可信HF/native权重和已验配方；不是随意缩dim避开错误。更新provider、Core builder、精度初始化、AutoBridge mapping和recipe时联动[总览](../overview/bridge.md)与checkpoint专题。
 
+2026-11-04 复核固定 `41af2dcf0dfd83c8933f588bb871b7f56dbd4368`，新增 adapter 导出内存/collective 契约：`save_hf_adapter` 的每个 rank 必须完整驱动 gather generator，仅 rank0 clone/保留完整 adapter 并写文件；rank0 转换/写入失败通过 status broadcast 通知其他 ranks。新增 mock 单测覆盖非零 rank 不留权重、不写文件、空导出和写入错误传播，不构成真实 TP/PP/EP 集群回归。共享 outer factor 的 serving layout 与 PEFT-loadable 展开形式仍不同。
+
+ModelOpt 导出现在先 `build_hf_modelopt_export_plan`，再消费 prepared tasks；grouped API 要求各 rank 同序消费（含空组和 StopIteration），本地消费者完成后才进入下一组。它拒绝 unmerged adapters 和定制 HF export override；旧 quant_mode 参数式调用不能直接当作现接口。普通 HF 导出还区分真实量化状态 sidecars 与 plain weight dtype，config-only 路线会在 rank0 收集完整 CPU state，不能把所有路径都称为恒定内存 streaming。
+
+保留依据：`gpt_provider.py` 的最终 MTP 调用、Qwen3 基础 recipe/测试、DPO 成对数据与评分/step/loss 原件字节未变，故保留原参数/数值条件和 PR 修复尚未进入该 provider 的结论；新 builder recipe 与导出分支没有取消这些数据和状态契约。
+
+补采 `ModelOptExportPlan` 确认 plan 保存 tasks、quantization config、参数集合和本地量化 spec；`prepare_modelopt_export_tasks` 每次检查 spec 未改变并安装新 stream hooks，不能把旧 plan 用于已改 recipe 的模型。映射拓扑、TP/EP 量化一致性和 tied aliases 另有校验；当前拒绝 grouped HF expert weights、部分定制 QKV/Mamba layout / permute mapping，`check_exportable_quantizers` 也拒绝无法带出的已启用 KV/output 等 quantizer。prepared plan 不是任意量化格式都可导出的证明。
+
 ## 固定证据与复核范围
 
-- [src/megatron/bridge/models/gpt_provider.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/models/gpt_provider.py)
-- [src/megatron/bridge/models/conversion/auto_bridge.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/models/conversion/auto_bridge.py)
-- [src/megatron/bridge/recipes/qwen/qwen3.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/recipes/qwen/qwen3.py)
-- [tests/unit_tests/recipes/qwen/test_qwen3_recipes.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/tests/unit_tests/recipes/qwen/test_qwen3_recipes.py)
-- [docs/training/entry-points.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/training/entry-points.md)
-- [docs/training/mixed-precision.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/training/mixed-precision.md)
-- [docs/training/peft.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/training/peft.md)
+- [src/megatron/bridge/models/gpt_provider.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/models/gpt_provider.py)
+- [src/megatron/bridge/models/conversion/auto_bridge.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/models/conversion/auto_bridge.py)
+- [src/megatron/bridge/recipes/qwen/qwen3.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/recipes/qwen/qwen3.py)
+- [tests/unit_tests/recipes/qwen/test_qwen3_recipes.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/tests/unit_tests/recipes/qwen/test_qwen3_recipes.py)
+- [docs/training/entry-points.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/entry-points.md)
+- [docs/training/mixed-precision.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/mixed-precision.md)
+- [docs/training/peft.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/peft.md)
 
-- [src/megatron/bridge/data/builders/dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/data/builders/dpo.py)
-- [src/megatron/bridge/data/datasets/preference.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/data/datasets/preference.py)
-- [src/megatron/bridge/data/datasets/preference_pair.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/data/datasets/preference_pair.py)
-- [src/megatron/bridge/training/dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/dpo.py)
-- [src/megatron/bridge/training/dpo_step.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/dpo_step.py)
-- [src/megatron/bridge/training/dpo_train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/dpo_train.py)
-- [scripts/dpo/score_reference_logprobs.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/scripts/dpo/score_reference_logprobs.py)
-- [src/megatron/bridge/recipes/qwen/h100/qwen3_moe.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/recipes/qwen/h100/qwen3_moe.py)
-- [tests/unit_tests/training/test_dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/tests/unit_tests/training/test_dpo.py)
-- [tests/unit_tests/training/test_dpo_step.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/tests/unit_tests/training/test_dpo_step.py)
-- [tests/unit_tests/training/test_dpo_train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/tests/unit_tests/training/test_dpo_train.py)
-- [tests/unit_tests/models/test_adapter_export.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/tests/unit_tests/models/test_adapter_export.py)
+- [src/megatron/bridge/data/builders/dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/data/builders/dpo.py)
+- [src/megatron/bridge/data/datasets/preference.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/data/datasets/preference.py)
+- [src/megatron/bridge/data/datasets/preference_pair.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/data/datasets/preference_pair.py)
+- [src/megatron/bridge/training/dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/training/dpo.py)
+- [src/megatron/bridge/training/dpo_step.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/training/dpo_step.py)
+- [src/megatron/bridge/training/dpo_train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/training/dpo_train.py)
+- [scripts/dpo/score_reference_logprobs.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/scripts/dpo/score_reference_logprobs.py)
+- [src/megatron/bridge/recipes/qwen/h100/qwen3_moe.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/recipes/qwen/h100/qwen3_moe.py)
+- [tests/unit_tests/training/test_dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/tests/unit_tests/training/test_dpo.py)
+- [tests/unit_tests/training/test_dpo_step.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/tests/unit_tests/training/test_dpo_step.py)
+- [tests/unit_tests/training/test_dpo_train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/tests/unit_tests/training/test_dpo_train.py)
+- [tests/unit_tests/models/test_adapter_export.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/tests/unit_tests/models/test_adapter_export.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

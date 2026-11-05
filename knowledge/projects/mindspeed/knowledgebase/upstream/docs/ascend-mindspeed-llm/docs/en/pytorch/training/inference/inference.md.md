@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/pytorch/training/inference/inference.md
-raw_sha256: 29f57cd9e07be59c55f3538dcb76c76689433b0d4b17077d055a15450eb9fbc9
+raw_sha256: 4aff0be773b72389f05f992e97f43b6b625f10e9fff2d597d4f47f0db4d93d6f
 sources: []
-generated_body_sha256: b79b263d5421d06c3978ededd511cc4436969f070823c3d7fe0e36a4dfdee44d
+generated_body_sha256: fc20aa40edf012b1e59d1d8e19bbdd35f4b8ffd9fe181d828a9888b8cd6f73a9
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/pytorch/training/inference/inference.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/pytorch/training/inference/inference.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/pytorch/training/inference/inference.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -83,7 +83,7 @@ Upstream source document; original commands, claims and links require their stat
 
     - `TOKENIZER_MODEL`: Specifies the tokenizer file path for the model, for example `tokenizer.model`.
 
-    > [!NOTE]
+    > [!NOTE] Note
     >
     > Apart from the path configuration, all other parameters in the inference script must match the training parameters, including the parallel partition settings for TP, PP, EP, and VPP, and custom model structure parameters such as `--noop-layers` and `--num-layer-list`. Otherwise, the model weights may fail to load.
 

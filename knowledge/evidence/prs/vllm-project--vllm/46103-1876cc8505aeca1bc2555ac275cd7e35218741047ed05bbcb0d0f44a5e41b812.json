@@ -1,0 +1,1015 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "d32ade59ef6102fd421ae72417ad18bcff24cc92487a0e879f1811e5273a576c",
+      "isPrivate": false,
+      "numbers": [
+        46136,
+        46132,
+        46127,
+        46126,
+        46103,
+        46068,
+        46066,
+        46060
+      ],
+      "observed_at": "2026-11-04T22:49:36.787518+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4996,
+        "resetAt": "2026-11-04T23:48:38Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "ac521f623706b74ac12a01e6ed8f7297a39257fe",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\r\n\r\nOn ROCm/gfx950 the DeepSeek-V3.2-style **Lightning indexer prefill** (the FP8 MQA `logits` + per-row `top_k`) is computed **redundantly on every tensor-parallel rank**: each rank runs the full indexer over *all* prefill query rows and produces the identical `topk_indices_buffer`. Unlike the main attention/MLP, this work is not split by TP, so it is replicated `tp_size` times. Its cost grows with the causal range each query attends to, so at long context the replicated indexer prefill becomes a dominant, TP-non-scaling chunk of TTFT.\r\n\r\nThis PR shards that prefill indexer work across the TP group on the **query (M / token) dimension**. Each rank computes `rocm_fp8_mqa_logits` + `top_k_per_row_prefill` for only its slice of prefill rows, then the ranks exchange their slices so every rank ends up with the full `topk_indices_buffer` that the subsequent sparse attention needs. The KV-cache quant/gather and the decode path are unchanged.\r\n\r\nTwo partition schemes are provided:\r\n\r\n- **`TP_SHARD` (default ON):** split the `num_prefill_tokens` rows into `tp_size` contiguous shards. The remainder rows are assigned to rank 0 (the cheapest, lowest-index shard). Reassembly is hybrid NCCL: a ring `all_gather` over the evenly-divisible block plus a single `broadcast` for the remainder rows.\r\n- **`TP_SHARD_FOLD` (default OFF):** a work-balanced fold for the case where a step spans a very large causal range. Because per-row indexer cost rises with token index (`~ ke - ks`), a plain contiguous split overloads the last rank. Fold cuts the rows into `2*tp` groups and pairs a cheap low-index group with an expensive high-index one on each rank. The split is fixed symmetric (`M ≈ P/2`, rounded to a multiple of `tp` so the first half can ring `all_gather`), which already balances the ~linear per-row cost. Reassembly is the rank-ordered first half via ring `all_gather` and the reversed second half via per-group `broadcast`s (batched in a single `group_start`/`group_end`).\r\n\r\nSharding only kicks in on gfx950 with `tp_size > 1` and `num_prefill_tokens >= 512 * tp_size`, so short prefills (where the indexer is negligible and the collective would just add latency) fall back to the original replicated path.\r\n\r\nMinor cleanups in the same change:\r\n\r\n- Skip the redundant `cp_gather_indexer_k_quant_cache` when `chunk.skip_kv_gather` is set (avoids re-gathering K for chunks that don't need it).\r\n- Drop the unconditional `topk_indices_buffer[...] = -1` memset on gfx950 (the kernel fully writes the buffer there); keep it as a safety net on other archs.\r\n\r\n## Test Plan\r\n\r\n- **Correctness:** GSM8K (lm_eval, 5-shot, full 1319-example set) on 8×MI355 (gfx950, TP=8) for both models and both shard paths.\r\n- **Performance:** `vllm bench serve` sweeps over ISL × concurrency for both models (baseline vs `TP_SHARD` vs `TP_SHARD+FOLD`), reported below.\r\n\r\n## Test Result\r\n\r\n### Accuracy — GSM8K, 5-shot, full set\r\n\r\n| Model | Config | exact_match (flexible) | exact_match (strict) |\r\n|---|---|---:|---:|\r\n| GLM-5.1-FP8 | `TP_SHARD` | 0.9386 | 0.9454 |\r\n| GLM-5.1-FP8 | `TP_SHARD+FOLD` | 0.9386 | 0.9431 |\r\n| DeepSeek-V4-Pro | `TP_SHARD` | 0.9500 | 0.8825 |\r\n| DeepSeek-V4-Pro | `TP_SHARD+FOLD` | 0.9409 | 0.8719 |\r\n\r\n### Performance\r\n\r\nSetup: 8×MI355 (gfx950), TP=8, `rocm/vllm-dev:nightly` (vllm `0.23.1rc1.dev354`) with this PR's two files overlaid; `vllm bench serve`, random dataset, OSL=1000, `--ignore-eos`, request-rate `inf`. All numbers are vs the `baseline` (replicated) column and **`+` always means better** (higher throughput / lower latency).\r\n\r\nThe first three columns (`baseline` / `TP_SHARD` / `TP_SHARD+FOLD`) run at vLLM **default** gpu-mem-util and default chunked-prefill size (8192). The two **`chunk16k`** columns combine the shard with a larger prefill chunk (`--max-num-batched-tokens 16384`) at `--gpu-memory-utilization 0.88`; this is a serving-side tuning knob (not part of this PR's code) that trades a little short/mid-context TTFT for better long-context TPOT/throughput.\r\n\r\nShort context (≤ 8K) is neutral within ±2–3% (the indexer is a tiny fraction of work, and the gate skips sharding for the smallest prefills); the win grows with context length, reaching **2.1× throughput** for GLM-5.1 at 199K and **+40%** for DeepSeek-V4-Pro at 512K.\r\n\r\n#### GLM-5.1-FP8\r\n\r\n**Output throughput (tok/s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 4000 | 16 | 381.9 | 385.3 (+1%) | 385.0 (+1%) | 384.2 (+1%) | 383.1 (+0%) |\r\n| 4000 | 64 | 1000.6 | 1012.0 (+1%) | 1010.2 (+1%) | 1018.9 (+2%) | 1013.4 (+1%) |\r\n| 4000 | 256 | 1615.2 | 1647.5 (+2%) | 1641.4 (+2%) | 1661.5 (+3%) | 1658.8 (+3%) |\r\n| 16000 | 4 | 130.0 | 130.8 (+1%) | 134.7 (+4%) | 133.6 (+3%) | 134.2 (+3%) |\r\n| 16000 | 16 | 281.8 | 300.6 (+7%) | 300.3 (+7%) | 301.8 (+7%) | 303.0 (+8%) |\r\n| 16000 | 64 | 415.3 | 458.3 (+10%) | 457.6 (+10%) | 461.3 (+11%) | 464.4 (+12%) |\r\n| 100000 | 4 | 37.3 | 56.7 (+52%) | 56.9 (+53%) | 56.3 (+51%) | 57.9 (+55%) |\r\n| 100000 | 12 | 42.2 | 69.7 (+65%) | 69.9 (+66%) | 69.6 (+65%) | 71.6 (+70%) |\r\n| 199000 | 6 | 14.5 | 30.9 (+112%) | 30.8 (+112%) | 31.3 (+115%) | 31.5 (+117%) |\r\n\r\n**Mean TTFT (s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 4000 | 16 | 9.61 | 9.58 (+0%) | 9.63 (-0%) | 10.19 (-6%) | 10.23 (-6%) |\r\n| 4000 | 64 | 6.68 | 6.57 (+2%) | 6.69 (-0%) | 7.18 (-7%) | 7.41 (-11%) |\r\n| 4000 | 256 | 23.59 | 22.77 (+3%) | 22.92 (+3%) | 22.60 (+4%) | 22.70 (+4%) |\r\n| 16000 | 4 | 3.56 | 3.92 (-10%) | 3.10 (+13%) | 3.33 (+6%) | 3.27 (+8%) |\r\n| 16000 | 16 | 8.72 | 7.59 (+13%) | 7.62 (+13%) | 8.49 (+3%) | 8.40 (+4%) |\r\n| 16000 | 64 | 29.09 | 25.31 (+13%) | 25.35 (+13%) | 25.38 (+13%) | 25.11 (+14%) |\r\n| 100000 | 4 | 39.58 | 20.77 (+48%) | 20.74 (+48%) | 23.37 (+41%) | 22.25 (+44%) |\r\n| 100000 | 12 | 79.31 | 41.67 (+47%) | 41.60 (+48%) | 43.59 (+45%) | 41.71 (+47%) |\r\n| 199000 | 6 | 150.40 | 59.70 (+60%) | 59.77 (+60%) | 61.76 (+59%) | 61.71 (+59%) |\r\n\r\n**Mean TPOT (ms)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 4000 | 16 | 32.3 | 31.9 (+1%) | 31.9 (+1%) | 31.5 (+3%) | 31.5 (+2%) |\r\n| 4000 | 64 | 57.0 | 56.4 (+1%) | 56.4 (+1%) | 55.5 (+3%) | 55.7 (+2%) |\r\n| 4000 | 256 | 133.4 | 131.1 (+2%) | 131.5 (+1%) | 130.8 (+2%) | 130.9 (+2%) |\r\n| 16000 | 4 | 27.2 | 26.6 (+2%) | 26.6 (+2%) | 26.6 (+2%) | 26.6 (+2%) |\r\n| 16000 | 16 | 47.9 | 45.5 (+5%) | 45.5 (+5%) | 44.5 (+7%) | 44.3 (+7%) |\r\n| 16000 | 64 | 123.9 | 113.2 (+9%) | 113.4 (+8%) | 112.8 (+9%) | 112.2 (+9%) |\r\n| 100000 | 4 | 67.5 | 49.5 (+27%) | 49.4 (+27%) | 47.6 (+30%) | 46.8 (+31%) |\r\n| 100000 | 12 | 204.2 | 129.4 (+37%) | 129.0 (+37%) | 128.5 (+37%) | 125.4 (+39%) |\r\n| 199000 | 6 | 261.5 | 133.9 (+49%) | 133.9 (+49%) | 129.7 (+50%) | 128.4 (+51%) |\r\n\r\n#### DeepSeek-V4-Pro\r\n\r\n**Output throughput (tok/s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 8000 | 16 | 370.7 | 369.3 (-0%) | 372.4 (+0%) | 374.5 (+1%) | 373.5 (+1%) |\r\n| 8000 | 64 | 719.3 | 721.7 (+0%) | 720.2 (+0%) | 750.2 (+4%) | 746.7 (+4%) |\r\n| 8000 | 256 | 1089.2 | 1087.1 (-0%) | 1091.0 (+0%) | 1107.1 (+2%) | 1107.0 (+2%) |\r\n| 64000 | 4 | 76.4 | 78.6 (+3%) | 78.6 (+3%) | 79.7 (+4%) | 79.7 (+4%) |\r\n| 64000 | 16 | 129.9 | 137.0 (+5%) | 137.0 (+5%) | 139.0 (+7%) | 139.3 (+7%) |\r\n| 64000 | 64 | 158.5 | 169.4 (+7%) | 169.3 (+7%) | 171.4 (+8%) | 171.9 (+8%) |\r\n| 128000 | 6 | 55.2 | 60.6 (+10%) | 60.8 (+10%) | 61.6 (+12%) | 61.9 (+12%) |\r\n| 128000 | 12 | 64.4 | 71.7 (+11%) | 71.9 (+12%) | 72.9 (+13%) | 73.2 (+14%) |\r\n| 256000 | 6 | 27.2 | 33.0 (+21%) | 33.3 (+22%) | 33.9 (+25%) | 34.2 (+26%) |\r\n| 512000 | 4 | 10.5 | 14.7 (+40%) | 14.9 (+42%) | 15.3 (+46%) | 15.5 (+48%) |\r\n\r\n**Mean TTFT (s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 8000 | 16 | 3.73 | 3.70 (+1%) | 3.71 (+0%) | 4.65 (-25%) | 4.63 (-24%) |\r\n| 8000 | 64 | 13.38 | 13.31 (+1%) | 13.36 (+0%) | 12.81 (+4%) | 12.94 (+3%) |\r\n| 8000 | 256 | 41.96 | 41.73 (+1%) | 41.81 (+0%) | 40.37 (+4%) | 40.39 (+4%) |\r\n| 64000 | 4 | 11.80 | 10.99 (+7%) | 10.99 (+7%) | 11.80 (+0%) | 11.77 (+0%) |\r\n| 64000 | 16 | 28.99 | 26.99 (+7%) | 26.97 (+7%) | 27.81 (+4%) | 27.69 (+4%) |\r\n| 64000 | 64 | 97.87 | 91.05 (+7%) | 91.02 (+7%) | 89.45 (+9%) | 89.05 (+9%) |\r\n| 128000 | 6 | 32.96 | 28.74 (+13%) | 28.64 (+13%) | 30.62 (+7%) | 30.41 (+8%) |\r\n| 128000 | 12 | 52.07 | 45.57 (+12%) | 45.40 (+13%) | 47.00 (+10%) | 46.67 (+10%) |\r\n| 256000 | 6 | 80.21 | 63.43 (+21%) | 62.95 (+22%) | 66.92 (+17%) | 65.55 (+18%) |\r\n| 512000 | 4 | 176.65 | 120.09 (+32%) | 119.06 (+33%) | 125.55 (+29%) | 124.39 (+30%) |\r\n\r\n**Mean TPOT (ms)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 8000 | 16 | 39.4 | 39.5 (-0%) | 39.2 (+0%) | 38.1 (+3%) | 38.2 (+3%) |\r\n| 8000 | 64 | 75.1 | 74.9 (+0%) | 75.0 (+0%) | 72.3 (+4%) | 72.5 (+3%) |\r\n| 8000 | 256 | 189.7 | 190.4 (-0%) | 189.5 (+0%) | 189.3 (+0%) | 189.3 (+0%) |\r\n| 64000 | 4 | 40.4 | 39.8 (+2%) | 39.8 (+2%) | 38.3 (+5%) | 38.4 (+5%) |\r\n| 64000 | 16 | 93.4 | 89.0 (+5%) | 89.0 (+5%) | 86.9 (+7%) | 86.8 (+7%) |\r\n| 64000 | 64 | 301.6 | 282.4 (+6%) | 282.6 (+6%) | 282.0 (+6%) | 281.2 (+7%) |\r\n| 128000 | 6 | 75.2 | 69.8 (+7%) | 69.6 (+8%) | 66.6 (+11%) | 66.3 (+12%) |\r\n| 128000 | 12 | 133.0 | 120.6 (+9%) | 120.2 (+10%) | 117.0 (+12%) | 116.6 (+12%) |\r\n| 256000 | 6 | 139.2 | 117.2 (+16%) | 116.3 (+16%) | 109.5 (+21%) | 109.1 (+22%) |\r\n| 512000 | 4 | 203.5 | 150.3 (+26%) | 148.8 (+27%) | 135.4 (+33%) | 133.4 (+34%) |\r\n\r\n## Notes\r\n\r\nBoth env vars are read on gfx950 only; sharding additionally requires `tp_size > 1` and `num_prefill_tokens >= 512 * tp_size`.\r\n\r\n- `VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD` (default `1`): shard the indexer prefill across the TP group on the token dimension. Set `0` to fall back to the original replicated path.\r\n- `VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD` (default `0`): use the work-balanced fold partition instead of contiguous shards (the fold split point is fixed at `P/2`).\r\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Concurrensee.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork",
+            "createdAt": "2026-06-18T21:34:23Z",
+            "databaseId": 4746310185,
+            "updatedAt": "2026-06-18T21:34:23Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4746310185"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Fangzhou-Ai"
+            },
+            "body": "Thanks @Concurrensee ! What's the command to run your test here? I saw you have added two envs, what's the best practice to use?",
+            "createdAt": "2026-06-24T21:21:35Z",
+            "databaseId": 4793777477,
+            "updatedAt": "2026-06-24T21:21:35Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793777477"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Fangzhou-Ai"
+            },
+            "body": "Hi @dllehr-amd  can you please spare some time to look at this PR?",
+            "createdAt": "2026-06-24T21:29:05Z",
+            "databaseId": 4793829863,
+            "updatedAt": "2026-06-24T21:29:05Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793829863"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Concurrensee"
+            },
+            "body": "Hi @Fangzhou-Ai,\r\nBest practice on the two envs:\r\n\r\nDefault config: keep the defaults — TP_SHARD on, FOLD off. TP_SHARD self-gates (only active on gfx950 when tp_size > 1 and num_prefill_tokens >= 512 * tp_size), so short prefills fall back to the replicated path and long-context prefills get the speedup automatically.\r\n\r\nWhen tuning chunk size for long-context runs, turn on FOLD (VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD=1). Larger prefill chunks span a wider causal range per step, where the work-balanced fold partition pays off the most.\r\n\r\nSince VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD is on by default, if you observe a regression on a specific case, turn it off (=0) to fall back to the original replicated path.",
+            "createdAt": "2026-06-24T21:40:40Z",
+            "databaseId": 4793907950,
+            "updatedAt": "2026-06-24T21:48:25Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793907950"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Concurrensee"
+            },
+            "body": "Hi @Fangzhou-Ai,\r\nCommands to run (8×MI355, TP=8):\r\n\r\n```\r\nVLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=1 \\\r\nvllm serve $MODEL --tensor-parallel-size 8 \\\r\n  --max-model-len $MAXLEN --no-enable-prefix-caching --trust-remote-code\r\n# fold (for long-context / larger chunk): prepend VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD=1\r\n# baseline A/B:                           test against an image without this PR and an image with this PR. \r\n# contorl SHARD                           prepend VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD=1/0 to turn on/off shard\r\n```\r\n\r\n```\r\n vllm bench serve --model $MODEL --dataset-name random \\\r\n  --random-input-len $ISL --random-output-len 1000 --ignore-eos \\\r\n  --num-prompts $((2*C)) --max-concurrency $C --request-rate inf \\\r\n  --percentile-metrics ttft,tpot --metric-percentiles 50,95\r\n```\r\n```\r\nlm_eval --model local-completions --tasks gsm8k --num_fewshot 5 \\\r\n  --model_args model=$MODEL,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=128,tokenized_requests=False\r\n```",
+            "createdAt": "2026-06-24T21:46:19Z",
+            "databaseId": 4793943006,
+            "updatedAt": "2026-06-25T18:04:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793943006"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Concurrensee.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-07-28T05:42:24Z",
+            "databaseId": 5100413243,
+            "updatedAt": "2026-07-28T05:42:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-5100413243"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "This pull request has been automatically marked as stale because it has not had any activity within 90 days. It will be automatically closed if no further activity occurs within 30 days. Leave a comment if you feel this pull request should remain open. Thank you!",
+            "createdAt": "2026-10-27T01:55:06Z",
+            "databaseId": 6431802912,
+            "updatedAt": "2026-10-27T01:55:06Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-6431802912"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAX9dhiA=",
+          "hasNextPage": false
+        },
+        "totalCount": 7
+      },
+      "headRefOid": "b3139535cf7a096e026af0106452e007564e8838",
+      "headRepository": {
+        "nameWithOwner": "Concurrensee/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 46103,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "AndreasKaratzas"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "AndreasKaratzas"
+                  },
+                  "body": "Env vars have a specific cadence. They must be defined in envs.py \nAlso the redefinition of hidden vars as well here is not clean at all. \n\nAnd also why do we need env vars for this? ",
+                  "createdAt": "2026-06-20T02:09:06Z",
+                  "databaseId": 3445272894,
+                  "diffHunk": "@@ -24,7 +30,30 @@\n     _ON_GFX942 = False\n     _ON_GFX950 = False\n \n-\n+# Shard the replicated lightning-indexer prefill logits+top-k across the TP \n+# group on the query (M) dimension. Default ON; gated to gfx950 and the prefill\n+# branch only (decode is unchanged).\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD\", \"1\") == \"1\"\n+)\n+# FOLDED work-balanced row partition. The logits kernel is causal-aware (per-row\n+# cost ~ ke - ks), so a uniform row split overloads the last rank. Fold instead:\n+# cut the P rows into 2*tp equal groups and give rank r the pair {g=r, g=2tp-1-r}.\n+# Helps only when a step spans a large causal range (big prefill chunks). \n+# Default OFF.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD\", \"0\") == \"1\"\n+)\n+# Fold split point: rows are cut into a first half [0, M) and second half [M, P)\n+# at M ~= split*P, each into tp equal groups; rank r pairs first-group r (cheap,\n+# low index) with the reversed second-group (expensive, high index). split=0.5 is\n+# the symmetric fold (exactly balances LINEAR per-row work). split>0.5 shrinks the\n+# costly high-index groups, which rebalances if the indexer cost grows\n+# super-linearly with token index. First half (rank-ordered) reassembles via ring\n+# all_gather; second half (reversed) via broadcasts.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT = float(\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT\", \"0.5\")\n+)",
+                  "line": null,
+                  "originalLine": 56,
+                  "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+                  "updatedAt": "2026-06-20T02:09:24Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3445272894"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNi0yMFQwMjowOTowNlrOzVqxPg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 4536276114,
+            "state": "COMMENTED",
+            "submittedAt": "2026-06-20T02:09:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4536276114"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Concurrensee"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "Concurrensee"
+                  },
+                  "body": "Updated!\r\n\r\nThis was used to test whether the actual real workload is linear or not (Now deleted)",
+                  "createdAt": "2026-06-20T04:56:52Z",
+                  "databaseId": 3445482775,
+                  "diffHunk": "@@ -24,7 +30,30 @@\n     _ON_GFX942 = False\n     _ON_GFX950 = False\n \n-\n+# Shard the replicated lightning-indexer prefill logits+top-k across the TP \n+# group on the query (M) dimension. Default ON; gated to gfx950 and the prefill\n+# branch only (decode is unchanged).\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD\", \"1\") == \"1\"\n+)\n+# FOLDED work-balanced row partition. The logits kernel is causal-aware (per-row\n+# cost ~ ke - ks), so a uniform row split overloads the last rank. Fold instead:\n+# cut the P rows into 2*tp equal groups and give rank r the pair {g=r, g=2tp-1-r}.\n+# Helps only when a step spans a large causal range (big prefill chunks). \n+# Default OFF.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD\", \"0\") == \"1\"\n+)\n+# Fold split point: rows are cut into a first half [0, M) and second half [M, P)\n+# at M ~= split*P, each into tp equal groups; rank r pairs first-group r (cheap,\n+# low index) with the reversed second-group (expensive, high index). split=0.5 is\n+# the symmetric fold (exactly balances LINEAR per-row work). split>0.5 shrinks the\n+# costly high-index groups, which rebalances if the indexer cost grows\n+# super-linearly with token index. First half (rank-ordered) reassembles via ring\n+# all_gather; second half (reversed) via broadcasts.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT = float(\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT\", \"0.5\")\n+)",
+                  "line": null,
+                  "originalLine": 56,
+                  "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+                  "updatedAt": "2026-06-20T07:39:22Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3445482775"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNi0yMFQwNDo1Njo1MlrOzV3lFw==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 4536539848,
+            "state": "COMMENTED",
+            "submittedAt": "2026-06-20T04:56:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4536539848"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "dllehr-amd"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "dllehr-amd"
+                  },
+                  "body": "My understanding is that pynccl_comm can be not None, but also disabled.  Should we check for that as well here?",
+                  "createdAt": "2026-06-30T16:47:22Z",
+                  "databaseId": 3500434389,
+                  "diffHunk": "@@ -746,50 +752,176 @@ def rocm_aiter_sparse_attn_indexer(\n             scale_fmt,\n         )\n \n-    topk_indices_buffer[: hidden_states.shape[0]] = -1\n+    # Redundant on gfx950. Kept for other archs as a safety net.\n+    if not _ON_GFX950:\n+        topk_indices_buffer[: hidden_states.shape[0]] = -1\n     if has_prefill:\n         prefill_metadata = layer_attn_metadata.prefill\n         assert prefill_metadata is not None\n \n+        # TP row-sharding of the indexer prefill\n+        num_prefill_tokens = layer_attn_metadata.num_prefill_tokens\n+        tp_size = get_tensor_model_parallel_world_size()\n+        do_shard = (\n+            envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD\n+            and _ON_GFX950\n+            and tp_size > 1\n+            and num_prefill_tokens >= 512 * tp_size\n+        )\n+        fold = False\n+        if do_shard:\n+            tp_rank = get_tensor_model_parallel_rank()\n+\n+            prefill_offset = num_decode_tokens\n+            prefill_end = prefill_offset + num_prefill_tokens\n+\n+            if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD:\n+                fold = True\n+                P = num_prefill_tokens\n+                # Fold: first half [0,M) = tp rank-ordered groups; second half\n+                # [M,P) = tp groups in REVERSE rank order, so each rank pairs a\n+                # cheap low-index group with an expensive high-index one. M is a\n+                # multiple of tp so the first half can ring all_gather. The split\n+                # is symmetric (M ~= P/2), which exactly balances the linear\n+                # per-row indexer cost across ranks.\n+                fold_M = max(\n+                    tp_size,\n+                    min(\n+                        P - tp_size,\n+                        round(0.5 * P / tp_size) * tp_size,\n+                    ),\n+                )\n+                fb = [(i * fold_M) // tp_size for i in range(tp_size + 1)]\n+                sb = [(j * (P - fold_M)) // tp_size for j in range(tp_size + 1)]\n+                second_groups = [\n+                    (\n+                        prefill_offset + fold_M + sb[j],\n+                        prefill_offset + fold_M + sb[j + 1],\n+                        tp_size - 1 - j,\n+                    )\n+                    for j in range(tp_size)\n+                ]\n+                shard_ranges = [\n+                    (prefill_offset + fb[tp_rank], prefill_offset + fb[tp_rank + 1]),\n+                    (\n+                        prefill_offset + fold_M + sb[tp_size - 1 - tp_rank],\n+                        prefill_offset + fold_M + sb[tp_size - tp_rank],\n+                    ),\n+                ]\n+            else:\n+                base = num_prefill_tokens // tp_size\n+                rem = num_prefill_tokens - base * tp_size\n+                # rank 0 heuristically has lowest workload\n+                # Compute rem tokens in rank 0 then broadcast cost is generally\n+                # lower than recomputing it across all ranks.\n+                if tp_rank == 0:\n+                    rank_start = prefill_offset\n+                    rank_end = prefill_offset + rem + base\n+                else:\n+                    rank_start = prefill_offset + rem + tp_rank * base\n+                    rank_end = rank_start + base\n+                shard_ranges = [(rank_start, rank_end)]\n+\n         workspace_manager = current_workspace_manager()\n         k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(\n             ((total_seq_lens, head_dim), fp8_dtype),\n             ((total_seq_lens, 4), torch.uint8),\n         )\n+\n         for chunk in prefill_metadata.chunks:\n             k_fp8 = k_fp8_full[: chunk.total_seq_lens]\n             k_scale = k_scale_full[: chunk.total_seq_lens]\n-            cp_gather_indexer_k_quant_cache_triton(\n-                kv_cache,\n-                k_fp8,\n-                k_scale,\n-                chunk.block_table,\n-                chunk.cu_seq_lens,\n-                token_to_seq=chunk.token_to_seq,\n-            )\n-            logits = rocm_fp8_mqa_logits(\n-                q_fp8[chunk.token_start : chunk.token_end],\n-                (k_fp8, k_scale.view(torch.float32)),\n-                weights[chunk.token_start : chunk.token_end],\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-            )\n-            topk_indices = topk_indices_buffer[\n-                chunk.token_start : chunk.token_end, :topk_tokens\n-            ]\n-\n-            num_rows = logits.shape[0]\n-\n-            torch.ops._C.top_k_per_row_prefill(\n-                logits,\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-                topk_indices,\n-                num_rows,\n-                logits.stride(0),\n-                logits.stride(1),\n-                topk_tokens,\n+\n+            # TODO: gather only the causal key span each rank reads\n+            if not chunk.skip_kv_gather:\n+                cp_gather_indexer_k_quant_cache_triton(\n+                    kv_cache,\n+                    k_fp8,\n+                    k_scale,\n+                    chunk.block_table,\n+                    chunk.cu_seq_lens,\n+                    token_to_seq=chunk.token_to_seq,\n+                )\n+\n+            seg_ranges = (\n+                shard_ranges if do_shard else [(chunk.token_start, chunk.token_end)]\n             )\n+            for seg_start, seg_end in seg_ranges:\n+                row_start = max(chunk.token_start, seg_start)\n+                row_end = min(chunk.token_end, seg_end)\n+                if row_start >= row_end:\n+                    # This rank owns no rows of this segment in this chunk.\n+                    continue\n+                lo = row_start - chunk.token_start\n+                hi = row_end - chunk.token_start\n+                cu_seqlen_ks = chunk.cu_seqlen_ks[lo:hi]\n+                cu_seqlen_ke = chunk.cu_seqlen_ke[lo:hi]\n+\n+                logits = rocm_fp8_mqa_logits(\n+                    q_fp8[row_start:row_end],\n+                    (k_fp8, k_scale.view(torch.float32)),\n+                    weights[row_start:row_end],\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                )\n+\n+                topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]\n+\n+                num_rows = logits.shape[0]\n+\n+                torch.ops._C.top_k_per_row_prefill(\n+                    logits,\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                    topk_indices,\n+                    num_rows,\n+                    logits.stride(0),\n+                    logits.stride(1),\n+                    topk_tokens,\n+                )\n+\n+        if do_shard:\n+            pg = get_tp_group().device_group\n+            if fold:\n+                # First half rank-ordered -> ring all_gather; second half\n+                # reverse-ordered -> per-group broadcasts.\n+                dist.all_gather_into_tensor(\n+                    topk_indices_buffer[\n+                        prefill_offset : prefill_offset + fold_M, :topk_tokens\n+                    ],\n+                    topk_indices_buffer[\n+                        shard_ranges[0][0] : shard_ranges[0][1], :topk_tokens\n+                    ],\n+                    group=pg,\n+                )\n+                # TODO: any all gather API in reverse order?\n+                pynccl_comm = getattr(\n+                    get_tp_group().device_communicator, \"pynccl_comm\", None\n+                )\n+                assert pynccl_comm is not None",
+                  "line": null,
+                  "originalLine": 901,
+                  "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+                  "updatedAt": "2026-06-30T16:47:27Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3500434389"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNi0zMFQxNjo0NzoyMlrO0KRj1Q==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 4602373493,
+            "state": "COMMENTED",
+            "submittedAt": "2026-06-30T16:47:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4602373493"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Concurrensee"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "Concurrensee"
+                  },
+                  "body": "Resolved!",
+                  "createdAt": "2026-06-30T22:55:26Z",
+                  "databaseId": 3502278330,
+                  "diffHunk": "@@ -746,50 +752,176 @@ def rocm_aiter_sparse_attn_indexer(\n             scale_fmt,\n         )\n \n-    topk_indices_buffer[: hidden_states.shape[0]] = -1\n+    # Redundant on gfx950. Kept for other archs as a safety net.\n+    if not _ON_GFX950:\n+        topk_indices_buffer[: hidden_states.shape[0]] = -1\n     if has_prefill:\n         prefill_metadata = layer_attn_metadata.prefill\n         assert prefill_metadata is not None\n \n+        # TP row-sharding of the indexer prefill\n+        num_prefill_tokens = layer_attn_metadata.num_prefill_tokens\n+        tp_size = get_tensor_model_parallel_world_size()\n+        do_shard = (\n+            envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD\n+            and _ON_GFX950\n+            and tp_size > 1\n+            and num_prefill_tokens >= 512 * tp_size\n+        )\n+        fold = False\n+        if do_shard:\n+            tp_rank = get_tensor_model_parallel_rank()\n+\n+            prefill_offset = num_decode_tokens\n+            prefill_end = prefill_offset + num_prefill_tokens\n+\n+            if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD:\n+                fold = True\n+                P = num_prefill_tokens\n+                # Fold: first half [0,M) = tp rank-ordered groups; second half\n+                # [M,P) = tp groups in REVERSE rank order, so each rank pairs a\n+                # cheap low-index group with an expensive high-index one. M is a\n+                # multiple of tp so the first half can ring all_gather. The split\n+                # is symmetric (M ~= P/2), which exactly balances the linear\n+                # per-row indexer cost across ranks.\n+                fold_M = max(\n+                    tp_size,\n+                    min(\n+                        P - tp_size,\n+                        round(0.5 * P / tp_size) * tp_size,\n+                    ),\n+                )\n+                fb = [(i * fold_M) // tp_size for i in range(tp_size + 1)]\n+                sb = [(j * (P - fold_M)) // tp_size for j in range(tp_size + 1)]\n+                second_groups = [\n+                    (\n+                        prefill_offset + fold_M + sb[j],\n+                        prefill_offset + fold_M + sb[j + 1],\n+                        tp_size - 1 - j,\n+                    )\n+                    for j in range(tp_size)\n+                ]\n+                shard_ranges = [\n+                    (prefill_offset + fb[tp_rank], prefill_offset + fb[tp_rank + 1]),\n+                    (\n+                        prefill_offset + fold_M + sb[tp_size - 1 - tp_rank],\n+                        prefill_offset + fold_M + sb[tp_size - tp_rank],\n+                    ),\n+                ]\n+            else:\n+                base = num_prefill_tokens // tp_size\n+                rem = num_prefill_tokens - base * tp_size\n+                # rank 0 heuristically has lowest workload\n+                # Compute rem tokens in rank 0 then broadcast cost is generally\n+                # lower than recomputing it across all ranks.\n+                if tp_rank == 0:\n+                    rank_start = prefill_offset\n+                    rank_end = prefill_offset + rem + base\n+                else:\n+                    rank_start = prefill_offset + rem + tp_rank * base\n+                    rank_end = rank_start + base\n+                shard_ranges = [(rank_start, rank_end)]\n+\n         workspace_manager = current_workspace_manager()\n         k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(\n             ((total_seq_lens, head_dim), fp8_dtype),\n             ((total_seq_lens, 4), torch.uint8),\n         )\n+\n         for chunk in prefill_metadata.chunks:\n             k_fp8 = k_fp8_full[: chunk.total_seq_lens]\n             k_scale = k_scale_full[: chunk.total_seq_lens]\n-            cp_gather_indexer_k_quant_cache_triton(\n-                kv_cache,\n-                k_fp8,\n-                k_scale,\n-                chunk.block_table,\n-                chunk.cu_seq_lens,\n-                token_to_seq=chunk.token_to_seq,\n-            )\n-            logits = rocm_fp8_mqa_logits(\n-                q_fp8[chunk.token_start : chunk.token_end],\n-                (k_fp8, k_scale.view(torch.float32)),\n-                weights[chunk.token_start : chunk.token_end],\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-            )\n-            topk_indices = topk_indices_buffer[\n-                chunk.token_start : chunk.token_end, :topk_tokens\n-            ]\n-\n-            num_rows = logits.shape[0]\n-\n-            torch.ops._C.top_k_per_row_prefill(\n-                logits,\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-                topk_indices,\n-                num_rows,\n-                logits.stride(0),\n-                logits.stride(1),\n-                topk_tokens,\n+\n+            # TODO: gather only the causal key span each rank reads\n+            if not chunk.skip_kv_gather:\n+                cp_gather_indexer_k_quant_cache_triton(\n+                    kv_cache,\n+                    k_fp8,\n+                    k_scale,\n+                    chunk.block_table,\n+                    chunk.cu_seq_lens,\n+                    token_to_seq=chunk.token_to_seq,\n+                )\n+\n+            seg_ranges = (\n+                shard_ranges if do_shard else [(chunk.token_start, chunk.token_end)]\n             )\n+            for seg_start, seg_end in seg_ranges:\n+                row_start = max(chunk.token_start, seg_start)\n+                row_end = min(chunk.token_end, seg_end)\n+                if row_start >= row_end:\n+                    # This rank owns no rows of this segment in this chunk.\n+                    continue\n+                lo = row_start - chunk.token_start\n+                hi = row_end - chunk.token_start\n+                cu_seqlen_ks = chunk.cu_seqlen_ks[lo:hi]\n+                cu_seqlen_ke = chunk.cu_seqlen_ke[lo:hi]\n+\n+                logits = rocm_fp8_mqa_logits(\n+                    q_fp8[row_start:row_end],\n+                    (k_fp8, k_scale.view(torch.float32)),\n+                    weights[row_start:row_end],\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                )\n+\n+                topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]\n+\n+                num_rows = logits.shape[0]\n+\n+                torch.ops._C.top_k_per_row_prefill(\n+                    logits,\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                    topk_indices,\n+                    num_rows,\n+                    logits.stride(0),\n+                    logits.stride(1),\n+                    topk_tokens,\n+                )\n+\n+        if do_shard:\n+            pg = get_tp_group().device_group\n+            if fold:\n+                # First half rank-ordered -> ring all_gather; second half\n+                # reverse-ordered -> per-group broadcasts.\n+                dist.all_gather_into_tensor(\n+                    topk_indices_buffer[\n+                        prefill_offset : prefill_offset + fold_M, :topk_tokens\n+                    ],\n+                    topk_indices_buffer[\n+                        shard_ranges[0][0] : shard_ranges[0][1], :topk_tokens\n+                    ],\n+                    group=pg,\n+                )\n+                # TODO: any all gather API in reverse order?\n+                pynccl_comm = getattr(\n+                    get_tp_group().device_communicator, \"pynccl_comm\", None\n+                )\n+                assert pynccl_comm is not None",
+                  "line": null,
+                  "originalLine": 901,
+                  "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+                  "updatedAt": "2026-06-30T22:55:26Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3502278330"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNi0zMFQyMjo1NToyNlrO0MCGug==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 4604606227,
+            "state": "COMMENTED",
+            "submittedAt": "2026-06-30T22:55:26Z",
+            "url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4604606227"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0wNi0zMFQyMjo1NToyNlq0MjAyNi0wNi0zMFQyMjo1NToyNlrPAAAAARJ0txM=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "state": "OPEN",
+      "title": "[ROCm][Perf] TP-shard Lightning indexer prefill",
+      "updatedAt": "2026-10-27T01:55:06Z",
+      "url": "https://github.com/vllm-project/vllm/pull/46103"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/46103/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/46103/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/46103"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/46103"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/46103/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/46103"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/b3139535cf7a096e026af0106452e007564e8838"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 179,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 24409,
+        "forks_count": 24409,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9866,
+        "open_issues_count": 9866,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T22:02:06Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 344310,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 96323,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-04T22:07:51Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 96323,
+        "watchers_count": 96323,
+        "web_commit_signoff_required": true
+      },
+      "sha": "ac521f623706b74ac12a01e6ed8f7297a39257fe",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Purpose\r\n\r\nOn ROCm/gfx950 the DeepSeek-V3.2-style **Lightning indexer prefill** (the FP8 MQA `logits` + per-row `top_k`) is computed **redundantly on every tensor-parallel rank**: each rank runs the full indexer over *all* prefill query rows and produces the identical `topk_indices_buffer`. Unlike the main attention/MLP, this work is not split by TP, so it is replicated `tp_size` times. Its cost grows with the causal range each query attends to, so at long context the replicated indexer prefill becomes a dominant, TP-non-scaling chunk of TTFT.\r\n\r\nThis PR shards that prefill indexer work across the TP group on the **query (M / token) dimension**. Each rank computes `rocm_fp8_mqa_logits` + `top_k_per_row_prefill` for only its slice of prefill rows, then the ranks exchange their slices so every rank ends up with the full `topk_indices_buffer` that the subsequent sparse attention needs. The KV-cache quant/gather and the decode path are unchanged.\r\n\r\nTwo partition schemes are provided:\r\n\r\n- **`TP_SHARD` (default ON):** split the `num_prefill_tokens` rows into `tp_size` contiguous shards. The remainder rows are assigned to rank 0 (the cheapest, lowest-index shard). Reassembly is hybrid NCCL: a ring `all_gather` over the evenly-divisible block plus a single `broadcast` for the remainder rows.\r\n- **`TP_SHARD_FOLD` (default OFF):** a work-balanced fold for the case where a step spans a very large causal range. Because per-row indexer cost rises with token index (`~ ke - ks`), a plain contiguous split overloads the last rank. Fold cuts the rows into `2*tp` groups and pairs a cheap low-index group with an expensive high-index one on each rank. The split is fixed symmetric (`M ≈ P/2`, rounded to a multiple of `tp` so the first half can ring `all_gather`), which already balances the ~linear per-row cost. Reassembly is the rank-ordered first half via ring `all_gather` and the reversed second half via per-group `broadcast`s (batched in a single `group_start`/`group_end`).\r\n\r\nSharding only kicks in on gfx950 with `tp_size > 1` and `num_prefill_tokens >= 512 * tp_size`, so short prefills (where the indexer is negligible and the collective would just add latency) fall back to the original replicated path.\r\n\r\nMinor cleanups in the same change:\r\n\r\n- Skip the redundant `cp_gather_indexer_k_quant_cache` when `chunk.skip_kv_gather` is set (avoids re-gathering K for chunks that don't need it).\r\n- Drop the unconditional `topk_indices_buffer[...] = -1` memset on gfx950 (the kernel fully writes the buffer there); keep it as a safety net on other archs.\r\n\r\n## Test Plan\r\n\r\n- **Correctness:** GSM8K (lm_eval, 5-shot, full 1319-example set) on 8×MI355 (gfx950, TP=8) for both models and both shard paths.\r\n- **Performance:** `vllm bench serve` sweeps over ISL × concurrency for both models (baseline vs `TP_SHARD` vs `TP_SHARD+FOLD`), reported below.\r\n\r\n## Test Result\r\n\r\n### Accuracy — GSM8K, 5-shot, full set\r\n\r\n| Model | Config | exact_match (flexible) | exact_match (strict) |\r\n|---|---|---:|---:|\r\n| GLM-5.1-FP8 | `TP_SHARD` | 0.9386 | 0.9454 |\r\n| GLM-5.1-FP8 | `TP_SHARD+FOLD` | 0.9386 | 0.9431 |\r\n| DeepSeek-V4-Pro | `TP_SHARD` | 0.9500 | 0.8825 |\r\n| DeepSeek-V4-Pro | `TP_SHARD+FOLD` | 0.9409 | 0.8719 |\r\n\r\n### Performance\r\n\r\nSetup: 8×MI355 (gfx950), TP=8, `rocm/vllm-dev:nightly` (vllm `0.23.1rc1.dev354`) with this PR's two files overlaid; `vllm bench serve`, random dataset, OSL=1000, `--ignore-eos`, request-rate `inf`. All numbers are vs the `baseline` (replicated) column and **`+` always means better** (higher throughput / lower latency).\r\n\r\nThe first three columns (`baseline` / `TP_SHARD` / `TP_SHARD+FOLD`) run at vLLM **default** gpu-mem-util and default chunked-prefill size (8192). The two **`chunk16k`** columns combine the shard with a larger prefill chunk (`--max-num-batched-tokens 16384`) at `--gpu-memory-utilization 0.88`; this is a serving-side tuning knob (not part of this PR's code) that trades a little short/mid-context TTFT for better long-context TPOT/throughput.\r\n\r\nShort context (≤ 8K) is neutral within ±2–3% (the indexer is a tiny fraction of work, and the gate skips sharding for the smallest prefills); the win grows with context length, reaching **2.1× throughput** for GLM-5.1 at 199K and **+40%** for DeepSeek-V4-Pro at 512K.\r\n\r\n#### GLM-5.1-FP8\r\n\r\n**Output throughput (tok/s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 4000 | 16 | 381.9 | 385.3 (+1%) | 385.0 (+1%) | 384.2 (+1%) | 383.1 (+0%) |\r\n| 4000 | 64 | 1000.6 | 1012.0 (+1%) | 1010.2 (+1%) | 1018.9 (+2%) | 1013.4 (+1%) |\r\n| 4000 | 256 | 1615.2 | 1647.5 (+2%) | 1641.4 (+2%) | 1661.5 (+3%) | 1658.8 (+3%) |\r\n| 16000 | 4 | 130.0 | 130.8 (+1%) | 134.7 (+4%) | 133.6 (+3%) | 134.2 (+3%) |\r\n| 16000 | 16 | 281.8 | 300.6 (+7%) | 300.3 (+7%) | 301.8 (+7%) | 303.0 (+8%) |\r\n| 16000 | 64 | 415.3 | 458.3 (+10%) | 457.6 (+10%) | 461.3 (+11%) | 464.4 (+12%) |\r\n| 100000 | 4 | 37.3 | 56.7 (+52%) | 56.9 (+53%) | 56.3 (+51%) | 57.9 (+55%) |\r\n| 100000 | 12 | 42.2 | 69.7 (+65%) | 69.9 (+66%) | 69.6 (+65%) | 71.6 (+70%) |\r\n| 199000 | 6 | 14.5 | 30.9 (+112%) | 30.8 (+112%) | 31.3 (+115%) | 31.5 (+117%) |\r\n\r\n**Mean TTFT (s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 4000 | 16 | 9.61 | 9.58 (+0%) | 9.63 (-0%) | 10.19 (-6%) | 10.23 (-6%) |\r\n| 4000 | 64 | 6.68 | 6.57 (+2%) | 6.69 (-0%) | 7.18 (-7%) | 7.41 (-11%) |\r\n| 4000 | 256 | 23.59 | 22.77 (+3%) | 22.92 (+3%) | 22.60 (+4%) | 22.70 (+4%) |\r\n| 16000 | 4 | 3.56 | 3.92 (-10%) | 3.10 (+13%) | 3.33 (+6%) | 3.27 (+8%) |\r\n| 16000 | 16 | 8.72 | 7.59 (+13%) | 7.62 (+13%) | 8.49 (+3%) | 8.40 (+4%) |\r\n| 16000 | 64 | 29.09 | 25.31 (+13%) | 25.35 (+13%) | 25.38 (+13%) | 25.11 (+14%) |\r\n| 100000 | 4 | 39.58 | 20.77 (+48%) | 20.74 (+48%) | 23.37 (+41%) | 22.25 (+44%) |\r\n| 100000 | 12 | 79.31 | 41.67 (+47%) | 41.60 (+48%) | 43.59 (+45%) | 41.71 (+47%) |\r\n| 199000 | 6 | 150.40 | 59.70 (+60%) | 59.77 (+60%) | 61.76 (+59%) | 61.71 (+59%) |\r\n\r\n**Mean TPOT (ms)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 4000 | 16 | 32.3 | 31.9 (+1%) | 31.9 (+1%) | 31.5 (+3%) | 31.5 (+2%) |\r\n| 4000 | 64 | 57.0 | 56.4 (+1%) | 56.4 (+1%) | 55.5 (+3%) | 55.7 (+2%) |\r\n| 4000 | 256 | 133.4 | 131.1 (+2%) | 131.5 (+1%) | 130.8 (+2%) | 130.9 (+2%) |\r\n| 16000 | 4 | 27.2 | 26.6 (+2%) | 26.6 (+2%) | 26.6 (+2%) | 26.6 (+2%) |\r\n| 16000 | 16 | 47.9 | 45.5 (+5%) | 45.5 (+5%) | 44.5 (+7%) | 44.3 (+7%) |\r\n| 16000 | 64 | 123.9 | 113.2 (+9%) | 113.4 (+8%) | 112.8 (+9%) | 112.2 (+9%) |\r\n| 100000 | 4 | 67.5 | 49.5 (+27%) | 49.4 (+27%) | 47.6 (+30%) | 46.8 (+31%) |\r\n| 100000 | 12 | 204.2 | 129.4 (+37%) | 129.0 (+37%) | 128.5 (+37%) | 125.4 (+39%) |\r\n| 199000 | 6 | 261.5 | 133.9 (+49%) | 133.9 (+49%) | 129.7 (+50%) | 128.4 (+51%) |\r\n\r\n#### DeepSeek-V4-Pro\r\n\r\n**Output throughput (tok/s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 8000 | 16 | 370.7 | 369.3 (-0%) | 372.4 (+0%) | 374.5 (+1%) | 373.5 (+1%) |\r\n| 8000 | 64 | 719.3 | 721.7 (+0%) | 720.2 (+0%) | 750.2 (+4%) | 746.7 (+4%) |\r\n| 8000 | 256 | 1089.2 | 1087.1 (-0%) | 1091.0 (+0%) | 1107.1 (+2%) | 1107.0 (+2%) |\r\n| 64000 | 4 | 76.4 | 78.6 (+3%) | 78.6 (+3%) | 79.7 (+4%) | 79.7 (+4%) |\r\n| 64000 | 16 | 129.9 | 137.0 (+5%) | 137.0 (+5%) | 139.0 (+7%) | 139.3 (+7%) |\r\n| 64000 | 64 | 158.5 | 169.4 (+7%) | 169.3 (+7%) | 171.4 (+8%) | 171.9 (+8%) |\r\n| 128000 | 6 | 55.2 | 60.6 (+10%) | 60.8 (+10%) | 61.6 (+12%) | 61.9 (+12%) |\r\n| 128000 | 12 | 64.4 | 71.7 (+11%) | 71.9 (+12%) | 72.9 (+13%) | 73.2 (+14%) |\r\n| 256000 | 6 | 27.2 | 33.0 (+21%) | 33.3 (+22%) | 33.9 (+25%) | 34.2 (+26%) |\r\n| 512000 | 4 | 10.5 | 14.7 (+40%) | 14.9 (+42%) | 15.3 (+46%) | 15.5 (+48%) |\r\n\r\n**Mean TTFT (s)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 8000 | 16 | 3.73 | 3.70 (+1%) | 3.71 (+0%) | 4.65 (-25%) | 4.63 (-24%) |\r\n| 8000 | 64 | 13.38 | 13.31 (+1%) | 13.36 (+0%) | 12.81 (+4%) | 12.94 (+3%) |\r\n| 8000 | 256 | 41.96 | 41.73 (+1%) | 41.81 (+0%) | 40.37 (+4%) | 40.39 (+4%) |\r\n| 64000 | 4 | 11.80 | 10.99 (+7%) | 10.99 (+7%) | 11.80 (+0%) | 11.77 (+0%) |\r\n| 64000 | 16 | 28.99 | 26.99 (+7%) | 26.97 (+7%) | 27.81 (+4%) | 27.69 (+4%) |\r\n| 64000 | 64 | 97.87 | 91.05 (+7%) | 91.02 (+7%) | 89.45 (+9%) | 89.05 (+9%) |\r\n| 128000 | 6 | 32.96 | 28.74 (+13%) | 28.64 (+13%) | 30.62 (+7%) | 30.41 (+8%) |\r\n| 128000 | 12 | 52.07 | 45.57 (+12%) | 45.40 (+13%) | 47.00 (+10%) | 46.67 (+10%) |\r\n| 256000 | 6 | 80.21 | 63.43 (+21%) | 62.95 (+22%) | 66.92 (+17%) | 65.55 (+18%) |\r\n| 512000 | 4 | 176.65 | 120.09 (+32%) | 119.06 (+33%) | 125.55 (+29%) | 124.39 (+30%) |\r\n\r\n**Mean TPOT (ms)**\r\n\r\n| ISL | Conc | baseline | TP_SHARD | TP_SHARD+FOLD | TP_SHARD+chunk16k | TP_SHARD+FOLD+chunk16k |\r\n|---:|---:|---:|---:|---:|---:|---:|\r\n| 8000 | 16 | 39.4 | 39.5 (-0%) | 39.2 (+0%) | 38.1 (+3%) | 38.2 (+3%) |\r\n| 8000 | 64 | 75.1 | 74.9 (+0%) | 75.0 (+0%) | 72.3 (+4%) | 72.5 (+3%) |\r\n| 8000 | 256 | 189.7 | 190.4 (-0%) | 189.5 (+0%) | 189.3 (+0%) | 189.3 (+0%) |\r\n| 64000 | 4 | 40.4 | 39.8 (+2%) | 39.8 (+2%) | 38.3 (+5%) | 38.4 (+5%) |\r\n| 64000 | 16 | 93.4 | 89.0 (+5%) | 89.0 (+5%) | 86.9 (+7%) | 86.8 (+7%) |\r\n| 64000 | 64 | 301.6 | 282.4 (+6%) | 282.6 (+6%) | 282.0 (+6%) | 281.2 (+7%) |\r\n| 128000 | 6 | 75.2 | 69.8 (+7%) | 69.6 (+8%) | 66.6 (+11%) | 66.3 (+12%) |\r\n| 128000 | 12 | 133.0 | 120.6 (+9%) | 120.2 (+10%) | 117.0 (+12%) | 116.6 (+12%) |\r\n| 256000 | 6 | 139.2 | 117.2 (+16%) | 116.3 (+16%) | 109.5 (+21%) | 109.1 (+22%) |\r\n| 512000 | 4 | 203.5 | 150.3 (+26%) | 148.8 (+27%) | 135.4 (+33%) | 133.4 (+34%) |\r\n\r\n## Notes\r\n\r\nBoth env vars are read on gfx950 only; sharding additionally requires `tp_size > 1` and `num_prefill_tokens >= 512 * tp_size`.\r\n\r\n- `VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD` (default `1`): shard the indexer prefill across the TP group on the token dimension. Set `0` to fall back to the original replicated path.\r\n- `VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD` (default `0`): use the work-balanced fold partition instead of contiguous shards (the fold split point is fixed at `P/2`).\r\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 7,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/46103/comments",
+    "commits": 7,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/46103/commits",
+    "created_at": "2026-06-18T21:30:53Z",
+    "deletions": 31,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/46103.diff",
+    "draft": false,
+    "head": {
+      "label": "Concurrensee:glm-indexer-tp-shard",
+      "ref": "glm-indexer-tp-shard",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/Concurrensee/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/Concurrensee/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/Concurrensee/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/Concurrensee/vllm/branches{/branch}",
+        "clone_url": "https://github.com/Concurrensee/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/Concurrensee/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/Concurrensee/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/Concurrensee/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/Concurrensee/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/Concurrensee/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/Concurrensee/vllm/contributors",
+        "created_at": "2025-01-10T17:46:54Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/Concurrensee/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/Concurrensee/vllm/downloads",
+        "events_url": "https://api.github.com/repos/Concurrensee/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/Concurrensee/vllm/forks",
+        "full_name": "Concurrensee/vllm",
+        "git_commits_url": "https://api.github.com/repos/Concurrensee/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/Concurrensee/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/Concurrensee/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/Concurrensee/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.vllm.ai",
+        "hooks_url": "https://api.github.com/repos/Concurrensee/vllm/hooks",
+        "html_url": "https://github.com/Concurrensee/vllm",
+        "id": 914977912,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/Concurrensee/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/Concurrensee/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/Concurrensee/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/Concurrensee/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/Concurrensee/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/Concurrensee/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/Concurrensee/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/Concurrensee/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDONol0eA",
+        "notifications_url": "https://api.github.com/repos/Concurrensee/vllm/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/78570093?v=4",
+          "events_url": "https://api.github.com/users/Concurrensee/events{/privacy}",
+          "followers_url": "https://api.github.com/users/Concurrensee/followers",
+          "following_url": "https://api.github.com/users/Concurrensee/following{/other_user}",
+          "gists_url": "https://api.github.com/users/Concurrensee/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/Concurrensee",
+          "id": 78570093,
+          "login": "Concurrensee",
+          "node_id": "MDQ6VXNlcjc4NTcwMDkz",
+          "organizations_url": "https://api.github.com/users/Concurrensee/orgs",
+          "received_events_url": "https://api.github.com/users/Concurrensee/received_events",
+          "repos_url": "https://api.github.com/users/Concurrensee/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/Concurrensee/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/Concurrensee/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/Concurrensee",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/Concurrensee/vllm/pulls{/number}",
+        "pushed_at": "2026-10-23T11:06:20Z",
+        "releases_url": "https://api.github.com/repos/Concurrensee/vllm/releases{/id}",
+        "size": 310584,
+        "ssh_url": "git@github.com:Concurrensee/vllm.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/Concurrensee/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/Concurrensee/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/Concurrensee/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/Concurrensee/vllm/subscription",
+        "svn_url": "https://github.com/Concurrensee/vllm",
+        "tags_url": "https://api.github.com/repos/Concurrensee/vllm/tags",
+        "teams_url": "https://api.github.com/repos/Concurrensee/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/Concurrensee/vllm/git/trees{/sha}",
+        "updated_at": "2025-12-08T19:33:53Z",
+        "url": "https://api.github.com/repos/Concurrensee/vllm",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "b3139535cf7a096e026af0106452e007564e8838",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/78570093?v=4",
+        "events_url": "https://api.github.com/users/Concurrensee/events{/privacy}",
+        "followers_url": "https://api.github.com/users/Concurrensee/followers",
+        "following_url": "https://api.github.com/users/Concurrensee/following{/other_user}",
+        "gists_url": "https://api.github.com/users/Concurrensee/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/Concurrensee",
+        "id": 78570093,
+        "login": "Concurrensee",
+        "node_id": "MDQ6VXNlcjc4NTcwMDkz",
+        "organizations_url": "https://api.github.com/users/Concurrensee/orgs",
+        "received_events_url": "https://api.github.com/users/Concurrensee/received_events",
+        "repos_url": "https://api.github.com/users/Concurrensee/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/Concurrensee/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/Concurrensee/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/Concurrensee",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/46103",
+    "id": 3894561756,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/46103",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "B60205",
+        "default": false,
+        "description": "Related to AMD ROCm",
+        "id": 6114440385,
+        "name": "rocm",
+        "node_id": "LA_kwDOI7xefs8AAAABbHL0wQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/rocm"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "d4c5f9",
+        "default": false,
+        "description": "",
+        "id": 7614859318,
+        "name": "needs-rebase",
+        "node_id": "LA_kwDOI7xefs8AAAABxeGINg",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/needs-rebase"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": "Over 90 days of inactivity",
+        "id": 7648877658,
+        "name": "stale",
+        "node_id": "LA_kwDOI7xefs8AAAABx-icWg",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/stale"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "9810B3",
+        "default": false,
+        "description": "",
+        "id": 8068298936,
+        "name": "v1",
+        "node_id": "LA_kwDOI7xefs8AAAAB4Oh4uA",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/v1"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs7oIkvc",
+    "number": 46103,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/46103.patch",
+    "rebaseable": null,
+    "requested_reviewers": [
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/29171856?v=4",
+        "events_url": "https://api.github.com/users/tjtanaa/events{/privacy}",
+        "followers_url": "https://api.github.com/users/tjtanaa/followers",
+        "following_url": "https://api.github.com/users/tjtanaa/following{/other_user}",
+        "gists_url": "https://api.github.com/users/tjtanaa/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/tjtanaa",
+        "id": 29171856,
+        "login": "tjtanaa",
+        "node_id": "MDQ6VXNlcjI5MTcxODU2",
+        "organizations_url": "https://api.github.com/users/tjtanaa/orgs",
+        "received_events_url": "https://api.github.com/users/tjtanaa/received_events",
+        "repos_url": "https://api.github.com/users/tjtanaa/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/tjtanaa/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/tjtanaa/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/tjtanaa",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/42451412?v=4",
+        "events_url": "https://api.github.com/users/AndreasKaratzas/events{/privacy}",
+        "followers_url": "https://api.github.com/users/AndreasKaratzas/followers",
+        "following_url": "https://api.github.com/users/AndreasKaratzas/following{/other_user}",
+        "gists_url": "https://api.github.com/users/AndreasKaratzas/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/AndreasKaratzas",
+        "id": 42451412,
+        "login": "AndreasKaratzas",
+        "node_id": "MDQ6VXNlcjQyNDUxNDEy",
+        "organizations_url": "https://api.github.com/users/AndreasKaratzas/orgs",
+        "received_events_url": "https://api.github.com/users/AndreasKaratzas/received_events",
+        "repos_url": "https://api.github.com/users/AndreasKaratzas/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/AndreasKaratzas/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/AndreasKaratzas/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/AndreasKaratzas",
+        "user_view_type": "public"
+      },
+      {
+        "avatar_url": "https://avatars.githubusercontent.com/u/91553416?v=4",
+        "events_url": "https://api.github.com/users/dllehr-amd/events{/privacy}",
+        "followers_url": "https://api.github.com/users/dllehr-amd/followers",
+        "following_url": "https://api.github.com/users/dllehr-amd/following{/other_user}",
+        "gists_url": "https://api.github.com/users/dllehr-amd/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/dllehr-amd",
+        "id": 91553416,
+        "login": "dllehr-amd",
+        "node_id": "U_kgDOBXT-iA",
+        "organizations_url": "https://api.github.com/users/dllehr-amd/orgs",
+        "received_events_url": "https://api.github.com/users/dllehr-amd/received_events",
+        "repos_url": "https://api.github.com/users/dllehr-amd/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/dllehr-amd/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/dllehr-amd/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/dllehr-amd",
+        "user_view_type": "public"
+      }
+    ],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 4,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/46103/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/b3139535cf7a096e026af0106452e007564e8838",
+    "title": "[ROCm][Perf] TP-shard Lightning indexer prefill",
+    "updated_at": "2026-10-27T01:55:06Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/46103",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/78570093?v=4",
+      "events_url": "https://api.github.com/users/Concurrensee/events{/privacy}",
+      "followers_url": "https://api.github.com/users/Concurrensee/followers",
+      "following_url": "https://api.github.com/users/Concurrensee/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Concurrensee/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/Concurrensee",
+      "id": 78570093,
+      "login": "Concurrensee",
+      "node_id": "MDQ6VXNlcjc4NTcwMDkz",
+      "organizations_url": "https://api.github.com/users/Concurrensee/orgs",
+      "received_events_url": "https://api.github.com/users/Concurrensee/received_events",
+      "repos_url": "https://api.github.com/users/Concurrensee/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/Concurrensee/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Concurrensee/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/Concurrensee",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 16,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/b3139535cf7a096e026af0106452e007564e8838/vllm%2Fenvs.py",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fenvs.py?ref=b3139535cf7a096e026af0106452e007564e8838",
+      "deletions": 0,
+      "filename": "vllm/envs.py",
+      "patch": "@@ -124,6 +124,8 @@\n     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0\n     VLLM_ROCM_USE_AITER_RMSNORM: bool = True\n     VLLM_ROCM_USE_AITER_MLA: bool = True\n+    VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD: bool = True\n+    VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD: bool = False\n     VLLM_ROCM_USE_AITER_MHA: bool = True\n     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False\n     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False\n@@ -1170,6 +1172,20 @@ def _resolve_rust_frontend_path() -> str | None:\n     \"VLLM_ROCM_USE_AITER_MLA\": lambda: (\n         os.getenv(\"VLLM_ROCM_USE_AITER_MLA\", \"True\").lower() in (\"true\", \"1\")\n     ),\n+    # Shard the replicated ROCm AITER sparse-MLA (lightning indexer) prefill\n+    # logits + top-k across the TP group on the query dimension. By default is\n+    # enabled (gated at runtime to gfx950 with tp_size > 1).\n+    \"VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD\": lambda: (\n+        os.getenv(\"VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD\", \"True\").lower()\n+        in (\"true\", \"1\")\n+    ),\n+    # Use the work-balanced fold partition for the sharded sparse-MLA indexer\n+    # prefill (each rank pairs a cheap low-index row group with an expensive\n+    # high-index one). By default is disabled.\n+    \"VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD\": lambda: (\n+        os.getenv(\"VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD\", \"False\").lower()\n+        in (\"true\", \"1\")\n+    ),\n     # Whether to use aiter mha ops.\n     # By default is enabled.\n     \"VLLM_ROCM_USE_AITER_MHA\": lambda: (",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/b3139535cf7a096e026af0106452e007564e8838/vllm%2Fenvs.py",
+      "sha": "11dda5a8f1447a3afc4686ac3ee7bedc0353e08d",
+      "status": "modified"
+    },
+    {
+      "additions": 163,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/b3139535cf7a096e026af0106452e007564e8838/vllm%2Fv1%2Fattention%2Fops%2Frocm_aiter_mla_sparse.py",
+      "changes": 194,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fattention%2Fops%2Frocm_aiter_mla_sparse.py?ref=b3139535cf7a096e026af0106452e007564e8838",
+      "deletions": 31,
+      "filename": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "patch": "@@ -6,10 +6,16 @@\n from importlib.util import find_spec\n \n import torch\n+import torch.distributed as dist\n import torch.nn.functional as F\n \n import vllm.envs as envs\n from vllm.compilation.breakable_cudagraph import eager_break_during_capture\n+from vllm.distributed import (\n+    get_tensor_model_parallel_rank,\n+    get_tensor_model_parallel_world_size,\n+    get_tp_group,\n+)\n from vllm.forward_context import get_forward_context\n from vllm.platforms import current_platform\n from vllm.triton_utils import tl, triton\n@@ -746,50 +752,176 @@ def rocm_aiter_sparse_attn_indexer(\n             scale_fmt,\n         )\n \n-    topk_indices_buffer[: hidden_states.shape[0]] = -1\n+    # Redundant on gfx950. Kept for other archs as a safety net.\n+    if not _ON_GFX950:\n+        topk_indices_buffer[: hidden_states.shape[0]] = -1\n     if has_prefill:\n         prefill_metadata = layer_attn_metadata.prefill\n         assert prefill_metadata is not None\n \n+        # TP row-sharding of the indexer prefill\n+        num_prefill_tokens = layer_attn_metadata.num_prefill_tokens\n+        tp_size = get_tensor_model_parallel_world_size()\n+        do_shard = (\n+            envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD\n+            and _ON_GFX950\n+            and tp_size > 1\n+            and num_prefill_tokens >= 512 * tp_size\n+        )\n+        fold = False\n+        if do_shard:\n+            tp_rank = get_tensor_model_parallel_rank()\n+\n+            prefill_offset = num_decode_tokens\n+            prefill_end = prefill_offset + num_prefill_tokens\n+\n+            if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD:\n+                fold = True\n+                P = num_prefill_tokens\n+                # Fold: first half [0,M) = tp rank-ordered groups; second half\n+                # [M,P) = tp groups in REVERSE rank order, so each rank pairs a\n+                # cheap low-index group with an expensive high-index one. M is a\n+                # multiple of tp so the first half can ring all_gather. The split\n+                # is symmetric (M ~= P/2), which exactly balances the linear\n+                # per-row indexer cost across ranks.\n+                fold_M = max(\n+                    tp_size,\n+                    min(\n+                        P - tp_size,\n+                        round(0.5 * P / tp_size) * tp_size,\n+                    ),\n+                )\n+                fb = [(i * fold_M) // tp_size for i in range(tp_size + 1)]\n+                sb = [(j * (P - fold_M)) // tp_size for j in range(tp_size + 1)]\n+                second_groups = [\n+                    (\n+                        prefill_offset + fold_M + sb[j],\n+                        prefill_offset + fold_M + sb[j + 1],\n+                        tp_size - 1 - j,\n+                    )\n+                    for j in range(tp_size)\n+                ]\n+                shard_ranges = [\n+                    (prefill_offset + fb[tp_rank], prefill_offset + fb[tp_rank + 1]),\n+                    (\n+                        prefill_offset + fold_M + sb[tp_size - 1 - tp_rank],\n+                        prefill_offset + fold_M + sb[tp_size - tp_rank],\n+                    ),\n+                ]\n+            else:\n+                base = num_prefill_tokens // tp_size\n+                rem = num_prefill_tokens - base * tp_size\n+                # rank 0 heuristically has lowest workload\n+                # Compute rem tokens in rank 0 then broadcast cost is generally\n+                # lower than recomputing it across all ranks.\n+                if tp_rank == 0:\n+                    rank_start = prefill_offset\n+                    rank_end = prefill_offset + rem + base\n+                else:\n+                    rank_start = prefill_offset + rem + tp_rank * base\n+                    rank_end = rank_start + base\n+                shard_ranges = [(rank_start, rank_end)]\n+\n         workspace_manager = current_workspace_manager()\n         k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(\n             ((total_seq_lens, head_dim), fp8_dtype),\n             ((total_seq_lens, 4), torch.uint8),\n         )\n+\n         for chunk in prefill_metadata.chunks:\n             k_fp8 = k_fp8_full[: chunk.total_seq_lens]\n             k_scale = k_scale_full[: chunk.total_seq_lens]\n-            cp_gather_indexer_k_quant_cache_triton(\n-                kv_cache,\n-                k_fp8,\n-                k_scale,\n-                chunk.block_table,\n-                chunk.cu_seq_lens,\n-                token_to_seq=chunk.token_to_seq,\n-            )\n-            logits = rocm_fp8_mqa_logits(\n-                q_fp8[chunk.token_start : chunk.token_end],\n-                (k_fp8, k_scale.view(torch.float32)),\n-                weights[chunk.token_start : chunk.token_end],\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-            )\n-            topk_indices = topk_indices_buffer[\n-                chunk.token_start : chunk.token_end, :topk_tokens\n-            ]\n-\n-            num_rows = logits.shape[0]\n-\n-            torch.ops._C.top_k_per_row_prefill(\n-                logits,\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-                topk_indices,\n-                num_rows,\n-                logits.stride(0),\n-                logits.stride(1),\n-                topk_tokens,\n+\n+            # TODO: gather only the causal key span each rank reads\n+            if not chunk.skip_kv_gather:\n+                cp_gather_indexer_k_quant_cache_triton(\n+                    kv_cache,\n+                    k_fp8,\n+                    k_scale,\n+                    chunk.block_table,\n+                    chunk.cu_seq_lens,\n+                    token_to_seq=chunk.token_to_seq,\n+                )\n+\n+            seg_ranges = (\n+                shard_ranges if do_shard else [(chunk.token_start, chunk.token_end)]\n             )\n+            for seg_start, seg_end in seg_ranges:\n+                row_start = max(chunk.token_start, seg_start)\n+                row_end = min(chunk.token_end, seg_end)\n+                if row_start >= row_end:\n+                    # This rank owns no rows of this segment in this chunk.\n+                    continue\n+                lo = row_start - chunk.token_start\n+                hi = row_end - chunk.token_start\n+                cu_seqlen_ks = chunk.cu_seqlen_ks[lo:hi]\n+                cu_seqlen_ke = chunk.cu_seqlen_ke[lo:hi]\n+\n+                logits = rocm_fp8_mqa_logits(\n+                    q_fp8[row_start:row_end],\n+                    (k_fp8, k_scale.view(torch.float32)),\n+                    weights[row_start:row_end],\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                )\n+\n+                topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]\n+\n+                num_rows = logits.shape[0]\n+\n+                torch.ops._C.top_k_per_row_prefill(\n+                    logits,\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                    topk_indices,\n+                    num_rows,\n+                    logits.stride(0),\n+                    logits.stride(1),\n+                    topk_tokens,\n+                )\n+\n+        if do_shard:\n+            pg = get_tp_group().device_group\n+            if fold:\n+                # First half rank-ordered -> ring all_gather; second half\n+                # reverse-ordered -> per-group broadcasts.\n+                dist.all_gather_into_tensor(\n+                    topk_indices_buffer[\n+                        prefill_offset : prefill_offset + fold_M, :topk_tokens\n+                    ],\n+                    topk_indices_buffer[\n+                        shard_ranges[0][0] : shard_ranges[0][1], :topk_tokens\n+                    ],\n+                    group=pg,\n+                )\n+                # TODO: any all gather API in reverse order?\n+                pynccl_comm = getattr(\n+                    get_tp_group().device_communicator, \"pynccl_comm\", None\n+                )\n+                assert pynccl_comm is not None and not pynccl_comm.disabled\n+                pynccl_comm.group_start()\n+                for gs, ge, owner in second_groups:\n+                    if ge > gs:\n+                        pynccl_comm.broadcast(\n+                            topk_indices_buffer[gs:ge, :topk_tokens], src=owner\n+                        )\n+                pynccl_comm.group_end()\n+            else:\n+                base = num_prefill_tokens // tp_size\n+                rem = num_prefill_tokens - base * tp_size\n+                ag_start = prefill_offset + rem\n+                in_start = ag_start + tp_rank * base\n+                dist.all_gather_into_tensor(\n+                    topk_indices_buffer[ag_start:prefill_end, :topk_tokens],\n+                    topk_indices_buffer[in_start : in_start + base, :topk_tokens],\n+                    group=pg,\n+                )\n+                if rem:\n+                    dist.broadcast(\n+                        topk_indices_buffer[prefill_offset:ag_start, :topk_tokens],\n+                        src=dist.get_global_rank(pg, 0),\n+                        group=pg,\n+                    )\n \n     if has_decode:\n         decode_metadata = layer_attn_metadata.decode",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/b3139535cf7a096e026af0106452e007564e8838/vllm%2Fv1%2Fattention%2Fops%2Frocm_aiter_mla_sparse.py",
+      "sha": "c4756344214637f908ce09943ac217f3e142b7e0",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "Env vars have a specific cadence. They must be defined in envs.py \nAlso the redefinition of hidden vars as well here is not clean at all. \n\nAnd also why do we need env vars for this? ",
+      "created_at": "2026-06-20T02:09:06Z",
+      "diff_hunk": "@@ -24,7 +30,30 @@\n     _ON_GFX942 = False\n     _ON_GFX950 = False\n \n-\n+# Shard the replicated lightning-indexer prefill logits+top-k across the TP \n+# group on the query (M) dimension. Default ON; gated to gfx950 and the prefill\n+# branch only (decode is unchanged).\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD\", \"1\") == \"1\"\n+)\n+# FOLDED work-balanced row partition. The logits kernel is causal-aware (per-row\n+# cost ~ ke - ks), so a uniform row split overloads the last rank. Fold instead:\n+# cut the P rows into 2*tp equal groups and give rank r the pair {g=r, g=2tp-1-r}.\n+# Helps only when a step spans a large causal range (big prefill chunks). \n+# Default OFF.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD\", \"0\") == \"1\"\n+)\n+# Fold split point: rows are cut into a first half [0, M) and second half [M, P)\n+# at M ~= split*P, each into tp equal groups; rank r pairs first-group r (cheap,\n+# low index) with the reversed second-group (expensive, high index). split=0.5 is\n+# the symmetric fold (exactly balances LINEAR per-row work). split>0.5 shrinks the\n+# costly high-index groups, which rebalances if the indexer cost grows\n+# super-linearly with token index. First half (rank-ordered) reassembles via ring\n+# all_gather; second half (reversed) via broadcasts.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT = float(\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT\", \"0.5\")\n+)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3445272894",
+      "id": 3445272894,
+      "line": null,
+      "original_line": 56,
+      "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "updated_at": "2026-06-20T02:09:24Z",
+      "user": {
+        "login": "AndreasKaratzas"
+      }
+    },
+    {
+      "body": "Updated!\r\n\r\nThis was used to test whether the actual real workload is linear or not (Now deleted)",
+      "created_at": "2026-06-20T04:56:52Z",
+      "diff_hunk": "@@ -24,7 +30,30 @@\n     _ON_GFX942 = False\n     _ON_GFX950 = False\n \n-\n+# Shard the replicated lightning-indexer prefill logits+top-k across the TP \n+# group on the query (M) dimension. Default ON; gated to gfx950 and the prefill\n+# branch only (decode is unchanged).\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD\", \"1\") == \"1\"\n+)\n+# FOLDED work-balanced row partition. The logits kernel is causal-aware (per-row\n+# cost ~ ke - ks), so a uniform row split overloads the last rank. Fold instead:\n+# cut the P rows into 2*tp equal groups and give rank r the pair {g=r, g=2tp-1-r}.\n+# Helps only when a step spans a large causal range (big prefill chunks). \n+# Default OFF.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD = (\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD\", \"0\") == \"1\"\n+)\n+# Fold split point: rows are cut into a first half [0, M) and second half [M, P)\n+# at M ~= split*P, each into tp equal groups; rank r pairs first-group r (cheap,\n+# low index) with the reversed second-group (expensive, high index). split=0.5 is\n+# the symmetric fold (exactly balances LINEAR per-row work). split>0.5 shrinks the\n+# costly high-index groups, which rebalances if the indexer cost grows\n+# super-linearly with token index. First half (rank-ordered) reassembles via ring\n+# all_gather; second half (reversed) via broadcasts.\n+_ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT = float(\n+    os.environ.get(\"ROCM_AITER_MLA_SPARSE_TP_SHARD_FOLD_SPLIT\", \"0.5\")\n+)",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3445482775",
+      "id": 3445482775,
+      "line": null,
+      "original_line": 56,
+      "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "updated_at": "2026-06-20T07:39:22Z",
+      "user": {
+        "login": "Concurrensee"
+      }
+    },
+    {
+      "body": "My understanding is that pynccl_comm can be not None, but also disabled.  Should we check for that as well here?",
+      "created_at": "2026-06-30T16:47:22Z",
+      "diff_hunk": "@@ -746,50 +752,176 @@ def rocm_aiter_sparse_attn_indexer(\n             scale_fmt,\n         )\n \n-    topk_indices_buffer[: hidden_states.shape[0]] = -1\n+    # Redundant on gfx950. Kept for other archs as a safety net.\n+    if not _ON_GFX950:\n+        topk_indices_buffer[: hidden_states.shape[0]] = -1\n     if has_prefill:\n         prefill_metadata = layer_attn_metadata.prefill\n         assert prefill_metadata is not None\n \n+        # TP row-sharding of the indexer prefill\n+        num_prefill_tokens = layer_attn_metadata.num_prefill_tokens\n+        tp_size = get_tensor_model_parallel_world_size()\n+        do_shard = (\n+            envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD\n+            and _ON_GFX950\n+            and tp_size > 1\n+            and num_prefill_tokens >= 512 * tp_size\n+        )\n+        fold = False\n+        if do_shard:\n+            tp_rank = get_tensor_model_parallel_rank()\n+\n+            prefill_offset = num_decode_tokens\n+            prefill_end = prefill_offset + num_prefill_tokens\n+\n+            if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD:\n+                fold = True\n+                P = num_prefill_tokens\n+                # Fold: first half [0,M) = tp rank-ordered groups; second half\n+                # [M,P) = tp groups in REVERSE rank order, so each rank pairs a\n+                # cheap low-index group with an expensive high-index one. M is a\n+                # multiple of tp so the first half can ring all_gather. The split\n+                # is symmetric (M ~= P/2), which exactly balances the linear\n+                # per-row indexer cost across ranks.\n+                fold_M = max(\n+                    tp_size,\n+                    min(\n+                        P - tp_size,\n+                        round(0.5 * P / tp_size) * tp_size,\n+                    ),\n+                )\n+                fb = [(i * fold_M) // tp_size for i in range(tp_size + 1)]\n+                sb = [(j * (P - fold_M)) // tp_size for j in range(tp_size + 1)]\n+                second_groups = [\n+                    (\n+                        prefill_offset + fold_M + sb[j],\n+                        prefill_offset + fold_M + sb[j + 1],\n+                        tp_size - 1 - j,\n+                    )\n+                    for j in range(tp_size)\n+                ]\n+                shard_ranges = [\n+                    (prefill_offset + fb[tp_rank], prefill_offset + fb[tp_rank + 1]),\n+                    (\n+                        prefill_offset + fold_M + sb[tp_size - 1 - tp_rank],\n+                        prefill_offset + fold_M + sb[tp_size - tp_rank],\n+                    ),\n+                ]\n+            else:\n+                base = num_prefill_tokens // tp_size\n+                rem = num_prefill_tokens - base * tp_size\n+                # rank 0 heuristically has lowest workload\n+                # Compute rem tokens in rank 0 then broadcast cost is generally\n+                # lower than recomputing it across all ranks.\n+                if tp_rank == 0:\n+                    rank_start = prefill_offset\n+                    rank_end = prefill_offset + rem + base\n+                else:\n+                    rank_start = prefill_offset + rem + tp_rank * base\n+                    rank_end = rank_start + base\n+                shard_ranges = [(rank_start, rank_end)]\n+\n         workspace_manager = current_workspace_manager()\n         k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(\n             ((total_seq_lens, head_dim), fp8_dtype),\n             ((total_seq_lens, 4), torch.uint8),\n         )\n+\n         for chunk in prefill_metadata.chunks:\n             k_fp8 = k_fp8_full[: chunk.total_seq_lens]\n             k_scale = k_scale_full[: chunk.total_seq_lens]\n-            cp_gather_indexer_k_quant_cache_triton(\n-                kv_cache,\n-                k_fp8,\n-                k_scale,\n-                chunk.block_table,\n-                chunk.cu_seq_lens,\n-                token_to_seq=chunk.token_to_seq,\n-            )\n-            logits = rocm_fp8_mqa_logits(\n-                q_fp8[chunk.token_start : chunk.token_end],\n-                (k_fp8, k_scale.view(torch.float32)),\n-                weights[chunk.token_start : chunk.token_end],\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-            )\n-            topk_indices = topk_indices_buffer[\n-                chunk.token_start : chunk.token_end, :topk_tokens\n-            ]\n-\n-            num_rows = logits.shape[0]\n-\n-            torch.ops._C.top_k_per_row_prefill(\n-                logits,\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-                topk_indices,\n-                num_rows,\n-                logits.stride(0),\n-                logits.stride(1),\n-                topk_tokens,\n+\n+            # TODO: gather only the causal key span each rank reads\n+            if not chunk.skip_kv_gather:\n+                cp_gather_indexer_k_quant_cache_triton(\n+                    kv_cache,\n+                    k_fp8,\n+                    k_scale,\n+                    chunk.block_table,\n+                    chunk.cu_seq_lens,\n+                    token_to_seq=chunk.token_to_seq,\n+                )\n+\n+            seg_ranges = (\n+                shard_ranges if do_shard else [(chunk.token_start, chunk.token_end)]\n             )\n+            for seg_start, seg_end in seg_ranges:\n+                row_start = max(chunk.token_start, seg_start)\n+                row_end = min(chunk.token_end, seg_end)\n+                if row_start >= row_end:\n+                    # This rank owns no rows of this segment in this chunk.\n+                    continue\n+                lo = row_start - chunk.token_start\n+                hi = row_end - chunk.token_start\n+                cu_seqlen_ks = chunk.cu_seqlen_ks[lo:hi]\n+                cu_seqlen_ke = chunk.cu_seqlen_ke[lo:hi]\n+\n+                logits = rocm_fp8_mqa_logits(\n+                    q_fp8[row_start:row_end],\n+                    (k_fp8, k_scale.view(torch.float32)),\n+                    weights[row_start:row_end],\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                )\n+\n+                topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]\n+\n+                num_rows = logits.shape[0]\n+\n+                torch.ops._C.top_k_per_row_prefill(\n+                    logits,\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                    topk_indices,\n+                    num_rows,\n+                    logits.stride(0),\n+                    logits.stride(1),\n+                    topk_tokens,\n+                )\n+\n+        if do_shard:\n+            pg = get_tp_group().device_group\n+            if fold:\n+                # First half rank-ordered -> ring all_gather; second half\n+                # reverse-ordered -> per-group broadcasts.\n+                dist.all_gather_into_tensor(\n+                    topk_indices_buffer[\n+                        prefill_offset : prefill_offset + fold_M, :topk_tokens\n+                    ],\n+                    topk_indices_buffer[\n+                        shard_ranges[0][0] : shard_ranges[0][1], :topk_tokens\n+                    ],\n+                    group=pg,\n+                )\n+                # TODO: any all gather API in reverse order?\n+                pynccl_comm = getattr(\n+                    get_tp_group().device_communicator, \"pynccl_comm\", None\n+                )\n+                assert pynccl_comm is not None",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3500434389",
+      "id": 3500434389,
+      "line": null,
+      "original_line": 901,
+      "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "updated_at": "2026-06-30T16:47:27Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    },
+    {
+      "body": "Resolved!",
+      "created_at": "2026-06-30T22:55:26Z",
+      "diff_hunk": "@@ -746,50 +752,176 @@ def rocm_aiter_sparse_attn_indexer(\n             scale_fmt,\n         )\n \n-    topk_indices_buffer[: hidden_states.shape[0]] = -1\n+    # Redundant on gfx950. Kept for other archs as a safety net.\n+    if not _ON_GFX950:\n+        topk_indices_buffer[: hidden_states.shape[0]] = -1\n     if has_prefill:\n         prefill_metadata = layer_attn_metadata.prefill\n         assert prefill_metadata is not None\n \n+        # TP row-sharding of the indexer prefill\n+        num_prefill_tokens = layer_attn_metadata.num_prefill_tokens\n+        tp_size = get_tensor_model_parallel_world_size()\n+        do_shard = (\n+            envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD\n+            and _ON_GFX950\n+            and tp_size > 1\n+            and num_prefill_tokens >= 512 * tp_size\n+        )\n+        fold = False\n+        if do_shard:\n+            tp_rank = get_tensor_model_parallel_rank()\n+\n+            prefill_offset = num_decode_tokens\n+            prefill_end = prefill_offset + num_prefill_tokens\n+\n+            if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD:\n+                fold = True\n+                P = num_prefill_tokens\n+                # Fold: first half [0,M) = tp rank-ordered groups; second half\n+                # [M,P) = tp groups in REVERSE rank order, so each rank pairs a\n+                # cheap low-index group with an expensive high-index one. M is a\n+                # multiple of tp so the first half can ring all_gather. The split\n+                # is symmetric (M ~= P/2), which exactly balances the linear\n+                # per-row indexer cost across ranks.\n+                fold_M = max(\n+                    tp_size,\n+                    min(\n+                        P - tp_size,\n+                        round(0.5 * P / tp_size) * tp_size,\n+                    ),\n+                )\n+                fb = [(i * fold_M) // tp_size for i in range(tp_size + 1)]\n+                sb = [(j * (P - fold_M)) // tp_size for j in range(tp_size + 1)]\n+                second_groups = [\n+                    (\n+                        prefill_offset + fold_M + sb[j],\n+                        prefill_offset + fold_M + sb[j + 1],\n+                        tp_size - 1 - j,\n+                    )\n+                    for j in range(tp_size)\n+                ]\n+                shard_ranges = [\n+                    (prefill_offset + fb[tp_rank], prefill_offset + fb[tp_rank + 1]),\n+                    (\n+                        prefill_offset + fold_M + sb[tp_size - 1 - tp_rank],\n+                        prefill_offset + fold_M + sb[tp_size - tp_rank],\n+                    ),\n+                ]\n+            else:\n+                base = num_prefill_tokens // tp_size\n+                rem = num_prefill_tokens - base * tp_size\n+                # rank 0 heuristically has lowest workload\n+                # Compute rem tokens in rank 0 then broadcast cost is generally\n+                # lower than recomputing it across all ranks.\n+                if tp_rank == 0:\n+                    rank_start = prefill_offset\n+                    rank_end = prefill_offset + rem + base\n+                else:\n+                    rank_start = prefill_offset + rem + tp_rank * base\n+                    rank_end = rank_start + base\n+                shard_ranges = [(rank_start, rank_end)]\n+\n         workspace_manager = current_workspace_manager()\n         k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(\n             ((total_seq_lens, head_dim), fp8_dtype),\n             ((total_seq_lens, 4), torch.uint8),\n         )\n+\n         for chunk in prefill_metadata.chunks:\n             k_fp8 = k_fp8_full[: chunk.total_seq_lens]\n             k_scale = k_scale_full[: chunk.total_seq_lens]\n-            cp_gather_indexer_k_quant_cache_triton(\n-                kv_cache,\n-                k_fp8,\n-                k_scale,\n-                chunk.block_table,\n-                chunk.cu_seq_lens,\n-                token_to_seq=chunk.token_to_seq,\n-            )\n-            logits = rocm_fp8_mqa_logits(\n-                q_fp8[chunk.token_start : chunk.token_end],\n-                (k_fp8, k_scale.view(torch.float32)),\n-                weights[chunk.token_start : chunk.token_end],\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-            )\n-            topk_indices = topk_indices_buffer[\n-                chunk.token_start : chunk.token_end, :topk_tokens\n-            ]\n-\n-            num_rows = logits.shape[0]\n-\n-            torch.ops._C.top_k_per_row_prefill(\n-                logits,\n-                chunk.cu_seqlen_ks,\n-                chunk.cu_seqlen_ke,\n-                topk_indices,\n-                num_rows,\n-                logits.stride(0),\n-                logits.stride(1),\n-                topk_tokens,\n+\n+            # TODO: gather only the causal key span each rank reads\n+            if not chunk.skip_kv_gather:\n+                cp_gather_indexer_k_quant_cache_triton(\n+                    kv_cache,\n+                    k_fp8,\n+                    k_scale,\n+                    chunk.block_table,\n+                    chunk.cu_seq_lens,\n+                    token_to_seq=chunk.token_to_seq,\n+                )\n+\n+            seg_ranges = (\n+                shard_ranges if do_shard else [(chunk.token_start, chunk.token_end)]\n             )\n+            for seg_start, seg_end in seg_ranges:\n+                row_start = max(chunk.token_start, seg_start)\n+                row_end = min(chunk.token_end, seg_end)\n+                if row_start >= row_end:\n+                    # This rank owns no rows of this segment in this chunk.\n+                    continue\n+                lo = row_start - chunk.token_start\n+                hi = row_end - chunk.token_start\n+                cu_seqlen_ks = chunk.cu_seqlen_ks[lo:hi]\n+                cu_seqlen_ke = chunk.cu_seqlen_ke[lo:hi]\n+\n+                logits = rocm_fp8_mqa_logits(\n+                    q_fp8[row_start:row_end],\n+                    (k_fp8, k_scale.view(torch.float32)),\n+                    weights[row_start:row_end],\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                )\n+\n+                topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]\n+\n+                num_rows = logits.shape[0]\n+\n+                torch.ops._C.top_k_per_row_prefill(\n+                    logits,\n+                    cu_seqlen_ks,\n+                    cu_seqlen_ke,\n+                    topk_indices,\n+                    num_rows,\n+                    logits.stride(0),\n+                    logits.stride(1),\n+                    topk_tokens,\n+                )\n+\n+        if do_shard:\n+            pg = get_tp_group().device_group\n+            if fold:\n+                # First half rank-ordered -> ring all_gather; second half\n+                # reverse-ordered -> per-group broadcasts.\n+                dist.all_gather_into_tensor(\n+                    topk_indices_buffer[\n+                        prefill_offset : prefill_offset + fold_M, :topk_tokens\n+                    ],\n+                    topk_indices_buffer[\n+                        shard_ranges[0][0] : shard_ranges[0][1], :topk_tokens\n+                    ],\n+                    group=pg,\n+                )\n+                # TODO: any all gather API in reverse order?\n+                pynccl_comm = getattr(\n+                    get_tp_group().device_communicator, \"pynccl_comm\", None\n+                )\n+                assert pynccl_comm is not None",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#discussion_r3502278330",
+      "id": 3502278330,
+      "line": null,
+      "original_line": 901,
+      "path": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "updated_at": "2026-06-30T22:55:26Z",
+      "user": {
+        "login": "Concurrensee"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Concurrensee.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork",
+      "created_at": "2026-06-18T21:34:23Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4746310185",
+      "id": 4746310185,
+      "updated_at": "2026-06-18T21:34:23Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "Thanks @Concurrensee ! What's the command to run your test here? I saw you have added two envs, what's the best practice to use?",
+      "created_at": "2026-06-24T21:21:35Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793777477",
+      "id": 4793777477,
+      "updated_at": "2026-06-24T21:21:35Z",
+      "user": {
+        "login": "Fangzhou-Ai"
+      }
+    },
+    {
+      "body": "Hi @dllehr-amd  can you please spare some time to look at this PR?",
+      "created_at": "2026-06-24T21:29:05Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793829863",
+      "id": 4793829863,
+      "updated_at": "2026-06-24T21:29:05Z",
+      "user": {
+        "login": "Fangzhou-Ai"
+      }
+    },
+    {
+      "body": "Hi @Fangzhou-Ai,\r\nBest practice on the two envs:\r\n\r\nDefault config: keep the defaults — TP_SHARD on, FOLD off. TP_SHARD self-gates (only active on gfx950 when tp_size > 1 and num_prefill_tokens >= 512 * tp_size), so short prefills fall back to the replicated path and long-context prefills get the speedup automatically.\r\n\r\nWhen tuning chunk size for long-context runs, turn on FOLD (VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD=1). Larger prefill chunks span a wider causal range per step, where the work-balanced fold partition pays off the most.\r\n\r\nSince VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD is on by default, if you observe a regression on a specific case, turn it off (=0) to fall back to the original replicated path.",
+      "created_at": "2026-06-24T21:40:40Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793907950",
+      "id": 4793907950,
+      "updated_at": "2026-06-24T21:48:25Z",
+      "user": {
+        "login": "Concurrensee"
+      }
+    },
+    {
+      "body": "Hi @Fangzhou-Ai,\r\nCommands to run (8×MI355, TP=8):\r\n\r\n```\r\nVLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=1 \\\r\nvllm serve $MODEL --tensor-parallel-size 8 \\\r\n  --max-model-len $MAXLEN --no-enable-prefix-caching --trust-remote-code\r\n# fold (for long-context / larger chunk): prepend VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD_FOLD=1\r\n# baseline A/B:                           test against an image without this PR and an image with this PR. \r\n# contorl SHARD                           prepend VLLM_ROCM_USE_AITER_MLA_SPARSE_TP_SHARD=1/0 to turn on/off shard\r\n```\r\n\r\n```\r\n vllm bench serve --model $MODEL --dataset-name random \\\r\n  --random-input-len $ISL --random-output-len 1000 --ignore-eos \\\r\n  --num-prompts $((2*C)) --max-concurrency $C --request-rate inf \\\r\n  --percentile-metrics ttft,tpot --metric-percentiles 50,95\r\n```\r\n```\r\nlm_eval --model local-completions --tasks gsm8k --num_fewshot 5 \\\r\n  --model_args model=$MODEL,base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=128,tokenized_requests=False\r\n```",
+      "created_at": "2026-06-24T21:46:19Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-4793943006",
+      "id": 4793943006,
+      "updated_at": "2026-06-25T18:04:27Z",
+      "user": {
+        "login": "Concurrensee"
+      }
+    },
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @Concurrensee.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-07-28T05:42:24Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-5100413243",
+      "id": 5100413243,
+      "updated_at": "2026-07-28T05:42:24Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "This pull request has been automatically marked as stale because it has not had any activity within 90 days. It will be automatically closed if no further activity occurs within 30 days. Leave a comment if you feel this pull request should remain open. Thank you!",
+      "created_at": "2026-10-27T01:55:06Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#issuecomment-6431802912",
+      "id": 6431802912,
+      "updated_at": "2026-10-27T01:55:06Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 46103,
+  "refs": {
+    "base": {
+      "commit": "ac521f623706b74ac12a01e6ed8f7297a39257fe",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "b3139535cf7a096e026af0106452e007564e8838",
+      "repository": "Concurrensee/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4536276114",
+      "id": 4536276114,
+      "state": "COMMENTED",
+      "submitted_at": "2026-06-20T02:09:24Z",
+      "user": {
+        "login": "AndreasKaratzas"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4536539848",
+      "id": 4536539848,
+      "state": "COMMENTED",
+      "submitted_at": "2026-06-20T04:56:52Z",
+      "user": {
+        "login": "Concurrensee"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4602373493",
+      "id": 4602373493,
+      "state": "COMMENTED",
+      "submitted_at": "2026-06-30T16:47:27Z",
+      "user": {
+        "login": "dllehr-amd"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/46103#pullrequestreview-4604606227",
+      "id": 4604606227,
+      "state": "COMMENTED",
+      "submitted_at": "2026-06-30T22:55:26Z",
+      "user": {
+        "login": "Concurrensee"
+      }
+    }
+  ]
+}

@@ -9,46 +9,59 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 3634007b5cca45b6e3ce61742e818c4c7fdb9c5147092cc4872e0752c00f7b75
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 85a02ce07f786fac33c3d2cda4e9b4fa460b0b68e8308ddfda5ddd2c0f9fdf13
 - source: pytorch-torchtitan
   path: RELEASE.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 25602fde9bc0d1742bea6e1072b69db8565f4c37168b49b4a65b017f2d6b657b
 - source: pytorch-torchtitan
   path: pyproject.toml
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0341afacb518276f192c2c8a836c32426e80856bf8c5f0ff194c3028c221520d
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 4c8bd1c4a4c82eaea345ccb97abf671a1e59faf92df2d9fa147ce21c5e7fe780
 - source: pytorch-torchtitan
   path: torchtitan/train.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: ccdc21c169ecd6e16133a06ee17c9cce8587389c1b06b60bac798ef5571efb3b
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 4c3af6ec7cdef4eb99253ec18b594bceb4486cb0d7da1f4f8f167bf0bed4aef8
 - source: pytorch-torchtitan
   path: torchtitan/trainer.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: c49922cf3d47918901135fc0b798141479cb16b24fb1004b19b255a663c13288
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 1e03e753238c07818a9b238b9264001cd3223528e5d18e4316eb88be14175135
 - source: pytorch-torchtitan
   path: torchtitan/training_engine.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 04d566f414d65830070069c7bde9eba232da16a23f329abc4446f565abb2006e
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 2ffe06874d3a03ccc91d407f1bc91d5f2beaa9c746738dd3a3646f1c800a798f
 - source: pytorch-torchtitan
   path: torchtitan/rl/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 62fde87475bed82db694353ac5892caaa9162c3ca854d7182353f6bcb486970b
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: c4f1816a03546f6ffd5d800a3008aedfdf24a9fa34161a6cfa3fb5cae6184c72
 - source: pytorch-torchtitan
   path: torchtitan/distributed/activation_remat.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 4e935605e29f904ad5c5bef1036e265021f42c334a7a17c6d01083040dffc5a7
 - source: pytorch-torchtitan
   path: torchtitan/rl/actors/system.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 7733d646cda32114febac5a669f9beb12be8445c864d8b540bc908f240e1650a
+- source: pytorch-torchtitan
+  path: torchtitan/config/configs.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 3465866709813651cc91114c4a006a5cc3c05d6069e9f04200e68d10c91c3659
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/accelerator_graph.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: dec500ca70df82c8c8388b41e49970cd9dbbdd2a1c287217c4783827b576e9d5
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/generator.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: fe3ccd0288aa613d11234607fa24e91e98953015dd75a49657da0b4c7dd56b01
 ---
 # TorchTitan 官方工程：定位、能力边界与阅读路线
 
@@ -78,7 +91,7 @@ TorchTitan 是 PyTorch 原生训练工程，围绕 DTensor、DeviceMesh、FSDP2 
 - **配置方式**：当前主线使用 Python recipe；`torchtitan_recipes` 是独立顶层包。旧 TOML、旧 CLI 字段和旧目录必须按提交核对，不能混用。
 - **分布式与性能**：FSDP2/HSDP、TP/PP/CP/EP、区域重算、局部编译、MoE dispatcher、低精度模块均有各自约束，并非任意组合都被验证。
 - **实验路径**：GraphTrainer、TorchFT、NVFP4、特定 RL 模型和未合入优化分别记录成熟度。功能出现在源码里不代表全部模型、后端、精度和并行组合都可用。
-- **硬件边界**：MXFP8/NVFP4、CuTe/Dist-MoE、对称显存、attention 后端和 graph 的要求需逐项核对。当前 `cuda_graphs_supported()` 显式排除 ROCm；设置开关不代表真实捕获执行。
+- **硬件边界**：MXFP8/NVFP4、CuTe/Dist-MoE、对称显存、attention 后端和 graph 的要求需逐项核对。当前 `accelerator_graphs_supported()` 显式排除 ROCm；设置开关不代表真实捕获执行。
 
 ## 重点优化案例
 
@@ -94,23 +107,35 @@ TorchTitan 是 PyTorch 原生训练工程，围绕 DTensor、DeviceMesh、FSDP2 
 
 RL 的领域服务与 actor framework 分开：Controller 经 `ActorSystem` provision/spawn/stop，默认实现仍是 Monarch；`Generator.Config.engine` 选择推理 engine。这个抽象允许扩展其他 actor 实现，但本提交没有因此完成其他 framework 或 HCU 后端适配。
 
+## 本固定主线的配置与所有权变化
+
+精度现在由根配置 `precision: PrecisionConfig` 统一传给引擎和 RL 两角色；`dtype`、`param_dtype`、`reduce_dtype` 分别描述基础存储、混合精度计算和归约。局部编译入口为 `model.local_compile: LocalCompileConfig`，Graph 配置/API 改名为 `accelerator_graph*`，源码仍明确拒绝 ROCm/HIP 路径。统一命名不等于新增 HCU 支持。
+
+恢复点与推理导出已分目录；RL trainer 不再持有整份 pinned CPU 权重镜像，generator 可选 CPU prefetch 或 GPU fetch。它们会改变主机峰值、暂停时间和异步所有权，需沿专题中的真实消费者验证，不能直接复用旧容量或耗时结论。
+
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/README.md)
-- [RELEASE.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/RELEASE.md)
-- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/pyproject.toml)
-- [torchtitan/train.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/train.py)
-- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/trainer.py)
-- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/training_engine.py)
-- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/README.md)
+- [README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/README.md)
+- [RELEASE.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/RELEASE.md)
+- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/pyproject.toml)
+- [torchtitan/train.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/train.py)
+- [torchtitan/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/trainer.py)
+- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/training_engine.py)
+- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/README.md)
 
 ## 本轮机制更新入口
 
-[并行与显存](../topics/parallelism-and-memory.md)更新 `activation_remat` 配置与惰性预处理；[编译与通信](../topics/compile-fusion-and-communication.md)区分共享 Graph pool、eval capture、逐 microbatch group 归约及当前 PP capture 输入结构风险；[训练与数值](../topics/training-and-numerics.md)更新 PP loss kwargs/metrics 和首个 WGRAD dtype；[TitanRL](../topics/titanrl.md)更新 ActorSystem、model state dict transfer、FP32 LM head 与冻结 router 的默认。实际配置、模型 loss 与生成权重版本仍按同一上下文验收。
+[并行与显存](../topics/parallelism-and-memory.md)更新 `activation_remat` 配置与惰性预处理；[编译与通信](../topics/compile-fusion-and-communication.md)区分共享 Graph pool、eval capture、逐 microbatch group 归约及已修复的 PP capture 四项输入链及剩余设备验证边界；[训练与数值](../topics/training-and-numerics.md)更新 PP loss kwargs/metrics 和首个 WGRAD dtype；[TitanRL](../topics/titanrl.md)更新 ActorSystem、model state dict transfer、FP32 LM head 与冻结 router 的默认。实际配置、模型 loss 与生成权重版本仍按同一上下文验收。
 
 ## 本次补充的实现与测试依据
 
-- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/activation_remat.py)
-- [torchtitan/rl/actors/system.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/system.py)
+- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/activation_remat.py)
+- [torchtitan/rl/actors/system.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/actors/system.py)
+
+- [torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/configs.py)
+
+- [torchtitan/distributed/accelerator_graph.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/accelerator_graph.py)
+
+- [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/generator.py)

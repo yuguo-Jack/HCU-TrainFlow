@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: vllm-project/vllm
-commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+commit: 25e7c5728d834335288d080e1c36810fa111d4da
 path: docs/training/weight_transfer/README.md
-raw_sha256: a307f0cf03d6b2581c43ac745a872b7b0d4df4c08b8a2e843633abf0351a35be
+raw_sha256: f99e82bb5c95f9e3353d8e27d64ee8d2ab48a05f9ecd270e5334bcbb697dbdc7
 sources: []
-generated_body_sha256: 939d856a2353ed95681baf129130bb4a814429fe212e7c42492dee444ec530a8
+generated_body_sha256: 300c2263505ce2269c55135c5890be8fcc42437665704c9ed981767c1139edf1
 source_state: current-scan
 ---
 
 # vllm-project/vllm / docs/training/weight_transfer/README.md
 
-[Original at fixed commit](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/weight_transfer/README.md)
+[Original at fixed commit](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/training/weight_transfer/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -140,8 +140,8 @@ on. This is the main rule to internalize:
 | Backend, inference side | `WeightTransferConfig(backend=...)` | A plain string selector — that is all this config holds |
 | Backend, trainer side | `init_info.backend` | A `ClassVar` on each init info; never passed by hand |
 | Wire params (`packed`, buffer sizes) | the backend's `TrainerInitInfo` | The trainer propagates them to the worker during `trainer_init`, so the two sides *cannot* disagree |
-| Weights to send | a [`WeightSource`](base.md#weightsource) | `ModuleSource(model)` covers plain and FSDP-sharded modules |
-| Per-round payload | the backend's update info | Built by the engine (from `source.metadata()`, or from a delta backend's per-round payload); you never construct it |
+| Weights to send | a [`WeightSource`](base.md#weightsource) | Usually written for your framework; `ModuleSource(model)` covers modules every rank holds whole (plain, FSDP, DTensor) |
+| Per-round payload | the backend's update info | Built by the engine (from `source.metadata`, or from a delta backend's per-round payload); you never construct it |
 
 !!! note
     Wire params are deliberately *not* on `WeightTransferConfig` and *not* on the
@@ -154,9 +154,16 @@ on. This is the main rule to internalize:
 For sharded trainers (FSDP, TP/PP/EP), **every trainer rank builds an engine and
 calls `send_weights()`**. Rank 0 is the sender: only it holds a communicator,
 talks to the client, and puts bytes on the wire. Non-sender ranks still iterate
-the `WeightSource`, because materializing a parameter is usually itself a
-collective (an FSDP `full_tensor()` all-gather, a Megatron export) that would
-deadlock if some ranks skipped it.
+the `WeightSource` over the parameters they own, because materializing a
+parameter is usually itself a collective among its owners (an FSDP
+`full_tensor()` all-gather, a Megatron export) that would deadlock if some of
+them skipped it. Which ranks own which parameter is declared in
+[`ParamMeta.owners`](base.md#parammeta-ownership-and-layout).
+Only [sharded RDT](sharded_rdt.md) and [NCCL](nccl.md#broadcasting-ranks)
+accept ranks that own different parameters, such as pipeline stages.
+Pipeline-parallel support for IPC is in progress; until then it, like NCCL M2N,
+needs every parameter owned by rank 0 or by every rank (see each backend's
+Limitations).
 
 Pass each process's own `rank` on the init info. It is explicit rather than read
 from a global process group, which is ambiguous once several groups (FSDP / TP /
@@ -170,6 +177,21 @@ engine = WeightTransferTrainerFactory.trainer_init(
 )
 engine.send_weights()  # called on every rank
 ```
+
+## Verifying a New Model Without a Trainer
+
+To check that weight updates work for a new model before wiring up an RL
+framework, the [checkpoint publisher and weight-update verifier](https://github.com/vllm-project/vllm/tree/vllm-state-transition-verifier/tools/state_transition_verifier) on the
+`vllm-state-transition-verifier` branch pushes a local Hugging Face checkpoint
+into a running `vllm serve` over NCCL, without a trainer, and compares
+fixed-token outputs and GSM8K accuracy before and after the update. Get it with:
+
+```bash
+git fetch origin vllm-state-transition-verifier
+git checkout FETCH_HEAD -- tools/state_transition_verifier
+```
+
+and start from `tools/state_transition_verifier/README.md`.
 
 ## API Endpoints
 

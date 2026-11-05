@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/dcp.mdx
-raw_sha256: e796fcd8c63beb45d79772d39420b64156e3bd2372d8573345af268487a15077
+raw_sha256: f6d0e1bf3f31fd8a9d381b28533b2607ed0ee063f23dbf7426573998fd4ebb5e
 sources: []
-generated_body_sha256: 34a465cbefc0d9e2133186a5e08fa0920a60d948552a5a524b94472caeb2bfd0
+generated_body_sha256: 6dd325f869697427f92d3f6afa81b9adde2e59838e4b34e52d4649d34465b741
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/dcp.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/advanced_features/dcp.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/dcp.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -151,7 +151,7 @@ For context partition `r`, the kernel returns locally normalized output `o_r` an
 
 ### Query-projection replication
 
-Normally each layer all-gathers its absorbed and rotary query components. `--dcp-replicate-q-proj` gathers the query-projection and `w_kc` weights once at startup and computes the full DCP-group query locally. The trade is more weight memory and GEMM work for one fewer collective per layer. Only unquantized BF16/FP16 weights use this path; other layers fall back to the query all-gather.
+Normally each layer all-gathers its absorbed and rotary query components. `--dcp-replicate-q-proj` gathers the query-projection and `w_kc` weights once at startup and computes the full DCP-group query locally. The trade is more weight memory and GEMM work for one fewer collective per layer. `w_kc` must be BF16/FP16, and the query projection may be unquantized BF16/FP16 or 128x128 block-FP8 (gathered as FP8 weight plus block scales, then post-processed like the per-rank shard so it runs the same GEMM); other layers fall back to the query all-gather.
 
 ### Communication backends
 

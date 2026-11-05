@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/training/quick_start.md
-raw_sha256: 505eeb01cf10d55e2991894de03f525b52e1b1d6eaee413de81c0c8860ccdaf0
+raw_sha256: 53d6d5589776901be871b136ec747bb2c57a9430a1aceb9f5e86ef05ca1986cd
 sources: []
-generated_body_sha256: a643ce9996e19e19fa3ecb68001c2fc34f5fa67779a509e8f9f784ab7e85938c
+generated_body_sha256: d83b61cd409797488163ec946c1af52cb8029d8ddf56cbbff2d2b0468d777f00
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/training/quick_start.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/training/quick_start.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/training/quick_start.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -43,7 +43,7 @@ Upstream source document; original commands, claims and links require their stat
 - 具备初级的Python开发经验
 - 对[Megatron-LM](https://github.com/NVIDIA/Megatron-LM)有基本的了解
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > MindSpeed LLM支持<term>Ascend 950PR&950DT系列产品</term>、<term>Atlas A3训练系列产品</term>和<term>Atlas A2训练系列产品</term>，且要求单NPU的片上内存为64GB及以上，详见[模型支持列表](../models/supported_models.md)。
 >
@@ -190,7 +190,7 @@ Upstream source document; original commands, claims and links require their stat
     |`--untie-embeddings-and-output-weights`|根据原模型要求将output层和embedding层的权重解耦|
     |`--bf16`|昇腾芯片对bf16精度支持良好，可显著提升训练速度|
 
-> [!NOTE]
+> [!NOTE] 说明
 >
 > - 多机训练需在多个终端同时启动预训练脚本（每个终端的预训练脚本只有NODE_RANK参数不同，MASTER_ADDR均为主节点的IP地址，其他参数均相同）。
 > - 如果使用多机训练，且多节点间未配置NFS等共享存储，必须在训练启动脚本中增加`--no-shared-storage`参数。开启此参数之后，非主节点将自动在本地生成并缓存数据预处理结果，以避免跨节点读取数据时报错。

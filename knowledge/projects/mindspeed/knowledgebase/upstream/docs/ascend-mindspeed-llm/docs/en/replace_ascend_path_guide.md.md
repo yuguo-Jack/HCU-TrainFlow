@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/replace_ascend_path_guide.md
-raw_sha256: a988cd6916b96c84d0e2a419876e1439cbd31f7d7b0dc71bdf2d479bb0746432
+raw_sha256: 95b583c378e5a179c2f5890a5e409a670a2716174681345ebd906b2ce37df21d
 sources: []
-generated_body_sha256: 81913c0d81216b79bad8fe2a15b180f136e8763d35a7eb23ba36f508868b3968
+generated_body_sha256: 44a08f627a9b81d1b64490b696523f21831fc1bc898d76c081c8edf5c78d6eb4
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/replace_ascend_path_guide.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/replace_ascend_path_guide.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/replace_ascend_path_guide.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -52,7 +52,7 @@ This guide provides the complete steps for performing a batch path replacement u
 | File Type | Description | Typical Path Examples |
 |---------|------|-------------|
 | Shell scripts (`.sh`) | Various runtime scripts, including but not limited to: data preprocessing, weight conversion, pretraining, fine-tuning, evaluation, inference, testing | `examples/*/*.sh`, `tests/*/*.sh` |
-| Markdown documents (`.md`) | All documentation, including but not limited to: installation guides, quick-start guides, task-specific guides, feature descriptions | `docs/zh/install_guide.md`, `docker/OVERVIEW.md`, `docs/zh/pytorch/*/*.md` |
+| Markdown documents (`.md`) | All documentation, including but not limited to: installation guides, quick-start guides, task-specific guides, feature descriptions | `docs/en/install_guide.md`, `docker/OVERVIEW.md`, `docs/en/pytorch/*/*.md` |
 | RST documents (`.rst`) | reStructuredText-style documentation | `docs/*/*.rst` |
 | TXT documents (`.txt`) | Plain text description files or configuration notes | `requirements.txt` |
 | Python files (`.py`) | Source code (if it contains path references) | Source files of each module |
@@ -167,7 +167,8 @@ Some versions require the chip model identifier returned by the `dcmi_get_device
 
 > Note: The current MindSpeed LLM code does not call this interface directly. This is provided here only as an adaptation note. If upper-layer service or operation scripts rely on the return value of this interface to determine the chip model, the return value must be `A2G3` or `A2G4`. Otherwise, model-related logic branches may be affected.
 
-For the verification method, please refer to the **dcmi_get_device_chip_info interface prototype**.
+For the verification method, please refer to:
+[dcmi_get_device_chip_info interface prototype](https://support.huawei.com/enterprise/zh/doc/EDOC1100568435/8739bb5a)
 
 ### 4. Core Functionality Smoke Verification
 
@@ -194,6 +195,6 @@ Options:
   --source SOURCE       Source path (default: /usr/local/Ascend/driver)
   --target TARGET       Target path (default: /usr/local/npu/driver)
   --dir DIR             Directory to scan (default: current directory .)
-  --extensions EXT...   File extension whitelist (default: .sh .md .rst .py .txt + Dockerfile)
+  --extensions EXT...   File extension allowlist (default: .sh .md .rst .py .txt + Dockerfile)
   --dry-run             Preview changes only, do not modify files
 ```

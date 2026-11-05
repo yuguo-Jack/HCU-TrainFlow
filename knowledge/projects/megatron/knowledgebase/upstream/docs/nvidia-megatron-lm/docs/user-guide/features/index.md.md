@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: ab1a28486b92adb3702f1289ff3a332cdb74294f
+commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
 path: docs/user-guide/features/index.md
-raw_sha256: ec6321bd33ed44752c83bc794bac8caba829d5f3de85e90dc31a06a5552aee7e
+raw_sha256: e94617a74f0a50dae06c665ff414ca5988044950984725c2061181f8b70f1f4f
 sources: []
-generated_body_sha256: 7a73fa3c8fd914326322f7821988950648ffb291d1fb00da3e5a99a0d9f90a64
+generated_body_sha256: f9758292b41f4e14f72c842890809e6b847e2a581a2bf4487213c00db7ee2e54
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / docs/user-guide/features/index.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/ab1a28486b92adb3702f1289ff3a332cdb74294f/docs/user-guide/features/index.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/docs/user-guide/features/index.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -54,5 +54,6 @@ paged_stash
 tokenizers
 megatron_energon
 megatron_rl
+offline_logits_distillation
 ../../mcore-inference-user-guide
 ```

@@ -6,11 +6,11 @@
 
 ## 1. 来源快照与核对状态
 
-**最近核对：2026-10-22。** 本次对照[本仓 `781f4370` 登记的来源](https://github.com/yuguo-Jack/HCU-TrainFlow/blob/781f4370ce2404286be17927ce827696a7ab2f6b/knowledge/sources.json)、源码树清单及依赖锁；这不是对所有上游最新 HEAD 的检查。
+**最近核对：2026-11-04。** 本次对照本轮 22 个 Git 来源的固定完整树、[来源登记](../knowledge/sources.json)及工具依赖锁；其中 21 个仓保留许可副本，BBuf 未登记根目录许可，不据公开访问推断额外授权。这不是对观测后继续推进的上游 HEAD 的检查。
 
 | 范围 | 核对结果与边界 |
 | --- | --- |
-| 21 个官方仓、27 份 LICENSE/NOTICE 副本 | 与上述登记快照的 Git blob 一致，比较时兼容 Windows 工作树换行；文件级、文档专用许可仍需按所用材料核对 |
+| 21 个官方仓、29 份 LICENSE/NOTICE/LICENSING 副本 | 原 27 份与本轮固定树的 Git blob 一致，另补 cuDNN Frontend 当前 LICENSING.md 及其引用的 THIRD_PARTY_LICENSES.txt；比较时兼容 Windows 工作树换行，文件级、文档专用许可仍需按所用材料核对 |
 | HCU TraceLens 的 LICENSE | 与依赖锁 `22786b16d429783927981bd592a47ad0f79db3ba` 中的 LICENSE 一致；它是工具依赖，不是第二套 HCU 项目 Wiki |
 | Cluster Manager、Train Simulator 的 4 份声明 | 保留历史来源和集成归属；本次不宣称核对到这两个工程的最新版本 |
 | 两项 NVIDIA 官网来源 | 已单列网页、声明入口和版本定位方式；不能用代码仓许可副本的一致性代替网页再分发范围的核对 |
@@ -19,7 +19,7 @@
 
 ## 2. 官方仓材料的许可副本
 
-文档目录、单个文件、代码片段或 PR 附件可能有各自的声明；下列根目录许可不覆盖一切材料。例如 Primus 的[文档许可页](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/license.md)、cuDNN Frontend 的 [LICENSING.md](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/LICENSING.md) 需要与实际使用内容一并阅读。
+文档目录、单个文件、代码片段或 PR 附件可能有各自的声明；下列根目录许可不覆盖一切材料。例如 Primus 的[文档许可页](https://github.com/AMD-AGI/Primus/blob/8e7a2406111e1c2c3d22112ddb3a1741c619b2ea/docs/license.md)、cuDNN Frontend 的 [LICENSING.md](licenses/nvidia-cudnn-frontend/LICENSING.md) 需要与实际使用内容一并阅读。后者本轮新增 KPage backward/scheduler 的第三方 MIT 声明，已按 `f88a1ef2a35bc405967691dd798eb062298fcd9a` 保留完整当前副本，不把根许可的一致性当成第三方声明无需更新。
 
 - [AMD-AGI/Primus / LICENSE](licenses/amd-agi-primus/LICENSE) · [fixed original](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/LICENSE)
 - [AMD-AGI/TraceLens / LICENSE](licenses/amd-agi-tracelens/LICENSE) · [fixed original](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/LICENSE)
@@ -36,6 +36,8 @@
 - [NVIDIA/cudnn-frontend / LICENSE-MIT.txt](licenses/nvidia-cudnn-frontend/LICENSE-MIT.txt) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/LICENSE-MIT.txt)
 - [NVIDIA/cudnn-frontend / LICENSE.txt](licenses/nvidia-cudnn-frontend/LICENSE.txt) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/LICENSE.txt)
 - [NVIDIA/cudnn-frontend / NOTICE](licenses/nvidia-cudnn-frontend/NOTICE) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/941078f2ce6aa0a45ac5813b81760a19c616732a/NOTICE)
+- [NVIDIA/cudnn-frontend / LICENSING.md](licenses/nvidia-cudnn-frontend/LICENSING.md) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/LICENSING.md)
+- [NVIDIA/cudnn-frontend / THIRD_PARTY_LICENSES.txt](licenses/nvidia-cudnn-frontend/THIRD_PARTY_LICENSES.txt) · [fixed original](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/THIRD_PARTY_LICENSES.txt)
 - [NVIDIA/Megatron-Energon / LICENSE](licenses/nvidia-megatron-energon/LICENSE) · [fixed original](https://github.com/NVIDIA/Megatron-Energon/blob/accdabc3983843665a34cd1578c0e82d2403e3a9/LICENSE)
 - [NVIDIA/Megatron-LM / LICENSE](licenses/nvidia-megatron-lm/LICENSE) · [fixed original](https://github.com/NVIDIA/Megatron-LM/blob/e30d863a6d82a3c45f2d71355dc73fbf5610967b/LICENSE)
 - [NVIDIA-NeMo/Megatron-Bridge / LICENSE](licenses/nvidia-nemo-megatron-bridge/LICENSE) · [fixed original](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53681c1aa264b54a1afa320830738382ee2a44f4/LICENSE)
@@ -72,7 +74,7 @@ HCU TraceLens 是当前集成依赖，其实际版本见 [manifest.json](manifes
 
 ## 5. 未观察到顶层许可的来源
 
-[BBuf/AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/e51089a7b5b25939d5ab6f2216df0ba07be30225) 在本次登记树中仍未发现顶层 LICENSE/NOTICE；[此前固定来源](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/154cc565d0374746442bac17bd69368b888f4775) 同样如此。这是对具体清单的观察，不推断作者放弃权利或所有文件均无单独声明。保留归属不授予新的许可，扩大材料使用范围前须确认适用依据。
+[BBuf/AI-Infra-Auto-Driven-SKILLS](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/371dee04ee30ed918b240823b2a12c139d1a67fa) 在本次登记树中仍未发现顶层 LICENSE/NOTICE；[此前固定来源](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/tree/154cc565d0374746442bac17bd69368b888f4775) 同样如此。这是对具体清单的观察，不推断作者放弃权利或所有文件均无单独声明。保留归属不授予新的许可，扩大材料使用范围前须确认适用依据。
 
 ## 6. 后续维护规则
 

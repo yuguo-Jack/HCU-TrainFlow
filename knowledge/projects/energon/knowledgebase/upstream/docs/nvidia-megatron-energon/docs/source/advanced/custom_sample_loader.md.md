@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/advanced/custom_sample_loader.md
-raw_sha256: feb71f0adff9dea2a403e6f4fce2513ce67e5ee7d0bdb3142073ad78f82f656c
+raw_sha256: 25371fb5131891fa277d5db0ea07395f7f71a6c5f6ca1ef2d43df1c503538970
 sources: []
-generated_body_sha256: 0302ccd86fd5cb3c74d5ef2d1fef23b53532a6fc97beb96c46fe682c33f95930
+generated_body_sha256: 57aedc42728c26ca09bf622f818c3933b56c4c458de22f09fdb832a1e63df6e9
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/advanced/custom_sample_loader.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/d8dba7f399dcf4dcf4e42b7f8412a9ad9abe463b/docs/source/advanced/custom_sample_loader.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/advanced/custom_sample_loader.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -86,6 +86,7 @@ part should be kept. The meaning of the name depends on the dataset format:
 | --- | --- |
 | WebDataset | Sample part names/extensions such as `jpg`, `gt.txt`, or `bbox.json` |
 | JSONL | The single logical part `json` |
+| Megatron-LM BinIdx | The single logical part `tokens` |
 
 For example, a WebDataset cooker can avoid decoding unused parts:
 
@@ -98,8 +99,9 @@ Cooker(
 
 A filter configured by the dataset factory and a filter supplied by a cooker
 are combined by intersection: a part is loaded only when both filters keep it.
-Filtering out `json` removes the only payload part from JSONL samples, leaving
-only Energon metadata.
+Filtering out `json` or `tokens` removes the only
+payload part from JSONL or BinIdx samples respectively, leaving only Energon
+metadata.
 
 
 (interleaved-sample-loader)=

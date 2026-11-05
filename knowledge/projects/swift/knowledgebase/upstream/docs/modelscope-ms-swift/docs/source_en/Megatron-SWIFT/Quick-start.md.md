@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: modelscope/ms-swift
-commit: 22249748429ce7e8516640e35cbe997e572a233a
+commit: 9853e4672d014e35e2b6ba1bfd26d8204100adbb
 path: docs/source_en/Megatron-SWIFT/Quick-start.md
-raw_sha256: 8c84a25dd7e4f74a56127ed17c6965dc3efca1320b6d06e9ea14cb9db8f1438b
+raw_sha256: 69a293d20fd5569ee01645655cdf2e4b4f14f0bcecddba789f1d3d73a7586f41
 sources: []
-generated_body_sha256: 69dc347168c079bde616a3cdb2a451f71113cd40f633c60da646dafaf9ffca9b
+generated_body_sha256: acc9e6d9a4aeccdd99ac5e01040250d1e6536db84800925729a4300ad85285ba
 source_state: current-scan
 ---
 
 # modelscope/ms-swift / docs/source_en/Megatron-SWIFT/Quick-start.md
 
-[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/22249748429ce7e8516640e35cbe997e572a233a/docs/source_en/Megatron-SWIFT/Quick-start.md)
+[Original at fixed commit](https://github.com/modelscope/ms-swift/blob/9853e4672d014e35e2b6ba1bfd26d8204100adbb/docs/source_en/Megatron-SWIFT/Quick-start.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -105,7 +105,7 @@ Recommended Operating Environment:
 | torch        | >=2.0        | 2.8.0/2.11.0    |                    |
 | transformer-engine    | >=2.3       |  2.16.0  |                  |
 | apex |   |  0.1 | |
-| megatron-core    |    >=0.16,<0.20    | 0.18.0      |                  |
+| megatron-core    |    >=0.18,<0.20    | 0.18.0      |                  |
 | mcore-bridge    |    >=1.3.0    |   1.6.0   |                  |
 | flash-attn    |        | 2.8.3/4.0.0b15   |                  |
 | transformers | >=4.33       | 4.57.6/5.12.1    |                    |

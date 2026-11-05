@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: BBuf/AI-Infra-Auto-Driven-SKILLS
-commit: e51089a7b5b25939d5ab6f2216df0ba07be30225
+commit: 371dee04ee30ed918b240823b2a12c139d1a67fa
 path: README.md
-raw_sha256: 3b99889424fbaf96c02094b359469873890be51c9580c5c1204f30cc1c51e892
+raw_sha256: 6fbed4a644aa49cdf360a82489166012d7752917de6a8feb68d351a8da5aef2c
 sources: []
-generated_body_sha256: 618759bb3cb767c14a653f6c88028c08d16e9edab1a2b709fd96a917b5abeed2
+generated_body_sha256: 538bdcdba415421c4586d61480bfce34d40b6561f9638d2d6c9b29f1fc40bc1c
 source_state: current-scan
 ---
 
 # BBuf/AI-Infra-Auto-Driven-SKILLS / README.md
 
-[Original at fixed commit](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/e51089a7b5b25939d5ab6f2216df0ba07be30225/README.md)
+[Original at fixed commit](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/blob/371dee04ee30ed918b240823b2a12c139d1a67fa/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -31,13 +31,13 @@ Upstream source document; original commands, claims and links require their stat
 # AI-Infra-Auto-Driven-SKILLS
 
 **Agent-ready skills for LLM serving benchmarks, profiler triage, capacity
-planning, model Day-0 support, code review, incident triage, and model PR
+planning, model Day-0 support, incident triage, and model PR
 history across SGLang, vLLM, TensorRT-LLM, and TokenSpeed — plus SGLang PR
 and article explainer videos.**
 
 [![GitHub stars](https://img.shields.io/github/stars/BBuf/AI-Infra-Auto-Driven-SKILLS?style=social)](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/BBuf/AI-Infra-Auto-Driven-SKILLS?style=flat-square)](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/commits/main)
-[![Skills](https://img.shields.io/badge/skills-11-2f80ed?style=flat-square)](#skills)
+[![Skills](https://img.shields.io/badge/skills-10-2f80ed?style=flat-square)](#skills)
 [![PR histories](https://img.shields.io/badge/pr_histories-118-2ea44f?style=flat-square)](#model-pr-history)
 [![KDA-Pilot](https://img.shields.io/badge/sibling-KDA--Pilot-ff7b72?style=flat-square)](https://github.com/BBuf/KDA-Pilot)
 
@@ -52,10 +52,9 @@ live in [`sglang-diffusion-optimization-flows/`](sglang-diffusion-optimization-f
 
 ## Releases
 
-**[v0.1.5](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/releases/tag/v0.1.5)**
-— [Release notes (中文)](release-notes/v0.1.5.md), covering model Day-0 support,
-profiler layer guides, 118 bilingual model histories, and the October source audit.
-Previous release: [v0.1.0](release-notes/v0.1.0.md).
+**[v0.1.6](https://github.com/BBuf/AI-Infra-Auto-Driven-SKILLS/releases/tag/v0.1.6)**
+— [Release notes (中文)](release-notes/v0.1.6.md), covering the new explainer-video skill.
+Previous releases: [v0.1.5](release-notes/v0.1.5.md), [v0.1.0](release-notes/v0.1.0.md).
 
 ## Skills
 
@@ -68,7 +67,6 @@ Previous release: [v0.1.0](release-notes/v0.1.0.md).
 | [`torch-profiler-layer-track`](skills/torch-profiler-layer-track/) | Add verified layer-number guides and compact GPU lanes to a trace for Perfetto navigation. |
 | [`model-compute-simulation`](skills/model-compute-simulation/) | Estimate operator shapes, FLOPs, and MFU for a serving shape, or map kernels back to operators. |
 | [`sglang-model-day0-support`](skills/model-optimization/sglang-model-day0-support/) | Turn a new model architecture into an SGLang Day-0 PR DAG, validation matrix, and release lock. |
-| [`sglang-humanize-review`](skills/sglang-humanize-review/) | Review an SGLang PR the way maintainers do, grounded in the full human review corpus. |
 | [`sglang-prod-incident-triage`](skills/sglang-prod-incident-triage/) | Turn queue growth, timeouts, wrong outputs, crashes, or stalls into a replay and the next debug step. |
 | [`model-architecture-diagram`](skills/model-architecture-diagram/) | Return original public architecture diagrams for popular LLM, VLM, MoE, OCR, and diffusion families. |
 | [`sglang-explainer-video`](skills/sglang-explainer-video/) | Turn an SGLang PR number or a technical article into a Chinese explainer video that fully explains its algorithms and code (length follows the material), with edge-tts narration, word-synced bilingual captions, and the unified SGLang cover, rendered with HyperFrames. |

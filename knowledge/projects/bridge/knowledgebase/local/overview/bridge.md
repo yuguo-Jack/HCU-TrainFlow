@@ -10,65 +10,66 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: nvidia-nemo-megatron-bridge
   path: README.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: 4a079f8008605229ed7e01c1087b78fc79c4dfd0aadae3cdea833e2a994aa619
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: c5338daa70661d52a663d4919f2f6012b9ffe9d72e5eac6a2eef96a1cf07ea2a
 - source: nvidia-nemo-megatron-bridge
   path: pyproject.toml
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: 2ebff648597a2aa379fe8b76aa17f279135070337e8981f2acb4918820b33137
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: 044abb1c08a098005b4207d1919d8ec6a034955ede261af3684261ea2ce8640d
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/entry-points.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: b2adf198c102593158c53b3c5dce1eb118655c54b117b41726bd77ea82d17665
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/config-container-overview.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 384b425f0c180976d4d472da569fca71b6af5fd42bd1a1f07ab36af9481daef1
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/config.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: e6402cd67d776fa9937915fa926c16cb3daac7b18a93b6710e2c631fd9d8c39d
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: deeafbdcdbb8738f7ca6d2e0190e159b542d6bc6e1fab919eca9d4f740e4bd93
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/pretrain.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: 28a0fec822239d825da13838dcb6d86ee4b6ac13a52865bb351dc668e59225bf
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: d224e0dda091430b0e52bf094fafee119e201e2213755de68f81fc572cbc7714
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/train.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: fc9f3755a844b2c8b93a93dbdb200fcc77d52c8a6035d7ced8e07e994bd1abe9
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: 03f09f7ff1da6cc83f04ea9450280bf33adcd873ced83d50e7c35531910adddf
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/models/gpt_provider.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 2354707c4c81b5e05c6e62e4613092c26e7271dd17aa293ace75d1bc736abd4f
 - source: nvidia-nemo-megatron-bridge
   path: docs/releases/software-versions.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: b3ff95aed883fe9583144a10d88d0508abbaab8fe7c5524777da67f913d0ff43
 - source: nvidia-nemo-megatron-bridge
   path: docs/training/checkpointing.md
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: effe7f073c2edd1ee8340ecc3f16ceba506be520f5f939ffb1c5368dc7eb35b4
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/training/dpo_train.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 45c7e92be9a7c390efbcbaf800569987dc2e66a7877283e0de1250901ddecfb4
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/data/builders/dpo.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 71d0f8a0a5df6ec78a265aba09856091e1a1ea20740f20c28c9ec2bc0dfd700a
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/models/conversion/auto_bridge.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
-  sha256: cabf1fbd8954002d4dd852e80590ff3a9bb0efe2b0615f603b498d0b049abe94
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
+  sha256: 1634f53dfb7f086f73c467d980553a4483663cf61f48738d2103cff5319dd465
 - source: nvidia-nemo-megatron-bridge
   path: src/megatron/bridge/models/hf_pretrained/state.py
-  commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+  commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
   sha256: 0729aa811936cc1f6caa02cbe54f3d9d74cd6173464bb03555a6341d54a0c849
+retrieved_on: '2026-11-04'
 ---
 
 # Megatron Bridge：配方、Provider、通信与完整训练状态
@@ -96,7 +97,7 @@ HCU独立Bridge patch仓、HCU Megatron-LM内嵌Bridge和本页官方main是不�
 
 ## 3. 安装、版本与真实加载
 
-本页当前核对官方 main `2b1c8ccd7285cfd09b82afd523859dbe04d754e4`，父树的 `3rdparty/Megatron-LM` 固定为 `ce852bfb93f364f64a556602fc71a5d9ed2c377e`。`pyproject.toml`要求Python>=3.12,<3.13；本次 Transformers 上界改到 <5.21，ModelOpt 的可选配套与 TE metadata 也有更新，不能只更新 Bridge Python 文件而忽略实际 Core/扩展组合。build依赖Torch/pybind11，一些TE/SSM扩展有单独build isolation要求。应按该提交安装文档/锁文件与实际运行镜像配套，不将包classifiers或单个pip成功当兼容证据。
+本页当前核对官方 main `41af2dcf0dfd83c8933f588bb871b7f56dbd4368`，父树的 `3rdparty/Megatron-LM` 固定为 `e0a4bfed7f1e233b857187ceff0104645858d7d1`。2026-11-04 检索的 `pyproject.toml` 仍要求 Python>=3.12,<3.13，Transformers 上界仍为 <5.21；本轮 FlashInfer Python/cubin 同步推进到 0.7.2.post1、ModelOpt 为 0.48.0、cuDNN Frontend 为 1.32.0，另有 filelock/GitPython/cryptography 约束更新。依赖注释或最低版本不代替实际可安装、扩展加载与硬件验证，不能只更新 Bridge Python 文件而忽略实际 Core/扩展组合。build依赖Torch/pybind11，一些TE/SSM扩展有单独build isolation要求。应按该提交安装文档/锁文件与实际运行镜像配套，不将包classifiers或单个pip成功当兼容证据。
 
 release software-versions表列NeMo容器的Core/TE/Torch/Bridge组合，是发布配对，不自动代表main与HCU部署相同。本页提供查找机制；真实任务保存Bridge/Core/TE/attention/Energon及patch版本、import路径、库制品和有效配置。不能为读Wiki把最新NV依赖装进HCU训练镜像。
 
@@ -142,26 +143,30 @@ recipe→ConfigContainer validate/finalize/runtime update→GlobalState→provid
 
 [#6140](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6140.md)说明替换decoder后还需finalize TE precision；[#6406](../../upstream/prs/NVIDIA-NeMo--Megatron-Bridge/PR-6406.md)解释decentralized provider中MTP最终builder的rank传递问题。本次固定 `gpt_provider.py` 尚未包含该最终调用的参数变更；保留讨论中的 CPU 回归范围，不由 PR 状态或后续 Core HEAD 推定本快照已修。
 
-与上一固定版本相比，本次训练侧增加 DPO 数据/产物/loss 合约、委托 Core 的确定性校验、local CUDA graph 清理，以及 builder-backed adapter 导出和 HF 目录复用时的旧权重清理。新增 Beam、Nemotron 3.5 Super VL、Muse Spark Open 等 README 入口应继续读各模型验证卡，不由模型列表推导所有训练/转换/精度组合可用。历史 DeepSeekV4 inference 示例仅是其当时范围，不能再概括全部增量。
+相对上轮 `2b1c8ccd7285cfd09b82afd523859dbe04d754e4`，本轮训练侧变化包括 emerging optimizer 的 LayerWise 分布规范化、MFSDP V2 checkpoint / dtype 校验边界、退出时 DataLoader 和 local graph runner 的释放，以及 collective adapter 导出只在 rank0 保留完整权重并广播写入错误。Qwen3 MoE 的 H100 recipe 改走 builder-backed `get_model_config()`，ModelOpt 导出改用 prepared plan 与 grouped stream；这些入口不能和旧 provider/导出 API 混用。README 新增 MiniCPM-o 4.5 的 text/image/audio understanding，明确不含 speech generation 或 SFT/LoRA recipes；不由模型列表推导全部训练组合可用。DPO 数据/loss、确定性委托和旧权重清理机制来自此前版本，其未变消费者继续保留。
 
 更新核对实际Core/TE/Energon版本和HCU父gitlink，同时复核总览、三专题、模型recipe和依赖调用。PR讨论变化可能修正结论，即使文件哈希未变也检查；roadmap若在Issue/Discussion/Project继续在线查，不把采集PR窗口称作全部历史覆盖。
 
+本轮保留依据：`gpt_provider.py`、DPO builder/数据/step/loss 与所引测试、`StateSource`、发布配对表和主要训练指南字节未变，故保留 MTP 最终调用仍缺该 PR 参数变化、DPO pair/token 口径及 HF 旧权重清理边界。新的 NVRx 文档指出 inprocess API 已弃用且在较新 main 移除，必须检查实际安装版，见恢复专题。主仓冻结、底层 Core gitlink与HCU部署是三项不同证据。
+
+2026-11-04 固定 GitHub 最近10条 release 观测已包含 [`v0.7.0`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/releases/tag/v0.7.0)（2026-10-30）。该发行记录不把本页 main 的 LayerWise/FSDP/ModelOpt 等所有变化自动纳入0.7.0；release 配对表、tag 原件、main 与 HCU 使用锁分别确认。
+
 ## 固定证据与复核范围
 
-- [README.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/README.md)
-- [pyproject.toml](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/pyproject.toml)
-- [docs/training/entry-points.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/training/entry-points.md)
-- [docs/training/config-container-overview.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/training/config-container-overview.md)
-- [src/megatron/bridge/training/config.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/config.py)
-- [src/megatron/bridge/training/pretrain.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/pretrain.py)
-- [src/megatron/bridge/training/train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/train.py)
-- [src/megatron/bridge/models/gpt_provider.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/models/gpt_provider.py)
-- [docs/releases/software-versions.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/releases/software-versions.md)
-- [docs/training/checkpointing.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/docs/training/checkpointing.md)
+- [README.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/README.md)
+- [pyproject.toml](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/pyproject.toml)
+- [docs/training/entry-points.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/entry-points.md)
+- [docs/training/config-container-overview.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/config-container-overview.md)
+- [src/megatron/bridge/training/config.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/training/config.py)
+- [src/megatron/bridge/training/pretrain.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/training/pretrain.py)
+- [src/megatron/bridge/training/train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/training/train.py)
+- [src/megatron/bridge/models/gpt_provider.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/models/gpt_provider.py)
+- [docs/releases/software-versions.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/releases/software-versions.md)
+- [docs/training/checkpointing.md](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/docs/training/checkpointing.md)
 
-- [src/megatron/bridge/training/dpo_train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/training/dpo_train.py)
-- [src/megatron/bridge/data/builders/dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/data/builders/dpo.py)
-- [src/megatron/bridge/models/conversion/auto_bridge.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/models/conversion/auto_bridge.py)
-- [src/megatron/bridge/models/hf_pretrained/state.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/src/megatron/bridge/models/hf_pretrained/state.py)
+- [src/megatron/bridge/training/dpo_train.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/training/dpo_train.py)
+- [src/megatron/bridge/data/builders/dpo.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/data/builders/dpo.py)
+- [src/megatron/bridge/models/conversion/auto_bridge.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/models/conversion/auto_bridge.py)
+- [src/megatron/bridge/models/hf_pretrained/state.py](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/src/megatron/bridge/models/hf_pretrained/state.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source/embodied_tutorial/eval_docs/model_integration.md
-raw_sha256: b4ec59fa209efcf251b302c6e5b484b6dc974bee7b691cd730f72d656f8ea2c8
+raw_sha256: 07b71cfa9571bf5f0e553262c685029a01d652efc5b42f459cea3458b1ff778a
 sources: []
-generated_body_sha256: 414c44bf6e0018ed7cd14b21cb1ca1137eab6fd58ab2e7ca05909117a841d9a7
+generated_body_sha256: 3916a242a02e6ed0be55d0200f714a56322743c73a73a8a18c66832a6512d53b
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/embodied_tutorial/eval_docs/model_integration.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/embodied_tutorial/eval_docs/model_integration.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/embodied_tutorial/eval_docs/model_integration.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -309,7 +309,7 @@ Location: `factories/<model>_factory.py`; register with `@register_factory("<mod
 - `build(...)`: load the model — import, config, weights / `random_init`, device/dtype — and return `PredictActionModelSpec(model=..., metadata={...})`, where `model` implements `predict_action` (see §2 The `predict_action` contract).
 - The registry key must pair with a PayloadBuilder of the same `model_type` (both must be registered for the run to start — see the startup fail-fast in §1 Overview).
 
-References: `factories/pi05_factory.py`, `factories/xvla_factory.py`, `factories/groot_n1_6_factory.py`.
+References: `factories/pi05_factory.py`, `factories/xvla_factory.py`, `factories/gr00t_n1_6_factory.py`.
 
 ### 3.2 PayloadBuilder
 
@@ -319,7 +319,7 @@ Location: `payload_builders/<model>.py`; register with `@register_payload_builde
 - `build(canonical, ctx) -> dict`: canonical observation (from the adapter) → `predict_action` kwargs — image packing per the view policy, state per `state_encoding`, model-specific fields.
 - Optional closed-loop hooks: `reset()` / `update_from_response()` / `note_env_action()`.
 
-References: `payload_builders/pi05.py`, `payload_builders/xvla.py`, `payload_builders/groot_n1_6.py`.
+References: `payload_builders/pi05.py`, `payload_builders/xvla.py`, `payload_builders/gr00t_n1_6.py`.
 
 ### 3.3 ActionDecoder
 

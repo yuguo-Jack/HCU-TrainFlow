@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/zh/pytorch/tools/model_io_trace.md
-raw_sha256: ec4717cf81be647ee27103782a242868f373a91d4616960cf586129fcca1959a
+raw_sha256: ff161df0865e2654753ce7af4777489a8f288bd0c210767993b4d495d8b2539c
 sources: []
-generated_body_sha256: b399da8b99684078bd04fa2ab359e4f412d8ec95ad456b01b1eaaea827795ea0
+generated_body_sha256: 09ac48faeaaa9d7dbbff7e53f98b7969418877a619b7ae737a0fe768f54a998a
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/zh/pytorch/tools/model_io_trace.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/zh/pytorch/tools/model_io_trace.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/zh/pytorch/tools/model_io_trace.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -131,7 +131,7 @@ training:
 
 - `model_io_trace_config_path`：可选参数，自定义模型输入输出采集配置文件路径。
 
-  > [!NOTE]
+  > [!NOTE] 说明
   >
   > - `model_io_trace_config_path`参数未配置时，MindSpeed LLM默认使用[`model_io_trace_config.json`](../../../../mindspeed_llm/tools/model_io_trace_config.json)。
   > - 自定义配置文件`custom_config.json`必须是所有训练进程均可访问的文件。
@@ -182,7 +182,7 @@ training:
 
 - `--model-io-trace-config-path`：可选参数，自定义模型输入输出采集配置文件路径。
 
-  > [!NOTE]
+  > [!NOTE] 说明
   >
   > - `--model-io-trace-config-path`参数未配置时，MindSpeed LLM默认使用[`model_io_trace_config.json`](../../../../mindspeed_llm/tools/model_io_trace_config.json)。
   > - 自定义配置文件`custom_config.json`必须是所有训练进程均可访问的文件。

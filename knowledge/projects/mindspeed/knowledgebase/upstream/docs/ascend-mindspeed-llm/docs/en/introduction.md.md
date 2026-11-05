@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: Ascend/MindSpeed-LLM
-commit: 2fed626696175480ae1ab3342a94017301a25209
+commit: f5f84bbbac05be79f883b30629d7f637e6f4649e
 path: docs/en/introduction.md
-raw_sha256: ed2e0c05fcefdef07ad3d395897f05787a50b3cf88ae31c07284f58e3034dbba
+raw_sha256: 4f2bae9708d8a8497f26ef1ac1e3f2ca5ee605018a56b7e71f7be90e6cf4c086
 sources: []
-generated_body_sha256: d2d116d61d937df1fb9488ba560e455081ac161931d9b0312bb9fe4948088bd7
+generated_body_sha256: 102af13fca6e67b3d7452f83bf38ad9bd3a46910ae887f68d30f39c8dbc3bc6a
 source_state: current-scan
 ---
 
 # Ascend/MindSpeed-LLM / docs/en/introduction.md
 
-[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/2fed626696175480ae1ab3342a94017301a25209/docs/en/introduction.md)
+[Original at fixed commit](https://github.com/Ascend/MindSpeed-LLM/blob/f5f84bbbac05be79f883b30629d7f637e6f4649e/docs/en/introduction.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -34,7 +34,7 @@ MindSpeed LLM, as the Ascend large language model (LLM) training framework, aims
 
 MindSpeed LLM supports multiple LLMs based on Transformer, including Dense models and MoE models, and provides more than 100 mainstream open-source models and ready-to-use training scripts, supporting model pretraining, fine-tuning, and efficient distributed training.
 
-MindSpeed LLM is a distributed training framework for LLMs within the MindSpeed ecosystem. It integrates natively with the MindSpeed Core training acceleration library and is designed for Ascend hardware to optimize LLM training from four aspects: parallel optimization, memory optimization, communication optimization, and computation optimization.
+MindSpeed LLM is a distributed training framework for LLMs within the MindSpeed ecosystem. It provides two implementations: the Megatron training backend (with MindSpeed Core acceleration enabled) and the FSDP training backend (with FSDP Turbo acceleration enabled). It is designed for Ascend hardware and optimizes LLM training from four dimensions: parallel optimization, memory optimization, communication optimization, and computation optimization.
 
 ## MindSpeed LLM Architecture
 
@@ -48,7 +48,7 @@ The MindSpeed LLM architecture is shown in [Figure 1](#architecture) and consist
   - Checkpoint-based training resumption and final weight saving at the end of training.
 - **MindSpeed LLM training backends**.
   - **Megatron training backend**: Based on Megatron-LM, it provides an incremental model development solution that uses ModelSpec as the template. You can develop a new model in weeks or days.
-  - **FSDP2 training backend**: Based on MindSpeed-FSDP, it provides an incremental model development solution that directly integrates with third-party Transformers libraries. You can develop a new model in days.
+  - **FSDP training backend**: Based on MindSpeed-FSDP, it provides an incremental model development solution that directly integrates with third-party Transformers libraries. You can develop a new model in days.
 - **MindSpeed LLM training workflows**.
   - **Distributed pretraining**: Supports end-to-end distributed pretraining, including data processing and mainstream model and data partitioning schemes.
   - **Distributed instruction fine-tuning**: Supports multiple mainstream fine-tuning algorithms in the industry to achieve competitive training results.

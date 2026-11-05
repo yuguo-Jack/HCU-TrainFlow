@@ -1,0 +1,937 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "b242e7162697c3877f8333a329d38ca9a0f00f53e13e1d2792993f5eb08cfb2d",
+      "isPrivate": false,
+      "numbers": [
+        5706,
+        5704,
+        5703,
+        5702,
+        5700,
+        5699,
+        5698,
+        5697
+      ],
+      "observed_at": "2026-11-04T18:25:01.480317+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4951,
+        "resetAt": "2026-11-04T19:00:29Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "ad7a9937b5e57ccadebbb98b3eb14ff139ceb2b3",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\nWritten with Claude Code: the analysis, measurements and test plan below.\n\n**TLDR:** In plain FULL CUDA-graph mode (TorchTitan's default), decode replays a graph captured for a mixed batch, which freezes `max_seqlen_q = num_tokens`, so FA4 launches tiles for query rows that don't exist. This PR gives every model's decode its own FULL graphs (GDN/KDA models, e.g. Qwen3.5, already had them) and keeps them safe at DP>1. Decode attention at batch 32-1024: -27% (head dim 128) to -43% (head dim 64). Real generator decode step: Qwen3-8B TP2 at 2k context -22% to -30% at batch 128-1024; Qwen3-30B-A3B at DP 2 x EP 2 -20% / -26% at batch 256 / 1024. Outputs are bitwise identical to main; Qwen3-8B's KV cache size is unchanged.\n\n```text\nmain:     64 decodes -> graph \"64 tokens\", captured as a mixed batch (max_seqlen_q = 64) -> FA4 grid for 64 queries per sequence\nthis PR:  64 decodes -> graph \"64 decodes\" (max_seqlen_q = 1)                           -> FA4 grid for 1 query per sequence\n          DP>1, a peer prefills 16k -> this rank is padded to 16k -> graph \"16384 tokens\" (mixed), as on main\n```\n\n```python\n# TorchTitanGPUModelRunner.load_model\n# before: only models with GDN/KDA layers\nif any(layer.get_attn_backend() is TorchTitanLinearAttentionBackend for layer in mamba_layers):\n    self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n# after: every model\nself.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n\n# TorchTitanCudagraphDispatcher.dispatch, uniform decode in FULL mode\nif num_tokens <= self.max_decode_capture_size:   # decode graph\n    dispatch = self.decode_dispatcher.dispatch\nelif batch_invariant and eager_allowed:          # eager on the decode kernels\n    return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)\n# else: mixed graph, as in stock FULL\n```\n\n**Stack** (4 PRs, merge 1 -> 4; this PR is in **bold**)\n\n| # | PR | Independent? | Needs (stack positions) |\n|---|---|---|---|\n| **1** | **#5704 vLLM generator: decode-specialized FULL graphs for every model, DP>1-safe** | **yes** | **—** |\n| 2 | #5490 FULL CUDA graphs for linear-attention generators at DP>1 | no | 1 |\n| 3 | #5489 vLLM generator: 128-token KV pages when FA4 runs attention | yes | — |\n| 4 | #5706 Muse Spark: use varlen attention in the CP-16 LoRA SFT recipe | yes | — |\n\n**Problem**\n1. **One graph for two batch kinds.** In plain FULL mode, vLLM drops the uniform-decode flag from the graph key (`v1/cudagraph_dispatcher.py:302`, vLLM 9f03b51), so 64 one-token decodes and one 64-token prefill replay the same graph.\n2. **Captured as the mixed batch.** That graph freezes `max_query_len = num_tokens`, which TorchTitan's attention passes to FA4 as the host int `max_seqlen_q`.\n3. **Cost.** FA4 sizes its grid from `max_seqlen_q`: decode attention takes 1.3-2.0x longer from 32 sequences at head dim 64 and from 64 at head dim 128 (GB300).\n4. **Already solved for linear attention.** `TorchTitanCudagraphDispatcher` adds decode keys in FULL mode, but the runner installs it only for models with GDN/KDA layers.\n5. **DP>1.** vLLM pads a decoding rank to the busiest rank's token count and then allows only FULL (`v1/worker/gpu_model_runner.py:4038-4048`, vLLM 9f03b51); a decode batch above every decode key then asserts (`v1/cudagraph_dispatcher.py:320`).\n\n**Solution**\n1. `TorchTitanGPUModelRunner.load_model` installs `TorchTitanCudagraphDispatcher` for every model; decode batches get FULL graphs captured with `max_seqlen_q = 1`.\n2. `dispatch`, for a uniform-decode batch in FULL mode:\n   ```text\n   num_tokens <= max_decode_capture_size          -> decode graph\n   larger (DP padding, or a capture-size gap)     -> mixed graph, as in stock FULL\n   larger, batch-invariant, eager allowed         -> eager on the decode kernels (GDN/KDA's packed kernels\n                                                     in the mixed graph don't match them bitwise)\n   ```\n3. KV cache: vLLM's graph-memory estimate, which comes out of the KV cache, charges every FULL graph like the second-largest one (`v1/worker/gpu_model_runner.py:6740-6771`, `v1/worker/gpu_worker.py:619-623`). The 11 decode graphs (0.03 GiB) would cost Qwen3-8B TP2 2.6% of its KV tokens, so `TorchTitanGPUModelRunner.initialize_kv_cache` drops the decode keys from the profiling pass. vLLM discards those profiling keys anyway, and the real pass rebuilds them, decode keys included.\n4. Unchanged: prefill and mixed graphs, FULL_DECODE_ONLY and eager modes.\n\n**Results**\n```text\nNumerics: bitwise identical. The real generator's tokens + logprobs (24 greedy requests x 24 tokens, sha256 per rank)\n          match main's: Qwen3-8B TP2 e73b7da70eb6ce7b both; Qwen3-30B-A3B DP2 x EP2 334e973c003b5e13 both, with rank 0\n          prefilling 16000 tokens while rank 1 decodes.\n\nGB300, TorchTitan's vLLM engine (VLLMEngine, FULL graphs, max_num_seqs 1024, max_num_batched_tokens 16384, graphs up\nto 16384 tokens). Decode step = median engine.step() wall over 20 steady steps; prefill = one prompt, add -> finished.\nDecode, prefill and Qwen3-30B rows ran on the previous revision (8e6f60bae, before the initialize_kv_cache change, which\nonly touches profiling-time keys); the KV row and the sha ran at this code.\nQwen3-8B, TP 2, decode at 2048-token context (2 interleaved runs, a / b), ms\nbatch     main          this PR       delta\n1         3.67 / 3.70   3.68 / 3.62   +0% / -2%\n2         3.85 / 3.86   3.85 / 3.86   +0% / -0%\n4         3.85 / 3.85   3.84 / 3.85   -0% / -0%\n8         3.96 / 3.95   3.96 / 3.96   +0% / +0%\n16        4.12 / 4.17   4.29 / 4.41   +4% / +6%   (host noise, see NOTE)\n32        4.27 / 4.27   4.29 / 4.28   +1% / +0%\n64        5.87 / 5.88   5.86 / 5.16   -0% / -12%  (host noise, see NOTE)\n128       9.05 / 9.10   7.06 / 7.05   -22% / -23%\n256      14.05 / 14.13 10.28 / 10.30  -27% / -27%\n512      24.72 / 24.69 17.79 / 17.83  -28% / -28%\n1024     46.97 / 47.02 33.15 / 33.10  -29% / -30%\nprefill  2k / 4k / 8k / 16k tokens: 21.1 / 34.7 / 65.0 / 134.2 -> 20.7 / 34.6 / 65.5 / 135.0 (unchanged)\nKV cache, gpu_memory_utilization 0.85: 3,125,104 tokens -> 3,125,104 (graph-memory estimate 8.59 GiB both; real capture 1.57 -> 1.60 GiB)\n\nQwen3-30B-A3B-Base, DP 2 x EP 2 (Dist-MoE), decode at 512-token context (measured at these batch sizes only), ms\nbatch    1      4      16     64     256     1024\nmain     7.54   7.96   8.53   9.92   16.73   33.57\nthis PR  7.52   7.93   8.52   9.17   13.43   24.80     (-8% at 64, -20% at 256, -26% at 1024)\nprefill  2k / 4k / 8k / 16k tokens: 36.7 / 54.7 / 91.5 / 191.1 -> 36.1 / 54.6 / 91.2 / 190.1 (unchanged)\nDP check: while rank 0 prefills a 16000-token chunk, rank 1 is padded to 16384 tokens and replays the 16384-token\nmixed graph (no assert); every other decode step replays a decode graph.\n```\nDecode attention kernel alone (FA4 general kernel, 16-token pages, max_seqlen_q = batch -> 1, GB300, earlier main; geomean of time at batch 32-1024):\n```text\nhd128 32q/8kv (Qwen3-8B, TP1)        0.729\nhd64 16q/2kv + sink (gpt-oss, TP4)   0.618\nhd64 128q/16kv (TP1)                 0.568\nbatch 1-16: 1.000-1.002 for all three\n```\n- Every timed decode step replayed a decode graph (218-220 of 220; 2 steps at batch 1024 still carried prefill tokens); on main all replayed the mixed graph.\n- The gain grows with context: at 512-token context the same Qwen3-8B TP2 gains -5% / -1% / -1% at batch 256 / 512 / 1024 (one run), since attention is a smaller share of the step.\n- Training: not touched (generator only).\n\nYou may ask: why not switch TorchTitan to FULL_AND_PIECEWISE? TorchTitan captures with `CompilationMode.NONE` so vLLM's Inductor compile doesn't nest inside local compile, and without piecewise compilation vLLM turns FULL_AND_PIECEWISE into FULL_DECODE_ONLY, which runs prefill and mixed steps eager.\nYou may ask: why not fix vLLM? Plain FULL is one graph per size by design; decode specialization is what its split modes are for, and those need piecewise compilation. The dispatcher delegates to vLLM's own FULL_DECODE_ONLY dispatcher, so it can go once vLLM offers FULL decode next to FULL mixed graphs.\n\nNOTE: Cost: one more graph per decode batch size up to `max_num_seqs` (11 at 1024), 0.03 GiB in total for Qwen3-8B TP2. Engine init: Qwen3-8B TP2 52-65 s -> 58-68 s; Qwen3-30B-A3B DP2 x EP2 104 -> 141 s (one run each).\nNOTE: GDN/KDA models already captured decode graphs on main; the estimate now drops those too, so their KV cache grows a little (Qwen3.5-35B-A3B's 9 decode graphs take 0.12 GiB when captured alone). Qwen3-30B-A3B lost 1.0% of its KV tokens on the previous revision: one rank's weights + non-torch memory read 35.69 GiB vs 34.48 on main (the other rank 34.48 both), and its graph estimate grew only 0.08 GiB.\nNOTE: Batch 16-64 step times are host noise: batch 16 was +4% / +6% / -3% across three runs and 64 -0% / -12%, while GPU kernel time per step matches (profiled, rank 0, 10 steps: 4137 vs 4133 us at batch 16, the same kernels and counts).\nNOTE: CI's A10G (FA2) multi-GPU job passes TestBitwiseParityVarlen, Flex and Qwen35DebugVarlen with the new decode graphs. The new DP test needs SM90+: the MoE debug model's `torch._grouped_mm` copies to the host under CUDA graph capture before SM90. So it runs in the H100 RL job (`ciflow/rl`) and is skipped below SM90.\n\n**Test plan**\n```bash\npytest tests/rl/unit_tests/cpu/test_generator.py -k full_mode_decode_dispatch   # new, 5 cases; 2 fail without the bound, 1 without the batch-invariant branch\npytest tests/rl/unit_tests/cpu      # stack head: 510 passed, 9 skipped, 3 failed; the same 3 fail on main in this env:\n                                    # test_dapo_math::test_muse_spark_gb300_recipe_shards_sequences_in_the_trainer_only and\n                                    # test_model_defaults[dapo_math] (torch_checkpointing CallbackArgs ImportError),\n                                    # test_model_defaults[alphabet_sort] (disable_cuda_graphs TypeError)\n# GPU, GB300 (the parity and GDN classes ran on the previous revision; since then comment- and test-only changes + rebase)\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py   # new: 1 passed (GB300, 61 s); in CI's H100 RL job\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityVarlen             # 3 passed (FULL; replays the new decode graphs)\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityFlex               # 3 passed (flex decode now replays decode graphs too)\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen   # 4 passed\npytest tests/rl/unit_tests/gpu/test_gdn_cudagraph.py tests/rl/unit_tests/gpu/test_gdn_graph_metadata.py                 # 12 passed\n```\n- The new DP test: Qwen3 MoE debug model, DP = world size, batch-invariant, FULL graphs. Each rank's completions must not change when rank 0 prefills a 1500-token prompt next to their decodes, and the other ranks must replay a mixed graph above the largest decode graph.\n- Real-generator numbers above: a 2-GPU script that builds TorchTitan's `VLLMEngine` and records every step's dispatch (graph mode, padded tokens, decode or mixed) and the KV cache size.\n\n",
+      "changedFiles": 4,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: @claude please review",
+            "createdAt": "2026-10-29T21:17:14Z",
+            "databaseId": 6508538075,
+            "updatedAt": "2026-10-29T21:17:14Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6508538075"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 3m 14s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40956493571)\n\n---\n**Approve -- please address the items before merging** (missing upstream TODO links for the vLLM workarounds, and a private test-helper import): [review](https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview)",
+            "createdAt": "2026-10-29T21:17:37Z",
+            "databaseId": 6508545244,
+            "updatedAt": "2026-10-29T21:21:09Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6508545244"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: Pushed 1c3e0b3b8. The new CPU test now builds VllmConfig with DeviceConfig(device=\"cpu\"), since CPU CI has no platform to infer a device from (the RL CPU job failed its 5 cases). It also adds the two TODOs above.\n\nOn the questions:\n- Qwen3-30B KV at head: not re-measured. On the previous revision its graph estimate grew only 0.08 GiB (0.83 -> 0.91). The -1.0% came from one rank's weights + non-torch memory (34.48 -> 35.69 GiB; the other rank was unchanged), so the override can recover at most those 0.08 GiB.\n- Init: one run each. Graph capture is 24 s of the +37 s (40 -> 64 s). A generator initializes once per job, so this is paid once, against -20% / -26% decode step at batch 256 / 1024.",
+            "createdAt": "2026-10-29T21:26:49Z",
+            "databaseId": 6508719386,
+            "updatedAt": "2026-10-29T21:26:49Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6508719386"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: The new DP test failed in CI's A10G multi-GPU job: the MoE debug model's `torch._grouped_mm` copies to the host during CUDA graph capture before SM90 (`moe.py:146` -> `linear.py:453`), so FULL graphs can't be captured there. Both DP tests now run in the H100 RL job (`ciflow/rl`) and are skipped below SM90. The A10G job's parity classes (Varlen, Flex, Qwen3.5 debug) pass with the new decode graphs.",
+            "createdAt": "2026-10-30T03:04:44Z",
+            "databaseId": 6513932834,
+            "updatedAt": "2026-10-30T03:04:44Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6513932834"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYRCuiI=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "headRefOid": "0202a34a36fa030138c74416589a8af963975c45",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 5704,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve -- please address the items below before merging.** The problem is real and measured, the fix is small and lives in the generator's own vLLM runner, and the DP>1 bound is covered by tests. What's left is TODO links and naming.\n\n**What this PR does.** In plain FULL mode, vLLM keys CUDA graphs by token count alone. So N one-token decodes replay the graph captured for an N-token prefill, which has `max_seqlen_q = N` baked in, and FA4 launches tiles for query rows that don't exist. The GDN/KDA-only `TorchTitanCudagraphDispatcher` already captures separate decode keys; this PR installs it for every model. It also bounds decode dispatch by the largest decode graph, which fixes the assert at DP>1 when a decoding rank is padded to a peer's prefill. Finally, it drops the decode keys from vLLM's profiling-time memory estimate so the KV cache doesn't shrink.\n\n**Example.**\n```text\nQwen3-8B, FULL graphs, 128 decodes:\n  main:    graph \"128 tokens\" (mixed, max_seqlen_q=128)  -> 9.05 ms/step\n  this PR: graph \"128 decodes\" (max_seqlen_q=1)          -> 7.06 ms/step\nDP=2, rank 0 prefills 1500 tokens, rank 1 has 3 decodes, padded to >=1500 tokens, only FULL allowed:\n  decode dispatcher alone: no key above max_num_seqs -> assert\n  this PR: 1500 > max_decode_capture_size            -> stock mixed graph (same as main for non-GDN models)\n```\n\n### Must fix\n1. `torchtitan/rl/generator/vllm/worker.py:38-40` -- the vLLM workaround has no `TODO` with an upstream issue link (principle 3).\n2. `torchtitan/rl/generator/vllm/worker.py:110-117` -- the profiling-key trim depends on two vLLM internals, and either one breaking would fail silently. It needs a `TODO(<vLLM issue>)` and a note that the GPU test guards the rebuild.\n\n### Should consider\n- `tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py:35-38` -- imports the private `_make_prompt_tokens` from another test module.\n\n### Questions\n- The Qwen3-30B-A3B DP2 x EP2 numbers (1.0% fewer KV tokens, engine init 104 -> 141 s) came from the previous revision. Is the KV loss gone at HEAD now that `initialize_kv_cache` drops the decode keys from the estimate? And is +37 s of generator init acceptable for RL jobs that restart generators?\n\n<details><summary>Details</summary>\n\n- **GDN/KDA at DP>1.** I checked whether the new fall-through to the mixed graph lets batch-invariant GDN runs silently use packed kernels for decodes. It can't today: `TorchTitanLinearAttentionMetadataBuilder.get_cudagraph_support` returns `UNIFORM_BATCH` at DP>1 (`linear_attention.py:75-80`), so those models never reach FULL mode at DP>1. That path belongs to PR 2 of the stack.\n- **Batch-invariant eager branch.** It applies to every model, not only GDN/KDA. For attention-only models the mixed graph matches decode bitwise (the new GPU test checks this at DP 2), so the branch only costs performance there, and only when there is a capture-size gap at DP=1. That case is rare, so it doesn't justify a per-backend gate.\n- **Other modes.** FULL_DECODE_ONLY, NONE and PIECEWISE are unchanged: both `initialize_cudagraph_keys` and `dispatch` branch only on `CUDAGraphMode.FULL`.\n- **Test value.** The CPU test covers the bound and the eager branch. The GPU test covers what the CPU test can't: that vLLM's real DP padding reaches `dispatch` with `uniform_decode=True, valid_modes={FULL}`, and that the decode and mixed graphs give bitwise-identical outputs. It earns its CI entry.\n\n</details>\n\nNot verified: the KV-estimate and graph-rebuild behavior of vLLM 9f03b51 (vLLM source not readable in this environment), and all GPU numbers.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "This class now works around a vLLM gap for every model (FULL decode graphs next to FULL mixed graphs without piecewise compilation), but the docstring only says \"until upstream supports\" and gives no issue to track. CLAUDE.md principle 3 asks for a `TODO` with an upstream issue link here, so it gets deleted once vLLM ships the feature. Please file the vLLM issue (or link an existing one) and turn this sentence into `TODO(<link>): ...`.",
+                  "createdAt": "2026-10-29T21:20:28Z",
+                  "databaseId": 4418018982,
+                  "diffHunk": "@@ -9,35 +9,41 @@\n from collections.abc import Set\n from contextlib import nullcontext\n \n-from vllm.config import CUDAGraphMode, get_layers_from_vllm_config\n+from vllm.config import CUDAGraphMode\n from vllm.forward_context import BatchDescriptor\n-from vllm.model_executor.layers.mamba.abstract import MambaBase\n from vllm.utils.math_utils import round_up\n from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher\n from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner\n from vllm.v1.worker.gpu_model_runner import GPUModelRunner\n from vllm.v1.worker.gpu_worker import Worker as GPUWorker\n \n-from torchtitan.rl.generator.vllm.linear_attention import (\n-    TorchTitanLinearAttentionBackend,\n-)\n+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode\n \n \n class TorchTitanCudagraphDispatcher(CudagraphDispatcher):\n-    \"\"\"Keep native FULL descriptors distinct for packed linear attention and fused decode.\n-\n-    Currently installed only for TorchTitan's Attention Gym linear attention\n-    backends (GDN/KDA).\n-    vLLM at c6fa1f0 erases the uniform-decode discriminator in FULL mode:\n-    four one-token decodes collide with one four-token prefill. Attention Gym's\n-    different numerical paths need distinct keys. Delegate decode keys to the\n-    native FULL_DECODE_ONLY dispatcher until upstream supports FULL decode\n-    specialization; native capture, replay and graph ownership stay intact.\n+    \"\"\"Give decode batches their own FULL graphs, apart from prefill and mixed batches.\n+\n+    vLLM at 9f03b51 keys plain FULL graphs by token count only: four one-token\n+    decodes replay the graph captured for one four-token prefill, with\n+    ``max_query_len = 4`` frozen in. Decode needs its own graph:\n+      - Attention Gym linear attention (GDN/KDA) runs different decode kernels.\n+      - FA4 sizes its grid from ``max_query_len``: decode attention runs 1.3-2.0x\n+        longer from 32-64 sequences (GB300, 16-token pages).\n+\n+    Uniform-decode batch in FULL mode:\n+      num_tokens <= max_decode_capture_size              -> decode graph\n+      larger (DP padding, or a capture-size gap)         -> mixed graph, as in stock FULL\n+      larger, batch-invariant, eager allowed             -> eager on the decode kernels\n+\n+    Delegate decode keys to the native FULL_DECODE_ONLY dispatcher until upstream\n+    supports FULL decode specialization; native capture, replay and graph\n+    ownership stay intact.",
+                  "line": null,
+                  "originalLine": 40,
+                  "path": "torchtitan/rl/generator/vllm/worker.py",
+                  "updatedAt": "2026-10-29T21:20:54Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418018982"
+                },
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "This changes vLLM's graph-memory estimate by editing the dispatcher's key set in the middle of `initialize_kv_cache`. It depends on two vLLM internals: (a) the estimate reads `cudagraph_keys` after this call returns, and (b) the real (non-profiling) call re-runs `initialize_cudagraph_keys`. If a vLLM bump breaks (b), decode graphs silently stop being captured and you lose the speedup without any error. If it breaks (a), the KV cache shrinks by about 2.6% and nothing reports it either.\n\nTwo cheap fixes:\n- Mark this as a `TODO(<vLLM issue>)`: upstream should estimate each graph kind separately instead of charging every FULL graph like the second largest.\n- Add an assert or test that the decode keys exist after the real `initialize_kv_cache`. The new GPU test's `any(mode == FULL and uniform ...)` check already covers (b) at DP 2, so a short comment pointing to that test is enough for (b).",
+                  "createdAt": "2026-10-29T21:20:33Z",
+                  "databaseId": 4418019661,
+                  "diffHunk": "@@ -80,18 +96,25 @@ def dispatch(\n \n \n class TorchTitanGPUModelRunner(GPUModelRunner):\n-    \"\"\"V1 runner with sequence-parallel padding and linear attention (GDN/KDA) decode specialization.\"\"\"\n+    \"\"\"V1 runner with sequence-parallel padding and FULL-graph decode specialization.\"\"\"\n \n     def load_model(self, load_dummy_weights: bool = False) -> None:\n         super().load_model(load_dummy_weights)\n-        if any(\n-            layer.get_attn_backend() is TorchTitanLinearAttentionBackend\n-            for layer in get_layers_from_vllm_config(\n-                self.vllm_config, MambaBase\n-            ).values()\n-        ):\n-            assert not self.cudagraph_dispatcher.keys_initialized\n-            self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+        assert not self.cudagraph_dispatcher.keys_initialized\n+        self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+\n+    def initialize_kv_cache(\n+        self, kv_cache_config, is_profiling: bool = False, **kwargs\n+    ):\n+        super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)\n+        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph\n+        # like the second largest (a mixed graph). Decode graphs take far less (Qwen3-8B TP2:\n+        # 11 of them add 0.03 GiB to 1.57), so profile the mixed graphs only. vLLM drops\n+        # these profiling keys afterwards; the real call rebuilds them, decode keys included.\n+        dispatcher = self.cudagraph_dispatcher\n+        if is_profiling and dispatcher.cudagraph_mode == CUDAGraphMode.FULL:\n+            keys = dispatcher.cudagraph_keys[CUDAGraphMode.FULL]\n+            keys -= {key for key in keys if key.uniform}",
+                  "line": 120,
+                  "originalLine": 117,
+                  "path": "torchtitan/rl/generator/vllm/worker.py",
+                  "updatedAt": "2026-10-29T21:20:54Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418019661"
+                },
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "This imports `_make_prompt_tokens`, a private helper, from another test module. CLAUDE.md's naming rule says not to import another module's `_private` names. Either drop the underscore in `test_bitwise_parity.py`, since it now has two consumers, or inline the few lines this test needs.",
+                  "createdAt": "2026-10-29T21:20:36Z",
+                  "databaseId": 4418020037,
+                  "diffHunk": "@@ -0,0 +1,185 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"vLLM generator at DP > 1 with FULL CUDA graphs (multi-GPU).\n+\n+One torchrun launch per test: like test_bitwise_parity's classes, each test builds a\n+vLLM engine that frees its GPU memory only at process exit.\n+\"\"\"\n+\n+import contextlib\n+import os\n+import shutil\n+import tempfile\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+from torchtitan.config import CommConfig\n+from torchtitan.distributed import utils as dist_utils\n+from torchtitan.models.qwen3 import build_model_config\n+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig\n+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig\n+from torchtitan.rl.generator.vllm.registry import register_to_vllm\n+from torchtitan_recipes.tests.rl.alphabet_sort import (\n+    rl_grpo_qwen3_moe_debug_varlen_batch_invariant,\n+)\n+from vllm import SamplingParams\n+from vllm.config import CUDAGraphMode\n+from vllm.sampling_params import RequestOutputKind\n+\n+from tests.rl.unit_tests.gpu.test_bitwise_parity import (\n+    _make_prompt_tokens,\n+    build_inference_engine,\n+)",
+                  "line": 38,
+                  "originalLine": 38,
+                  "path": "tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py",
+                  "updatedAt": "2026-10-29T21:20:54Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418020037"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQyMToyMDozNlrPAAAAAQdVosU=",
+                "hasNextPage": false
+              },
+              "totalCount": 3
+            },
+            "databaseId": 5705121115,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-29T21:20:54Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705121115"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: Added a TODO to the class docstring (1c3e0b3b8). No vLLM issue exists yet; filing one is Felipe's call, so the TODO has no link for now.",
+                  "createdAt": "2026-10-29T21:26:44Z",
+                  "databaseId": 4418073162,
+                  "diffHunk": "@@ -9,35 +9,41 @@\n from collections.abc import Set\n from contextlib import nullcontext\n \n-from vllm.config import CUDAGraphMode, get_layers_from_vllm_config\n+from vllm.config import CUDAGraphMode\n from vllm.forward_context import BatchDescriptor\n-from vllm.model_executor.layers.mamba.abstract import MambaBase\n from vllm.utils.math_utils import round_up\n from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher\n from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner\n from vllm.v1.worker.gpu_model_runner import GPUModelRunner\n from vllm.v1.worker.gpu_worker import Worker as GPUWorker\n \n-from torchtitan.rl.generator.vllm.linear_attention import (\n-    TorchTitanLinearAttentionBackend,\n-)\n+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode\n \n \n class TorchTitanCudagraphDispatcher(CudagraphDispatcher):\n-    \"\"\"Keep native FULL descriptors distinct for packed linear attention and fused decode.\n-\n-    Currently installed only for TorchTitan's Attention Gym linear attention\n-    backends (GDN/KDA).\n-    vLLM at c6fa1f0 erases the uniform-decode discriminator in FULL mode:\n-    four one-token decodes collide with one four-token prefill. Attention Gym's\n-    different numerical paths need distinct keys. Delegate decode keys to the\n-    native FULL_DECODE_ONLY dispatcher until upstream supports FULL decode\n-    specialization; native capture, replay and graph ownership stay intact.\n+    \"\"\"Give decode batches their own FULL graphs, apart from prefill and mixed batches.\n+\n+    vLLM at 9f03b51 keys plain FULL graphs by token count only: four one-token\n+    decodes replay the graph captured for one four-token prefill, with\n+    ``max_query_len = 4`` frozen in. Decode needs its own graph:\n+      - Attention Gym linear attention (GDN/KDA) runs different decode kernels.\n+      - FA4 sizes its grid from ``max_query_len``: decode attention runs 1.3-2.0x\n+        longer from 32-64 sequences (GB300, 16-token pages).\n+\n+    Uniform-decode batch in FULL mode:\n+      num_tokens <= max_decode_capture_size              -> decode graph\n+      larger (DP padding, or a capture-size gap)         -> mixed graph, as in stock FULL\n+      larger, batch-invariant, eager allowed             -> eager on the decode kernels\n+\n+    Delegate decode keys to the native FULL_DECODE_ONLY dispatcher until upstream\n+    supports FULL decode specialization; native capture, replay and graph\n+    ownership stay intact.",
+                  "line": null,
+                  "originalLine": 40,
+                  "path": "torchtitan/rl/generator/vllm/worker.py",
+                  "updatedAt": "2026-10-29T21:26:44Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418073162"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQyMToyNjo0NFrPAAAAAQdWcko=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5705189975,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-29T21:26:44Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705189975"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: Added the TODO, plus a pointer to the guard for (b): test_generator_dp_cudagraph.py asserts a FULL decode graph still replays after the real initialize_kv_cache. (a) shows up only as the KV cache size, which vLLM logs; no test pins it.",
+                  "createdAt": "2026-10-29T21:26:46Z",
+                  "databaseId": 4418073432,
+                  "diffHunk": "@@ -80,18 +96,25 @@ def dispatch(\n \n \n class TorchTitanGPUModelRunner(GPUModelRunner):\n-    \"\"\"V1 runner with sequence-parallel padding and linear attention (GDN/KDA) decode specialization.\"\"\"\n+    \"\"\"V1 runner with sequence-parallel padding and FULL-graph decode specialization.\"\"\"\n \n     def load_model(self, load_dummy_weights: bool = False) -> None:\n         super().load_model(load_dummy_weights)\n-        if any(\n-            layer.get_attn_backend() is TorchTitanLinearAttentionBackend\n-            for layer in get_layers_from_vllm_config(\n-                self.vllm_config, MambaBase\n-            ).values()\n-        ):\n-            assert not self.cudagraph_dispatcher.keys_initialized\n-            self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+        assert not self.cudagraph_dispatcher.keys_initialized\n+        self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+\n+    def initialize_kv_cache(\n+        self, kv_cache_config, is_profiling: bool = False, **kwargs\n+    ):\n+        super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)\n+        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph\n+        # like the second largest (a mixed graph). Decode graphs take far less (Qwen3-8B TP2:\n+        # 11 of them add 0.03 GiB to 1.57), so profile the mixed graphs only. vLLM drops\n+        # these profiling keys afterwards; the real call rebuilds them, decode keys included.\n+        dispatcher = self.cudagraph_dispatcher\n+        if is_profiling and dispatcher.cudagraph_mode == CUDAGraphMode.FULL:\n+            keys = dispatcher.cudagraph_keys[CUDAGraphMode.FULL]\n+            keys -= {key for key in keys if key.uniform}",
+                  "line": 120,
+                  "originalLine": 117,
+                  "path": "torchtitan/rl/generator/vllm/worker.py",
+                  "updatedAt": "2026-10-29T21:26:46Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418073432"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQyMToyNjo0NlrPAAAAAQdWc1g=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5705190282,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-29T21:26:46Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705190282"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: Keeping it here: test_generator_uneven_decode.py, test_generator_dist_moe_mxfp8.py and cpu/test_generator.py already import _make_prompt_tokens from test_bitwise_parity.py. Renaming it touches those files, so it fits better as its own change.",
+                  "createdAt": "2026-10-29T21:26:47Z",
+                  "databaseId": 4418073647,
+                  "diffHunk": "@@ -0,0 +1,185 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"vLLM generator at DP > 1 with FULL CUDA graphs (multi-GPU).\n+\n+One torchrun launch per test: like test_bitwise_parity's classes, each test builds a\n+vLLM engine that frees its GPU memory only at process exit.\n+\"\"\"\n+\n+import contextlib\n+import os\n+import shutil\n+import tempfile\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+from torchtitan.config import CommConfig\n+from torchtitan.distributed import utils as dist_utils\n+from torchtitan.models.qwen3 import build_model_config\n+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig\n+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig\n+from torchtitan.rl.generator.vllm.registry import register_to_vllm\n+from torchtitan_recipes.tests.rl.alphabet_sort import (\n+    rl_grpo_qwen3_moe_debug_varlen_batch_invariant,\n+)\n+from vllm import SamplingParams\n+from vllm.config import CUDAGraphMode\n+from vllm.sampling_params import RequestOutputKind\n+\n+from tests.rl.unit_tests.gpu.test_bitwise_parity import (\n+    _make_prompt_tokens,\n+    build_inference_engine,\n+)",
+                  "line": 38,
+                  "originalLine": 38,
+                  "path": "tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py",
+                  "updatedAt": "2026-10-29T21:26:47Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418073647"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQyMToyNjo0N1rPAAAAAQdWdC8=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5705190555,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-29T21:26:47Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705190555"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yOVQyMToyNjo0N1q0MjAyNi0xMC0yOVQyMToyNjo0N1rPAAAAAVQOTJs=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "state": "OPEN",
+      "title": "[rl] vLLM generator: decode-specialized FULL graphs for every model, DP>1-safe",
+      "updatedAt": "2026-11-03T06:09:32Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5704"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5704/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5704/commits"
+      },
+      "html": {
+        "href": "https://github.com/pytorch/torchtitan/pull/5704"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5704"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5704/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5704"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/statuses/0202a34a36fa030138c74416589a8af963975c45"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 298,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "pytorch:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1074,
+        "forks_count": 1074,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 383,
+        "open_issues_count": 383,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-11-04T17:45:15Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 202350,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5877,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-11-04T17:45:19Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5877,
+        "watchers_count": 5877,
+        "web_commit_signoff_required": false
+      },
+      "sha": "ad7a9937b5e57ccadebbb98b3eb14ff139ceb2b3",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\nWritten with Claude Code: the analysis, measurements and test plan below.\n\n**TLDR:** In plain FULL CUDA-graph mode (TorchTitan's default), decode replays a graph captured for a mixed batch, which freezes `max_seqlen_q = num_tokens`, so FA4 launches tiles for query rows that don't exist. This PR gives every model's decode its own FULL graphs (GDN/KDA models, e.g. Qwen3.5, already had them) and keeps them safe at DP>1. Decode attention at batch 32-1024: -27% (head dim 128) to -43% (head dim 64). Real generator decode step: Qwen3-8B TP2 at 2k context -22% to -30% at batch 128-1024; Qwen3-30B-A3B at DP 2 x EP 2 -20% / -26% at batch 256 / 1024. Outputs are bitwise identical to main; Qwen3-8B's KV cache size is unchanged.\n\n```text\nmain:     64 decodes -> graph \"64 tokens\", captured as a mixed batch (max_seqlen_q = 64) -> FA4 grid for 64 queries per sequence\nthis PR:  64 decodes -> graph \"64 decodes\" (max_seqlen_q = 1)                           -> FA4 grid for 1 query per sequence\n          DP>1, a peer prefills 16k -> this rank is padded to 16k -> graph \"16384 tokens\" (mixed), as on main\n```\n\n```python\n# TorchTitanGPUModelRunner.load_model\n# before: only models with GDN/KDA layers\nif any(layer.get_attn_backend() is TorchTitanLinearAttentionBackend for layer in mamba_layers):\n    self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n# after: every model\nself.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n\n# TorchTitanCudagraphDispatcher.dispatch, uniform decode in FULL mode\nif num_tokens <= self.max_decode_capture_size:   # decode graph\n    dispatch = self.decode_dispatcher.dispatch\nelif batch_invariant and eager_allowed:          # eager on the decode kernels\n    return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)\n# else: mixed graph, as in stock FULL\n```\n\n**Stack** (4 PRs, merge 1 -> 4; this PR is in **bold**)\n\n| # | PR | Independent? | Needs (stack positions) |\n|---|---|---|---|\n| **1** | **#5704 vLLM generator: decode-specialized FULL graphs for every model, DP>1-safe** | **yes** | **—** |\n| 2 | #5490 FULL CUDA graphs for linear-attention generators at DP>1 | no | 1 |\n| 3 | #5489 vLLM generator: 128-token KV pages when FA4 runs attention | yes | — |\n| 4 | #5706 Muse Spark: use varlen attention in the CP-16 LoRA SFT recipe | yes | — |\n\n**Problem**\n1. **One graph for two batch kinds.** In plain FULL mode, vLLM drops the uniform-decode flag from the graph key (`v1/cudagraph_dispatcher.py:302`, vLLM 9f03b51), so 64 one-token decodes and one 64-token prefill replay the same graph.\n2. **Captured as the mixed batch.** That graph freezes `max_query_len = num_tokens`, which TorchTitan's attention passes to FA4 as the host int `max_seqlen_q`.\n3. **Cost.** FA4 sizes its grid from `max_seqlen_q`: decode attention takes 1.3-2.0x longer from 32 sequences at head dim 64 and from 64 at head dim 128 (GB300).\n4. **Already solved for linear attention.** `TorchTitanCudagraphDispatcher` adds decode keys in FULL mode, but the runner installs it only for models with GDN/KDA layers.\n5. **DP>1.** vLLM pads a decoding rank to the busiest rank's token count and then allows only FULL (`v1/worker/gpu_model_runner.py:4038-4048`, vLLM 9f03b51); a decode batch above every decode key then asserts (`v1/cudagraph_dispatcher.py:320`).\n\n**Solution**\n1. `TorchTitanGPUModelRunner.load_model` installs `TorchTitanCudagraphDispatcher` for every model; decode batches get FULL graphs captured with `max_seqlen_q = 1`.\n2. `dispatch`, for a uniform-decode batch in FULL mode:\n   ```text\n   num_tokens <= max_decode_capture_size          -> decode graph\n   larger (DP padding, or a capture-size gap)     -> mixed graph, as in stock FULL\n   larger, batch-invariant, eager allowed         -> eager on the decode kernels (GDN/KDA's packed kernels\n                                                     in the mixed graph don't match them bitwise)\n   ```\n3. KV cache: vLLM's graph-memory estimate, which comes out of the KV cache, charges every FULL graph like the second-largest one (`v1/worker/gpu_model_runner.py:6740-6771`, `v1/worker/gpu_worker.py:619-623`). The 11 decode graphs (0.03 GiB) would cost Qwen3-8B TP2 2.6% of its KV tokens, so `TorchTitanGPUModelRunner.initialize_kv_cache` drops the decode keys from the profiling pass. vLLM discards those profiling keys anyway, and the real pass rebuilds them, decode keys included.\n4. Unchanged: prefill and mixed graphs, FULL_DECODE_ONLY and eager modes.\n\n**Results**\n```text\nNumerics: bitwise identical. The real generator's tokens + logprobs (24 greedy requests x 24 tokens, sha256 per rank)\n          match main's: Qwen3-8B TP2 e73b7da70eb6ce7b both; Qwen3-30B-A3B DP2 x EP2 334e973c003b5e13 both, with rank 0\n          prefilling 16000 tokens while rank 1 decodes.\n\nGB300, TorchTitan's vLLM engine (VLLMEngine, FULL graphs, max_num_seqs 1024, max_num_batched_tokens 16384, graphs up\nto 16384 tokens). Decode step = median engine.step() wall over 20 steady steps; prefill = one prompt, add -> finished.\nDecode, prefill and Qwen3-30B rows ran on the previous revision (8e6f60bae, before the initialize_kv_cache change, which\nonly touches profiling-time keys); the KV row and the sha ran at this code.\nQwen3-8B, TP 2, decode at 2048-token context (2 interleaved runs, a / b), ms\nbatch     main          this PR       delta\n1         3.67 / 3.70   3.68 / 3.62   +0% / -2%\n2         3.85 / 3.86   3.85 / 3.86   +0% / -0%\n4         3.85 / 3.85   3.84 / 3.85   -0% / -0%\n8         3.96 / 3.95   3.96 / 3.96   +0% / +0%\n16        4.12 / 4.17   4.29 / 4.41   +4% / +6%   (host noise, see NOTE)\n32        4.27 / 4.27   4.29 / 4.28   +1% / +0%\n64        5.87 / 5.88   5.86 / 5.16   -0% / -12%  (host noise, see NOTE)\n128       9.05 / 9.10   7.06 / 7.05   -22% / -23%\n256      14.05 / 14.13 10.28 / 10.30  -27% / -27%\n512      24.72 / 24.69 17.79 / 17.83  -28% / -28%\n1024     46.97 / 47.02 33.15 / 33.10  -29% / -30%\nprefill  2k / 4k / 8k / 16k tokens: 21.1 / 34.7 / 65.0 / 134.2 -> 20.7 / 34.6 / 65.5 / 135.0 (unchanged)\nKV cache, gpu_memory_utilization 0.85: 3,125,104 tokens -> 3,125,104 (graph-memory estimate 8.59 GiB both; real capture 1.57 -> 1.60 GiB)\n\nQwen3-30B-A3B-Base, DP 2 x EP 2 (Dist-MoE), decode at 512-token context (measured at these batch sizes only), ms\nbatch    1      4      16     64     256     1024\nmain     7.54   7.96   8.53   9.92   16.73   33.57\nthis PR  7.52   7.93   8.52   9.17   13.43   24.80     (-8% at 64, -20% at 256, -26% at 1024)\nprefill  2k / 4k / 8k / 16k tokens: 36.7 / 54.7 / 91.5 / 191.1 -> 36.1 / 54.6 / 91.2 / 190.1 (unchanged)\nDP check: while rank 0 prefills a 16000-token chunk, rank 1 is padded to 16384 tokens and replays the 16384-token\nmixed graph (no assert); every other decode step replays a decode graph.\n```\nDecode attention kernel alone (FA4 general kernel, 16-token pages, max_seqlen_q = batch -> 1, GB300, earlier main; geomean of time at batch 32-1024):\n```text\nhd128 32q/8kv (Qwen3-8B, TP1)        0.729\nhd64 16q/2kv + sink (gpt-oss, TP4)   0.618\nhd64 128q/16kv (TP1)                 0.568\nbatch 1-16: 1.000-1.002 for all three\n```\n- Every timed decode step replayed a decode graph (218-220 of 220; 2 steps at batch 1024 still carried prefill tokens); on main all replayed the mixed graph.\n- The gain grows with context: at 512-token context the same Qwen3-8B TP2 gains -5% / -1% / -1% at batch 256 / 512 / 1024 (one run), since attention is a smaller share of the step.\n- Training: not touched (generator only).\n\nYou may ask: why not switch TorchTitan to FULL_AND_PIECEWISE? TorchTitan captures with `CompilationMode.NONE` so vLLM's Inductor compile doesn't nest inside local compile, and without piecewise compilation vLLM turns FULL_AND_PIECEWISE into FULL_DECODE_ONLY, which runs prefill and mixed steps eager.\nYou may ask: why not fix vLLM? Plain FULL is one graph per size by design; decode specialization is what its split modes are for, and those need piecewise compilation. The dispatcher delegates to vLLM's own FULL_DECODE_ONLY dispatcher, so it can go once vLLM offers FULL decode next to FULL mixed graphs.\n\nNOTE: Cost: one more graph per decode batch size up to `max_num_seqs` (11 at 1024), 0.03 GiB in total for Qwen3-8B TP2. Engine init: Qwen3-8B TP2 52-65 s -> 58-68 s; Qwen3-30B-A3B DP2 x EP2 104 -> 141 s (one run each).\nNOTE: GDN/KDA models already captured decode graphs on main; the estimate now drops those too, so their KV cache grows a little (Qwen3.5-35B-A3B's 9 decode graphs take 0.12 GiB when captured alone). Qwen3-30B-A3B lost 1.0% of its KV tokens on the previous revision: one rank's weights + non-torch memory read 35.69 GiB vs 34.48 on main (the other rank 34.48 both), and its graph estimate grew only 0.08 GiB.\nNOTE: Batch 16-64 step times are host noise: batch 16 was +4% / +6% / -3% across three runs and 64 -0% / -12%, while GPU kernel time per step matches (profiled, rank 0, 10 steps: 4137 vs 4133 us at batch 16, the same kernels and counts).\nNOTE: CI's A10G (FA2) multi-GPU job passes TestBitwiseParityVarlen, Flex and Qwen35DebugVarlen with the new decode graphs. The new DP test needs SM90+: the MoE debug model's `torch._grouped_mm` copies to the host under CUDA graph capture before SM90. So it runs in the H100 RL job (`ciflow/rl`) and is skipped below SM90.\n\n**Test plan**\n```bash\npytest tests/rl/unit_tests/cpu/test_generator.py -k full_mode_decode_dispatch   # new, 5 cases; 2 fail without the bound, 1 without the batch-invariant branch\npytest tests/rl/unit_tests/cpu      # stack head: 510 passed, 9 skipped, 3 failed; the same 3 fail on main in this env:\n                                    # test_dapo_math::test_muse_spark_gb300_recipe_shards_sequences_in_the_trainer_only and\n                                    # test_model_defaults[dapo_math] (torch_checkpointing CallbackArgs ImportError),\n                                    # test_model_defaults[alphabet_sort] (disable_cuda_graphs TypeError)\n# GPU, GB300 (the parity and GDN classes ran on the previous revision; since then comment- and test-only changes + rebase)\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py   # new: 1 passed (GB300, 61 s); in CI's H100 RL job\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityVarlen             # 3 passed (FULL; replays the new decode graphs)\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityFlex               # 3 passed (flex decode now replays decode graphs too)\ntorchrun --nproc-per-node=2 -m pytest tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityQwen35DebugVarlen   # 4 passed\npytest tests/rl/unit_tests/gpu/test_gdn_cudagraph.py tests/rl/unit_tests/gpu/test_gdn_graph_metadata.py                 # 12 passed\n```\n- The new DP test: Qwen3 MoE debug model, DP = world size, batch-invariant, FULL graphs. Each rank's completions must not change when rank 0 prefills a 1500-token prompt next to their decodes, and the other ranks must replay a mixed graph above the largest decode graph.\n- Real-generator numbers above: a 2-GPU script that builds TorchTitan's `VLLMEngine` and records every step's dispatch (graph mode, padded tokens, decode or mixed) and the KV cache size.\n\n",
+    "changed_files": 4,
+    "closed_at": null,
+    "comments": 4,
+    "comments_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5704/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5704/commits",
+    "created_at": "2026-10-29T21:16:22Z",
+    "deletions": 25,
+    "diff_url": "https://github.com/pytorch/torchtitan/pull/5704.diff",
+    "draft": true,
+    "head": {
+      "label": "pytorch:felipemello1/decode-graphs/1-decode-specialized-full-graphs",
+      "ref": "felipemello1/decode-graphs/1-decode-specialized-full-graphs",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1074,
+        "forks_count": 1074,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 383,
+        "open_issues_count": 383,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-11-04T17:45:15Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 202350,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5877,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-11-04T17:45:19Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5877,
+        "watchers_count": 5877,
+        "web_commit_signoff_required": false
+      },
+      "sha": "0202a34a36fa030138c74416589a8af963975c45",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5704",
+    "id": 5075665247,
+    "issue_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5704",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "009900",
+        "default": false,
+        "description": "This label is managed by the Meta Open Source bot.",
+        "id": 6319105129,
+        "name": "CLA Signed",
+        "node_id": "LA_kwDOK5EkJM8AAAABeKXkaQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/CLA%20Signed"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10889347594,
+        "name": "ciflow/rl",
+        "node_id": "LA_kwDOK5EkJM8AAAACiQ5CCg",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/rl"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": null,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOK5EkJM8AAAABLoiBXw",
+    "number": 5704,
+    "patch_url": "https://github.com/pytorch/torchtitan/pull/5704.patch",
+    "rebaseable": null,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}",
+    "review_comments": 6,
+    "review_comments_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5704/comments",
+    "stack": {
+      "base": {
+        "ref": "main",
+        "sha": "ad7a9937b5e57ccadebbb98b3eb14ff139ceb2b3"
+      },
+      "id": 2811926,
+      "number": 5705,
+      "position": 1,
+      "size": 4
+    },
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/0202a34a36fa030138c74416589a8af963975c45",
+    "title": "[rl] vLLM generator: decode-specialized FULL graphs for every model, DP>1-safe",
+    "updated_at": "2026-11-03T06:09:32Z",
+    "url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5704",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+      "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+      "followers_url": "https://api.github.com/users/felipemello1/followers",
+      "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+      "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/felipemello1",
+      "id": 23004953,
+      "login": "felipemello1",
+      "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+      "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+      "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+      "repos_url": "https://api.github.com/users/felipemello1/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/felipemello1",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/0202a34a36fa030138c74416589a8af963975c45/.github%2Fworkflows%2Fintegration_test_rl_h100.yaml",
+      "changes": 2,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/.github%2Fworkflows%2Fintegration_test_rl_h100.yaml?ref=0202a34a36fa030138c74416589a8af963975c45",
+      "deletions": 0,
+      "filename": ".github/workflows/integration_test_rl_h100.yaml",
+      "patch": "@@ -81,6 +81,8 @@ jobs:\n \n         RL_TEST_DUMP_FOLDER=\"$OUTPUT_DIR\" torchrun --nproc-per-node=1 -m pytest \\\n           tests/rl/unit_tests/gpu/test_bitwise_parity.py::TestBitwiseParityKimiK3DebugVarlen -v\n+        torchrun --nproc-per-node=2 -m pytest \\\n+          tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py::test_vllm_dp_decode_graphs_with_prefilling_peer -v\n \n         python -m tests.integration_tests.run_tests \"$OUTPUT_DIR/integration\" \\\n           --ngpu 8 --test_suite rl_h100",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/0202a34a36fa030138c74416589a8af963975c45/.github%2Fworkflows%2Fintegration_test_rl_h100.yaml",
+      "sha": "b42a43f2731f1f132b84f26977b0a2fe46cb6f1a",
+      "status": "modified"
+    },
+    {
+      "additions": 53,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/0202a34a36fa030138c74416589a8af963975c45/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_generator.py",
+      "changes": 53,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_generator.py?ref=0202a34a36fa030138c74416589a8af963975c45",
+      "deletions": 0,
+      "filename": "tests/rl/unit_tests/cpu/test_generator.py",
+      "patch": "@@ -58,13 +58,22 @@\n from torchtitan.rl.generator.vllm.registry import register_to_vllm\n from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder\n from torchtitan.rl.generator.vllm.worker import (\n+    TorchTitanCudagraphDispatcher,\n     TorchTitanGPUModelRunner,\n     TorchTitanGPUWorker,\n )\n from torchtitan.rl.observability import metrics as m\n from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter\n from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy\n from vllm import SamplingParams\n+from vllm.config import (\n+    CompilationConfig,\n+    CompilationMode,\n+    CUDAGraphMode,\n+    DeviceConfig,\n+    SchedulerConfig,\n+    VllmConfig,\n+)\n from vllm.exceptions import VLLMValidationError\n from vllm.logprobs import FlatLogprobs, Logprob\n from vllm.sampling_params import RequestOutputKind\n@@ -817,6 +826,50 @@ def test_sequence_parallel_padding_rounds_runner_tokens(\n     )\n \n \n+@pytest.mark.parametrize(\n+    \"num_tokens,valid_modes,batch_invariant,expected\",\n+    [\n+        (2, None, False, (CUDAGraphMode.FULL, True)),\n+        # 3 decodes pad to 8, past the largest decode graph (2): mixed graph.\n+        (3, None, False, (CUDAGraphMode.FULL, False)),\n+        # Batch-invariant runs keep them eager on the decode kernels.\n+        (3, None, True, (CUDAGraphMode.NONE, False)),\n+        # DP sync pads a decoding rank to a peer's batch and allows only FULL:\n+        # a decode graph up to the largest one, else the mixed graph.\n+        (2, {CUDAGraphMode.FULL}, False, (CUDAGraphMode.FULL, True)),\n+        (16, {CUDAGraphMode.FULL}, True, (CUDAGraphMode.FULL, False)),\n+    ],\n+)\n+def test_full_mode_decode_dispatch(\n+    monkeypatch, num_tokens, valid_modes, batch_invariant, expected\n+):\n+    monkeypatch.setattr(\n+        \"torchtitan.rl.generator.vllm.worker.is_in_batch_invariant_mode\",\n+        lambda: batch_invariant,\n+    )\n+    # An explicit device: CPU CI has no platform for vLLM to infer one from.\n+    config = VllmConfig(device_config=DeviceConfig(device=\"cpu\"))\n+    config.compilation_config = CompilationConfig(\n+        mode=CompilationMode.NONE,\n+        cudagraph_mode=CUDAGraphMode.FULL,\n+        cudagraph_capture_sizes=[1, 2, 8, 16],\n+        max_cudagraph_capture_size=16,\n+    )\n+    config.scheduler_config = SchedulerConfig(\n+        max_model_len=64,\n+        max_num_seqs=4,\n+        max_num_batched_tokens=16,\n+        is_encoder_decoder=False,\n+    )\n+    dispatcher = TorchTitanCudagraphDispatcher(config)\n+    dispatcher.initialize_cudagraph_keys(CUDAGraphMode.FULL)\n+\n+    mode, descriptor = dispatcher.dispatch(\n+        num_tokens, uniform_decode=True, valid_modes=valid_modes\n+    )\n+    assert (mode, descriptor.uniform) == expected\n+\n+\n def test_only_weights_use_cumem_allocator(monkeypatch):\n     base_worker_cls = TorchTitanGPUWorker.__mro__[1]\n     monkeypatch.setattr(",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/0202a34a36fa030138c74416589a8af963975c45/tests%2Frl%2Funit_tests%2Fcpu%2Ftest_generator.py",
+      "sha": "8f63b0a21322cc354ad9990f4b5537a84e6ef448",
+      "status": "modified"
+    },
+    {
+      "additions": 192,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/0202a34a36fa030138c74416589a8af963975c45/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_generator_dp_cudagraph.py",
+      "changes": 192,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_generator_dp_cudagraph.py?ref=0202a34a36fa030138c74416589a8af963975c45",
+      "deletions": 0,
+      "filename": "tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py",
+      "patch": "@@ -0,0 +1,192 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"vLLM generator at DP > 1 with FULL CUDA graphs (multi-GPU).\n+\n+One torchrun launch per test: like test_bitwise_parity's classes, each test builds a\n+vLLM engine that frees its GPU memory only at process exit.\n+\"\"\"\n+\n+import contextlib\n+import os\n+import shutil\n+import tempfile\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+from torchtitan.config import CommConfig\n+from torchtitan.distributed import utils as dist_utils\n+from torchtitan.models.qwen3 import build_model_config\n+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig\n+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig\n+from torchtitan.rl.generator.vllm.registry import register_to_vllm\n+from torchtitan_recipes.tests.rl.alphabet_sort import (\n+    rl_grpo_qwen3_moe_debug_varlen_batch_invariant,\n+)\n+from vllm import SamplingParams\n+from vllm.config import CUDAGraphMode\n+from vllm.sampling_params import RequestOutputKind\n+\n+from tests.rl.unit_tests.gpu.test_bitwise_parity import (\n+    _make_prompt_tokens,\n+    build_inference_engine,\n+)\n+\n+# Runs under a torchrun launch with two or more GPUs.\n+pytestmark = pytest.mark.multi_gpu\n+\n+# Rank 0's long prompt; the other ranks are padded to its prefill chunk.\n+LONG_PROMPT_TOKENS = 1500\n+\n+# The MoE debug models' torch._grouped_mm copies to the host under CUDA graph capture\n+# before SM90, so FULL graphs can't be captured there.\n+requires_sm90 = pytest.mark.skipif(\n+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),\n+    reason=\"FULL graphs of the MoE debug models need SM90+\",\n+)\n+\n+\n+def _run(engine, prefix, prompts, params, *, long_prompt=None):\n+    \"\"\"Run ``prompts`` to completion; ``long_prompt`` joins at the third step.\"\"\"\n+    for index, prompt in enumerate(prompts):\n+        engine.add_request(f\"{prefix}{index}\", {\"prompt_token_ids\": prompt}, params)\n+    outputs = {}\n+    step = 0\n+    while engine.has_unfinished_requests():\n+        if step == 2 and long_prompt is not None:\n+            engine.add_request(\n+                f\"{prefix}long\",\n+                {\"prompt_token_ids\": long_prompt},\n+                SamplingParams(max_tokens=1, output_kind=RequestOutputKind.FINAL_ONLY),\n+            )\n+        for output in engine.step():\n+            if output.request_id == f\"{prefix}long\":\n+                continue\n+            sample = output.outputs[0]\n+            outputs[output.request_id.removeprefix(prefix)] = (\n+                list(sample.token_ids),\n+                [next(iter(logprobs.values())).logprob for logprobs in sample.logprobs],\n+            )\n+        step += 1\n+    return outputs\n+\n+\n+def _world_size() -> int:\n+    world_size = (\n+        dist.get_world_size()\n+        if dist.is_initialized()\n+        else int(os.environ.get(\"WORLD_SIZE\", \"1\"))\n+    )\n+    if world_size < 2:\n+        pytest.skip(f\"requires at least 2 GPUs, got {world_size}\")\n+    return world_size\n+\n+\n+@contextlib.contextmanager\n+def _dp_engine(config):\n+    \"\"\"Build the generator's engine; yield it, its dispatch records and the largest decode graph.\"\"\"\n+    generator = config.generator\n+    temporary_dump_folder = None\n+    if not dist.is_initialized():\n+        temporary_dump_folder = tempfile.mkdtemp(prefix=\"rl_generator_dp_\")\n+        dist_utils.init_distributed(CommConfig(), base_folder=temporary_dump_folder)\n+    register_to_vllm(\n+        generator.model, parallelism=generator.parallelism, checkpointer_config=None\n+    )\n+    engine = build_inference_engine(config)\n+    records = []\n+\n+    def instrument(worker):\n+        runner = worker.model_runner\n+        original = runner._determine_batch_execution_and_padding\n+\n+        def record(num_tokens, *args, **kwargs):\n+            result = original(num_tokens, *args, **kwargs)\n+            mode, descriptor = result[:2]\n+            records.append((mode, descriptor.num_tokens, descriptor.uniform))\n+            return result\n+\n+        runner._determine_batch_execution_and_padding = record\n+        return runner.cudagraph_dispatcher.max_decode_capture_size\n+\n+    try:\n+        (max_decode_capture_size,) = engine.collective_rpc(instrument)\n+        yield engine, records, max_decode_capture_size\n+    finally:\n+        if dist.is_initialized():\n+            dist.barrier()\n+        renderer = getattr(engine, \"renderer\", None)\n+        if renderer is not None:\n+            renderer.shutdown()\n+        if temporary_dump_folder is not None:\n+            shutil.rmtree(temporary_dump_folder, ignore_errors=True)\n+\n+\n+def _greedy_params() -> SamplingParams:\n+    return SamplingParams(\n+        temperature=0.0,\n+        max_tokens=16,\n+        ignore_eos=True,\n+        logprobs=1,\n+        output_kind=RequestOutputKind.FINAL_ONLY,\n+    )\n+\n+\n+@requires_sm90\n+def test_vllm_dp_decode_graphs_with_prefilling_peer():\n+    \"\"\"A decoding DP rank replays decode graphs, and the mixed graph when padded to a peer's prefill.\n+\n+    Batch-invariant mode makes each rank's completions independent of the other\n+    ranks' load, so they must not change when rank 0 prefills a long prompt\n+    while the others decode.\n+    \"\"\"\n+    world_size = _world_size()\n+    config = rl_grpo_qwen3_moe_debug_varlen_batch_invariant()\n+    generator = config.generator\n+    # Every DP rank holds every expert: the local MoE path captures in FULL graphs.\n+    generator.parallelism = InferenceParallelismConfig(data_parallel_degree=world_size)\n+    generator.model = build_model_config(\n+        \"debugmodel_moe\",\n+        seq_len=2048,\n+        attn_backend=\"varlen\",\n+        parallelism=generator.parallelism.to_training(),\n+    )\n+    # Local compile regions do not support batch-invariant mode.\n+    generator.model.local_compile.regions = []\n+    generator.engine.cuda_graph = VLLMCudaGraphConfig(mode=\"FULL\")\n+    generator.gpu_memory_limit = 0.5\n+\n+    with _dp_engine(config) as (engine, records, max_decode_capture_size):\n+        prompts = _make_prompt_tokens(3, 64, engine.get_tokenizer())\n+        alone = _run(engine, \"alone\", prompts, _greedy_params())\n+        alone_records = records[:]\n+        records.clear()\n+        engine.reset_prefix_cache()\n+        long_prompt = None\n+        if dist.get_rank() == 0:\n+            long_prompt = _make_prompt_tokens(\n+                1, LONG_PROMPT_TOKENS, engine.get_tokenizer()\n+            )[0]\n+        beside_prefill = _run(\n+            engine, \"beside\", prompts, _greedy_params(), long_prompt=long_prompt\n+        )\n+\n+        assert beside_prefill == alone\n+        assert any(\n+            mode == CUDAGraphMode.FULL and uniform for mode, _, uniform in alone_records\n+        ), alone_records\n+        if dist.get_rank() != 0:\n+            # Padded to rank 0's long-prompt chunk, past the largest decode graph: the\n+            # mixed graph. (A rank's own short prefill also replays a mixed graph.)\n+            assert max_decode_capture_size < LONG_PROMPT_TOKENS\n+            assert any(\n+                mode == CUDAGraphMode.FULL\n+                and num_tokens >= LONG_PROMPT_TOKENS\n+                and not uniform\n+                for mode, num_tokens, uniform in records\n+            ), records",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/0202a34a36fa030138c74416589a8af963975c45/tests%2Frl%2Funit_tests%2Fgpu%2Ftest_generator_dp_cudagraph.py",
+      "sha": "244ea37dc50cd94bf413744931b84059a67fe0f6",
+      "status": "added"
+    },
+    {
+      "additions": 51,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/0202a34a36fa030138c74416589a8af963975c45/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fworker.py",
+      "changes": 76,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fworker.py?ref=0202a34a36fa030138c74416589a8af963975c45",
+      "deletions": 25,
+      "filename": "torchtitan/rl/generator/vllm/worker.py",
+      "patch": "@@ -9,35 +9,42 @@\n from collections.abc import Set\n from contextlib import nullcontext\n \n-from vllm.config import CUDAGraphMode, get_layers_from_vllm_config\n+from vllm.config import CUDAGraphMode\n from vllm.forward_context import BatchDescriptor\n-from vllm.model_executor.layers.mamba.abstract import MambaBase\n from vllm.utils.math_utils import round_up\n from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher\n from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner\n from vllm.v1.worker.gpu_model_runner import GPUModelRunner\n from vllm.v1.worker.gpu_worker import Worker as GPUWorker\n \n-from torchtitan.rl.generator.vllm.linear_attention import (\n-    TorchTitanLinearAttentionBackend,\n-)\n+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode\n \n \n class TorchTitanCudagraphDispatcher(CudagraphDispatcher):\n-    \"\"\"Keep native FULL descriptors distinct for packed linear attention and fused decode.\n-\n-    Currently installed only for TorchTitan's Attention Gym linear attention\n-    backends (GDN/KDA).\n-    vLLM at c6fa1f0 erases the uniform-decode discriminator in FULL mode:\n-    four one-token decodes collide with one four-token prefill. Attention Gym's\n-    different numerical paths need distinct keys. Delegate decode keys to the\n-    native FULL_DECODE_ONLY dispatcher until upstream supports FULL decode\n-    specialization; native capture, replay and graph ownership stay intact.\n+    \"\"\"Give decode batches their own FULL graphs, apart from prefill and mixed batches.\n+\n+    vLLM at 9f03b51 keys plain FULL graphs by token count only: four one-token\n+    decodes replay the graph captured for one four-token prefill, with\n+    ``max_query_len = 4`` frozen in. Decode needs its own graph:\n+      - Attention Gym linear attention (GDN/KDA) runs different decode kernels.\n+      - FA4 sizes its grid from ``max_query_len``: decode attention runs 1.3-2.0x\n+        longer from 32-64 sequences (GB300, 16-token pages).\n+\n+    Uniform-decode batch in FULL mode:\n+      num_tokens <= max_decode_capture_size              -> decode graph\n+      larger (DP padding, or a capture-size gap)         -> mixed graph, as in stock FULL\n+      larger, batch-invariant, eager allowed             -> eager on the decode kernels\n+\n+    Decode keys come from the native FULL_DECODE_ONLY dispatcher; native capture,\n+    replay and graph ownership stay intact.\n+    TODO: drop this class once vLLM captures FULL decode graphs next to FULL mixed\n+    graphs without piecewise compilation.\n     The single-token key also covers fresh requests: initialization is GPU mask\n     data, not another dispatch key or a reason to switch to packed arithmetic.\n \n     This costs one additional graph capture per decode-specialized batch size\n-    and additional memory for the expanded graph pool.\n+    (11 at max_num_seqs 1024); ``TorchTitanGPUModelRunner.initialize_kv_cache``\n+    keeps them out of vLLM's graph-memory estimate.\n     \"\"\"\n \n     def initialize_cudagraph_keys(\n@@ -49,9 +56,13 @@ def initialize_cudagraph_keys(\n             self.decode_dispatcher.initialize_cudagraph_keys(\n                 CUDAGraphMode.FULL_DECODE_ONLY, uniform_decode_query_len\n             )\n+            self.max_decode_capture_size = 0\n             for mode, descriptors in self.decode_dispatcher.get_capture_descs():\n                 for descriptor in descriptors:\n                     self.add_cudagraph_key(mode, descriptor)\n+                    self.max_decode_capture_size = max(\n+                        self.max_decode_capture_size, descriptor.num_tokens\n+                    )\n \n     def dispatch(\n         self,\n@@ -68,7 +79,13 @@ def dispatch(\n             and self.cudagraph_mode == CUDAGraphMode.FULL\n             and uniform_decode\n         ):\n-            dispatch = self.decode_dispatcher.dispatch\n+            if num_tokens <= self.max_decode_capture_size:\n+                dispatch = self.decode_dispatcher.dispatch\n+            elif is_in_batch_invariant_mode() and (\n+                valid_modes is None or CUDAGraphMode.NONE in valid_modes\n+            ):\n+                # GDN/KDA's packed kernels in the mixed graph don't match decode bitwise.\n+                return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)\n         return dispatch(\n             num_tokens,\n             uniform_decode,\n@@ -80,18 +97,27 @@ def dispatch(\n \n \n class TorchTitanGPUModelRunner(GPUModelRunner):\n-    \"\"\"V1 runner with sequence-parallel padding and linear attention (GDN/KDA) decode specialization.\"\"\"\n+    \"\"\"V1 runner with sequence-parallel padding and FULL-graph decode specialization.\"\"\"\n \n     def load_model(self, load_dummy_weights: bool = False) -> None:\n         super().load_model(load_dummy_weights)\n-        if any(\n-            layer.get_attn_backend() is TorchTitanLinearAttentionBackend\n-            for layer in get_layers_from_vllm_config(\n-                self.vllm_config, MambaBase\n-            ).values()\n-        ):\n-            assert not self.cudagraph_dispatcher.keys_initialized\n-            self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+        assert not self.cudagraph_dispatcher.keys_initialized\n+        self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+\n+    def initialize_kv_cache(\n+        self, kv_cache_config, is_profiling: bool = False, **kwargs\n+    ):\n+        super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)\n+        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph\n+        # like the second largest (a mixed graph). Decode graphs take far less (Qwen3-8B TP2:\n+        # 11 of them add 0.03 GiB to 1.57), so profile the mixed graphs only. vLLM drops\n+        # these profiling keys afterwards; the real call rebuilds them, decode keys included\n+        # (test_generator_dp_cudagraph.py checks a decode graph still replays).\n+        # TODO: drop once vLLM's estimate charges decode graphs at their own size.\n+        dispatcher = self.cudagraph_dispatcher\n+        if is_profiling and dispatcher.cudagraph_mode == CUDAGraphMode.FULL:\n+            keys = dispatcher.cudagraph_keys[CUDAGraphMode.FULL]\n+            keys -= {key for key in keys if key.uniform}\n \n     def _determine_batch_execution_and_padding(self, num_tokens: int, *args, **kwargs):\n         \"\"\"Tell the model how many of this step's tokens are real, before padding.",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/0202a34a36fa030138c74416589a8af963975c45/torchtitan%2Frl%2Fgenerator%2Fvllm%2Fworker.py",
+      "sha": "39eb17055cf51617625a0159cc49fc6e0d7727f1",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "This class now works around a vLLM gap for every model (FULL decode graphs next to FULL mixed graphs without piecewise compilation), but the docstring only says \"until upstream supports\" and gives no issue to track. CLAUDE.md principle 3 asks for a `TODO` with an upstream issue link here, so it gets deleted once vLLM ships the feature. Please file the vLLM issue (or link an existing one) and turn this sentence into `TODO(<link>): ...`.",
+      "created_at": "2026-10-29T21:20:28Z",
+      "diff_hunk": "@@ -9,35 +9,41 @@\n from collections.abc import Set\n from contextlib import nullcontext\n \n-from vllm.config import CUDAGraphMode, get_layers_from_vllm_config\n+from vllm.config import CUDAGraphMode\n from vllm.forward_context import BatchDescriptor\n-from vllm.model_executor.layers.mamba.abstract import MambaBase\n from vllm.utils.math_utils import round_up\n from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher\n from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner\n from vllm.v1.worker.gpu_model_runner import GPUModelRunner\n from vllm.v1.worker.gpu_worker import Worker as GPUWorker\n \n-from torchtitan.rl.generator.vllm.linear_attention import (\n-    TorchTitanLinearAttentionBackend,\n-)\n+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode\n \n \n class TorchTitanCudagraphDispatcher(CudagraphDispatcher):\n-    \"\"\"Keep native FULL descriptors distinct for packed linear attention and fused decode.\n-\n-    Currently installed only for TorchTitan's Attention Gym linear attention\n-    backends (GDN/KDA).\n-    vLLM at c6fa1f0 erases the uniform-decode discriminator in FULL mode:\n-    four one-token decodes collide with one four-token prefill. Attention Gym's\n-    different numerical paths need distinct keys. Delegate decode keys to the\n-    native FULL_DECODE_ONLY dispatcher until upstream supports FULL decode\n-    specialization; native capture, replay and graph ownership stay intact.\n+    \"\"\"Give decode batches their own FULL graphs, apart from prefill and mixed batches.\n+\n+    vLLM at 9f03b51 keys plain FULL graphs by token count only: four one-token\n+    decodes replay the graph captured for one four-token prefill, with\n+    ``max_query_len = 4`` frozen in. Decode needs its own graph:\n+      - Attention Gym linear attention (GDN/KDA) runs different decode kernels.\n+      - FA4 sizes its grid from ``max_query_len``: decode attention runs 1.3-2.0x\n+        longer from 32-64 sequences (GB300, 16-token pages).\n+\n+    Uniform-decode batch in FULL mode:\n+      num_tokens <= max_decode_capture_size              -> decode graph\n+      larger (DP padding, or a capture-size gap)         -> mixed graph, as in stock FULL\n+      larger, batch-invariant, eager allowed             -> eager on the decode kernels\n+\n+    Delegate decode keys to the native FULL_DECODE_ONLY dispatcher until upstream\n+    supports FULL decode specialization; native capture, replay and graph\n+    ownership stay intact.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418018982",
+      "id": 4418018982,
+      "line": null,
+      "original_line": 40,
+      "path": "torchtitan/rl/generator/vllm/worker.py",
+      "updated_at": "2026-10-29T21:20:54Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "This changes vLLM's graph-memory estimate by editing the dispatcher's key set in the middle of `initialize_kv_cache`. It depends on two vLLM internals: (a) the estimate reads `cudagraph_keys` after this call returns, and (b) the real (non-profiling) call re-runs `initialize_cudagraph_keys`. If a vLLM bump breaks (b), decode graphs silently stop being captured and you lose the speedup without any error. If it breaks (a), the KV cache shrinks by about 2.6% and nothing reports it either.\n\nTwo cheap fixes:\n- Mark this as a `TODO(<vLLM issue>)`: upstream should estimate each graph kind separately instead of charging every FULL graph like the second largest.\n- Add an assert or test that the decode keys exist after the real `initialize_kv_cache`. The new GPU test's `any(mode == FULL and uniform ...)` check already covers (b) at DP 2, so a short comment pointing to that test is enough for (b).",
+      "created_at": "2026-10-29T21:20:33Z",
+      "diff_hunk": "@@ -80,18 +96,25 @@ def dispatch(\n \n \n class TorchTitanGPUModelRunner(GPUModelRunner):\n-    \"\"\"V1 runner with sequence-parallel padding and linear attention (GDN/KDA) decode specialization.\"\"\"\n+    \"\"\"V1 runner with sequence-parallel padding and FULL-graph decode specialization.\"\"\"\n \n     def load_model(self, load_dummy_weights: bool = False) -> None:\n         super().load_model(load_dummy_weights)\n-        if any(\n-            layer.get_attn_backend() is TorchTitanLinearAttentionBackend\n-            for layer in get_layers_from_vllm_config(\n-                self.vllm_config, MambaBase\n-            ).values()\n-        ):\n-            assert not self.cudagraph_dispatcher.keys_initialized\n-            self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+        assert not self.cudagraph_dispatcher.keys_initialized\n+        self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+\n+    def initialize_kv_cache(\n+        self, kv_cache_config, is_profiling: bool = False, **kwargs\n+    ):\n+        super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)\n+        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph\n+        # like the second largest (a mixed graph). Decode graphs take far less (Qwen3-8B TP2:\n+        # 11 of them add 0.03 GiB to 1.57), so profile the mixed graphs only. vLLM drops\n+        # these profiling keys afterwards; the real call rebuilds them, decode keys included.\n+        dispatcher = self.cudagraph_dispatcher\n+        if is_profiling and dispatcher.cudagraph_mode == CUDAGraphMode.FULL:\n+            keys = dispatcher.cudagraph_keys[CUDAGraphMode.FULL]\n+            keys -= {key for key in keys if key.uniform}",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418019661",
+      "id": 4418019661,
+      "line": 120,
+      "original_line": 117,
+      "path": "torchtitan/rl/generator/vllm/worker.py",
+      "updated_at": "2026-10-29T21:20:54Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "This imports `_make_prompt_tokens`, a private helper, from another test module. CLAUDE.md's naming rule says not to import another module's `_private` names. Either drop the underscore in `test_bitwise_parity.py`, since it now has two consumers, or inline the few lines this test needs.",
+      "created_at": "2026-10-29T21:20:36Z",
+      "diff_hunk": "@@ -0,0 +1,185 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"vLLM generator at DP > 1 with FULL CUDA graphs (multi-GPU).\n+\n+One torchrun launch per test: like test_bitwise_parity's classes, each test builds a\n+vLLM engine that frees its GPU memory only at process exit.\n+\"\"\"\n+\n+import contextlib\n+import os\n+import shutil\n+import tempfile\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+from torchtitan.config import CommConfig\n+from torchtitan.distributed import utils as dist_utils\n+from torchtitan.models.qwen3 import build_model_config\n+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig\n+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig\n+from torchtitan.rl.generator.vllm.registry import register_to_vllm\n+from torchtitan_recipes.tests.rl.alphabet_sort import (\n+    rl_grpo_qwen3_moe_debug_varlen_batch_invariant,\n+)\n+from vllm import SamplingParams\n+from vllm.config import CUDAGraphMode\n+from vllm.sampling_params import RequestOutputKind\n+\n+from tests.rl.unit_tests.gpu.test_bitwise_parity import (\n+    _make_prompt_tokens,\n+    build_inference_engine,\n+)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418020037",
+      "id": 4418020037,
+      "line": 38,
+      "original_line": 38,
+      "path": "tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py",
+      "updated_at": "2026-10-29T21:20:54Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: Added a TODO to the class docstring (1c3e0b3b8). No vLLM issue exists yet; filing one is Felipe's call, so the TODO has no link for now.",
+      "created_at": "2026-10-29T21:26:44Z",
+      "diff_hunk": "@@ -9,35 +9,41 @@\n from collections.abc import Set\n from contextlib import nullcontext\n \n-from vllm.config import CUDAGraphMode, get_layers_from_vllm_config\n+from vllm.config import CUDAGraphMode\n from vllm.forward_context import BatchDescriptor\n-from vllm.model_executor.layers.mamba.abstract import MambaBase\n from vllm.utils.math_utils import round_up\n from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher\n from vllm.v1.worker import gpu_model_runner as vllm_gpu_model_runner\n from vllm.v1.worker.gpu_model_runner import GPUModelRunner\n from vllm.v1.worker.gpu_worker import Worker as GPUWorker\n \n-from torchtitan.rl.generator.vllm.linear_attention import (\n-    TorchTitanLinearAttentionBackend,\n-)\n+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode\n \n \n class TorchTitanCudagraphDispatcher(CudagraphDispatcher):\n-    \"\"\"Keep native FULL descriptors distinct for packed linear attention and fused decode.\n-\n-    Currently installed only for TorchTitan's Attention Gym linear attention\n-    backends (GDN/KDA).\n-    vLLM at c6fa1f0 erases the uniform-decode discriminator in FULL mode:\n-    four one-token decodes collide with one four-token prefill. Attention Gym's\n-    different numerical paths need distinct keys. Delegate decode keys to the\n-    native FULL_DECODE_ONLY dispatcher until upstream supports FULL decode\n-    specialization; native capture, replay and graph ownership stay intact.\n+    \"\"\"Give decode batches their own FULL graphs, apart from prefill and mixed batches.\n+\n+    vLLM at 9f03b51 keys plain FULL graphs by token count only: four one-token\n+    decodes replay the graph captured for one four-token prefill, with\n+    ``max_query_len = 4`` frozen in. Decode needs its own graph:\n+      - Attention Gym linear attention (GDN/KDA) runs different decode kernels.\n+      - FA4 sizes its grid from ``max_query_len``: decode attention runs 1.3-2.0x\n+        longer from 32-64 sequences (GB300, 16-token pages).\n+\n+    Uniform-decode batch in FULL mode:\n+      num_tokens <= max_decode_capture_size              -> decode graph\n+      larger (DP padding, or a capture-size gap)         -> mixed graph, as in stock FULL\n+      larger, batch-invariant, eager allowed             -> eager on the decode kernels\n+\n+    Delegate decode keys to the native FULL_DECODE_ONLY dispatcher until upstream\n+    supports FULL decode specialization; native capture, replay and graph\n+    ownership stay intact.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418073162",
+      "id": 4418073162,
+      "line": null,
+      "original_line": 40,
+      "path": "torchtitan/rl/generator/vllm/worker.py",
+      "updated_at": "2026-10-29T21:26:44Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Reply from claude: Added the TODO, plus a pointer to the guard for (b): test_generator_dp_cudagraph.py asserts a FULL decode graph still replays after the real initialize_kv_cache. (a) shows up only as the KV cache size, which vLLM logs; no test pins it.",
+      "created_at": "2026-10-29T21:26:46Z",
+      "diff_hunk": "@@ -80,18 +96,25 @@ def dispatch(\n \n \n class TorchTitanGPUModelRunner(GPUModelRunner):\n-    \"\"\"V1 runner with sequence-parallel padding and linear attention (GDN/KDA) decode specialization.\"\"\"\n+    \"\"\"V1 runner with sequence-parallel padding and FULL-graph decode specialization.\"\"\"\n \n     def load_model(self, load_dummy_weights: bool = False) -> None:\n         super().load_model(load_dummy_weights)\n-        if any(\n-            layer.get_attn_backend() is TorchTitanLinearAttentionBackend\n-            for layer in get_layers_from_vllm_config(\n-                self.vllm_config, MambaBase\n-            ).values()\n-        ):\n-            assert not self.cudagraph_dispatcher.keys_initialized\n-            self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+        assert not self.cudagraph_dispatcher.keys_initialized\n+        self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)\n+\n+    def initialize_kv_cache(\n+        self, kv_cache_config, is_profiling: bool = False, **kwargs\n+    ):\n+        super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)\n+        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph\n+        # like the second largest (a mixed graph). Decode graphs take far less (Qwen3-8B TP2:\n+        # 11 of them add 0.03 GiB to 1.57), so profile the mixed graphs only. vLLM drops\n+        # these profiling keys afterwards; the real call rebuilds them, decode keys included.\n+        dispatcher = self.cudagraph_dispatcher\n+        if is_profiling and dispatcher.cudagraph_mode == CUDAGraphMode.FULL:\n+            keys = dispatcher.cudagraph_keys[CUDAGraphMode.FULL]\n+            keys -= {key for key in keys if key.uniform}",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418073432",
+      "id": 4418073432,
+      "line": 120,
+      "original_line": 117,
+      "path": "torchtitan/rl/generator/vllm/worker.py",
+      "updated_at": "2026-10-29T21:26:46Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Reply from claude: Keeping it here: test_generator_uneven_decode.py, test_generator_dist_moe_mxfp8.py and cpu/test_generator.py already import _make_prompt_tokens from test_bitwise_parity.py. Renaming it touches those files, so it fits better as its own change.",
+      "created_at": "2026-10-29T21:26:47Z",
+      "diff_hunk": "@@ -0,0 +1,185 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+\"\"\"vLLM generator at DP > 1 with FULL CUDA graphs (multi-GPU).\n+\n+One torchrun launch per test: like test_bitwise_parity's classes, each test builds a\n+vLLM engine that frees its GPU memory only at process exit.\n+\"\"\"\n+\n+import contextlib\n+import os\n+import shutil\n+import tempfile\n+\n+import pytest\n+import torch\n+import torch.distributed as dist\n+\n+from torchtitan.config import CommConfig\n+from torchtitan.distributed import utils as dist_utils\n+from torchtitan.models.qwen3 import build_model_config\n+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig\n+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig\n+from torchtitan.rl.generator.vllm.registry import register_to_vllm\n+from torchtitan_recipes.tests.rl.alphabet_sort import (\n+    rl_grpo_qwen3_moe_debug_varlen_batch_invariant,\n+)\n+from vllm import SamplingParams\n+from vllm.config import CUDAGraphMode\n+from vllm.sampling_params import RequestOutputKind\n+\n+from tests.rl.unit_tests.gpu.test_bitwise_parity import (\n+    _make_prompt_tokens,\n+    build_inference_engine,\n+)",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#discussion_r4418073647",
+      "id": 4418073647,
+      "line": 38,
+      "original_line": 38,
+      "path": "tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py",
+      "updated_at": "2026-10-29T21:26:47Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Reply from claude: @claude please review",
+      "created_at": "2026-10-29T21:17:14Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6508538075",
+      "id": 6508538075,
+      "updated_at": "2026-10-29T21:17:14Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 3m 14s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40956493571)\n\n---\n**Approve -- please address the items before merging** (missing upstream TODO links for the vLLM workarounds, and a private test-helper import): [review](https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview)",
+      "created_at": "2026-10-29T21:17:37Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6508545244",
+      "id": 6508545244,
+      "updated_at": "2026-10-29T21:21:09Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: Pushed 1c3e0b3b8. The new CPU test now builds VllmConfig with DeviceConfig(device=\"cpu\"), since CPU CI has no platform to infer a device from (the RL CPU job failed its 5 cases). It also adds the two TODOs above.\n\nOn the questions:\n- Qwen3-30B KV at head: not re-measured. On the previous revision its graph estimate grew only 0.08 GiB (0.83 -> 0.91). The -1.0% came from one rank's weights + non-torch memory (34.48 -> 35.69 GiB; the other rank was unchanged), so the override can recover at most those 0.08 GiB.\n- Init: one run each. Graph capture is 24 s of the +37 s (40 -> 64 s). A generator initializes once per job, so this is paid once, against -20% / -26% decode step at batch 256 / 1024.",
+      "created_at": "2026-10-29T21:26:49Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6508719386",
+      "id": 6508719386,
+      "updated_at": "2026-10-29T21:26:49Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "Reply from claude: The new DP test failed in CI's A10G multi-GPU job: the MoE debug model's `torch._grouped_mm` copies to the host during CUDA graph capture before SM90 (`moe.py:146` -> `linear.py:453`), so FULL graphs can't be captured there. Both DP tests now run in the H100 RL job (`ciflow/rl`) and are skipped below SM90. The A10G job's parity classes (Varlen, Flex, Qwen3.5 debug) pass with the new decode graphs.",
+      "created_at": "2026-10-30T03:04:44Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#issuecomment-6513932834",
+      "id": 6513932834,
+      "updated_at": "2026-10-30T03:04:44Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "number": 5704,
+  "refs": {
+    "base": {
+      "commit": "ad7a9937b5e57ccadebbb98b3eb14ff139ceb2b3",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "0202a34a36fa030138c74416589a8af963975c45",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "**Verdict: Approve -- please address the items below before merging.** The problem is real and measured, the fix is small and lives in the generator's own vLLM runner, and the DP>1 bound is covered by tests. What's left is TODO links and naming.\n\n**What this PR does.** In plain FULL mode, vLLM keys CUDA graphs by token count alone. So N one-token decodes replay the graph captured for an N-token prefill, which has `max_seqlen_q = N` baked in, and FA4 launches tiles for query rows that don't exist. The GDN/KDA-only `TorchTitanCudagraphDispatcher` already captures separate decode keys; this PR installs it for every model. It also bounds decode dispatch by the largest decode graph, which fixes the assert at DP>1 when a decoding rank is padded to a peer's prefill. Finally, it drops the decode keys from vLLM's profiling-time memory estimate so the KV cache doesn't shrink.\n\n**Example.**\n```text\nQwen3-8B, FULL graphs, 128 decodes:\n  main:    graph \"128 tokens\" (mixed, max_seqlen_q=128)  -> 9.05 ms/step\n  this PR: graph \"128 decodes\" (max_seqlen_q=1)          -> 7.06 ms/step\nDP=2, rank 0 prefills 1500 tokens, rank 1 has 3 decodes, padded to >=1500 tokens, only FULL allowed:\n  decode dispatcher alone: no key above max_num_seqs -> assert\n  this PR: 1500 > max_decode_capture_size            -> stock mixed graph (same as main for non-GDN models)\n```\n\n### Must fix\n1. `torchtitan/rl/generator/vllm/worker.py:38-40` -- the vLLM workaround has no `TODO` with an upstream issue link (principle 3).\n2. `torchtitan/rl/generator/vllm/worker.py:110-117` -- the profiling-key trim depends on two vLLM internals, and either one breaking would fail silently. It needs a `TODO(<vLLM issue>)` and a note that the GPU test guards the rebuild.\n\n### Should consider\n- `tests/rl/unit_tests/gpu/test_generator_dp_cudagraph.py:35-38` -- imports the private `_make_prompt_tokens` from another test module.\n\n### Questions\n- The Qwen3-30B-A3B DP2 x EP2 numbers (1.0% fewer KV tokens, engine init 104 -> 141 s) came from the previous revision. Is the KV loss gone at HEAD now that `initialize_kv_cache` drops the decode keys from the estimate? And is +37 s of generator init acceptable for RL jobs that restart generators?\n\n<details><summary>Details</summary>\n\n- **GDN/KDA at DP>1.** I checked whether the new fall-through to the mixed graph lets batch-invariant GDN runs silently use packed kernels for decodes. It can't today: `TorchTitanLinearAttentionMetadataBuilder.get_cudagraph_support` returns `UNIFORM_BATCH` at DP>1 (`linear_attention.py:75-80`), so those models never reach FULL mode at DP>1. That path belongs to PR 2 of the stack.\n- **Batch-invariant eager branch.** It applies to every model, not only GDN/KDA. For attention-only models the mixed graph matches decode bitwise (the new GPU test checks this at DP 2), so the branch only costs performance there, and only when there is a capture-size gap at DP=1. That case is rare, so it doesn't justify a per-backend gate.\n- **Other modes.** FULL_DECODE_ONLY, NONE and PIECEWISE are unchanged: both `initialize_cudagraph_keys` and `dispatch` branch only on `CUDAGraphMode.FULL`.\n- **Test value.** The CPU test covers the bound and the eager branch. The GPU test covers what the CPU test can't: that vLLM's real DP padding reaches `dispatch` with `uniform_decode=True, valid_modes={FULL}`, and that the decode and mixed graphs give bitwise-identical outputs. It earns its CI entry.\n\n</details>\n\nNot verified: the KV-estimate and graph-rebuild behavior of vLLM 9f03b51 (vLLM source not readable in this environment), and all GPU numbers.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705121115",
+      "id": 5705121115,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-29T21:20:54Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705189975",
+      "id": 5705189975,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-29T21:26:44Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705190282",
+      "id": 5705190282,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-29T21:26:46Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5704#pullrequestreview-5705190555",
+      "id": 5705190555,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-29T21:26:47Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ]
+}

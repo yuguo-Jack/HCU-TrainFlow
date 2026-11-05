@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/experiments/torchft/README.md
-raw_sha256: c34880d0431703971a752863782dd75680656e1d1639d8da1713cca7782e3c0b
+raw_sha256: f14525be1990ddf383f0a313bbca93092ecce5ee6275082a1be969e7f67a8c87
 sources: []
-generated_body_sha256: a97d6dd6b7b66520d8b8bd55dcef0807b8eb5de4996969b5aabae02d4bbb2be6
+generated_body_sha256: 49caebfcd779d1d7a412ab9050a4809bbdb8139196df0066211c49b0e0e9a494
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/experiments/torchft/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/experiments/torchft/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/experiments/torchft/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -112,10 +112,11 @@ Configure fault tolerance in the selected Python recipe.
 
 For all training modes:
 
-- `--fault_tolerance.no-use_async_quorum`: Run the quorum synchronously, so the
-  step waits for the quorum, including any state export or load it performs for
-  healing, before the forward and backward passes. By default the quorum runs in
-  the background of the step.
+- `config.fault_tolerance.use_async_quorum = False` runs a synchronous quorum:
+  the step waits for quorum, including state export/load for healing, before
+  forward/backward. The field is ignored when `semi_sync_method` is set, because
+  semi-sync training always uses a synchronous quorum. The default (`True`) runs
+  the quorum in the background of the step.
 
 [Optional] Only for semi-synchronous training:
 
@@ -132,7 +133,7 @@ trigger recovery before higher-level timeouts kill the process.
 
 | Parameter | Recommended value | Purpose |
 | --- | --- | --- |
-| `fault_tolerance.process_group_timeout_ms` | 60s | Shortest timeout — detects a stalled inter-replica collective (e.g. an allreduce hanging because a peer died). TorchFT catches it and marks the step as errored. Must be shorter than `comm.train_timeout_seconds`: TorchFT's FSDP all-reduce hook runs inline within FSDP ops, blocking the default process-group collectives. |
+| `fault_tolerance.process_group_timeout_ms` | 60000 (60s) | Shortest timeout -- detects a stalled inter-replica collective (e.g. an allreduce hanging because a peer died). TorchFT catches it and marks the step as errored. Must be shorter than `comm.train_timeout_seconds`: TorchFT's FSDP all-reduce hook runs inline within FSDP ops, blocking the default process-group collectives. |
 | `comm.train_timeout_seconds` | 120s | Default process-group timeout for intra-replica FSDP collectives during steady-state training. Must exceed `process_group_timeout_ms` so the TorchFT process group can time out and recover before the watchdog kills the process. |
 | `comm.init_timeout_seconds` | 180s | Same as above, for initialization, with extra buffer for lazy init, data loading, and JIT compilation. |
 | `TORCH_NCCL_NONBLOCKING_TIMEOUT` | 200s | NCCL's internal C++ timeout for non-blocking process-group ops. Must exceed the Python-level timeouts so PyTorch's timeout fires first, allowing graceful handling before NCCL aborts at the C++ level. |

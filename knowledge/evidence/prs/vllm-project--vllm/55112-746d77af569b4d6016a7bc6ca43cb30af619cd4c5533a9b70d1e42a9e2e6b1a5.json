@@ -1,0 +1,408 @@
+{
+  "acquisition": {
+    "detail_binding": "Merged PR detail from original GraphQL row",
+    "graphql_observation": {
+      "artifact": "5b17102bc481b0257594d101e7965315356ceb9fc9e8241a8b96d39bf341d10a",
+      "isPrivate": false,
+      "numbers": [
+        55138,
+        55130,
+        55122,
+        55120,
+        55115,
+        55113,
+        55112,
+        55109
+      ],
+      "observed_at": "2026-11-04T22:25:03.304772+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4760,
+        "resetAt": "2026-11-04T22:47:37Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "938be2d83d1815433ee0e825d2f01349a0fc6a89",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "## Purpose\n\n`copy_kv_cache_blocks_inplace` (the CoW copy for partial prefix-cache hits) skips a KV cache view when another view with the same `data_ptr` has already been copied. That is right for cross-layer KV sharing (identical aliased views) but wrong for hybrid models: the KV cache config puts one layer of each KV cache group on the same tensor, so a Mamba state view and an attention view share a base address while spanning different bytes per block, and whichever view comes first in layer order decides how many bytes of a block get copied.\n\nFor Kimi-K3 (3 KDA groups + 1 MLA group, block_size 5760, kernel page 64) the KDA view `(num_blocks, 1, 1, 814080)` int8 comes first, so the MLA view `(num_blocks*90, 1, 64, 576)` bf16 of the same tensor is skipped and an MLA block copy moves only 814080 of its 6635520 bytes, i.e. the first 706 of 5760 token slots. The whole-storage fast path would hide this, but it is not taken when several tensors live in one allocation.\n\nObserved effect (het-TP PD, TP8 prefill -> TP1 decode, `--prefix-match-unit 128`, GSM8K 5-shot): every prompt's prefill stops at its last 128-token boundary `B` (Mamba align mode caches the state there); on the small-KV prefill engine the request is then preempted and resumes with a local partial prefix-cache hit on its own boundary entry, which redirects every group's block through this CoW copy (any new request with a partial hit takes the same path). The block the request continues in and ships to decode reads `slots [0,707) valid | [707,B) zero | [B,N-1) valid`. Accuracy dropped to 0.72 with a 128-token sawtooth (about 0.2 right after a boundary, 0.95 late in a chunk), only for `B >= 768`, deterministic per prompt and independent of the KDA kernel. Decode-local prefill on TP1 was unaffected because its per-block Mamba state is 8x larger (5653 slots), which is why the problem only showed up with a high-TP prefill engine.\n\n## Fix\n\nKey the dedup on `(device, data_ptr, shape, stride, element_size)`, so only identical aliased views are skipped and every overlaid geometry is copied. Overlaid views copy the same source block, so the extra narrow copy is redundant but harmless.\n\n### Why the deduplication key includes view geometry\n\nThe key answers: \"Has this view's block copy already been performed?\" The same starting address does not imply the same copy coverage.\n\nConsider the layout used by the regression test: four scheduler blocks per tensor region, 64 bytes per block, and two 256-byte tensor regions in one 512-byte storage. Within each region, a narrow Mamba view and a wider attention view start at the same address:\n\n```text\nOne scheduler block:\nbyte offset     0              24                         64\n                |--------------|--------------------------|\nMamba view      |  state data  |\nAttention view  |              full KV data               |\n```\n\nThe two views have these properties:\n\n| Property | Mamba view | Attention view |\n|---|---|---|\n| Device | CPU | CPU |\n| Starting address | A | A |\n| Shape | (4, 1, 1, 24) | (8, 1, 8, 2) |\n| Stride, in elements | (64, 1, 1, 1) | (16, 16, 2, 1) |\n| Element size | 1 byte (int8) | 2 bytes (int16) |\n| Bytes covered per scheduler block | 24 | 64 |\n\nThe attention view splits each scheduler block into two kernel pages: each page contains `1 * 8 * 2 = 16` int16 elements, so the two pages cover `2 * 16 * 2 = 64` bytes.\n\nWhen copying block 0 to block 2, with the Mamba view visited first:\n\n1. **Before the fix:** both views have the key `(device, A)`. The Mamba view copies the first 24 bytes and records the key. The attention view is then skipped, leaving the remaining 40 destination bytes unchanged.\n2. **After the fix:** the views have different geometry keys. The Mamba view copies the first 24 bytes, and the attention view subsequently copies all 64 bytes. The overlapping 24 bytes are copied from the same source block to the same destination block, so the extra copy is redundant but harmless.\n\nThis example deliberately uses two tensor regions in one storage. The whole-storage fast path requires `storage.nbytes() == num_blocks * scheduler_block_stride`; here that is `512 == 4 * 64`, which is false. The fallback copies the current view's logical elements, so the narrow view cannot cover the full attention block. With a single 256-byte region, the whole-storage fast path would copy the full block and hide the bug.\n\nThe new key describes both the starting location and the layout:\n\n```python\nkey = (\n    cache.device,\n    cache.data_ptr(),\n    tuple(cache.shape),\n    tuple(cache.stride()),\n    cache.element_size(),\n)\n```\n\n- `device` and `data_ptr()` identify where the view starts.\n- `shape` describes its logical extent.\n- `stride()` describes where its elements lie. For example, two views starting at `a` with shape `(3,)` can select `[a, b, c]` with stride 1 or `[a, c, e]` with stride 2.\n- `element_size()` converts element-based strides to byte distances: stride 2 means 2 bytes for int8 but 4 bytes for int16.\n\nMatching these fields lets identical aliased views retain the existing deduplication optimization without skipping overlaid views that cover different bytes.\n\n## Test Plan\n\n- New `tests/v1/worker/test_attn_utils.py::test_copy_kv_cache_blocks_overlaid_views_copy_whole_block`: two tensors in one storage, each with a narrow Mamba view listed before a wide attention view at the same address. Fails before the fix (only the first 24 of 64 bytes of the block are copied), passes after.\n- `pytest tests/v1/worker/test_attn_utils.py`: 16 passed.\n- E2E: Kimi-K3 het-TP PD (TP8 prefill, TP1/DP16 decode, NIXL + Mooncake Store), GSM8K 5-shot, 1319 prompts:\n\n  | | before fix | with fix |\n  |---|---|---|\n  | exact_match (strict) | 0.7218 / 0.7286 (two runs) | **0.9682** |\n  | decode-side MLA page scans with interior all-zero pages | 344 of 347 requests with B >= 768 | 0 of 31656 scans |\n\n  (Second pass of the same run pending; decode-only baseline for this model is ~0.964.)\n\n## Notes\n\n- No open PR touches `copy_kv_cache_blocks_inplace` (searched `copy_kv_cache_blocks_inplace`, `kv_cache_block_copies`, `CoW block copy hybrid`).\n- AI-assisted (Claude Code); the analysis, fix and test were reviewed line by line and the tests above were run by the submitter.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_013hMcjaJa8vC9zEZeipxDfd\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "mergify"
+            },
+            "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @zhewenl.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+            "createdAt": "2026-09-12T06:06:42Z",
+            "databaseId": 5644080706,
+            "updatedAt": "2026-09-12T06:06:42Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-5644080706"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "Xynonners"
+            },
+            "body": "Can confirm this causes KV-cache corruption on Qwen3.8-27B too. I hit it with the official FP8 checkpoint on vLLM 0.31.0: V2 runner, TP2, FlashInfer, BF16 KV, Marlin, no speculation, and `--block-size 1600 --prefix-match-unit 64 --mamba-cache-mode align`.\n\nReusing a 1,536-token prefix changed the next token for an otherwise identical 1,599-token prompt. The recurrent-state copy was fine, but the wider attention page sharing its address wasn’t fully copied. The bad bytes were already there before the next forward pass.\n\nSelecting the widest compatible view fixed it locally. Cold and cached execution then matched across all 16 attention layers and 48 recurrent layers.\n\nI also have a small model-free repro where putting the narrow view first leaves 40 bytes uncopied; reversing the view order makes it pass.",
+            "createdAt": "2026-10-24T09:55:35Z",
+            "databaseId": 6382794467,
+            "updatedAt": "2026-10-24T09:55:35Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6382794467"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "mispa-ms"
+            },
+            "body": "Edit (Oct 26): corrected the GSM8K line (measured with our own patch, not this diff) and the test setup; dropped the rebase offer since you rebased.\n\nWe hit the same bug on Kimi K3 with prefix caching on: on a partial prefix hit, the copy-on-write copied only the KDA state bytes at the start of each page, so the MLA rows after them were read stale. Our own patch for this bug (not this diff) restored GSM8K on Kimi K3 (GB300, 1P1D disaggregated, TP8 + DCP8, block size 896, 1319 questions, greedy): 0.9515 -> 0.9682, paired exact McNemar p = 0.003. We have not run this diff end to end yet. @Xynonners sees the same on Qwen3.8-27B.\n\nWe have a fix with tests and would like to help land this PR. Differences from this diff:\n1. If one hole-free view covers the other page views at an address, only that view is copied (keying by geometry copies those bytes twice).\n2. A later view with a different block stride (e.g. a raw backing tensor) is skipped, as on main. Copying it writes bytes of blocks that are not being copied.\n\nTests (CPU unit tests, nightly image for main `c50aca144`; `vllm/v1/worker/utils.py` and this diff are unchanged since, including after your rebase):\n- `test_copy_kv_cache_blocks_overlaid_hybrid_pages` (LBHNC/LBNHC, 8 cases): main fails 4; this PR and ours pass all 8.\n- `test_copy_kv_cache_blocks_overlaid_views_without_covering_view`: main and this PR fail; ours passes.\n- `tests/v1/worker`: no new failures with ours.\n\nIf useful, we can push these tests or our branch for you to take in (with co-authorship).\n\nDisclosure: written with AI assistance (Claude Code); I reviewed it.\n",
+            "createdAt": "2026-10-25T22:19:22Z",
+            "databaseId": 6404164193,
+            "updatedAt": "2026-10-26T21:51:47Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6404164193"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "chatgpt-codex-connector"
+            },
+            "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"f9e7d5b357e9b1336854e4c4b01ef7a7fc08871c\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-10-26T20:13:54.829565Z\">2026-10-26T20:13:54.829565Z</relative-time> | `f9e7d5b` | Draft marked ready |\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>",
+            "createdAt": "2026-10-26T20:08:29Z",
+            "databaseId": 6426158380,
+            "updatedAt": "2026-10-26T20:13:55Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6426158380"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "zhewenl"
+            },
+            "body": "/ci run",
+            "createdAt": "2026-10-26T22:36:34Z",
+            "databaseId": 6428971394,
+            "updatedAt": "2026-10-26T22:36:34Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6428971394"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "github-actions"
+            },
+            "body": "✅ Triggered [Buildkite CI #97442](https://buildkite.com/vllm/ci/builds/97442) for commit `a8a8519591da`.",
+            "createdAt": "2026-10-26T22:37:04Z",
+            "databaseId": 6428979260,
+            "updatedAt": "2026-10-26T22:37:04Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6428979260"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAX8ycDw=",
+          "hasNextPage": false
+        },
+        "totalCount": 6
+      },
+      "headRefOid": "a8a8519591daf777f118abd3db19fb68f9abc1d0",
+      "headRepository": {
+        "nameWithOwner": "zhewenl/vllm"
+      },
+      "mergeCommit": {
+        "oid": "8701c9b7513db7f8ae1020c8d79efa8687120b5d"
+      },
+      "merged": true,
+      "mergedAt": "2026-10-27T02:32:05Z",
+      "number": 55112,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5658287997,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-26T20:08:20Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#pullrequestreview-5658287997"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "chatgpt-codex-connector"
+            },
+            "body": "<!-- codex-review-receipt:v1 -->\n\n\n### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `f9e7d5b357`\n    \n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "chatgpt-codex-connector"
+                  },
+                  "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Add an entry-point regression for overlaid CoW copies**\n\nWhen this production path is reached via a partial hybrid prefix-cache hit, this test fabricates the tensor views and invokes the helper directly, so it never verifies that `LLM` cache planning/binding and scheduling produce and execute the same copy; the reported accuracy regression could return while this test remains green. Add a regression through `LLM`/`vllm_runner` (or `RemoteOpenAIServer`) that triggers the overlaid-view CoW path, as required for user-visible behavior fixes.\n\nAGENTS.md reference: [tests/AGENTS.md:L8-L10](https://github.com/vllm-project/vllm/blob/f9e7d5b357e9b1336854e4c4b01ef7a7fc08871c/tests/AGENTS.md#L8-L10)\n\nUseful? React with 👍 / 👎.\n\n<!-- codex-code-review-finding:v1 -->",
+                  "createdAt": "2026-10-26T20:13:52Z",
+                  "databaseId": 4381974287,
+                  "diffHunk": "@@ -883,3 +883,47 @@ def test_packed_token_cache_cannot_be_split():\n     packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]\n     with pytest.raises(ValueError, match=\"cannot be split\"):\n         map_kv_caches_to_kernel_blocks({\"layer.0\": packed}, [group])\n+\n+\n+def test_copy_kv_cache_blocks_overlaid_views_copy_whole_block():\n+    \"\"\"Hybrid overlays: a Mamba state view and an attention view of one tensor\n+    share a base address but span different bytes per block, and several such\n+    tensors live in one allocation (so the whole-storage fast path is off).\n+    The copy must cover the attention span even though the narrow Mamba view\n+    is encountered first; otherwise the pages past the Mamba state size in\n+    the destination block keep whatever they held before.\"\"\"\n+    num_blocks = 4\n+    num_tensors = 2\n+    block_stride = 64  # bytes per scheduler block in every tensor\n+    state_bytes = 24  # Mamba state occupies only the leading bytes of a block\n+    tensor_bytes = num_blocks * block_stride\n+    raw = torch.arange(num_tensors * tensor_bytes, dtype=torch.int32).to(torch.uint8)\n+    storage = raw.untyped_storage()\n+\n+    caches: list[torch.Tensor] = []\n+    for tensor_idx in range(num_tensors):\n+        base = tensor_idx * tensor_bytes\n+        mamba = torch.empty(0, dtype=torch.int8)\n+        mamba.set_(storage)\n+        mamba = mamba.as_strided(\n+            (num_blocks, 1, 1, state_bytes), (block_stride, 1, 1, 1), base\n+        )\n+        # 2 kernel pages of 8 int16 per scheduler block cover the whole block.\n+        attn = torch.empty(0, dtype=torch.int16)\n+        attn.set_(storage)\n+        attn = attn.as_strided((num_blocks * 2, 1, 8, 2), (16, 16, 2, 1), base // 2)\n+        assert mamba.data_ptr() == attn.data_ptr()\n+        caches += [mamba, attn]\n+\n+    expected = raw.view(num_tensors, num_blocks, block_stride).clone()\n+    expected[:, 2] = expected[:, 0]\n+\n+    copy_kv_cache_blocks_inplace(",
+                  "line": 921,
+                  "originalLine": 921,
+                  "path": "tests/v1/worker/test_attn_utils.py",
+                  "updatedAt": "2026-10-26T20:13:52Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/55112#discussion_r4381974287"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yNlQyMDoxMzo1MlrPAAAAAQUvnw8=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5658357052,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-26T20:13:52Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#pullrequestreview-5658357052"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "ZJY0516"
+            },
+            "body": "LGTM",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5660020957,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-26T22:35:12Z",
+            "url": "https://github.com/vllm-project/vllm/pull/55112#pullrequestreview-5660020957"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0yNlQyMjozNToxMlq0MjAyNi0xMC0yNlQyMjozNToxMlrPAAAAAVFdEN0=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "state": "MERGED",
+      "title": "[Bugfix][Core] Copy every overlaid KV view in copy_kv_cache_blocks_inplace",
+      "updatedAt": "2026-10-27T18:00:55Z",
+      "url": "https://github.com/vllm-project/vllm/pull/55112"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": false
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "base": {
+      "repo": {
+        "full_name": "vllm-project/vllm"
+      },
+      "sha": "938be2d83d1815433ee0e825d2f01349a0fc6a89"
+    },
+    "body": "## Purpose\n\n`copy_kv_cache_blocks_inplace` (the CoW copy for partial prefix-cache hits) skips a KV cache view when another view with the same `data_ptr` has already been copied. That is right for cross-layer KV sharing (identical aliased views) but wrong for hybrid models: the KV cache config puts one layer of each KV cache group on the same tensor, so a Mamba state view and an attention view share a base address while spanning different bytes per block, and whichever view comes first in layer order decides how many bytes of a block get copied.\n\nFor Kimi-K3 (3 KDA groups + 1 MLA group, block_size 5760, kernel page 64) the KDA view `(num_blocks, 1, 1, 814080)` int8 comes first, so the MLA view `(num_blocks*90, 1, 64, 576)` bf16 of the same tensor is skipped and an MLA block copy moves only 814080 of its 6635520 bytes, i.e. the first 706 of 5760 token slots. The whole-storage fast path would hide this, but it is not taken when several tensors live in one allocation.\n\nObserved effect (het-TP PD, TP8 prefill -> TP1 decode, `--prefix-match-unit 128`, GSM8K 5-shot): every prompt's prefill stops at its last 128-token boundary `B` (Mamba align mode caches the state there); on the small-KV prefill engine the request is then preempted and resumes with a local partial prefix-cache hit on its own boundary entry, which redirects every group's block through this CoW copy (any new request with a partial hit takes the same path). The block the request continues in and ships to decode reads `slots [0,707) valid | [707,B) zero | [B,N-1) valid`. Accuracy dropped to 0.72 with a 128-token sawtooth (about 0.2 right after a boundary, 0.95 late in a chunk), only for `B >= 768`, deterministic per prompt and independent of the KDA kernel. Decode-local prefill on TP1 was unaffected because its per-block Mamba state is 8x larger (5653 slots), which is why the problem only showed up with a high-TP prefill engine.\n\n## Fix\n\nKey the dedup on `(device, data_ptr, shape, stride, element_size)`, so only identical aliased views are skipped and every overlaid geometry is copied. Overlaid views copy the same source block, so the extra narrow copy is redundant but harmless.\n\n### Why the deduplication key includes view geometry\n\nThe key answers: \"Has this view's block copy already been performed?\" The same starting address does not imply the same copy coverage.\n\nConsider the layout used by the regression test: four scheduler blocks per tensor region, 64 bytes per block, and two 256-byte tensor regions in one 512-byte storage. Within each region, a narrow Mamba view and a wider attention view start at the same address:\n\n```text\nOne scheduler block:\nbyte offset     0              24                         64\n                |--------------|--------------------------|\nMamba view      |  state data  |\nAttention view  |              full KV data               |\n```\n\nThe two views have these properties:\n\n| Property | Mamba view | Attention view |\n|---|---|---|\n| Device | CPU | CPU |\n| Starting address | A | A |\n| Shape | (4, 1, 1, 24) | (8, 1, 8, 2) |\n| Stride, in elements | (64, 1, 1, 1) | (16, 16, 2, 1) |\n| Element size | 1 byte (int8) | 2 bytes (int16) |\n| Bytes covered per scheduler block | 24 | 64 |\n\nThe attention view splits each scheduler block into two kernel pages: each page contains `1 * 8 * 2 = 16` int16 elements, so the two pages cover `2 * 16 * 2 = 64` bytes.\n\nWhen copying block 0 to block 2, with the Mamba view visited first:\n\n1. **Before the fix:** both views have the key `(device, A)`. The Mamba view copies the first 24 bytes and records the key. The attention view is then skipped, leaving the remaining 40 destination bytes unchanged.\n2. **After the fix:** the views have different geometry keys. The Mamba view copies the first 24 bytes, and the attention view subsequently copies all 64 bytes. The overlapping 24 bytes are copied from the same source block to the same destination block, so the extra copy is redundant but harmless.\n\nThis example deliberately uses two tensor regions in one storage. The whole-storage fast path requires `storage.nbytes() == num_blocks * scheduler_block_stride`; here that is `512 == 4 * 64`, which is false. The fallback copies the current view's logical elements, so the narrow view cannot cover the full attention block. With a single 256-byte region, the whole-storage fast path would copy the full block and hide the bug.\n\nThe new key describes both the starting location and the layout:\n\n```python\nkey = (\n    cache.device,\n    cache.data_ptr(),\n    tuple(cache.shape),\n    tuple(cache.stride()),\n    cache.element_size(),\n)\n```\n\n- `device` and `data_ptr()` identify where the view starts.\n- `shape` describes its logical extent.\n- `stride()` describes where its elements lie. For example, two views starting at `a` with shape `(3,)` can select `[a, b, c]` with stride 1 or `[a, c, e]` with stride 2.\n- `element_size()` converts element-based strides to byte distances: stride 2 means 2 bytes for int8 but 4 bytes for int16.\n\nMatching these fields lets identical aliased views retain the existing deduplication optimization without skipping overlaid views that cover different bytes.\n\n## Test Plan\n\n- New `tests/v1/worker/test_attn_utils.py::test_copy_kv_cache_blocks_overlaid_views_copy_whole_block`: two tensors in one storage, each with a narrow Mamba view listed before a wide attention view at the same address. Fails before the fix (only the first 24 of 64 bytes of the block are copied), passes after.\n- `pytest tests/v1/worker/test_attn_utils.py`: 16 passed.\n- E2E: Kimi-K3 het-TP PD (TP8 prefill, TP1/DP16 decode, NIXL + Mooncake Store), GSM8K 5-shot, 1319 prompts:\n\n  | | before fix | with fix |\n  |---|---|---|\n  | exact_match (strict) | 0.7218 / 0.7286 (two runs) | **0.9682** |\n  | decode-side MLA page scans with interior all-zero pages | 344 of 347 requests with B >= 768 | 0 of 31656 scans |\n\n  (Second pass of the same run pending; decode-only baseline for this model is ~0.964.)\n\n## Notes\n\n- No open PR touches `copy_kv_cache_blocks_inplace` (searched `copy_kv_cache_blocks_inplace`, `kv_cache_block_copies`, `CoW block copy hybrid`).\n- AI-assisted (Claude Code); the analysis, fix and test were reviewed line by line and the tests above were run by the submitter.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_013hMcjaJa8vC9zEZeipxDfd\n",
+    "changed_files": 2,
+    "head": {
+      "repo": {
+        "full_name": "zhewenl/vllm"
+      },
+      "sha": "a8a8519591daf777f118abd3db19fb68f9abc1d0"
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/55112",
+    "merge_commit_sha": "8701c9b7513db7f8ae1020c8d79efa8687120b5d",
+    "merged": true,
+    "merged_at": "2026-10-27T02:32:05Z",
+    "number": 55112,
+    "state": "closed",
+    "title": "[Bugfix][Core] Copy every overlaid KV view in copy_kv_cache_blocks_inplace",
+    "updated_at": "2026-10-27T18:00:55Z"
+  },
+  "files": [
+    {
+      "additions": 44,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a8a8519591daf777f118abd3db19fb68f9abc1d0/tests%2Fv1%2Fworker%2Ftest_attn_utils.py",
+      "changes": 44,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/tests%2Fv1%2Fworker%2Ftest_attn_utils.py?ref=a8a8519591daf777f118abd3db19fb68f9abc1d0",
+      "deletions": 0,
+      "filename": "tests/v1/worker/test_attn_utils.py",
+      "patch": "@@ -883,3 +883,47 @@ def test_packed_token_cache_cannot_be_split():\n     packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]\n     with pytest.raises(ValueError, match=\"cannot be split\"):\n         map_kv_caches_to_kernel_blocks({\"layer.0\": packed}, [group])\n+\n+\n+def test_copy_kv_cache_blocks_overlaid_views_copy_whole_block():\n+    \"\"\"Hybrid overlays: a Mamba state view and an attention view of one tensor\n+    share a base address but span different bytes per block, and several such\n+    tensors live in one allocation (so the whole-storage fast path is off).\n+    The copy must cover the attention span even though the narrow Mamba view\n+    is encountered first; otherwise the pages past the Mamba state size in\n+    the destination block keep whatever they held before.\"\"\"\n+    num_blocks = 4\n+    num_tensors = 2\n+    block_stride = 64  # bytes per scheduler block in every tensor\n+    state_bytes = 24  # Mamba state occupies only the leading bytes of a block\n+    tensor_bytes = num_blocks * block_stride\n+    raw = torch.arange(num_tensors * tensor_bytes, dtype=torch.int32).to(torch.uint8)\n+    storage = raw.untyped_storage()\n+\n+    caches: list[torch.Tensor] = []\n+    for tensor_idx in range(num_tensors):\n+        base = tensor_idx * tensor_bytes\n+        mamba = torch.empty(0, dtype=torch.int8)\n+        mamba.set_(storage)\n+        mamba = mamba.as_strided(\n+            (num_blocks, 1, 1, state_bytes), (block_stride, 1, 1, 1), base\n+        )\n+        # 2 kernel pages of 8 int16 per scheduler block cover the whole block.\n+        attn = torch.empty(0, dtype=torch.int16)\n+        attn.set_(storage)\n+        attn = attn.as_strided((num_blocks * 2, 1, 8, 2), (16, 16, 2, 1), base // 2)\n+        assert mamba.data_ptr() == attn.data_ptr()\n+        caches += [mamba, attn]\n+\n+    expected = raw.view(num_tensors, num_blocks, block_stride).clone()\n+    expected[:, 2] = expected[:, 0]\n+\n+    copy_kv_cache_blocks_inplace(\n+        caches,\n+        num_blocks,\n+        [KVCacheBlockCopy(src_block_id=0, dst_block_id=2)],\n+    )\n+\n+    torch.testing.assert_close(\n+        raw.view(num_tensors, num_blocks, block_stride), expected\n+    )",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a8a8519591daf777f118abd3db19fb68f9abc1d0/tests%2Fv1%2Fworker%2Ftest_attn_utils.py",
+      "sha": "2d59898a5f70b4ba3eb4af8636f19b320f597702",
+      "status": "modified"
+    },
+    {
+      "additions": 13,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/a8a8519591daf777f118abd3db19fb68f9abc1d0/vllm%2Fv1%2Fworker%2Futils.py",
+      "changes": 16,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fv1%2Fworker%2Futils.py?ref=a8a8519591daf777f118abd3db19fb68f9abc1d0",
+      "deletions": 3,
+      "filename": "vllm/v1/worker/utils.py",
+      "patch": "@@ -916,12 +916,22 @@ def copy_kv_cache_blocks_inplace(\n \n     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)\n     indices: torch.Tensor | None = None\n-    seen: set[tuple[torch.device, int]] = set()\n+    seen: set[tuple[Any, ...]] = set()\n     copied_storages: set[tuple[torch.device, int]] = set()\n     for cache in kv_caches:\n         # Layers sharing KV (cross-layer sharing) alias the same view; copy it\n-        # once. data_ptr distinguishes per-layer views of a shared allocation.\n-        key = (cache.device, cache.data_ptr())\n+        # once. Hybrid models overlay layers of different kinds on one tensor,\n+        # so views at the same address can differ in geometry (a Mamba state\n+        # view spans only the leading bytes of a block that an attention view\n+        # spans in full); each geometry must be copied, so the key covers the\n+        # view's shape and strides and not just its address.\n+        key = (\n+            cache.device,\n+            cache.data_ptr(),\n+            tuple(cache.shape),\n+            tuple(cache.stride()),\n+            cache.element_size(),\n+        )\n         if key in seen:\n             continue\n         seen.add(key)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/a8a8519591daf777f118abd3db19fb68f9abc1d0/vllm%2Fv1%2Fworker%2Futils.py",
+      "sha": "5a254c481eb04da32ceb72a511f93b6498492dba",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Add an entry-point regression for overlaid CoW copies**\n\nWhen this production path is reached via a partial hybrid prefix-cache hit, this test fabricates the tensor views and invokes the helper directly, so it never verifies that `LLM` cache planning/binding and scheduling produce and execute the same copy; the reported accuracy regression could return while this test remains green. Add a regression through `LLM`/`vllm_runner` (or `RemoteOpenAIServer`) that triggers the overlaid-view CoW path, as required for user-visible behavior fixes.\n\nAGENTS.md reference: [tests/AGENTS.md:L8-L10](https://github.com/vllm-project/vllm/blob/f9e7d5b357e9b1336854e4c4b01ef7a7fc08871c/tests/AGENTS.md#L8-L10)\n\nUseful? React with 👍 / 👎.\n\n<!-- codex-code-review-finding:v1 -->",
+      "created_at": "2026-10-26T20:13:52Z",
+      "diff_hunk": "@@ -883,3 +883,47 @@ def test_packed_token_cache_cannot_be_split():\n     packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]\n     with pytest.raises(ValueError, match=\"cannot be split\"):\n         map_kv_caches_to_kernel_blocks({\"layer.0\": packed}, [group])\n+\n+\n+def test_copy_kv_cache_blocks_overlaid_views_copy_whole_block():\n+    \"\"\"Hybrid overlays: a Mamba state view and an attention view of one tensor\n+    share a base address but span different bytes per block, and several such\n+    tensors live in one allocation (so the whole-storage fast path is off).\n+    The copy must cover the attention span even though the narrow Mamba view\n+    is encountered first; otherwise the pages past the Mamba state size in\n+    the destination block keep whatever they held before.\"\"\"\n+    num_blocks = 4\n+    num_tensors = 2\n+    block_stride = 64  # bytes per scheduler block in every tensor\n+    state_bytes = 24  # Mamba state occupies only the leading bytes of a block\n+    tensor_bytes = num_blocks * block_stride\n+    raw = torch.arange(num_tensors * tensor_bytes, dtype=torch.int32).to(torch.uint8)\n+    storage = raw.untyped_storage()\n+\n+    caches: list[torch.Tensor] = []\n+    for tensor_idx in range(num_tensors):\n+        base = tensor_idx * tensor_bytes\n+        mamba = torch.empty(0, dtype=torch.int8)\n+        mamba.set_(storage)\n+        mamba = mamba.as_strided(\n+            (num_blocks, 1, 1, state_bytes), (block_stride, 1, 1, 1), base\n+        )\n+        # 2 kernel pages of 8 int16 per scheduler block cover the whole block.\n+        attn = torch.empty(0, dtype=torch.int16)\n+        attn.set_(storage)\n+        attn = attn.as_strided((num_blocks * 2, 1, 8, 2), (16, 16, 2, 1), base // 2)\n+        assert mamba.data_ptr() == attn.data_ptr()\n+        caches += [mamba, attn]\n+\n+    expected = raw.view(num_tensors, num_blocks, block_stride).clone()\n+    expected[:, 2] = expected[:, 0]\n+\n+    copy_kv_cache_blocks_inplace(",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#discussion_r4381974287",
+      "id": 4381974287,
+      "line": 921,
+      "original_line": 921,
+      "path": "tests/v1/worker/test_attn_utils.py",
+      "updated_at": "2026-10-26T20:13:52Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "This pull request has merge conflicts that must be resolved before it can be\nmerged. Please rebase the PR, @zhewenl.\n\nhttps://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork\n",
+      "created_at": "2026-09-12T06:06:42Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-5644080706",
+      "id": 5644080706,
+      "updated_at": "2026-09-12T06:06:42Z",
+      "user": {
+        "login": "mergify[bot]"
+      }
+    },
+    {
+      "body": "Can confirm this causes KV-cache corruption on Qwen3.8-27B too. I hit it with the official FP8 checkpoint on vLLM 0.31.0: V2 runner, TP2, FlashInfer, BF16 KV, Marlin, no speculation, and `--block-size 1600 --prefix-match-unit 64 --mamba-cache-mode align`.\n\nReusing a 1,536-token prefix changed the next token for an otherwise identical 1,599-token prompt. The recurrent-state copy was fine, but the wider attention page sharing its address wasn’t fully copied. The bad bytes were already there before the next forward pass.\n\nSelecting the widest compatible view fixed it locally. Cold and cached execution then matched across all 16 attention layers and 48 recurrent layers.\n\nI also have a small model-free repro where putting the narrow view first leaves 40 bytes uncopied; reversing the view order makes it pass.",
+      "created_at": "2026-10-24T09:55:35Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6382794467",
+      "id": 6382794467,
+      "updated_at": "2026-10-24T09:55:35Z",
+      "user": {
+        "login": "Xynonners"
+      }
+    },
+    {
+      "body": "Edit (Oct 26): corrected the GSM8K line (measured with our own patch, not this diff) and the test setup; dropped the rebase offer since you rebased.\n\nWe hit the same bug on Kimi K3 with prefix caching on: on a partial prefix hit, the copy-on-write copied only the KDA state bytes at the start of each page, so the MLA rows after them were read stale. Our own patch for this bug (not this diff) restored GSM8K on Kimi K3 (GB300, 1P1D disaggregated, TP8 + DCP8, block size 896, 1319 questions, greedy): 0.9515 -> 0.9682, paired exact McNemar p = 0.003. We have not run this diff end to end yet. @Xynonners sees the same on Qwen3.8-27B.\n\nWe have a fix with tests and would like to help land this PR. Differences from this diff:\n1. If one hole-free view covers the other page views at an address, only that view is copied (keying by geometry copies those bytes twice).\n2. A later view with a different block stride (e.g. a raw backing tensor) is skipped, as on main. Copying it writes bytes of blocks that are not being copied.\n\nTests (CPU unit tests, nightly image for main `c50aca144`; `vllm/v1/worker/utils.py` and this diff are unchanged since, including after your rebase):\n- `test_copy_kv_cache_blocks_overlaid_hybrid_pages` (LBHNC/LBNHC, 8 cases): main fails 4; this PR and ours pass all 8.\n- `test_copy_kv_cache_blocks_overlaid_views_without_covering_view`: main and this PR fail; ours passes.\n- `tests/v1/worker`: no new failures with ours.\n\nIf useful, we can push these tests or our branch for you to take in (with co-authorship).\n\nDisclosure: written with AI assistance (Claude Code); I reviewed it.\n",
+      "created_at": "2026-10-25T22:19:22Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6404164193",
+      "id": 6404164193,
+      "updated_at": "2026-10-26T21:51:47Z",
+      "user": {
+        "login": "mispa-ms"
+      }
+    },
+    {
+      "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"f9e7d5b357e9b1336854e4c4b01ef7a7fc08871c\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-10-26T20:13:54.829565Z\">2026-10-26T20:13:54.829565Z</relative-time> | `f9e7d5b` | Draft marked ready |\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>",
+      "created_at": "2026-10-26T20:08:29Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6426158380",
+      "id": 6426158380,
+      "updated_at": "2026-10-26T20:13:55Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
+    },
+    {
+      "body": "/ci run",
+      "created_at": "2026-10-26T22:36:34Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6428971394",
+      "id": 6428971394,
+      "updated_at": "2026-10-26T22:36:34Z",
+      "user": {
+        "login": "zhewenl"
+      }
+    },
+    {
+      "body": "✅ Triggered [Buildkite CI #97442](https://buildkite.com/vllm/ci/builds/97442) for commit `a8a8519591da`.",
+      "created_at": "2026-10-26T22:37:04Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#issuecomment-6428979260",
+      "id": 6428979260,
+      "updated_at": "2026-10-26T22:37:04Z",
+      "user": {
+        "login": "github-actions[bot]"
+      }
+    }
+  ],
+  "number": 55112,
+  "refs": {
+    "base": {
+      "commit": "938be2d83d1815433ee0e825d2f01349a0fc6a89",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "a8a8519591daf777f118abd3db19fb68f9abc1d0",
+      "repository": "zhewenl/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#pullrequestreview-5658287997",
+      "id": 5658287997,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-26T20:08:20Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "<!-- codex-review-receipt:v1 -->\n\n\n### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `f9e7d5b357`\n    \n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#pullrequestreview-5658357052",
+      "id": 5658357052,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-26T20:13:52Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]"
+      }
+    },
+    {
+      "body": "LGTM",
+      "html_url": "https://github.com/vllm-project/vllm/pull/55112#pullrequestreview-5660020957",
+      "id": 5660020957,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-26T22:35:12Z",
+      "user": {
+        "login": "ZJY0516"
+      }
+    }
+  ]
+}

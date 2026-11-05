@@ -1,0 +1,744 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "ec1652806c19ab86d837a652f398246b684e8a43e785cd4eaae7608d2e8c07af",
+      "isPrivate": false,
+      "numbers": [
+        53360,
+        53340,
+        53335,
+        53332,
+        53328,
+        53298,
+        53287,
+        53273
+      ],
+      "observed_at": "2026-11-04T22:35:27.262047+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4728,
+        "resetAt": "2026-11-04T22:47:37Z"
+      },
+      "repository": "vllm-project/vllm"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "c6c33f2b1facdcf6ace0d2f241f20507c6cc8157",
+      "baseRepository": {
+        "nameWithOwner": "vllm-project/vllm"
+      },
+      "body": "### Purpose\r\n\r\nThe Gemma4 decoder layer wrote the post-attention residual as a standalone add:\r\n\r\n```python\r\nhidden_states = self.post_attention_layernorm(hidden_states)\r\nhidden_states = hidden_states + residual        # separate elementwise add kernel\r\nresidual = hidden_states\r\nhidden_states = self.pre_feedforward_layernorm(hidden_states)\r\n```\r\n\r\nThat add lowers to its own kernel every layer (`triton_poi_fused_add_*` in a torch-compile trace; a standalone elementwise pass otherwise). This PR folds it into the following norm using `RMSNorm`'s two-argument add-then-norm form:\r\n\r\n```python\r\nhidden_states = self.post_attention_layernorm(hidden_states)\r\nhidden_states, residual = self.pre_feedforward_layernorm(hidden_states, residual)\r\n```\r\n\r\n`RMSNorm.forward(x, residual)` dispatches to `fused_add_rms_norm`, which performs the residual add and the normalization in one op. This is the exact residual-threading pattern `gemma3` and `llama` already use. On ROCm (CK-tile / aiter RMSNorm) this removes one standalone add kernel per decoder layer; on other backends it removes the separate add node from the graph.\r\n\r\nPrimarily this is a redundant-kernel cleanup that aligns Gemma4 with the gemma3/llama residual-threading pattern. The measurable upside is concentrated in short-input decode — the long tail of chat interactions, where inputs start as very short sentences and the fixed per-pass kernel overhead is a larger fraction of each step; at large ISL the saved time is negligible against the prefill GEMMs (see Serving benchmark).\r\n\r\n### Why this is numerically equivalent (not an approximation)\r\n\r\n`fused_add_rms_norm` (`vllm/ir/ops/layernorm.py`) computes:\r\n\r\n```\r\nresidual = x + residual\r\nout      = rms_norm(residual, weight, eps)\r\nreturn out, residual\r\n```\r\n\r\nMapping to the old code: `x = post_attention_layernorm(attn_out)`, `residual = old_residual`. The returned `residual` is `post_attn_norm_out + old_residual` — identical to the previous `residual = hidden_states` after the explicit add — and the returned `hidden_states` is `pre_feedforward_layernorm(that sum)`. The two MoE-branch reads of `residual` (`pre_feedforward_layernorm_2(residual)`, `router(residual)`) and the post-FFN add therefore see the same value as before.\r\n\r\n### Scope / what is intentionally not changed\r\n\r\n- Only the **post-attention** residual add is fused. The **post-feedforward** residual add (`hidden_states = hidden_states + residual` after `post_feedforward_layernorm`) is left as-is: the per-layer-embedding (PLE) contribution and the `layer_scalar` multiply sit between it and the next layer's `input_layernorm`, so there is no adjacent norm to fold it into without restructuring the cross-layer residual flow.\r\n- `q_norm` / `k_norm` / `v_norm` / RoPE, the attention path, the MoE branch, and all non-Gemma models are untouched.\r\n- The **Gemma4 MTP (multi-token prediction) draft** decoder layer (`gemma4_mtp.py`) carried the identical unfused post-attention add and is fused the same way; its post-feedforward add is likewise left unchanged. Non-MTP and non-Gemma paths are untouched.\r\n\r\n### Relation to existing PRs (not a duplicate)\r\n\r\nChecked open `vllm-project/vllm` PRs (`gemma4 residual`, `gemma4 rms norm`, `fused_add_rms_norm gemma`, `gemma4 fused`). No PR fuses the **post-attention** residual add. Closest, and why this is distinct/complementary:\r\n\r\n- **#42144** *[Kernel] Fuse dual RMSNorm + residual + scalar in Gemma4 MoE layers* — a bespoke Triton kernel for the **post-FFN tail** `(rmsnorm(rmsnorm+rmsnorm)+residual)*scalar`, gated to **MoE layers, CUDA, no PLE**. That fuses the *other* residual add (`triton_residual_add_mul`, which this PR deliberately leaves alone), on a path this dense FP8 model never executes. The two are **complementary**: #42144 handles the post-FFN tail, this PR handles the post-attention add.\r\n- **#43953** *[ROCm][Perf] Enable AR+RMS fusion for GemmaRMSNorm models* — a compile-pass `allreduce+residual_add+rmsnorm` fusion at **TP>1** for `GemmaRMSNorm`. Different mechanism and scope; this PR is TP=1, plain `RMSNorm`, no allreduce.\r\n- **#53115** *enable FUSED_QK_NORM_ROPE for 512 head dim (Gemma4)* — separate QK-norm+RoPE kernel work, unrelated to residual-add fusion.\r\n\r\n### Test Plan\r\n\r\n- **Accuracy (output-affecting → required):** gsm8k via `lm_eval` against a served checkpoint, before vs after — must match within noise.\r\n  ```\r\n  lm_eval --model local-completions \\\r\n    --model_args model=<gemma-4-ckpt>,base_url=http://localhost:8000/v1/completions,num_concurrent=50 \\\r\n    --tasks gsm8k --limit 1000\r\n  ```\r\n- **Registry model tests:** Gemma4 is registered (`tests/models/registry.py`: `Gemma4ForCausalLM` → `google/gemma-4-E2B-it`), so the standard model-correctness harness exercises this path.\r\n- **Trace check (perf, done):** confirmed via A/B GPU-lane trace — the per-layer `triton_poi_fused_add_0` (post-attention add) is gone (960 → 0), folded into the pre-FFN norm (see Test Result).\r\n- **Lint:** `pre-commit run --files vllm/model_executor/models/gemma4.py vllm/model_executor/models/gemma4_mtp.py` (ruff, 88-col — the change is within limits).\r\n\r\n### Test Result\r\n\r\n**Accuracy — gsm8k, 1000 samples, 5-shot.** No regression: both metrics move within one standard error (≈ ±0.014), i.e. statistically unchanged (marginally higher).\r\n\r\n| gsm8k metric | baseline | this PR (fused add) |\r\n|--|--|--|\r\n| flexible-extract exact_match | 0.734 ± 0.0140 | 0.740 ± 0.0139 |\r\n| strict-match exact_match | 0.727 ± 0.0141 | 0.730 ± 0.0140 |\r\n\r\n**Kernel confirmation (A/B GPU-lane traces).** Diff of GPU-lane traces before vs after this change (16 forward passes over 60 layers, so a per-layer per-pass kernel appears 60 × 16 = 960 times):\r\n\r\n| kernel | baseline | this PR | note |\r\n|--|--|--|--|\r\n| `triton_poi_fused_add_0` (post-attention add) | 960 | **0** | removed — folded into pre-FFN `fused_add_rms_norm` |\r\n| `triton_poi_fused_add_mul_*` (post-FFN add + `layer_scalar`) | 960 | 960 | kept (not fusable); suffix renumbered `_2`→`_1` |\r\n| total GPU kernels | 22,306 | 21,346 | net **−960** = exactly one add/layer removed |\r\n\r\n- The net kernel-count change is **precisely** the 960 removed post-attention adds; every other difference is inductor renumbering with identical counts (`gelu_mul_slice_1`→`_0`, `rms_norm_4`→`_3`).\r\n- The add is **fused, not dropped**: the ck_tile RMSNorm still carries `Rmsnorm2dFusedAddEnumE0` (fused-add disabled), so the add folded into the fp8-group-quant norm path via `fused_add_rms_norm`, and the residual still feeds the surviving post-FFN add.\r\n- Measured removed-kernel time: **~5.1 ms across the trace ≈ 0.32 ms/forward-pass**.\r\n\r\n**Serving benchmark — `vllm bench serve`** (random dataset, input 4096 / output 140, mean of 3 seeds; `RedHatAI/gemma-4-31B-it-FP8-block`, TP=1, `--kv-cache-dtype fp8`, `--max-model-len 32768`, AITER (`VLLM_ROCM_USE_AITER=1`) with the `ROCM_AITER_UNIFIED_ATTN` backend; baseline = same build with the post-attention add unfused). This exercises the dense base Gemma4 decoder path; the MTP draft layer carries the identical change and is covered by the equivalence argument above. Deltas are within run-to-run noise — removing ~0.32 ms/step is a small fraction at these batch sizes — so no regression:\r\n\r\n| concurrency | output tok/s (base → PR) | median TTFT ms (base → PR) | median TPOT ms (base → PR) | median ITL ms (base → PR) | req/s (base → PR) |\r\n|--|--|--|--|--|--|\r\n| 1 | 35.97 → 35.71 (−0.7%) | 1011 → 1011 (+0.1%) | 20.74 → 20.94 (+1.0%) | 20.78 → 20.98 (+1.0%) | 0.26 → 0.26 |\r\n| 4 | 78.35 → 77.95 (−0.5%) | 3475 → 3149 (−9.4%) | 26.43 → 29.02 (+9.8%) | 22.95 → 23.24 (+1.2%) | 0.56 → 0.56 |\r\n| 8 | 101.68 → 101.73 (+0.0%) | 4975 → 5289 (+6.3%) | 43.48 → 41.24 (−5.2%) | 22.45 → 22.61 (+0.7%) | 0.73 → 0.73 |\r\n| 16 | 118.19 → 118.42 (+0.2%) | 8707 → 8679 (−0.3%) | 72.41 → 72.51 (+0.1%) | 23.47 → 23.37 (−0.4%) | 0.84 → 0.85 |\r\n| 32 | 127.40 → 127.80 (+0.3%) | 11420 → 11695 (+2.4%) | 168.34 → 164.46 (−2.3%) | 27.48 → 27.39 (−0.3%) | 0.91 → 0.91 |\r\n| 64 | 131.49 → 131.73 (+0.2%) | 11799 → 11772 (−0.2%) | 398.77 → 398.08 (−0.2%) | 37.57 → 37.51 (−0.1%) | 0.94 → 0.94 |\r\n\r\nOutput throughput is neutral across the sweep; **TTFT, TPOT and ITL are flat** (within seed noise — the ±9% swings at concurrency 4/8 are single-point TTFT/TPOT variance, not a trend). Expected: TTFT is prefill-dominated (GEMMs/attention over 4096 input tokens), so removing ~0.32 ms of residual-add kernels per pass is negligible at these batch sizes — but more impactful in the long tail of chat interactions, where inputs start as very short sentences and the fixed per-pass kernel cost is a larger fraction of each decode step.\r\n\r\n### On adding a dedicated unit test\r\n\r\nNot added, by design. The change is an equivalence-preserving refactor to a call already covered by `fused_add_rms_norm`'s own tests and by the registry-driven Gemma4 generation tests; a bespoke `Gemma4DecoderLayer` numerical-equivalence test would need a full config + weights + GPU and would largely duplicate framework coverage. Per AGENTS.md, validation for a model-output-affecting change is a model eval (gsm8k above), which is the guard here. If a reviewer prefers an explicit equivalence unit test, it can be added.\r\n\r\n",
+      "changedFiles": 2,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "cjackal"
+            },
+            "body": "There is a gemma4_mtp counterpart of this unfused fused_add_rms_norm which benefits from the same fusion, FYI",
+            "createdAt": "2026-08-21T13:35:27Z",
+            "databaseId": 5370459090,
+            "updatedAt": "2026-08-21T13:35:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/53273#issuecomment-5370459090"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "mpashkovskii"
+            },
+            "body": "> There is a gemma4_mtp counterpart of this unfused fused_add_rms_norm which benefits from the same fusion, FYI\r\n\r\n@cjackal, thanks for the tip. Added the fusion to MTP part as well.",
+            "createdAt": "2026-08-26T05:10:05Z",
+            "databaseId": 5420888935,
+            "updatedAt": "2026-08-26T05:10:05Z",
+            "url": "https://github.com/vllm-project/vllm/pull/53273#issuecomment-5420888935"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "maeehart"
+            },
+            "body": "The uplift from this PR is not huge, but it makes sense to merge in my opinion. Could you take a look @dllehr-amd ?",
+            "createdAt": "2026-09-10T20:53:56Z",
+            "databaseId": 5625295649,
+            "updatedAt": "2026-09-10T20:53:56Z",
+            "url": "https://github.com/vllm-project/vllm/pull/53273#issuecomment-5625295649"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAU9LMyE=",
+          "hasNextPage": false
+        },
+        "totalCount": 3
+      },
+      "headRefOid": "ce14c22f873278dd64e8820ab298e68821293293",
+      "headRepository": {
+        "nameWithOwner": "mpashkovskii/vllm"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 53273,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 4993566013,
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-21T13:14:41Z",
+            "url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-4993566013"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "simondanielsson"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "simondanielsson"
+                  },
+                  "body": "**Minor**: do we need this comment or is it evident from the commit message? \n```suggestion\n```",
+                  "createdAt": "2026-08-26T09:34:24Z",
+                  "databaseId": 3861426526,
+                  "diffHunk": "@@ -720,11 +720,14 @@ def forward(\n         )\n \n         hidden_states = self.post_attention_layernorm(hidden_states)\n-        hidden_states = hidden_states + residual\n-        residual = hidden_states\n \n-        # MLP runs unconditionally (same inputs for MoE and non-MoE)\n-        hidden_states = self.pre_feedforward_layernorm(hidden_states)\n+        # MLP runs unconditionally (same inputs for MoE and non-MoE).\n+        # Fuse the post-attention residual add into pre_ff_norm's\n+        # add-then-norm path: residual becomes (post_attn_norm out + input),\n+        # replacing the standalone add with one fused_add_rms_norm kernel.",
+                  "line": null,
+                  "originalLine": 727,
+                  "path": "vllm/model_executor/models/gemma4.py",
+                  "updatedAt": "2026-08-26T09:34:24Z",
+                  "url": "https://github.com/vllm-project/vllm/pull/53273#discussion_r3861426526"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOC0yNlQwOTozNDoyNFrO5iixXg==",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5028844219,
+            "state": "COMMENTED",
+            "submittedAt": "2026-08-26T09:34:24Z",
+            "url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-5028844219"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "frida-andersson"
+            },
+            "body": "Thanks for the PR! I think it looks good but can you just run these two tests?\r\n- The Gemma4 DSpark test (`v1/e2e/spec_decode/acceptance_rates/dspark/ -k gemma4`). It runs with `enforce_eager=True`, where `vllm_c` writes into `residual` in place, and I think that overwrites the captured aux hidden states\r\n- The Gemma4 MTP test (`v1/e2e/spec_decode/mtp/test_mtp.py -k gemma4`). The MTP CI step doesn't trigger on model file changes, so the `gemma4_mtp.py` change isn't covered",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5758379790,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T19:35:27Z",
+            "url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-5758379790"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "simondanielsson"
+            },
+            "body": "Can we run a couple of more perf sweeps, perhaps both at long and short ctx? \n\nI think this makes sense, I'm just worried the perf seems to degrade in many cases",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5758525845,
+            "state": "COMMENTED",
+            "submittedAt": "2026-11-03T19:47:11Z",
+            "url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-5758525845"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wM1QxOTo0NzoxMVq0MjAyNi0xMS0wM1QxOTo0NzoxMVrPAAAAAVc8IZU=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "state": "OPEN",
+      "title": "[Model][Gemma4] Fuse post-attention residual add into pre-FFN RMSNorm",
+      "updatedAt": "2026-11-03T19:47:11Z",
+      "url": "https://github.com/vllm-project/vllm/pull/53273"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/53273/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/53273/commits"
+      },
+      "html": {
+        "href": "https://github.com/vllm-project/vllm/pull/53273"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/issues/53273"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/53273/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/pulls/53273"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/vllm-project/vllm/statuses/ce14c22f873278dd64e8820ab298e68821293293"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 7,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "vllm-project:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/vllm-project/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/vllm-project/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/vllm-project/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/vllm-project/vllm/branches{/branch}",
+        "clone_url": "https://github.com/vllm-project/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/vllm-project/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/vllm-project/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/vllm-project/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/vllm-project/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/vllm-project/vllm/contributors",
+        "created_at": "2023-02-09T11:23:20Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/vllm-project/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/vllm-project/vllm/downloads",
+        "events_url": "https://api.github.com/repos/vllm-project/vllm/events",
+        "fork": false,
+        "forks": 24409,
+        "forks_count": 24409,
+        "forks_url": "https://api.github.com/repos/vllm-project/vllm/forks",
+        "full_name": "vllm-project/vllm",
+        "git_commits_url": "https://api.github.com/repos/vllm-project/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/vllm-project/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/vllm-project/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/vllm-project/vllm.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://vllm.ai",
+        "hooks_url": "https://api.github.com/repos/vllm-project/vllm/hooks",
+        "html_url": "https://github.com/vllm-project/vllm",
+        "id": 599547518,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/vllm-project/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/vllm-project/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/vllm-project/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/vllm-project/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/vllm-project/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/vllm-project/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/vllm-project/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/vllm-project/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOI7xefg",
+        "notifications_url": "https://api.github.com/repos/vllm-project/vllm/notifications{?since,all,participating}",
+        "open_issues": 9867,
+        "open_issues_count": 9867,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+          "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+          "followers_url": "https://api.github.com/users/vllm-project/followers",
+          "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+          "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/vllm-project",
+          "id": 136984999,
+          "login": "vllm-project",
+          "node_id": "O_kgDOCCo5pw",
+          "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+          "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+          "repos_url": "https://api.github.com/users/vllm-project/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/vllm-project",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/vllm-project/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T22:02:06Z",
+        "releases_url": "https://api.github.com/repos/vllm-project/vllm/releases{/id}",
+        "size": 344310,
+        "ssh_url": "git@github.com:vllm-project/vllm.git",
+        "stargazers_count": 96323,
+        "stargazers_url": "https://api.github.com/repos/vllm-project/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/vllm-project/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/vllm-project/vllm/subscription",
+        "svn_url": "https://github.com/vllm-project/vllm",
+        "tags_url": "https://api.github.com/repos/vllm-project/vllm/tags",
+        "teams_url": "https://api.github.com/repos/vllm-project/vllm/teams",
+        "topics": [
+          "amd",
+          "blackwell",
+          "cuda",
+          "deepseek",
+          "deepseek-v3",
+          "gpt",
+          "gpt-oss",
+          "inference",
+          "kimi",
+          "llama",
+          "llm",
+          "llm-serving",
+          "model-serving",
+          "moe",
+          "openai",
+          "pytorch",
+          "qwen",
+          "qwen3",
+          "tpu",
+          "transformer"
+        ],
+        "trees_url": "https://api.github.com/repos/vllm-project/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-04T22:07:51Z",
+        "url": "https://api.github.com/repos/vllm-project/vllm",
+        "visibility": "public",
+        "watchers": 96323,
+        "watchers_count": 96323,
+        "web_commit_signoff_required": true
+      },
+      "sha": "c6c33f2b1facdcf6ace0d2f241f20507c6cc8157",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/136984999?v=4",
+        "events_url": "https://api.github.com/users/vllm-project/events{/privacy}",
+        "followers_url": "https://api.github.com/users/vllm-project/followers",
+        "following_url": "https://api.github.com/users/vllm-project/following{/other_user}",
+        "gists_url": "https://api.github.com/users/vllm-project/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/vllm-project",
+        "id": 136984999,
+        "login": "vllm-project",
+        "node_id": "O_kgDOCCo5pw",
+        "organizations_url": "https://api.github.com/users/vllm-project/orgs",
+        "received_events_url": "https://api.github.com/users/vllm-project/received_events",
+        "repos_url": "https://api.github.com/users/vllm-project/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/vllm-project/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/vllm-project/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/vllm-project",
+        "user_view_type": "public"
+      }
+    },
+    "body": "### Purpose\r\n\r\nThe Gemma4 decoder layer wrote the post-attention residual as a standalone add:\r\n\r\n```python\r\nhidden_states = self.post_attention_layernorm(hidden_states)\r\nhidden_states = hidden_states + residual        # separate elementwise add kernel\r\nresidual = hidden_states\r\nhidden_states = self.pre_feedforward_layernorm(hidden_states)\r\n```\r\n\r\nThat add lowers to its own kernel every layer (`triton_poi_fused_add_*` in a torch-compile trace; a standalone elementwise pass otherwise). This PR folds it into the following norm using `RMSNorm`'s two-argument add-then-norm form:\r\n\r\n```python\r\nhidden_states = self.post_attention_layernorm(hidden_states)\r\nhidden_states, residual = self.pre_feedforward_layernorm(hidden_states, residual)\r\n```\r\n\r\n`RMSNorm.forward(x, residual)` dispatches to `fused_add_rms_norm`, which performs the residual add and the normalization in one op. This is the exact residual-threading pattern `gemma3` and `llama` already use. On ROCm (CK-tile / aiter RMSNorm) this removes one standalone add kernel per decoder layer; on other backends it removes the separate add node from the graph.\r\n\r\nPrimarily this is a redundant-kernel cleanup that aligns Gemma4 with the gemma3/llama residual-threading pattern. The measurable upside is concentrated in short-input decode — the long tail of chat interactions, where inputs start as very short sentences and the fixed per-pass kernel overhead is a larger fraction of each step; at large ISL the saved time is negligible against the prefill GEMMs (see Serving benchmark).\r\n\r\n### Why this is numerically equivalent (not an approximation)\r\n\r\n`fused_add_rms_norm` (`vllm/ir/ops/layernorm.py`) computes:\r\n\r\n```\r\nresidual = x + residual\r\nout      = rms_norm(residual, weight, eps)\r\nreturn out, residual\r\n```\r\n\r\nMapping to the old code: `x = post_attention_layernorm(attn_out)`, `residual = old_residual`. The returned `residual` is `post_attn_norm_out + old_residual` — identical to the previous `residual = hidden_states` after the explicit add — and the returned `hidden_states` is `pre_feedforward_layernorm(that sum)`. The two MoE-branch reads of `residual` (`pre_feedforward_layernorm_2(residual)`, `router(residual)`) and the post-FFN add therefore see the same value as before.\r\n\r\n### Scope / what is intentionally not changed\r\n\r\n- Only the **post-attention** residual add is fused. The **post-feedforward** residual add (`hidden_states = hidden_states + residual` after `post_feedforward_layernorm`) is left as-is: the per-layer-embedding (PLE) contribution and the `layer_scalar` multiply sit between it and the next layer's `input_layernorm`, so there is no adjacent norm to fold it into without restructuring the cross-layer residual flow.\r\n- `q_norm` / `k_norm` / `v_norm` / RoPE, the attention path, the MoE branch, and all non-Gemma models are untouched.\r\n- The **Gemma4 MTP (multi-token prediction) draft** decoder layer (`gemma4_mtp.py`) carried the identical unfused post-attention add and is fused the same way; its post-feedforward add is likewise left unchanged. Non-MTP and non-Gemma paths are untouched.\r\n\r\n### Relation to existing PRs (not a duplicate)\r\n\r\nChecked open `vllm-project/vllm` PRs (`gemma4 residual`, `gemma4 rms norm`, `fused_add_rms_norm gemma`, `gemma4 fused`). No PR fuses the **post-attention** residual add. Closest, and why this is distinct/complementary:\r\n\r\n- **#42144** *[Kernel] Fuse dual RMSNorm + residual + scalar in Gemma4 MoE layers* — a bespoke Triton kernel for the **post-FFN tail** `(rmsnorm(rmsnorm+rmsnorm)+residual)*scalar`, gated to **MoE layers, CUDA, no PLE**. That fuses the *other* residual add (`triton_residual_add_mul`, which this PR deliberately leaves alone), on a path this dense FP8 model never executes. The two are **complementary**: #42144 handles the post-FFN tail, this PR handles the post-attention add.\r\n- **#43953** *[ROCm][Perf] Enable AR+RMS fusion for GemmaRMSNorm models* — a compile-pass `allreduce+residual_add+rmsnorm` fusion at **TP>1** for `GemmaRMSNorm`. Different mechanism and scope; this PR is TP=1, plain `RMSNorm`, no allreduce.\r\n- **#53115** *enable FUSED_QK_NORM_ROPE for 512 head dim (Gemma4)* — separate QK-norm+RoPE kernel work, unrelated to residual-add fusion.\r\n\r\n### Test Plan\r\n\r\n- **Accuracy (output-affecting → required):** gsm8k via `lm_eval` against a served checkpoint, before vs after — must match within noise.\r\n  ```\r\n  lm_eval --model local-completions \\\r\n    --model_args model=<gemma-4-ckpt>,base_url=http://localhost:8000/v1/completions,num_concurrent=50 \\\r\n    --tasks gsm8k --limit 1000\r\n  ```\r\n- **Registry model tests:** Gemma4 is registered (`tests/models/registry.py`: `Gemma4ForCausalLM` → `google/gemma-4-E2B-it`), so the standard model-correctness harness exercises this path.\r\n- **Trace check (perf, done):** confirmed via A/B GPU-lane trace — the per-layer `triton_poi_fused_add_0` (post-attention add) is gone (960 → 0), folded into the pre-FFN norm (see Test Result).\r\n- **Lint:** `pre-commit run --files vllm/model_executor/models/gemma4.py vllm/model_executor/models/gemma4_mtp.py` (ruff, 88-col — the change is within limits).\r\n\r\n### Test Result\r\n\r\n**Accuracy — gsm8k, 1000 samples, 5-shot.** No regression: both metrics move within one standard error (≈ ±0.014), i.e. statistically unchanged (marginally higher).\r\n\r\n| gsm8k metric | baseline | this PR (fused add) |\r\n|--|--|--|\r\n| flexible-extract exact_match | 0.734 ± 0.0140 | 0.740 ± 0.0139 |\r\n| strict-match exact_match | 0.727 ± 0.0141 | 0.730 ± 0.0140 |\r\n\r\n**Kernel confirmation (A/B GPU-lane traces).** Diff of GPU-lane traces before vs after this change (16 forward passes over 60 layers, so a per-layer per-pass kernel appears 60 × 16 = 960 times):\r\n\r\n| kernel | baseline | this PR | note |\r\n|--|--|--|--|\r\n| `triton_poi_fused_add_0` (post-attention add) | 960 | **0** | removed — folded into pre-FFN `fused_add_rms_norm` |\r\n| `triton_poi_fused_add_mul_*` (post-FFN add + `layer_scalar`) | 960 | 960 | kept (not fusable); suffix renumbered `_2`→`_1` |\r\n| total GPU kernels | 22,306 | 21,346 | net **−960** = exactly one add/layer removed |\r\n\r\n- The net kernel-count change is **precisely** the 960 removed post-attention adds; every other difference is inductor renumbering with identical counts (`gelu_mul_slice_1`→`_0`, `rms_norm_4`→`_3`).\r\n- The add is **fused, not dropped**: the ck_tile RMSNorm still carries `Rmsnorm2dFusedAddEnumE0` (fused-add disabled), so the add folded into the fp8-group-quant norm path via `fused_add_rms_norm`, and the residual still feeds the surviving post-FFN add.\r\n- Measured removed-kernel time: **~5.1 ms across the trace ≈ 0.32 ms/forward-pass**.\r\n\r\n**Serving benchmark — `vllm bench serve`** (random dataset, input 4096 / output 140, mean of 3 seeds; `RedHatAI/gemma-4-31B-it-FP8-block`, TP=1, `--kv-cache-dtype fp8`, `--max-model-len 32768`, AITER (`VLLM_ROCM_USE_AITER=1`) with the `ROCM_AITER_UNIFIED_ATTN` backend; baseline = same build with the post-attention add unfused). This exercises the dense base Gemma4 decoder path; the MTP draft layer carries the identical change and is covered by the equivalence argument above. Deltas are within run-to-run noise — removing ~0.32 ms/step is a small fraction at these batch sizes — so no regression:\r\n\r\n| concurrency | output tok/s (base → PR) | median TTFT ms (base → PR) | median TPOT ms (base → PR) | median ITL ms (base → PR) | req/s (base → PR) |\r\n|--|--|--|--|--|--|\r\n| 1 | 35.97 → 35.71 (−0.7%) | 1011 → 1011 (+0.1%) | 20.74 → 20.94 (+1.0%) | 20.78 → 20.98 (+1.0%) | 0.26 → 0.26 |\r\n| 4 | 78.35 → 77.95 (−0.5%) | 3475 → 3149 (−9.4%) | 26.43 → 29.02 (+9.8%) | 22.95 → 23.24 (+1.2%) | 0.56 → 0.56 |\r\n| 8 | 101.68 → 101.73 (+0.0%) | 4975 → 5289 (+6.3%) | 43.48 → 41.24 (−5.2%) | 22.45 → 22.61 (+0.7%) | 0.73 → 0.73 |\r\n| 16 | 118.19 → 118.42 (+0.2%) | 8707 → 8679 (−0.3%) | 72.41 → 72.51 (+0.1%) | 23.47 → 23.37 (−0.4%) | 0.84 → 0.85 |\r\n| 32 | 127.40 → 127.80 (+0.3%) | 11420 → 11695 (+2.4%) | 168.34 → 164.46 (−2.3%) | 27.48 → 27.39 (−0.3%) | 0.91 → 0.91 |\r\n| 64 | 131.49 → 131.73 (+0.2%) | 11799 → 11772 (−0.2%) | 398.77 → 398.08 (−0.2%) | 37.57 → 37.51 (−0.1%) | 0.94 → 0.94 |\r\n\r\nOutput throughput is neutral across the sweep; **TTFT, TPOT and ITL are flat** (within seed noise — the ±9% swings at concurrency 4/8 are single-point TTFT/TPOT variance, not a trend). Expected: TTFT is prefill-dominated (GEMMs/attention over 4096 input tokens), so removing ~0.32 ms of residual-add kernels per pass is negligible at these batch sizes — but more impactful in the long tail of chat interactions, where inputs start as very short sentences and the fixed per-pass kernel cost is a larger fraction of each decode step.\r\n\r\n### On adding a dedicated unit test\r\n\r\nNot added, by design. The change is an equivalence-preserving refactor to a call already covered by `fused_add_rms_norm`'s own tests and by the registry-driven Gemma4 generation tests; a bespoke `Gemma4DecoderLayer` numerical-equivalence test would need a full config + weights + GPU and would largely duplicate framework coverage. Per AGENTS.md, validation for a model-output-affecting change is a model eval (gsm8k above), which is the guard here. If a reviewer prefers an explicit equivalence unit test, it can be added.\r\n\r\n",
+    "changed_files": 2,
+    "closed_at": null,
+    "comments": 3,
+    "comments_url": "https://api.github.com/repos/vllm-project/vllm/issues/53273/comments",
+    "commits": 7,
+    "commits_url": "https://api.github.com/repos/vllm-project/vllm/pulls/53273/commits",
+    "created_at": "2026-08-21T13:14:38Z",
+    "deletions": 8,
+    "diff_url": "https://github.com/vllm-project/vllm/pull/53273.diff",
+    "draft": false,
+    "head": {
+      "label": "mpashkovskii:rocm/gemma4-fuse-post-attn-residual-rmsnorm",
+      "ref": "rocm/gemma4-fuse-post-attn-residual-rmsnorm",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/mpashkovskii/vllm/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/mpashkovskii/vllm/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/mpashkovskii/vllm/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/mpashkovskii/vllm/branches{/branch}",
+        "clone_url": "https://github.com/mpashkovskii/vllm.git",
+        "collaborators_url": "https://api.github.com/repos/mpashkovskii/vllm/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/mpashkovskii/vllm/comments{/number}",
+        "commits_url": "https://api.github.com/repos/mpashkovskii/vllm/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/mpashkovskii/vllm/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/mpashkovskii/vllm/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/mpashkovskii/vllm/contributors",
+        "created_at": "2025-10-10T10:13:53Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/mpashkovskii/vllm/deployments",
+        "description": "A high-throughput and memory-efficient inference and serving engine for LLMs",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/mpashkovskii/vllm/downloads",
+        "events_url": "https://api.github.com/repos/mpashkovskii/vllm/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/mpashkovskii/vllm/forks",
+        "full_name": "mpashkovskii/vllm",
+        "git_commits_url": "https://api.github.com/repos/mpashkovskii/vllm/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/mpashkovskii/vllm/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/mpashkovskii/vllm/git/tags{/sha}",
+        "git_url": "git://github.com/mpashkovskii/vllm.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "https://docs.vllm.ai",
+        "hooks_url": "https://api.github.com/repos/mpashkovskii/vllm/hooks",
+        "html_url": "https://github.com/mpashkovskii/vllm",
+        "id": 1073581333,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/mpashkovskii/vllm/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/mpashkovskii/vllm/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/mpashkovskii/vllm/issues{/number}",
+        "keys_url": "https://api.github.com/repos/mpashkovskii/vllm/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/mpashkovskii/vllm/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/mpashkovskii/vllm/languages",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "node_id": "MDc6TGljZW5zZTI=",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0"
+        },
+        "merges_url": "https://api.github.com/repos/mpashkovskii/vllm/merges",
+        "milestones_url": "https://api.github.com/repos/mpashkovskii/vllm/milestones{/number}",
+        "mirror_url": null,
+        "name": "vllm",
+        "node_id": "R_kgDOP_2NFQ",
+        "notifications_url": "https://api.github.com/repos/mpashkovskii/vllm/notifications{?since,all,participating}",
+        "open_issues": 7,
+        "open_issues_count": 7,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/181324193?v=4",
+          "events_url": "https://api.github.com/users/mpashkovskii/events{/privacy}",
+          "followers_url": "https://api.github.com/users/mpashkovskii/followers",
+          "following_url": "https://api.github.com/users/mpashkovskii/following{/other_user}",
+          "gists_url": "https://api.github.com/users/mpashkovskii/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/mpashkovskii",
+          "id": 181324193,
+          "login": "mpashkovskii",
+          "node_id": "U_kgDOCs7JoQ",
+          "organizations_url": "https://api.github.com/users/mpashkovskii/orgs",
+          "received_events_url": "https://api.github.com/users/mpashkovskii/received_events",
+          "repos_url": "https://api.github.com/users/mpashkovskii/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/mpashkovskii/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/mpashkovskii/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/mpashkovskii",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/mpashkovskii/vllm/pulls{/number}",
+        "pushed_at": "2026-11-04T12:18:32Z",
+        "releases_url": "https://api.github.com/repos/mpashkovskii/vllm/releases{/id}",
+        "size": 348564,
+        "ssh_url": "git@github.com:mpashkovskii/vllm.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/mpashkovskii/vllm/stargazers",
+        "statuses_url": "https://api.github.com/repos/mpashkovskii/vllm/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/mpashkovskii/vllm/subscribers",
+        "subscription_url": "https://api.github.com/repos/mpashkovskii/vllm/subscription",
+        "svn_url": "https://github.com/mpashkovskii/vllm",
+        "tags_url": "https://api.github.com/repos/mpashkovskii/vllm/tags",
+        "teams_url": "https://api.github.com/repos/mpashkovskii/vllm/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/mpashkovskii/vllm/git/trees{/sha}",
+        "updated_at": "2026-11-04T12:20:25Z",
+        "url": "https://api.github.com/repos/mpashkovskii/vllm",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": true
+      },
+      "sha": "ce14c22f873278dd64e8820ab298e68821293293",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/181324193?v=4",
+        "events_url": "https://api.github.com/users/mpashkovskii/events{/privacy}",
+        "followers_url": "https://api.github.com/users/mpashkovskii/followers",
+        "following_url": "https://api.github.com/users/mpashkovskii/following{/other_user}",
+        "gists_url": "https://api.github.com/users/mpashkovskii/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/mpashkovskii",
+        "id": 181324193,
+        "login": "mpashkovskii",
+        "node_id": "U_kgDOCs7JoQ",
+        "organizations_url": "https://api.github.com/users/mpashkovskii/orgs",
+        "received_events_url": "https://api.github.com/users/mpashkovskii/received_events",
+        "repos_url": "https://api.github.com/users/mpashkovskii/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/mpashkovskii/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/mpashkovskii/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/mpashkovskii",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/vllm-project/vllm/pull/53273",
+    "id": 4332083011,
+    "issue_url": "https://api.github.com/repos/vllm-project/vllm/issues/53273",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "e2eb47",
+        "default": false,
+        "description": "Run pre-commit for new contributors without triggering other tests",
+        "id": 10587097537,
+        "name": "verified",
+        "node_id": "LA_kwDOI7xefs8AAAACdwpJwQ",
+        "url": "https://api.github.com/repos/vllm-project/vllm/labels/verified"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "9034b5371f9d0e286aaaa7a19ad95cbed76be0cf",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOI7xefs8AAAABAjZXQw",
+    "number": 53273,
+    "patch_url": "https://github.com/vllm-project/vllm/pull/53273.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/vllm-project/vllm/pulls/comments{/number}",
+    "review_comments": 1,
+    "review_comments_url": "https://api.github.com/repos/vllm-project/vllm/pulls/53273/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/vllm-project/vllm/statuses/ce14c22f873278dd64e8820ab298e68821293293",
+    "title": "[Model][Gemma4] Fuse post-attention residual add into pre-FFN RMSNorm",
+    "updated_at": "2026-11-03T19:47:11Z",
+    "url": "https://api.github.com/repos/vllm-project/vllm/pulls/53273",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/181324193?v=4",
+      "events_url": "https://api.github.com/users/mpashkovskii/events{/privacy}",
+      "followers_url": "https://api.github.com/users/mpashkovskii/followers",
+      "following_url": "https://api.github.com/users/mpashkovskii/following{/other_user}",
+      "gists_url": "https://api.github.com/users/mpashkovskii/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/mpashkovskii",
+      "id": 181324193,
+      "login": "mpashkovskii",
+      "node_id": "U_kgDOCs7JoQ",
+      "organizations_url": "https://api.github.com/users/mpashkovskii/orgs",
+      "received_events_url": "https://api.github.com/users/mpashkovskii/received_events",
+      "repos_url": "https://api.github.com/users/mpashkovskii/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/mpashkovskii/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/mpashkovskii/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/mpashkovskii",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 4,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/ce14c22f873278dd64e8820ab298e68821293293/vllm%2Fmodel_executor%2Fmodels%2Fgemma4.py",
+      "changes": 8,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fmodels%2Fgemma4.py?ref=ce14c22f873278dd64e8820ab298e68821293293",
+      "deletions": 4,
+      "filename": "vllm/model_executor/models/gemma4.py",
+      "patch": "@@ -720,11 +720,11 @@ def forward(\n         )\n \n         hidden_states = self.post_attention_layernorm(hidden_states)\n-        hidden_states = hidden_states + residual\n-        residual = hidden_states\n \n-        # MLP runs unconditionally (same inputs for MoE and non-MoE)\n-        hidden_states = self.pre_feedforward_layernorm(hidden_states)\n+        # MLP runs unconditionally (same inputs for MoE and non-MoE).\n+        hidden_states, residual = self.pre_feedforward_layernorm(\n+            hidden_states, residual\n+        )\n         hidden_states = self.mlp(hidden_states)\n \n         if self.enable_moe_block:",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/ce14c22f873278dd64e8820ab298e68821293293/vllm%2Fmodel_executor%2Fmodels%2Fgemma4.py",
+      "sha": "17680d7853de6aed1df6ec1b4cf3ddaa56926a00",
+      "status": "modified"
+    },
+    {
+      "additions": 3,
+      "blob_url": "https://github.com/vllm-project/vllm/blob/ce14c22f873278dd64e8820ab298e68821293293/vllm%2Fmodel_executor%2Fmodels%2Fgemma4_mtp.py",
+      "changes": 7,
+      "contents_url": "https://api.github.com/repos/vllm-project/vllm/contents/vllm%2Fmodel_executor%2Fmodels%2Fgemma4_mtp.py?ref=ce14c22f873278dd64e8820ab298e68821293293",
+      "deletions": 4,
+      "filename": "vllm/model_executor/models/gemma4_mtp.py",
+      "patch": "@@ -328,10 +328,9 @@ def forward(\n         )\n \n         hidden_states = self.post_attention_layernorm(hidden_states)\n-        hidden_states = hidden_states + residual\n-        residual = hidden_states\n-\n-        hidden_states = self.pre_feedforward_layernorm(hidden_states)\n+        hidden_states, residual = self.pre_feedforward_layernorm(\n+            hidden_states, residual\n+        )\n         hidden_states = self.mlp(hidden_states)\n \n         hidden_states = self.post_feedforward_layernorm(hidden_states)",
+      "raw_url": "https://github.com/vllm-project/vllm/raw/ce14c22f873278dd64e8820ab298e68821293293/vllm%2Fmodel_executor%2Fmodels%2Fgemma4_mtp.py",
+      "sha": "7029cf32eaffc98a73e47363ae8f55e5fa9f6b04",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "**Minor**: do we need this comment or is it evident from the commit message? \n```suggestion\n```",
+      "created_at": "2026-08-26T09:34:24Z",
+      "diff_hunk": "@@ -720,11 +720,14 @@ def forward(\n         )\n \n         hidden_states = self.post_attention_layernorm(hidden_states)\n-        hidden_states = hidden_states + residual\n-        residual = hidden_states\n \n-        # MLP runs unconditionally (same inputs for MoE and non-MoE)\n-        hidden_states = self.pre_feedforward_layernorm(hidden_states)\n+        # MLP runs unconditionally (same inputs for MoE and non-MoE).\n+        # Fuse the post-attention residual add into pre_ff_norm's\n+        # add-then-norm path: residual becomes (post_attn_norm out + input),\n+        # replacing the standalone add with one fused_add_rms_norm kernel.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#discussion_r3861426526",
+      "id": 3861426526,
+      "line": null,
+      "original_line": 727,
+      "path": "vllm/model_executor/models/gemma4.py",
+      "updated_at": "2026-08-26T09:34:24Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "There is a gemma4_mtp counterpart of this unfused fused_add_rms_norm which benefits from the same fusion, FYI",
+      "created_at": "2026-08-21T13:35:27Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#issuecomment-5370459090",
+      "id": 5370459090,
+      "updated_at": "2026-08-21T13:35:27Z",
+      "user": {
+        "login": "cjackal"
+      }
+    },
+    {
+      "body": "> There is a gemma4_mtp counterpart of this unfused fused_add_rms_norm which benefits from the same fusion, FYI\r\n\r\n@cjackal, thanks for the tip. Added the fusion to MTP part as well.",
+      "created_at": "2026-08-26T05:10:05Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#issuecomment-5420888935",
+      "id": 5420888935,
+      "updated_at": "2026-08-26T05:10:05Z",
+      "user": {
+        "login": "mpashkovskii"
+      }
+    },
+    {
+      "body": "The uplift from this PR is not huge, but it makes sense to merge in my opinion. Could you take a look @dllehr-amd ?",
+      "created_at": "2026-09-10T20:53:56Z",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#issuecomment-5625295649",
+      "id": 5625295649,
+      "updated_at": "2026-09-10T20:53:56Z",
+      "user": {
+        "login": "maeehart"
+      }
+    }
+  ],
+  "number": 53273,
+  "refs": {
+    "base": {
+      "commit": "c6c33f2b1facdcf6ace0d2f241f20507c6cc8157",
+      "repository": "vllm-project/vllm"
+    },
+    "head": {
+      "commit": "ce14c22f873278dd64e8820ab298e68821293293",
+      "repository": "mpashkovskii/vllm"
+    }
+  },
+  "repository": "vllm-project/vllm",
+  "reviews": [
+    {
+      "body": "## Claude Code Review\n\nThis pull request is from a fork — automated review is disabled. A repository maintainer can comment `@claude review` to run a one-time review.",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-4993566013",
+      "id": 4993566013,
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-21T13:14:41Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-5028844219",
+      "id": 5028844219,
+      "state": "COMMENTED",
+      "submitted_at": "2026-08-26T09:34:24Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    },
+    {
+      "body": "Thanks for the PR! I think it looks good but can you just run these two tests?\r\n- The Gemma4 DSpark test (`v1/e2e/spec_decode/acceptance_rates/dspark/ -k gemma4`). It runs with `enforce_eager=True`, where `vllm_c` writes into `residual` in place, and I think that overwrites the captured aux hidden states\r\n- The Gemma4 MTP test (`v1/e2e/spec_decode/mtp/test_mtp.py -k gemma4`). The MTP CI step doesn't trigger on model file changes, so the `gemma4_mtp.py` change isn't covered",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-5758379790",
+      "id": 5758379790,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T19:35:27Z",
+      "user": {
+        "login": "frida-andersson"
+      }
+    },
+    {
+      "body": "Can we run a couple of more perf sweeps, perhaps both at long and short ctx? \n\nI think this makes sense, I'm just worried the perf seems to degrade in many cases",
+      "html_url": "https://github.com/vllm-project/vllm/pull/53273#pullrequestreview-5758525845",
+      "id": 5758525845,
+      "state": "COMMENTED",
+      "submitted_at": "2026-11-03T19:47:11Z",
+      "user": {
+        "login": "simondanielsson"
+      }
+    }
+  ]
+}

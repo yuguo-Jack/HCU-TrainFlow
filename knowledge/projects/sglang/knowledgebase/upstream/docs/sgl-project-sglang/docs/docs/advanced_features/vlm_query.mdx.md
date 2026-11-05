@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: bd2d73daa5afda6bcad8d479a834f2e70bbe9569
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/vlm_query.mdx
-raw_sha256: fd1ab5e6a6bd12d79452cede2411218295c58f9e089904c924f25b515e2e9f0f
+raw_sha256: e2b1e4630a57425a66f33b6b91cdf18a08952ebff52451a513c7516e575930be
 sources: []
-generated_body_sha256: 727410a45cb9e250ac434d75480177668c80d2cb04f54df963322b552576a8c4
+generated_body_sha256: 16bb45cf484f2f74342b9e39c02152e82b852a6147c629fe6e3f26b70f70bb7d
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/vlm_query.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/bd2d73daa5afda6bcad8d479a834f2e70bbe9569/docs/docs/advanced_features/vlm_query.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/vlm_query.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -61,6 +61,38 @@ SGLang supports three ways to pass visual data, each optimized for different sce
 **Key Rule**: Within a single request, use only one format for all images. Don't mix formats.
 
 The examples below demonstrate all three approaches with both Qwen2.5-VL and Llama 4 models.
+
+## Multimodal cache identity
+
+SGLang identifies actual media features or supplied embeddings using full 256-bit
+digests. Cache identities also include tensor shape and dtype, container boundaries,
+modality, model-specific metadata, and the effective model/processor configuration.
+CPU and CUDA tensor hashing use BLAKE3; GPU hashing transfers only the digests to
+the host. These are collision-resistant identifiers, not a mathematical guarantee
+that collisions are impossible.
+
+- `mm_hashes` remains accepted for compatibility, but cannot override cache keys
+  or skip server-side content hashing. External routers must not assume that a
+  supplied scalar hash equals SGLang's internal KV-cache key.
+- `mm_content_hashes` describes source content. Keep
+  `--trust-mm-content-hashes` disabled for untrusted clients; enabling it allows
+  preprocessing-cache lookup before verifying the supplied media.
+- Embedding caching and batch deduplication retain the full identity. KV caching
+  namespaces each request by its ordered media identities and `cache_salt`, so a
+  short placeholder collision cannot reuse another image's KV state. Requests
+  with identical media can still share prefixes; requests with different media
+  do not share even their common text prefix. This can increase prefill cost for
+  workloads with long shared instructions and changing images.
+- Pin model revisions when sharing encoder caches. Clear caches or restart when
+  replacing weights or processor implementations in place; a configuration
+  fingerprint is not a checksum of all model weights.
+
+Custom processors must hash the final model-facing features and metadata before
+exporting CUDA transport handles. The shared frontend finalization path then binds
+the processor namespace and updates any prebuilt padding together; composite
+processors must delegate this step to their inner processor.
+Keep server-created full identities intact across transport and never use a
+truncated scalar hash as an embedding or KV-cache identity.
 
 ## Querying Qwen2.5-VL Model
 

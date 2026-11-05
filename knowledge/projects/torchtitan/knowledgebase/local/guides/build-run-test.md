@@ -9,70 +9,88 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: pyproject.toml
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0341afacb518276f192c2c8a836c32426e80856bf8c5f0ff194c3028c221520d
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 4c8bd1c4a4c82eaea345ccb97abf671a1e59faf92df2d9fa147ce21c5e7fe780
 - source: pytorch-torchtitan
   path: .ci/docker/requirements.txt
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0ee71eafd1705db09a09aa73ed7333a2f0aaabd97c6f3629d383bd7162d401ce
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 099347f7fad10ba1a21e9e689bf27e8bb4cff19e4e2716addef18cd7e17c3486
 - source: pytorch-torchtitan
   path: .ci/docker/requirements-rl.txt
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 1ab5e0be999db70997ace51b9413fc398e651048f063fdd7ca6c272ef28559d9
 - source: pytorch-torchtitan
   path: run_train.sh
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: f88bd97eff8c7a4b8623dae59ed03a94d80bf7fb9b7941e376f7caddd74863ee
 - source: pytorch-torchtitan
   path: torchtitan/config/loader.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 8e943af9319c881efa76598de21def00662a024a98093d175ccc5dc2bfef48f2
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 809e852e7f25119748c6ab27be9eab0750f129f4e899935116768129d12df1e9
 - source: pytorch-torchtitan
   path: torchtitan/config/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: e62e3776a4dd1c2179b3643d9e611f5a6f53fc972ac16de4588ee96a99a06b9b
 - source: pytorch-torchtitan
   path: torchtitan_recipes/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: a72fb9eab9eb7f376a50622327954f614694ed6aea5bb782aae51035e9c9157a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 80bf0cdce6473544775bf13189368107b72642a97efb075a9486e77a21ecbe1c
 - source: pytorch-torchtitan
   path: torchtitan_recipes/tests/models/llama3.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: b69ea67a899aebd423fcc0b71dbfe2213200d7895f7ef879152a0adeed31807c
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: a248bb7d8e9b72b304281491fd594e8f7ad2f0a53dac03672f9e36e8057853f9
 - source: pytorch-torchtitan
   path: tests/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0872f733f18e85e085802fff3813cd1ee359ec1cc10b8d5929642e62d4c4e712
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 73f9a9597a0aaeef657c103ec1cc544375c0e9229f49a9a50abcd8d3a02af248
 - source: pytorch-torchtitan
   path: docs/debugging.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0938badc6722b624d4c07d6e2a620c02fa9cf4bb0e7b26b9d5de77c8b0586b0a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 523e0d62eca05f837e9ec4da6530a60e4cd95a8f8f55d7f2a8a0f8b1d542fd49
 - source: pytorch-torchtitan
   path: torchtitan/models/flux/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 63090efd1c71ea0b10f0b4ed318959ab7eaf37336276997f712b9aa662175ca6
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 945d9a8a89c7726d786a526c20e141814300a33f6fed8736d697fcf69853c8a4
 - source: pytorch-torchtitan
   path: torchtitan/rl/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 62fde87475bed82db694353ac5892caaa9162c3ca854d7182353f6bcb486970b
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: c4f1816a03546f6ffd5d800a3008aedfdf24a9fa34161a6cfa3fb5cae6184c72
 - source: pytorch-torchtitan
   path: torchtitan/config/configs.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: aaf73beb7efb044ac1978b3edb43b48db256ccd708660880d947bc70e9be3a2c
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 3465866709813651cc91114c4a006a5cc3c05d6069e9f04200e68d10c91c3659
 - source: pytorch-torchtitan
   path: torchtitan/distributed/activation_remat.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 4e935605e29f904ad5c5bef1036e265021f42c334a7a17c6d01083040dffc5a7
 - source: pytorch-torchtitan
   path: torchtitan/rl/actors/monarch/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 5f4cdb46330683cb8bd2a65d764662712972fb8989afe35a9b9dfbe5e3270209
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 3b46f79840dec9f3efd25319247fe259c0009daeec74bf381d06c483ddea8b09
+- source: pytorch-torchtitan
+  path: torchtitan/config/parallelism.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 64e4a9d95288e2de09146dd99dd075760a74265f9e8c2384a36f0995d3546232
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/local_compile.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 258d7980f3a28c310d0fb1a31319c4124677de921de573d6fd22878879a96f93
+- source: pytorch-torchtitan
+  path: torchtitan/training_engine.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 2ffe06874d3a03ccc91d407f1bc91d5f2beaa9c746738dd3a3646f1c800a798f
+- source: pytorch-torchtitan
+  path: tests/unit_tests/cpu/test_trainer.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: b9681edfc274190ede7dcbba70a8bc82b814b51d4facf3618feb3c6961e0891d
+
 pr_sources:
 - pr-pytorch--torchtitan-5277
 - pr-pytorch--torchtitan-5280
@@ -84,7 +102,7 @@ pr_sources:
 
 本页是所引用官方提交的使用说明，不是 HCU 已验证安装脚本。官方要求 Python 3.11+，使用较新的 PyTorch nightly 及匹配 TorchAO/扩展；必须核对 `.ci/docker/requirements*.txt` 和实际 recipe。不能在 HCU 环境执行官方 CUDA wheel 安装命令来覆盖现有 Torch。
 
-基础依赖包含 Grain、datasets、tokenizers、renderers、safetensors，以及固定提交的 `spmd_types`、`torch_remat`、`torch_checkpointing`。RL 另外涉及 Monarch、TorchStore、vLLM、环境/奖励依赖；FLUX/VLM/开发测试使用各自 extra。锁下列信息：TorchTitan SHA、Torch/DTK、TorchAO、attention 与通信扩展版本、Python、构建选项、设备型号和可用并行规模。官方 `.ci` 的 wheel/硬件选择只适用于它明确支持的平台。
+基础依赖包含 Grain、datasets、tokenizers、renderers、safetensors，以及版本明确的 `spmd_types`、`torch_remat`、`torch_checkpointing`。RL 另外涉及 Monarch、TorchStore、vLLM、环境/奖励依赖；FLUX/VLM/开发测试使用各自 extra。锁下列信息：TorchTitan SHA、Torch/DTK、TorchAO、attention 与通信扩展版本、Python、构建选项、设备型号和可用并行规模。官方 `.ci` 的 wheel/硬件选择只适用于它明确支持的平台。
 
 在匹配依赖已就绪的环境中，可用 `python -m pip install -e . --no-deps` 安装该 checkout；`--no-deps` 不会补依赖，也不证明依赖兼容。当前 `pyproject.toml` 同时打包 `torchtitan` 和 `torchtitan_recipes`；从旧版本升级后重新安装，否则在仓外可能找不到新 recipe 包。
 
@@ -132,28 +150,34 @@ Fake PG 仍需它使用的 GPU 算子和依赖，不是纯 CPU 模拟器。PP �
 
 ## 本固定开发线的升级检查
 
-依赖清单新增 `pyarrow<26`，renderers 为0.1.12、attn-gym 为0.0.17，spmd_types 与 torch_remat 的固定提交也变化；这些只是当前 `.ci` 的版本事实，升级 HCU 已有环境前仍需核对实际兼容矩阵，不自动安装本页依赖。
+依赖清单新增 `pyarrow<26`，renderers 为0.1.12、attn-gym 为0.0.17，`spmd_types==0.3.1`、`torch_remat==0.2.2`、`torch_checkpointing==0.1.1` 已由旧 Git 固定提交改为发行版依赖；这些只是当前 `.ci` 的版本事实，升级 HCU 已有环境前仍需核对实际兼容矩阵，不自动安装本页依赖。
 
-当前 TrainingEngine 字段为 `activation_remat`，用 `ActivationRematConfig` / `FullActivationRematConfig` / `DefaultActivationRematConfig` 配置；禁用用 None。逐组 Graph 字段为 `training.cuda_graph_per_microbatch_group`，旧 `cuda_graph_per_accumulation_group` 已改名。它要求均匀 tensor metadata 和相同梯度参与参数集合，并拒绝 `fsdp_defer_gradient_reduction=True`。`preprocess_microbatch_groups_lazily=True` 则要求关闭 CUDA graphs 且无 SDC replay；它改变输入物化时刻，不改变有效 token 预算。
+当前 TrainingEngine 字段为 `activation_remat`，用 `ActivationRematConfig` / `FullActivationRematConfig` / `DefaultActivationRematConfig` 配置；禁用用 None。逐组 Graph 字段为 `training.accelerator_graph_per_microbatch_group`，旧 `cuda_graph_per_accumulation_group` 已改名。它要求均匀 tensor metadata 和相同梯度参与参数集合，并拒绝 `fsdp_defer_gradient_reduction=True`。`preprocess_microbatch_groups_lazily=True` 则要求关闭 CUDA graphs 且无 SDC replay；它改变输入物化时刻，不改变有效 token 预算。
 
 RL 多机 launcher 现在将预先构造的 actor system 传给 `Controller.setup_async(actor_system=...)`；Monarch 的 host meshes/GPU 分配实现已移到 `actors/monarch/provisioning.py`，`train.py` 不再暴露旧的 provisioning 调用链。默认 actor 仍为 Monarch；替换其框架不是只改一个名字。
 
 当前 `RELEASE.md` 增补 B200 的 RC GPU 验证与 DeepEP remat 梯度检查，明确 RC GPU 工作流使用 Real PG、未覆盖 ROCm/Fake PG，RL也未包含在该GPU工作流。工作流列出项目与测试不等于该固定main提交的所有job已经通过。
 
+## 配置迁移需沿消费者验证
+
+根配置新增 `precision=PrecisionConfig(dtype="float32", param_dtype="bfloat16", reduce_dtype="float32")`；旧 `training.dtype` / `mixed_precision_param` / `mixed_precision_reduce` 不应继续传入。FSDP CPU offload 现在位于 `parallelism.fsdp_enable_cpu_offloading`，仍要求 `debug.distinct_seed_mesh_axes` 包含 `dp_shard`；`max_context_length` 移至模型配置。`model.local_compile.regions` 替代旧 `local_compile_regions` 列表。
+
+Graph 开关为 `training.disable_accelerator_graphs`、`training.accelerator_graph_per_microbatch_group`、`optim.enable_accelerator_graph`。`ConfigLoader` 在 recipe 赋值和 launch options 后再次调用根 `__post_init__`；override 仍有自身后续阶段。保存最终解析结果并核对断言，不能只证明旧字段名称已替换。当前 source/test 修复了 PP capture 的四项 microbatch 与首个 loss kwargs 传递，但本轮没有运行 GPU/PP/HCU 组合。
+
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/pyproject.toml)
-- [.ci/docker/requirements.txt](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/.ci/docker/requirements.txt)
-- [.ci/docker/requirements-rl.txt](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/.ci/docker/requirements-rl.txt)
-- [run_train.sh](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/run_train.sh)
-- [torchtitan/config/loader.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/loader.py)
-- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/README.md)
-- [torchtitan_recipes/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan_recipes/README.md)
-- [torchtitan_recipes/tests/models/llama3.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan_recipes/tests/models/llama3.py)
-- [tests/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/README.md)
-- [docs/debugging.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/docs/debugging.md)
+- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/pyproject.toml)
+- [.ci/docker/requirements.txt](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/.ci/docker/requirements.txt)
+- [.ci/docker/requirements-rl.txt](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/.ci/docker/requirements-rl.txt)
+- [run_train.sh](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/run_train.sh)
+- [torchtitan/config/loader.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/loader.py)
+- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/README.md)
+- [torchtitan_recipes/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan_recipes/README.md)
+- [torchtitan_recipes/tests/models/llama3.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan_recipes/tests/models/llama3.py)
+- [tests/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/README.md)
+- [docs/debugging.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/docs/debugging.md)
 
 - [PR #5277：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5277.md)
 - [PR #5280：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5280.md)
@@ -163,11 +187,19 @@ RL 多机 launcher 现在将预先构造的 actor system 传给 `Controller.setu
 
 主线 [PR #5311](https://github.com/pytorch/torchtitan/pull/5311) 修复不可解析的示例命令。FLUX 依赖文件为 `.ci/docker/requirements-flux.txt`；RL 的输出目录用 `--output-dir`，资产路径先核对 Python recipe 的赋值与 train.py 接受的参数。知识库的运行示例也须跟源码参数解析一致，不能因旧 README 有某个 flag 就强行传入。旧版本回放仍使用其自己的配置和接口。
 
-- [torchtitan/models/flux/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/flux/README.md)
-- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/README.md)
+- [torchtitan/models/flux/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/flux/README.md)
+- [torchtitan/rl/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/README.md)
 
 ## 本次补充的实现与测试依据
 
-- [torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/configs.py)
-- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/activation_remat.py)
-- [torchtitan/rl/actors/monarch/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/README.md)
+- [torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/configs.py)
+- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/activation_remat.py)
+- [torchtitan/rl/actors/monarch/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/actors/monarch/README.md)
+
+- [torchtitan/config/parallelism.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/parallelism.py)
+
+- [torchtitan/distributed/local_compile.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/local_compile.py)
+
+- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/training_engine.py)
+
+- [tests/unit_tests/cpu/test_trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/unit_tests/cpu/test_trainer.py)

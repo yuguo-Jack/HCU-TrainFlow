@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: ab1a28486b92adb3702f1289ff3a332cdb74294f
+commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
 path: docs/user-guide/features/paged_stash.md
-raw_sha256: 053fecb7a457408c19a5c44322c2dfd6a50a3d27e49786ddc6192b503c6d96a1
+raw_sha256: c290e8e9a72f9b0a0b864651dc28e692279d5389e547dbef5ea3f56f622a5a7d
 sources: []
-generated_body_sha256: 2cd517ae03b5f511f97f2b087b4b317e9a09c1df5cbfa90152767aed9d18ecfe
+generated_body_sha256: 46eb5fc034e706682d5b95ee286db7aa1a7a9301202831afc539b6488dbed516
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / docs/user-guide/features/paged_stash.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/ab1a28486b92adb3702f1289ff3a332cdb74294f/docs/user-guide/features/paged_stash.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/docs/user-guide/features/paged_stash.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -41,7 +41,7 @@ Upstream source document; original commands, claims and links require their stat
 
 **Paged stash** = **sync-free** expert execution + **paged stashing** (packing routed-expert activations for backward into paged buffers).
 
-**Sync-free:** `--moe-flex-dispatcher-backend hybridep`, `--use-transformer-engine-op-fuser`, and `--moe-expert-rank-capacity-factor` pre-size dispatch and fused grouped expert buffers from a user-controlled capacity, avoiding a per-step device query / realloc loop for buffer sizing.
+**Sync-free:** `--moe-flex-dispatcher-backend hybridep` and `--moe-expert-rank-capacity-factor` pre-size dispatch and grouped expert buffers from a user-controlled capacity, avoiding a per-step device query / realloc loop for buffer sizing. Expert compute can use either `--use-transformer-engine-op-fuser` or the device-initiated Transformer Engine GroupedTensor path (`--moe-grouped-gemm --moe-use-grouped-tensor`).
 
 **Paged stashing:** `--moe-paged-stash` stores those activations in paged CUDA buffers (optional pinned host spill). It helps save activation memory; sync-free still works without it, at the cost of higher activation memory use.
 
@@ -49,19 +49,35 @@ Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-ba
 
 ## Prerequisites
 
-HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.
+HybridEP and TE grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. The non-op-fuser path requires a Transformer Engine version whose GroupedLinear marks saved GroupedTensor activation buffers for paged stashing. It currently supports only fused SwiGLU or QuickGeGLU (`bias_activation_fusion=True`) without GLU interleaving; restricting the activation contract keeps dynamic-tensor marking at the fused autograd boundaries. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.
 
 ## Configuration
 
 ```bash
-# Sync-free
+# Common static-budget configuration
+--moe-token-dispatcher-type flex
 --moe-flex-dispatcher-backend hybridep
---use-transformer-engine-op-fuser
 --moe-expert-rank-capacity-factor <float>
 
 # Paged stashing (to avoid memory waste due to fragmentation)
 --moe-paged-stash
+
+# Choose one expert-compute path:
+
+# A. TE operation fuser (used by the full-iteration CUDA graph + CuTe DSL route)
+--use-transformer-engine-op-fuser
+
+# B. Device-initiated GroupedLinear, without the operation fuser
+--moe-grouped-gemm
+--moe-use-grouped-tensor
+--swiglu  # Keep fusion enabled; do not pass --no-bias-swiglu-fusion.
 ```
+
+Path B removes host-device synchronization from grouped GEMM split metadata, but FC1, activation,
+and FC2 remain separate launches. Without a full-iteration CUDA graph it can therefore retain
+significant CPU launch overhead even though the expert path is host-device sync-free.
+The legacy multi-stream cuBLAS GroupedLinear path is not supported because it materializes split
+metadata on the host; paged stashing would not make that expert path sync-free.
 
 ## Tuning (paged stashing only)
 

@@ -9,58 +9,72 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/distributed/PARALLELISM_CONTEXT.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 7df6f250d92b8a4bf37557a330a571cd4273062fce08a2f3268abfce7ee58916
 - source: pytorch-torchtitan
   path: torchtitan/distributed/parallelism_context.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 36d2ff85f47b79e42d1e69567c9a4466f4573340630a4b5b55479cadb85350f1
 - source: pytorch-torchtitan
   path: torchtitan/config/parallelism.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 7fd587ef274963ff8171981b3dee2adde352c4401466044ecc05b39fdf834573
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 64e4a9d95288e2de09146dd99dd075760a74265f9e8c2384a36f0995d3546232
 - source: pytorch-torchtitan
   path: torchtitan/distributed/fsdp.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 397ee700761af56345048cb0e7ba5b120bbc2b57a94e02aebb1c4c8499b8846a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: ae80b4bd15521159e1041142726e9717c3d952399b273889e5fca11caa221e81
 - source: pytorch-torchtitan
   path: torchtitan/distributed/PIPELINE_PARALLEL.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: c7f4d13d05e0c858f586c431c643e8b5478f9145318e7fdc75fe6df79fded44e
 - source: pytorch-torchtitan
   path: torchtitan/distributed/pipeline_parallel.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 1da335028a5e6360ecdcbe554ea0711b43cba0949c10ac912ebd22a7534ec751
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 21f503def70b1cb570be163729cacd4fd6c0ccb27d376c4ed1c15323495cb5bb
 - source: pytorch-torchtitan
   path: torchtitan/distributed/REMAT.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 7b419c4cb3e396ad1f6015130afdacf229264b214a18e0610b7bc9ac91097f99
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 6693c808dafbc202f526f366fe25dd60dc03453966230be810f6907f7b84cff0
 - source: pytorch-torchtitan
   path: torchtitan/distributed/activation_remat.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 4e935605e29f904ad5c5bef1036e265021f42c334a7a17c6d01083040dffc5a7
 - source: pytorch-torchtitan
   path: torchtitan/config/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: e62e3776a4dd1c2179b3643d9e611f5a6f53fc972ac16de4588ee96a99a06b9b
 - source: pytorch-torchtitan
   path: torchtitan/components/optim/ema.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 8cfa06a39eb1c7d84fbea7d283fc856a485054e599a7168e3c6f1b9e522fe8ff
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 697ded5d011b65cb87b9a3c88a0fed9a215ddacad37a3a40d1a3c44fa0db95b0
 - source: pytorch-torchtitan
   path: torchtitan/config/configs.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: aaf73beb7efb044ac1978b3edb43b48db256ccd708660880d947bc70e9be3a2c
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 3465866709813651cc91114c4a006a5cc3c05d6069e9f04200e68d10c91c3659
 - source: pytorch-torchtitan
   path: tests/unit_tests/cpu/test_trainer.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 1882d21356427492dcfc7c160f842e6f18fe813fa565066e8b420741139d9d6b
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: b9681edfc274190ede7dcbba70a8bc82b814b51d4facf3618feb3c6961e0891d
+- source: pytorch-torchtitan
+  path: torchtitan/models/base/module.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 68d6ed42a6b0b95baba44774bb119123ffbe7c63217248b60e5a479ab4ed7e5f
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/fsdp_lifecycle.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 5b6f66b8bcc49a6a0cfadcaa670618a406580607fd5e15a677a9c50040a609b9
+- source: pytorch-torchtitan
+  path: torchtitan/models/common/moe/token_dispatcher.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 1565face09bffc7246f1d9ddc1a1304fe814ade500605df2f66517fd8a270dfa
+
 pr_sources:
 - pr-pytorch--torchtitan-5101
 - pr-pytorch--torchtitan-5280
@@ -123,21 +137,29 @@ PR #5266 的上游实验也提醒：视觉编码器减少 FSDP 通信后，指�
 
 `preprocess_microbatch_groups_lazily` 避免一步开始就把所有group搬入设备和构造掩码；PP中每组包含本schedule step的所有microbatch。它要求关闭CUDA graphs且无SDC replay；pageable输入和varlen host同步可能增加等待，收益取决于输入和实际重叠，不能把注释中的某个H100百分比写成通用结论。全局token分母保持原步的值。
 
-当前decoder统一将MoE挂在 `feed_forward`，FSDP按模块真实类型判断稀疏路径，不再按旧 `moe_enabled` 属性；symm-mem dense scope、expert参数和prefetch必须核对新模块树。EMA DTensor初始化新增显式global shape/stride，局部分片的empty_like大小不能替代全局元数据。
+当前常见 decoder 将 MoE 挂在 `feed_forward`；FSDP 扫描 block 的真实直接子模块并按 MoE/DistMoE 类型判断稀疏路径，避免把固定字段名当作所有模型的契约；symm-mem dense scope、expert参数和prefetch必须核对新模块树。EMA DTensor初始化新增显式global shape/stride，局部分片的empty_like大小不能替代全局元数据。
+
+## FSDP policy 与 partial backward 的状态边界
+
+当前 FSDP policy 在 `fully_shard` 前收集 `named_preserve_dtype_params()` 的参数身份，对这些参数使用自身 dtype 与目标 dtype 的 promote 结果。embedding-only shard unit 可跳过 backward unshard，但必须确实全部由 embedding 参数构成；混入 norm 等需要权重的模块不能沿用该优化。
+
+`fsdp_lifecycle.fsdp_partial_backwards` 保存并恢复各 group 的 post-forward mesh、reshard、reduce 与 HSDP all-reduce policy；有外层 backward 或手工 finalization 时保留未归约梯度和预取状态，不能用一次 public sync setter 覆盖独立 HSDP policy。PP metadata inference 结束还对 FSDP stage 注册 `reset_iter_state` 清理。评估 chunked loss、split backward 与 Graph 组合时同时检查参数驻留、输出 hooks、归约次数和异常后的 finally 恢复。
+
+DeepEP 与 HybridEP 的 dispatch/combine 共享 `ep_communication` remat 选择，不能一个保存、另一个重放：backward 还消费 forward handle。DeepEP 使用确定性排序 buffer；HybridEP 的 prefix scans 保持 token 顺序。全量重算会一起重放两端通信，省显存不等于消除通信或 host 等待。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/distributed/PARALLELISM_CONTEXT.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/PARALLELISM_CONTEXT.md)
-- [torchtitan/distributed/parallelism_context.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/parallelism_context.py)
-- [torchtitan/config/parallelism.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/parallelism.py)
-- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/fsdp.py)
-- [torchtitan/distributed/PIPELINE_PARALLEL.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/PIPELINE_PARALLEL.md)
-- [torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/pipeline_parallel.py)
-- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/REMAT.md)
-- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/activation_remat.py)
-- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/README.md)
+- [torchtitan/distributed/PARALLELISM_CONTEXT.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/PARALLELISM_CONTEXT.md)
+- [torchtitan/distributed/parallelism_context.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/parallelism_context.py)
+- [torchtitan/config/parallelism.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/parallelism.py)
+- [torchtitan/distributed/fsdp.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/fsdp.py)
+- [torchtitan/distributed/PIPELINE_PARALLEL.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/PIPELINE_PARALLEL.md)
+- [torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/pipeline_parallel.py)
+- [torchtitan/distributed/REMAT.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/REMAT.md)
+- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/activation_remat.py)
+- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/README.md)
 
 - [PR #5101：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5101.md)
 - [PR #5280：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5280.md)
@@ -151,9 +173,15 @@ PR #5266 的上游实验也提醒：视觉编码器减少 FSDP 通信后，指�
 
 验证应覆盖 offload 开关、参数和 buffers、多步 EMA 数值、checkpoint round trip 以及并行规模变化；本页仅审查当前源码，没有执行该测试矩阵。不要用这个实现去推断所有 optimizer state 都自动采用同一 offload 策略。
 
-- [torchtitan/components/optim/ema.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/components/optim/ema.py)
+- [torchtitan/components/optim/ema.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/components/optim/ema.py)
 
 ## 本次补充的实现与测试依据
 
-- [torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/configs.py)
-- [tests/unit_tests/cpu/test_trainer.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/unit_tests/cpu/test_trainer.py)
+- [torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/configs.py)
+- [tests/unit_tests/cpu/test_trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/unit_tests/cpu/test_trainer.py)
+
+- [torchtitan/models/base/module.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/base/module.py)
+
+- [torchtitan/distributed/fsdp_lifecycle.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/fsdp_lifecycle.py)
+
+- [torchtitan/models/common/moe/token_dispatcher.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/moe/token_dispatcher.py)

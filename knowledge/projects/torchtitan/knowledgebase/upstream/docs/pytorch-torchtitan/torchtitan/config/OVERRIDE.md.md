@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/config/OVERRIDE.md
-raw_sha256: 8bd415ea0af50c5b4f7ad407c22afeea9ca63c22c2c6139b89f11311f55c46b6
+raw_sha256: ea807062ffbc1e4267bff8c91730aca37a454091b16b25ada20adc07d784bf22
 sources: []
-generated_body_sha256: 14c193f175dced17574bb76dcc7e56facb0702fcd8d5c6f7294fc8048f5b9fcd
+generated_body_sha256: d824a56a416a5b95543984e2a17298ec632c3dc03e8cfc8c6ca04626a59b3b55
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/config/OVERRIDE.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/OVERRIDE.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/OVERRIDE.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -506,16 +506,17 @@ for the full recipe.
   while retaining the core `DenseFeedForward` parameter layout and checkpoint
   behavior. Because the override targets `SwiGLU.Config`, it also applies to
   grouped experts and dist-GEMM feed-forwards that use that activation.
-- `torchtitan_recipes/overrides/helion_rope.py` — **the custom-kernel example.** Swaps
-  `ComplexRoPE` for a fused Helion kernel (forward + backward) wrapped in a
-  `torch.library.custom_op` (with `register_fake` / `register_autograd`), the
-  recipe from "Custom kernels and `torch.compile`". `helion` is an optional
-  dependency, so the module imports without it and falls back to the PyTorch RoPE
-  when it (or CUDA) is unavailable; it is checkpoint-compatible with stock.
+- `torchtitan_recipes/overrides/higher_precision_rms_norm.py` -- **a
+  higher-precision norm example.** It replaces every exact `RMSNorm.Config`
+  (decoder norms and QK norms) with `HigherPrecisionRMSNorm`, which keeps the
+  `nn.RMSNorm` parameter layout and accumulates the sum of squares with
+  compensated FP32 summation (FP64 with `use_kahan_summation=False`). The Triton
+  kernels are registered as `torch.library.custom_op`s with fake and autograd
+  registrations. It runs as a local SPMD region typed by the norm's own
+  `ShardingConfig`.
 The `TritonRoPE` snippets above are illustrative — no `triton_rope.py` is
-shipped — but RoPE is a fully valid override target (`helion_rope.py` is a real
-one): each attention module owns a `rope` submodule (`RoPE.Config`), so a custom
-RoPE is an ordinary component override.
+shipped — but RoPE is a fully valid override target: each attention module owns a
+`rope` submodule (`RoPE.Config`), so a custom RoPE is an ordinary component override.
 
 ## Code map
 
@@ -526,7 +527,7 @@ RoPE is an ordinary component override.
 | `torchtitan/models/base/model.py` | `BaseModel` owns the model-level lifecycle and its nested config participates directly in traversal. |
 | `torchtitan/trainer.py` | Holds the `override` config field and applies recipe-provided overrides before builds. |
 | `torchtitan/rl/controller/controller.py` | Holds the RL `override` field and applies it to the trainer and generator models before spawning actors. |
-| `torchtitan_recipes/overrides/` | In-repo example implementations (`fused_swiglu.py`, `helion_rope.py`). |
+| `torchtitan_recipes/overrides/` | In-repo example implementations (`fused_swiglu.py`). |
 | `tests/unit_tests/cpu/config/test_override.py` | Unit tests: registration, provenance, FQN / exact targeting, per-node conflicts, per-entry kwargs, `derive`. |
 
 Overriding a component requires no changes to a recipe or model package; that

@@ -10,57 +10,58 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: reviewed implementation chains and official guides; not all models, backends or HCU runtime qualification
+reviewed_on: '2026-11-04'
+coverage: reviewed implementation chains and official guides; not all models, backends
+  or HCU runtime qualification
 sources:
 - source: vllm-project-vllm
   path: README.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
   sha256: 4dc7399323b9660117f8cc1226afb7a81cdbb912dbb4ae74b66d89052417d11c
 - source: vllm-project-vllm
   path: pyproject.toml
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 1527725d5e4d65a780d13646e1eb97531ad9fc18c6d575708e42eaaa232e5747
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 9f3264aa7b7722a024593f452c41eaac7e7c322c71a51081f54fcc88c8647379
 - source: vllm-project-vllm
   path: setup.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 47fdd4a8cbffa723242729cd6874b332eb31e2d602055c123a8683ea6b7a00fd
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: d0ee2b591a71c0960c1c6ec12ae5cc820b9ecef7f4d15064f1b1b27f418dbe71
 - source: vllm-project-vllm
   path: docs/getting_started/installation/gpu.rocm.inc.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: c470c39fb50917ab05be600609260113db37389844ab713436dc42306a524715
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: deda6575af9dfa83d5a58b0b1112a859a6fe092ba457e59a3dd5d037d698f7b3
 - source: vllm-project-vllm
   path: docs/models/supported_models.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: c907f3cd269129be144608c1ec255f09e3901a4e591a9c1df096d4f1f408654c
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 2e0d665b14f0d5385c440f591803c52187b389c44dbbac00914b12b2d67f6910
 - source: vllm-project-vllm
   path: docs/training/rlhf.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: d5f1075d027de319baf6e7698cf21701d90a7026d3c1807b2439b38c6e2a4ec5
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 56d2f446eb98232949176564869840ad8bcc9d182b8ce40959bd4f28f5d22bf8
 - source: vllm-project-vllm
   path: docs/training/weight_transfer/README.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: a307f0cf03d6b2581c43ac745a872b7b0d4df4c08b8a2e843633abf0351a35be
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: f99e82bb5c95f9e3353d8e27d64ee8d2ab48a05f9ecd270e5334bcbb697dbdc7
 - source: vllm-project-vllm
   path: docs/features/sleep_mode.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 85bd01f925e1ad92c80ac023214ec1a1dd7d431fc8ae03ba4ee214cfb8ab13de
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 7f8d19a6a7eeea565a9339bae555b6deb36c5f02087342087b4b1de85dfb0342
 - source: vllm-project-vllm
   path: vllm/v1/worker/gpu_worker.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: b401a1e0579df877f16184cb2850f4ddf034bb60f9877500e324fd586a563e20
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: a60f9d8c4935eb8e8949ea706a5922aae5df711c32599236319e6b145ad404da
 - source: vllm-project-vllm
   path: vllm/v1/core/sched/scheduler.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 7c56bb15fb3a21386ea312a2320fe42346b348cfe51635581070e77ce8a741f7
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 6fa70af3d7c7eeddea72a794a79e96d1de4ae0e1d982b64b0891071dfdc79dee
 - source: vllm-project-vllm
   path: examples/rl/rlhf_async_new_apis.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
   sha256: b422474b8ae8d7d6b5e7fb52fb5e7ba50bbd48c79be76f1b856502cfe0fe1fae
 - source: vllm-project-vllm
   path: tests/v1/worker/test_gpu_worker_weight_transfer.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 4d4b4779e4f0fcfac6ff29df30584b32722ca243f6faf74d46ddbd432c34e33e
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 6207d97b7673c913ab8210b9723c97675058b998e42a6942617742ff797573ff
 ---
 
 # vLLM：RL 权重同步、生成与显存交接的工程地图
@@ -92,6 +93,8 @@ vLLM在RL中提供高吞吐rollout、eval及训练后的权重安装，负责推
 
 当前固定pyproject声明Python ≥3.11且<3.15，build依赖指定Torch；源码setup依据目标平台构建扩展，ROCm官方指南与HCU镜像配方应分别阅读。遵循实际HCU fork支持的Torch/DTK/编译器/通信版本，记录wheel来源、source SHA、扩展路径和backend日志；`vllm.__version__`不是动态库加载证据。
 
+ROCm wheel 另受 Python 和平台变体约束：当前指南仅提供 Python 3.12 的 ROCm wheel，其他 Python 版本的安装可能回退到 CUDA wheel。`rocm100`、`rocm721` 与已停止更新的旧 `rocm72` 源不能混用；pip 的 ROCm 10.0/TheRock 路线也不能替代 HCU 镜像配方。按明确 wheel URL/标签、依赖和加载日志验身份，不以安装命令成功作为平台匹配证明。
+
 从HCU消费者既有rollout脚本选择serve或嵌入式LLM/AsyncLLM；固定模型config/tokenizer、TP/PP/DP/EP、attention/quantization、max-model-len、scheduler预算和memory配置。训练main与推理main各自latest并不保证兼容，wire params、loader格式和控制端必须成组锁定。
 
 ## 模型、数据和运行验收
@@ -110,11 +113,13 @@ vLLM在RL中提供高吞吐rollout、eval及训练后的权重安装，负责推
 
 同步卡住先确认所有训练 rank 是否按所选 source 的 metadata 同序 materialize/reshard、所有 rollout worker 是否进入 receive；OOM先看逐层group是否退化、weight/KV恢复是否同时峰值、host backup是否重叠。失败同步不消费新policy样本；明确可信版本、所有worker结果和更新状态后再恢复。服务重启不代替consumer checkpoint/RNG/样本游标恢复。
 
+当前 `WeightSource` 已统一为缓存的 metadata 属性及 `iter_full()` / `iter_local()`，owners 和布局必须在各 rank 一致；旧 source 子类与方法不能混装。dense NCCL 的多 broadcaster、M2N 的全训练 rank ownership 限制、异步 KV-load slots，以及实验 CUDA 进程 checkpoint 各有独立边界，见两专题，不能由单一 factory 登记推出组合可用。
+
 ## Release、规划、PR 与维护
 
 当前 HTTP health 在一次 weight update 失败后仍可能返回200，而模型已处于中途 reload 状态。消费者必须检查完整 start/update/finish 结果，重新安装可信完整权重后才恢复生成；只补最后一个 chunk 或只修改 version 标签都不能修复这类状态，见[传权专题](../topics/weight-transfer.md)。
 
-本页固定官方main `bde4d001130e5112d984ba99f0546e22c09e1a89`；2026-10-20最近可见正式release为[v0.32.0](https://github.com/vllm-project/vllm/releases/tag/v0.32.0)（2026-10-18 发布）。[Releases](https://github.com/vllm-project/vllm/releases)、[官方文档](https://docs.vllm.ai/)、[Issues/RFC](https://github.com/vllm-project/vllm/issues)、[PR](https://github.com/vllm-project/vllm/pulls)共同核对规划、合入和发布。sleep-backend源码引用RFC #34303是扩展动机，不证明所有durable/CRIU backend已实现。
+本页固定官方main `25e7c5728d834335288d080e1c36810fa111d4da`；2026-11-04 release API 最近记录的名称为 v0.33.0、实际 tag 为 [v0.33.0rc3](https://github.com/vllm-project/vllm/releases/tag/v0.33.0rc3)（2026-11-02 发布，API 标为非 prerelease）。名称、tag 和源码 main 分别保存，不能把 tag 中的 rc 或 API 标志单独当成 HCU 稳定资格。[Releases](https://github.com/vllm-project/vllm/releases)、[官方文档](https://docs.vllm.ai/)、[Issues/RFC](https://github.com/vllm-project/vllm/issues)、[PR](https://github.com/vllm-project/vllm/pulls)共同核对规划、合入和发布。sleep-backend源码引用RFC #34303是扩展动机，不证明所有durable/CRIU backend已实现。
 
 保留[PR #59772](../../upstream/prs/vllm-project--vllm/PR-59772.md)作为可选ModelExpress依赖/CI测试约束的历史入口；它修测试发现与skip，不能称为训练传权性能提升。相关实现PR需按问题继续`wiki-search-pr "weight transfer layerwise" --engine vllm`，再追head/base和真实调用。
 
@@ -126,17 +131,17 @@ HCU 侧若通过 vLLM 插件接入，基础包、插件及算子扩展是不同�
 
 ## 固定证据与验证范围
 
-- [README.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/README.md)
-- [pyproject.toml](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/pyproject.toml)
-- [setup.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/setup.py)
-- [docs/getting_started/installation/gpu.rocm.inc.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/getting_started/installation/gpu.rocm.inc.md)
-- [docs/models/supported_models.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/models/supported_models.md)
-- [docs/training/rlhf.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/rlhf.md)
-- [docs/training/weight_transfer/README.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/training/weight_transfer/README.md)
-- [docs/features/sleep_mode.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/features/sleep_mode.md)
-- [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/worker/gpu_worker.py)
-- [vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/core/sched/scheduler.py)
-- [examples/rl/rlhf_async_new_apis.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/examples/rl/rlhf_async_new_apis.py)
-- [tests/v1/worker/test_gpu_worker_weight_transfer.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/tests/v1/worker/test_gpu_worker_weight_transfer.py)
+- [README.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/README.md)
+- [pyproject.toml](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/pyproject.toml)
+- [setup.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/setup.py)
+- [docs/getting_started/installation/gpu.rocm.inc.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/getting_started/installation/gpu.rocm.inc.md)
+- [docs/models/supported_models.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/models/supported_models.md)
+- [docs/training/rlhf.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/training/rlhf.md)
+- [docs/training/weight_transfer/README.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/training/weight_transfer/README.md)
+- [docs/features/sleep_mode.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/features/sleep_mode.md)
+- [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/v1/worker/gpu_worker.py)
+- [vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/v1/core/sched/scheduler.py)
+- [examples/rl/rlhf_async_new_apis.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/examples/rl/rlhf_async_new_apis.py)
+- [tests/v1/worker/test_gpu_worker_weight_transfer.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/tests/v1/worker/test_gpu_worker_weight_transfer.py)
 
-本页在 2026-10-20 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+本页在 2026-11-04 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 733126ddccaf49c4bfd780d384f00878c1f0a9a8
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: docs/source/embodied_tutorial/quick_start_dreamzero.md
-raw_sha256: d8cf3a7d95272e3c08f60f6b8e88ebe65220bc84ad89c182c8c5cf9b58729f89
+raw_sha256: 9fb3119b2394ba1e4435e107278677e7ee09daf767e8d6e993ff8433ce625fe4
 sources: []
-generated_body_sha256: 69596ffea71b784ae360f249e4472442f559746f92f33697530342bc8c34cbc1
+generated_body_sha256: 7f4ede3ff47b4f11d1d4647c7a376041af7bd582a1335a0d24c5da2c5bd409fd
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / docs/source/embodied_tutorial/quick_start_dreamzero.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/733126ddccaf49c4bfd780d384f00878c1f0a9a8/docs/source/embodied_tutorial/quick_start_dreamzero.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/embodied_tutorial/quick_start_dreamzero.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -235,7 +235,7 @@ CACHE_DIR=$DREAMZERO_CACHE_ROOT/dreamzero_full_wan22_5b SAMPLE_TRANSFORM_SEED=0 
     bash examples/embodied/dreamzero/run_dreamzero_wan22_5b_full_fsdp_finetune.sh
 ```
 
-The training script strictly validates the cache at startup. When manifest, `_SUCCESS`, or transform config mismatch, training aborts before the first step.
+The training script strictly validates the cache at startup. When manifest, `_SUCCESS`, or transform config mismatch, training aborts before the first step. For 14B, caching prompt_embs is optional: append `--include-prompt-embs` when generating the cache and set `CACHE_PROMPT_EMBS=true` for the 14B full fine-tuning script. Each step then skips the frozen Text Encoder, but every sample takes about 4 MiB more, roughly tripling the cache.
 
 ### 2.4 Performance Optimization Switches
 The DROID 5B / 14B configs enable validated default optimizations. The 5B Full FSDP recipe also enables Delta-FP8 by default and requires a supported CUDA/NCCL environment; pass `--no-fsdp-delta-fp8-allgather` to use native BF16 AllGather on an unsupported environment or for an A/B comparison. LIBERO, AgiBot, and YAM use conservative defaults. After adjusting performance switches, we recommend running 3–10 steps first and checking loss, grad norm, and memory usage.
@@ -251,6 +251,7 @@ bash examples/embodied/dreamzero/run_dreamzero_wan22_5b_full_fsdp_finetune.sh \
 
 # Wan2.1 14B
 bash examples/embodied/dreamzero/run_dreamzero_wan21_14b_full_fsdp_finetune.sh \
+    model.compile_causal_attention_block=false \
     model.skip_single_state_attention=false model.compile_causal_cross_attention=false \
     model.compile_cross_attention_emulate_precision_casts=false model.compile_block_norm_modulate=false \
     model.qk_rmsnorm_impl=wan model.manual_self_attn_linear_backward=false model.fused_rope=false \
@@ -264,7 +265,7 @@ Main switches:
 | Switch | Default | Description |
 | --- | --- | --- |
 | `model.flash_attention_dense` | `true` | dense attention uses FlashAttention directly |
-| `model.compile_causal_attention_block` (5B) | `true` | compile the full `CausalWanAttentionBlock` forward with `torch.compile` |
+| `model.compile_causal_attention_block` (5B / 14B) | `true` | compile the full `CausalWanAttentionBlock` forward with `torch.compile`; the 14B LoRA script turns it off (variable-length samples) |
 | `model.batch_vae_encode` | `true` | batched VAE encoding; higher throughput but larger peak memory; disable when OOM |
 | `model.prompt_emb_cache` | `gpu` | cache frozen Text Encoder outputs; set to `cpu` or empty string to disable |
 | `model.compile_causal_cross_attention` (14B) | `true` | `torch.compile` compile causal cross-attention |

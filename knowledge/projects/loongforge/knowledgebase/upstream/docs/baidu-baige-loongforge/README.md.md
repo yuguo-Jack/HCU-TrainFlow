@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: baidu-baige/LoongForge
-commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
+commit: 042a68102395b9f4024d1a61084592c4c618371a
 path: README.md
-raw_sha256: ec1cd750b18a1fe1e6af9ce284ed0227b0701a1d8d6eabc7561d8450606e5fdf
+raw_sha256: df67a100050c88b9b94082117cc5e918943639d9d51b1b7f971ae7a891bf584d
 sources: []
-generated_body_sha256: 02961c34e31b6314d1dad7d7dccb9bad96083ce9d738870c1f8899a09f675493
+generated_body_sha256: 50cb3d9bb473ac5720d14b616af0013cb2c9351cc84d8f82fc1324454416e92a
 source_state: current-scan
 ---
 
 # baidu-baige/LoongForge / README.md
 
-[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/README.md)
+[Original at fixed commit](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -41,9 +41,9 @@ Upstream source document; original commands, claims and links require their stat
 <h3 align="center">Train LLMs, VLMs, diffusion, and embodied models — faster.</h3>
 
 <p align="center">
-  <a href="https://loongforge.readthedocs.io/en/latest/index.html"><b>Docs &#8599;&#xFE0E;</b></a>
+  <a href="https://loongforge.readthedocs.io/en/latest/index.html"><b>Docs</b></a>
   &nbsp;·&nbsp;
-  <a href="https://baidu-baige.github.io/LoongForge/blog/"><b>Blog &#8599;&#xFE0E;</b></a>
+  <a href="https://baidu-baige.github.io/LoongForge/blog/"><b>Blog</b></a>
   &nbsp;·&nbsp;
   <a href="#performance"><b>Performance</b></a>
   &nbsp;·&nbsp;
@@ -78,13 +78,13 @@ Upstream source document; original commands, claims and links require their stat
 
 **LoongForge** is an open-source training framework developed by the [Baidu AI Cloud Baige team](https://cloud.baidu.com/product/aihc.html), built to deliver faster training for mainstream **LLMs, VLMs, diffusion, and embodied models**.
 
-- **High Performance** — Built on a multi-backend architecture (Megatron-LM and torch-native), with [deep training-speed](#performance) optimizations that keep **training loss aligned with the baseline**.
-- **Easy to Use** — Covers 40+ mainstream open-source [models](#models), each with ready-to-run configs and launch examples. Ships with supporting tools such as checkpoint conversion and data preprocessing, and supports **pre-training**, **continued pre-training**, **SFT**, and **LoRA**.
-- **Production-Proven** — Open-sourced from [AIAK-Training-LLM](https://cloud.baidu.com/doc/AIHC/s/Alyo476jr), a training suite that serves enterprise customers' proprietary models and also powers some [awesome projects](#powered-by-loongforge), with its largest validated scale for large-model training reaching **5,000+ XPUs**.
+- **High Performance** — Built on Megatron-LM and torch-native backends, with deep optimizations for [training speed](#performance) that keep **training loss aligned with the baseline**.
+- **Easy to Use** — Ready-to-run configs and launch scripts for 40+ open-source [models](#models), plus checkpoint conversion and data preprocessing tools. Supports **pre-training**, **mid-training**, **SFT**, and **LoRA**.
+- **Production-Proven** — Open-sourced from [AIAK-Training-LLM](https://cloud.baidu.com/doc/AIHC/s/Alyo476jr), which powers enterprise customers' proprietary models and several [open-source projects](#powered-by-loongforge). Production runs reach **5,000+ XPUs**.
 
 ---
 
-**Example:** training the embodied model DreamZero (full fine-tuning of Wan2.2-5B) on LoongForge reaches 4.38× the open-source baseline's throughput, with loss curves staying aligned
+**Example:** training the embodied model DreamZero on LoongForge reaches 4.38× the open-source baseline's throughput, with loss curves staying aligned
 
 <p align="center">
   <a href="https://baidu-baige.github.io/LoongForge/assets/video/dreamzero-comparison.mp4">
@@ -100,7 +100,7 @@ Upstream source document; original commands, claims and links require their stat
 <a id="architecture"></a>
 ## 🏗️ Architecture
 
-Different model families and scales call for different training strategies, so LoongForge adopts a multi-backend architecture.
+Since optimal training strategies differ across model families and scales, LoongForge adopts a multi-backend architecture.
 
 <p align="center">
   <picture>
@@ -115,7 +115,8 @@ Different model families and scales call for different training strategies, so L
 
 ## 🔥 Latest News
 
-- **[2026/10]** 🤖 Introducing **[LoongForge-VLDA](./cookbook/loongforge-vlda/)**, a Vision-Language-Delta-Action model trained with LoongForge: **98.5%** on LIBERO, **84.5%** zero-shot on LIBERO-Plus, and **+17–18 points** over π0.5 on real robots. [[project page](https://baidu-baige.github.io/LoongForge/projects/vlda.html)]
+- **[2026/10]** 🤖 Added VLA training support for **[LingBot-VLA-v2](./examples/embodied/lingbot_vla_v2/)**, built on the new tensor_wise distributed optimizer with Muon. `--optimizer muon` also runs under plain DDP for any model.
+- **[2026/10]** 🤖 Introducing **[LoongForge-VLDA](./cookbook/loongforge-vlda/)**, a Vision-Language-Delta-Action model trained with LoongForge: **98.5%** on LIBERO, **84.5%** zero-shot on LIBERO-Plus, and **+17–18 points** over π0.5 on real robots. [[project page](https://baidu-baige.github.io/LoongForge/projects/vlda.html)] [[paper](https://arxiv.org/abs/2610.25874)]
 - **[2026/10]** 🦾 Open-sourced **[ego2robot](./tools/ego2robot/)** — a pipeline that converts first-person videos of human manipulation into dual-arm robot training data, outputting **LeRobot v3.0** format across **16 robot morphologies**.
 - **[2026/09]** ✨ Added training support for **[GLM-5.3-flash](./examples/glm5_next/)**.
 - **[2026/09]** ✨ Added **[Kimi-K3](./examples/kimi_k3/)** BF16 training support for both LLMs and VLMs.
@@ -125,13 +126,13 @@ Different model families and scales call for different training strategies, so L
 - **[2026/08]** ✨ Added training support for **GLM-5.2**, along with a **[GLM-5.2 + MoonViT](./configs/models/glm5.2_vit/)** custom-composition [example](./examples/glm5.2_vit/) for extending GLM with multimodal capabilities.
 - **[2026/08]** ✨ Added training support for **MiniCPM-V-4.6** and **Qwen3.8-27B**.
 - **[2026/08]** 🧪 Introduced a unified [**evaluation module**](./loongforge/embodied/eval/) for the embodied stack, currently covering **Pi0.5 / xVLA / GR00T**, with more models on the way.
-- **[2026/07]** 🐳 Unified the **prebuilt Docker images** — all model families (LLM / VLM / Embodied / Diffusion) now share a single image.
-- **[2026/07]** 🤖 Released **[LoongForge-Embodied](./loongforge/embodied)**, a torch-native DDP/FSDP training subsystem for embodied models (Pi0.5, GR00T-N1.6/N1.7, xVLA, LingBot-VA, FastWAM, DreamZero, and Cosmos3), with up to **4.38× speedup**.
-- **[2026/07]** ✨ Added training support for **DeepSeek-V4-Flash / DeepSeek-V4-Pro**.
 
 <details>
 <summary><b>📅 More</b></summary>
 
+- **[2026/07]** 🐳 Unified the **prebuilt Docker images** — all model families (LLM / VLM / Embodied / Diffusion) now share a single image.
+- **[2026/07]** 🤖 Released **[LoongForge-Embodied](./loongforge/embodied)**, a torch-native DDP/FSDP training subsystem for embodied models (Pi0.5, GR00T-N1.6/N1.7, xVLA, LingBot-VA, FastWAM, DreamZero, and Cosmos3), with up to **4.38× speedup**.
+- **[2026/07]** ✨ Added training support for **DeepSeek-V4-Flash / DeepSeek-V4-Pro**.
 - **[2026/07]** ✨ Added training support for **Qwen-Image-Edit-2511**.
 - **[2026/06]** 🤖 Expanded VLA coverage with **GR00T N1.6**; **2.3× speedup** on GR00T training. [[blog](https://baidu-baige.github.io/LoongForge/blog/2026-06-loongforge-groot-n16-acceleration.html)]
 - **[2026/05]** ⚡ Accelerated **Wan 2.2** training by **116%**, and added CP and data packing support.
@@ -305,14 +306,16 @@ Click any model for its training examples; see [`configs/models/`](./configs/mod
 <td valign="top">
 <ul>
 <li><a href="examples/embodied/pi05/">Pi0.5</a></li>
-<li><a href="examples/embodied/groot_n1_6/">GR00T-N1.6</a></li>
-<li><a href="examples/embodied/groot_n1_7/">GR00T-N1.7</a></li>
+<li><a href="examples/embodied/gr00t_n1_6/">GR00T-N1.6</a></li>
+<li><a href="examples/embodied/gr00t_n1_7/">GR00T-N1.7</a></li>
 <li><a href="examples/embodied/xvla/">xVLA</a></li>
 <li><a href="examples/embodied/wall_oss_0_5/">Wall-OSS-0.5</a></li>
 <li><a href="examples/embodied/fastwam/">FastWAM</a></li>
 <li><a href="examples/embodied/lingbot_va/">LingBot-VA</a></li>
+<li><a href="examples/embodied/lingbot_vla_v2/">LingBot-VLA-v2</a></li>
 <li><a href="examples/embodied/cosmos3/">Cosmos3</a></li>
 <li><a href="examples/embodied/dreamzero/">DreamZero</a></li>
+<li><a href="cookbook/loongforge-vlda/">LoongForge-VLDA</a></li>
 </ul>
 </td>
 <td valign="top">
@@ -382,7 +385,7 @@ See more on the [Projects page](https://baidu-baige.github.io/LoongForge/project
 
 ### From the LoongForge Team
 
-- [**LoongForge-VLDA**](./cookbook/loongforge-vlda/) — Vision-Language-Delta-Action model for robotic manipulation: **98.5%** on LIBERO, **84.5%** zero-shot on LIBERO-Plus, and **17–18 points** ahead of π₀.₅ on real robots. [[project page](https://baidu-baige.github.io/LoongForge/projects/vlda.html)]
+- [**LoongForge-VLDA**](https://baidu-baige.github.io/LoongForge/projects/vlda.html) — Vision-Language-Delta-Action model for robotic manipulation: **98.5%** on LIBERO, **84.5%** zero-shot on LIBERO-Plus, and **17–18 points** ahead of π₀.₅ on real robots.
 
 https://github.com/user-attachments/assets/8563afca-f79a-4a45-bb4f-36e06c0ccbcb
 
@@ -437,7 +440,7 @@ LoongForge/
 
 ## 📝 Citation
 
-If you find LoongForge helpful, please cite this project:
+If you find LoongForge helpful, please consider citing this project:
 
 ```bibtex
 @software{LoongForge2026,
@@ -448,7 +451,7 @@ If you find LoongForge helpful, please cite this project:
 }
 ```
 
-If you use TAOT for MoE training in LoongForge, you can cite our paper:
+If you find TAOT helpful, please consider citing our paper:
 
 ```bibtex
 @article{zhang2026taot,
@@ -457,6 +460,18 @@ If you use TAOT for MoE training in LoongForge, you can cite our paper:
   journal = {arXiv preprint arXiv:2608.03676},
   year    = {2026},
   url     = {https://arxiv.org/abs/2608.03676}
+}
+```
+
+If you find LoongForge-VLDA helpful, please consider citing our paper:
+
+```bibtex
+@article{zhang2026vlda,
+  title   = {{Vision-Language-Delta-Action}: Learning Compact Deltas as Actionable Transition Interfaces for Robotic Manipulation},
+  author  = {Zhang, Lingsen and Li, Wei and He, Jie and Zhang, Henghua and Mo, Kai and Li, Shiyong and Wang, Yanpeng and Shao, Rui},
+  journal = {arXiv preprint arXiv:2610.25874},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2610.25874}
 }
 ```
 

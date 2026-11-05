@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: README.md
-raw_sha256: 3634007b5cca45b6e3ce61742e818c4c7fdb9c5147092cc4872e0752c00f7b75
+raw_sha256: 85a02ce07f786fac33c3d2cda4e9b4fa460b0b68e8308ddfda5ddd2c0f9fdf13
 sources: []
-generated_body_sha256: c7d4480479b06318d272bf6c61e0123751bf38f1f5013c45e03e9e4837b7d0da
+generated_body_sha256: a659ce7ce85bae4222450d0ccc4601a937902bf47d8f94f68bb18a635eac3cd3
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -28,7 +28,11 @@ Upstream source document; original commands, claims and links require their stat
 
 <div align="center">
 
-# torchtitan
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/images/logo/torchtitan-rectangle-torch-white.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/images/logo/torchtitan-rectangle-torch-black.svg">
+  <img alt="torchtitan" src="assets/images/logo/torchtitan-rectangle-torch-black.svg" width="560">
+</picture>
 
 **A PyTorch-native platform for pretraining and post-training generative AI models at scale**
 
@@ -187,7 +191,8 @@ the [model guide](torchtitan/models/README.md).
 
 **Debugging and observability**
 - [Metrics](torchtitan/observability/METRICS.md): loss, memory, throughput, TFLOPs, and MFU in TensorBoard or W&B
-- [Profiling, memory snapshots, and Flight Recorder](docs/debugging.md)
+- [Profiling and memory snapshots](torchtitan/observability/README.md)
+- [Flight Recorder and other debugging tools](docs/debugging.md)
 - Fake-backend dry runs of large layouts on one GPU
 - Deterministic mode and [loss comparison](scripts/loss_compare.py) across commits
 - [SDC replay](torchtitan/observability/SILENT_DATA_CORRUPTION.md) and [structured logging](torchtitan/observability/structured_logger/README.md)

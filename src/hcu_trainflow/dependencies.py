@@ -7,6 +7,9 @@ import subprocess
 
 from .core import FlowError, read_json, write_json
 
+# Bound automatic history repair; never make an existing target a depth-one root.
+FORWARD_HISTORY_DEEPEN = 128
+
 
 def source_urls(item):
     """Registered equivalent origins; mirrors share the same pinned commit."""
@@ -151,6 +154,55 @@ def migrate_upstream_origin(root, item, state):
     return inspect_checkout(root, item)
 
 
+def revision_relation(path, current, target):
+    """Positive ancestry is proof; a shallow negative is only unknown history."""
+    forward = git(path, 'merge-base', '--is-ancestor', current, target, check=False)
+    if forward.returncode == 0:
+        return 'forward'
+    if forward.returncode != 1:
+        return 'unknown'
+    backward = git(path, 'merge-base', '--is-ancestor', target, current, check=False)
+    if backward.returncode == 0:
+        return 'ahead'
+    if backward.returncode != 1:
+        return 'unknown'
+    shallow = git(path, 'rev-parse', '--is-shallow-repository').stdout.strip()
+    return 'unknown' if shallow == 'true' else 'diverged'
+
+
+def advance_managed_checkout(root, item, state):
+    """Move an existing clean checkout only after proving a forward update."""
+    path, current, target = root / item['path'], state.get('commit'), item['commit']
+    unresolved = 'Cannot prove a forward update; preserve current HEAD. Fetch and verify the pinned history or review the manifest lock before retrying'
+    if not current:
+        return {**state, 'action': unresolved}
+    relation = revision_relation(path, current, target)
+    if relation == 'unknown':
+        try:
+            # --deepen extends existing shallow history instead of cutting the new
+            # target into a depth-one root. Full checkouts keep their full history.
+            filtering = ['--filter=blob:none'] if item.get('sparse_paths') else []
+            git(path, 'fetch', '--no-tags', f'--deepen={FORWARD_HISTORY_DEEPEN}', *filtering, 'origin', target)
+            relation = revision_relation(path, current, target)
+        except (FlowError, OSError):
+            return {**state, 'action': unresolved + '; the bounded history fetch was unavailable'}
+    if relation != 'forward':
+        action = {
+            'ahead': 'Current HEAD is newer than the locked commit; preserve it. Review the installed source and advance the manifest lock before installing',
+            'diverged': 'Current HEAD and the locked commit have divergent history; preserve this checkout and reconcile the source and manifest separately',
+        }.get(relation, unresolved + f'; history remains incomplete after one deepen={FORWARD_HISTORY_DEEPEN} attempt')
+        return {**state, 'action': action}
+    # Fetching may take time. Do not act on an earlier clean/identity observation
+    # if another user changed the checkout while ancestry was being established.
+    latest = inspect_checkout(root, item)
+    if latest['status'] != 'revision-mismatch' or latest.get('commit') != current:
+        return {**latest, 'action': 'Checkout changed during verification; preserve its current state and inspect before retrying'}
+    if item.get('sparse_paths'):
+        git(path, 'sparse-checkout', 'set', '--cone', *item['sparse_paths'])
+    git(path, 'checkout', '--detach', target)
+    return inspect_checkout(root, item)
+
+
 def sync_dependencies(project, only=None, include_optional=False, status_only=False, migrate_origin=False, *, knowledge_source=None):
     root, entries = load_manifest(project)
     requested = set(only or [])
@@ -167,15 +219,14 @@ def sync_dependencies(project, only=None, include_optional=False, status_only=Fa
             state = inspect_checkout(root, item)
             if not status_only and migrate_origin and not state.get('external') and state['status'] == 'origin-mismatch':
                 state = migrate_upstream_origin(root, item, state)
-            if not status_only and not state.get('external') and state['status'] in {'missing', 'revision-mismatch'}:
+            if not status_only and not state.get('external') and state['status'] == 'missing':
                 path = root / item['path']
-                if state['status'] == 'missing':
-                    path.mkdir(parents=True)
-                    git(path, 'init')
-                    url = item['url']
-                    if item['id'] == 'hcu-knowledge' and knowledge_source not in {None, 'github'}:
-                        url = item['mirrors'][knowledge_source]
-                    git(path, 'remote', 'add', 'origin', url)
+                path.mkdir(parents=True)
+                git(path, 'init')
+                url = item['url']
+                if item['id'] == 'hcu-knowledge' and knowledge_source not in {None, 'github'}:
+                    url = item['mirrors'][knowledge_source]
+                git(path, 'remote', 'add', 'origin', url)
                 # No reset/clean: Git refuses collisions. Local changes are caught before fetching.
                 filtering = ['--filter=blob:none'] if item.get('sparse_paths') else []
                 git(path, 'fetch', '--depth', '1', *filtering, 'origin', item['commit'])
@@ -183,6 +234,8 @@ def sync_dependencies(project, only=None, include_optional=False, status_only=Fa
                     git(path, 'sparse-checkout', 'set', '--cone', *item['sparse_paths'])
                 git(path, 'checkout', '--detach', item['commit'])
                 state = inspect_checkout(root, item)
+            elif not status_only and not state.get('external') and state['status'] == 'revision-mismatch':
+                state = advance_managed_checkout(root, item, state)
             if state['status'] == 'dirty':
                 state['action'] = 'Preserve local edits; use a separate development checkout or resolve them before sync'
             if state['status'] == 'origin-mismatch' and 'action' not in state:

@@ -10,49 +10,58 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: reviewed implementation chains and official guides; not all models, backends or HCU runtime qualification
+reviewed_on: '2026-11-04'
+coverage: reviewed implementation chains and official guides; not all models, backends
+  or HCU runtime qualification
 sources:
 - source: vllm-project-vllm
   path: docs/features/sleep_mode.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 85bd01f925e1ad92c80ac023214ec1a1dd7d431fc8ae03ba4ee214cfb8ab13de
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 7f8d19a6a7eeea565a9339bae555b6deb36c5f02087342087b4b1de85dfb0342
 - source: vllm-project-vllm
   path: docs/design/hybrid_kv_cache_manager.md
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 46668c028e946aba3604f9509ae07ced27353628d836a91427145c502ea5ee22
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: f42303bb084b577e899f4165e1bf8f48cb2f464f2ece52f07d362d664b983d2b
 - source: vllm-project-vllm
   path: vllm/device_allocator/sleep_mode_backend.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
   sha256: 4c90c6aa44b50dc5bbdd6b09d1e6a91d56d3481a109a8d7f8cc351927401196b
 - source: vllm-project-vllm
   path: vllm/v1/worker/gpu_worker.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: b401a1e0579df877f16184cb2850f4ddf034bb60f9877500e324fd586a563e20
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: a60f9d8c4935eb8e8949ea706a5922aae5df711c32599236319e6b145ad404da
 - source: vllm-project-vllm
   path: vllm/v1/core/kv_cache_manager.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: cdd0185bd11f301631856336818987baa3520084134de65ab4abb9ecbf714623
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 62c24c6c5143c7b1dcd7831180dcd1e0285d258e7ddf4d6c67e071f0a9077d05
 - source: vllm-project-vllm
   path: vllm/v1/core/sched/scheduler.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 7c56bb15fb3a21386ea312a2320fe42346b348cfe51635581070e77ce8a741f7
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 6fa70af3d7c7eeddea72a794a79e96d1de4ae0e1d982b64b0891071dfdc79dee
 - source: vllm-project-vllm
   path: vllm/config/scheduler.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 61485c7a1ef1c7c65339767f4b223f55de76d2ca152eb19df915c88f526be9de
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 69aaaef2a78e889b5e1e0e0dd8180455f8c6d368f6663c43d634417b816fea28
 - source: vllm-project-vllm
   path: tests/v1/worker/test_sleep_mode_backend.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: 80cbeef15c516e2dcf936987117b2a8e392405ec4f627e1ea1cb2870e3fdad8e
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 65eefb257fd2412f202934fb836f809c1af628f5e8e1622bf005ad78234e8540
 - source: vllm-project-vllm
   path: tests/model_executor/test_sleep_mode_tensor_ownership.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
-  sha256: be4d7b31c31e75d048b66a99849be15cff8de4c93bcdc1c6f5dced53afddbfd1
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: ce09e53cd474b9da712bb3ae602998a140dfbf8938bfef7de2252ff6ffaab509
 - source: vllm-project-vllm
   path: examples/rl/rlhf_async_new_apis.py
-  commit: bde4d001130e5112d984ba99f0546e22c09e1a89
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
   sha256: b422474b8ae8d7d6b5e7fb52fb5e7ba50bbd48c79be76f1b856502cfe0fe1fae
+- source: vllm-project-vllm
+  path: vllm/v1/executor/cuda_checkpoint_executor.py
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: f409c6914fe1385e5a832f69a111cd72048ee6a3e195743506b932294e43fc43
+- source: vllm-project-vllm
+  path: tests/v1/executor/test_cuda_checkpoint_executor.py
+  commit: 25e7c5728d834335288d080e1c36810fa111d4da
+  sha256: 84a5e9a1204e182d3943e5890ac55699d5ac71aed0dac7c5e8f6e6b79800eb89
 ---
 
 # vLLM sleep、KV 与调度：训练共卡的内存和数值交接
@@ -64,6 +73,8 @@ sources:
 ## Sleep 状态和分 tag 恢复
 
 公共LLM/API→engine/executor→`gpu_worker.sleep/wake_up`→`SleepModeBackendFactory`→实际allocator。当前默认`cumem`封装平台allocator；factory还暴露communicator、graph、compiled artifact、durable-storage能力查询。接口存在不代表各能力均由默认backend保证，源码注释里的CRIU/durable规划不等于已有可用实现。
+
+`sleep_mode_backend` 可选择由插件登记的 backend；未登记名称可能到首次使用（如 sleep）才报错，启动成功不是资格检查。CUDA graph offload 和 KV-only discard 另有能力要求，选择一个 backend 名称不能同时满足这些前提。
 
 | 状态 | weights/KV行为 | 适用与代价 |
 | --- | --- | --- |
@@ -80,9 +91,13 @@ level2的冻结参数保留选项按运行时parameter-name glob匹配，不按c
 
 `enable_nccl_comm_suspend`是实验性选项，官方要求NCCL≥2.29.7，旧库保留buffers并warning。HCU不能仅因提供RCCL就自动启用，必须核对相应API/symbol、fork和运行测试。官方ROCm sleep还受`VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE`影响，大chunk更少操作但可能更易OOM，当前教程默认256MB；HCU取值需匹配DTK和测量，不能照搬AMD结论。
 
+官方新增实验性 `CUDACheckpointExecutor`，在普通 level1 sleep 后保存剩余 CUDA 进程状态；它要求 Linux/NVIDIA、V2 runner、cumem、专用 worker 及受限的单节点 TP，拒绝外部 KV/权重传输等组合，并不提供训练 checkpoint 或模型切换。源码在失败时终止 worker，避免部分 rank 恢复后继续服务；部分 tag wake 也须先恢复整个 CUDA 进程。它与默认 allocator 的 graph-pool offload 是不同机制，不能扩写成 HCU、任意通信库或生产长稳已经支持。
+
 ## Token 预算、抢占与异步在途
 
 V1 scheduler按token预算、request状态与KV可用blocks推进。`max_num_batched_tokens`、`max_num_seqs`、model长度与chunked prefill改变每步输入，需同时看prefill/decode、队列和内存；microbenchmark不能代表RL真实长度分布。
+
+新增 `max_num_inflight_kv_loads` 限制异步 KV load 持有的 slots：计算 load 进行中、已完成但等待运行，以及尚未结束的 aborted loads。显式设置后可在 running batch 满时提前发起受支持的异步 load；默认 `None` 保持原来的发起时机。它不扩大实际 running batch 或 graph 容量，也不消除等候请求占用的 KV，需测首 token、尾延迟和驻留峰值，不能只把传输重叠视为净收益。
 
 KV不足时preemption/recompute会增加工作。异步调度包含inflight/stale output与延后block-free，未完成GPU写入前复用block会污染新请求；不能通过去同步“优化等待”而破坏ownership。睡眠/权重更新须与pause完成和request处理对齐，HTTP已响应与所有设备工作结束分别核对。
 
@@ -112,15 +127,19 @@ worker sleep-backend与tensor-ownership测试是状态/接口回归，真实模�
 
 ## 固定证据与验证范围
 
-- [docs/features/sleep_mode.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/features/sleep_mode.md)
-- [docs/design/hybrid_kv_cache_manager.md](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/docs/design/hybrid_kv_cache_manager.md)
-- [vllm/device_allocator/sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/device_allocator/sleep_mode_backend.py)
-- [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/worker/gpu_worker.py)
-- [vllm/v1/core/kv_cache_manager.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/core/kv_cache_manager.py)
-- [vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/v1/core/sched/scheduler.py)
-- [vllm/config/scheduler.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/vllm/config/scheduler.py)
-- [tests/v1/worker/test_sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/tests/v1/worker/test_sleep_mode_backend.py)
-- [tests/model_executor/test_sleep_mode_tensor_ownership.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/tests/model_executor/test_sleep_mode_tensor_ownership.py)
-- [examples/rl/rlhf_async_new_apis.py](https://github.com/vllm-project/vllm/blob/bde4d001130e5112d984ba99f0546e22c09e1a89/examples/rl/rlhf_async_new_apis.py)
+- [docs/features/sleep_mode.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/features/sleep_mode.md)
+- [docs/design/hybrid_kv_cache_manager.md](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/docs/design/hybrid_kv_cache_manager.md)
+- [vllm/device_allocator/sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/device_allocator/sleep_mode_backend.py)
+- [vllm/v1/worker/gpu_worker.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/v1/worker/gpu_worker.py)
+- [vllm/v1/core/kv_cache_manager.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/v1/core/kv_cache_manager.py)
+- [vllm/v1/core/sched/scheduler.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/v1/core/sched/scheduler.py)
+- [vllm/config/scheduler.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/config/scheduler.py)
+- [tests/v1/worker/test_sleep_mode_backend.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/tests/v1/worker/test_sleep_mode_backend.py)
+- [tests/model_executor/test_sleep_mode_tensor_ownership.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/tests/model_executor/test_sleep_mode_tensor_ownership.py)
+- [examples/rl/rlhf_async_new_apis.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/examples/rl/rlhf_async_new_apis.py)
 
-本页在 2026-10-20 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+本页在 2026-11-04 阅读上述固定源码和教程；官方接口、上游测试内容、HCU 分支支持及现场实测分别判断。本轮没有执行 GPU 测试，也不宣称覆盖全部模型或 transport。更新时复核总览、两个机制专题、训练框架适配器、调用方测试与 Skill；普通查询可继续追在线 PR 和固定源码，不能将查询缓存自动升级为共享结论。
+
+- [vllm/v1/executor/cuda_checkpoint_executor.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/vllm/v1/executor/cuda_checkpoint_executor.py)
+
+- [tests/v1/executor/test_cuda_checkpoint_executor.py](https://github.com/vllm-project/vllm/blob/25e7c5728d834335288d080e1c36810fa111d4da/tests/v1/executor/test_cuda_checkpoint_executor.py)

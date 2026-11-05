@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/rl/examples/verifiers/README.md
-raw_sha256: 09684b00a2c5ddbe6f10b85d72df59b82e2c0318f56d2762b873ffed4b80fb65
+raw_sha256: 981bd6e73f3af39445452eb8b3d65015cd510c72d0f9098f57865aa7efa55fd7
 sources: []
-generated_body_sha256: a8c825367fb50c7b024bbeb063eb35a721f29901612902257dee6cb8669d0ae2
+generated_body_sha256: 08b7fb91d04c28ed05da504b4cf221e4ed691959bffa94066a4ad3e0afea5fe3
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/examples/verifiers/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/rl/examples/verifiers/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/examples/verifiers/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -111,4 +111,4 @@ python -m torchtitan.rl.train \
 
 See [DAPO Math](./dapo_math) for a complete single-turn example and
 [Terminal-Bench](./terminal_bench) for a multi-turn agent example. This
-integration pins Verifiers 0.3.1 and uses its `verifiers.v1` API.
+integration pins Verifiers 0.4.0 and uses its `verifiers.v1` API.

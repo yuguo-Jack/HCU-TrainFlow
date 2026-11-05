@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/accelerator-setup-guide.md
-raw_sha256: 364150fc929d266d5bbbf771184f82621bb7f5700ae1678da8ae8bfb9560255c
+raw_sha256: 8f45968bc1891aab769d0f1cb065e657f7da4c65adca209e39511bd653789dbf
 sources: []
-generated_body_sha256: 5554c69dddefc9ebb706558e5d52f953dd2233768beb0cad9b028759b06bbed7
+generated_body_sha256: fd17d44aadd28587003340889e59423253f88abe2b4286b0cb2425bb724621af
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/accelerator-setup-guide.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/accelerator-setup-guide.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/accelerator-setup-guide.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -94,6 +94,13 @@ Launching DeepSpeed model on multiple CPU nodes is similar to other accelerators
 
 deepspeed --hostfile=<hostfile> --bind_cores_to_rank --launcher impi --master_addr <master-ip> <deepspeed-model-script>
 ```
+
+## Memory limits in containers on Intel Architecture CPU
+In a container, a Kubernetes pod or a Slurm job step, the process can use only its cgroup memory limit. ZeRO, the inference v2 KV cache and the `deepspeed.compile` passes size their buffers from `get_accelerator().total_memory()` and `available_memory()`, so on the CPU accelerator these use the cgroup limit. `total_memory()` is the smallest memory limit from the cgroup of the process up to the cgroup root, and `available_memory()` is the smallest free headroom over those cgroups. Without a limit, both report host RAM. cgroup v1 and v2 are supported. To report host RAM in all cases, set:
+```
+export DS_CPU_RESPECT_CGROUP_MEMORY=0
+```
+The `deepspeed` launcher forwards the variable to every node.
 
 ## Install with Intel Extension for PyTorch and oneCCL
 Although not mandatory, Intel Extension for PyTorch and Intel oneCCL provide better optimizations for LLM models.  Intel oneCCL also provide optimization when running LLM model on multi-node.  To use DeepSpeed with Intel Extension for PyTorch and oneCCL, use the following steps:

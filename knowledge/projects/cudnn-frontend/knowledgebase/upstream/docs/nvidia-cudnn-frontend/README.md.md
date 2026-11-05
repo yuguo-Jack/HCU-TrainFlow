@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/cudnn-frontend
-commit: a7269d7607db343fb099dabf6d8fef47f4a2498c
+commit: f88a1ef2a35bc405967691dd798eb062298fcd9a
 path: README.md
-raw_sha256: f4e2131aeab9f5f6697805b9546aef78544370a6950a5c046ff3637b066ed4fa
+raw_sha256: 13505fbe9dda7756a916f924600a2e7b44e22515129aa4ba16971f02e1c2e790
 sources: []
-generated_body_sha256: 5e24a23ea9566669308e59e2e98b77e23220e6d155ac81d8eb4b6897836622dd
+generated_body_sha256: ef311c629594d90d109f4d9733f45270e05ed7445638638a4b219b76b176140a
 source_state: current-scan
 ---
 
 # NVIDIA/cudnn-frontend / README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/a7269d7607db343fb099dabf6d8fef47f4a2498c/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/cudnn-frontend/blob/f88a1ef2a35bc405967691dd798eb062298fcd9a/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -249,22 +249,55 @@ python -m cudnn.collect_env
 
 If `import cudnn` itself fails, download [collect_env.py](python/cudnn/collect_env.py) and run it standalone with any Python.
 
+### CUDA graph retention
+
+A CUDA graph recorded from a graph (stream capture of `execute()`, or `populate_cuda_graph()`) holds references to the execution plans and kernel code it launches, so it stays valid after the graph is destroyed. Launching a CUDA graph that holds such references takes slightly longer. Applications can turn the references off if they keep each graph's execution plans and host-copy data alive and unchanged until every CUDA graph recorded from it (and every clone and graph exec of one) has finished and been destroyed. Keeping the graph object alive is not enough if it is rebuilt or deserialized again in the meantime, since that replaces them:
+
+```cpp
+graph.set_cuda_graph_retention(cudnn_frontend::CudaGraphRetention_t::NONE);  // before building plans
+```
+
+```python
+graph = cudnn.pygraph(..., cuda_graph_retention=cudnn.cuda_graph_retention.NONE)
+```
+
+or for the whole process, for graphs that do not set it:
+
+```bash
+export CUDNN_CUDA_GRAPH_RETENTION=none   # default: per_graph
+```
+
+The variable is shared with the cuDNN backend, so with cuDNN 9.28 or newer it turns off the backend's references too; the graph setting is also passed to the backend. With cuDNN 9.27, whose backend always keeps its references, only the frontend's are removed.
+
 ### Overriding the CUDA runtime library
 
-When the frontend is built with dynamic loading enabled, it locates the CUDA runtime
-(`libcudart.so.*`) at runtime by searching for the supported major versions. In some
+On Linux, when the frontend is built with dynamic loading enabled, it locates the
+CUDA runtime (`libcudart.so.*`) by searching CUDA 12 followed by CUDA 13. In some
 environments (for example, containers such as GKE where the TCPXO NCCL plugin mounts a
 different `libcudart` major version from the host) multiple versions of `libcudart` may be
-visible on the library search path, and the automatic detection aborts with a
-`Multiple libcudart libraries found` error.
+visible on the library search path. Automatic detection warns with
+`Multiple libcudart libraries found` and keeps the first match.
 
-To resolve this, set the `CUDNN_FRONTEND_CUDART_LIB_NAME` environment variable to the
-library name (or full path) that should be loaded. This bypasses the automatic detection:
+To select a particular runtime, set `CUDNN_FRONTEND_CUDART_LIB_NAME` to the library
+name or full path. This bypasses automatic detection:
 
 ```bash
 export CUDNN_FRONTEND_CUDART_LIB_NAME=libcudart.so.13
 # or an absolute path
 export CUDNN_FRONTEND_CUDART_LIB_NAME=/usr/local/cuda/lib64/libcudart.so.13
+```
+
+On Windows, dynamic loading currently requires CUDA 13 headers and a CUDA 13
+runtime (`cudart64_13.dll`). The loader calls `cudaRuntimeGetVersion` and rejects
+other runtime majors, including when using an explicit override. Support for
+additional Windows CUDA versions can be added separately. The loader searches
+registered DLL directories, including those added through Python's
+`os.add_dll_directory()`, and retains a PATH fallback. Keep Python DLL-directory
+handles alive for as long as library discovery may occur.
+
+```powershell
+$env:CUDNN_FRONTEND_CUDART_LIB_NAME = "cudart64_13.dll"
+# or the full path to the selected CUDA 13 runtime DLL
 ```
 
 ## License

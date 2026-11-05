@@ -9,37 +9,38 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: torchtitan/models/common/linear/inplace_wgrad_accum.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: b1086699045a0c753df637460512eede4448772ba78c17c23f7863c9987df467
 - source: pytorch-torchtitan
   path: torchtitan/models/common/linear/linear.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 6fa01212bbaa44502862b3aba0b16e1955a77a09cbda6ff304839836a42834f0
 - source: pytorch-torchtitan
   path: torchtitan/models/common/linear/async_linear.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 9ea047214c1b0991e9dac6183b95f26b6e18bd2d3796761ab7472a429b02aa93
 - source: pytorch-torchtitan
   path: torchtitan/distributed/pipeline_parallel.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 1da335028a5e6360ecdcbe554ea0711b43cba0949c10ac912ebd22a7534ec751
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 21f503def70b1cb570be163729cacd4fd6c0ccb27d376c4ed1c15323495cb5bb
 - source: pytorch-torchtitan
   path: torchtitan/experiments/graph_trainer/tests/test_inplace_wgrad_accum_config.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: e2939367a48d17d4f73c2cc5cbc08bf426d13f05681a5a7a49b8ba73bb4f5a92
 - source: pytorch-torchtitan
   path: tests/unit_tests/cpu/models/common/test_inplace_wgrad_accum.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: bcc6eed8715c641b527105560918284e40a032dd1cce97af4d5bcb97a42cd811
 - source: pytorch-torchtitan
   path: tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 999896227598f0af578966cb1b968f34a45e8b25dadd16568d26055a1600c35e
 pr_sources:
 - pr-pytorch--torchtitan-5137
@@ -77,17 +78,21 @@ HCU 的借鉴点是减少大 dW 临时量和重复显存读写，同时保留 au
 
 当前测试入口：CPU `tests/unit_tests/cpu/models/common/test_inplace_wgrad_accum.py` 覆盖 leaf/tracing 拒绝、running grad 和 split-backward 禁用；GPU `tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py` 现单独检查首个GEMM返回FP32及最终grad逐位等于FP32-output mm，另覆盖BF16 WGRAD到FP32 running grad、stacked projections与双卡FSDP多microbatch；GraphTrainer 另有配置禁用回归。这里只核对测试内容，未执行这些上游 GPU 测试。
 
+## 当前提交的保留结论
+
+本次核对 `linear.py`、`inplace_wgrad_accum.py` 与 CPU/GPU WGRAD 回归，引用文件的内容未变：首个 WGRAD 直接产出 grad_dtype、后续原地累积、owned buffer 和 PP 分离 dI/dW 禁用条件继续成立。相邻引擎改为 accelerator-graph API，PP prepare 已接收四项与首个 loss kwargs；这修复调用链缺口，没有改变本案例的梯度舍入和所有权契约。仍未在本轮运行上游设备测试。
+
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [torchtitan/models/common/linear/inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/linear/inplace_wgrad_accum.py)
-- [torchtitan/models/common/linear/linear.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/linear/linear.py)
-- [torchtitan/models/common/linear/async_linear.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/models/common/linear/async_linear.py)
-- [torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/pipeline_parallel.py)
-- [torchtitan/experiments/graph_trainer/tests/test_inplace_wgrad_accum_config.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/experiments/graph_trainer/tests/test_inplace_wgrad_accum_config.py)
-- [tests/unit_tests/cpu/models/common/test_inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/unit_tests/cpu/models/common/test_inplace_wgrad_accum.py)
-- [tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py)
+- [torchtitan/models/common/linear/inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/linear/inplace_wgrad_accum.py)
+- [torchtitan/models/common/linear/linear.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/linear/linear.py)
+- [torchtitan/models/common/linear/async_linear.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/common/linear/async_linear.py)
+- [torchtitan/distributed/pipeline_parallel.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/pipeline_parallel.py)
+- [torchtitan/experiments/graph_trainer/tests/test_inplace_wgrad_accum_config.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/experiments/graph_trainer/tests/test_inplace_wgrad_accum_config.py)
+- [tests/unit_tests/cpu/models/common/test_inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/unit_tests/cpu/models/common/test_inplace_wgrad_accum.py)
+- [tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/unit_tests/gpu/models/common/test_linear_inplace_wgrad_accum.py)
 
 - [PR #5137：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5137.md)
 - [PR #5250：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5250.md)

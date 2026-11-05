@@ -8,38 +8,39 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source delta and related discussion review; unchanged evidence reused; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: baidu-baige-loongforge
   path: .gitmodules
-  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
+  commit: 042a68102395b9f4024d1a61084592c4c618371a
   sha256: b5aca9eaf884dfde53b152fc6000eff8a8c793339b659411f6e79292bf68b2ed
 - source: baidu-baige-loongforge
   path: docs/source/features/moe_all2all_overlap.md
-  commit: 15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c
+  commit: 042a68102395b9f4024d1a61084592c4c618371a
   sha256: bd5b07da7b731f7cc3b3d0259ea4c9153da39fa0da7622e3a6cc493aaa46a615
 - source: baidu-loong-megatron
   path: megatron/core/pipeline_parallel/schedules.py
-  commit: cfcdede99642303b1dff0464b77a7df50ef6e4ea
+  commit: 9d2d6b30f4099ed0e29300f76e19f55b72387ffc
   sha256: 97eb33ae369eae12ffc86b76d7c6ab4ce7d3c8fc4536278e6643ad6cd581bb00
 - source: baidu-loong-megatron
   path: megatron/core/pipeline_parallel/fine_grained_activation_offload.py
-  commit: cfcdede99642303b1dff0464b77a7df50ef6e4ea
+  commit: 9d2d6b30f4099ed0e29300f76e19f55b72387ffc
   sha256: 2211b10e879f93ebc1abb0289bc6a56094a41483c8172b582c38c0b2bda88491
 - source: baidu-loong-megatron
   path: megatron/core/transformer/transformer_config.py
-  commit: cfcdede99642303b1dff0464b77a7df50ef6e4ea
+  commit: 9d2d6b30f4099ed0e29300f76e19f55b72387ffc
   sha256: 1ddc625ba2d9304b535c88279d2db9a47796eaeb3617bad9a6e6674386a69d74
+retrieved_on: '2026-11-04'
 ---
 
 # LoongForge：跨微批 EP 重叠、延迟 wgrad 与细粒度卸载
 
 ## 性能问题与父子版本
 
-EP all-to-all在关键路径暴露等待时，将不同microbatch的forward/backward和通信交错，可用计算隐藏dispatch/combine。文档入口在父LoongForge，真实schedule/offload由父树锁定。本次父仓 `15504e1bb7d9` 已选 Loong-Megatron `cfcdede99642303b1dff0464b77a7df50ef6e4ea`；与历史 `64c279` 比较，`schedules.py` 和 `fine_grained_activation_offload.py` 原件逐字节相同，所述 EP/卸载生命周期继续适用。不是任意Megatron main都有相同flag和节点。
+EP all-to-all在关键路径暴露等待时，将不同microbatch的forward/backward和通信交错，可用计算隐藏dispatch/combine。文档入口在父LoongForge，真实schedule/offload由父树锁定。2026-11-04 检索父仓 `042a68102395b9f4024d1a61084592c4c618371a`，实际选择 Loong-Megatron `9d2d6b30f4099ed0e29300f76e19f55b72387ffc`；与上轮 `cfcdede99642303b1dff0464b77a7df50ef6e4ea` 及历史 `64c279afb879229cff12fb293624e3691990403f` 比较，`schedules.py` 和 `fine_grained_activation_offload.py` 原件逐字节相同，所述 EP/卸载生命周期继续适用。不是任意Megatron main都有相同flag和节点。
 
-子仓本次新增的是另一条 [变量长 ChunkPipe](loongforge-chunkpipe-variable-length.md)接入：其 iterator、MLA/MTP、数据广播与 loss 归一化有自己的条件。不能因共享 microbatch/schedule 术语就把变长序列分块、跨微批 EP 和 CPU 激活卸载当成同一个开关或已验证组合。
+另一条 [变量长 ChunkPipe](loongforge-chunkpipe-variable-length.md) 的 iterator、MLA/MTP、数据广播与 loss 归一化有自己的条件；本轮 MLA 进一步调整了 RoPE 缓存 head 数与非对称 causal mask。不能因共享 microbatch/schedule 术语就把变长序列分块、跨微批 EP 和 CPU 激活卸载当成同一个开关或已验证组合。
 
 ## 调度与参数组合
 
@@ -63,12 +64,14 @@ EP all-to-all在关键路径暴露等待时，将不同microbatch的forward/back
 
 卡住查schedule/queue/事件与collective顺序；梯度错误查提前释放或FP8元数据，OOM区分HBM激活和通信buffer。按完整机制包恢复可信schedule与缓存，不保留一半新wgrad/一半旧state。更新父gitlink后重新读子schedule/offload/config与测试，联动[案例](../cases/loongforge-ep-offload.md)及[总览](../overview/engineering-guide.md)。
 
+保留依据：父仓 `.gitmodules` / EP 文档与子仓 `schedules.py`、`fine_grained_activation_offload.py`、`TransformerConfig` 所引字节相同。重点复核 `tensor_need_offloading_checker` 仍按 numel 判断阈值，`bulk_reload_group` / backward 仍等待对应事件，故不改变容量单位或宣称所有 copy 被隐藏；当前 MLA 变化须独立验证。
+
 ## 固定证据与复核范围
 
-- [.gitmodules](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/.gitmodules)
-- [docs/source/features/moe_all2all_overlap.md](https://github.com/baidu-baige/LoongForge/blob/15504e1bb7d948bd3900d17ed35fe5cd4bc50d3c/docs/source/features/moe_all2all_overlap.md)
-- [megatron/core/pipeline_parallel/schedules.py](https://github.com/baidu-baige/Loong-Megatron/blob/cfcdede99642303b1dff0464b77a7df50ef6e4ea/megatron/core/pipeline_parallel/schedules.py)
-- [megatron/core/pipeline_parallel/fine_grained_activation_offload.py](https://github.com/baidu-baige/Loong-Megatron/blob/cfcdede99642303b1dff0464b77a7df50ef6e4ea/megatron/core/pipeline_parallel/fine_grained_activation_offload.py)
-- [megatron/core/transformer/transformer_config.py](https://github.com/baidu-baige/Loong-Megatron/blob/cfcdede99642303b1dff0464b77a7df50ef6e4ea/megatron/core/transformer/transformer_config.py)
+- [.gitmodules](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/.gitmodules)
+- [docs/source/features/moe_all2all_overlap.md](https://github.com/baidu-baige/LoongForge/blob/042a68102395b9f4024d1a61084592c4c618371a/docs/source/features/moe_all2all_overlap.md)
+- [megatron/core/pipeline_parallel/schedules.py](https://github.com/baidu-baige/Loong-Megatron/blob/9d2d6b30f4099ed0e29300f76e19f55b72387ffc/megatron/core/pipeline_parallel/schedules.py)
+- [megatron/core/pipeline_parallel/fine_grained_activation_offload.py](https://github.com/baidu-baige/Loong-Megatron/blob/9d2d6b30f4099ed0e29300f76e19f55b72387ffc/megatron/core/pipeline_parallel/fine_grained_activation_offload.py)
+- [megatron/core/transformer/transformer_config.py](https://github.com/baidu-baige/Loong-Megatron/blob/9d2d6b30f4099ed0e29300f76e19f55b72387ffc/megatron/core/transformer/transformer_config.py)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

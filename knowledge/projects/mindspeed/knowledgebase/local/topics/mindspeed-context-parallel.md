@@ -9,21 +9,22 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source, official documentation and related PR reading; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: ascend-mindspeed
   path: mindspeed/features_manager/context_parallel/context_parallel_feature.py
-  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
+  commit: c2357e9ae4689cf1791a5f258217cd256ce41ce1
   sha256: 965840f69c4a944f21ca3303b18a67cbb2daa7e72c9443b10bd5483e3eae9dd9
 - source: ascend-mindspeed
   path: docs/en/features/ring-attention-context-parallel.md
-  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
+  commit: c2357e9ae4689cf1791a5f258217cd256ce41ce1
   sha256: dece78275526a481193bda7a7e973576c69c5d0e606248e0bb3d56408f649359
 - source: ascend-mindspeed
   path: docs/en/features/kvallgather-context-parallel.md
-  commit: 3c7f3251c4163f5020407dc6fb1706964817ac9b
+  commit: c2357e9ae4689cf1791a5f258217cd256ce41ce1
   sha256: f714c5c862a86a417d8c0c9597e8963d4c7e43b5e226be20e4f4821096e38115
+retrieved_on: '2026-11-04'
 ---
 
 # MindSpeed：Ring、Hybrid 与 KV All-Gather 上下文并行
@@ -52,10 +53,12 @@ feature 参数验证→model parallel group 初始化/销毁 patch→batch 的 C
 
 卡住先核对组成员、某 rank shape/异常与 ring send/recv顺序；loss 偏差先核对 mask/position/data ownership；OOM 查 buffer 生命周期和最坏 rank。先退回已验证 CP算法或CP=1，在容量允许下定位，不随意改模型结构。更新 feature、group、batch shard、attention、RoPE 和 LLM recipe 时共同复核[总览](../overview/engineering-guide.md)，并对照 HCU 对应分支实现。
 
+2026-11-04 检索独立 Core `c2357e9ae4689cf1791a5f258217cd256ce41ce1`：`ContextParallelFeature.validate_args/register_patches` 与 ring / KV all-gather 两份文档字节未变，故保留 sequence、head、window、TE / mask 与 group 约束。复核以 `divmod(CP, Ulysses)` 实际表达式为准，错误提示文字不能倒置整除关系；其中 `deepseek_v4_cp_algo` 的检查是另一模型路径，不能将 ring 的 2×CP 条件机械套用。没有执行多 rank attention。
+
 ## 固定证据与复核范围
 
-- [mindspeed/features_manager/context_parallel/context_parallel_feature.py](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/mindspeed/features_manager/context_parallel/context_parallel_feature.py)
-- [docs/en/features/ring-attention-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/features/ring-attention-context-parallel.md)
-- [docs/en/features/kvallgather-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/3c7f3251c4163f5020407dc6fb1706964817ac9b/docs/en/features/kvallgather-context-parallel.md)
+- [mindspeed/features_manager/context_parallel/context_parallel_feature.py](https://github.com/Ascend/MindSpeed/blob/c2357e9ae4689cf1791a5f258217cd256ce41ce1/mindspeed/features_manager/context_parallel/context_parallel_feature.py)
+- [docs/en/features/ring-attention-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/c2357e9ae4689cf1791a5f258217cd256ce41ce1/docs/en/features/ring-attention-context-parallel.md)
+- [docs/en/features/kvallgather-context-parallel.md](https://github.com/Ascend/MindSpeed/blob/c2357e9ae4689cf1791a5f258217cd256ce41ce1/docs/en/features/kvallgather-context-parallel.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

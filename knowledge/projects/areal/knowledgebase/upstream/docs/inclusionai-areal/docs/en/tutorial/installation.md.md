@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: areal-project/AReaL
-commit: 01de0a83e17cb12c918fc791466138ddbd4168c9
+commit: 27879753c7611fee9a0af6e71a4f838db27b72a7
 path: docs/en/tutorial/installation.md
-raw_sha256: dcbab21748c4d1530c7fe69f38470a338332796aab0c68971aa6761c942659c8
+raw_sha256: 605c14606ee4fb4316155d6f8eca5b9fa5ccf3085fd06f64ba542aae9540d5b5
 sources: []
-generated_body_sha256: 1fae8cf6779e23f1896050255df02f4701eb871c06d72e96a6ed11829fb917fb
+generated_body_sha256: a35b5407776944e6828630f5e0fc2e3fe04a348c5f2d3e9c29a7d00d7852a67b
 source_state: current-scan
 ---
 
 # areal-project/AReaL / docs/en/tutorial/installation.md
 
-[Original at fixed commit](https://github.com/areal-project/AReaL/blob/01de0a83e17cb12c918fc791466138ddbd4168c9/docs/en/tutorial/installation.md)
+[Original at fixed commit](https://github.com/areal-project/AReaL/blob/27879753c7611fee9a0af6e71a4f838db27b72a7/docs/en/tutorial/installation.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -52,7 +52,7 @@ The following hardware configuration has been extensively tested:
 | Git LFS                  | Required for downloading models, datasets, and AReaL code. See [installation guide](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                                 27.5.1                                                                                                 |
 | NVIDIA Container Toolkit |                                         See [installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                                          |
-| AReaL Image              |                                   `ghcr.io/areal-project/areal-runtime:v2.1.0-sglang` (default) or `v2.1.0-vllm`. Includes runtime dependencies and Ray components.                                    |
+| AReaL Image              |                                   `ghcr.io/areal-project/areal-runtime:v2.1.1-sglang` (default) or `v2.1.1-vllm`. Includes runtime dependencies and Ray components.                                    |
 
 **Note**: This tutorial does not cover the installation of NVIDIA Drivers, CUDA, or
 shared storage mounting, as these depend on your specific node configuration and system
@@ -70,11 +70,11 @@ We recommend using Docker with our provided image. The Dockerfile is available i
 top-level directory of the AReaL repository.
 
 ```bash
-docker pull ghcr.io/areal-project/areal-runtime:v2.1.0-sglang
+docker pull ghcr.io/areal-project/areal-runtime:v2.1.1-sglang
 docker run -it --name areal-node1 \
    --privileged --gpus all --network host \
    --shm-size 700g -v /path/to/mount:/path/to/mount \
-   ghcr.io/areal-project/areal-runtime:v2.1.0-sglang \
+   ghcr.io/areal-project/areal-runtime:v2.1.1-sglang \
    /bin/bash
 git clone https://github.com/areal-project/AReaL /path/to/mount/AReaL
 cd /path/to/mount/AReaL
@@ -82,7 +82,7 @@ uv pip install -e . --no-deps
 ```
 
 A vLLM variant of the Docker image is also available at
-`ghcr.io/areal-project/areal-runtime:v2.1.0-vllm`. Replace the image tag in the commands
+`ghcr.io/areal-project/areal-runtime:v2.1.1-vllm`. Replace the image tag in the commands
 above if you prefer vLLM as the inference backend.
 
 ### Option 2: Custom Environment Installation

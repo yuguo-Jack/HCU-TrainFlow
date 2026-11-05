@@ -10,23 +10,40 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-LM
-commit: ab1a28486b92adb3702f1289ff3a332cdb74294f
+commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
 path: tests/README.md
-raw_sha256: ee9e3ffbb453d7c6ca3c91743b4d412c3068ce97db68cd89347c7fcc6fe128de
+raw_sha256: 5df6b6157e62c4476b0d10f5d555018898eed459aacf5ba9d420c4754e9457a2
 sources: []
-generated_body_sha256: fae7634717db167b523dc7bf4fb943202b245d39e1242857570bf371ac87a074
+generated_body_sha256: 0cd80a1521b565af9afef67da947882fe3e5199c606aeea38161249d7aade0e0
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-LM / tests/README.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/ab1a28486b92adb3702f1289ff3a332cdb74294f/tests/README.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/tests/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
 ---
 
 # Megatron-LM Tests
+
+## A2A Overlap Test Isolation
+
+The two-chunk schedule tests in `unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py`
+reuse one parallel topology per class (and per TP size for padding-mask tests).
+This bounds communicator and HybridEP initialization across the parameter matrix.
+MCore's `destroy_model_parallel()` clears NCCL group references without unregistering those
+groups from PyTorch, so each topology scope explicitly destroys the groups it
+creates. The fixture preserves the default group and pre-existing groups,
+and finalizes NCCL EP before destroying its borrowed communicator. Cached flex buffers
+are also released before their groups. A per-case fixture collects model/plan cycles
+after the test helpers return and releases the NCCL EP context and zero-copy buffers.
+NCCL EP caches the dispatch alignment process-wide, so BF16 and FP8 cases must not
+reuse that context even when their parallel topology matches. Topology teardown
+checks that no new registered groups remain. This keeps
+communication memory bounded across the full dispatcher, precision, MTP, and
+recompute matrix.
 
 ## Updating Functional Test Golden Values
 

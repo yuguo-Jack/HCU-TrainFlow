@@ -9,46 +9,68 @@ stages:
 visibility: public
 review_level: selected-source-and-tutorial-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
+retrieved_on: '2026-11-04'
 coverage: Curated source chains and official evidence at a fixed main commit; not all models, backends
   or HCU runtime validated.
 sources:
 - source: pytorch-torchtitan
   path: README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 3634007b5cca45b6e3ce61742e818c4c7fdb9c5147092cc4872e0752c00f7b75
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 85a02ce07f786fac33c3d2cda4e9b4fa460b0b68e8308ddfda5ddd2c0f9fdf13
 - source: pytorch-torchtitan
   path: RELEASE.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 25602fde9bc0d1742bea6e1072b69db8565f4c37168b49b4a65b017f2d6b657b
 - source: pytorch-torchtitan
   path: assets/version.txt
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 998f6b887ed7a6ef44e84210d0237b715bed42ea7254f48dc418afec0a484103
 - source: pytorch-torchtitan
   path: pyproject.toml
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0341afacb518276f192c2c8a836c32426e80856bf8c5f0ff194c3028c221520d
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 4c8bd1c4a4c82eaea345ccb97abf671a1e59faf92df2d9fa147ce21c5e7fe780
 - source: pytorch-torchtitan
   path: torchtitan_recipes/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: a72fb9eab9eb7f376a50622327954f614694ed6aea5bb782aae51035e9c9157a
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 80bf0cdce6473544775bf13189368107b72642a97efb075a9486e77a21ecbe1c
 - source: pytorch-torchtitan
   path: torchtitan/config/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: e62e3776a4dd1c2179b3643d9e611f5a6f53fc972ac16de4588ee96a99a06b9b
 - source: pytorch-torchtitan
   path: tests/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 0872f733f18e85e085802fff3813cd1ee359ec1cc10b8d5929642e62d4c4e712
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 73f9a9597a0aaeef657c103ec1cc544375c0e9229f49a9a50abcd8d3a02af248
 - source: pytorch-torchtitan
   path: torchtitan/distributed/activation_remat.py
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
   sha256: 4e935605e29f904ad5c5bef1036e265021f42c334a7a17c6d01083040dffc5a7
 - source: pytorch-torchtitan
   path: torchtitan/rl/actors/monarch/README.md
-  commit: a242475253433725f10f39c18f5ccbfdf188e097
-  sha256: 5f4cdb46330683cb8bd2a65d764662712972fb8989afe35a9b9dfbe5e3270209
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 3b46f79840dec9f3efd25319247fe259c0009daeec74bf381d06c483ddea8b09
+- source: pytorch-torchtitan
+  path: torchtitan/config/configs.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 3465866709813651cc91114c4a006a5cc3c05d6069e9f04200e68d10c91c3659
+- source: pytorch-torchtitan
+  path: torchtitan/training_engine.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: 2ffe06874d3a03ccc91d407f1bc91d5f2beaa9c746738dd3a3646f1c800a798f
+- source: pytorch-torchtitan
+  path: torchtitan/distributed/accelerator_graph.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: dec500ca70df82c8c8388b41e49970cd9dbbdd2a1c287217c4783827b576e9d5
+- source: pytorch-torchtitan
+  path: torchtitan/rl/trainer/trainer.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: f52d1d78a769b06bc511dc638486626592d0f0bdbd249d14a2f8df4107d0c3b3
+- source: pytorch-torchtitan
+  path: torchtitan/rl/generator/generator.py
+  commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
+  sha256: fe3ccd0288aa613d11234607fa24e91e98953015dd75a49657da0b4c7dd56b01
+
 pr_sources:
 - pr-pytorch--torchtitan-4760
 - pr-pytorch--torchtitan-5033
@@ -68,7 +90,7 @@ pr_sources:
 
 | 内容 | 已收录范围 | 不能由此推断 |
 | --- | --- | --- |
-| 源码 | main 的固定提交 `a242475253433725f10f39c18f5ccbfdf188e097`；全仓路径/对象清单 | 全部文件已逐行精读或硬件验证 |
+| 源码 | main 的固定提交 `485c065cb248863bf2e2c65588becd6d7a8bcf83`；全仓路径/对象清单 | 全部文件已逐行精读或硬件验证 |
 | 作者专题 | 15 页总览、目录、安装运行测试、训练/数值、并行/显存、编译通信、MoE/量化、profile、恢复、RL 与 3 个案例 | 每个模型/后端均已形成完整专题 |
 | 官方原文 | 当前来源锁、文档 ledger 与全仓路径清单中的训练教程/README | 图表、外链或依赖工程已全部离线复制 |
 | PR | 已保留的重要历史 PR 与本次增量窗口；完成范围以独立 PR ledger 为准 | 历史 PR 全量采集或全部案例精读 |
@@ -79,7 +101,7 @@ pr_sources:
 
 ## Release 不等于 main 的版本文件
 
-2026-10-20 复核官方 Releases，最新非预发布仍为 [v0.3.0](https://github.com/pytorch/torchtitan/releases/tag/v0.3.0)，发布于 2026-09-03。本次固定 main 的 `assets/version.txt` 仍为 `0.2.2`；应分别保存 tag、commit、包版本和依赖，不能根据一个字符串断言主线退回旧功能。
+2026-11-04 官方 Releases API 快照列出最新非预发布 [v0.4.0](https://github.com/pytorch/torchtitan/releases/tag/v0.4.0)，发布于 2026-10-28，target 为 `release/0.4`；v0.3.0（2026-09-03）属于此前发布。本次固定 main 的 `assets/version.txt` 仍为 `0.2.2`；应分别保存 tag、commit、包版本和依赖，不能根据一个字符串断言主线退回旧功能，也不把 main 所有改动自动归给 v0.4.0。
 
 发布信息按[官方 Releases](https://github.com/pytorch/torchtitan/releases)查证；本库不单独批量归档发布页 JSON。v0.3.0 的兼容表、旧目录和参数是那次发布的条件，不自动适用于当前 main；例如主线之后重组 recipe、移除旧 CLI，用 release 教程运行 main 需要逐项核对。
 
@@ -109,13 +131,15 @@ pr_sources:
 | #5101 | merged | 重算专题 | FullAC 迁到 torch_remat，旧开关不照搬 |
 | #5137、#5250 | merged | WGRAD 案例 | 梯度所有权、舍入、PP/graph 禁用条件 |
 | #5033 | merged | Attention Residual 案例 | kernel 吞吐与模型吞吐不等价 |
-| #5107、#5268 | merged | RL 权重同步案例 | trainer CPU 暂存与 generator FSDP group 峰值分别测量 |
-| #4760 | 2026-10-20 API复核仍open；既有review包含请求修改 | PR 原文和 CP/MLA 候选 | 通信压缩/打包仍在评审，既有review报告过训练数值漂移；不能当现成等价优化 |
-| #5263 | 2026-10-20 API复核仍open、未merge | 编译通信专题及 PR 原文 | DeepEP 新 API 与模型限制，deferred counts 不代表消除 CPU 等待 |
+| #5107、#5268 | 历史采集为 merged | RL 权重同步案例 | 原 CPU mirror 已被新主线移除；历史 H100 数字不覆盖当前 transport/load mode |
+| #4760 | 2026-11-04 API 核对 closed、merged；2026-10-19 合入 | PR 原文和当前 CP/MLA 消费者 | 通信压缩/打包已进入主线；BF16 梯度累积顺序与 native checkpoint key 变化仍须验证 |
+| #5263 | 2026-11-04 API 核对仍 open、未 merge | 编译通信专题及 PR 原文 | DeepEP 新 API 与模型限制，deferred counts 不代表消除 CPU 等待 |
 
 上表状态是采集时观察，不是永久结论。PR review 的修改意见、讨论中的失败与当前 patch 都保留；不要只读标题或作者最初的收益描述。
 
-本次 [#4760 候选](../../upstream/prs/pytorch--torchtitan/PR-4760.md) 的 K/V all-gather 路线已改为先传归一化后的压缩 KV latent 与 headless key，再在本地执行 `wkv_b` 展开。Ulysses 路线先投影，再合并 Q 与 packed KV 传输，输入通信仍有一次 all-to-all 和一次 all-gather，输出 head→token 还需 all-to-all。该候选 head 还拒绝 fused MLA 与 CP 的组合、拒绝 TorchTitan vLLM MLA 路线，并禁用相应 Kimi parity/RL 测试；这些限制属于尚未合入的 PR，不直接归给本页固定 main。禁用测试和旧实验数据都不构成本次等价性或 HCU 验收。
+[#4760](../../upstream/prs/pytorch--torchtitan/PR-4760.md) 当前固定 head 为 `5018b40a5547d51193e157ff3d61cad3cb20c22e`、base 为 `2fa29617b8b17cb80b5b1b7a4c4cfaa5077b1cb8`，已合入。K/V all-gather 路线先传归一化压缩 KV latent 与 headless key，再本地 `wkv_b` 展开；Ulysses 输入合并 Q 与 packed KV，仍有一次 all-to-all 和一次 all-gather，输出 head→token 还需 all-to-all。它降低通信量，也改变投影/归约位置；作者固定 BF16 比较首步 logits/loss 相同但梯度不同，后续更新与 loss 并非 bitwise 等价，未证明真实数据收敛。
+
+PR head 的 fused-MLA+CP 拒绝及当时 vLLM MLA/测试禁用是该版本边界；当前 main 已有独立 compressed-cache 消费者，不能用旧 PR 限制覆盖新实现。native checkpoint 的 `wkv_b` 移入 `attention.inner_attention`，旧 native key 不再自动重映射；HF adapter 兼容与旧 native 恢复是两件事。历史 H100 吞吐与禁用测试都不构成本次 HCU 验收。
 
 ## 搜索、追代码与更新
 
@@ -125,7 +149,7 @@ hcu-trainflow wiki-search "TorchTitan 梯度累积" --project .
 hcu-trainflow wiki-search "weight sync" --engine torchtitan --project .
 hcu-trainflow wiki-search-pr "attention residual" --engine torchtitan
 hcu-trainflow wiki-pr pytorch/torchtitan 5033
-hcu-trainflow wiki-code pytorch/torchtitan a242475253433725f10f39c18f5ccbfdf188e097 torchtitan/models/common/linear/linear.py
+hcu-trainflow wiki-code pytorch/torchtitan 485c065cb248863bf2e2c65588becd6d7a8bcf83 torchtitan/models/common/linear/linear.py
 
 # 定向更新；max 只是单批上限，存在 pending 时继续相应阶段。
 hcu-trainflow wiki-update . pytorch-torchtitan --max-documents 100 --max-prs 50
@@ -139,21 +163,25 @@ Release/roadmap 非 PR 内容由维护 Agent 沿官方入口核查并更新版�
 
 ## 本轮实际迁移与未决边界
 
-配置从 activation checkpoint policy 构建器转为 `activation_remat` dataclass；Linear/MoE 包、统一 attention/feed_forward 字段、RL service/ActorSystem 目录同时迁移。Graph/validation 共用 pool、逐组 replay、惰性预处理、PP loss kwargs 和首个 WGRAD 输出 dtype 都影响调用者与数值；不能仅替换来源 SHA。
+本轮对固定主线逐页沿消费者核对：根 PrecisionConfig 与 preserve-dtype 参数贯穿 FSDP/export/RL transfer；LocalCompileConfig 取代列表；accelerator-graph 重命名保持 HIP 拒绝；PP prepare 的四项输入与 loss kwargs 缺口已在实现和 CPU 测试修复。FSDP partial backward/group cleanup、DistMuon child communicator、模型级 loss kwargs/CP、checkpoint exports/完成标记和 Cuspy 输出格式均有实际变化。
 
-当前主干已有 DeepEP v2 ElasticBuffer，不等于具体 deferred-epilogue PR #5263 已合入。此次 API核对的 #5263 head为 `d5e59c25e0900889fe19c2c3c7120273719c4373`，#4760 head为 `6ec06994290d0ceed8797638890cd9d21b965e9f`，两者均未merge；PR完整讨论与变动覆盖仍由各自采集记录表达。PP capture 的3项/4项输入结构不一致见[编译专题](../topics/compile-fusion-and-communication.md)，在解决与验证前不将新增 Graph 测试当作该引擎组合验收。
+RL trainer 移除自有 CPU mirror，generator 增加 cpu_prefetch/gpu_fetch 并改为显式逐组 fetch、严格参数覆盖及失败全 rank 停机。旧 #5107/#5268 说明只作为机制历史与特定实验，当前接口详见专题和案例。WGRAD 核心/直接回归、Attention Residual override 未变，已在相应案例记录具体保留依据。
+
+本轮 API/原件核对更正了旧 #4760 open 结论，当前为 merged；#5263 保持 open，head `d5e59c25e0900889fe19c2c3c7120273719c4373`、base `448b9c8be41abc7fcbd5ccc768242b8865d4347b`。后者仅为 opt-in shared-expert scheduling，默认关闭、仍等待 CPU counts，不支持由此宣称 compact training Graph 可用；作者验证为特定 H200 单机 BF16 EP8/TP/AC 矩阵，非 FP8/Dist-MoE/PP/CP/多机或收敛证明。上游 CI action_required 不等于通过。
+
+本页读了这两项的当前状态/说明及固定 main 消费者，全部 PR 评论、review 和文件覆盖由主控独立 PR ledger 表达，不冒称已完成全窗口语义审阅。没有安装、构建或执行上游训练/设备测试。
 
 ## 固定证据与使用边界
 
-本页以官方主线 `a242475253433725f10f39c18f5ccbfdf188e097` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
+本页以官方主线 `485c065cb248863bf2e2c65588becd6d7a8bcf83` 为源码基准。完成选定调用链与教程阅读；本轮没有安装或运行 TorchTitan，未在 HCU 验证。上游报告的测试与性能不等于本工程实测。
 
-- [README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/README.md)
-- [RELEASE.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/RELEASE.md)
-- [assets/version.txt](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/assets/version.txt)
-- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/pyproject.toml)
-- [torchtitan_recipes/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan_recipes/README.md)
-- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/config/README.md)
-- [tests/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/tests/README.md)
+- [README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/README.md)
+- [RELEASE.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/RELEASE.md)
+- [assets/version.txt](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/assets/version.txt)
+- [pyproject.toml](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/pyproject.toml)
+- [torchtitan_recipes/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan_recipes/README.md)
+- [torchtitan/config/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/README.md)
+- [tests/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/tests/README.md)
 
 - [PR #4760：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-4760.md)
 - [PR #5033：描述、review、评论及 diff](../../upstream/prs/pytorch--torchtitan/PR-5033.md)
@@ -169,5 +197,15 @@ Release/roadmap 非 PR 内容由维护 Agent 沿官方入口核查并更新版�
 
 ## 本次补充的实现与测试依据
 
-- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/distributed/activation_remat.py)
-- [torchtitan/rl/actors/monarch/README.md](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/actors/monarch/README.md)
+- [torchtitan/distributed/activation_remat.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/activation_remat.py)
+- [torchtitan/rl/actors/monarch/README.md](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/actors/monarch/README.md)
+
+- [torchtitan/config/configs.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/config/configs.py)
+
+- [torchtitan/training_engine.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/training_engine.py)
+
+- [torchtitan/distributed/accelerator_graph.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/distributed/accelerator_graph.py)
+
+- [torchtitan/rl/trainer/trainer.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/trainer/trainer.py)
+
+- [torchtitan/rl/generator/generator.py](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/generator/generator.py)

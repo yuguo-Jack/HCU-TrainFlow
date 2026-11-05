@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA-NeMo/Megatron-Bridge
-commit: 2b1c8ccd7285cfd09b82afd523859dbe04d754e4
+commit: 41af2dcf0dfd83c8933f588bb871b7f56dbd4368
 path: README.md
-raw_sha256: 4a079f8008605229ed7e01c1087b78fc79c4dfd0aadae3cdea833e2a994aa619
+raw_sha256: c5338daa70661d52a663d4919f2f6012b9ffe9d72e5eac6a2eef96a1cf07ea2a
 sources: []
-generated_body_sha256: 31cd943b0ed30660fcf38846687dc7cde959984a6f5d4a40465a6b71c8ef2c4c
+generated_body_sha256: 6f3c8900168fffe55f48c0ed1845b8deb6dfb33cc840b10a4cf1377c5fdf483a
 source_state: current-scan
 ---
 
 # NVIDIA-NeMo/Megatron-Bridge / README.md
 
-[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/2b1c8ccd7285cfd09b82afd523859dbe04d754e4/README.md)
+[Original at fixed commit](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/41af2dcf0dfd83c8933f588bb871b7f56dbd4368/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -273,6 +273,7 @@ Megatron Bridge provides out-of-the-box bridges and training recipes for a wide 
 | [**HY V3**](https://huggingface.co/tencent/Hy3-preview-Base) | Hy3 preview-Base (HF → Megatron checkpoint conversion) |
 | [**Kimi**](docs/models/kimi/index.md) | Kimi K2, Kimi-K2.5-VL, Kimi K3 |
 | [**Llama**](docs/models/llama/index.md) | Llama 3 / 3.1 / 3.2 / 3.3 |
+| [**MiniCPM-o**](docs/models/minicpmo/minicpmo-4.5.md) | MiniCPM-o 4.5 (text/image/audio understanding only; no speech generation or SFT/LoRA recipes) |
 | [**MiniMax**](docs/models/minimax/index.md) | MiniMax-M2 / M2.5 / M2.7, MiniMax-M3 |
 | [**Mistral**](docs/models/mistral/index.md) | Ministral 3 (3B/8B/14B) |
 | [**Xiaomi-MiMo**](docs/models/mimo/index.md) | Xiaomi-MiMo, MiMo-V2-Flash |

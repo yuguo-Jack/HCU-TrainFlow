@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/index.md
-raw_sha256: 71ac76ff2b4cc03c5bebd08ba27af002a08763c70c24983f1eb3416ea75d5434
+raw_sha256: a68f3850c598df139a0b4284d9fd86bd72322e1848391445827092f51e77426f
 sources: []
-generated_body_sha256: 5cbf9afd904f1c6efa3a9fd1cb325524a62aec47b696bd085fc56c24b9299db6
+generated_body_sha256: e53d3bb20d14cedeb83ed91518ac43bceecc1ffb634083a385090ed6d9edd19b
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/index.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/index.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/index.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -76,6 +76,7 @@ maxdepth: 2
 ---
 advanced/remote_dataset
 advanced/crude_datasets
+advanced/filter_index
 advanced/custom_sample_loader
 advanced/repro_scaling
 advanced/packing

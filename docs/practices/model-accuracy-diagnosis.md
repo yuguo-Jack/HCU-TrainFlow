@@ -27,6 +27,8 @@
 
 HCU-Knowledge 的 `te-fp8-state-and-recompute` 保留了这种版本差异：TE `main@73dbcf534252`（2.18 开发线）对已识别的 stateless recipe 不再保存/反序列化 pickle 附加状态；DelayedScaling 历史、旧格式或未知 payload 默认可能被拒绝。`NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE=1` 是可信旧 checkpoint 的显式兼容选择，不是通用训练默认，更不能代替 scale/history 恢复后的数值验收。`release_v2.16` 和现场制品需分别查实现，不能由 main 新策略推定其行为。普通模型权重转换往返、完整训练状态恢复和异步写入完成仍是不同检查。
 
+本轮 TE `main@072eca0b863cb19fa39bb6cab67abf0110d4ed0e` 的 `_extra_state.py`、`module/base.py` 与 `quantization.py` 和上述固定证据的 blob 相同，因此保留其状态契约；新增 tensorwise INT8 模拟则让 `Float8CurrentScalingQuantizer` 实际使用 `kInt8`。recipe 名中有 FP8 不等于底层存储采用 E4M3/E5M2，诊断和容量记录需连同实际 quantizer dtype、scale 布局、GEMM 后端及被跳过的组合核对。来源测试定义和软件门控不代替现场精度验收。
+
 ## 2. 有 NVIDIA 环境：分层建立跨平台对照
 
 1. **确定可比实现。** 以支持该模型的官方训练配方/实现为语义依据，HCU 端使用适用的 HCU 启动方式。记录官方与 HCU 补丁差异；NV 运行也需通过自身基本正确性检查，不能把某张卡的输出自动当作数学真值。
@@ -58,9 +60,11 @@ HCU-Knowledge 的 `te-fp8-state-and-recompute` 保留了这种版本差异：TE 
 
 ### 先发现当前工具
 
-用 `$hcu-knowledge-search` 查询项目 `dcu_probe` 的工程报告、`hcuprobe-hook-tensor-lifecycle` 和 `hcuprobe-cross-rank-first-diff`，再核对目标环境当前源码与入口。已核对的固定版本为 `26.2.0-dev@b8dddb57`：distribution 是 `hcu-probe`，import/CLI 为 `hcuprobe`，实现位于 `python/hcuprobe/`。这是查证起点，不是固定要求所有环境安装此版本；历史 `dcu_probe`/`msprobe` 命名、配置和目录不能混用。
+用 `$hcu-knowledge-search` 查询项目 `dcu_probe` 的工程报告、`hcuprobe-hook-tensor-lifecycle` 和 `hcuprobe-cross-rank-first-diff`，再核对目标环境当前源码与入口。当前公开主源是 [HYGON-AI/hcu_probe-das 的 `26.2.0-dev@1cf9e496`](https://github.com/HYGON-AI/hcu_probe-das/tree/1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa)：distribution 是 `hcu-probe`，包声明 `26.2.0+hcu.0.2.0`，import/CLI 为 `hcuprobe`，实现位于 `python/hcuprobe/`。这是查证起点，不是固定要求所有环境安装此版本；历史 `dcu_probe`/`msprobe` 命名、配置和目录不能混用。
 
-公开参考 [HYGON-AI/hcu_probe-das@de68655e](https://github.com/HYGON-AI/hcu_probe-das/tree/de68655e9bd3a3678fd29889982135c473d25f94) 已可读取，但不能据仓名推导 import 命名空间。其 pyproject 仍打包 `python/hcuprobe` 并提供 `hcuprobe` CLI，新增 `python/hcuprobe/tools/compare.py` 却残留 `hcu_probe.core...` 导入；该包装器及仓内框架接入示例尚不能视为已验证安装入口。先用当前制品的正式 CLI/API 核验，不自动安装仓内附带的其他 Agent Skill，也不因新增框架文档就认定训练、推理及所有后端均已通过。
+该公开快照的 [CLI 入口](https://github.com/HYGON-AI/hcu_probe-das/blob/1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa/python/hcuprobe/cli.py) 为 `hcuprobe.cli:main`，再转调正式分派；它只在导入阶段过滤一条 CANN 环境提示并恢复 logger，不能解释为 HCU 支持 Ascend 专属 mode 或所有错误已被处理。[compare 包装器](https://github.com/HYGON-AI/hcu_probe-das/blob/1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa/python/hcuprobe/tools/compare.py) 已修复 `de68655e` 的 `hcu_probe.core...` 旧导入。`precheck` extra 现包含 ONNX/ONNX Runtime 等所需依赖；只按实际功能安装匹配项，`test` extra 里的其他后端不成为 HCU 必需依赖。源码 `_build_info.py` 是可被构建 hook 替换的占位模板，不能以其中 `26.0.0/unknown` 代替当前 wheel 元数据和源码身份。先核验目标制品，不自动安装仓内附带的其他 Agent Skill，也不因新增框架文档就认定训练、推理及所有后端均已通过。
+
+内部 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5` 现作为历史固定证据；已比对 debugger、hook、service、collector、compare 分派及首差调度的关键文件，与当前公开快照的 Git blob 相同，所以下述生命周期方法继续适用。这个文件级结论不扩大为全部后端、包装器或发行制品等价，安装、采集和跨 rank 定位仍需现场验收。
 
 在实际采集环境确认包来源、Torch/HCU 兼容性以及：
 
@@ -90,11 +94,13 @@ debugger.step()  # 仅正常完成后推进；映射到真实 iteration/microbat
 
 多 microbatch、1F1B、重算、共享模块及多个模型实例需按实际调用序列接入，不能机械在每次 forward 后 `step()`。默认 hook 不保证自动捕获 optimizer 的全部 master/state；需要更新证据时显式保存更新前后状态，核对与参数 ID/分组对应。诊断 NaN 时可按当前 PyTorch 使用 `detect_anomaly` 覆盖前向及反向取栈，但它不保证捕获所有前向 Inf、通信错误和自定义实现；辅以明确边界的 finite/状态检查，不常驻性能运行。
 
+使用框架集成时，先核对 feature 注册、wrapper 的实际目标、返回值与步数推进者。当前公开 [Megatron dump 接口](https://github.com/HYGON-AI/hcu_probe-das/blob/1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa/python/hcuprobe/integrations/megatron/dump.py) 在模型是列表时只向生命周期传入首项；PP/VP 多 chunk 不能由此推定全部覆盖。随仓 shim 会区分 HCU 与上游的 `train_step` 目标，装包也不会自动完成目标引擎的 feature 注册。monitor 集成对嵌套优化器采用手动 step 的约定，接入时须避免与自动 patch 重复推进。按目标源码验证实际命中、所有必需 chunk/反向与跳步记录；来源旧版模型的实测不代替当前引擎验收。
+
 ### 先小范围统计，再采实体张量
 
 1. 选相同少量 step、相关 rank 与层，先确认 hook 真正命中。保存 rank/组、microbatch、phase、调用序号和 module/API 到语义边界的映射。forward 重算不能和原 forward 混配；不要只按文件排序或同名层配对。
 2. 用统计或摘要缩小范围，再对候选层及其输入/输出/梯度补实体 tensor 与栈。统计不能还原逐元素误差；摘要只用于快速筛查，不能当容差或密码学证明。该固定版本部分名为 MD5 的字段实际是 CRC32，使用时检查当前实现。
-3. 核对 start/stop/step、flush、JSON 索引与实际文件。空匹配、未匹配调用、缺 rank、缺 backward、meta/fake 只有元数据、异步写入未完成都记录为不充分。退出码 0 或报告存在不代表数值通过。
+3. 核对 start/stop/step、flush、JSON 索引与实际文件。当前 `service.stop()` 在禁用、debug/L2 或停止条件下可能提前返回，不能把示意中的 `stop()` 当作所有异步写入已完成；正常 `step()` 也受停止条件约束。确认当前模式的落盘完成和必需 tensor 可读取，JSON 中有记录不保证实体张量齐全。空匹配、未匹配调用、缺 rank、缺 backward、meta/fake 只有元数据、异步写入未完成都记录为不充分。退出码 0 或报告存在不代表数值通过。
 4. 异步采集可能 clone 张量并延长显存占用，保存线程也会引入同步/I/O。必须确认快照在后续原地修改前固定、跨流生产者完成、异常退出是否 flush；不能把引用到后续被改写的张量当当时输入。
 5. 编译/Graph 模式可能绕过 hook，Probe 也可能引入 graph break 或改变调度。诊断用 eager 能缩小问题，但最终应在原 compiled/graph 路径用其真实输入和边界证据复验；采集后消失的故障保留竞态候选，不能直接关闭。
 6. 采集前估计字节量、额外显存和磁盘余量，按定位逐步扩范围；缺少通信因果信息时再补相关完整进程组。完成诊断后关闭采集，独立测性能。废弃 dump 按[工作区维护](../workspace-maintenance.md)在阶段收尾/低频节点退役，失败唯一原件、基线和修复证据保持保护。
@@ -118,7 +124,7 @@ NaN/Inf 单列计数、位置和最早来源。attention mask 等语义允许的
 | 梯度通过、参数更新偏离 | 参数 ID/组、master/moment/step、unscale/clip 顺序、跳步、weight decay、部分更新后错误重试 |
 | 恢复后或若干步才偏离 | scheduler/RNG/数据位置、量化状态/EMA、异步 checkpoint 完成、数值累计；从最后可信保存点重放同样数据 |
 
-Probe 自动首差分析是候选定位，不能代替因果确认。多 rank 必须核对通信组、P2P peer 和调用顺序，沿错误接收张量回溯发送者；不把 CSV 第一行或最先打印异常的 rank 当根因。交叉更换节点/库只能在资源授权内进行，并固定其他变量，用来区分软件与硬件/链路问题。
+Probe 自动首差分析是候选定位，不能代替因果确认。多 rank 必须核对通信组、P2P peer 和调用顺序，沿错误接收张量回溯发送者；缺少进程组信息时工具可能退回全 rank 候选，不能把该候选集、CSV 第一行或最先打印异常的 rank 当根因。交叉更换节点/库只能在资源授权内进行，并固定其他变量，用来区分软件与硬件/链路问题。
 
 初始基线或常规回归若在充分覆盖下满足声明契约，记录覆盖范围后直接回所属阶段，无需强找一个根因。原异常未复现却仍无法解释时，仅能报告“该窗口未复现”，继续保留原问题和证据；一次对照通过不能关闭间歇故障。
 
@@ -146,7 +152,7 @@ Probe 自动首差分析是候选定位，不能代替因果确认。多 rank �
 
 ## 8. 查证与后续维护
 
-本方法依据 HCU-Knowledge 已保留的 `dcu_probe` 工程报告及两个专题，并核对 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5` 的 PyTorch debugger 生命周期。该来源为内部工程，通过已绑定 HCU 知识库查询；不把其私有源码复制进公共 TrainFlow。
+本方法依据 HCU-Knowledge 已保留的 `dcu_probe` 工程报告及两个专题，并核对 `b8dddb57debbe31fb9a0ba46f7429de9c28014a5` 的 PyTorch debugger 生命周期。2026-11-04 又核对公开主源 `1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa` 的 [包元数据](https://github.com/HYGON-AI/hcu_probe-das/blob/1cf9e49686a2d3f61aca42ef110fdd1ac9660ffa/pyproject.toml)、CLI/compare 包装器及关键核心文件身份，修正来源角色和已解决的旧 namespace 问题。内部历史证据通过已绑定 HCU 知识库查询，不把其私有源码复制进公共 TrainFlow；本轮未安装 Probe、执行上游测试、采集张量或进行 HCU/NV 精度实验。
 
 2026-10-20 增量复核还使用公开 Probe `de68655e9bd3a3678fd29889982135c473d25f94` 的包元数据和包装器、HCU TE `main@73dbcf534252d13f463d63c439cf7c41bb05150e` 的 `_extra_state.py`/`module/base.py`，以及 HCU PyTorch 公开 `2.12.0-dev@acf085724329a8c07556709324cb757ce7046fbd` 的精度消费者与数值修正。它们补充本页的版本/状态核验方法；没有安装 Probe、重放 checkpoint 或进行 HCU/NV 精度实测。具体来源与未覆盖项继续从大库工程指南查询，不把开发线文档、UT 记录或同号 wheel 当作现场兼容证明。
 

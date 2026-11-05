@@ -10,53 +10,70 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
-coverage: selected source, official documentation and related PR reading; no HCU runtime validation
+reviewed_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 sources:
 - source: nvidia-megatron-energon
   path: src/megatron/energon/loader.py
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: 00f4780c39c023c999acead866c3056128d4ff4b8c9678ead1ccb8f5d498d1f0
 - source: nvidia-megatron-energon
   path: src/megatron/energon/savable_loader.py
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: 8c1a5e58984cd33e41ec17fdc6a55ef1efd9b3a02e6d7606cfbef9da89f6865a
 - source: nvidia-megatron-energon
   path: src/megatron/energon/worker.py
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: d6bdaca8035e80518a70ce0283f123604749c4a8ab3f368d736df5cfc3e73c30
 - source: nvidia-megatron-energon
   path: docs/source/basic/save_restore.md
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: b6db5d6072470133817e393d13330d758159c872cc6fcd22299104d8bdf87c61
 - source: nvidia-megatron-energon
   path: docs/source/advanced/repro_scaling.md
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: 4cccff0a2238bcdc2d6eabd253855cb3b6eeb16fa77b9bde80a6720a9535b46b
 - source: nvidia-megatron-energon
   path: docs/source/advanced/parallelism.md
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: 427aa86fba6a0bac1a9460255e46a93d7d67ec502a852d26105eccd313484f4e
 - source: nvidia-megatron-energon
   path: tests/test_dataset.py
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: 83b947681603f6825a2349c7881e735409b53a6ca0152851a9ee6254eff0fb2b
 - source: nvidia-megatron-energon
   path: src/megatron/energon/flavors/common/dataset_sampler.py
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: 35d1b00fa7dec5914d928fa558cf07ee4cb5b29005c3f2aac653ba9c0c513d78
 - source: nvidia-megatron-energon
   path: src/megatron/energon/flavors/common/manifest/sharder.py
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: a88e23aabbc593dac1bee74ddd2ca9999cf03a7ee5981eb09b313a3b9016ebb0
 - source: nvidia-megatron-energon
   path: src/megatron/energon/rng.py
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
   sha256: bfa73c2a2e38947a659dac65b2d29ade26523fcc06390f0acaaf7c428149abb0
 - source: nvidia-megatron-energon
   path: docs/source/internals/compatibility.md
-  commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
-  sha256: 024c424612f9aa007417bd247881f1b837b47cb60295215d9216c49b77196c93
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
+  sha256: 03cbc7dadc02504d4e348aeaf87866153791870cd55b04a945f09dff47be50d7
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/recipe/recipe.py
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
+  sha256: f5b43761fca94c1dd4d36e5bc655ecd5beb2974bc002d265f503ca6d3d3ba28c
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/recipe/dataset_loader.py
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
+  sha256: e7a4dfafa532bc145253611966a23e3906a760a33140cab7f5eb4e5872d46afd
+- source: nvidia-megatron-energon
+  path: src/megatron/energon/flavors/common/filter_index.py
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
+  sha256: d2cc184330d0a53be41b1f8c753e2ca06a992a91ab11f7599571050ffbd33aca
+- source: nvidia-megatron-energon
+  path: tests/test_filter_index.py
+  commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
+  sha256: bfa633d01e0fdd6405f738bf1ccebf8d10138c1e229ff59767f28b7b6e25af4a
+retrieved_on: '2026-11-04'
 ---
 
 # Energon：数据空泡、Snapshot 恢复、Worker 与资源生命周期
@@ -75,7 +92,7 @@ workers会预取未来样本，训练真正消费位置落后于worker当前状�
 
 ## 2a. 大数据集索引常量内存与版本边界
 
-本轮 `DatasetSampler._pending_slices` 不再分配/保存全量随机待处理列表：无 shuffle 返回 `range(num_slices)`；有限 epoch shuffle 以 `FeistelPermutation(num_slices × shuffle_over_epochs, seed)` 按位置取索引，再对 num_slices 取模；replacement 模式继续用 worker RNG 逐个抽取。Feistel 在下一幂次二进制域做默认八轮置换，对域外结果 cycle walking，形成目标范围内的双射。它降低随 slice 数增长的索引内存，但每次查找有整数运算/cycle walking 的 CPU 成本，不代表所有加载场景都更快。
+当前 `DatasetSampler._pending_slices` 已使用此前引入的常量内存实现，本轮该文件字节未变；它不分配/保存全量随机待处理列表：无 shuffle 返回 `range(num_slices)`；有限 epoch shuffle 以 `FeistelPermutation(num_slices × shuffle_over_epochs, seed)` 按位置取索引，再对 num_slices 取模；replacement 模式继续用 worker RNG 逐个抽取。Feistel 在下一幂次二进制域做默认八轮置换，对域外结果 cycle walking，形成目标范围内的双射。它降低随 slice 数增长的索引内存，但每次查找有整数运算/cycle walking 的 CPU 成本，不代表所有加载场景都更快。
 
 `Sharder` 对 `max_samples_per_sequence==1` 直接创建每 worker 的 range offsets，`_clean_offsets` 保留 range，sampler 配置也用 start/stop/step 表达，避免为每个 sample 展开 Python offsets 列表。此特化不代表所有 sequence cap、packing buffer 或 reader 缓存都变为常量内存。
 
@@ -103,19 +120,23 @@ watchdog默认超时诊断/是否fail由策略决定，不负责节点隔离或�
 
 回退可信数据配方、较少workers/prefetch或严格错误策略，代价和输入瓶颈说明清楚；保留训练state对应数据版本。更新loader/reader/wrapper、storageclient、workergroup和Bridge保存逻辑时同步[总览](../overview/energon.md)与[packing专题](energon-encoding-packing.md)。
 
+2026-11-04 检索固定 `e33bbe768a4f7a629377a365c8af9a7b98b1219e`：所引 loader / worker / sampler / sharder / RNG / 测试及恢复文档字节不变，保留 snapshot+消费 offset、Feistel 状态、DP×worker 缩扩与资源关闭限制。compatibility 文档新增 `test_filter_index.py` 作为格式/工厂变更验证入口；Recipe 新 filter 将改变可见样本身份，旧 state 或同名数据路径不能自动证明过滤索引兼容。验证应增加 filter 索引与源数据的版本、样本 ID / 有效 token、保存后未来序列复现，并明确原 Bridge 的同 DP size 消费者限制仍然成立。本轮没有执行这些测试。
+
+补采的 filter 实现将原样本整数地址映射为过滤后的地址：manifest sidecar 位于 `.nv-meta/filter_<name>.json/.idx`，单文件数据使用旁置同名后缀，当前索引版本为 2。`FilterView` 验证版本、shard 名/顺序、原样本计数和 primary 文件 byte size，并按选定 split 的 shard 顺序翻译；它不校验 companion 文件或完整内容 hash，同大小改写不由这些检查自动识别。`TranslatedIndexReader` 将 restore key 的整数位置改为 filtered_index，故必须保留对应 filter 原件，不能换 filter 后沿用旧位置。上游 `test_filtered_training_recipe_checkpoint`、stale filter、分 rank/worker、BINIDX passthrough 测试提供特定范围参考，本轮未运行，不扩大为全部格式/分布式恢复兼容。
+
 ## 固定证据与复核范围
 
-- [src/megatron/energon/loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/loader.py)
-- [src/megatron/energon/savable_loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/savable_loader.py)
-- [src/megatron/energon/worker.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/worker.py)
-- [docs/source/basic/save_restore.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/basic/save_restore.md)
-- [docs/source/advanced/repro_scaling.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/repro_scaling.md)
-- [docs/source/advanced/parallelism.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/advanced/parallelism.md)
-- [tests/test_dataset.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/tests/test_dataset.py)
+- [src/megatron/energon/loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/src/megatron/energon/loader.py)
+- [src/megatron/energon/savable_loader.py](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/src/megatron/energon/savable_loader.py)
+- [src/megatron/energon/worker.py](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/src/megatron/energon/worker.py)
+- [docs/source/basic/save_restore.md](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/basic/save_restore.md)
+- [docs/source/advanced/repro_scaling.md](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/advanced/repro_scaling.md)
+- [docs/source/advanced/parallelism.md](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/advanced/parallelism.md)
+- [tests/test_dataset.py](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/tests/test_dataset.py)
 
-- [src/megatron/energon/flavors/common/dataset_sampler.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/flavors/common/dataset_sampler.py)
-- [src/megatron/energon/flavors/common/manifest/sharder.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/flavors/common/manifest/sharder.py)
-- [src/megatron/energon/rng.py](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/src/megatron/energon/rng.py)
-- [docs/source/internals/compatibility.md](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/internals/compatibility.md)
+- [src/megatron/energon/flavors/common/dataset_sampler.py](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/src/megatron/energon/flavors/common/dataset_sampler.py)
+- [src/megatron/energon/flavors/common/manifest/sharder.py](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/src/megatron/energon/flavors/common/manifest/sharder.py)
+- [src/megatron/energon/rng.py](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/src/megatron/energon/rng.py)
+- [docs/source/internals/compatibility.md](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/internals/compatibility.md)
 
 本页说明已阅读的官方源码、文档和机制。没有在 HCU 上执行这些上游测试；上游性能、发布状态与当前部署是否具备该能力应分别确认。更新时同时复核工程总览、相应专题、案例、调用方与依赖版本。

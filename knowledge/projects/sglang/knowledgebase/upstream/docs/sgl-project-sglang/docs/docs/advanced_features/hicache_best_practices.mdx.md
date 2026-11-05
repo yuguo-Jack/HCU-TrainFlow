@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/hicache_best_practices.mdx
-raw_sha256: 68de42b66110fe0690d1fb0f8ec7b17db3197315225c574034e3dfd5eba6be16
+raw_sha256: 88c464df10abad5699d5748f267212904c5746a3f9eab9b7edc0fb2224c24f22
 sources: []
-generated_body_sha256: d4d559c6031a50d1af108d54ed8e2d386213a342ac06e0287a7fb9831ca10098
+generated_body_sha256: 29c5d781316cc78bdf913791723d35edda8f2ad021351fa953480cf19e7d290c
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/hicache_best_practices.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/advanced_features/hicache_best_practices.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/hicache_best_practices.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -57,6 +57,7 @@ L1 and L2 are private to a single inference instance; only L3 can be shared. Hos
 Notes:
 
 - Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](./hicache_storage_runtime_attach_detach).
+- Hybrid Mamba/GDN/KDA models keep a second host pool for recurrent states next to host KV. It is sized from the device Mamba pool (by `--hicache-ratio`, or by the device-byte split of `--hicache-size`), so with a small `--max-mamba-cache-size` it holds far fewer states than host KV holds requests and fills first. When it is full, its LRU drops the oldest states, and a prefix whose KV is still on host cannot be matched again until a request recomputes it. Watch `sglang:hicache_host_mamba_used_states` against `sglang:hicache_host_mamba_total_states`, and raise the ratio if the pool runs full.
 
 ## Key Configurations with Storage Backends Enabled
 
@@ -169,6 +170,40 @@ python3 -m sglang.launch_server \
   --disaggregation-transfer-backend mooncake
 ```
 
+
+### Deployment with Local Filesystem Backends
+
+`file` is the minimal reference backend: unbounded, staged, serial file I/O.
+For a local NVMe or filesystem tier use `fast_file`. It keeps the same on-disk
+page format and adds direct host-buffer I/O for page-first layouts, parallel
+reads, atomic page publication, and background LRU eviction:
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-mem-layout page_first \
+  --hicache-io-backend kernel \
+  --hicache-write-policy write_through \
+  --hicache-storage-backend fast_file \
+  --hicache-storage-backend-extra-config \
+  '{"file_storage_path":"/mnt/nvme/hicache","max_size":"3Ti","min_free_space":"4Ti","read_workers":8}'
+```
+
+Pages live below the storage root in a namespace derived from the model name,
+parallel layout, and host pool layout, so one root can be shared by several
+deployments. The root resolves exactly like the `file` backend's:
+`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`, then the `file_storage_path`
+extra-config key (`--file-storage-path`), then `/tmp/hicache`; the namespace
+directory keeps its pages apart from `file` pages in the same root.
+`max_size` bounds one namespace as tracked by one process (MLA ranks share a
+namespace and rank 0 owns eviction); `min_free_space` is a floor for the whole
+filesystem. Both are optional. Eviction state and the optional
+`enable_metadata_cache` are process-local, and a completed write means close
+plus rename rather than `fsync`. The module docstring of
+`sglang/srt/mem_cache/storage/fast_file/fast_file_store.py` lists every
+extra-config key.
 
 ### Deployment with HF3FS
 

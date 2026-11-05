@@ -170,6 +170,125 @@ def test_worker_uses_native_counter_status(tmp_path, monkeypatch, native, expect
     assert result['status'] == expected
 
 
+@pytest.mark.parametrize('mode', ['compare', 'graph', 'agent'])
+@pytest.mark.parametrize('diagnostic', [None, 'Mean of empty slice',
+    'Inconsistent kernel list length found. Skipping a row.'])
+def test_native_report_modes_preserve_warnings_and_sample_loss(tmp_path, monkeypatch, capsys, mode, diagnostic):
+    import sys
+    from types import SimpleNamespace
+    import warnings
+    from hcu_trainflow import tracelens_feature_worker as worker
+
+    def report(**kwargs):
+        if diagnostic:
+            for _ in range(2):
+                warnings.warn(diagnostic, UserWarning)
+        return {'ops_summary': [1]}  # Valid aggregate output survives detail loss.
+
+    monkeypatch.setitem(sys.modules, 'TraceLens.Reporting.generate_perf_report_pytorch',
+                        SimpleNamespace(generate_perf_report_pytorch=report))
+    write_json(tmp_path / 'arch.json', {'name': 'synthetic-hcu'})
+
+    def native(module, *args):
+        if module == 'TraceLens.Trace2Tree.training_graph':
+            report()  # The graph CLI generates its report in this process.
+            write_json(tmp_path / 'graph.json', {'status': 'complete'})
+        elif module == 'TraceLens.Agent.Analysis.utils.hcu_analysis':
+            write_json(tmp_path / 'hcu_native_analysis.json', {'status': 'metrics_complete'})
+
+    monkeypatch.setattr(worker, 'run_native', native)
+    request = {'mode': mode, 'trace': 'before.json', 'comparison_trace': 'after.json',
+               'gpu_arch_json': str(tmp_path / 'arch.json'), 'manifest': 'graph-manifest.json',
+               'capture_folder': str(tmp_path)}
+    with warnings.catch_warnings():
+        warnings.simplefilter('always')
+        result = worker.analyze(request, tmp_path)
+    skipped = diagnostic and 'Skipping a row.' in diagnostic
+    expected = 'needs-agent-review' if mode == 'agent' else 'incomplete' if skipped else 'generated'
+    assert result['status'] == expected
+    assert (result.get('native_report_status') == 'incomplete') is bool(skipped)
+    assert any('skipped variable-length samples' in gap for gap in result['gaps']) is bool(skipped)
+    assert bool(result['native_warnings']) is bool(diagnostic)
+    stderr = capsys.readouterr().err
+    if diagnostic:
+        warning = result['native_warnings'][0]
+        assert warning['count'] == (4 if mode == 'compare' else 2)
+        assert warning['filename'].endswith('test_tracelens_features.py') and warning['lineno'] > 0
+        assert diagnostic in stderr and warning['message'] == diagnostic
+    else:
+        assert not stderr
+    if mode == 'agent':
+        assert result['qualification']['status'] == 'metrics_complete'
+        assert any('Active workflow Agent' in gap for gap in result['gaps'])
+
+
+def test_advanced_worker_preserves_warning_if_native_raises(tmp_path, monkeypatch, capsys):
+    import sys
+    from types import SimpleNamespace
+    import warnings
+    from hcu_trainflow import tracelens_feature_worker as worker
+
+    def fail(**kwargs):
+        warnings.warn('Inconsistent kernel list length found. Skipping a row.', UserWarning)
+        raise RuntimeError('native report failed')
+
+    monkeypatch.setitem(sys.modules, 'TraceLens.Reporting.generate_perf_report_pytorch',
+                        SimpleNamespace(generate_perf_report_pytorch=fail))
+    request = tmp_path / 'request.json'
+    write_json(request, {'mode': 'compare', 'trace': 'before', 'comparison_trace': 'after'})
+    monkeypatch.setattr(sys, 'argv', ['worker', str(request)])
+    with pytest.raises(RuntimeError, match='native report failed'):
+        worker.main()
+    assert 'Skipping a row.' in capsys.readouterr().err
+    assert not (tmp_path / 'worker.json').exists()
+
+
+def test_advanced_analysis_respects_warning_error_policy(tmp_path, monkeypatch):
+    import warnings
+    from hcu_trainflow import tracelens_feature_worker as worker
+
+    def native(*args):
+        warnings.warn('strict diagnostic', UserWarning)
+
+    monkeypatch.setattr(worker, 'run_native', native)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', UserWarning)
+        with pytest.raises(UserWarning, match='strict diagnostic'):
+            worker.analyze({'mode': 'graph', 'manifest': 'manifest.json', 'capture_folder': '.'}, tmp_path)
+
+
+@pytest.mark.parametrize('code,expected', [
+    ('native-kernel-detail-samples-skipped', 'incomplete'), ('native-warning', 'generated')])
+def test_outer_receipt_cannot_hide_native_sample_loss(tmp_path, monkeypatch, code, expected):
+    store, request, _ = setup(tmp_path, monkeypatch)
+    warning = {'code': code, 'count': 2, 'message': 'retained diagnostic'}
+
+    def run(argv, **kwargs):
+        write_json(Path(argv[-1]).parent / 'worker.json',
+                   {'status': 'generated', 'native_warnings': [warning], 'gaps': []})
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(features, 'run_bounded', run)
+    result = features.run_feature(store, '.', request)
+    assert result['status'] == expected
+    assert result['native_warnings'] == [warning]
+    assert result['worker']['native_warnings'] == [warning]
+    assert bool(result['gaps']) is (expected == 'incomplete')
+
+
+@pytest.mark.parametrize('native_warnings', [None, {}, ['not-a-warning-row']])
+def test_malformed_native_warnings_fail_receipt_validation(tmp_path, monkeypatch, native_warnings):
+    store, request, _ = setup(tmp_path, monkeypatch)
+
+    def run(argv, **kwargs):
+        write_json(Path(argv[-1]).parent / 'worker.json',
+                   {'status': 'generated', 'native_warnings': native_warnings})
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(features, 'run_bounded', run)
+    assert features.run_feature(store, '.', request)['status'] == 'failed'
+
+
 def test_outer_timeout_reaps_native_grandchild(tmp_path):
     import sys
     import time

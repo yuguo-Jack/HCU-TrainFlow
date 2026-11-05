@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: 65aaaa960698ab5d6e98c874177b41b9c30e9c58
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/models/qwen3_8/README.md
-raw_sha256: df8758300f5743f46f7eec44f92530253c3c3877b65ab2ff66e4ff102aca143f
+raw_sha256: 0413c2e1e2fe2e5500fbc7e0566c7e6db3b80d3418b4709f9dd26128ca4dc228
 sources: []
-generated_body_sha256: 3f36eb9ae6c187ca6f2bb47ee77cd167ac3d81071cef33ef1e4b7eafd7745747
+generated_body_sha256: 6661e8af980ac0ee833adcf2264b2e98172530947e143e3a40579df1083090fa
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/models/qwen3_8/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/65aaaa960698ab5d6e98c874177b41b9c30e9c58/torchtitan/models/qwen3_8/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/models/qwen3_8/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -39,6 +39,21 @@ This directory owns only:
 
 The shared model, Gated DeltaNet, RoPE, vision encoder, sharding,
 parallelization, and state-dict adapter keep their existing Qwen3.5 names.
+
+## Supported Parallelisms
+
+Qwen3.8 reuses the Qwen3.5 model implementation and parallelization (see the
+note above), so it supports the same parallelisms documented in
+[Qwen3.5's Supported Parallelisms](../qwen3_5/README.md#supported-parallelisms):
+
+| Feature | Notes |
+|---------|-------|
+| FSDP / HSDP | Decoder sharded per-layer; vision encoder sharded as a single unit (one AllGather) |
+| Tensor Parallelism (TP) | With Sequence Parallel; head-sharded TP on GatedDeltaNet projections |
+| Expert Parallelism (EP) | For the `2.4T-A95B` MoE variant |
+| Pipeline Parallel (PP) | Vision encoder assigned to first stage; 1F1B and Interleaved1F1B schedules |
+| Context Parallelism (CP) | Attention Gym native CP for GatedDeltaNet; full attention supports K/V all-gather with contiguous, head-tail, or PTRR partitions and Ulysses with contiguous partitions |
+| Sample Packing | Opt-in via `MMSamplePackingConfig` |
 
 ## Model variants
 

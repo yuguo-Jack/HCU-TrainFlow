@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/internals/dataset_formats.md
-raw_sha256: c82af96996bf03b7c27f3a9c8e50100eeff9ab410be7ae30778178831017f8d9
+raw_sha256: 8f98da5b8d2d44d192aecc6e887facdcb95bcc5240073d08b6576e6ef2ac03ea
 sources: []
-generated_body_sha256: e454a0c86ffcf6ec2c186d2294b5ed3362b90a8c3e2301ce79be9bf8f8939446
+generated_body_sha256: d7627bbadf9ade53bc41d6b587c3f1664c865550dcd6246617b810d0ca64699e
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/internals/dataset_formats.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/internals/dataset_formats.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/internals/dataset_formats.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -48,10 +48,11 @@ then supplies worker partitioning, filtering, shuffling, restore keys, and mappi
 `BaseIndexedDatasetFactory` is the usual base for a finite, indexable format. Its `build` implementation:
 
 1. merges the caller's part filter with the factory filter;
-2. assigns virtual shards to workers;
-3. asks the flavor to build an `IndexedSampleReader`;
-4. wraps the reader in `DatasetSampler`;
-5. maps each `SampleRecord` through the configured sample loader.
+2. applies a prepared filter index, if configured;
+3. assigns virtual shards to workers;
+4. asks the flavor to build an `IndexedSampleReader`;
+5. wraps the reader in `DatasetSampler`;
+6. maps each `SampleRecord` through the configured sample loader.
 
 Subclasses normally implement `_build_reader`, `load_sample`, and `as_file_store` rather than recreating
 this pipeline.
@@ -114,6 +115,11 @@ another format.
 Importing a flavor module must register its provider before detection is used. If a new format is public,
 also expose its factory through the intended API module.
 
+Factories must implement the `BaseCoreDatasetFactory.get_original_shards(path)` class method.
+Providers expose the same method to the resolver. It returns `ShardInfo` entries in source order,
+with names, primary file paths, and original sample counts before splits, subsets, or filters.
+It must work quickly without walking the dataset. Manifest factories inherit this from `BaseManifestDatasetFactory`; direct-file formats supply their own implementation.
+
 ## Adding a dataset flavor
 
 Use this checklist:
@@ -123,7 +129,7 @@ Use this checklist:
    cached index is stale and must be rebuilt.
 3. **Reader:** implement integer ordinal access, length, resource cleanup, and `SampleRecord` provenance.
 4. **Factory:** subclass the appropriate indexed base and implement only the format-specific hooks.
-5. **Filtering:** verify `part_filter` and exclusions.
+5. **Filtering:** verify `part_filter`, exclusions, and prepared `FilterView` translation.
 6. **Key access:** implement `FileStore` or part readers if mounts or auxiliary lookup require it.
 7. **Detection:** register a provider at the least surprising priority and test competing path shapes.
 8. **Configuration:** ensure `config()` contains stable leaf identity fields used by diagnostics.
@@ -131,13 +137,14 @@ Use this checklist:
 10. **Tests:** cover preparation, direct reading, worker splitting, filtering, save/restore, detection, and
     stale or corrupt metadata.
 
-Relevant tests include `test_dataset_factory_resolver.py` and the format-specific dataset tests. A format that changes existing sample order also needs the iteration-order tests
+Relevant tests include `test_dataset_factory_resolver.py`, the format-specific dataset tests, and
+`test_filter_index.py`. A format that changes existing sample order also needs the iteration-order tests
 listed in {ref}`compatibility`.
 
 ## Configuration is descriptive
 
 A factory's `config()` result is a recursively serializable description used for logging. Stable fields
-such as `_path`, `split_part`, and `subset` are significant.
+such as `_path`, `split_part`, `subset`, and `filter` are significant.
 
 Configuration should not contain open readers or runtime progress. Runtime progress belongs to
 `SavableDataset` state.

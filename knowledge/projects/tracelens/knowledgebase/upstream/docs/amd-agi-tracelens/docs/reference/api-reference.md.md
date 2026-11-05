@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/reference/api-reference.md
-raw_sha256: 0d12d3f243f76d4770667c47b6e7751033b805d172a825bd7d26b610ecb427d1
+raw_sha256: 941ecebfc1bee16551730aed5c23d9d0cb588f7dd6d12ee28f7c40b3b3abaf34
 sources: []
-generated_body_sha256: 59672b9fa6d6ab3d98c5e99c6f1ba8df87ea7cc2c40e4309ce59cc18b5dae480
+generated_body_sha256: e41b9bd1ad39e917acd732bfe7e3bdd7d12e3c6b32d317646fe38188b4b5ab30
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/reference/api-reference.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/reference/api-reference.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/reference/api-reference.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -69,11 +69,12 @@ Generate a multi-sheet Excel report from a PyTorch (`torch.profiler`) trace.
 | `--include_unlinked_kernels` | off | Include kernels with no linked CPU op in the GPU-timeline analysis. |
 | `--micro_idle_thresh_us` | None | Threshold (µs) to classify an idle interval as micro-idle. |
 | `--comparison_json_path` | None | Second trace to compare against; runs TraceDiff and adds speedup/delta/LCA columns plus a `diff_stats` sheet. |
-| `--enable-origami` | off | Use Origami for simulated GEMM/SDPA times when a GPU arch JSON is provided. |
+| `--enable-origami-gemm` | off | Add `Origami` GEMM times when a GPU arch is given. |
+| `--enable-origami-sdpa-tile` | off | Add `SDPA Tile Origami` attention times from TraceLens's tile model, with Origami timing each tile GEMM. |
 | `--detect_recompute` | off | Detect activation recomputation and add an `is_recompute` column. |
 | `--include_overlap_info` | off | Add kernel-overlap sheets. |
 | `--topk_ops`, `--topk_roofline_ops` | None | Limit rows in the unique-args and roofline tables. |
-| `--extension_file` | None | Custom extensions for `TraceTree` and `PerfModel`. |
+| `--extension_file` | None | Python file with custom hooks: tree post-processing, perf models, op categories, op projections (your own predicted times and columns), and kernel filters. See [Extend the report](../how-to/generate-perf-report-pytorch.md#extend-the-report-custom-hooks). |
 
 **Output:** an `.xlsx` workbook with the GPU-timeline, operator-category,
 operator, unique-argument, and roofline sheets.
@@ -93,6 +94,36 @@ Shares most options with `TraceLens_generate_perf_report_pytorch` (output
 paths, short-kernel study, roofline/Origami, comparison, call stack). Run with
 `--help` for the full list.
 
+### TraceLens_generate_perf_report_from_config
+
+Generate one report per job from a YAML file. The same entry point is
+`python -m TraceLens.Reporting.generate_perf_report_from_config`.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--config` | required | Path to the run YAML. |
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `analysis_mode` | yes | `default` (calls the `TraceLens_generate_perf_report_pytorch` report) or `inference` (calls the `TraceLens_generate_perf_report_pytorch_inference` report). |
+| `output_dir` | yes | Directory for the reports and `run_config.resolved.yaml`. |
+| `jobs[].name` | more than one job, unless `combine_by_node` | Output names become `perf_report_<name>.xlsx` and `perf_report_<name>_csvs/`. |
+| `jobs[].trace_path` | yes | Trace to analyze. |
+| `jobs[].platform`, `jobs[].gpu_arch_json_path` | exactly one | Architecture name, or path to an architecture JSON file. |
+| `jobs[].capture_folder` | no | Graph-capture folder. `inference` only. |
+| `jobs[].compare_to` | no | `trace_path` and, in `inference`, `capture_folder` of a trace to compare against. |
+| `jobs[].precomputed_diff_stats` | no | `diff_stats.csv` to use instead of TraceDiff. |
+| `jobs[].phase` | when `aggregation` is set | Phase label, for example `prefill` or `decode`. |
+| `jobs[].node` | when `aggregation.policy` is `combine_by_node` | Index of the node within its phase, a non-negative integer. The node id is `<phase>_<index>`, for example `prefill_0`. Jobs with the same phase and index combine. |
+| `aggregation.policy` | no | `combine_by_node`. Combines every job's CSVs into `perf_report_aggregated_csvs/`. `combine`, `combine_by_phase`, and `combine_stack` are reserved and not supported yet. |
+| any report parameter | no | Top-level, by Python name. Applies to every job. |
+
+**Output:** one report per job, plus the aggregated CSVs when `aggregation` is
+set. Aggregation is experimental. It is also available from Python as
+`TraceLens.Reporting.aggregate_perf_reports.aggregate_perf_report_csvs`. See
+[Generate performance reports from a YAML config](../how-to/generate-perf-report-from-config.md)
+for defaults and examples.
+
 ### TraceLens_generate_perf_report_jax
 
 Generate a report from a JAX XPlane protobuf trace (also accepts a PyTorch
@@ -104,7 +135,7 @@ trace).
 | `--output_xlsx_path` | auto | Output Excel file. |
 | `--output_csvs_dir` | None | Directory for CSV output. |
 | `--kernel_metadata_keyword_filters` | None | Only analyze events whose metadata contains the given keyword(s), for example `remat checkpoint`. |
-| `--enable-origami` | off | Use Origami simulated GEMM/SDPA times when a GPU arch JSON is provided. |
+| `--enable-origami-gemm` | off | Add `Origami` GEMM times when a GPU arch is given. |
 
 ### TraceLens_generate_perf_report_rocprof
 
@@ -231,7 +262,7 @@ example notebook under `examples/`.
 |--------|---------|-----------|
 | `Trace2Tree` | Build and navigate the hierarchical event tree (Python ops → CPU dispatch → GPU kernels). | [Trace2Tree data model](../conceptual/trace2tree.md), [`trace2tree_example.ipynb`](https://github.com/AMD-AGI/TraceLens/blob/main/examples/trace2tree_example.ipynb) |
 | `TreePerf` | GPU-timeline breakdown, per-op performance, and roofline metrics. | [Analyze traces with the TraceLens SDK](../how-to/sdk-analysis.md), [`tree_perf_example.ipynb`](https://github.com/AMD-AGI/TraceLens/blob/main/examples/tree_perf_example.ipynb) |
-| `PerfModel` | Compute and roofline performance models for operators. | [GEMM analysis](../conceptual/gemm-analysis.md), [Triton kernel performance model](../conceptual/triton-perf-model-walkthrough.md) |
+| `PerfModel` | Perf models (each operator's parameters, FLOPs, and bytes) and op projections (per-op values computed from that work, usually a predicted time: roofline, Origami, or your own). | [GEMM analysis](../conceptual/gemm-analysis.md), [Triton kernel performance model](../conceptual/triton-perf-model-walkthrough.md), [Add an op projection](../how-to/generate-perf-report-pytorch.md#add-an-op-projection) |
 | `NcclAnalyser` | Multi-rank collective latency/bandwidth/skew analysis. | [Analyze collectives with NcclAnalyser](../how-to/nccl-analysis.md), [`nccl_analyser_example.ipynb`](https://github.com/AMD-AGI/TraceLens/blob/main/examples/nccl_analyser_example.ipynb) |
 | `TraceDiff` | Morphological comparison of two trace trees. | [Compare two traces](../how-to/compare-traces.md), [`trace_diff_example.ipynb`](https://github.com/AMD-AGI/TraceLens/blob/main/examples/trace_diff_example.ipynb) |
 | `EventReplay` | Extract and replay isolated operations. | [Replay a single operation](../how-to/event-replay.md), [`event_replayer_example.ipynb`](https://github.com/AMD-AGI/TraceLens/blob/main/examples/event_replayer_example.ipynb) |

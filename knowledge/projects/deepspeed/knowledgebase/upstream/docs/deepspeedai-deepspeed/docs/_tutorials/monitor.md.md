@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: deepspeedai/DeepSpeed
-commit: bc1ad320a9afb516797577924a9983c6d7cd6793
+commit: d8241a9ba266405e1a58fadf19e24b2370f6d7fa
 path: docs/_tutorials/monitor.md
-raw_sha256: ebe8df2c0d2b812accc56b4989b667246db4c76c3286113ddf9a851ab8cccd41
+raw_sha256: 5ebd2f7270f66fe92dff502904630bc66ce122046b2451b42fac9399119deb81
 sources: []
-generated_body_sha256: 1d6b6fa286deb6465930aa88202b91b3821ec503a441e99820d24d0611b0eeb4
+generated_body_sha256: 20017635d38cf7c7e30ea39f745e194e66e671cbe11b7284b20f6a361fec1fcb
 source_state: current-scan
 ---
 
 # deepspeedai/DeepSpeed / docs/_tutorials/monitor.md
 
-[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/bc1ad320a9afb516797577924a9983c6d7cd6793/docs/_tutorials/monitor.md)
+[Original at fixed commit](https://github.com/deepspeedai/DeepSpeed/blob/d8241a9ba266405e1a58fadf19e24b2370f6d7fa/docs/_tutorials/monitor.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -109,7 +109,7 @@ The steps to create a custom monitor are as follows:
 
 \* Note - Some Monitor backends don't support mixed sample values. Be sure to use your DeepSpeed engine object's `global_samples` attribute in each 3-tuple
 
-For example usage, see the following modified [DeepSpeedExamples/cifar](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/cifar) example:
+For example usage, see the following modified [DeepSpeedExamples/cifar](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/cifar) example:
 
 ```python
 # Step 1: Import monitor (and DeepSpeed config, if needed)

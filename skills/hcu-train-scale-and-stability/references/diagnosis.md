@@ -73,11 +73,15 @@
 4. 若某 rank 未到调用点，回查其前序数据、算子、异常/退出及控制流。HCU 知识库有数据不一致造成 collective 参数不同的案例；不能通过调通信性能变量修复此类契约错误。
 5. 所有成员正确下发仍不推进，才结合实际加载的 RCCL/插件/runtime、拓扑/传输、proxy 进度与设备状态缩小到实现层；必要时阅读当前 HCU 分支的 enqueue、transport、proxy 及调用方源码。
 
+跨节点或多 P2P 连接问题另保留连接/buffer 选择与首次、重复调用顺序；一个连接通过不能排除另一个连接的预连接或生命周期问题。超节点拓扑还要保存融合 XML、systemId、rank→PCI/NIC 与实际路径，不能仅按不同 host 上相同 PCI 地址合并设备。初始化时 SMI/插件缺符号与真正的网络停滞分开；环境变量设置不证明实际加载了指定库或发生了自动回退。对应 HCU RCCL 版本与候选修复见 [证据入口](evidence-sources.md)。
+
 还要区分 host API 返回、通信设备工作完成、消费 stream 的依赖建立、watchdog 观察到完成四个时刻。异步 `Work.wait` 可能只插入设备依赖，不能据返回或单个 event 推断全组成功。graph 的监控 event 与消费 join event 可能用途不同；先查现场 TorchComms/PyTorch 后端，不删除依赖来“修复”卡住，也不假定所有超时从 Python 调用时开始计时。HCU 查 `torchcomms-async-functional-watchdog` 与 `pytorch-memory-stream-graph-lifecycle`。
 
 先核对观察动作本身是否允许。当前 Galaxy 的 event query/synchronize 会检查 capture 状态，对仍在活跃 capture 中记录的 event 可使 capture 失效并返回错误；不能为轮询完成临时加入 host 查询或同步，再把新增错误归咎于通信。复用框架已有的安全观察点，必要时在有界、明确改变 Graph 模式的复现中定位，原正式时序仍需复验。DeepEP/MoonEP/UltraEP 等异步路线还要追 plan/generation、视图所有权、消费 join 和迭代收尾，不能把接口返回 event 理解为任意并发或 Graph 资格。
 
 诊断复现可在确认版本支持后使用 `NCCL_DEBUG=INFO`、`NCCL_DEBUG_SUBSYS=INIT,COLL`、按 host/PID 区分的 `NCCL_DEBUG_FILE`；还需按 attempt 分目录。HCU RCCL 使用 NCCL 风格变量，不代表 NV 工具都可用。PyTorch 的 `TORCH_DISTRIBUTED_DEBUG`、flight recorder 等先核对当前 HCU 构建；`monitored_barrier` 的官方支持范围是 Gloo，若用它需在可修改的复现程序中由相同成员按相同顺序创建并使用诊断组，不能对挂住进程临时“插入 barrier”。这些都是诊断开销，不用于报性能收益。
+
+使用 flight recorder 时，沿实际 ProcessGroupNCCL 的记录、watchdog 和 writer 核对 buffer、PG/global rank、序列及输出。当前 HCU 2.13 维护实现的重复 dump 可能覆盖上次文件，需先保留原件；buffer 关闭、dump 超时、缺栈或 writer 未完成都保留不完整状态。coalesced 的逐操作元数据和整组 Work 的时序更新不是同一条记录，不能把缺 timing 的子记录当作耗时0或未下发。不要用 dump 成功代替训练/通信恢复，或用放宽 watchdog 改掉现场失败条件。
 
 ### 3.3 复现与隔离
 
@@ -88,7 +92,7 @@
 1. 先辨识异常类型与退出来源：Python 异常、主机 signal/core、cgroup/调度终止、HIP 异步错误、HSA/驱动故障。记录最早错误及相邻调用，而不是只看 launcher 最后打印的失败。
 2. **主机 core：** 核对 core 是否生成/完整、core_pattern 或系统转储服务、任务进程资源限制；读取现有配置，避免为一次调查修改全机设置。使用对应可执行文件、共享库、build ID 和调试符号；普通主机 core 不保证包含 GPU 状态。
 3. **HCU 设备转储：** 查询当前 DTK 手册和 `hipprof --help`；确认现场 runtime 支持时，才在有界复现中配置 `HSA_ENABLE_COREDUMP` 等能力。内存快照额外评估空间与落盘时间，存到任务授权位置。`HSA_COREDUMP_SAVE_DIR` 在旧材料有缺陷记录，不直接从旧示例抄到新环境。
-4. DTK 26.10 文档包含 `hipprof --input-core <core_0>`，历史版本曾废弃后恢复该接口。只对匹配格式的异构转储使用；看 fault_info、queue、kernel/code object、参数和地址，不把它当所有 ELF core 的解析器。设备调试优先查询现场 `hipgdb`/对应手册，不能默认 AMD rocgdb 与 HCU 工具互换。
+4. DTK 26.10 文档包含 `hipprof --input-core <core_0>`，历史版本曾废弃后恢复该接口。只对匹配格式的异构转储使用；看 fault_info、queue、kernel/code object、参数和地址，不把它当所有 ELF core 的解析器。设备调试优先查询现场 `hipgdb`/对应手册，不能默认 AMD rocgdb 与 HCU 工具互换。该版 hipgdb 手册明确不支持 coredump 调试和 Python 接口；主机端与设备端的 backtrace、thread/lane 环境分别解释，不能把 host 栈当作完整 kernel 栈。
 5. VMFault 可由越界、失效地址、异步释放/跨流生命周期、设备断言等触发；核对实际 kernel、参数有效区间、布局/别名、同步和源代码断言。某个 HCU 通信实现的 assertion trap 也可能表现为 VMFault；错误标签或栈落在库内不能单独归责。
 6. 缩小到保留失败条件的输入与调用链，必要时在独立调试构建中补符号、校验或同步定位。同步/debug/-O0 改变时间与代码形态；问题消失仅是线索，修复要回到正常优化构建复验。
 
@@ -118,7 +122,11 @@ Linux 下先由目标 PID 的 `/proc/<pid>/cgroup` 与实际挂载确定路径�
 
 按当前 HCU PyTorch 支持情况使用 memory summary/snapshot/history，限制记录窗口和数据量；私有 API 先核对签名。必要时查 DTK `hipprof --memory-usage`（趋势）或 `--leak-check`（栈与分配信息）。先读现场帮助，选一个进程或最小复现，并考虑 hook/LD_PRELOAD、正常退出生成报告、未拦截接口和采集自身开销；没有报告不算没有泄漏。与 XProf/XCompute 性能采集分开，不混合命令或输出格式。
 
+若采集本身卡住或尾部数据缺失，先查对应工具版本的缺陷与刷新条件。runtime-doc 记录旧版 `--leak-check` 死锁、子进程退出未析构造成 trace 缺尾，以及特定版本 Graph 聚合使 kernel 名称/时间异常；它们不是自动升级 DTK、关闭 Graph 或发送强制信号的通用理由。核对当前支持的退出刷新、buffer 和正常结束路径，保留缺失 rank 与未终结的采集进程；不将空报告或 profiler 退出0当作原训练正常。
+
 VMM/expandable segments 另分虚拟地址预留与物理 create/map/释放；VA 耗尽、物理 OOM 和碎片不是同一指标。按实际 PyTorch、HIP/DTK、IPC/mempool/stream 组合查能力，不把某份调研的版本通过记录或一次地址复用当作全面支持，也不因名称存在就默认打开。Graph 失败后的池/BLAS workspace 清理要在异常路径检查；`allocated` 降低不能单独证明保留段已释放。
+
+runtime 内存池还要分配到所选 stream、capture 与释放路径核对。当前 Galaxy 的 `hipFreeAsync` 在部分分支会回退到带等待的释放，Graph 使用中的释放另通过 marker/队列执行；API 名带 Async 不保证 host 完全不等待或物理内存立即归还。不得为降低 reserved 而跳过这些依赖或直接 trim 活跃池，先按实际加载版本定位等待和资源所有者。
 
 `empty_cache`、缩 batch 或强制周期重启只能作为诊断/缓解手段，不能自动称根因修复。修复后关闭诊断，覆盖原增长窗口、保存/恢复周期和最坏 shape，观察峰值与斜率；短跑尚不足就保留长稳待验证项。
 
@@ -130,7 +138,9 @@ VMM/expandable segments 另分虚拟地址预留与物理 create/map/释放；VA
 
 沿输入/tokenizer/mask/labels → 首个前向差异 → loss 归一化 → backward/梯度归约 → clipping/unscale → optimizer 更新定位第一处分歧。先检查数据和配方一致性，再逐层缩小；关注混合参数组、低精度缩放状态、溢出跳步和累积边界。首个被发现的坏张量还要沿通信或异步边回溯生产者。
 
-按需复用 HCU hcuprobe/dcu_probe、TE dump 或引擎现有比对入口。核对当前源码的调用方法和 hook 覆盖，先采相同少量 step/rank/算子，读取输出/梯度/更新前后张量，必要时扩至完整相关通信组。异步 dump 应保存当时的内容；缺 rank、空匹配、同名模块错配或没采到 backward 都是 incomplete。不要通过放宽容差、替换优化器或改变训练目标掩盖偏差。
+按需复用 HCU `hcu-probe` distribution / `hcuprobe` import、CLI，TE dump 或引擎现有比对入口；`dcu_probe` 是 KB 工程 ID，旧命名文档不替代当前包入口。核对当前源码的调用方法和 hook 覆盖，先采相同少量 step/rank/算子，读取输出/梯度/更新前后张量，必要时扩至完整相关通信组。异步 dump 应保存当时的内容并验实际 flush：普通 tensor 的 clone 缓存会增加峰值，FP8/FP4 另有 CPU 转换，`stop()` 的过滤/早返回不保证实体张量已落盘。元数据、统计 Future 缺值、空匹配和只返回输出目录均不能证明比较完成。
+
+跨 rank 首差候选还须核对 ProcessGroup、P2P peer 和调用序列；缺组信息的通信图可能回退为全部 rank 候选，首个 CSV 行或接收侧坏张量均不是根因证明。缺 rank、同名模块错配或没采到 backward 保持 incomplete，按共用精度指南核对真实张量与生产者。不要通过放宽容差、替换优化器或改变训练目标掩盖偏差。
 
 RL 另对齐 policy/权重版本、rollout 样本及数据年龄、logprob/reward、训练/推理精度与权重传输完成状态。发现错误先停住该候选推进；修复后局部回归，再于稳定阶段做同初态 loss 对照，无需每次调查都长时训练。
 
@@ -157,7 +167,7 @@ RL 另对齐 policy/权重版本、rollout 样本及数据年龄、logprob/rewar
 1. **存储：** 先查容量、inode、quota、挂载/权限及读写错误，区分磁盘满、元数据/网络阻塞和写入进程退出。大型写盘探测本身可能扰动训练，不自动压满共享存储。
 2. **checkpoint：** 确认 writer/finalization 完成、manifest/分片/metadata 一致、完整性与加载版本匹配；未结束写入的目录不能当恢复点。异步保存保留并检查实际 save future/结果，close 无异常不一定传播写盘错误。检查模型 keys、优化器、RNG、scheduler、数据位置及实际低精度 recipe 的持久状态，按项目 `docs/training-state-validation.md` 做恢复对照，不能仅以 load exit0 判断完整。TE 旧状态兼容应先核对格式与可信来源，不通过丢弃 scale/amax 历史或全局开启 unsafe 加载绕过恢复失败。
 3. **控制链：** 逐项核对异常被检测 → 事件被消费 → 原作业停止 → 必需成员实际退出 → 节点处置 → 新资源就绪 → 新 attempt 启动 → 加载恢复点 → 真正继续 step。每一段保存身份、回执和截止；失败落在哪段就调查哪段，不能只看“restart sent”。
-4. **责任与边界：** Cluster Manager 的裸机/Slurm/MPI、Docker launcher 和 K8s operator 是不同入口，阅读已部署分支/PR，不照搬另一部署的命令。Docker 恢复核对替补节点容器准备、实际首节点启动和全部成员退出；停止脚本若按容器内进程名匹配，必须使用任务专属容器。空 hostfile 的幂等成功不能证明失联旧节点已经停止；故障归属用真实 rank/slot 映射，不能把控制节点名当故障节点。确认重试预算、退避和重复失败的人工介入点；无效恢复不能无限循环。
+4. **责任与边界：** Cluster Manager 的裸机/Slurm/MPI、Docker launcher 和 K8s operator 是不同入口，阅读已部署分支/PR，不照搬另一部署的命令。Docker 恢复核对替补节点容器准备、实际首节点启动和全部成员退出；停止脚本若按容器内进程名匹配，必须使用任务专属容器。空 hostfile 的幂等成功不能证明失联旧节点已经停止。PRTE/MPI rank 按真实每节点 MPI 进程数映射，训练 global rank 另按 GPU worker 布局；嵌套 torchrun 时不能套同一个 slots，未知布局进入人工介入。确认重试预算、退避和重复失败的人工介入点；当前参考实现停止失败后仍可能推进 STARTING，此状态不解除旧成员 unknown，按项目 [站点恢复器接入](../../../docs/operations.md#衔接站点恢复器)核对，无效恢复不能无限循环。
 5. **节点重入：** 保留故障证据，在授权隔离池中复核设备、网络及任务相关负载，必要时与已确认健康节点交叉测试。K8s Ready、单次 check 返回0、已发送告警均不够；核对结构化结果/缺项。解除黑名单/taint 由当前恢复协议决定，不能删除其他管理者状态。
 6. **观察与告警：** 对照新 attempt 的真实进度、全部成员、watcher、独立 sentinel 与日志轮转/存储。outbox、桥接消费、飞书送达、Agent 接手、问题解除是不同状态。训练恢复后 watcher 仍失联时保留监控故障，不能只关闭训练异常。
 

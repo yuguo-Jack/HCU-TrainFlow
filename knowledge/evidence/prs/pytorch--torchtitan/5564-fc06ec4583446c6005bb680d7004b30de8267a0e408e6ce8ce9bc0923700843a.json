@@ -1,0 +1,997 @@
+{
+  "acquisition": {
+    "detail_binding": "Core detail fields and complete head/base repository+SHA matched GraphQL before combining",
+    "graphql_observation": {
+      "artifact": "6aaef4fb31a168a86518bd331bfedc590173a4a46be0b048895875dd56940f6b",
+      "isPrivate": false,
+      "numbers": [
+        5569,
+        5568,
+        5566,
+        5565,
+        5564,
+        5563,
+        5562,
+        5561
+      ],
+      "observed_at": "2026-11-04T18:26:28.383779+00:00",
+      "rate": {
+        "cost": 1,
+        "remaining": 4842,
+        "resetAt": "2026-11-04T18:59:40Z"
+      },
+      "repository": "pytorch/torchtitan"
+    },
+    "method": "GraphQL complete PR/comment/review connections + REST files or immutable-pair files reuse",
+    "public_repository_verified": true,
+    "raw_graphql_pull_request": {
+      "baseRefOid": "45d7c3ef8883adbd72b8201385756e12d70c75d2",
+      "baseRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\nWritten with Claude Code: the analysis, measurements and test plan below.\n\n**TLDR:** `materialize_mla_kv`, the k/v build shared by DeepSeek-V3 and Kimi K3 MLA, becomes the `mla_kv` local-compile region, which fuses the eager concat kernels. Two DeepSeek-V3 layers at 16k: -2.6% wall, -2.7% under CUDA graphs, -1.07 GB peak (2 layers, no activation remat). Outputs are bitwise; grads are bitwise except k_shared's, a sum over heads in Inductor's order (1 bf16 ulp on 1 of 1,048,576 elements under some configs). `UlyssesMLAAttention` now all-gathers k_shared synchronously, so the region keeps k_shared's grad.\n\n```text\nmain:     kv -> split -> k_nope, v (a view of kv);  k = cat(k_nope, k_shared on every head)   eager cat; bwd: eager cat\nthis PR:  region(kv, k_shared) -> k, v (dense when grad is on)                                Triton copies; bwd: one copy + head sum\n```\n\nIndependent of the PR below it in the stack (no shared files; applies cleanly on main).\n\n**Problem**\n1. **Shared k/v build.** `MLAAttention` builds per-head k and v in `materialize_mla_kv`, from packed `kv` `[T, H, 256]` and the shared key `[T, 64]`.\n2. **Eager copies.** It splits kv into k_nope and v, broadcasts the shared key to all heads, and concatenates `k = [k_nope, k_shared]` `[T, H, 192]`.\n3. **Slow kernels.** Both concats run ATen's generic cat kernel: k's 1552 us vs 189 us at full memory bandwidth (8x), the backward's 1940 vs 302 us (6.4x).\n4. **Cost.** 3.55 ms per DeepSeek-V3 layer at 16k, fwd+bwd kernel time (ideal 0.53 ms).\n\n**Solution**\n1. **Region.** `materialize_mla_kv` is now the `mla_kv` region. Inductor fuses split, broadcast and concat into one copy kernel, and the backward concat into another.\n2. **Dense v when grad is on.** Attention saves v, and a v that views kv keeps all of kv alive. A dense v lets kv go after the forward: -0.54 GB per MLA layer at 16k without activation remat. Under compile the copy is free: it replaces the backward's copy of v's grad.\n3. **Ulysses CP.** `UlyssesMLAAttention` all-gathered k_shared with `async_op=True`. A compiled region detaches an unwaited async input, so k_shared's grad came out all zeros under `mla_kv`. The all-gather is now synchronous. The gathered k_shared is `[T, 64]` (2 MB at 16k in bf16); the overlap it loses was not measured.\n4. **Enabled** in `DeepSeekV3Model.Config` (Kimi K2.x inherits it) and `KimiK3Model.Config`.\n5. **Unchanged:** the function's signature and how both callers call it (`MLAAttention.forward`, also used after the CP all-gather, and `UlyssesMLAAttention.forward`). `no_grad` keeps the view.\n\n**Results**\n```text\nNumerics: bitwise except one grad. Outputs, k, v and kv's grad are copies: bitwise vs main under every autotune config.\n          k_shared's grad sums over heads in Inductor's order, not ATen's: 1 of 1,048,576 elements is 1 bf16 ulp\n          off under some reduction configs (op level, DeepSeek-V3 dims).\n          rel L2 vs fp64, k_shared grad:  main 1.656e-3 | this PR 1.656e-3\n          DeepSeek-V3, 2 layers:  output and all grads bitwise vs main in every run below\n          Kimi K3, 2 layers:      output bitwise; grads 5.6e-3 rel L2 vs main, same as main vs main (its backward is nondeterministic)\n          Batch invariant in deterministic mode: full batch vs uneven chunks, k, v and both grads bitwise.\n\nMeasured on main of 10-20 + this change. That tree's gate also checked is_compiling(); the compiled path is the same, so these rows hold.\nDeepSeek-V3 671B layers 2-3 (dense FFN + MoE at one EP8 rank's shapes, 32 experts), native dims, flex attention,\nno activation checkpointing except the remat rows, 1x GB300, ms per 2-layer step;\nmedian of 5 fresh processes (16k train), else 1 process\nmode                     T     main      this PR  delta\ntrain fwd+bwd            16k   177.48    172.89   -2.6%\ntrain CUDA graphs        16k   176.96    172.22   -2.7%\ntrain fwd+bwd            4k     41.05     39.60   -3.5%\ntrain CUDA graphs        4k     39.36     38.32   -2.6%\ntrain, activation remat  16k   194.82    188.01   -3.5%   (DefaultActivationRematConfig, the 671B recipe's)\nprefill no_grad          16k    51.02     48.85   -4.3%\npeak memory              16k    34.20     33.13 GB\npeak memory, remat       16k    30.38     29.84 GB         (kv is kept for the replay, so the saving is transient)\ntrain 32k: not run (the region's copies are per token, so the 16k delta should scale)\n\nKimi K3 layers 50 (KDA + MoE) + 51 (MLA + MoE), one EP8 rank's experts, varlen, no AC, 16k, median of 3 processes\ntrain fwd+bwd            16k   215.35    213.25   -0.7%   (median of per-process deltas)\ntrain CUDA graphs        16k   214.47    211.98   -1.2%   (2 processes)\npeak memory              16k    73.89     73.48 GB\n\nk/v build alone, kernel time per MLA layer, 16k, us\nDeepSeek-V3 fwd+bwd   3550 -> 737   (ideal 530; 680 with the dense-v copy)\nDeepSeek-V3 no_grad   1552 -> 218\nKimi K3 fwd+bwd       2682 -> 617\n\ngraphs: mla_kv 3 over T = 2k/4k/8k/16k + no_grad (static T, dynamic T, no_grad), limit 8; cold compile ~+1 s (first call, caches off)\n```\nDecode: not reached in the RL generator, which runs vLLM's native MLA. The exception is batch-invariant mode, whose only MLA configs (the Kimi K3 RL tests) set regions `[]`.\n\nYou may ask: why a dense v in eager too? Same memory reason, one code path instead of an eager/compiled fork. Measured 10-19 on the same split + copy, before it moved into `materialize_mla_kv` (2 DeepSeek-V3 layers at 4k): eager +0.2-0.3%, GraphTrainer +0.3-0.8% kernel time.\nYou may ask: why not a dense v under `no_grad`? Nothing is saved for backward, so it's only a copy: +0.44 ms wall on the 16k prefill (2 layers; two 155 us clones).\nYou may ask: why not always the view? Same time without activation checkpointing, but +0.54 GB per MLA layer at 16k without activation remat. Under activation remat the forward copy replays: +0.16 ms per layer (0.2%).\nNOTE: the region is on in the recipes that keep the model's default regions: `deepseek_v3_671b`, `deepseek_v3_671b_dist_moe_bf16`, `deepseek_v3_671b_dist_moe_mxfp8`, the Kimi K2.x / K3 model configs (debugmodel test recipes), and `rl_grpo_deepseek_v3_debug` (the H100 RL integration test, 4 GPUs: its trainer runs the region, its generator runs vLLM's native MLA). That RL test is the PR's only GPU end-to-end coverage.\nNOTE: the region is off in `deepseek_v3_671b_nvfp4_ffn_mxfp8_attn` (regions `[\"loss\"]`), GraphTrainer and SPMD-typechecking configs (regions `[]`), the Kimi K3 RL test configs (`[]`) and the `fused_mla` override (it skips `materialize_mla_kv`). With grad on, these still return a dense v (cost in \"You may ask\").\nNOTE: Ulysses CP: q keeps the packed q/kv buffer alive, so there a dense v adds `[T, H/cp, 128]` per MLA layer instead of saving memory. No recipe uses Ulysses MLA.\nNOTE: goldens: the fake-PG A10G DeepSeek-V3 golden is unchanged (bitwise; the region is on there). The real-PG CP+PP goldens (A10G, mi350x) get refreshed if they move. The Kimi K3 B200 golden runs with typechecking, so regions are off there.\nNOTE: not tested: varlen DeepSeek-V3 (the 671B recipe's default backend; the region doesn't touch attention), multi-GPU TP and CP, loss curve.\n\n**Test plan**\n- `pytest tests/unit_tests/cpu/models/common/test_mla_compile.py`: 3 passed.\n  - region vs eager for the projected and Ulysses input layouts, v dense with grad on. Fails before: eager v is a view, and `mla_kv` is not a region.\n  - `UlyssesMLAAttention.forward` on a 1-rank gloo CP group (an SDPA stand-in for FlexInnerAttention, whose compiled flex doesn't build on every CPU): every input and weight grad under `mla_kv` matches eager. Fails without the `cp_mla.py` change: k_shared's grad is all zeros.\n- `pytest tests/unit_tests/cpu/models/common/test_mla_compile.py tests/unit_tests/cpu/models/common/test_mla_remat.py tests/unit_tests/cpu/models/common/test_cp_attention.py tests/unit_tests/cpu/models/deepseek_v3/ tests/unit_tests/cpu/models/kimi_k3/`: 96 passed.\n- Core CPU (`tests/unit_tests/cpu/models/common`, `muse_spark`, `kimi_k3`, `deepseek_v3`, `recipes`): 497 passed, 3 failed (main's 3). RL CPU: 504 passed, 1 failed (main's `alphabet_sort`).\n\n",
+      "changedFiles": 7,
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: @claude please review",
+            "createdAt": "2026-10-29T21:55:30Z",
+            "databaseId": 6509228354,
+            "updatedAt": "2026-10-29T21:55:30Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6509228354"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 2m 1s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40961797532)\n\n---\n**Approve** -- see the [review](https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview) (one optional test suggestion; a maintainer still needs to review).",
+            "createdAt": "2026-10-29T21:55:51Z",
+            "databaseId": 6509234386,
+            "updatedAt": "2026-10-29T21:58:13Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6509234386"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: pushed 45152e09d. `UlyssesMLAAttention` all-gathered k_shared with `async_op=True`, and the `mla_kv` region detached that unwaited input, so k_shared's grad was all zeros under Ulysses CP. The all-gather is now synchronous, and `test_ulysses_mla_grads_match_eager` runs the real forward on a 1-rank gloo group (it fails without the fix). Body updated: memory under remat and Ulysses, goldens, provenance. @claude please review\n",
+            "createdAt": "2026-10-30T03:03:01Z",
+            "databaseId": 6513910836,
+            "updatedAt": "2026-10-30T03:03:01Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513910836"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 2m 22s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40995156520)\n\n---\n**Approve** -- please add a TODO with an upstream issue link for the synchronous all-gather workaround, and check whether `kv_THP` also reaches `mla_kv` unwaited at CP > 1 -- see the [review](https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview).",
+            "createdAt": "2026-10-30T03:03:24Z",
+            "databaseId": 6513915850,
+            "updatedAt": "2026-10-30T03:06:01Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513915850"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "Reply from claude: on the all-to-all question: spmd_types' shard all-to-all (`_AllToAllShard.forward`) is a blocking `dist.all_to_all` followed by `torch.cat`, at every world size. It accepts `async_op` but never returns an `AsyncCollectiveTensor`, and there is no world-size-1 short-circuit for it (the only one is in all_reduce). On the 1-rank gloo group: the all-to-all with `async_op=True` returns a plain `Tensor`, and the k_shared all-gather returns an `AsyncCollectiveTensor`. So the test covers both paths as they run at CP > 1, and q / kv reach `mla_kv` as plain tensors.\n\nThe TODO is in a5f3fb77b (comment-only change). @claude please review\n",
+            "createdAt": "2026-10-30T03:07:28Z",
+            "databaseId": 6513968556,
+            "updatedAt": "2026-10-30T03:07:28Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513968556"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Claude finished @felipemello1's task in 48s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40995591535)\n\n---\n**Approve**: the TODO is in, and the all-to-all question is answered. No new problems. See the [review](https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview). A maintainer still needs to review.",
+            "createdAt": "2026-10-30T03:07:50Z",
+            "databaseId": 6513973308,
+            "updatedAt": "2026-10-30T03:08:56Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513973308"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYRDWDw=",
+          "hasNextPage": false
+        },
+        "totalCount": 6
+      },
+      "headRefOid": "a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "headRepository": {
+        "nameWithOwner": "pytorch/torchtitan"
+      },
+      "mergeCommit": null,
+      "merged": false,
+      "mergedAt": null,
+      "number": 5564,
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve** -- a small change that follows the existing `local_compile` pattern (`mla_qk`), with measured end-to-end wins and bitwise outputs. A maintainer still needs to review because it touches `models/common/`.\n\n**What this PR does.** It decorates `materialize_mla_kv` (shared by DeepSeek-V3, the Kimi K2.x models that inherit its config, and Kimi K3, including both CP variants) as the `mla_kv` local-compile region, and enables that region in both model configs. It also makes `v` dense when grad is on, so attention no longer saves a view that keeps the whole `[T, H, N+V]` `kv` alive.\n\n**Example.** One DeepSeek-V3 MLA layer at T=16k, grad on:\n```text\nbefore: k_nope, v = split(kv)            # v is a view of kv\n        k = cat(k_nope, expand(k_shared)) # eager CatArrayBatchedCopy\n        attention saves v -> kv [T,H,256] stays alive until backward\nafter:  one Inductor copy builds k and a dense v\n        attention saves the dense v -> kv freed after forward (-0.54 GB/layer)\n        no_grad: v is still a view (nothing is saved, so no copy)\n```\n\n### Should consider\n- `tests/unit_tests/cpu/models/common/test_mla_compile.py:50` -- the `no_grad` view assertion pins a perf choice and costs a third CPU compile; consider keeping only the grad-on contiguity assert (inline).\n\n<details><summary>Details</summary>\n\n- Call sites: `MLAAttention.forward` binds `materialize_kv=materialize_mla_kv` at def time. That binding is the `local_compile` wrapper, so the region applies to `MLAAttention`, to the all-gather CP variant (which calls `MLAAttention.forward`), and to `UlyssesMLAAttention`. The `fused_mla` override passes its own `materialize_kv`, so it isn't affected, as the description says.\n- `torch.is_grad_enabled()` inside the region is guarded by Dynamo. That matches the description's 3 graphs (static T, dynamic T, no_grad), which fits under the recompile limit.\n- Remat: `recompute_needs_tensor(kv_THP, k_shared_TR)` already keeps `kv` for replay, so with remat on, the dense `v` changes time (the description measures +0.16 ms per layer) but not peak memory.\n- The test is in the right place (`models/common`, next to the shared function). The Ulysses parametrization adds real coverage: a non-contiguous `kv` taken from a packed q/kv tensor.\n- Eager configs (GraphTrainer, RL with regions `[]`) pay the copy of `v` (+0.2-0.8% kernel time) to get the same memory win. I agree with keeping one code path here.\n\n</details>\n\nNot verified: the GPU perf and memory numbers, and the golden-loss impact on A10G/mi350x (integration runs are still queued). The CPU Unit Test workflow was skipped on this stacked PR, so `test_mla_compile.py` has not run in CI yet.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "Optional: the grad-on `v.is_contiguous()` check guards a real memory invariant (a view would keep all of `kv` alive). The `no_grad` check only pins a perf choice (skip a copy nobody saves), and under `[\"mla_kv\"]` it adds a third Inductor compile per parametrization on the CPU runner. Consider dropping these two lines and keeping only the grad-on assert.",
+                  "createdAt": "2026-10-29T21:57:45Z",
+                  "databaseId": 4418335162,
+                  "diffHunk": "@@ -0,0 +1,54 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import pytest\n+import torch\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention import materialize_mla_kv\n+\n+# T tokens, H heads, N per-head key dims, R shared key dims, V value dims\n+T, H, N, R, V = 16, 4, 8, 4, 6\n+\n+\n+@pytest.fixture(autouse=True)\n+def reset_local_compile():\n+    LocalCompileConfig(regions=[]).apply()\n+    torch._dynamo.reset()\n+    yield\n+    LocalCompileConfig(regions=[]).apply()\n+\n+\n+@pytest.mark.parametrize(\"layout\", [\"projected\", \"ulysses\"])\n+def test_compiled_mla_kv_matches_eager(layout: str) -> None:\n+    \"\"\"``projected``: kv viewed from the wkv_b output (MLAAttention).\n+    ``ulysses``: q and kv split from one packed tensor (UlyssesMLAAttention).\"\"\"\n+    torch.manual_seed(0)\n+    if layout == \"projected\":\n+        bases = [torch.randn(T, H, N + R), torch.randn(T, H * (N + V))]\n+    else:\n+        bases = [torch.randn(T, H, N + R + N + V)]\n+    k_shared = torch.randn(T, R)\n+    grad_k, grad_v = torch.randn(T, H, N + R), torch.randn(T, H, V)\n+\n+    results = []\n+    for regions in ([], [\"mla_kv\"]):\n+        LocalCompileConfig(regions=regions).apply()\n+        leaves = [t.clone().requires_grad_() for t in (*bases, k_shared)]\n+        if layout == \"projected\":\n+            q, kv = leaves[0], leaves[1].view(T, H, N + V)\n+        else:\n+            q, kv = leaves[0].split([N + R, N + V], dim=-1)\n+        k, v = materialize_mla_kv(q, kv, leaves[-1])\n+        torch.autograd.backward((k, v), (grad_k, grad_v))\n+        results.append((k, v, *(t.grad for t in leaves)))\n+\n+        assert v.is_contiguous()  # attention saves v; a view would keep kv alive\n+        with torch.no_grad():  # nothing is saved, so v stays a view\n+            assert not materialize_mla_kv(q, kv, leaves[-1])[1].is_contiguous()",
+                  "line": 60,
+                  "originalLine": 51,
+                  "path": "tests/unit_tests/cpu/models/common/test_mla_compile.py",
+                  "updatedAt": "2026-10-29T21:57:59Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4418335162"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yOVQyMTo1Nzo0NVrPAAAAAQdacbo=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5705514585,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-29T21:57:59Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5705514585"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: keeping it. The no_grad assert is the one that catches an always-dense v: that costs +0.44 ms on the 16k prefill (2 DeepSeek-V3 layers, two 155 us clones) and saves nothing, since nothing is saved for backward. With an always-dense v, the grad-on assert and the eager comparison both still pass; only this assert fails. The file still runs in about 5 s on CPU.\n",
+                  "createdAt": "2026-10-30T03:02:59Z",
+                  "databaseId": 4420052371,
+                  "diffHunk": "@@ -0,0 +1,54 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import pytest\n+import torch\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention import materialize_mla_kv\n+\n+# T tokens, H heads, N per-head key dims, R shared key dims, V value dims\n+T, H, N, R, V = 16, 4, 8, 4, 6\n+\n+\n+@pytest.fixture(autouse=True)\n+def reset_local_compile():\n+    LocalCompileConfig(regions=[]).apply()\n+    torch._dynamo.reset()\n+    yield\n+    LocalCompileConfig(regions=[]).apply()\n+\n+\n+@pytest.mark.parametrize(\"layout\", [\"projected\", \"ulysses\"])\n+def test_compiled_mla_kv_matches_eager(layout: str) -> None:\n+    \"\"\"``projected``: kv viewed from the wkv_b output (MLAAttention).\n+    ``ulysses``: q and kv split from one packed tensor (UlyssesMLAAttention).\"\"\"\n+    torch.manual_seed(0)\n+    if layout == \"projected\":\n+        bases = [torch.randn(T, H, N + R), torch.randn(T, H * (N + V))]\n+    else:\n+        bases = [torch.randn(T, H, N + R + N + V)]\n+    k_shared = torch.randn(T, R)\n+    grad_k, grad_v = torch.randn(T, H, N + R), torch.randn(T, H, V)\n+\n+    results = []\n+    for regions in ([], [\"mla_kv\"]):\n+        LocalCompileConfig(regions=regions).apply()\n+        leaves = [t.clone().requires_grad_() for t in (*bases, k_shared)]\n+        if layout == \"projected\":\n+            q, kv = leaves[0], leaves[1].view(T, H, N + V)\n+        else:\n+            q, kv = leaves[0].split([N + R, N + V], dim=-1)\n+        k, v = materialize_mla_kv(q, kv, leaves[-1])\n+        torch.autograd.backward((k, v), (grad_k, grad_v))\n+        results.append((k, v, *(t.grad for t in leaves)))\n+\n+        assert v.is_contiguous()  # attention saves v; a view would keep kv alive\n+        with torch.no_grad():  # nothing is saved, so v stays a view\n+            assert not materialize_mla_kv(q, kv, leaves[-1])[1].is_contiguous()",
+                  "line": 60,
+                  "originalLine": 51,
+                  "path": "tests/unit_tests/cpu/models/common/test_mla_compile.py",
+                  "updatedAt": "2026-10-30T03:02:59Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4420052371"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMFQwMzowMjo1OVrPAAAAAQd0pZM=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5707604302,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-30T03:02:59Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707604302"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve -- please address the item below before merging** -- the new commit fixes a real silent zero-grad under Ulysses CP with the smallest change and adds a test that fails without it. The workaround still needs a TODO that links an upstream issue. A maintainer still needs to review, since this touches `models/common/`.\n\n**What changed since the last review.** `UlyssesMLAAttention` now all-gathers `k_shared` synchronously (`cp_mla.py:107-117`). `test_cp_attention.py` now pins `[False, True, True]` for the async flags. `test_ulysses_mla_grads_match_eager` runs the real forward on a 1-rank gloo group and compares every grad under `mla_kv` against eager. The earlier optional note about the `no_grad` view assert is settled by the author's reply: only that assert catches an always-dense `v`.\n\n**Example.** Ulysses CP with `mla_kv` on, before this commit:\n```text\nk_shared = redistribute(k_shared, S(0) -> R, async_op=True)  # AsyncCollectiveTensor, not waited\nk, v = materialize_mla_kv(q, kv, k_shared)                   # compiled region gets the unwaited input\n                                                             # -> detached, k_shared.grad == 0, no error\nafter:  sync all-gather -> plain tensor -> grad flows; matches eager\n```\n\n### Must fix\n- `torchtitan/models/common/attention/cp_mla.py:105` -- the comment describes a PyTorch bug: compile silently detaches an unwaited `AsyncCollectiveTensor` input. Add a `TODO` with an upstream issue link so `async_op=True` can come back once it's fixed (see the inline comment).\n\n### Questions\n- Under real multi-rank Ulysses, `kv_THP` comes from `torch.split` of the `async_op=True` all-to-all output (`cp_mla.py:121-136`). An `AsyncCollectiveTensor` passes view ops through without waiting, so `kv_THP` may also reach `mla_kv` unwaited. The 1-rank test shows `kv_c.grad` matching eager. Can you confirm that the 1-rank all-to-all really returns an async tensor (and not a short-circuit), so the test covers this path too? If it doesn't, `kv`'s grad may have the same silent zero at CP > 1. *Unverified: I couldn't read the installed `spmd_types` here.*\n\n<details><summary>Details</summary>\n\n- Root cause and layer: the fix belongs at the call site because `local_compile` has no place to wait on inputs generically. Waiting in its `wrapped` would also be possible, but `ACT.wait()` returns the inner `elem`, which would drop autograd too, so that isn't a drop-in. The real fix is upstream, hence the TODO.\n- Overlap loss: the gathered `k_shared` is `[T, 64]` (about 2 MB at 16k). The all-gather used to overlap with `project_mla_kv` and the packed cat. No recipe uses Ulysses MLA, so the unmeasured cost is acceptable.\n- Test placement and cost: `tests/unit_tests/cpu/models/common/` mirrors the source tree. The gloo `HashStore` single-rank group is cheap and guards a silent-grad regression that no other test covers.\n\n</details>\n\nNot verified: GPU perf and memory numbers, and the real-PG CP+PP golden impact.",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "login": "claude"
+                  },
+                  "body": "This works around a PyTorch gap: `torch.compile` takes an unwaited `AsyncCollectiveTensor` input and silently detaches it, so the grad comes out as zeros with no error. The repo rule for upstream workarounds is a `TODO` with an issue link. Without one, nobody will know to restore `async_op=True` once it's fixed. The same silent zero-grad can hit any `local_compile` region that gets an async collective output as a direct input, so filing it upstream is worth more than this one call site.\n\n```suggestion\n        # TODO(<issue link>): not async -- torch.compile detaches an unwaited\n        # AsyncCollectiveTensor input, so the mla_kv region would drop k_shared's grad.\n```",
+                  "createdAt": "2026-10-30T03:05:32Z",
+                  "databaseId": 4420063481,
+                  "diffHunk": "@@ -102,6 +102,8 @@ def forward(\n \n         # Q and packed KV have heads, so move their CP shard from T to H with\n         # one all-to-all. The shared key has no H dimension and is all-gathered.\n+        # Not async: the mla_kv region would detach an unwaited input and drop\n+        # k_shared's grad.",
+                  "line": null,
+                  "originalLine": 106,
+                  "path": "torchtitan/models/common/attention/cp_mla.py",
+                  "updatedAt": "2026-10-30T03:05:47Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4420063481"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMFQwMzowNTozMlrPAAAAAQd00Pk=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5707616930,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-30T03:05:47Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707616930"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "login": "felipemello1"
+            },
+            "body": "",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "User",
+                    "login": "felipemello1"
+                  },
+                  "body": "Reply from claude: applied in a5f3fb77b. There's no open PyTorch issue for this; the closest upstream record is pytorch/pytorch#191113 (\"Preserve requires_grad when unwrapping ACT inputs in process_inputs\"), which describes this exact bug and was closed unmerged. The TODO links that.\n",
+                  "createdAt": "2026-10-30T03:07:25Z",
+                  "databaseId": 4420072364,
+                  "diffHunk": "@@ -102,6 +102,8 @@ def forward(\n \n         # Q and packed KV have heads, so move their CP shard from T to H with\n         # one all-to-all. The shared key has no H dimension and is all-gathered.\n+        # Not async: the mla_kv region would detach an unwaited input and drop\n+        # k_shared's grad.",
+                  "line": null,
+                  "originalLine": 106,
+                  "path": "torchtitan/models/common/attention/cp_mla.py",
+                  "updatedAt": "2026-10-30T03:07:26Z",
+                  "url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4420072364"
+                }
+              ],
+              "pageInfo": {
+                "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0zMFQwMzowNzoyNVrPAAAAAQd086w=",
+                "hasNextPage": false
+              },
+              "totalCount": 1
+            },
+            "databaseId": 5707630212,
+            "state": "COMMENTED",
+            "submittedAt": "2026-10-30T03:07:26Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707630212"
+          },
+          {
+            "author": {
+              "__typename": "Bot",
+              "login": "claude"
+            },
+            "body": "**Verdict: Approve** -- both items from the last review are settled, and the new commit only changes a comment. This touches `models/common/`, so a maintainer still needs to review.\n\n**What changed since the last review.** a5f3fb77b adds `TODO(pytorch/pytorch#191113)` to the synchronous k_shared all-gather (`cp_mla.py:105-106`). No code changed.\n\n**Example.** The Ulysses CP path at HEAD:\n```text\nk_shared = redistribute(S(0) -> R)                  # synchronous: plain tensor, grad flows\npacked   = redistribute(S(0) -> S(1), async_op=True) # spmd_types all-to-all blocks anyway -> plain tensor\nq, kv    = split(packed)\nk, v     = materialize_mla_kv(q, kv, k_shared)      # mla_kv region: all three inputs keep autograd\n```\n\n### Earlier items\n- Must fix (TODO with upstream link): resolved. #191113 is a closed, unmerged PR, not an open issue, but it describes this exact bug and gives a future reader the trail to restoring `async_op=True`.\n- Question (does `kv_THP` reach `mla_kv` unwaited at CP > 1?): answered. The author says spmd_types' shard all-to-all is a blocking `dist.all_to_all` plus `torch.cat` at every world size and never returns an `AsyncCollectiveTensor`, so `q`/`kv` reach the region as plain tensors. `test_ulysses_mla_grads_match_eager` compares `kv_c.grad` against eager. If spmd_types ever makes the all-to-all truly async, that test fails instead of `kv`'s grad going silently to zero.\n\nNo new problems found.\n\nNot verified: the spmd_types internals behind the all-to-all answer (the package isn't readable in this checkout), the GPU perf and memory numbers, and the real-PG CP+PP golden impact.",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "endCursor": null,
+                "hasNextPage": false
+              },
+              "totalCount": 0
+            },
+            "databaseId": 5707637556,
+            "state": "APPROVED",
+            "submittedAt": "2026-10-30T03:08:45Z",
+            "url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707637556"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0zMFQwMzowODo0NVq0MjAyNi0xMC0zMFQwMzowODozNFrPAAAAAVQzozQ=",
+          "hasNextPage": false
+        },
+        "totalCount": 5
+      },
+      "state": "OPEN",
+      "title": "[mla][perf] Compile MLA's key/value build as the mla_kv region",
+      "updatedAt": "2026-11-03T06:09:36Z",
+      "url": "https://github.com/pytorch/torchtitan/pull/5564"
+    },
+    "reused_files": null,
+    "unmerged_rest_detail": true
+  },
+  "coverage": {
+    "diff_complete": true,
+    "files": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "inline_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "issue_comments": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    },
+    "reviews": {
+      "complete": true,
+      "error": null,
+      "next_url": null,
+      "pages": 1
+    }
+  },
+  "detail": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5564/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5564/commits"
+      },
+      "html": {
+        "href": "https://github.com/pytorch/torchtitan/pull/5564"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/issues/5564"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5564/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/pulls/5564"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/pytorch/torchtitan/statuses/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 119,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "pytorch:felipemello1/muse-followups/1-qkv-split-in-region",
+      "ref": "felipemello1/muse-followups/1-qkv-split-in-region",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1074,
+        "forks_count": 1074,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 383,
+        "open_issues_count": 383,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-11-04T17:45:15Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 202350,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5877,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-11-04T17:45:19Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5877,
+        "watchers_count": 5877,
+        "web_commit_signoff_required": false
+      },
+      "sha": "45d7c3ef8883adbd72b8201385756e12d70c75d2",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Summary (human-written)\n<!-- Write this yourself, not with an AI tool. 2-5 sentences: the problem, why\n     this approach, and what you checked yourself. -->\n\n## Agent details\n\nWritten with Claude Code: the analysis, measurements and test plan below.\n\n**TLDR:** `materialize_mla_kv`, the k/v build shared by DeepSeek-V3 and Kimi K3 MLA, becomes the `mla_kv` local-compile region, which fuses the eager concat kernels. Two DeepSeek-V3 layers at 16k: -2.6% wall, -2.7% under CUDA graphs, -1.07 GB peak (2 layers, no activation remat). Outputs are bitwise; grads are bitwise except k_shared's, a sum over heads in Inductor's order (1 bf16 ulp on 1 of 1,048,576 elements under some configs). `UlyssesMLAAttention` now all-gathers k_shared synchronously, so the region keeps k_shared's grad.\n\n```text\nmain:     kv -> split -> k_nope, v (a view of kv);  k = cat(k_nope, k_shared on every head)   eager cat; bwd: eager cat\nthis PR:  region(kv, k_shared) -> k, v (dense when grad is on)                                Triton copies; bwd: one copy + head sum\n```\n\nIndependent of the PR below it in the stack (no shared files; applies cleanly on main).\n\n**Problem**\n1. **Shared k/v build.** `MLAAttention` builds per-head k and v in `materialize_mla_kv`, from packed `kv` `[T, H, 256]` and the shared key `[T, 64]`.\n2. **Eager copies.** It splits kv into k_nope and v, broadcasts the shared key to all heads, and concatenates `k = [k_nope, k_shared]` `[T, H, 192]`.\n3. **Slow kernels.** Both concats run ATen's generic cat kernel: k's 1552 us vs 189 us at full memory bandwidth (8x), the backward's 1940 vs 302 us (6.4x).\n4. **Cost.** 3.55 ms per DeepSeek-V3 layer at 16k, fwd+bwd kernel time (ideal 0.53 ms).\n\n**Solution**\n1. **Region.** `materialize_mla_kv` is now the `mla_kv` region. Inductor fuses split, broadcast and concat into one copy kernel, and the backward concat into another.\n2. **Dense v when grad is on.** Attention saves v, and a v that views kv keeps all of kv alive. A dense v lets kv go after the forward: -0.54 GB per MLA layer at 16k without activation remat. Under compile the copy is free: it replaces the backward's copy of v's grad.\n3. **Ulysses CP.** `UlyssesMLAAttention` all-gathered k_shared with `async_op=True`. A compiled region detaches an unwaited async input, so k_shared's grad came out all zeros under `mla_kv`. The all-gather is now synchronous. The gathered k_shared is `[T, 64]` (2 MB at 16k in bf16); the overlap it loses was not measured.\n4. **Enabled** in `DeepSeekV3Model.Config` (Kimi K2.x inherits it) and `KimiK3Model.Config`.\n5. **Unchanged:** the function's signature and how both callers call it (`MLAAttention.forward`, also used after the CP all-gather, and `UlyssesMLAAttention.forward`). `no_grad` keeps the view.\n\n**Results**\n```text\nNumerics: bitwise except one grad. Outputs, k, v and kv's grad are copies: bitwise vs main under every autotune config.\n          k_shared's grad sums over heads in Inductor's order, not ATen's: 1 of 1,048,576 elements is 1 bf16 ulp\n          off under some reduction configs (op level, DeepSeek-V3 dims).\n          rel L2 vs fp64, k_shared grad:  main 1.656e-3 | this PR 1.656e-3\n          DeepSeek-V3, 2 layers:  output and all grads bitwise vs main in every run below\n          Kimi K3, 2 layers:      output bitwise; grads 5.6e-3 rel L2 vs main, same as main vs main (its backward is nondeterministic)\n          Batch invariant in deterministic mode: full batch vs uneven chunks, k, v and both grads bitwise.\n\nMeasured on main of 10-20 + this change. That tree's gate also checked is_compiling(); the compiled path is the same, so these rows hold.\nDeepSeek-V3 671B layers 2-3 (dense FFN + MoE at one EP8 rank's shapes, 32 experts), native dims, flex attention,\nno activation checkpointing except the remat rows, 1x GB300, ms per 2-layer step;\nmedian of 5 fresh processes (16k train), else 1 process\nmode                     T     main      this PR  delta\ntrain fwd+bwd            16k   177.48    172.89   -2.6%\ntrain CUDA graphs        16k   176.96    172.22   -2.7%\ntrain fwd+bwd            4k     41.05     39.60   -3.5%\ntrain CUDA graphs        4k     39.36     38.32   -2.6%\ntrain, activation remat  16k   194.82    188.01   -3.5%   (DefaultActivationRematConfig, the 671B recipe's)\nprefill no_grad          16k    51.02     48.85   -4.3%\npeak memory              16k    34.20     33.13 GB\npeak memory, remat       16k    30.38     29.84 GB         (kv is kept for the replay, so the saving is transient)\ntrain 32k: not run (the region's copies are per token, so the 16k delta should scale)\n\nKimi K3 layers 50 (KDA + MoE) + 51 (MLA + MoE), one EP8 rank's experts, varlen, no AC, 16k, median of 3 processes\ntrain fwd+bwd            16k   215.35    213.25   -0.7%   (median of per-process deltas)\ntrain CUDA graphs        16k   214.47    211.98   -1.2%   (2 processes)\npeak memory              16k    73.89     73.48 GB\n\nk/v build alone, kernel time per MLA layer, 16k, us\nDeepSeek-V3 fwd+bwd   3550 -> 737   (ideal 530; 680 with the dense-v copy)\nDeepSeek-V3 no_grad   1552 -> 218\nKimi K3 fwd+bwd       2682 -> 617\n\ngraphs: mla_kv 3 over T = 2k/4k/8k/16k + no_grad (static T, dynamic T, no_grad), limit 8; cold compile ~+1 s (first call, caches off)\n```\nDecode: not reached in the RL generator, which runs vLLM's native MLA. The exception is batch-invariant mode, whose only MLA configs (the Kimi K3 RL tests) set regions `[]`.\n\nYou may ask: why a dense v in eager too? Same memory reason, one code path instead of an eager/compiled fork. Measured 10-19 on the same split + copy, before it moved into `materialize_mla_kv` (2 DeepSeek-V3 layers at 4k): eager +0.2-0.3%, GraphTrainer +0.3-0.8% kernel time.\nYou may ask: why not a dense v under `no_grad`? Nothing is saved for backward, so it's only a copy: +0.44 ms wall on the 16k prefill (2 layers; two 155 us clones).\nYou may ask: why not always the view? Same time without activation checkpointing, but +0.54 GB per MLA layer at 16k without activation remat. Under activation remat the forward copy replays: +0.16 ms per layer (0.2%).\nNOTE: the region is on in the recipes that keep the model's default regions: `deepseek_v3_671b`, `deepseek_v3_671b_dist_moe_bf16`, `deepseek_v3_671b_dist_moe_mxfp8`, the Kimi K2.x / K3 model configs (debugmodel test recipes), and `rl_grpo_deepseek_v3_debug` (the H100 RL integration test, 4 GPUs: its trainer runs the region, its generator runs vLLM's native MLA). That RL test is the PR's only GPU end-to-end coverage.\nNOTE: the region is off in `deepseek_v3_671b_nvfp4_ffn_mxfp8_attn` (regions `[\"loss\"]`), GraphTrainer and SPMD-typechecking configs (regions `[]`), the Kimi K3 RL test configs (`[]`) and the `fused_mla` override (it skips `materialize_mla_kv`). With grad on, these still return a dense v (cost in \"You may ask\").\nNOTE: Ulysses CP: q keeps the packed q/kv buffer alive, so there a dense v adds `[T, H/cp, 128]` per MLA layer instead of saving memory. No recipe uses Ulysses MLA.\nNOTE: goldens: the fake-PG A10G DeepSeek-V3 golden is unchanged (bitwise; the region is on there). The real-PG CP+PP goldens (A10G, mi350x) get refreshed if they move. The Kimi K3 B200 golden runs with typechecking, so regions are off there.\nNOTE: not tested: varlen DeepSeek-V3 (the 671B recipe's default backend; the region doesn't touch attention), multi-GPU TP and CP, loss curve.\n\n**Test plan**\n- `pytest tests/unit_tests/cpu/models/common/test_mla_compile.py`: 3 passed.\n  - region vs eager for the projected and Ulysses input layouts, v dense with grad on. Fails before: eager v is a view, and `mla_kv` is not a region.\n  - `UlyssesMLAAttention.forward` on a 1-rank gloo CP group (an SDPA stand-in for FlexInnerAttention, whose compiled flex doesn't build on every CPU): every input and weight grad under `mla_kv` matches eager. Fails without the `cp_mla.py` change: k_shared's grad is all zeros.\n- `pytest tests/unit_tests/cpu/models/common/test_mla_compile.py tests/unit_tests/cpu/models/common/test_mla_remat.py tests/unit_tests/cpu/models/common/test_cp_attention.py tests/unit_tests/cpu/models/deepseek_v3/ tests/unit_tests/cpu/models/kimi_k3/`: 96 passed.\n- Core CPU (`tests/unit_tests/cpu/models/common`, `muse_spark`, `kimi_k3`, `deepseek_v3`, `recipes`): 497 passed, 3 failed (main's 3). RL CPU: 504 passed, 1 failed (main's `alphabet_sort`).\n\n",
+    "changed_files": 7,
+    "closed_at": null,
+    "comments": 6,
+    "comments_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5564/comments",
+    "commits": 1,
+    "commits_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5564/commits",
+    "created_at": "2026-10-20T09:15:33Z",
+    "deletions": 2,
+    "diff_url": "https://github.com/pytorch/torchtitan/pull/5564.diff",
+    "draft": true,
+    "head": {
+      "label": "pytorch:felipemello1/muse-followups/2-mla-kv-region",
+      "ref": "felipemello1/muse-followups/2-mla-kv-region",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/pytorch/torchtitan/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/pytorch/torchtitan/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/pytorch/torchtitan/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/pytorch/torchtitan/branches{/branch}",
+        "clone_url": "https://github.com/pytorch/torchtitan.git",
+        "collaborators_url": "https://api.github.com/repos/pytorch/torchtitan/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/pytorch/torchtitan/comments{/number}",
+        "commits_url": "https://api.github.com/repos/pytorch/torchtitan/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/pytorch/torchtitan/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/pytorch/torchtitan/contributors",
+        "created_at": "2023-12-13T01:51:37Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/pytorch/torchtitan/deployments",
+        "description": "A PyTorch native platform for training generative AI models",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/pytorch/torchtitan/downloads",
+        "events_url": "https://api.github.com/repos/pytorch/torchtitan/events",
+        "fork": false,
+        "forks": 1074,
+        "forks_count": 1074,
+        "forks_url": "https://api.github.com/repos/pytorch/torchtitan/forks",
+        "full_name": "pytorch/torchtitan",
+        "git_commits_url": "https://api.github.com/repos/pytorch/torchtitan/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/pytorch/torchtitan/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/pytorch/torchtitan/git/tags{/sha}",
+        "git_url": "git://github.com/pytorch/torchtitan.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": false,
+        "homepage": "",
+        "hooks_url": "https://api.github.com/repos/pytorch/torchtitan/hooks",
+        "html_url": "https://github.com/pytorch/torchtitan",
+        "id": 730932260,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/pytorch/torchtitan/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/pytorch/torchtitan/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/pytorch/torchtitan/issues{/number}",
+        "keys_url": "https://api.github.com/repos/pytorch/torchtitan/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/pytorch/torchtitan/labels{/name}",
+        "language": "Python",
+        "languages_url": "https://api.github.com/repos/pytorch/torchtitan/languages",
+        "license": {
+          "key": "bsd-3-clause",
+          "name": "BSD 3-Clause \"New\" or \"Revised\" License",
+          "node_id": "MDc6TGljZW5zZTU=",
+          "spdx_id": "BSD-3-Clause",
+          "url": "https://api.github.com/licenses/bsd-3-clause"
+        },
+        "merges_url": "https://api.github.com/repos/pytorch/torchtitan/merges",
+        "milestones_url": "https://api.github.com/repos/pytorch/torchtitan/milestones{/number}",
+        "mirror_url": null,
+        "name": "torchtitan",
+        "node_id": "R_kgDOK5EkJA",
+        "notifications_url": "https://api.github.com/repos/pytorch/torchtitan/notifications{?since,all,participating}",
+        "open_issues": 383,
+        "open_issues_count": 383,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+          "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+          "followers_url": "https://api.github.com/users/pytorch/followers",
+          "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+          "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/pytorch",
+          "id": 21003710,
+          "login": "pytorch",
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+          "organizations_url": "https://api.github.com/users/pytorch/orgs",
+          "received_events_url": "https://api.github.com/users/pytorch/received_events",
+          "repos_url": "https://api.github.com/users/pytorch/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+          "type": "Organization",
+          "url": "https://api.github.com/users/pytorch",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/pytorch/torchtitan/pulls{/number}",
+        "pushed_at": "2026-11-04T17:45:15Z",
+        "releases_url": "https://api.github.com/repos/pytorch/torchtitan/releases{/id}",
+        "size": 202350,
+        "ssh_url": "org-21003710@github.com:pytorch/torchtitan.git",
+        "stargazers_count": 5877,
+        "stargazers_url": "https://api.github.com/repos/pytorch/torchtitan/stargazers",
+        "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/pytorch/torchtitan/subscribers",
+        "subscription_url": "https://api.github.com/repos/pytorch/torchtitan/subscription",
+        "svn_url": "https://github.com/pytorch/torchtitan",
+        "tags_url": "https://api.github.com/repos/pytorch/torchtitan/tags",
+        "teams_url": "https://api.github.com/repos/pytorch/torchtitan/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/pytorch/torchtitan/git/trees{/sha}",
+        "updated_at": "2026-11-04T17:45:19Z",
+        "url": "https://api.github.com/repos/pytorch/torchtitan",
+        "visibility": "public",
+        "watchers": 5877,
+        "watchers_count": 5877,
+        "web_commit_signoff_required": false
+      },
+      "sha": "a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/21003710?v=4",
+        "events_url": "https://api.github.com/users/pytorch/events{/privacy}",
+        "followers_url": "https://api.github.com/users/pytorch/followers",
+        "following_url": "https://api.github.com/users/pytorch/following{/other_user}",
+        "gists_url": "https://api.github.com/users/pytorch/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/pytorch",
+        "id": 21003710,
+        "login": "pytorch",
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjIxMDAzNzEw",
+        "organizations_url": "https://api.github.com/users/pytorch/orgs",
+        "received_events_url": "https://api.github.com/users/pytorch/received_events",
+        "repos_url": "https://api.github.com/users/pytorch/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/pytorch/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/pytorch/subscriptions",
+        "type": "Organization",
+        "url": "https://api.github.com/users/pytorch",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/pytorch/torchtitan/pull/5564",
+    "id": 4933638209,
+    "issue_url": "https://api.github.com/repos/pytorch/torchtitan/issues/5564",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "009900",
+        "default": false,
+        "description": "This label is managed by the Meta Open Source bot.",
+        "id": 6319105129,
+        "name": "CLA Signed",
+        "node_id": "LA_kwDOK5EkJM8AAAABeKXkaQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/CLA%20Signed"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "ededed",
+        "default": false,
+        "description": null,
+        "id": 10889347594,
+        "name": "ciflow/rl",
+        "node_id": "LA_kwDOK5EkJM8AAAACiQ5CCg",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/rl"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "89F2C0",
+        "default": false,
+        "description": "Run 1-GPU Fake PG integration tests",
+        "id": 12159706465,
+        "name": "ciflow/fake-pg",
+        "node_id": "LA_kwDOK5EkJM8AAAAC1MZlYQ",
+        "url": "https://api.github.com/repos/pytorch/torchtitan/labels/ciflow/fake-pg"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": false,
+    "merge_commit_sha": "2f1026d7c709a075cb2b014cec7b3e8df197d17b",
+    "mergeable": true,
+    "mergeable_state": "behind",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOK5EkJM8AAAABJhFYQQ",
+    "number": 5564,
+    "patch_url": "https://github.com/pytorch/torchtitan/pull/5564.patch",
+    "rebaseable": false,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/comments{/number}",
+    "review_comments": 4,
+    "review_comments_url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5564/comments",
+    "stack": {
+      "base": {
+        "ref": "main",
+        "sha": "ad7a9937b5e57ccadebbb98b3eb14ff139ceb2b3"
+      },
+      "id": 2271699,
+      "number": 5499,
+      "position": 13,
+      "size": 13
+    },
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/pytorch/torchtitan/statuses/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+    "title": "[mla][perf] Compile MLA's key/value build as the mla_kv region",
+    "updated_at": "2026-11-03T06:09:36Z",
+    "url": "https://api.github.com/repos/pytorch/torchtitan/pulls/5564",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/23004953?v=4",
+      "events_url": "https://api.github.com/users/felipemello1/events{/privacy}",
+      "followers_url": "https://api.github.com/users/felipemello1/followers",
+      "following_url": "https://api.github.com/users/felipemello1/following{/other_user}",
+      "gists_url": "https://api.github.com/users/felipemello1/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/felipemello1",
+      "id": 23004953,
+      "login": "felipemello1",
+      "node_id": "MDQ6VXNlcjIzMDA0OTUz",
+      "organizations_url": "https://api.github.com/users/felipemello1/orgs",
+      "received_events_url": "https://api.github.com/users/felipemello1/received_events",
+      "repos_url": "https://api.github.com/users/felipemello1/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/felipemello1/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/felipemello1/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/felipemello1",
+      "user_view_type": "public"
+    }
+  },
+  "files": [
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_cp_attention.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_cp_attention.py?ref=a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "deletions": 1,
+      "filename": "tests/unit_tests/cpu/models/common/test_cp_attention.py",
+      "patch": "@@ -1266,7 +1266,8 @@ def record(x, group, *, src, dst, backward_options=None, async_op=False):\n         self.assertEqual((8, 4, 13), calls[1][0].shape)\n         self.assertEqual((spmd.S(0), spmd.S(1)), calls[1][2:4])\n         self.assertEqual((spmd.S(1), spmd.S(0)), calls[2][2:4])\n-        self.assertTrue(all(call[5] for call in calls))\n+        # k_shared's all-gather is synchronous; mla_kv would detach an async one.\n+        self.assertEqual([False, True, True], [call[5] for call in calls])\n         inner_forward.assert_called_once()\n         args = inner_forward.call_args.args\n         self.assertIs(args[0], kernel.inner_attention)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_cp_attention.py",
+      "sha": "feb721b1f2a30a980cba8ae04f4a0c152f340ed9",
+      "status": "modified"
+    },
+    {
+      "additions": 107,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_mla_compile.py",
+      "changes": 107,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_mla_compile.py?ref=a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/models/common/test_mla_compile.py",
+      "patch": "@@ -0,0 +1,107 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+from unittest.mock import patch\n+\n+import pytest\n+import spmd_types as spmd\n+import torch\n+import torch.distributed as dist\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention import (\n+    cp_mla,\n+    FlexInnerAttention,\n+    materialize_mla_kv,\n+)\n+from torchtitan.models.common.linear import Linear\n+\n+# T tokens, H heads, N per-head key dims, R shared key dims, V value dims, L latent dims\n+T, H, N, R, V, L = 16, 4, 8, 4, 6, 8\n+\n+\n+@pytest.fixture(autouse=True)\n+def reset_local_compile():\n+    LocalCompileConfig().apply()\n+    torch._dynamo.reset()\n+    yield\n+    LocalCompileConfig().apply()\n+\n+\n+@pytest.mark.parametrize(\"layout\", [\"projected\", \"ulysses\"])\n+def test_compiled_mla_kv_matches_eager(layout: str) -> None:\n+    \"\"\"``projected``: kv viewed from the wkv_b output (MLAAttention).\n+    ``ulysses``: q and kv split from one packed tensor (UlyssesMLAAttention).\"\"\"\n+    torch.manual_seed(0)\n+    if layout == \"projected\":\n+        bases = [torch.randn(T, H, N + R), torch.randn(T, H * (N + V))]\n+    else:\n+        bases = [torch.randn(T, H, N + R + N + V)]\n+    k_shared = torch.randn(T, R)\n+    grad_k, grad_v = torch.randn(T, H, N + R), torch.randn(T, H, V)\n+\n+    results = []\n+    for regions in ([], [\"mla_kv\"]):\n+        LocalCompileConfig(regions=regions).apply()\n+        leaves = [t.clone().requires_grad_() for t in (*bases, k_shared)]\n+        if layout == \"projected\":\n+            q, kv = leaves[0], leaves[1].view(T, H, N + V)\n+        else:\n+            q, kv = leaves[0].split([N + R, N + V], dim=-1)\n+        k, v = materialize_mla_kv(q, kv, leaves[-1])\n+        torch.autograd.backward((k, v), (grad_k, grad_v))\n+        results.append((k, v, *(t.grad for t in leaves)))\n+\n+        assert v.is_contiguous()  # attention saves v; a view would keep kv alive\n+        with torch.no_grad():  # nothing is saved, so v stays a view\n+            assert not materialize_mla_kv(q, kv, leaves[-1])[1].is_contiguous()\n+\n+    for eager, compiled in zip(*results, strict=True):\n+        torch.testing.assert_close(compiled, eager)\n+\n+\n+class _CausalSDPA(torch.nn.Module):\n+    \"\"\"Stands in for FlexInnerAttention, whose compiled flex kernel doesn't build on every CPU.\"\"\"\n+\n+    def forward(self, q, k, v, **kwargs):\n+        q, k, v = (t.transpose(0, 1) for t in (q, k, v))\n+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)\n+        return out.transpose(0, 1)\n+\n+\n+def test_ulysses_mla_grads_match_eager() -> None:\n+    \"\"\"UlyssesMLAAttention on a 1-rank gloo CP group: every grad under ``mla_kv``\n+    matches eager. An async k_shared all-gather reaches the region unwaited and\n+    detached, so k_shared's grad would be zero.\"\"\"\n+    dist.init_process_group(\"gloo\", store=dist.HashStore(), rank=0, world_size=1)\n+    try:\n+        torch.manual_seed(0)\n+        attention = cp_mla.UlyssesMLAAttention.Config(\n+            wkv_b=Linear.Config(in_features=L, out_features=H * (N + V)),\n+            packed_kv_head_dim=N + V,\n+            inner_attention=FlexInnerAttention.Config(),\n+        ).build()\n+        attention.inner_attention = _CausalSDPA()\n+        inputs = (torch.randn(T, H, N + R), torch.randn(T, L), torch.randn(T, R))\n+        results = []\n+        with (\n+            patch.object(cp_mla, \"spmd_mesh_group\", return_value=dist.group.WORLD),\n+            spmd.no_typecheck(),\n+        ):\n+            for regions in ([], [\"mla_kv\"]):\n+                LocalCompileConfig(regions=regions).apply()\n+                attention.zero_grad(set_to_none=True)\n+                q, kv_c, k_shared = (x.clone().requires_grad_() for x in inputs)\n+                out = attention(q, kv_c, k_shared, attention_metadata=None)\n+                out.backward(torch.ones_like(out))\n+                results.append(\n+                    (out, q.grad, kv_c.grad, k_shared.grad, attention.wkv_b.weight.grad)\n+                )\n+    finally:\n+        dist.destroy_process_group()\n+\n+    for eager, compiled in zip(*results, strict=True):\n+        torch.testing.assert_close(compiled, eager)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/tests%2Funit_tests%2Fcpu%2Fmodels%2Fcommon%2Ftest_mla_compile.py",
+      "sha": "6772264c8fdb76aa8ea43586392ea6957fecb67b",
+      "status": "added"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/tests%2Funit_tests%2Fcpu%2Fmodels%2Fkimi_k3%2Ftest_kimi_k3_config.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/tests%2Funit_tests%2Fcpu%2Fmodels%2Fkimi_k3%2Ftest_kimi_k3_config.py?ref=a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "deletions": 0,
+      "filename": "tests/unit_tests/cpu/models/kimi_k3/test_kimi_k3_config.py",
+      "patch": "@@ -27,6 +27,7 @@ def test_kimi_k3_enables_attention_residual_local_compile() -> None:\n         \"fused_binary_activation\",\n         \"fp32_to_bf16_split\",\n         \"attention_residual\",\n+        \"mla_kv\",\n     ]\n \n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/tests%2Funit_tests%2Fcpu%2Fmodels%2Fkimi_k3%2Ftest_kimi_k3_config.py",
+      "sha": "b568ed46b71094633cfb1eddbfd0a5a5d7c02bcc",
+      "status": "modified"
+    },
+    {
+      "additions": 2,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fcp_mla.py",
+      "changes": 3,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fcp_mla.py?ref=a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "deletions": 1,
+      "filename": "torchtitan/models/common/attention/cp_mla.py",
+      "patch": "@@ -102,6 +102,8 @@ def forward(\n \n         # Q and packed KV have heads, so move their CP shard from T to H with\n         # one all-to-all. The shared key has no H dimension and is all-gathered.\n+        # TODO(pytorch/pytorch#191113): not async: torch.compile detaches an unwaited\n+        # AsyncCollectiveTensor input, so the mla_kv region would drop k_shared's grad.\n         k_shared_TR = remat.region(\n             spmd.redistribute,\n             self.remat_region_name(\"cp_all_gather\"),\n@@ -112,7 +114,6 @@ def forward(\n             src=spmd.S(_TOKEN_DIM),\n             dst=spmd.R,\n             backward_options={\"op_dtype\": k_shared_TR.dtype},\n-            async_op=True,\n         )\n         kv_THP = self.project_mla_kv(kv_c_normed_TL)\n         remat.recompute_needs_tensor(q_THK, kv_THP)",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fcp_mla.py",
+      "sha": "52483c064400ffce9f611bf3776c87c711bac0a8",
+      "status": "modified"
+    },
+    {
+      "additions": 5,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fmla.py",
+      "changes": 5,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fmla.py?ref=a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "deletions": 0,
+      "filename": "torchtitan/models/common/attention/mla.py",
+      "patch": "@@ -13,6 +13,7 @@\n import torch\n import torch_remat as remat\n \n+from torchtitan.distributed.local_compile import local_compile\n from torchtitan.models.common.linear import Linear\n \n from .attention import InnerAttention\n@@ -35,6 +36,7 @@\n # P = packed per-head KV channels (N + V)\n \n \n+@local_compile(\"mla_kv\", batch_invariant=True)\n def materialize_mla_kv(\n     q_THK: torch.Tensor,\n     kv_THP: torch.Tensor,\n@@ -46,6 +48,9 @@ def materialize_mla_kv(\n     k_nope_THN, v_THV = torch.split(kv_THP, [nope_head_dim, value_head_dim], dim=-1)\n     k_shared_THR = k_shared_TR.unsqueeze(1).expand(-1, k_nope_THN.shape[1], -1)\n     k_THK = torch.cat((k_nope_THN, k_shared_THR), dim=-1)\n+    # Attention saves v for backward; a v that views kv would keep all of kv alive.\n+    if torch.is_grad_enabled():\n+        v_THV = v_THV.contiguous()\n     return k_THK, v_THV\n \n ",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fcommon%2Fattention%2Fmla.py",
+      "sha": "7ac44812f162e8c6749092e6a532044a21d5e13e",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py?ref=a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "deletions": 0,
+      "filename": "torchtitan/models/deepseek_v3/model.py",
+      "patch": "@@ -127,6 +127,7 @@ class Config(MTPDecoder.Config):\n                     \"moe_aux_loss\",\n                     \"rope\",\n                     \"mla_qk\",\n+                    \"mla_kv\",\n                 ]\n             )\n         )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fdeepseek_v3%2Fmodel.py",
+      "sha": "5fff5cf5299e46f4219cc1618400565b45af0bee",
+      "status": "modified"
+    },
+    {
+      "additions": 1,
+      "blob_url": "https://github.com/pytorch/torchtitan/blob/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fkimi_k3%2Fmodel.py",
+      "changes": 1,
+      "contents_url": "https://api.github.com/repos/pytorch/torchtitan/contents/torchtitan%2Fmodels%2Fkimi_k3%2Fmodel.py?ref=a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "deletions": 0,
+      "filename": "torchtitan/models/kimi_k3/model.py",
+      "patch": "@@ -234,6 +234,7 @@ class Config(Decoder.Config):\n                     \"fused_binary_activation\",\n                     \"fp32_to_bf16_split\",\n                     \"attention_residual\",\n+                    \"mla_kv\",\n                 ]\n             )\n         )",
+      "raw_url": "https://github.com/pytorch/torchtitan/raw/a5f3fb77bb7ad5c88d33de292cff5db7dab6da72/torchtitan%2Fmodels%2Fkimi_k3%2Fmodel.py",
+      "sha": "ee393f5640c4691c3b3b41fd0c3a9259fc883622",
+      "status": "modified"
+    }
+  ],
+  "inline_comments": [
+    {
+      "body": "Optional: the grad-on `v.is_contiguous()` check guards a real memory invariant (a view would keep all of `kv` alive). The `no_grad` check only pins a perf choice (skip a copy nobody saves), and under `[\"mla_kv\"]` it adds a third Inductor compile per parametrization on the CPU runner. Consider dropping these two lines and keeping only the grad-on assert.",
+      "created_at": "2026-10-29T21:57:45Z",
+      "diff_hunk": "@@ -0,0 +1,54 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import pytest\n+import torch\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention import materialize_mla_kv\n+\n+# T tokens, H heads, N per-head key dims, R shared key dims, V value dims\n+T, H, N, R, V = 16, 4, 8, 4, 6\n+\n+\n+@pytest.fixture(autouse=True)\n+def reset_local_compile():\n+    LocalCompileConfig(regions=[]).apply()\n+    torch._dynamo.reset()\n+    yield\n+    LocalCompileConfig(regions=[]).apply()\n+\n+\n+@pytest.mark.parametrize(\"layout\", [\"projected\", \"ulysses\"])\n+def test_compiled_mla_kv_matches_eager(layout: str) -> None:\n+    \"\"\"``projected``: kv viewed from the wkv_b output (MLAAttention).\n+    ``ulysses``: q and kv split from one packed tensor (UlyssesMLAAttention).\"\"\"\n+    torch.manual_seed(0)\n+    if layout == \"projected\":\n+        bases = [torch.randn(T, H, N + R), torch.randn(T, H * (N + V))]\n+    else:\n+        bases = [torch.randn(T, H, N + R + N + V)]\n+    k_shared = torch.randn(T, R)\n+    grad_k, grad_v = torch.randn(T, H, N + R), torch.randn(T, H, V)\n+\n+    results = []\n+    for regions in ([], [\"mla_kv\"]):\n+        LocalCompileConfig(regions=regions).apply()\n+        leaves = [t.clone().requires_grad_() for t in (*bases, k_shared)]\n+        if layout == \"projected\":\n+            q, kv = leaves[0], leaves[1].view(T, H, N + V)\n+        else:\n+            q, kv = leaves[0].split([N + R, N + V], dim=-1)\n+        k, v = materialize_mla_kv(q, kv, leaves[-1])\n+        torch.autograd.backward((k, v), (grad_k, grad_v))\n+        results.append((k, v, *(t.grad for t in leaves)))\n+\n+        assert v.is_contiguous()  # attention saves v; a view would keep kv alive\n+        with torch.no_grad():  # nothing is saved, so v stays a view\n+            assert not materialize_mla_kv(q, kv, leaves[-1])[1].is_contiguous()",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4418335162",
+      "id": 4418335162,
+      "line": 60,
+      "original_line": 51,
+      "path": "tests/unit_tests/cpu/models/common/test_mla_compile.py",
+      "updated_at": "2026-10-29T21:57:59Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: keeping it. The no_grad assert is the one that catches an always-dense v: that costs +0.44 ms on the 16k prefill (2 DeepSeek-V3 layers, two 155 us clones) and saves nothing, since nothing is saved for backward. With an always-dense v, the grad-on assert and the eager comparison both still pass; only this assert fails. The file still runs in about 5 s on CPU.\n",
+      "created_at": "2026-10-30T03:02:59Z",
+      "diff_hunk": "@@ -0,0 +1,54 @@\n+# Copyright (c) Meta Platforms, Inc. and affiliates.\n+# All rights reserved.\n+#\n+# This source code is licensed under the BSD-style license found in the\n+# LICENSE file in the root directory of this source tree.\n+\n+import pytest\n+import torch\n+\n+from torchtitan.distributed.local_compile import LocalCompileConfig\n+from torchtitan.models.common.attention import materialize_mla_kv\n+\n+# T tokens, H heads, N per-head key dims, R shared key dims, V value dims\n+T, H, N, R, V = 16, 4, 8, 4, 6\n+\n+\n+@pytest.fixture(autouse=True)\n+def reset_local_compile():\n+    LocalCompileConfig(regions=[]).apply()\n+    torch._dynamo.reset()\n+    yield\n+    LocalCompileConfig(regions=[]).apply()\n+\n+\n+@pytest.mark.parametrize(\"layout\", [\"projected\", \"ulysses\"])\n+def test_compiled_mla_kv_matches_eager(layout: str) -> None:\n+    \"\"\"``projected``: kv viewed from the wkv_b output (MLAAttention).\n+    ``ulysses``: q and kv split from one packed tensor (UlyssesMLAAttention).\"\"\"\n+    torch.manual_seed(0)\n+    if layout == \"projected\":\n+        bases = [torch.randn(T, H, N + R), torch.randn(T, H * (N + V))]\n+    else:\n+        bases = [torch.randn(T, H, N + R + N + V)]\n+    k_shared = torch.randn(T, R)\n+    grad_k, grad_v = torch.randn(T, H, N + R), torch.randn(T, H, V)\n+\n+    results = []\n+    for regions in ([], [\"mla_kv\"]):\n+        LocalCompileConfig(regions=regions).apply()\n+        leaves = [t.clone().requires_grad_() for t in (*bases, k_shared)]\n+        if layout == \"projected\":\n+            q, kv = leaves[0], leaves[1].view(T, H, N + V)\n+        else:\n+            q, kv = leaves[0].split([N + R, N + V], dim=-1)\n+        k, v = materialize_mla_kv(q, kv, leaves[-1])\n+        torch.autograd.backward((k, v), (grad_k, grad_v))\n+        results.append((k, v, *(t.grad for t in leaves)))\n+\n+        assert v.is_contiguous()  # attention saves v; a view would keep kv alive\n+        with torch.no_grad():  # nothing is saved, so v stays a view\n+            assert not materialize_mla_kv(q, kv, leaves[-1])[1].is_contiguous()",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4420052371",
+      "id": 4420052371,
+      "line": 60,
+      "original_line": 51,
+      "path": "tests/unit_tests/cpu/models/common/test_mla_compile.py",
+      "updated_at": "2026-10-30T03:02:59Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "This works around a PyTorch gap: `torch.compile` takes an unwaited `AsyncCollectiveTensor` input and silently detaches it, so the grad comes out as zeros with no error. The repo rule for upstream workarounds is a `TODO` with an issue link. Without one, nobody will know to restore `async_op=True` once it's fixed. The same silent zero-grad can hit any `local_compile` region that gets an async collective output as a direct input, so filing it upstream is worth more than this one call site.\n\n```suggestion\n        # TODO(<issue link>): not async -- torch.compile detaches an unwaited\n        # AsyncCollectiveTensor input, so the mla_kv region would drop k_shared's grad.\n```",
+      "created_at": "2026-10-30T03:05:32Z",
+      "diff_hunk": "@@ -102,6 +102,8 @@ def forward(\n \n         # Q and packed KV have heads, so move their CP shard from T to H with\n         # one all-to-all. The shared key has no H dimension and is all-gathered.\n+        # Not async: the mla_kv region would detach an unwaited input and drop\n+        # k_shared's grad.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4420063481",
+      "id": 4420063481,
+      "line": null,
+      "original_line": 106,
+      "path": "torchtitan/models/common/attention/cp_mla.py",
+      "updated_at": "2026-10-30T03:05:47Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: applied in a5f3fb77b. There's no open PyTorch issue for this; the closest upstream record is pytorch/pytorch#191113 (\"Preserve requires_grad when unwrapping ACT inputs in process_inputs\"), which describes this exact bug and was closed unmerged. The TODO links that.\n",
+      "created_at": "2026-10-30T03:07:25Z",
+      "diff_hunk": "@@ -102,6 +102,8 @@ def forward(\n \n         # Q and packed KV have heads, so move their CP shard from T to H with\n         # one all-to-all. The shared key has no H dimension and is all-gathered.\n+        # Not async: the mla_kv region would detach an unwaited input and drop\n+        # k_shared's grad.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#discussion_r4420072364",
+      "id": 4420072364,
+      "line": null,
+      "original_line": 106,
+      "path": "torchtitan/models/common/attention/cp_mla.py",
+      "updated_at": "2026-10-30T03:07:26Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    }
+  ],
+  "issue_comments": [
+    {
+      "body": "Reply from claude: @claude please review",
+      "created_at": "2026-10-29T21:55:30Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6509228354",
+      "id": 6509228354,
+      "updated_at": "2026-10-29T21:55:30Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 2m 1s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40961797532)\n\n---\n**Approve** -- see the [review](https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview) (one optional test suggestion; a maintainer still needs to review).",
+      "created_at": "2026-10-29T21:55:51Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6509234386",
+      "id": 6509234386,
+      "updated_at": "2026-10-29T21:58:13Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: pushed 45152e09d. `UlyssesMLAAttention` all-gathered k_shared with `async_op=True`, and the `mla_kv` region detached that unwaited input, so k_shared's grad was all zeros under Ulysses CP. The all-gather is now synchronous, and `test_ulysses_mla_grads_match_eager` runs the real forward on a 1-rank gloo group (it fails without the fix). Body updated: memory under remat and Ulysses, goldens, provenance. @claude please review\n",
+      "created_at": "2026-10-30T03:03:01Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513910836",
+      "id": 6513910836,
+      "updated_at": "2026-10-30T03:03:01Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 2m 22s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40995156520)\n\n---\n**Approve** -- please add a TODO with an upstream issue link for the synchronous all-gather workaround, and check whether `kv_THP` also reaches `mla_kv` unwaited at CP > 1 -- see the [review](https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview).",
+      "created_at": "2026-10-30T03:03:24Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513915850",
+      "id": 6513915850,
+      "updated_at": "2026-10-30T03:06:01Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "Reply from claude: on the all-to-all question: spmd_types' shard all-to-all (`_AllToAllShard.forward`) is a blocking `dist.all_to_all` followed by `torch.cat`, at every world size. It accepts `async_op` but never returns an `AsyncCollectiveTensor`, and there is no world-size-1 short-circuit for it (the only one is in all_reduce). On the 1-rank gloo group: the all-to-all with `async_op=True` returns a plain `Tensor`, and the k_shared all-gather returns an `AsyncCollectiveTensor`. So the test covers both paths as they run at CP > 1, and q / kv reach `mla_kv` as plain tensors.\n\nThe TODO is in a5f3fb77b (comment-only change). @claude please review\n",
+      "created_at": "2026-10-30T03:07:28Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513968556",
+      "id": 6513968556,
+      "updated_at": "2026-10-30T03:07:28Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Claude finished @felipemello1's task in 48s** —— [View job](https://github.com/pytorch/torchtitan/actions/runs/40995591535)\n\n---\n**Approve**: the TODO is in, and the all-to-all question is answered. No new problems. See the [review](https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview). A maintainer still needs to review.",
+      "created_at": "2026-10-30T03:07:50Z",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#issuecomment-6513973308",
+      "id": 6513973308,
+      "updated_at": "2026-10-30T03:08:56Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ],
+  "number": 5564,
+  "refs": {
+    "base": {
+      "commit": "45d7c3ef8883adbd72b8201385756e12d70c75d2",
+      "repository": "pytorch/torchtitan"
+    },
+    "head": {
+      "commit": "a5f3fb77bb7ad5c88d33de292cff5db7dab6da72",
+      "repository": "pytorch/torchtitan"
+    }
+  },
+  "repository": "pytorch/torchtitan",
+  "reviews": [
+    {
+      "body": "**Verdict: Approve** -- a small change that follows the existing `local_compile` pattern (`mla_qk`), with measured end-to-end wins and bitwise outputs. A maintainer still needs to review because it touches `models/common/`.\n\n**What this PR does.** It decorates `materialize_mla_kv` (shared by DeepSeek-V3, the Kimi K2.x models that inherit its config, and Kimi K3, including both CP variants) as the `mla_kv` local-compile region, and enables that region in both model configs. It also makes `v` dense when grad is on, so attention no longer saves a view that keeps the whole `[T, H, N+V]` `kv` alive.\n\n**Example.** One DeepSeek-V3 MLA layer at T=16k, grad on:\n```text\nbefore: k_nope, v = split(kv)            # v is a view of kv\n        k = cat(k_nope, expand(k_shared)) # eager CatArrayBatchedCopy\n        attention saves v -> kv [T,H,256] stays alive until backward\nafter:  one Inductor copy builds k and a dense v\n        attention saves the dense v -> kv freed after forward (-0.54 GB/layer)\n        no_grad: v is still a view (nothing is saved, so no copy)\n```\n\n### Should consider\n- `tests/unit_tests/cpu/models/common/test_mla_compile.py:50` -- the `no_grad` view assertion pins a perf choice and costs a third CPU compile; consider keeping only the grad-on contiguity assert (inline).\n\n<details><summary>Details</summary>\n\n- Call sites: `MLAAttention.forward` binds `materialize_kv=materialize_mla_kv` at def time. That binding is the `local_compile` wrapper, so the region applies to `MLAAttention`, to the all-gather CP variant (which calls `MLAAttention.forward`), and to `UlyssesMLAAttention`. The `fused_mla` override passes its own `materialize_kv`, so it isn't affected, as the description says.\n- `torch.is_grad_enabled()` inside the region is guarded by Dynamo. That matches the description's 3 graphs (static T, dynamic T, no_grad), which fits under the recompile limit.\n- Remat: `recompute_needs_tensor(kv_THP, k_shared_TR)` already keeps `kv` for replay, so with remat on, the dense `v` changes time (the description measures +0.16 ms per layer) but not peak memory.\n- The test is in the right place (`models/common`, next to the shared function). The Ulysses parametrization adds real coverage: a non-contiguous `kv` taken from a packed q/kv tensor.\n- Eager configs (GraphTrainer, RL with regions `[]`) pay the copy of `v` (+0.2-0.8% kernel time) to get the same memory win. I agree with keeping one code path here.\n\n</details>\n\nNot verified: the GPU perf and memory numbers, and the golden-loss impact on A10G/mi350x (integration runs are still queued). The CPU Unit Test workflow was skipped on this stacked PR, so `test_mla_compile.py` has not run in CI yet.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5705514585",
+      "id": 5705514585,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-29T21:57:59Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707604302",
+      "id": 5707604302,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-30T03:02:59Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Verdict: Approve -- please address the item below before merging** -- the new commit fixes a real silent zero-grad under Ulysses CP with the smallest change and adds a test that fails without it. The workaround still needs a TODO that links an upstream issue. A maintainer still needs to review, since this touches `models/common/`.\n\n**What changed since the last review.** `UlyssesMLAAttention` now all-gathers `k_shared` synchronously (`cp_mla.py:107-117`). `test_cp_attention.py` now pins `[False, True, True]` for the async flags. `test_ulysses_mla_grads_match_eager` runs the real forward on a 1-rank gloo group and compares every grad under `mla_kv` against eager. The earlier optional note about the `no_grad` view assert is settled by the author's reply: only that assert catches an always-dense `v`.\n\n**Example.** Ulysses CP with `mla_kv` on, before this commit:\n```text\nk_shared = redistribute(k_shared, S(0) -> R, async_op=True)  # AsyncCollectiveTensor, not waited\nk, v = materialize_mla_kv(q, kv, k_shared)                   # compiled region gets the unwaited input\n                                                             # -> detached, k_shared.grad == 0, no error\nafter:  sync all-gather -> plain tensor -> grad flows; matches eager\n```\n\n### Must fix\n- `torchtitan/models/common/attention/cp_mla.py:105` -- the comment describes a PyTorch bug: compile silently detaches an unwaited `AsyncCollectiveTensor` input. Add a `TODO` with an upstream issue link so `async_op=True` can come back once it's fixed (see the inline comment).\n\n### Questions\n- Under real multi-rank Ulysses, `kv_THP` comes from `torch.split` of the `async_op=True` all-to-all output (`cp_mla.py:121-136`). An `AsyncCollectiveTensor` passes view ops through without waiting, so `kv_THP` may also reach `mla_kv` unwaited. The 1-rank test shows `kv_c.grad` matching eager. Can you confirm that the 1-rank all-to-all really returns an async tensor (and not a short-circuit), so the test covers this path too? If it doesn't, `kv`'s grad may have the same silent zero at CP > 1. *Unverified: I couldn't read the installed `spmd_types` here.*\n\n<details><summary>Details</summary>\n\n- Root cause and layer: the fix belongs at the call site because `local_compile` has no place to wait on inputs generically. Waiting in its `wrapped` would also be possible, but `ACT.wait()` returns the inner `elem`, which would drop autograd too, so that isn't a drop-in. The real fix is upstream, hence the TODO.\n- Overlap loss: the gathered `k_shared` is `[T, 64]` (about 2 MB at 16k). The all-gather used to overlap with `project_mla_kv` and the packed cat. No recipe uses Ulysses MLA, so the unmeasured cost is acceptable.\n- Test placement and cost: `tests/unit_tests/cpu/models/common/` mirrors the source tree. The gloo `HashStore` single-rank group is cheap and guards a silent-grad regression that no other test covers.\n\n</details>\n\nNot verified: GPU perf and memory numbers, and the real-PG CP+PP golden impact.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707616930",
+      "id": 5707616930,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-30T03:05:47Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    },
+    {
+      "body": "",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707630212",
+      "id": 5707630212,
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-30T03:07:26Z",
+      "user": {
+        "login": "felipemello1"
+      }
+    },
+    {
+      "body": "**Verdict: Approve** -- both items from the last review are settled, and the new commit only changes a comment. This touches `models/common/`, so a maintainer still needs to review.\n\n**What changed since the last review.** a5f3fb77b adds `TODO(pytorch/pytorch#191113)` to the synchronous k_shared all-gather (`cp_mla.py:105-106`). No code changed.\n\n**Example.** The Ulysses CP path at HEAD:\n```text\nk_shared = redistribute(S(0) -> R)                  # synchronous: plain tensor, grad flows\npacked   = redistribute(S(0) -> S(1), async_op=True) # spmd_types all-to-all blocks anyway -> plain tensor\nq, kv    = split(packed)\nk, v     = materialize_mla_kv(q, kv, k_shared)      # mla_kv region: all three inputs keep autograd\n```\n\n### Earlier items\n- Must fix (TODO with upstream link): resolved. #191113 is a closed, unmerged PR, not an open issue, but it describes this exact bug and gives a future reader the trail to restoring `async_op=True`.\n- Question (does `kv_THP` reach `mla_kv` unwaited at CP > 1?): answered. The author says spmd_types' shard all-to-all is a blocking `dist.all_to_all` plus `torch.cat` at every world size and never returns an `AsyncCollectiveTensor`, so `q`/`kv` reach the region as plain tensors. `test_ulysses_mla_grads_match_eager` compares `kv_c.grad` against eager. If spmd_types ever makes the all-to-all truly async, that test fails instead of `kv`'s grad going silently to zero.\n\nNo new problems found.\n\nNot verified: the spmd_types internals behind the all-to-all answer (the package isn't readable in this checkout), the GPU perf and memory numbers, and the real-PG CP+PP golden impact.",
+      "html_url": "https://github.com/pytorch/torchtitan/pull/5564#pullrequestreview-5707637556",
+      "id": 5707637556,
+      "state": "APPROVED",
+      "submitted_at": "2026-10-30T03:08:45Z",
+      "user": {
+        "login": "claude[bot]"
+      }
+    }
+  ]
+}

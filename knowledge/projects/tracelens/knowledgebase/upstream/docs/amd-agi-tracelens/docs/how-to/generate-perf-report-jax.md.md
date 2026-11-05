@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/TraceLens
-commit: c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3
+commit: 90f2f6f58210d1828c5eca6949b1dce7d2525fa7
 path: docs/how-to/generate-perf-report-jax.md
-raw_sha256: f775dc8ad874ad485196e117406cccf5c3d7b85d6c77867d42b2f3468867b9a8
+raw_sha256: c0d43826c7ea64091482f39f7ad25fb397098c6ce35a7893741a41763fd104b3
 sources: []
-generated_body_sha256: c83fa1648db05ddd5bdb44f45a304bd720e25da6fd53aa1291124b7ba0b8152f
+generated_body_sha256: d753c8b3678f888dd1b8a18d628ff2479612e1af9ad0472c32bdc2883dd17f97
 source_state: current-scan
 ---
 
 # AMD-AGI/TraceLens / docs/how-to/generate-perf-report-jax.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/c5da90ee7d59e49bf75e8602f0211da1f6dcd8b3/docs/how-to/generate-perf-report-jax.md)
+[Original at fixed commit](https://github.com/AMD-AGI/TraceLens/blob/90f2f6f58210d1828c5eca6949b1dce7d2525fa7/docs/how-to/generate-perf-report-jax.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -86,8 +86,8 @@ Options:
 - `--kernel_metadata_keyword_filters <kw> ...` restricts the analysis to events
   whose metadata contains the given keywords (for example, `remat checkpoint` to
   focus on rematerialization or checkpointing scopes).
-- `--enable-origami` uses Origami-simulated GEMM/SDPA times when a GPU arch JSON
-  is available.
+- `--enable-origami-gemm` adds Origami-simulated GEMM times (`Origami`
+  columns) when a GPU arch JSON is available.
 - `--output_xlsx_path` and `--output_csvs_dir` control output paths. (JAX
   currently supports only these output options.)
 

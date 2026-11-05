@@ -45,6 +45,8 @@
 
 MoE 的专家计算检查是否经过 TE grouped GEMM，以及能否复用 hipBLASLt 的 grouped GEMM 后端。具体开关、默认行为和支持条件按实际引擎/TE/数学库版本查询 HCU-Knowledge 并核对消费者源码，不把历史环境变量当作所有版本的必设项。适用时验证实际分派、前后向数值及整步收益；已命中仍有性能缺口，再按[数学库调优](math-library-tuning.md)提取真实分组复现交接，不直接重写已有能力。
 
+若实际引擎使用 Primus Turbo、AITER、DeepGEMM 或 LightOP，则沿该消费者的公开入口、父锁和 native 分派审查，不强行改成另一 grouped GEMM。区分本地 routing/scatter/gather、专家计算与跨卡 dispatch/combine，并将 pack/scale、有效 token、容量、返回对象和异步完成协议作为整体候选。库中新增 prepared Graph、device-args 或原生融合不代表当前引擎已接入；明确普通 eager、prepared 路径及 fallback，验证变化路由、多次 backward、main_grad 和稳定地址后才尝试相关组合。实现选择和数值检查见[库联动](hcu-library-integration.md)。
+
 卷积等 MIOpen 热点还要核对 layout、Find/benchmark、workspace 与缓存是否适配当前 HCU 调用路径：按[数学库调优](math-library-tuning.md)先比较已有选优能力，再决定 size 交接。搜索预热与正式运行分开；框架开关、HCU Find 模式和 AMD 同名参数不默认等价。rocBLAS 的自动选优结果同样回到真实引擎 backend 与配置命中验证，不能把独立工具的收益直接计入整步。
 
 ## 3. 在现有看板维护候选与处置

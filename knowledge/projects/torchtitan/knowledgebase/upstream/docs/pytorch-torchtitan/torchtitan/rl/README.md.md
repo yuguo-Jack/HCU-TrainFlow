@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: pytorch/torchtitan
-commit: a242475253433725f10f39c18f5ccbfdf188e097
+commit: 485c065cb248863bf2e2c65588becd6d7a8bcf83
 path: torchtitan/rl/README.md
-raw_sha256: 62fde87475bed82db694353ac5892caaa9162c3ca854d7182353f6bcb486970b
+raw_sha256: c4f1816a03546f6ffd5d800a3008aedfdf24a9fa34161a6cfa3fb5cae6184c72
 sources: []
-generated_body_sha256: 00d717f5f38af82e067af648bd92ce7e874f8c012c28b46c815611e4e7b9ea1e
+generated_body_sha256: 2630832c876b93089f4d4a1fa637d812e74d316a552bf27dea7024ce1e6d504e
 source_state: current-scan
 ---
 
 # pytorch/torchtitan / torchtitan/rl/README.md
 
-[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/a242475253433725f10f39c18f5ccbfdf188e097/torchtitan/rl/README.md)
+[Original at fixed commit](https://github.com/pytorch/torchtitan/blob/485c065cb248863bf2e2c65588becd6d7a8bcf83/torchtitan/rl/README.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -60,6 +60,7 @@ for MoE models. Generator sequence parallelism was disabled.
 |---|---|
 | Llama 3 | ✅ Supported |
 | Muse Glimmer | ✅ Supported |
+| Muse Spark | ✅ Supported (text only) |
 | Qwen 3 | ✅ Supported |
 | Qwen 3.5/3.6/3.8 | ✅ Supported (text only) |
 | GPT-OSS | ✅ Supported |
@@ -143,7 +144,7 @@ Most experiments configure four pieces:
 
 ```python
 rollouter = Rollouter.Config(
-    training_dataloader=IterableRLDataLoader.Config(dataset=MyDataset.Config()),
+    training_dataloader=IterableRolloutDataLoader.Config(dataset=MyDataset.Config()),
     validation_dataset=MyValidationDataset.Config(),
     worker=RolloutWorker.Config(
         message_env=MyEnv.Config(),
@@ -274,8 +275,12 @@ python -m torchtitan.rl.train \
 **NOTE:** The DAPO Math README documents checkpoint paths, expected outputs, and configuration variants.
 
 **Metrics:** W&B is on by default. Run `wandb login` first, or set
-`config.metrics.enable_wandb = False` in your recipe. Set
-`config.metrics.enable_tensorboard = True` to write TensorBoard metrics.
+`config.metrics.loggers = []` in your recipe. Append
+`TensorBoardLogger.Config()` to `config.metrics.loggers` to also write TensorBoard metrics.
+
+## Run on SLURM
+
+See [Launchers](./actors/monarch/README.md#launchers).
 
 ## Trainer/generator consistency
 
@@ -295,8 +300,8 @@ TitanRL exposes four complementary views of a run:
 Together these answer four different debugging questions: what the distributed system was doing, how the run was learning, how the inference engine was performing, and what the model actually produced.
 
 Reference recipes enable W&B by default. Run `wandb login` before launch, or
-disable it in the recipe with `config.metrics.enable_wandb = False`. Set
-`config.metrics.enable_tensorboard = True` to write TensorBoard metrics under
+disable it in the recipe with `config.metrics.loggers = []`. Append
+`TensorBoardLogger.Config()` to `config.metrics.loggers` to also write TensorBoard metrics under
 the output directory.
 
 The trainer supports the core `Profiler.Config`, including Kineto traces and

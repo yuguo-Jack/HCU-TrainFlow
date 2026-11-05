@@ -9,21 +9,23 @@ stages:
 visibility: public
 review_level: selected-source-reading
 runtime_validated: false
-reviewed_on: '2026-10-20'
+reviewed_on: '2026-11-04'
 sources:
 - source: nvidia-megatron-lm
   path: megatron/training/training.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
-  sha256: 560336b88b52060544ca76ceb8c9e0b9274472cdea043b76e2a87db467532883
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: 1cfba3a404c97febc4c2e40895467372e6ab540006dc6a6e22fbc547087a5b75
 - source: nvidia-megatron-lm
   path: megatron/training/arguments.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
-  sha256: fa0df51942af46de4af237397c81dc5200f86de11078334aaf19709c95a684fb
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
+  sha256: 91ec8ceb30b9af6d1bad58256e965e5b1f6cbf70ef120f450b09e570b2f44cce
 - source: nvidia-megatron-lm
   path: megatron/training/config/common_config.py
-  commit: e8a302ac5bfeb98c6701020cc6cba977d05ab1d4
+  commit: 21334a44ede0b8497d1770d0b80bc115e777bd00
   sha256: e8be4ca3cdb981348734ff2aedb1622dfa30f0e69218d1326ebd6d08703321e3
 kind: authored
+retrieved_on: '2026-11-04'
+coverage: frozen source delta and consumer review; unchanged files rechecked; no HCU runtime validation
 ---
 
 # 训练 profiler 采样与 TraceLens 联动
@@ -59,13 +61,17 @@ full_iteration replay 后仍执行主机数值验证；若比较完整训练步�
 
 `fake_process_group` 可观察一个进程的容量路径，但真实通信被跳过，不产生多 rank 链路、偏斜、overlap 或模型吞吐的验证结论。TraceLens 的输入仍须来自实际目标环境的完整对应窗口。
 
+本轮复核 `training.py` 的 profile 启停、`cfg.profiling` schedule 和 trace_handler：上述 wait/warmup/active、空 rank 列表与两类输出路径仍成立，因此保留。新增显存观测在模型/optimizer 构造后、checkpoint 加载后、该次 empty_cache 后和首次 iteration 前，可区分恢复临时峰值与从零构造基线；首次 iteration 前尚未包含后续 capture 的 graph pool。日志按模型实际 DP group 的 rank0 输出，不代表全 rank 峰值。
+
+full_iteration 新梯度转换图复用 F/B pool 的 scratch，回放顺序必须为 F/B→gradient conversion→eager optimizer；记录 graph reset/首次 capture 成本，并确认 optimizer/CPU-offload/FSDP 的实际分支。新增 tensor metrics 可能形成较长的独立 fault-tolerance 计时段，profile 中的这类诊断迭代与普通稳态步分开解释。
+
 ## TraceLens 分析接口
 
 官方工具机制见 [TraceLens Wiki](../../../../tracelens/README.md)。HCU 运行版本的命令、Graph、Replay、Roofline、Agent 与 DTK 输入边界统一见 [TrainFlow 分析契约](../../../../../../docs/tracelens-analysis.md)。本页负责 Megatron 的采样与消费关系，不重复维护 HCU fork 的实现知识。更换工具或 profiler 版本时复核接口和真实原件；理论上限、实测 sustained 参考和同 shape 实测分别保留来源。
 
 ## 固定源码与更新范围
 
-- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/training.py)
-- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/e8a302ac5bfeb98c6701020cc6cba977d05ab1d4/megatron/training/arguments.py)
+- [megatron/training/training.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/megatron/training/training.py)
+- [megatron/training/arguments.py](https://github.com/NVIDIA/Megatron-LM/blob/21334a44ede0b8497d1770d0b80bc115e777bd00/megatron/training/arguments.py)
 
 上述链接固定到本轮阅读的提交。上游变化时，需要同时检查总览、调用链、专题、案例和相关 Skill。本文区分源码行为与迁移建议；没有声称在 HCU 上完成性能或精度验证。

@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: sgl-project/sglang
-commit: 8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043
+commit: fd19cfb660f42bd3ceb6df7598bd343572e30d2c
 path: docs/docs/advanced_features/attention_backend.mdx
-raw_sha256: 2d58cc948ddcd4bf97393b4f1cce987fba7a74c02b976c9197d8298cc4ffde4d
+raw_sha256: 25947de4f55527e18e14bc4d939f94680f78a5769a5a166b17fc18d8835c1277
 sources: []
-generated_body_sha256: 303d1a41469fb018f7f1ca920cb9dbca7b65576cea40d449753d68deb50db5f2
+generated_body_sha256: 90f1c3df3db9f50af17374994c1fbd271216468e455b9bfccba75bf1a88f11e8
 source_state: current-scan
 ---
 
 # sgl-project/sglang / docs/docs/advanced_features/attention_backend.mdx
 
-[Original at fixed commit](https://github.com/sgl-project/sglang/blob/8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043/docs/docs/advanced_features/attention_backend.mdx)
+[Original at fixed commit](https://github.com/sgl-project/sglang/blob/fd19cfb660f42bd3ceb6df7598bd343572e30d2c/docs/docs/advanced_features/attention_backend.mdx)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -283,15 +283,6 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**TokenSpeed MLA (Blackwell)**</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32 or 64</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ (required)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**FA3 (FlashAttention 3)**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>n/a</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
@@ -358,7 +349,6 @@ MLA page-size constraints:
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ &#123;32, 64&#125;.
 - CuteDSL MLA: page_size ∈ &#123;32, 64&#125; (decode-only; prefill falls back to `trtllm_mla` when unset).
-- TokenSpeed MLA: page_size ∈ &#123;32, 64&#125; (Blackwell SM100/SM12x only; requires `--kv-cache-dtype fp8_e4m3`).
 
 ### GDN Attention Backends
 

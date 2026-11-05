@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: AMD-AGI/Primus
-commit: ab8735564c4cc3bb7c0475146057eee8dae4c650
+commit: bab82720d72cadbdfbedcc050c9fb49de3b353be
 path: docs/02-user-guide/environment-and-xla-flags.md
-raw_sha256: 2465209ea2dfba573ffd1d311fcdfb7e86392007d8260fba533add5242ec89cb
+raw_sha256: b885e1cb25ba0aafc5c2d8cf5cd2f8c10fe5b6f86aa9367853598857de7ccc96
 sources: []
-generated_body_sha256: f6e6048a52ceaa9215a57abdac5f1b2f03510da71ff4fe5a16397003ad6e4b0f
+generated_body_sha256: fea256d94ea8960ef286ca3f68186214479bcce6d1a695b13544216dcf6398f0
 source_state: current-scan
 ---
 
 # AMD-AGI/Primus / docs/02-user-guide/environment-and-xla-flags.md
 
-[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/ab8735564c4cc3bb7c0475146057eee8dae4c650/docs/02-user-guide/environment-and-xla-flags.md)
+[Original at fixed commit](https://github.com/AMD-AGI/Primus/blob/bab82720d72cadbdfbedcc050c9fb49de3b353be/docs/02-user-guide/environment-and-xla-flags.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -87,7 +87,7 @@ Three rules:
 
 An ordinary variable holds one value, so setting it is unambiguous. `XLA_FLAGS` holds *many* independent settings in one string, and both the Docker image and Primus contribute to it. Two consequences follow:
 
-1. **Setting `XLA_FLAGS` replaces every flag at once**, including defaults you probably want to keep — most importantly `--xla_gpu_autotune_level=4`, which prevents NaN loss on fp8 MoE models.
+1. **Setting `XLA_FLAGS` replaces every flag at once**, including defaults you probably want to keep — most importantly `--xla_gpu_autotune_level=3`, which keeps GEMM autotuning on (fp8 MoE models get NaN loss without it).
 2. **XLA honors the *last* occurrence of a repeated flag.** This is what makes `XLA_FLAGS_APPEND` work: your flag lands after the defaults and wins, without disturbing the others.
 
 ### Layering

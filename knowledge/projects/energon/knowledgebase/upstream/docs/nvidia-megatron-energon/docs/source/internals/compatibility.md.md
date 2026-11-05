@@ -10,17 +10,17 @@ stages:
 - optimize
 - fault-tolerance
 repository: NVIDIA/Megatron-Energon
-commit: bcfd8f5e245034830e7157f11f9ac0971c02e9cb
+commit: e33bbe768a4f7a629377a365c8af9a7b98b1219e
 path: docs/source/internals/compatibility.md
-raw_sha256: 024c424612f9aa007417bd247881f1b837b47cb60295215d9216c49b77196c93
+raw_sha256: 03cbc7dadc02504d4e348aeaf87866153791870cd55b04a945f09dff47be50d7
 sources: []
-generated_body_sha256: 35a1d7505a05f09e27e45bea922316a66106bae2d07b9d16b92eb89dfb63460f
+generated_body_sha256: 831fc11399b83b9649707a57b42955a55525b9b98fece656099928f319f4146b
 source_state: current-scan
 ---
 
 # NVIDIA/Megatron-Energon / docs/source/internals/compatibility.md
 
-[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/bcfd8f5e245034830e7157f11f9ac0971c02e9cb/docs/source/internals/compatibility.md)
+[Original at fixed commit](https://github.com/NVIDIA/Megatron-Energon/blob/e33bbe768a4f7a629377a365c8af9a7b98b1219e/docs/source/internals/compatibility.md)
 
 Upstream source document; original commands, claims and links require their stated platform/version. This is not an authored HCU recipe. Relative links should be resolved from the original file.
 
@@ -105,7 +105,7 @@ Use the rows relevant to the change:
 | Wrapper state or topology | Save/restore tests in `test_recipe.py`; affected wrapper tests | restore keys, reset |
 | Recipe nodes or identities | `test_recipe.py` | nested splits, typed subsets |
 | Worker assignment or RNG | current-batch-index tests in `test_dataset.py` | distributed rank, exact ordering |
-| Dataset factory or format | resolver and format-specific tests | preparation, stale indexes, `FileStore`, provenance |
+| Dataset factory or format | resolver and format-specific tests; `test_filter_index.py` | preparation, stale indexes, `FileStore`, provenance |
 | Prepared metadata | preparation and format reader tests | old metadata fixtures and explicit versioning |
 | Packing or blending | packing, grouping, and blending tests | mid-buffer restore, RNG |
 | Public imports | API and deprecation import tests | `__all__`, docs, typing |
