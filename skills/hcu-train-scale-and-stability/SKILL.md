@@ -5,6 +5,8 @@ description: 扩展 HCU 训练规模、筛机并衔接既有容错，持续观�
 
 # hcu-train-scale-and-stability
 
+本工程后续共享 Wiki/Skill 维护使用 `knowledge/storage.json` 的 `maintenance_branch: lite`。写入共享知识、来源锁或发布本仓前，先核对实际工程根、安装绑定、Git 工作区与当前分支为 lite；发现其他分支、detached HEAD、外来绑定或未归属本任务的改动时保留现场，不自动 checkout/reset/rebind。普通查询和私有缓存不因此切换分支。上游工程继续使用各自选定的 ref/commit，不统一改为 lite。
+
 知识检索按问题推进：先复用已有解释，不足时联搜 PR 或官方页面，找到入口后按需读原页、固定源码和必要讨论。普通 PR 不要求离线镜像正文、评论、review 或 diff，也不要求每仓全量总结。只有形成结论所需的重要或引用证据才正式保留；HCU 内部仓继续通过 `$hcu-knowledge-search` 查证。当前入口和命令习惯保持，资料发现、内容复核与现场实测分别记录。
 
 ## 开始前定位与阅读

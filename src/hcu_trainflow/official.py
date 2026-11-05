@@ -69,8 +69,10 @@ def search_prs(store, query, repos, token=None, limit=10, state='all', branch=No
         raise FlowError('No search terms')
     if not repos:
         return {'status':'scope-required', 'results':[], 'instruction':'Select an engine, source or repository.'}
-    result = {'query':query, 'queried_at':utc(), 'results':[], 'coverage':[]}
-    for repo in dict.fromkeys(repo_name(r) for r in repos):
+    repositories=list(dict.fromkeys(repo_name(repo) for repo in repos))
+    result = {'query':query, 'queried_at':utc(), 'results':[], 'coverage':[],
+              'query_scope':{'repositories':repositories,'state':state,'branch':branch,'page':page,'limit':limit}}
+    for repo in repositories:
         q = f'is:pr repo:{repo} ' + ' '.join('"'+t+'"' for t in terms)
         if state != 'all': q += ' is:' + state
         if branch: q += ' base:"' + branch.replace('"','') + '"'
@@ -92,7 +94,8 @@ def search_prs(store, query, repos, token=None, limit=10, state='all', branch=No
     result['status'] = 'ok' if all(c['complete'] for c in result['coverage']) and not result['display_truncated'] else 'partial'
     if result['display_truncated']:
         result['instruction']='Combined result limit reached; query individual repositories to inspect omitted candidates.'
-    result['artifact'] = store.put(json.dumps(result,ensure_ascii=False).encode())
+    payload={key:value for key,value in result.items() if key!='queried_at'}
+    result['artifact'] = store.put(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode())
     return result
 
 
@@ -172,10 +175,11 @@ def read_pr(store, repo, number, token=None, max_pages=20, *, discussions=None, 
     data['scope']={'body':True,'discussions':discussions,'files':files}
     data['refs']={side:{'repository':(detail.get(side,{}).get('repo') or {}).get('full_name'),
                         'commit':detail.get(side,{}).get('sha')} for side in ('head','base')}
-    sha=store.put(json.dumps(data,ensure_ascii=False).encode())
+    observed_at=data.pop('observed_at')
+    sha=store.put(json.dumps(data,ensure_ascii=False,sort_keys=True).encode())
     return {'artifact':sha,'repository':repo,'number':number,'title':detail.get('title'),'body':detail.get('body'),
             'refs':data['refs'],'coverage':data['coverage'],
-            'scope':data['scope'],'url':detail.get('html_url',f'https://github.com/{repo}/pull/{number}'),
+            'scope':data['scope'],'observed_at':observed_at,'url':detail.get('html_url',f'https://github.com/{repo}/pull/{number}'),
             'files':[{'path':f['filename'],'old_path':f.get('previous_filename',f['filename']),'status':f.get('status')} for f in data['files']],
             'status':'collected-not-reviewed' if all(v['complete'] for v in data['coverage'].values() if isinstance(v,dict) and v.get('requested',True)) else 'partial',
             'instruction':'Open the original PR page as needed. Discussions and files are optional; use exact head/base code, callers and tests for implementation claims. No runtime validation implied.'}
@@ -400,7 +404,7 @@ def sync_prs(store, project, source_id, token=None, max_prs=10, since=None):
     source=source_for(project,source_id)
     if not source or source.get('kind')=='web':raise FlowError('Select registered Git source')
     from .capture_policy import is_discovery
-    if is_discovery(source):
+    if is_discovery(source,project):
         return discover_prs(store,source,token,max_prs,since)
     repo=repo_name(source['repository']); engine=source.get('engine',source_id)
     ledger_path=Path(project)/'knowledge/catalog/pr-ledgers'/f'{source_id}.json'
@@ -555,6 +559,7 @@ def discover_prs(store, source, token=None, limit=10, since=None):
 def apply_refresh(store, project, stage_id):
     safe_id(stage_id)
     stage=read_json(store.root/'wiki/staging'/f'{stage_id}.json')
+    if stage.get('failures'):raise FlowError('Cannot apply incomplete source acquisition; retry failed registered paths')
     layout.require_local_owner(project, stage['source'])
     receipt=read_json(store.root/'wiki/reviews'/f'{stage_id}.json')
     reviewed_pages = receipt.get('page_hashes', {p: d['page_sha256'] for p, d in receipt['decisions'].items()})
@@ -573,17 +578,39 @@ def apply_refresh(store, project, stage_id):
     if latest['commit']!=stage['commit']:raise FlowError('Newer acquisition exists')
     registry=read_json(Path(project)/'knowledge/sources.json')
     source=next(s for s in registry if s['id']==stage['source'])
+    proofs=stage.get('absence_proofs',{})
+    if any(not wiki.valid_absence_proof(proof,stage['commit'],name)
+           or proof.get('repository')!=stage['repository'] for name,proof in proofs.items()):
+        raise FlowError('Invalid fixed-path absence proof')
+    from .capture_policy import is_discovery
+    if source.get('kind')!='web' and is_discovery(source,project):
+        if stage['repository']!=source['repository'] or stage['ref']!=source['ref']:
+            raise FlowError('Source registration changed; refresh and review the selected repository/ref')
+        if set(stage['files'])&set(proofs) or set(stage['files'])|set(proofs)!=set(source.get('paths',[])):
+            raise FlowError('Source registration changed or staged path coverage is incomplete; refresh and review again')
     source['baseline_commit']=stage['commit'];source['baseline_files']=stage['files']
+    if proofs or 'baseline_absent_files' in source:source['baseline_absent_files']=proofs
     lock_path=Path(project)/'knowledge/source-lock.json'
     lock=read_json(lock_path)
-    records={(r['repo'],r['commit'],r['path']):r for r in lock['files']}
+    historical=[row for row in lock['files'] if not isinstance(row,dict) or not all(key in row for key in ('repo','commit','path'))]
+    records={(r['repo'],r['commit'],r['path']):r for r in lock['files'] if isinstance(r,dict) and all(key in r for key in ('repo','commit','path'))}
     for name,row in stage['files'].items():
         records[(stage['repository'],stage['commit'],name)]={'repo':stage['repository'],'commit':stage['commit'],
-            'ref':stage['ref'],'path':name,**row}
-    lock['files']=list(records.values());lock['observed_on']=utc()[:10]
+            'ref':stage['ref'],'path':name,**row,'status':'collected'}
+    lock['files']=[*historical,*records.values()];lock['observed_on']=utc()[:10]
+    if proofs or 'absences' in lock:
+        prior_absences=lock.get('absences',[])
+        historical_absences=[row for row in prior_absences if not isinstance(row,dict) or not all(key in row for key in ('repo','commit','path'))]
+        absences={(row['repo'],row['commit'],row['path']):row for row in prior_absences
+                  if isinstance(row,dict) and all(key in row for key in ('repo','commit','path'))}
+        for name,proof in proofs.items():
+            absences[(stage['repository'],stage['commit'],name)]={'repo':stage['repository'],'commit':stage['commit'],
+                'ref':stage['ref'],'path':name,'status':'proven-absent','proof':proof}
+        lock['absences']=[*historical_absences,*absences.values()]
     write_json(lock_path,lock);write_json(Path(project)/'knowledge/sources.json',registry)
+    navigation=_maybe_catalog(store,project)
     return {'status':'content-applied','source':stage['source'],'commit':stage['commit'],
-            'workflow_pending':receipt.get('workflow_deferred',[]),'runtime_validated':False}
+            'workflow_pending':receipt.get('workflow_deferred',[]),'runtime_validated':False,'catalog':navigation}
 
 
 def document_exclusions(source):
@@ -807,11 +834,70 @@ def project_catalog(project):
         'kind':'source-map','review_level':'navigation-only','runtime_validated':False,'sources':[]},index)
 
 
+def _navigation_inputs(project):
+    """Fingerprint exactly the small inputs used by lite link navigation.
+
+    Source document/PR bodies and historical ledgers are deliberately excluded:
+    the hub links their selected directories, rather than expanding each item.
+    """
+    project=Path(project).resolve()
+    root=project/'knowledge'
+    registry=read_json(root/'sources.json')
+    coverage=root/'coverage.json'
+    groups=read_json(coverage).get('projects',[]) if coverage.is_file() else []
+    identities={layout.project_id(project,source=source['id']) for source in registry}
+    if (root/'projects').is_dir():identities.update(path.name for path in (root/'projects').iterdir() if path.is_dir())
+    titles={}
+    def title(path):
+        if not path.resolve().is_relative_to(root.resolve()):raise FlowError('Navigation page link escapes knowledge root')
+        if path.is_file():
+            meta,_=wiki.parse_page(path)
+            titles[path.relative_to(project).as_posix()]=meta.get('title',path.stem)
+    selected=[]
+    for identity in sorted(identities):
+        directory=root/'projects'/identity
+        for section in ['overview','guides','topics','cases','changes']:
+            for page in sorted((directory/'knowledgebase/local'/section).rglob('*.md')):title(page)
+        selected.append((identity,[(kind,any((directory/'knowledgebase/upstream'/kind).rglob('*.md')))
+                                    for kind in ['docs','prs','source-map']]))
+    for group in groups:
+        for name in [group.get('entry'),*group.get('related_pages',[])]:
+            if name:title(child(project,name))
+    sources=[]
+    for source in registry:
+        value={key:source.get(key) for key in ['id','repository','kind','ref','knowledge_project','document_scope']}
+        value['source_map_present']=layout.source_map(project,source['id']).is_file()
+        value['selected_documents_present']=any(layout.document_root(project,source['id']).rglob('*.md'))
+        sources.append(value)
+    signature=fingerprint({'sources':sources,'groups':groups,'titles':titles,'selected_sections':selected})
+    outputs=[root/'catalog/README.md',root/'projects/README.md',
+             *(root/'projects'/identity/'README.md' for identity in sorted(identities))]
+    return signature,outputs
+
+
+def _maybe_catalog(store,project):
+    from .capture_policy import discovery_project
+    if not discovery_project(project):return {'status':'not-managed','rebuilt':False}
+    project=Path(project).resolve()
+    signature,outputs=_navigation_inputs(project)
+    path=store.root/'wiki/catalog-checks'/f'{fingerprint(str(project))}.json'
+    previous=read_json(path) if path.is_file() else {}
+    hashes={page.relative_to(project).as_posix():digest(page.read_bytes()) if page.is_file() else None for page in outputs}
+    if previous.get('input')==signature and previous.get('outputs')==hashes and all(hashes.values()):
+        return {'status':'unchanged','rebuilt':False}
+    catalog(project)
+    # catalog() may create the canonical project directories on its first run.
+    signature,outputs=_navigation_inputs(project)
+    hashes={page.relative_to(project).as_posix():digest(page.read_bytes()) for page in outputs}
+    write_json(path,{'project':str(project),'input':signature,'outputs':hashes})
+    return {'status':'catalogued','rebuilt':True,'scope':'registered routes and selected-page navigation only'}
+
+
 def update_source(store, project, source_id, token=None, max_prs=10, max_documents=40, since=None):
     source=source_for(project,source_id)
     if not source:raise FlowError('Unknown source')
     from .capture_policy import is_discovery
-    if is_discovery(source) and source.get('kind')!='web':
+    if is_discovery(source,project) and source.get('kind')!='web':
         return _update_discovery_source(store,project,source,token,max_prs,since)
     result={'source':source_id,'stages':{},'errors':[]}
     steps=([('inventory',lambda:inventory(store,project,source_id,token,True)),
@@ -837,18 +923,40 @@ def update_source(store, project, source_id, token=None, max_prs=10, max_documen
 
 
 def _locked_source_commit(project,source):
-    """Use the actual collected lock; a registry's original baseline may be old."""
+    """Reuse only the complete, hash-bound baseline that was actually applied.
+
+    The lock keeps historical and partial observations. Their latest timestamps
+    or status fields do not select the current reviewed baseline.
+    """
+    commit=source.get('baseline_commit')
+    files=source.get('baseline_files')
+    absent=source.get('baseline_absent_files',{})
+    if (not isinstance(commit,str) or not re.fullmatch(r'[0-9a-f]{40}',commit)
+            or not isinstance(files,dict) or not isinstance(absent,dict)):
+        return None
+    watched=set(source.get('paths',[]))
+    if set(files)&set(absent) or set(files)|set(absent)!=watched:
+        return None
     path=Path(project)/'knowledge/source-lock.json'
-    rows=read_json(path).get('files',[]) if path.is_file() else []
-    rows=[row for row in rows if row.get('repo','').lower()==source['repository'].lower()
-          and row.get('ref')==source['ref'] and row.get('status')=='collected']
-    if rows:
-        commits={row['commit'] for row in rows}
-        covered={row['path'] for row in rows}
-        return next(iter(commits)) if len(commits)==1 and set(source.get('paths',[]))<=covered else None
-    if set(source.get('paths',[]))<=set(source.get('baseline_files',{})):
-        return source.get('baseline_commit')
-    return None
+    lock=read_json(path) if path.is_file() else {}
+    repositories={repo_name(repo).lower() for repo in [source['repository'],*source.get('repository_aliases',[])]}
+    rows=[row for row in lock.get('files',[]) if isinstance(row,dict)
+          and str(row.get('repo','')).lower() in repositories and row.get('commit')==commit]
+    for name,expected in files.items():
+        sha=expected.get('sha256') if isinstance(expected,dict) else None
+        if not isinstance(sha,str) or not re.fullmatch(r'[0-9a-f]{64}',sha):return None
+        matches=[row for row in rows if row.get('path')==name]
+        # Old native apply rows had no status; exact applied hash bindings make
+        # them compatible. Explicit failed/partial records never become passes.
+        if not matches or any(row.get('sha256')!=sha or row.get('status') not in {None,'collected'} for row in matches):
+            return None
+    for name,proof in absent.items():
+        if not wiki.valid_absence_proof(proof,commit,name):return None
+        if str(proof.get('repository','')).lower() not in repositories:return None
+        matches=[row for row in lock.get('absences',[]) if isinstance(row,dict) and row.get('commit')==commit and row.get('path')==name
+                 and str(row.get('repo','')).lower() in repositories]
+        if not matches or any(row.get('proof')!=proof or row.get('status')!='proven-absent' for row in matches):return None
+    return commit
 
 
 def _update_discovery_source(store,project,source,token,max_prs,since):
@@ -878,6 +986,10 @@ def _update_discovery_source(store,project,source,token,max_prs,since):
         result['stages']['prs']=sync_prs(store,project,source['id'],token,max_prs,since)
     except (OSError,ValueError) as exc:
         result['errors'].append({'stage':'prs','error':str(exc)[:240]})
+    try:
+        result['stages']['catalog']=_maybe_catalog(store,project)
+    except (OSError,ValueError) as exc:
+        result['errors'].append({'stage':'catalog','error':str(exc)[:240]})
     partial=result['errors'] or any(stage.get('status')=='partial' for stage in result['stages'].values())
     content=result['stages'].get('content',{})
     result['status']='partial' if partial else ('unchanged' if content.get('status')=='unchanged' else 'pending-content-review')

@@ -3,18 +3,38 @@ import json
 from pathlib import Path
 import re
 
-from .core import digest, read_json
+from .core import FlowError, digest, read_json
 
 
-def is_discovery(source):
+def is_discovery(source, project=None):
+    """The project profile is the default; a full capture must be explicit.
+
+    Callers without project context retain legacy defaults. This preserves old
+    standalone integrations without letting a new source in a lite project
+    silently opt back into all-discussion retention.
+    """
     policy = source.get('capture_policy', {})
-    return isinstance(policy, dict) and policy.get('changes') == 'discover'
+    if not isinstance(policy, dict):
+        raise FlowError('capture_policy must be a mapping')
+    if 'mode' in policy and (not isinstance(policy['mode'],str) or policy['mode'] not in {
+            'federated', 'selected_evidence', 'core_local', 'text_fallback', 'legacy_history'}):
+        raise FlowError('Unknown capture_policy mode')
+    if 'write_views' in policy and type(policy['write_views']) is not bool:
+        raise FlowError('capture_policy.write_views must be boolean')
+    changes = policy.get('changes')
+    if 'changes' in policy:
+        if not isinstance(changes,str) or changes not in {'discover', 'full'}:
+            raise FlowError('capture_policy.changes must be discover or full')
+        return changes == 'discover'
+    return bool(project is not None and discovery_project(project))
 
 
 def discovery_project(project, repository=None):
     root = Path(project)
     storage = root / 'knowledge/storage.json'
     settings = read_json(storage) if storage.is_file() else {}
+    if not isinstance(settings,dict):
+        raise FlowError('knowledge/storage.json must be a mapping')
     if settings.get('profile', settings.get('capture_profile')) == 'discovery-first':
         return True
     registry = root / 'knowledge/sources.json'

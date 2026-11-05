@@ -2,7 +2,19 @@
 
 两个入口分别为 `$hcu-trainflow-wiki-search` 和 `$hcu-trainflow-wiki-skill-update`。覆盖官方资料、可复用环境经验与最终模型优化总结；维护入口同时检查受影响的工作流用法并同步本机安装。任务初期、阶段验收和最终收尾的触发见 [维护时机](knowledge-architecture.md#任务中的维护时机)。
 
-lite 的 `knowledge/storage.json` 使用 `discovery-first`：普通 GitHub/GitLab PR 由联搜发现，直接打开原页，或按需读取正文与固定代码。评论、review 和 diff 不作全量离线镜像，也不因这些字段无法搜索而强制本地保底。已有作者知识、实际引用证据、站点经验及最终总结继续保留。重构不触发来源资料全量更新，用户仍用原来的搜索和更新入口。
+lite 的 `knowledge/storage.json` 使用 `discovery-first`：普通 GitHub/GitLab PR 由联搜发现，直接打开原页，或按需读取正文与固定代码。评论、review 和 diff 不作全量离线镜像，也不因这些字段无法搜索而强制本地保底。已有作者知识、实际引用证据、站点经验及最终总结继续保留。后续日常更新按实际授权检查所选来源，用户仍用原来的搜索和更新入口；“全来源更新”不等于全量 PR/讨论镜像。
+
+## 日常 lite 维护与发布
+
+本工程后续共享 Wiki/Skill 维护使用 `knowledge/storage.json` 的 `maintenance_branch: lite`。写入共享知识、来源锁或发布本仓前，先核对实际工程根、安装绑定、Git 工作区与当前分支为 lite；发现其他分支、detached HEAD、外来绑定或未处理改动时保留现场，不自动 checkout/reset/rebind。普通查询和私有缓存不因此切换分支。上游工程继续使用各自选定的 ref/commit，不统一改为 lite。
+
+检查工程时可使用 `git status --short --branch`、`git branch --show-current` 与 `git rev-parse --show-toplevel`；确认当前路径就是选定 checkout。遇到分支/绑定不符时先核对原因，保留未提交改动，不用强制切换掩盖问题。
+
+更新继续按原 Skill 和 wiki-update 等入口执行。新增 Git 来源未给策略时继承 discovery-first；legacy 全量采集须显式选择，不因新来源遗漏配置而回退。这里只约束本仓维护分支，不改官方来源的实际分支、版本或父锁。
+
+wiki-update/wiki-apply 按导航输入变化条件刷新轻量目录，包括实际来源、作者页、已保留页面或阅读入口的变化；无变化复用。手动修改作者页或路由后仍可按需执行 wiki-catalog 与 wiki-index。显式更新会真实读取所需新内容并保留失败范围，不能把历史重构记录中的“未刷新事实”作为后续禁止更新的规则。
+
+后续维护检查通过并按已有授权提交后，确认实际分支仍为 lite，再用 `git push origin HEAD:refs/heads/lite` 发布本仓并核对远端该分支与实际 CI；不推 main、不 force，不自动创建或推送标签。用户另行明确要求标签时才单独处理。
 
 ## 内容分层
 
@@ -58,7 +70,7 @@ hcu-trainflow wiki-search "weight transfer" --engine vllm --kind source-document
 
 多 Agent 或多个 checkout 共用私有工作区时，后续全文读取使用 `wiki-read PAGE_ID --generation SEARCH_RETURNED_GENERATION`，保证读取刚才命中的同一快照；也可 `--project PROJECT` 明确读取该工程当前本地版本。省略两者只兼容使用最近的 active 索引，不适合并发跨工程读取。
 
-**本地无候选**时，`wiki-search` 默认 `--online-pr auto` 按 engine/source/repo 范围搜索线上 PR；无范围时要求先确定仓。**有结果但不能回答问题**时，由 Agent 判断并主动 `wiki-search-pr` 或 `--online-pr always`，不能因有命中就停止。纯离线用 `--online-pr off`。
+lite 的 `wiki-search --online-pr auto` 在本地无候选、词项覆盖不足、命中页已变化，或问题明确要求最新进展/PR 时联搜线上 PR。显式 engine/source/repo 范围完整保留；未指定范围时只从本地候选推断最多 3 个有效引擎、6 个仓库，无可靠范围则提示先选仓，不随机扫仓。这只是候选充分性检查，不表示语义答案已验证。**有结果但不能回答问题**时，Agent 仍需主动 `wiki-search-pr` 或 `--online-pr always`。纯离线用 `--online-pr off`，旧非 lite 工程保留零命中回退行为。
 
 ```bash
 hcu-trainflow wiki-search-pr "weight sync" --engine verl --state merged --limit 10

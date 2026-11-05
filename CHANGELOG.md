@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1 — 2026-11-05
+
+- Make lite the persistent maintenance branch and keep new installations on it. Check the selected TrainFlow target and configured branch before shared CLI writes; preserve unrelated changes and read-only search. Upstream source refs remain independent.
+- Let new Git sources inherit discovery-first. Use the complete applied baseline for no-change checks, preserve proven path removals separately from read failures, reuse unchanged private query objects, and refresh light navigation only when its inputs change.
+- Extend bounded PR discovery to weak local candidates and explicit freshness/PR intent. Preserve complete explicit scopes, limit inferred scopes, keep private context local, and retain on-demand original/code reading.
+- Align six Skills and the exact independently published HCU-Knowledge dependency. This review fixes maintenance behavior without refreshing upstream facts or adding hardware qualification.
+
 ## 0.8.0 — 2026-11-05
 
 - Refactor maintenance around PR URL discovery and question-driven reading. Ordinary PRs no longer create full body/comment/review/diff mirrors; explicitly important or cited evidence remains traceable. No upstream facts are refreshed by this migration.

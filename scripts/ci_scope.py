@@ -12,6 +12,10 @@ DATA_TESTS = [
     'tests/test_knowledge_consistency.py', 'tests/test_wiki_coverage.py',
     'tests/test_documentation.py', 'tests/test_skill_routing.py',
     'tests/test_full_setup.py', 'tests/test_ci_scope.py',
+    'tests/test_official_lite.py', 'tests/test_wiki_index_lite.py',
+    'tests/test_wiki_coverage_lite.py', 'tests/test_persistent_lite_contract.py',
+    'tests/test_wiki_maintenance_branch.py', 'tests/test_wiki_search_policy.py',
+    'tests/test_official_incremental_review.py',
 ]
 
 

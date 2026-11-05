@@ -14,6 +14,8 @@
 
 ## 安装后如何定位和读取
 
+共享知识/Skill 写入或本仓发布前，先按 [日常 lite 维护与发布](wiki.md#日常-lite-维护与发布)核对 checkout 为 lite。这不改变上游来源的独立 ref/commit，也不为普通检索自动切换分支。
+
 六个已安装 Skill 的 `workspace.json.project_root` 指向工程 checkout。工程内 `docs/...`、`knowledge/...`、`skills/...` 均相对于该根目录；Skill 内的 `references/...` 相对于该 Skill 目录。跨 Skill 的阅读链接从工程副本解析，不能把 `../../docs` 当成系统 Skills 目录旁边的文件。
 
 首次使用、换 Agent 或工程升级后，先核对绑定及当前模式，读取本页对应行。安装目录的 Skill/reference 与工程版本必须一致；可用 `python scripts/sync_local_install.py --target <实际Skills目录> --check` 检查。正常轮次沿用已读且未变的规则，只补当前分支，不每轮通读全部文档。绑定失效、文件缺失或本地 Skill 过期应先修复；普通训练任务不为修复安装擅自拉上游或更换远端依赖。

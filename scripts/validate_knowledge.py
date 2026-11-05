@@ -29,8 +29,22 @@ def local_path(root, name):
     return path if path.is_relative_to(root.resolve()) else None
 
 
-def validate_baselines(sources, records):
+def validate_baselines(sources, records, absences=()):
     errors = []
+    from hcu_trainflow.wiki import valid_absence_proof
+    absent_records = {}
+    for row in absences:
+        key = (row.get('repo'), row.get('commit'), row.get('path'))
+        if key in absent_records:
+            errors.append('Duplicate source lock absence record')
+        absent_records[key] = row
+        proof = row.get('proof') or {}
+        if (row.get('status') != 'proven-absent' or not isinstance(proof, dict)
+                or proof.get('repository') != row.get('repo')
+                or not valid_absence_proof(proof, row.get('commit'), row.get('path'))):
+            errors.append(f'Source lock absence has no complete fixed-commit proof: {key}')
+        if key in records:
+            errors.append(f'Source lock path is both present and absent: {key}')
     for sid, source in sources.items():
         for name, row in source.get('baseline_files', {}).items():
             record = records.get((source.get('repository'), source.get('baseline_commit'), name))
@@ -38,6 +52,15 @@ def validate_baselines(sources, records):
                 errors.append(f'{sid}: baseline source missing/hash mismatch: {name}')
             if name not in source.get('paths', []):
                 errors.append(f'{sid}: baseline path not monitored: {name}')
+        for name, proof in source.get('baseline_absent_files', {}).items():
+            key = (source.get('repository'), source.get('baseline_commit'), name)
+            record = absent_records.get(key, {})
+            if (not valid_absence_proof(proof, source.get('baseline_commit'), name)
+                    or proof.get('repository') != source.get('repository')
+                    or record.get('proof') != proof or record.get('status') != 'proven-absent'):
+                errors.append(f'{sid}: baseline absence missing/invalid proof: {name}')
+            if name not in source.get('paths', []) or name in source.get('baseline_files', {}):
+                errors.append(f'{sid}: baseline absence unmonitored or also present: {name}')
     return errors
 
 
@@ -216,7 +239,7 @@ def validate(root):
             errors.append('Unmonitored maintenance path for '+rule['source'])
         for target in rule['targets']:
             if not (root/target).is_file():errors.append('Missing maintenance target '+target)
-    errors.extend(validate_baselines(sources, records))
+    errors.extend(validate_baselines(sources, records, lock.get('absences', [])))
     errors.extend(validate_catalog(root, sources, pages))
     errors.extend(validate_dependency_sources(root, sources, pages))
     errors.extend(validate_project_layout(root, sources, pages))

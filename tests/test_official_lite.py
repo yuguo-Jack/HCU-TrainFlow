@@ -12,7 +12,7 @@ def project(tmp_path):
     root=tmp_path/'project'
     (root/'knowledge').mkdir(parents=True)
     write_json(root/'knowledge/sources.json',[{'id':'engine','repository':'org/engine','ref':'main',
-               'baseline_commit':'a'*40,'paths':['a.py'],
+               'baseline_commit':'b'*40,'paths':['a.py'],'baseline_files':{'a.py':{'sha256':'c'*64}},
                'capture_policy':{'mode':'federated','changes':'discover','write_views':False}}])
     write_json(root/'knowledge/source-lock.json',{'files':[{'repo':'org/engine','ref':'main',
                'path':'a.py','commit':'b'*40,'status':'collected','sha256':'c'*64}]})

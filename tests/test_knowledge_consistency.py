@@ -80,6 +80,25 @@ def errors(project):
     return validator.validate(project)['errors']
 
 
+def test_proven_missing_baseline_requires_matching_versioned_absence_lock():
+    proof = {'kind':'fixed-complete-inventory-absence-v1', 'repository':'org/tool',
+             'commit':CURRENT, 'path':'removed.py', 'complete':True,
+             'inventory_artifact_sha256':'e'*64}
+    source = {'repository':'org/tool', 'baseline_commit':CURRENT, 'paths':['removed.py'],
+              'baseline_files':{}, 'baseline_absent_files':{'removed.py':proof}}
+    record = {'repo':'org/tool', 'commit':CURRENT, 'path':'removed.py',
+              'status':'proven-absent', 'proof':proof}
+    assert validator.validate_baselines({'tool':source}, {}, [record]) == []
+    assert validator.validate_baselines({'tool':source}, {})
+    wrong = {**record, 'commit':OLD}
+    assert validator.validate_baselines({'tool':source}, {}, [wrong])
+    incomplete = {**record, 'proof':{**proof, 'complete':False}}
+    assert validator.validate_baselines({'tool':source}, {}, [incomplete])
+    assert any('Duplicate' in error for error in validator.validate_baselines({'tool':source}, {}, [record, record]))
+    assert any('both present and absent' in error for error in validator.validate_baselines(
+        {'tool':source}, {('org/tool',CURRENT,'removed.py'):{'sha256':CURRENT_HASH}}, [record]))
+
+
 def test_bracketed_pr_titles_do_not_hide_broken_authored_links(project):
     path = project / 'knowledge/current.md'
     body = '[PR: [dev] overlap](prs/gone.md)\n[PR: [PyTorch] linear](historical.md)'

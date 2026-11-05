@@ -248,12 +248,113 @@ def refresh_source(store, project, source_id, token=None, fixed_commit=None):
     else:
         # A coordinated update reads the same tree for inventory, documents and
         # monitored code, even if the branch advances while PRs are collected.
-        acquisition_source = {**source, 'ref': fixed_commit} if fixed_commit else source
+        from .capture_policy import is_discovery
+        acquisition_source = {**source, '_capture_discovery':is_discovery(source,project)}
+        if fixed_commit:acquisition_source['ref']=fixed_commit
         sha, files, failures = collect_git_files(store, acquisition_source, token)
         if fixed_commit and sha != fixed_commit:
             raise FlowError('Source changed during fixed commit acquisition')
         ref = source['ref']
     return stage_source_refresh(store, project, source, sha, files, failures, ref)
+
+
+class SourceFiles(dict):
+    """Keep the old acquisition tuple while carrying explicit absence proofs."""
+    def __init__(self):
+        super().__init__()
+        self.absence_proofs={}
+
+
+def valid_absence_proof(proof, commit, path):
+    if (not isinstance(commit,str) or not re.fullmatch(r'[0-9a-f]{40}',commit)
+            or not isinstance(path,str) or not path or '\\' in path or '\0' in path
+            or path.startswith('/') or re.match(r'^[A-Za-z]:',path)
+            or any(part in {'','.','..'} for part in path.split('/'))):
+        return False
+    if (not isinstance(proof,dict) or proof.get('commit')!=commit or proof.get('path')!=path
+            or proof.get('complete') is not True or not isinstance(proof.get('repository'),str)):
+        return False
+    if proof.get('kind')=='fixed-complete-inventory-absence-v1':
+        return bool(re.fullmatch(r'[0-9a-f]{64}',str(proof.get('inventory_artifact_sha256',''))))
+    if proof.get('kind')!='fixed-git-tree-absence-v1':return False
+    missing=proof.get('missing_path')
+    if not isinstance(missing,str) or not (path==missing or path.startswith(missing+'/')):return False
+    if any(part in {'','.','..'} for part in missing.split('/')):return False
+    trees=proof.get('trees')
+    parents=missing.split('/')[:-1]
+    expected_chain=['/'.join(parents[:index]) for index in range(len(parents)+1)]
+    if (not isinstance(trees,list) or any(not isinstance(row,dict) for row in trees)
+            or [row.get('path') for row in trees]!=expected_chain
+            or not trees or trees[0].get('sha')!=proof.get('root_tree')):
+        return False
+    return (bool(re.fullmatch(r'[0-9a-f]{40}',str(proof.get('root_tree',''))))
+            and bool(re.fullmatch(r'[0-9a-f]{64}',str(proof.get('commit_artifact_sha256',''))))
+            and isinstance(trees,list) and bool(trees)
+            and all(isinstance(row,dict) and row.get('complete') is True
+                    and re.fullmatch(r'[0-9a-f]{40}',str(row.get('sha','')))
+                    and re.fullmatch(r'[0-9a-f]{64}',str(row.get('artifact_sha256',''))) for row in trees))
+
+
+def prove_git_path_absence(store, source, commit, name, token=None, *, cache=None, commit_info=None):
+    """Prove a missing component using fixed, non-recursive parent trees.
+
+    A failed raw/contents read is not evidence of deletion. Truncated trees,
+    submodule/symlink traversal and malformed responses remain unavailable.
+    Only the necessary parent chain is read; there is no whole-tree expansion.
+    """
+    repo=source['repository']
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repo) or not re.fullmatch(r'[0-9a-f]{40}',commit):
+        raise FlowError('Absence proof requires a registered public repository and fixed commit')
+    parts=name.split('/')
+    if not name or '\\' in name or any(part in {'','.','..'} for part in parts):raise FlowError('Invalid proof path')
+    cache={} if cache is None else cache
+    prefix=f'https://api.github.com/repos/{repo}'
+    root_key=('root',commit)
+    if root_key not in cache:
+        info=commit_info or {}
+        tree=(info.get('commit') or {}).get('tree',{}).get('sha') if isinstance(info,dict) else None
+        if tree and info.get('sha')!=commit:raise FlowError('Fixed commit tree proof mismatch')
+        if not isinstance(tree,str) or not re.fullmatch(r'[0-9a-f]{40}',tree):
+            info,_=_get_json(prefix+'/git/commits/'+commit,token)
+            if not isinstance(info,dict) or info.get('sha')!=commit:raise FlowError('Fixed Git commit proof mismatch')
+            tree=(info.get('tree') or {}).get('sha')
+        if not isinstance(tree,str) or not re.fullmatch(r'[0-9a-f]{40}',tree):raise FlowError('Fixed commit tree is unavailable')
+        artifact=store.put(json.dumps(info,ensure_ascii=False,sort_keys=True).encode(),'public')
+        cache[root_key]=(tree,artifact)
+    root_tree,commit_artifact=cache[root_key]
+    tree=root_tree
+    parent=[]
+    chain=[]
+    for index,part in enumerate(parts):
+        key=('tree',tree)
+        if key not in cache:
+            value,_=_get_json(prefix+'/git/trees/'+tree,token)
+            if (not isinstance(value,dict) or value.get('sha')!=tree or value.get('truncated') is not False
+                    or not isinstance(value.get('tree'),list)):
+                raise FlowError('A complete fixed parent tree is required; absence remains unproved')
+            if len(value['tree'])>10000:raise FlowError('Parent tree exceeds bounded proof window')
+            entries={}
+            for row in value['tree']:
+                if (not isinstance(row,dict) or not isinstance(row.get('path'),str) or not row['path']
+                        or '/' in row['path'] or '\\' in row['path'] or row['path'] in {'.','..'}
+                        or row.get('type') not in {'blob','tree','commit'}
+                        or not isinstance(row.get('sha'),str) or not re.fullmatch(r'[0-9a-f]{40}',row['sha'])
+                        or row['path'] in entries):
+                    raise FlowError('Malformed or ambiguous fixed parent tree')
+                entries[row['path']]=row
+            artifact=store.put(json.dumps(value,ensure_ascii=False,sort_keys=True).encode(),'public')
+            cache[key]=(entries,artifact)
+        entries,artifact=cache[key]
+        chain.append({'path':'/'.join(parent),'sha':tree,'artifact_sha256':artifact,'complete':True})
+        row=entries.get(part)
+        if row is None:
+            return {'kind':'fixed-git-tree-absence-v1','repository':repo,'commit':commit,'path':name,
+                    'root_tree':root_tree,'commit_artifact_sha256':commit_artifact,'trees':chain,
+                    'missing_path':'/'.join([*parent,part]),'complete':True}
+        if index==len(parts)-1 or row['type']!='tree':return None
+        parent.append(part)
+        tree=row['sha']
+    return None
 
 
 def collect_git_files(store, source, token=None):
@@ -265,17 +366,26 @@ def collect_git_files(store, source, token=None):
     sha = commit["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise FlowError("Unexpected commit SHA")
-    files, failures = {}, []
+    files, failures = SourceFiles(), []
+    from .capture_policy import is_discovery
+    discovery=source.get('_capture_discovery',False) or is_discovery(source)
+    proof_cache={}
     inventory_path=store.root/'wiki/inventory'/(source['id']+'.json')
     known_tree=None
     if inventory_path.exists():
         inventory=read_json(inventory_path)
         if inventory['commit']==sha:
             known_tree=json.loads(store.artifact(inventory['artifact']))['entries']
-    for name in source["paths"]:
+    for name in source.get("paths",[]):
         if name.startswith("/") or ".." in Path(name).parts:
             raise FlowError("Invalid registered source path")
-        if known_tree is not None and name not in known_tree:
+        blocked_parent=known_tree is not None and any(
+            prefix in known_tree and known_tree[prefix].get('type')!='tree'
+            for prefix in ('/'.join(name.split('/')[:index]) for index in range(1,len(name.split('/')))))
+        if known_tree is not None and name not in known_tree and not (discovery and blocked_parent):
+            if discovery:
+                files.absence_proofs[name]={'kind':'fixed-complete-inventory-absence-v1','repository':repo,
+                    'commit':sha,'path':name,'inventory_artifact_sha256':inventory['artifact'],'complete':True}
             continue  # Complete tree at this exact SHA proves removal; stage diff requires review.
         url = f"https://raw.githubusercontent.com/{repo}/{sha}/" + urllib.parse.quote(name)
         try:
@@ -292,7 +402,18 @@ def collect_git_files(store, source, token=None):
                 code=read_code(store,repo,sha,name,token,max_chars=1)
                 files[name]={'sha256':code['artifact'],'url':code['url']}
             except (OSError,ValueError) as fallback:
-                failures.append({"path":name,"status":"unavailable","error":str(fallback)[:240],"raw_error":type(exc).__name__})
+                proof_error=None
+                if discovery:
+                    try:
+                        proof=prove_git_path_absence(store,source,sha,name,token,cache=proof_cache,commit_info=commit)
+                        if proof:
+                            files.absence_proofs[name]=proof
+                            continue
+                    except (OSError,ValueError) as error:
+                        proof_error=str(error)[:240]
+                failure={"path":name,"status":"unavailable","error":str(fallback)[:240],"raw_error":type(exc).__name__}
+                if proof_error:failure['absence_proof_error']=proof_error
+                failures.append(failure)
     return sha, files, failures
 
 
@@ -388,6 +509,11 @@ def stage_source_refresh(store, project, source, sha, files, failures, ref):
             maintenance.append(name)
     result = {"source": source_id, "repository": repo, "ref": ref, "commit": sha, "files": files, "changed_paths": changes,
               "affected_pages": affected, "affected_workflows": sorted(set(maintenance)), "failures": failures, "observed_at": utc(), "status": "partial" if failures else "collected-not-reviewed"}
+    proofs=getattr(files,'absence_proofs',{})
+    if proofs:
+        if any(not valid_absence_proof(proof,sha,name) for name,proof in proofs.items()):
+            raise FlowError('Invalid fixed-path absence proof')
+        result['absence_proofs']=proofs
     result['page_inventory'] = page_hashes
     result['workflow_hashes'] = reviewed_workflows
     result['revision_kind'] = 'web-content-fingerprint' if source.get('kind') == 'web' else 'git-commit'

@@ -2,6 +2,8 @@
 
 ## 完整安装
 
+本工程的新安装和后续共享知识维护默认使用 lite。首次克隆选择 `git clone --branch lite --single-branch --depth 1 https://github.com/yuguo-Jack/HCU-TrainFlow.git`；已有独立 checkout 先核对分支、绑定和工作区，保留本地改动，不静默切换或覆盖。维护与发布遵循 [日常 lite 维护与发布](wiki.md#日常-lite-维护与发布)；只读使用历史版本不要求切分支。
+
 安装/升级采用[明确的维护写入范围](workspace-boundaries.md#4-必要例外与知识维护)：选定工程、第三方安装目录、实际 Python 与 Skill 目录。普通训练运行则默认写任务工作空间，不借安装绑定修改共享依赖或其他任务。
 
 系统 Python 3.10+、Git、Git LFS 和 HCU-Knowledge 读取权限是基础条件。`thirdparty/manifest.json` 锁定 TraceLens HCU fork、三个 Hygon 算子 Skill 的源仓以及必需的 HCU-Knowledge。第三方依赖本身只登记来源清单，不把完整 checkout 或 HCU-Knowledge 全量复制到本仓。本工程自带 Wiki 则提交实际站点知识、配方、测量及精选证据，见 [知识归属](knowledge-architecture.md)；凭据永不入仓。
@@ -127,7 +129,7 @@ python -m pip install -e thirdparty/TraceLens
 
 ### lite 知识读取契约
 
-HCU-Knowledge 锁定已独立交付的 lite 提交，直接复用其原 search/read/original/read-code/search-pr/read-pr 入口和实际安装绑定，不要直接拼接旧 derived、压缩包或源码缓存路径。普通 GitHub/GitLab PR 以联搜找到入口为目标；正文、讨论、diff 和固定代码按需读取，不因评论/review 无法被平台搜索而建立完整本地镜像。存储重构没有重新验证训练事实，原始事实版本和实测日期继续保留。私有知识原件不进入公开 TrainFlow 的 Wiki、索引或证据。
+HCU-Knowledge 锁定已独立交付的 lite 提交，直接复用其原 search/read/original/read-code/search-pr/read-pr 入口和实际安装绑定，不要直接拼接旧 derived、压缩包或源码缓存路径。普通 GitHub/GitLab PR 以联搜找到入口为目标；正文、讨论、diff 和固定代码按需读取，不因评论/review 无法被平台搜索而建立完整本地镜像。历史存储重构没有重新验证训练事实；后续真正更新资料时按实际内容推进版本与复核记录，原始实测日期不随维护自动改写。私有知识原件不进入公开 TrainFlow 的 Wiki、索引或证据。
 
 本仓 `knowledge/storage.json` 声明 discovery-first / shared-v1。旧普通 PR 原件可以从固定 Git 历史按需恢复，新克隆若需这些历史原件应保留对应 main/旧标签的提交对象；浅检出缺少固定对象时，按读取器提示定向补取该版本或打开固定原页。当前精选证据保持直接可读。历史解析与查阅缓存属于可重建副本，不要求为普通搜索重新建立全部 PR 正文路径。来源原页不可访问时说明缺口，不把缺口补写为已验证结论。
 

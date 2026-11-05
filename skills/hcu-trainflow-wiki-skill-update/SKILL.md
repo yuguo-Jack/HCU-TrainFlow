@@ -5,6 +5,8 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 # hcu-trainflow-wiki-skill-update
 
+本工程后续共享 Wiki/Skill 维护使用 `knowledge/storage.json` 的 `maintenance_branch: lite`。写入共享知识、来源锁或发布本仓前，先核对实际工程根、安装绑定、Git 工作区与当前分支为 lite；发现其他分支、detached HEAD、外来绑定或未归属本任务的改动时保留现场，不自动 checkout/reset/rebind。普通查询和私有缓存不因此切换分支。上游工程继续使用各自选定的 ref/commit，不统一改为 lite。
+
 知识检索按问题推进：先复用已有解释，不足时联搜 PR 或官方页面，找到入口后按需读原页、固定源码和必要讨论。普通 PR 不要求离线镜像正文、评论、review 或 diff，也不要求每仓全量总结。只有形成结论所需的重要或引用证据才正式保留；HCU 内部仓继续通过 `$hcu-knowledge-search` 查证。当前入口和命令习惯保持，资料发现、内容复核与现场实测分别记录。
 
 ## 开始前定位与阅读
@@ -23,7 +25,7 @@ description: 维护 HCU-TrainFlow-Wiki 的官方资料、通用环境经验与�
 
 先判断本次属于官方来源、经验总结、工作流用法维护中的哪些范围：官方来源按下述更新协议；只提炼经验时按“站点、模型经验与任务档案的维护”处理，不附带全量采集 PR。两者都执行相关性、证据、索引/检索和安装收尾检查。直接修改本仓流程/Skill 后同样同步安装。CLI 的 knowledge_followup 只是给 Agent 的非阻塞提醒，不是自动执行服务；把实际处理结果写入原任务计划/看板。未形成可复用知识就记录原因，不凑页面。
 
-训练中按相关来源和变化范围维护：只有影响当前命令、接口或结论的漂移才立即处理；无关上游新特性、全库补采和共享总结排到合适里程碑，不作为开始实验的前置工作。用户明确要求全量更新时仍覆盖全部登记来源。复核按影响选代码/检索/安装测试，纯文字改动不触发整套 GPU 实验；采集成功且未变内容不反复重读，关联判断和当前内容哈希仍须一致。
+训练中按相关来源和变化范围维护：只有影响当前命令、接口或结论的漂移才立即处理；无关上游新特性、全库补采和共享总结排到合适里程碑，不作为开始实验的前置工作。用户要求全部来源更新时，按 lite 策略检查全部登记来源的实际变化；这不扩大为全部 PR 正文、评论或历史补采。复核按影响选代码/检索/安装测试，纯文字改动不触发整套 GPU 实验；采集成功且未变内容不反复重读，关联判断和当前内容哈希仍须一致。
 
 ## 更新协议
 
@@ -47,7 +49,7 @@ HCU 大知识库已变更或用户要求对齐时，先只读核对其当前提�
    故障诊断与适配/优化异常接口确有变化时，复核规模长稳 Skill 的 `references/diagnosis.md`、`references/evidence-sources.md`、环境检查与模型适配的 `references/troubleshooting.md` 和 optimize 的 `references/validation-diagnostics.md`。按实际变化检查 DTK hipgdb/hipprof、runtime 信号/转储、RCCL/PyTorch 日志及内存 API、hcuprobe 与 Cluster Manager 的部署分支/恢复语义；缺现场测试保留待验证，不因纯存储重构重做这些事实检查。
 7. 修改后对实际受影响的页面/工作流写 decisions：decision、note、当前 page_sha256、新 source_commit。`wiki-review` 验证回执后，`wiki-apply` 再检查并写公共锁/基线，然后 wiki-index。确实依赖现场的 Skill/命令验证可 --defer-workflows 说明具体缺口，程序保留待办并在下次继续显示；Wiki 内容可先完成，不能把延后项标通过。采集、内容复核、软件发布与硬件实测分别记录。
    复核后又改正文/工作流或新增同来源专题时，重新检查并留下新回执；即使上游没有新变化也不能沿用过期复核。PR 重采后同样处理由作者页变动引起的待办。
-8. wiki-catalog 刷新来源/文档/PR 导航（wiki-update 已在收尾调用），wiki-index 更新搜索。运行本工程测试和真实问题检索，保存本次缺口及下次入口。Wiki 提交与 push 沿用任务授权；站点知识按本仓归属规则提交，凭据不入仓。原始缓存可重建，但源码版本锁、作者结论和公开证据链接必须保留。
+8. wiki-update/wiki-apply 按导航输入变化条件刷新轻量 catalog；无变化时复用，不制造新版本。手动增改作者页、来源路由或精选材料后，按需显式 wiki-catalog，再以 wiki-index 更新本地检索；不要假定每次 wiki-update 都会重建导航。运行受影响软件检查和真实问题检索，保留范围与未解决项。后续维护检查通过并按已有授权提交后，确认实际分支仍为 lite，再用 `git push origin HEAD:refs/heads/lite` 发布本仓并核对远端该分支与实际 CI；不推 main、不 force，不自动创建或推送标签。用户另行明确要求标签时才单独处理。站点知识按归属规则提交，凭据不入仓；固定版本锁、作者结论与必要证据继续保留。
 9. **维护收尾包含本机同步。** 本仓 Wiki/docs、Skill/reference、脚本、CLI 或包配置有改动，复核和测试通过后，定位当前 Skill 安装所在的实际 Skills 目录，运行 `python scripts/sync_local_install.py --target <实际Skills目录>`，再以 `--check` 只读复核。它先检查 editable 包的真实来源和版本，只有元数据漂移才离线刷新；Skill 按内容哈希只同步变化项，并核对绑定与阅读资源；失败不能报更新全部完成，按 `.work/setup/local-sync.json` 修复后重跑。源依赖约束、构建依赖或 thirdparty 锁有变化时先按 `docs/integrations.md` 完成对应安装/验证，局部同步不能代替依赖升级验收。仅文档/Wiki 内容通过 checkout 直接读取，但仍检查整个安装状态；同步完成后提醒新会话载入。其他安装目录只在明确选定时同步，不扫描所有 Agent；不自动更新 HCU-Knowledge。
 
 实际依赖升级需另外复核 thirdparty/manifest.json：锁定提交、bootstrap 指定工具、重装对应 Python 依赖/Skill，再检查接口和报告。脏 checkout 不覆盖。更新局部 Wiki 不触发 HCU-Knowledge 拉取或更新，其私有权限缺口单独报告。参见项目 docs/integrations.md。

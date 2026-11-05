@@ -8,7 +8,7 @@ Python 3.10+、SQLite FTS5、PyYAML（安装本包时拉取）。开发测试需
 
 ## 完整安装
 
-在已克隆的工程根目录执行；此命令安装必需依赖、知识检索和 11 个 Skill。内部知识库来源、已有知识库绑定及升级见[安装说明](integrations.md)。
+首次克隆显式选择 lite：`git clone --branch lite --single-branch --depth 1 https://github.com/yuguo-Jack/HCU-TrainFlow.git`。已有工程先核对实际路径和 `git branch --show-current`，不要为安装强制切换带改动的 checkout。在已确认的 lite 工程根目录执行；此命令安装必需依赖、知识检索和 11 个 Skill。内部知识库来源、已有知识库绑定及升级见[安装说明](integrations.md)。
 
 ```powershell
 git lfs install

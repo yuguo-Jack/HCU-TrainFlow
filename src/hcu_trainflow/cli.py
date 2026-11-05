@@ -132,6 +132,8 @@ def parser():
 
 def execute(a):
     from . import admission, analysis, coordination, delivery, environment, execution, flow, monitor, quality, team, wiki, official, experience
+    from .maintenance_branch import guard_cli
+    guard_cli(a)
     store = Store(a.workspace)
     c = a.command
     if c == "init": return {"workspace": str(store.root), "schema_version": 1, "version": __version__}
@@ -290,10 +292,9 @@ def execute(a):
     if c == "wiki-search":
         index=wiki.index_wiki(store,a.project)
         result=wiki.search_wiki(store,a.query,a.limit,a.engine,a.stage,a.kind,index=index)
-        if a.online_pr == 'always' or a.online_pr=='auto' and not result['results']:
-            result['online_pr']=official.annotate_prs(a.project,official.search_prs(store,a.pr_query or a.query,official.engine_repos(a.project,a.engine,a.source,a.repo),limit=a.limit))
-            if result['online_pr'].get('status') == 'partial':
-                result['status']='partial'
+        from .wiki_search_policy import augment
+        augment(store, a.project, result, a.query, mode=a.online_pr, engine=a.engine,
+                source=a.source, repos=a.repo, pr_query=a.pr_query, limit=a.limit)
         result['followup']='If local candidates are insufficient, wiki-search-pr -> wiki-pr -> wiki-code at exact head/base; no HCU-Knowledge update.'
         return result
     if c == "wiki-refresh": return wiki.refresh_source(store, a.project, a.source, os.environ.get("GITHUB_TOKEN"))

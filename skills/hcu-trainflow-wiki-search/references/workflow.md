@@ -12,3 +12,5 @@
 - `knowledge/README.md`：HCU-TrainFlow-Wiki 总入口，含官方资料、通用环境经验和模型最终总结。
 
 不要从安装目录的父级猜仓库位置；先核对上述工程绑定。执行前检查 `hcu-trainflow --help` 和相关子命令帮助，不猜不存在的 flag。
+
+共享内容写入与日常维护发布先读项目 `docs/wiki.md` 的“日常 lite 维护与发布”，核对真实 checkout 为 lite；新来源默认继承发现优先，不默认为 legacy 全量采集。历史查询仍按原 ID/版本读取，不为查阅切换工作分支。
